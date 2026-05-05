@@ -1,0 +1,33 @@
+{
+  "name": "@nexus/shared",
+  "version": "0.0.1",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./config": "./dist/config.js",
+    "./telemetry": "./dist/telemetry.js",
+    "./errors": "./dist/errors.js",
+    "./llm-types": "./dist/llm-types.js",
+    "./secret-scanner": "./dist/secret-scanner.js",
+    "./jwt": "./dist/jwt.js",
+    "./tenant-crypto": "./dist/tenant-crypto.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "jose": "^5.10.0",
+    "pino": "^8.17.0",
+    "pino-pretty": "^10.2.3",
+    "yaml": "^2.6.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.3"
+  }
+}

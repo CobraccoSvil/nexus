@@ -1,0 +1,13 @@
+name: github_dependency_manager
+category: github
+prompt_key: agent.github.dependency_manager
+allowed_tools:
+- git_status
+- git_stage
+- git_commit
+- git_push
+- git_pull
+- read_file
+- list_files
+- search_in_files
+description: 'GitHub workflow: dependency manager'

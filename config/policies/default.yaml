@@ -1,0 +1,88 @@
+# Profilo CLOUD — provider esterni, no on-premise
+profile: cloud
+
+providers:
+  openai:
+    enabled: true
+    timeout_ms: 30000
+  mistral:
+    enabled: true
+    timeout_ms: 30000
+  deepseek:
+    enabled: true
+    timeout_ms: 30000
+  google:
+    enabled: true
+    timeout_ms: 30000
+
+redaction:
+  enabled: true
+  strict_mode: false
+  presidio_grpc_url: presidio:50051
+  redaction_ttl_ms: 300000
+
+telemetry:
+  enabled: true
+  otlp_endpoint: http://localhost:4318
+  log_level: info
+  service_name: nexus-llm-gateway
+
+database:
+  # url non impostato qui: viene sempre sovrascritto da DATABASE_URL / POSTGRES_URL (env).
+  # In Docker l'env usa "postgres:5432", in WSL locale "localhost:5433".
+  pool_size: 20
+  ssl: false
+
+redis:
+  url: redis://redis:6379
+
+features:
+  allow_cloud_tier2: true
+  allow_cloud_tier3: false
+  dlp_enabled: true
+
+# Provider routing policy
+routing:
+  tier_0:
+    primary: openai
+    secondary: deepseek
+    tertiary: google
+    fallback: mistral
+  tier_1:
+    primary: openai
+    secondary: deepseek
+    tertiary: google
+    fallback: mistral
+  tier_2:
+    primary: openai
+    blocked: true  # tier 2 non raggiunge mai il cloud senza explicit override
+  tier_3:
+    blocked: true  # tier 3 sempre rifiutato — sarà supportato in fase hybrid/onprem
+
+# Gestione database e migrazioni per i progetti utente importati in Nexus.
+# Queste policy si applicano ai DB dei progetti (NON al DB interno di Nexus).
+project_database:
+  # Se true, ogni modifica schema deve passare dal migration runner.
+  require_migration_for_ddl: true
+  # Se true, l'utente può disabilitare il guardrail con conferma UI.
+  allow_override: true
+  # Il bypass richiede sempre una conferma esplicita nell'interfaccia utente.
+  override_requires_ui_confirm: true
+  # Ogni DDL (diretto o via migration) viene tracciato in project_migration_history.
+  audit_all_ddl: true
+  # Motore DB di default quando non rilevato dal detector.
+  default_engine: postgres
+  # V1: solo PostgreSQL supportato come motore gestito internamente.
+  supported_engines:
+    - postgres
+  # Tool di migrazione supportati; gli altri vengono rilevati ma non gestiti attivamente.
+  supported_migration_tools:
+    - alembic
+    - prisma
+    - sqlx
+    - flyway
+    - django
+    - rails
+    - knex
+    - liquibase
+    - generic-sql

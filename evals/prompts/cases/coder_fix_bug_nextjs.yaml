@@ -1,0 +1,14 @@
+name: coder_fix_bug_nextjs
+agent_type: coder
+intent: code_fix
+state:
+  repo_lang: TypeScript
+  repo_summary: "App Next.js 14 con App Router."
+rubric:
+  must_render_without_residual_placeholder: true
+  must_contain_xml_tags:
+    - "<role>"
+    - "<autonomia>"
+    - "<protocollo>"
+    - "<output_format>"
+  must_contain_in_protocol: ["IMPLEMENTA", "ESPLORA"]

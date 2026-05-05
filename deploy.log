@@ -1,0 +1,23 @@
+[0;34m[info][0m Versioni attualmente in esecuzione su dev101:
+  Backend  (mcp-core) : build_time = 1776157174
+  Frontend (web-ide)  : buildId    = build-1776169625846
+                        built at   = 2026-04-14T12:27:05.846Z
+
+[0;32m[deploy][0m Sincronizzazione sorgenti → dev101...
+[0;32m[deploy][0m   [1/2] File committati (git archive | ssh tar)...
+[0;32m[deploy][0m   [2/2] Nessun file extra da sincronizzare.
+[0;32m[deploy][0m Sync completato.
+[0;32m[deploy][0m Build frontend su dev101...
+  ├ chunks/356-13766e0c93b90e54.js       45.9 kB
+  ├ chunks/bd374a37-98e8224cde6918d1.js  54.2 kB
+  └ other shared chunks (total)          2.21 kB
+
+
+ƒ Middleware                             34.3 kB
+
+○  (Static)   prerendered as static content
+ƒ  (Dynamic)  server-rendered on demand
+
+[0;32m[deploy][0m Build frontend completato.
+[0;32m[deploy][0m Riavvio frontend...
+scripts/dev-server-101.sh: line 2: set: pipefail: invalid option name

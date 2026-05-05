@@ -1,0 +1,23 @@
+{
+  "name": "@ideai/nexus-gateway-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch --env-file=../../.env src/server.ts",
+    "start": "node --env-file=../../.env dist/server.js",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@nexus/llm-gateway": "workspace:*",
+    "@nexus/shared": "workspace:*",
+    "fastify": "^5.3.2",
+    "postgres": "^3.4.9"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3"
+  }
+}

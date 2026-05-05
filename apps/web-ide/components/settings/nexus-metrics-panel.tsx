@@ -1,0 +1,294 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import { useThemeColors } from "../../lib/theme";
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+const POLL_INTERVAL_MS = 5000;
+
+interface RouterStats {
+  total_decisions: number;
+  exploration_count: number;
+  exploitation_count: number;
+  cold_start_count: number;
+  avg_decision_time_us: number;
+  total_rewards: number;
+  current_epsilon: number;
+}
+
+interface SchedulerStats {
+  workers_registered: number;
+  total_runs: number;
+  total_failures: number;
+}
+
+interface NexusStats {
+  status: string;
+  router: RouterStats;
+  scheduler: SchedulerStats;
+  observability_ns: {
+    name: string;
+    entries: number;
+  };
+}
+
+function StatCard({
+  label,
+  value,
+  sub,
+  color,
+  tc,
+}: {
+  label: string;
+  value: string | number;
+  sub?: string;
+  color?: string;
+  tc: ReturnType<typeof useThemeColors>;
+}) {
+  return (
+    <div
+      style={{
+        padding: "10px 14px",
+        borderRadius: 8,
+        background: tc.bgInput,
+        border: `1px solid ${tc.border}`,
+        minWidth: 110,
+      }}
+    >
+      <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 4, fontWeight: 500 }}>{label}</div>
+      <div style={{ fontSize: 18, fontWeight: 700, color: color ?? tc.text, fontVariantNumeric: "tabular-nums" }}>
+        {value}
+      </div>
+      {sub && <div style={{ fontSize: 11, color: tc.textMuted, marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function pct(num: number, denom: number): string {
+  if (denom === 0) return "—";
+  return `${((num / denom) * 100).toFixed(1)}%`;
+}
+
+function formatUs(us: number): string {
+  if (us === 0) return "—";
+  if (us < 1000) return `${us.toFixed(0)} µs`;
+  return `${(us / 1000).toFixed(2)} ms`;
+}
+
+export function NexusMetricsPanel() {
+  const tc = useThemeColors();
+  const [stats, setStats] = useState<NexusStats | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const fetchStats = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/nexus/stats`, { credentials: "include" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data: NexusStats = await res.json();
+      setStats(data);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Errore caricamento stats");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchStats();
+    intervalRef.current = setInterval(fetchStats, POLL_INTERVAL_MS);
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, []);
+
+  const r = stats?.router;
+  const s = stats?.scheduler;
+
+  const explorationPct = r ? pct(r.exploration_count, r.total_decisions) : "—";
+  const exploitationPct = r ? pct(r.exploitation_count, r.total_decisions) : "—";
+  const coldStartPct = r ? pct(r.cold_start_count, r.total_decisions) : "—";
+
+  return (
+    <div
+      style={{
+        padding: 18,
+        borderRadius: 12,
+        border: `1px solid ${tc.border}`,
+        background: tc.bgCard,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+        <span style={{ fontSize: 14, fontWeight: 700 }}>📊 Nexus Router — Metriche Live</span>
+        {loading && (
+          <span className="text-xs text-muted">caricamento…</span>
+        )}
+        {!loading && !error && (
+          <span style={{
+            fontSize: 10,
+            fontWeight: 600,
+            background: "#22c55e20",
+            color: "#22c55e",
+            border: "1px solid #22c55e40",
+            borderRadius: 6,
+            padding: "1px 7px",
+          }}>
+            LIVE
+          </span>
+        )}
+        {!loading && error && (
+          <span style={{
+            fontSize: 10,
+            fontWeight: 600,
+            background: "#ef444420",
+            color: "#ef4444",
+            border: "1px solid #ef444440",
+            borderRadius: 6,
+            padding: "1px 7px",
+          }}>
+            OFFLINE
+          </span>
+        )}
+      </div>
+      <div style={{ color: tc.textMuted, fontSize: 12, marginBottom: 14 }}>
+        Snapshot in tempo reale del Q-Learning router. Aggiornato ogni {POLL_INTERVAL_MS / 1000}s.
+      </div>
+
+      {error ? (
+        <div style={{ color: tc.textMuted, fontSize: 12, padding: "10px 14px", borderRadius: 8, background: tc.bgHover }}>
+          {error} — il backend potrebbe non essere raggiungibile.
+        </div>
+      ) : (
+        <>
+          {/* Router Q-Learning stats */}
+          <div style={{ fontSize: 12, fontWeight: 700, color: tc.textSecondary, marginBottom: 8 }}>Router Q-Learning</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
+            <StatCard
+              label="Decisioni totali"
+              value={r?.total_decisions ?? "—"}
+              tc={tc}
+            />
+            <StatCard
+              label="ε (epsilon)"
+              value={r ? r.current_epsilon.toFixed(3) : "—"}
+              sub="esplorazione corrente"
+              color="#6366f1"
+              tc={tc}
+            />
+            <StatCard
+              label="Esplorazione"
+              value={explorationPct}
+              sub={r ? `${r.exploration_count} routing` : "—"}
+              color="#f59e0b"
+              tc={tc}
+            />
+            <StatCard
+              label="Exploitation"
+              value={exploitationPct}
+              sub={r ? `${r.exploitation_count} routing` : "—"}
+              color="#22c55e"
+              tc={tc}
+            />
+            <StatCard
+              label="Cold start"
+              value={coldStartPct}
+              sub={r ? `${r.cold_start_count} routing` : "—"}
+              color={tc.textMuted}
+              tc={tc}
+            />
+            <StatCard
+              label="Latenza media"
+              value={r ? formatUs(r.avg_decision_time_us) : "—"}
+              sub="decision time"
+              tc={tc}
+            />
+            <StatCard
+              label="Total rewards"
+              value={r ? r.total_rewards.toFixed(2) : "—"}
+              sub="cumulated RL reward"
+              color="#06b6d4"
+              tc={tc}
+            />
+          </div>
+
+          {/* Barre esplorazione vs exploitation */}
+          {r && r.total_decisions > 0 && (
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 6, fontWeight: 500 }}>
+                Distribuzione routing
+              </div>
+              <div style={{ display: "flex", height: 10, borderRadius: 6, overflow: "hidden", background: tc.bgHover }}>
+                <div
+                  style={{
+                    width: `${(r.exploration_count / r.total_decisions) * 100}%`,
+                    background: "#f59e0b",
+                    transition: "width 0.4s",
+                  }}
+                  title={`Exploration: ${explorationPct}`}
+                />
+                <div
+                  style={{
+                    width: `${(r.exploitation_count / r.total_decisions) * 100}%`,
+                    background: "#22c55e",
+                    transition: "width 0.4s",
+                  }}
+                  title={`Exploitation: ${exploitationPct}`}
+                />
+                <div
+                  style={{
+                    flex: 1,
+                    background: tc.border,
+                  }}
+                  title={`Cold start: ${coldStartPct}`}
+                />
+              </div>
+              <div style={{ display: "flex", gap: 14, marginTop: 5 }}>
+                {[
+                  { color: "#f59e0b", label: `Exploration ${explorationPct}` },
+                  { color: "#22c55e", label: `Exploitation ${exploitationPct}` },
+                  { color: tc.border, label: `Cold start ${coldStartPct}` },
+                ].map((item) => (
+                  <div key={item.label} style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: "50%", background: item.color, flexShrink: 0 }} />
+                    <span style={{ fontSize: 10, color: tc.textMuted }}>{item.label}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Scheduler summary */}
+          <div style={{ fontSize: 12, fontWeight: 700, color: tc.textSecondary, marginBottom: 8 }}>Learning Workers</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <StatCard
+              label="Workers attivi"
+              value={s?.workers_registered ?? "—"}
+              sub="registrati"
+              color="#6366f1"
+              tc={tc}
+            />
+            <StatCard
+              label="Runs totali"
+              value={s?.total_runs ?? "—"}
+              tc={tc}
+            />
+            <StatCard
+              label="Failures"
+              value={s?.total_failures ?? "—"}
+              color={s && s.total_failures > 0 ? "#ef4444" : tc.textMuted}
+              tc={tc}
+            />
+            <StatCard
+              label="Namespace entries"
+              value={stats?.observability_ns.entries ?? "—"}
+              sub={stats?.observability_ns.name}
+              tc={tc}
+            />
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

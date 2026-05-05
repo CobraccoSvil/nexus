@@ -1,0 +1,13 @@
+name: github_actions_optimizer
+category: github
+prompt_key: agent.github.actions_optimizer
+allowed_tools:
+- git_status
+- git_stage
+- git_commit
+- git_push
+- git_pull
+- read_file
+- list_files
+- search_in_files
+description: 'GitHub workflow: actions optimizer'

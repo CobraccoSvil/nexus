@@ -1,0 +1,104 @@
+syntax = "proto3";
+
+package ai_orchestrator.agent_router;
+
+// AgentRouter espone il router Q-Learning di `nexus-orchestrator` al brain
+// Python/LangGraph. Il brain invoca `SelectAgent` come sub-nodo del router
+// semantico: l'output e' un `agent_type` che viene usato per caricare il
+// profilo YAML corrispondente (`brain/agents/profiles/<agent_type>.yaml`).
+//
+// Lato Rust il server vive in mcp-core, in modo che una singola istanza di
+// QLearningRouter (condivisa con il resto del crate) gestisca tabella Q,
+// embedder HNSW e persistenza Postgres senza duplicazioni.
+
+message SelectAgentRequest {
+  // Identificatore del task (usato per le chiavi Q-learning e il log).
+  string task_id = 1;
+  // Tipo task (es: "code_generation", "bug_fix", "documentation").
+  // Stesso vocabolario dell'intent del SemanticRouter del brain.
+  string task_type = 2;
+  // Istruzioni/descrizione in linguaggio naturale — usate dall'embedder HNSW
+  // per trovare agenti simili.
+  string instructions = 3;
+  // Contesto aggiuntivo (codebase path, tag progetto) opzionale JSON.
+  string context_json = 4;
+  // Forza la selezione di un agente specifico (bypass Q-learning).
+  // Quando non vuoto il server risponde strategy=FORCED e confidence=1.0.
+  string forced_agent_type = 5;
+}
+
+message CandidateAgent {
+  string agent_type = 1;
+  float similarity_score = 2;
+  float q_value = 3;
+}
+
+message SelectAgentResponse {
+  // Nome dell'agente selezionato (match con profile_loader.get_profile()).
+  string agent_type = 1;
+  // Q-value dell'agente scelto.
+  float q_value = 2;
+  // Confidence della decisione 0.0-1.0.
+  float confidence = 3;
+  // Candidati considerati (fino a k_candidates).
+  repeated CandidateAgent candidates = 4;
+  // Strategia: "EXPLOITATION" | "EXPLORATION" | "COLD_START" | "FORCED".
+  string strategy = 5;
+  // Tempo di decisione in microsecondi.
+  uint64 decision_time_us = 6;
+}
+
+message FeedbackRequest {
+  // Task di riferimento.
+  string task_id = 1;
+  string task_type = 2;
+  string agent_type = 3;
+  // Reward osservato [0.0, 1.0] (1.0 = successo totale).
+  float reward = 4;
+  // Durata esecuzione in ms (opzionale, informativa).
+  uint64 duration_ms = 5;
+  // true se il task e' completato (terminale per Q-learning).
+  bool is_terminal = 6;
+}
+
+message FeedbackResponse {
+  // Q-value aggiornato dopo la feedback.
+  float new_q_value = 1;
+}
+
+message GetAgentMetricsRequest {
+  // Tipo di agente (es: "coder", "github_pr_manager").
+  string agent_type = 1;
+  // Numero di esecuzioni recenti da considerare (default: 10).
+  int32 limit = 2;
+}
+
+message GetAgentMetricsResponse {
+  // Latency media in ms delle ultime N esecuzioni.
+  float average_latency_ms = 1;
+  // Costo medio USD.
+  float average_cost_usd = 2;
+  // Reward medio osservato.
+  float average_reward = 3;
+  // Q-value corrente per questo agente (context-agnostic).
+  float q_value = 4;
+  // Numero di esecuzioni concluse con successo.
+  int32 success_count = 5;
+  // Numero di esecuzioni fallite.
+  int32 failure_count = 6;
+  // Numero di token totali processati (estimate).
+  int32 total_tokens_processed = 7;
+  // Timestamp ultimo aggiornamento (ISO8601).
+  string last_updated_at = 8;
+}
+
+service AgentRouter {
+  // Sceglie l'agente migliore per un task tramite Q-learning + HNSW.
+  rpc SelectAgent(SelectAgentRequest) returns (SelectAgentResponse);
+
+  // Aggiorna il Q-value con il reward osservato dall'esecuzione.
+  rpc SubmitFeedback(FeedbackRequest) returns (FeedbackResponse);
+
+  // Recupera metriche aggregate per un agente specifico (admin/monitoring).
+  rpc GetAgentMetrics(GetAgentMetricsRequest) returns (GetAgentMetricsResponse);
+}

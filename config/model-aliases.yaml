@@ -1,0 +1,81 @@
+# Model alias mapping — logico model name → reale model per provider
+aliases:
+  coder-small:
+    cloud_primary: openai/gpt-4o-mini
+    cloud_secondary: deepseek/deepseek-chat
+    onprem: Qwen/Qwen2.5-Coder-7B-Instruct
+    min_tier: 0
+    max_tier: 1
+
+  coder-large:
+    cloud_primary: openai/gpt-4.1
+    cloud_secondary: deepseek/deepseek-chat
+    onprem: Qwen/Qwen2.5-Coder-32B-Instruct
+    min_tier: 0
+    max_tier: 2
+
+  reasoning-heavy:
+    cloud_primary: openai/gpt-4.1
+    cloud_secondary: deepseek/deepseek-reasoner
+    onprem: deepseek-r1-distill-70b
+    min_tier: 0
+    max_tier: 2
+
+  sensitive-only:
+    cloud_primary: null
+    cloud_secondary: null
+    onprem: Qwen/Qwen2.5-72B-Instruct
+    min_tier: 3
+    max_tier: 3
+
+  embedding:
+    cloud_primary: openai/text-embedding-3-small
+    cloud_secondary: openai/text-embedding-3-large
+    onprem: BAAI/bge-m3
+    min_tier: 0
+    max_tier: 3
+
+  reranker:
+    cloud_primary: jina/jina-reranker-v2-base-multilingual
+    cloud_secondary: null
+    onprem: BAAI/bge-reranker-v2-m3
+    min_tier: 0
+    max_tier: 3
+
+  # ── Fallback cross-provider per modelli diretti (es. "google/gemini-2.5-flash") ──
+  # Usati quando mcp-core invia un modello provider-specifico e quel provider è in errore.
+  # La chain prova: deepseek → mistral come equivalenti economici.
+  google-flash-fallback:
+    cloud_primary: deepseek/deepseek-chat
+    cloud_secondary: mistral/mistral-small-latest
+    onprem: null
+    min_tier: 0
+    max_tier: 2
+
+  google-pro-fallback:
+    cloud_primary: deepseek/deepseek-chat
+    cloud_secondary: mistral/mistral-large-latest
+    onprem: null
+    min_tier: 0
+    max_tier: 2
+
+  anthropic-fallback:
+    cloud_primary: deepseek/deepseek-chat
+    cloud_secondary: mistral/mistral-small-latest
+    onprem: null
+    min_tier: 0
+    max_tier: 2
+
+  deepseek-fallback:
+    cloud_primary: mistral/mistral-small-latest
+    cloud_secondary: google/gemini-2.5-flash
+    onprem: null
+    min_tier: 0
+    max_tier: 2
+
+  mistral-fallback:
+    cloud_primary: deepseek/deepseek-chat
+    cloud_secondary: google/gemini-2.5-flash
+    onprem: null
+    min_tier: 0
+    max_tier: 2

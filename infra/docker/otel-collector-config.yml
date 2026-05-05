@@ -1,0 +1,35 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 10s
+    send_batch_size: 1024
+
+  attributes:
+    actions:
+      - key: service.name
+        value: nexus-llm-gateway
+        action: insert
+
+exporters:
+  # Jaeger accetta OTLP direttamente dalla versione 1.35+
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [attributes, batch]
+      exporters: [otlp/jaeger, debug]

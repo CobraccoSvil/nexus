@@ -1,0 +1,14 @@
+name: coder_optimize_query
+agent_type: coder
+intent: optimization
+state:
+  repo_lang: SQL
+  repo_summary: "Database PostgreSQL con query lente."
+rubric:
+  must_render_without_residual_placeholder: true
+  must_contain_xml_tags:
+    - "<role>"
+    - "<autonomia>"
+    - "<protocollo>"
+    - "<output_format>"
+  must_contain_in_protocol: ["IMPLEMENTA", "ESPLORA"]

@@ -1,0 +1,82 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16-latest
+    environment:
+      POSTGRES_USER: nexus
+      POSTGRES_PASSWORD: nexus
+      POSTGRES_DB: nexus
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ../sql/init-schemas.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    environment:
+      MODEL_ID: Qwen/Qwen2.5-Coder-32B-Instruct
+      CUDA_VISIBLE_DEVICES: "0"
+      DTYPE: float16
+    ports:
+      - "8000:8000"
+    volumes:
+      - vllm-models:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    # Richiede GPU — per dev locale disabilitare e usare mock
+
+  otel-collector:
+    image: otel/opentelemetry-collector:latest
+    command: ["--config=/etc/otel-collector-config.yml"]
+    volumes:
+      - ./otel-collector-config.yml:/etc/otel-collector-config.yml
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"
+
+  presidio-stub:
+    image: mcr.microsoft.com/presidio-api:latest
+    ports:
+      - "8001:8001"
+    environment:
+      PORT: 8001
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres-data:
+  vllm-models:
+
+networks:
+  default:
+    name: nexus-dev

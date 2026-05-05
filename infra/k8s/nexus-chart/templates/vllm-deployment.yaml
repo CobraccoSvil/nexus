@@ -1,0 +1,116 @@
+{{- if .Values.vllm.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "nexus.fullname" . }}-vllm
+  labels:
+    {{- include "nexus.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "nexus.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: vllm
+  template:
+    metadata:
+      labels:
+        {{- include "nexus.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: vllm
+    spec:
+      {{- with .Values.vllm.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.vllm.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: vllm
+          image: "{{ .Values.vllm.image.repository }}:{{ .Values.vllm.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--model"
+            - "{{ .Values.vllm.model }}"
+            - "--dtype"
+            - "{{ .Values.vllm.dtype }}"
+            - "--max-model-len"
+            - "{{ .Values.vllm.maxModelLen }}"
+            - "--port"
+            - "{{ .Values.vllm.port }}"
+            - "--host"
+            - "0.0.0.0"
+          env:
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.hf.tokenSecret }}
+                  key: {{ .Values.hf.tokenKey }}
+                  optional: true
+          ports:
+            - name: http
+              containerPort: {{ .Values.vllm.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.vllm.port }}
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.vllm.port }}
+            initialDelaySeconds: 90
+            periodSeconds: 15
+            timeoutSeconds: 10
+          resources:
+            {{- toYaml .Values.vllm.resources | nindent 12 }}
+          volumeMounts:
+            - name: model-cache
+              mountPath: /root/.cache/huggingface
+      volumes:
+        - name: model-cache
+          {{- if .Values.vllm.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "nexus.fullname" . }}-vllm-models
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+---
+{{- if .Values.vllm.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "nexus.fullname" . }}-vllm-models
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.vllm.persistence.storageClass }}
+  storageClassName: {{ .Values.vllm.persistence.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.vllm.persistence.size }}
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "nexus.fullname" . }}-vllm
+  labels:
+    {{- include "nexus.labels" . | nindent 4 }}
+    app.kubernetes.io/component: vllm
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.vllm.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "nexus.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: vllm
+{{- end }}

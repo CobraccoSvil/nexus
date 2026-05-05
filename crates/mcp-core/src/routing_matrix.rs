@@ -1,0 +1,376 @@
+//! Registry DB-driven dei modelli AI per il routing.
+//!
+//! Sostituisce la matrice hardcoded che era sparsa in:
+//! - orchestrator.rs (routing matrix + default_model_for_provider)
+//! - chat_messages.rs (4 punti)
+//! - models.rs (matrice duplicata)
+//! - projects/deep_review.rs
+//!
+//! Carica i modelli dalle tabelle `nexus_routing_matrix`,
+//! `nexus_provider_default_model` e `nexus_purpose_model` (vedi migrazioni
+//! 0101 e 0102) con cache 60s + refresh background.
+//!
+//! **Nessun fallback hardcoded**. Se il DB e' irraggiungibile o le tabelle
+//! sono vuote, ogni call site ottiene un errore esplicito (HTTP 503/500
+//! con messaggio chiaro). Questa scelta e' intenzionale: niente
+//! "magic fallback" che mascheri bug di configurazione.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use sqlx::PgPool;
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
+
+/// Refresh interval della cache. 60s e' un buon compromesso tra latenza di
+/// propagazione delle modifiche (UPDATE in DB → pickup in <60s, no redeploy)
+/// e overhead di query.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Matrice immutable con tutte le entry attive.
+#[derive(Debug, Clone)]
+pub struct RoutingMatrix {
+    /// Lookup (intent, behavior_mode) -> (provider, model_id)
+    pub by_intent_mode: HashMap<(String, String), (String, String)>,
+    /// Default model per provider (provider -> model_id)
+    pub default_models: HashMap<String, String>,
+    /// Modello per task interni (purpose -> (provider, model_id)).
+    /// Vedi migrazione 0102: chat_title_generator, chat_feedback_generator,
+    /// docs_generator, custom_instructions, admin_fallback_default, google_batch.
+    pub purpose_models: HashMap<String, (String, String)>,
+    /// Quando e' stata caricata l'ultima volta (per debug/UI)
+    pub loaded_at: Instant,
+}
+
+impl RoutingMatrix {
+    /// Cerca (provider, model) per (intent, behavior_mode).
+    pub fn lookup(&self, intent: &str, behavior_mode: &str) -> Option<(String, String)> {
+        self.by_intent_mode
+            .get(&(intent.to_string(), behavior_mode.to_string()))
+            .cloned()
+    }
+
+    /// Modello di default per un provider.
+    pub fn default_model(&self, provider: &str) -> Option<String> {
+        self.default_models.get(provider).cloned()
+    }
+
+    /// Modello per uno specifico task interno (es. "chat_title_generator").
+    /// Vedi migrazione 0102.
+    pub fn purpose_model(&self, purpose: &str) -> Option<(String, String)> {
+        self.purpose_models.get(purpose).cloned()
+    }
+
+    /// Numero totale di entry attive in tutta la matrice.
+    pub fn total_entries(&self) -> usize {
+        self.by_intent_mode.len() + self.default_models.len() + self.purpose_models.len()
+    }
+
+    /// Matrice di test pre-popolata con un sottoinsieme rappresentativo:
+    /// - tutti gli intent rischiosi (file_ops, system_admin, debug, architecture,
+    ///   refactor, fix_complesso) mappati a anthropic claude-sonnet-4-6
+    /// - intent leggeri (chat_*, fix_semplice, test, docs) mappati a modelli
+    ///   appropriati secondo il seed migrazione 0101
+    /// - default per provider e qualche purpose model
+    ///
+    /// Usata da test che vogliono validare il routing senza dipendere dal DB.
+    /// Mantenere allineata col seed in `db/migrations/0101_routing_model_registry.sql`
+    /// quando si cambia la matrice di produzione.
+    #[cfg(test)]
+    pub fn fallback_safe() -> Self {
+        let mut by_intent_mode = HashMap::new();
+        let entries: &[(&str, &str, &str, &str)] = &[
+            // chat
+            ("chat_breve", "veloce", "google", "gemini-2.5-flash-lite"),
+            ("chat_breve", "economica", "openai", "gpt-4.1-nano"),
+            ("chat_breve", "bilanciata", "google", "gemini-2.5-flash"),
+            ("chat_breve", "approfondita", "anthropic", "claude-haiku-4-5-20251001"),
+            ("chat_media", "bilanciata", "openai", "gpt-4.1-mini"),
+            ("chat_media", "approfondita", "anthropic", "claude-sonnet-4-6"),
+            ("chat_lunga", "bilanciata", "anthropic", "claude-haiku-4-5-20251001"),
+            ("chat_lunga", "approfondita", "anthropic", "claude-sonnet-4-6"),
+            // intent agentici (richiedono modelli capable)
+            ("file_ops", "veloce", "openai", "gpt-4.1-mini"),
+            ("file_ops", "bilanciata", "anthropic", "claude-haiku-4-5-20251001"),
+            ("file_ops", "approfondita", "anthropic", "claude-sonnet-4-6"),
+            ("system_admin", "veloce", "anthropic", "claude-haiku-4-5-20251001"),
+            ("system_admin", "bilanciata", "anthropic", "claude-sonnet-4-6"),
+            ("system_admin", "approfondita", "anthropic", "claude-sonnet-4-6"),
+            ("debug", "bilanciata", "anthropic", "claude-sonnet-4-6"),
+            ("debug", "approfondita", "anthropic", "claude-opus-4-6"),
+            ("architecture", "bilanciata", "anthropic", "claude-sonnet-4-6"),
+            ("architecture", "approfondita", "anthropic", "claude-opus-4-6"),
+            ("refactor", "bilanciata", "anthropic", "claude-haiku-4-5-20251001"),
+            ("refactor", "approfondita", "anthropic", "claude-sonnet-4-6"),
+            ("fix_semplice", "bilanciata", "openai", "gpt-4.1-mini"),
+            ("fix_complesso", "bilanciata", "anthropic", "claude-haiku-4-5-20251001"),
+            ("fix_complesso", "approfondita", "anthropic", "claude-sonnet-4-6"),
+            ("test", "bilanciata", "openai", "gpt-4.1-mini"),
+            ("docs", "bilanciata", "openai", "gpt-4.1"),
+        ];
+        for (intent, mode, provider, model) in entries {
+            by_intent_mode.insert(
+                (intent.to_string(), mode.to_string()),
+                (provider.to_string(), model.to_string()),
+            );
+        }
+        let mut default_models = HashMap::new();
+        default_models.insert("openai".to_string(), "gpt-4o-mini".to_string());
+        default_models.insert("anthropic".to_string(), "claude-sonnet-4-6".to_string());
+        default_models.insert("google".to_string(), "gemini-2.5-flash".to_string());
+        default_models.insert("mistral".to_string(), "mistral-small-latest".to_string());
+        default_models.insert("deepseek".to_string(), "deepseek-chat".to_string());
+        Self {
+            by_intent_mode,
+            default_models,
+            purpose_models: HashMap::new(),
+            loaded_at: Instant::now(),
+        }
+    }
+}
+
+/// Carica la matrice dal DB. Ritorna `Err` se DB irraggiungibile o tabelle vuote.
+async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
+    let matrix_rows = sqlx::query_as::<_, (String, String, String, String)>(
+        r#"SELECT intent, behavior_mode, provider, model_id
+           FROM nexus_routing_matrix
+           WHERE is_active = true
+           ORDER BY intent, behavior_mode, priority DESC"#,
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("query nexus_routing_matrix fallita: {e}"))?;
+
+    let default_rows = sqlx::query_as::<_, (String, String)>(
+        r#"SELECT provider, model_id FROM nexus_provider_default_model"#,
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("query nexus_provider_default_model fallita: {e}"))?;
+
+    // Purpose models (mig 0102). NON ignoriamo errori — se la tabella non
+    // esiste l'admin deve applicare la migrazione.
+    let purpose_rows = sqlx::query_as::<_, (String, String, String)>(
+        r#"SELECT purpose, provider, model_id FROM nexus_purpose_model"#,
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("query nexus_purpose_model fallita: {e}. Hai applicato la migrazione 0102?"))?;
+
+    if matrix_rows.is_empty() {
+        return Err(
+            "nexus_routing_matrix vuota. Applica la migrazione 0101 o popola la tabella.".to_string(),
+        );
+    }
+    if default_rows.is_empty() {
+        return Err(
+            "nexus_provider_default_model vuota. Applica la migrazione 0101 o popola la tabella.".to_string(),
+        );
+    }
+
+    let mut by_intent_mode: HashMap<(String, String), (String, String)> = HashMap::new();
+    for (intent, mode, provider, model_id) in matrix_rows {
+        by_intent_mode
+            .entry((intent, mode))
+            .or_insert((provider, model_id));
+    }
+
+    let default_models: HashMap<String, String> = default_rows.into_iter().collect();
+    let purpose_models: HashMap<String, (String, String)> = purpose_rows
+        .into_iter()
+        .map(|(purpose, provider, model)| (purpose, (provider, model)))
+        .collect();
+
+    Ok(RoutingMatrix {
+        by_intent_mode,
+        default_models,
+        purpose_models,
+        loaded_at: Instant::now(),
+    })
+}
+
+/// Manager della cache: tiene un `Arc<RoutingMatrix>` aggiornato in background.
+/// Le letture sono lock-free (clone dell'Arc).
+///
+/// Stato iniziale e durante refresh: `Option<Arc<RoutingMatrix>>`.
+/// Se `None` (mai caricata con successo), tutti i call site ricevono errore
+/// esplicito 503 invece di un fallback nascosto.
+#[derive(Clone)]
+pub struct RoutingMatrixCache {
+    inner: Arc<RwLock<Option<Arc<RoutingMatrix>>>>,
+    last_error: Arc<RwLock<Option<String>>>,
+}
+
+impl RoutingMatrixCache {
+    /// Inizializza la cache con retry-loop: 5 tentativi × 5s di backoff
+    /// per dare tempo a Postgres di salire (es. ordine systemd boot).
+    /// Se dopo 5 tentativi il DB e' ancora down, mcp-core PANICA all'avvio
+    /// con messaggio chiaro — non parte con una matrice fittizia.
+    /// Spawna poi il task di refresh background ogni 60s.
+    pub async fn init(db: PgPool) -> Self {
+        let mut last_err: Option<String> = None;
+        let mut initial: Option<Arc<RoutingMatrix>> = None;
+        for attempt in 1..=5 {
+            match fetch_from_db(&db).await {
+                Ok(m) => {
+                    info!(
+                        "routing_matrix: caricata da DB ({} routing, {} default per-provider, {} purpose-models)",
+                        m.by_intent_mode.len(),
+                        m.default_models.len(),
+                        m.purpose_models.len()
+                    );
+                    initial = Some(Arc::new(m));
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        "routing_matrix: tentativo {}/5 di load DB fallito ({}). Retry in 5s...",
+                        attempt, e
+                    );
+                    last_err = Some(e);
+                    if attempt < 5 {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        }
+
+        if initial.is_none() {
+            // Panic esplicito: niente fallback. Errore chiaro nei log per l'admin.
+            panic!(
+                "routing_matrix: impossibile caricare dal DB dopo 5 tentativi. \
+                 Errore: {}. \
+                 Verifica: (a) Postgres raggiungibile, (b) migrazioni 0101 e 0102 applicate, \
+                 (c) tabelle nexus_routing_matrix / nexus_provider_default_model / nexus_purpose_model popolate.",
+                last_err.unwrap_or_else(|| "unknown".to_string())
+            );
+        }
+
+        let inner = Arc::new(RwLock::new(initial));
+        let last_error = Arc::new(RwLock::new(last_err));
+        let cache = Self {
+            inner: inner.clone(),
+            last_error: last_error.clone(),
+        };
+
+        // Spawn refresh background. Errori NON sostituiscono la cache valida
+        // precedente — manteniamo l'ultima matrice buona finche' DB non torna up.
+        let inner_bg = inner;
+        let last_err_bg = last_error;
+        let db_bg = db;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(REFRESH_INTERVAL).await;
+                match fetch_from_db(&db_bg).await {
+                    Ok(new_matrix) => {
+                        let arc = Arc::new(new_matrix);
+                        {
+                            let mut w = inner_bg.write().await;
+                            *w = Some(arc);
+                        }
+                        {
+                            let mut e = last_err_bg.write().await;
+                            *e = None;
+                        }
+                        debug!("routing_matrix: refresh OK");
+                    }
+                    Err(e) => {
+                        warn!("routing_matrix: refresh fallito ({}). Mantengo cache precedente.", e);
+                        let mut le = last_err_bg.write().await;
+                        *le = Some(e);
+                    }
+                }
+            }
+        });
+
+        cache
+    }
+
+    /// Snapshot lock-free della matrice corrente.
+    /// Ritorna `Err` se la matrice non e' MAI stata caricata (DB down dall'avvio
+    /// e mcp-core non ha panic-ato — non dovrebbe succedere visto il retry-loop
+    /// ma e' un'invariante della struttura, non del DB).
+    pub fn current(&self) -> Result<Arc<RoutingMatrix>, String> {
+        match self.inner.try_read() {
+            Ok(g) => match &*g {
+                Some(arc) => Ok(Arc::clone(arc)),
+                None => Err("routing_matrix non caricata (DB down all'avvio?)".to_string()),
+            },
+            Err(_) => {
+                // Lock occupato dal refresh background. Riprova async.
+                Err("routing_matrix: cache temporaneamente non disponibile (refresh in corso)".to_string())
+            }
+        }
+    }
+
+    /// Versione async per quando puoi awaitare il lock.
+    pub async fn current_async(&self) -> Result<Arc<RoutingMatrix>, String> {
+        let g = self.inner.read().await;
+        g.as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| "routing_matrix non caricata (DB down all'avvio?)".to_string())
+    }
+
+    /// Ultimo errore osservato dal refresh (per dashboard admin).
+    pub async fn last_error(&self) -> Option<String> {
+        self.last_error.read().await.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_matrix() -> RoutingMatrix {
+        let mut by_intent_mode = HashMap::new();
+        by_intent_mode.insert(
+            ("file_ops".to_string(), "approfondita".to_string()),
+            ("anthropic".to_string(), "claude-sonnet-4-6".to_string()),
+        );
+        by_intent_mode.insert(
+            ("system_admin".to_string(), "bilanciata".to_string()),
+            ("anthropic".to_string(), "claude-sonnet-4-6".to_string()),
+        );
+        let mut default_models = HashMap::new();
+        default_models.insert("openai".to_string(), "gpt-4o-mini".to_string());
+        default_models.insert("anthropic".to_string(), "claude-sonnet-4-6".to_string());
+        let mut purpose_models = HashMap::new();
+        purpose_models.insert(
+            "chat_title_generator".to_string(),
+            ("openai".to_string(), "gpt-4.1-nano".to_string()),
+        );
+        RoutingMatrix {
+            by_intent_mode,
+            default_models,
+            purpose_models,
+            loaded_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn lookup_returns_some_for_existing_entry() {
+        let m = make_test_matrix();
+        let r = m.lookup("file_ops", "approfondita");
+        assert_eq!(r, Some(("anthropic".to_string(), "claude-sonnet-4-6".to_string())));
+    }
+
+    #[test]
+    fn lookup_returns_none_for_missing_entry() {
+        let m = make_test_matrix();
+        assert_eq!(m.lookup("nonexistent", "veloce"), None);
+    }
+
+    #[test]
+    fn default_model_returns_some_for_existing_provider() {
+        let m = make_test_matrix();
+        assert_eq!(m.default_model("openai"), Some("gpt-4o-mini".to_string()));
+    }
+
+    #[test]
+    fn default_model_returns_none_for_missing_provider() {
+        let m = make_test_matrix();
+        assert_eq!(m.default_model("xai"), None);
+    }
+}

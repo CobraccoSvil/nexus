@@ -1,0 +1,24 @@
+{
+  "name": "@nexus/rag",
+  "version": "0.0.1",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest --config tests/vitest.config.ts"
+  },
+  "dependencies": {
+    "@nexus/shared": "workspace:*",
+    "@nexus/embeddings": "workspace:*",
+    "postgres": "^3.4.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3",
+    "@types/node": "^24.0.0",
+    "vitest": "^2.1.0",
+    "@vitest/coverage-v8": "^2.1.0"
+  }
+}

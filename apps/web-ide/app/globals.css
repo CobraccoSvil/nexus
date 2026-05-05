@@ -1,0 +1,287 @@
+/* ============================================================
+   globals.css — unico file CSS globale del web-ide
+   Importato solo da app/layout.tsx (root).
+   Contiene: reset, keyframes, utility classes.
+   Colori sono CSS variables registrate da theme-body.tsx
+   ============================================================ */
+
+/* ---------- 1. Reset / base ---------- */
+body {
+  margin: 0;
+}
+
+::selection {
+  background: rgba(0, 122, 204, 0.4);
+}
+
+/* ---------- 2. Keyframes globali ---------- */
+@keyframes tabPulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.25; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes nexus-blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+
+/* ---------- 3A. Scrollbar utilities ---------- */
+.no-scrollbar {
+  scrollbar-width: none;        /* Firefox */
+  -ms-overflow-style: none;     /* IE/Edge legacy */
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;                /* Chrome / Safari */
+}
+
+/* ---------- 3B. Flex utilities ---------- */
+.flex { display: flex; }
+.flex-row { display: flex; align-items: center; }
+.flex-row-wrap { display: flex; flex-wrap: wrap; align-items: center; }
+.flex-col { display: flex; flex-direction: column; }
+
+/* Gap utilities */
+.gap-4 { gap: 4px; }
+.gap-6 { gap: 6px; }
+.gap-8 { gap: 8px; }
+.gap-10 { gap: 10px; }
+.gap-12 { gap: 12px; }
+.gap-16 { gap: 16px; }
+.gap-20 { gap: 20px; }
+
+/* Combined: flex + gap */
+.flex-row-gap-4 { display: flex; align-items: center; gap: 4px; }
+.flex-row-gap-6 { display: flex; align-items: center; gap: 6px; }
+.flex-row-gap-8 { display: flex; align-items: center; gap: 8px; }
+.flex-row-gap-10 { display: flex; align-items: center; gap: 10px; }
+.flex-row-gap-12 { display: flex; align-items: center; gap: 12px; }
+.flex-row-gap-16 { display: flex; align-items: center; gap: 16px; }
+.flex-row-gap-20 { display: flex; align-items: center; gap: 20px; }
+
+.flex-col-gap-4 { display: flex; flex-direction: column; gap: 4px; }
+.flex-col-gap-6 { display: flex; flex-direction: column; gap: 6px; }
+.flex-col-gap-8 { display: flex; flex-direction: column; gap: 8px; }
+.flex-col-gap-10 { display: flex; flex-direction: column; gap: 10px; }
+.flex-col-gap-12 { display: flex; flex-direction: column; gap: 12px; }
+.flex-col-gap-16 { display: flex; flex-direction: column; gap: 16px; }
+
+/* ---------- 3C. Spacing utilities ---------- */
+.px-2 { padding-left: 8px; padding-right: 8px; }
+.px-3 { padding-left: 12px; padding-right: 12px; }
+.px-4 { padding-left: 16px; padding-right: 16px; }
+.py-2 { padding-top: 8px; padding-bottom: 8px; }
+.py-3 { padding-top: 12px; padding-bottom: 12px; }
+.py-4 { padding-top: 16px; padding-bottom: 16px; }
+
+.mx-auto { margin-left: auto; margin-right: auto; }
+.my-0 { margin-top: 0; margin-bottom: 0; }
+
+/* ---------- 3D. Card utilities ---------- */
+.card {
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  padding: 16px;
+  background: var(--color-bgCard);
+}
+
+.card-sm {
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 12px;
+  background: var(--color-bgCard);
+}
+
+.card:hover {
+  background: var(--color-bgHover);
+}
+
+/* ---------- 3E. Button utilities ---------- */
+.btn {
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--color-border);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  transition: all 0.15s;
+  font-family: inherit;
+}
+
+.btn-primary {
+  background: var(--color-accent);
+  color: #fff;
+  border-color: var(--color-accent);
+}
+
+.btn-primary:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.btn-secondary {
+  background: var(--color-bgInput);
+  color: var(--color-text);
+  border-color: var(--color-border);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: var(--color-bgHover);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--color-textMuted);
+  border-color: var(--color-border);
+}
+
+.btn-ghost:hover:not(:disabled) {
+  background: var(--color-bgActive);
+  color: var(--color-text);
+}
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ---------- 3F. Input utilities ---------- */
+.input {
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bgInput);
+  color: var(--color-text);
+  font-size: 13px;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--color-accent);
+}
+
+.input::placeholder {
+  color: var(--color-textMuted);
+}
+
+/* ---------- 3G. Text utilities ---------- */
+.text-xs  { font-size: 11px; }
+.text-sm  { font-size: 12px; }
+.text-base { font-size: 13px; }
+.text-lg { font-size: 14px; }
+.text-xl { font-size: 16px; }
+.text-2xl { font-size: 18px; }
+.text-3xl { font-size: 20px; }
+
+.font-normal { font-weight: 400; }
+.font-semibold { font-weight: 600; }
+.font-bold { font-weight: 700; }
+
+.text-muted { color: var(--color-textMuted); }
+.text-secondary { color: var(--color-textSecondary); }
+.text-accent { color: var(--color-accent); }
+.text-success { color: var(--color-success); }
+.text-error { color: var(--color-error); }
+
+.text-left { text-align: left; }
+.text-center { text-align: center; }
+.text-right { text-align: right; }
+
+/* ---------- 3H. Display & Layout ---------- */
+.block { display: block; }
+.inline-block { display: inline-block; }
+.inline-flex { display: inline-flex; }
+.hidden { display: none; }
+
+.absolute { position: absolute; }
+.fixed { position: fixed; }
+.relative { position: relative; }
+
+.w-full { width: 100%; }
+.w-auto { width: auto; }
+
+.flex-1 { flex: 1; }
+.flex-shrink-0 { flex-shrink: 0; }
+.flex-wrap { flex-wrap: wrap; }
+
+.overflow-hidden { overflow: hidden; }
+.overflow-auto { overflow: auto; }
+.overflow-x-auto { overflow-x: auto; }
+.overflow-y-auto { overflow-y: auto; }
+
+.whitespace-nowrap { white-space: nowrap; }
+.whitespace-pre-wrap { white-space: pre-wrap; }
+
+.cursor-pointer { cursor: pointer; }
+.cursor-not-allowed { cursor: not-allowed; }
+
+.opacity-50 { opacity: 0.5; }
+.opacity-75 { opacity: 0.75; }
+
+.transition-all { transition: all 0.15s; }
+
+/* ---------- 3I. Border radius utilities ---------- */
+.rounded-sm { border-radius: 4px; }
+.rounded-md { border-radius: 8px; }
+.rounded-lg { border-radius: 12px; }
+.rounded-xl { border-radius: 16px; }
+.rounded-full { border-radius: 50%; }
+
+/* ---------- 3J. Margin utilities ---------- */
+.m-0 { margin: 0; }
+.m-auto { margin: auto; }
+.mt-0 { margin-top: 0; }
+.mt-2 { margin-top: 8px; }
+.mt-4 { margin-top: 16px; }
+.mt-6 { margin-top: 24px; }
+.mt-8 { margin-top: 32px; }
+.mb-0 { margin-bottom: 0; }
+.mb-2 { margin-bottom: 8px; }
+.mb-4 { margin-bottom: 16px; }
+.mb-6 { margin-bottom: 24px; }
+.mb-8 { margin-bottom: 32px; }
+.ml-0 { margin-left: 0; }
+.ml-2 { margin-left: 8px; }
+.ml-4 { margin-left: 16px; }
+.mr-0 { margin-right: 0; }
+.mr-2 { margin-right: 8px; }
+.mr-4 { margin-right: 16px; }
+
+/* ---------- 3K. Line-height utilities ---------- */
+.leading-none { line-height: 1; }
+.leading-tight { line-height: 1.25; }
+.leading-normal { line-height: 1.5; }
+.leading-relaxed { line-height: 1.6; }
+.leading-loose { line-height: 1.75; }
+
+/* ---------- 3L. Text decoration utilities ---------- */
+.no-underline { text-decoration: none; }
+.underline { text-decoration: underline; }
+
+/* ---------- 3M. Z-index utilities ---------- */
+.z-0 { z-index: 0; }
+.z-10 { z-index: 10; }
+.z-20 { z-index: 20; }
+.z-50 { z-index: 50; }
+.z-100 { z-index: 100; }
+.z-200 { z-index: 200; }
+
+/* ---------- 3N. Text truncation utilities ---------- */
+.truncate-ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.truncate-multiline {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

@@ -1,0 +1,29 @@
+[package]
+name = "browser-bridge-mcp"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "browser-bridge-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum = { workspace = true, features = ["ws", "macros"] }
+base64.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror = "1"
+tokio = { workspace = true, features = ["full"] }
+tokio-stream.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+rsa = "0.9"
+pkcs1 = { version = "0.7", features = ["pem"] }
+spki = { version = "0.7", features = ["pem"] }

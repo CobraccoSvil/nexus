@@ -1,0 +1,17 @@
+[Unit]
+Description=IDEAI Billing Service (:4040)
+After=network.target postgresql.service nexus-core.service
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/opt/ideai
+EnvironmentFile=/opt/ideai/.env
+ExecStart=/opt/ideai/bin/billing-service
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/ideai/billing.log
+StandardError=append:/var/log/ideai/billing.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+name: reviewer_code_review
+agent_type: reviewer
+intent: code_review
+state:
+  repo_lang: TypeScript
+  repo_summary: "Progetto TypeScript sottoposto a revisione del codice per qualita, sicurezza e conformita agli standard."
+rubric:
+  must_render_without_residual_placeholder: true
+  must_contain_xml_tags:
+    - "<role>"
+    - "<autonomia>"
+    - "<protocollo>"
+    - "<output_format>"
+  must_contain_in_protocol: ["review"]

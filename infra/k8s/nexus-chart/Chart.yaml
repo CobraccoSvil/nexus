@@ -1,0 +1,13 @@
+apiVersion: v2
+name: nexus
+description: Nexus LLM Gateway — stack on-premise con vLLM
+type: application
+version: 0.1.0
+appVersion: "0.0.1"
+keywords:
+  - llm
+  - vllm
+  - ai-gateway
+  - on-premise
+maintainers:
+  - name: nexus-team

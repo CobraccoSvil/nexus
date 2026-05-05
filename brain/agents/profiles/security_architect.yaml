@@ -1,0 +1,15 @@
+name: security_architect
+category: specialized
+prompt_key: agent.specialized.security_architect
+allowed_tools:
+- read_file
+- read_file_lines
+- list_files
+- search_in_files
+- git_status
+- search_codebase_semantic
+- recall_context
+- search_file_semantic
+- scan_code_quality
+- batch_analyze_code
+description: 'Specialista: security architect'

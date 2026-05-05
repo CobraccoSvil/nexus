@@ -1,0 +1,167 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: nexus
+      POSTGRES_PASSWORD: nexus
+      POSTGRES_DB: nexus
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ../sql/init-schemas.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ../sql/rls-policies.sql:/docker-entrypoint-initdb.d/02-rls.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    # GPU NVIDIA richiesta. Per test senza GPU: usa il profilo cpu-test (vllm-cpu sotto).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - "--model"
+      - "${VLLM_MODEL:-Qwen/Qwen2.5-Coder-32B-Instruct}"
+      - "--dtype"
+      - "float16"
+      - "--max-model-len"
+      - "${VLLM_MAX_MODEL_LEN:-32768}"
+      - "--port"
+      - "8000"
+      - "--host"
+      - "0.0.0.0"
+    environment:
+      HUGGING_FACE_HUB_TOKEN: "${HF_TOKEN:-}"
+    ports:
+      - "8000:8000"
+    volumes:
+      - vllm-models:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+
+  # vLLM CPU-only per CI / dev senza GPU
+  vllm-cpu:
+    image: vllm/vllm-openai:latest
+    profiles: ["cpu-test"]
+    command:
+      - "--model"
+      - "${VLLM_CPU_MODEL:-Qwen/Qwen2.5-Coder-7B-Instruct}"
+      - "--device"
+      - "cpu"
+      - "--dtype"
+      - "float32"
+      - "--max-model-len"
+      - "4096"
+      - "--port"
+      - "8001"
+    ports:
+      - "8001:8001"
+    volumes:
+      - vllm-models:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 180s
+
+  presidio:
+    image: mcr.microsoft.com/presidio-analyzer:latest
+    ports:
+      - "5002:5002"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5002/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  presidio-anonymizer:
+    image: mcr.microsoft.com/presidio-anonymizer:latest
+    ports:
+      - "5001:5001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  langfuse-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  langfuse:
+    image: ghcr.io/langfuse/langfuse:latest
+    depends_on:
+      - langfuse-db
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      NEXTAUTH_SECRET: "${LANGFUSE_SECRET:-change-me-in-production}"
+      NEXTAUTH_URL: "http://localhost:3000"
+      SALT: "${LANGFUSE_SALT:-change-me-in-production}"
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector-config.yml"]
+    volumes:
+      - ./otel-collector-config.yml:/etc/otel-collector-config.yml
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    depends_on:
+      - jaeger
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  vllm-models:
+  langfuse-data:
+
+networks:
+  default:
+    name: nexus-onprem

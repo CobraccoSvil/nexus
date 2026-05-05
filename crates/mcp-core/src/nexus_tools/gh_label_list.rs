@@ -1,0 +1,29 @@
+//! `github::gh_label_list` — `gh label list`.
+use super::exec::run_cmd;
+use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
+use async_trait::async_trait;
+use serde_json::{json, Value};
+
+pub struct GhLabelListTool;
+
+#[async_trait]
+impl NexusToolHandler for GhLabelListTool {
+    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+        let out = run_cmd(
+            "gh",
+            &["label", "list", "--json", "name,color,description"],
+            &ctx.project_root,
+            ctx.timeout_secs,
+        )
+        .await?;
+        if !out.success() {
+            return Err(NexusToolError::Exec { exit_code: out.exit_code, stderr: out.stderr });
+        }
+        let parsed: Value = serde_json::from_str(&out.stdout).unwrap_or(json!([]));
+        let count = parsed.as_array().map(|a| a.len()).unwrap_or(0);
+        Ok(json!({"ok": true, "count": count, "labels": parsed}))
+    }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety { read_only: true, can_write_filesystem: false, can_execute_subproc: true, network_egress: true }
+    }
+}

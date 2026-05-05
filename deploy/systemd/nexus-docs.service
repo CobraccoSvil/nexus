@@ -1,0 +1,17 @@
+[Unit]
+Description=IDEAI Document Service (:4030)
+After=network.target postgresql.service nexus-neural.service nexus-core.service
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/opt/ideai
+EnvironmentFile=/opt/ideai/.env
+ExecStart=/opt/ideai/bin/doc-service
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/ideai/docs.log
+StandardError=append:/var/log/ideai/docs.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,30 @@
+[package]
+name = "plugin-service"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "plugin-service"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+dotenvy.workspace = true
+jsonwebtoken.workspace = true
+nexus-auth = { path = "../nexus-auth" }
+nexus-types = { path = "../nexus-types" }
+reqwest.workspace = true
+nexus-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror = "1"
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+urlencoding.workspace = true
+uuid.workspace = true

@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package ai_orchestrator.tool_runner;
+
+// ToolRunner e' la superficie esposta da mcp-core (Rust) verso il brain
+// (Python/LangGraph) per eseguire tool sul filesystem/terminale dell'utente.
+// Il brain orchestra il loop agent; mcp-core e' solo un runner stateless.
+
+message ExecuteToolRequest {
+  // Nome del tool (es: "run_command", "read_file", "list_dir").
+  string tool_name = 1;
+  // Input JSON-encoded (schema per-tool, lo stesso che oggi passa nei
+  // tool_use_blocks di Anthropic).
+  string tool_input_json = 2;
+  // Sessione chat di appartenenza: mcp-core la usa per risolvere cwd,
+  // project_id, env, sandbox.
+  string session_id = 3;
+  // ID del tool_use block generato dal modello. Viene ritornato uguale
+  // cosi' il brain puo' correlare request/response.
+  string tool_use_id = 4;
+  // Correlation ID per logging/tracing (opzionale, generato dal brain).
+  string correlation_id = 5;
+}
+
+message ExecuteToolResponse {
+  // ID del tool_use block (echo della request).
+  string tool_use_id = 1;
+  // Risultato JSON-encoded. In caso di errore, contiene la descrizione.
+  string tool_result_json = 2;
+  // true se l'esecuzione e' fallita. Il brain lo mappa sul campo
+  // is_error del tool_result Anthropic.
+  bool is_error = 3;
+  // Durata totale dell'esecuzione in millisecondi.
+  uint64 duration_ms = 4;
+}
+
+// Chunk di output per tool long-running (run_service, build, ecc.).
+message ToolChunk {
+  string tool_use_id = 1;
+  // "stdout", "stderr", "status", "final".
+  string kind = 2;
+  // Payload del chunk (testo o JSON a seconda di kind).
+  string data = 3;
+  // Timestamp in ms dall'epoch.
+  uint64 ts_ms = 4;
+}
+
+service ToolRunner {
+  // Esecuzione unaria: per tool brevi (read_file, write_file, list_dir,
+  // run_command con timeout, ecc.).
+  rpc ExecuteTool(ExecuteToolRequest) returns (ExecuteToolResponse);
+
+  // Esecuzione streaming: per tool che producono output incrementale
+  // (run_service, build lunghi). L'ultimo chunk ha kind="final" e data
+  // contiene il JSON del risultato aggregato.
+  rpc StreamToolOutput(ExecuteToolRequest) returns (stream ToolChunk);
+}

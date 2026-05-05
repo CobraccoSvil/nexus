@@ -1,0 +1,19 @@
+
+> @ai-orchestrator/web-ide@0.1.0 dev
+> next dev -H 0.0.0.0
+
+   ▲ Next.js 15.5.14
+   - Local:        http://localhost:3000
+   - Network:      http://0.0.0.0:3000
+   - Environments: .env.local
+
+ ✓ Starting...
+ ✓ Ready in 1880ms
+ ✓ Compiled /middleware in 199ms (114 modules)
+ ○ Compiling /login ...
+ ✓ Compiled /login in 2.2s (1043 modules)
+ GET /ide 200 in 2838ms
+ GET /login 200 in 2835ms
+ ○ Compiling / ...
+ ✓ Compiled / in 1940ms (1050 modules)
+ GET / 200 in 2731ms

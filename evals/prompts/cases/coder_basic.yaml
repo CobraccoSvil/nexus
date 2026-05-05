@@ -1,0 +1,20 @@
+# Caso eval smoke: agente coder, task semplice di implementazione.
+name: coder_basic
+agent_type: coder
+intent: code_generation
+state:
+  repo_lang: TypeScript
+  repo_summary: "Monorepo Next.js + Rust. Frontend in apps/web-ide."
+input: |
+  Aggiungi un endpoint GET /api/health a apps/web-ide che ritorni
+  {status:"ok", ts:Date.now()}.
+expected_tools:
+  - search_in_files
+  - list_files
+  - write_file
+expected_artifacts:
+  - "apps/web-ide/app/api/health/route.ts"
+rubric:
+  must_render_without_residual_placeholder: true
+  must_contain_xml_tags: ["<role>", "<autonomia>", "<protocollo>", "<output_format>"]
+  forbidden_strings: ["{{lang_hint}}", "{{type_hint}}", "{{repo_summary}}"]

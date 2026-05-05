@@ -1,0 +1,14 @@
+FROM rust:1.85-bookworm AS builder
+WORKDIR /app
+COPY Cargo.toml Cargo.toml
+COPY crates crates
+RUN cargo build --release -p mcp-core
+
+FROM debian:bookworm-slim
+RUN useradd -ms /bin/bash app
+WORKDIR /app
+COPY --from=builder /app/target/release/mcp-core /usr/local/bin/mcp-core
+USER app
+EXPOSE 4000
+CMD ["mcp-core"]
+

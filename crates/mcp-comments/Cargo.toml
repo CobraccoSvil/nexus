@@ -1,0 +1,10 @@
+[package]
+name = "mcp-comments"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true

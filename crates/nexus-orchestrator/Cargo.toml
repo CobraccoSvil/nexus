@@ -1,0 +1,51 @@
+[package]
+name = "nexus-orchestrator"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Workspace deps
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+chrono.workspace = true
+
+# Local crates
+ruvector = { path = "../ruvector" }
+nexus-types = { path = "../nexus-types" }
+
+# Orchestrator specific
+parking_lot = "0.12"
+dashmap = "5.5"
+async-trait = "0.1"
+rand = "0.8"
+# ONNX Runtime — embeddings semantici (MiniLM-L6-v2, 384d)
+# Feature `onnx`: attiva OnnxMiniLmEmbedder. Disabilitare su CPU senza AVX2.
+# download-binaries: scarica libonnxruntime automaticamente al build
+# Se il modello non è presente al runtime si fa fallback a HashEmbedder.
+ort = { version = "2.0.0-rc.4", features = ["download-binaries"], optional = true }
+
+# Tokenizer BERT (WordPiece) per MiniLM — pura Rust, nessuna lib C
+tokenizers = { version = "0.19", default-features = false, features = ["onig"], optional = true }
+
+# Optional: Consensus protocols (can add later)
+# raft = "0.6"
+
+[features]
+# onnx: abilita OnnxMiniLmEmbedder (all-MiniLM-L6-v2, 384d).
+# Richiede CPU con AVX2 (es. Haswell e successivi) per libonnxruntime.so.
+# Su CPU senza AVX2 (es. Sandy Bridge, Ivy Bridge) disabilitare questo feature.
+# Default: disabilitato (usa HashEmbedder come fallback)
+onnx = ["dep:ort", "dep:tokenizers"]
+
+[dev-dependencies]
+criterion = "0.5"
+tokio-test = "0.4"

@@ -1,0 +1,59 @@
+# Profilo HYBRID — cloud per tier 0-1, vLLM locale per tier 2-3
+profile: hybrid
+
+providers:
+  anthropic:
+    enabled: true
+    timeout_ms: 30000
+  openai:
+    enabled: true
+    timeout_ms: 30000
+  mistral:
+    enabled: true
+    timeout_ms: 30000
+
+vllm:
+  base_url: http://vllm:8000/v1
+  api_key: ""
+  model_name: Qwen/Qwen2.5-Coder-32B-Instruct
+  max_context_tokens: 32768
+
+redaction:
+  enabled: true
+  strict_mode: false
+  presidio_grpc_url: presidio:50051
+
+telemetry:
+  enabled: true
+  otlp_endpoint: http://localhost:4318
+  log_level: info
+  service_name: nexus-llm-gateway
+
+database:
+  url: postgres://nexus:nexus@postgres:5432/nexus
+  pool_size: 20
+
+redis:
+  url: redis://redis:6379
+
+features:
+  allow_cloud_tier2: true
+  allow_cloud_tier3: false
+  dlp_enabled: true
+
+routing:
+  tier_0:
+    primary: anthropic
+    secondary: openai
+    fallback: vllm
+  tier_1:
+    primary: openai
+    secondary: anthropic
+    fallback: vllm
+  tier_2:
+    primary: vllm
+    secondary: anthropic
+    tertiary: openai
+  tier_3:
+    primary: vllm
+    secondary: null

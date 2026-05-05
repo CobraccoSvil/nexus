@@ -1,0 +1,17 @@
+[Unit]
+Description=IDEAI Chat & Agent Service (:4020)
+After=network.target postgresql.service redis.service nexus-core.service
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/opt/ideai
+EnvironmentFile=/opt/ideai/.env
+ExecStart=/opt/ideai/bin/chat-service
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/ideai/chat.log
+StandardError=append:/var/log/ideai/chat.log
+
+[Install]
+WantedBy=multi-user.target

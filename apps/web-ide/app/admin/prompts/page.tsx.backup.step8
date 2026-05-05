@@ -1,0 +1,870 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { useThemeColors } from "../../../lib/theme";
+import {
+  listPromptTemplates,
+  getPromptTemplate,
+  updatePromptTemplate,
+  disablePromptTemplate,
+  enablePromptTemplate,
+  aiSuggestPromptTemplate,
+  getPromptTools,
+  updatePromptTools,
+  getAvailableMcpTools,
+  type PromptTemplate,
+  type PromptTemplateHistory,
+  type PromptMcpTool,
+  type PromptToolsResponse,
+  type AvailableMcpTool,
+  batchAssignAllTools,
+} from "../../../lib/api-client";
+
+export default function PromptsAdminPage() {
+  const tc = useThemeColors();
+  const [templates, setTemplates] = useState<PromptTemplate[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [detail, setDetail] = useState<{ template: PromptTemplate; history: PromptTemplateHistory[] } | null>(null);
+  const [editContent, setEditContent] = useState("");
+  const [changeNote, setChangeNote] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [aiOpen, setAiOpen] = useState(false);
+  const [aiInstruction, setAiInstruction] = useState("");
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiSuggestion, setAiSuggestion] = useState<string | null>(null);
+  const [aiAutoAssigned, setAiAutoAssigned] = useState<number>(0);
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [batchResult, setBatchResult] = useState<{ processed: number; assigned: number; errors: number } | null>(null);
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const [promptTools, setPromptTools] = useState<PromptToolsResponse | null>(null);
+  const [availableTools, setAvailableTools] = useState<AvailableMcpTool[]>([]);
+  const [toolsLoading, setToolsLoading] = useState(false);
+  const [expandedCategories, setExpandedCategories] = useState<Set<string>>(new Set());
+
+  const toggleCategory = (cat: string) => {
+    setExpandedCategories((prev) => {
+      const next = new Set(prev);
+      if (next.has(cat)) next.delete(cat);
+      else next.add(cat);
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    listPromptTemplates()
+      .then((list) => setTemplates(list))
+      .catch((e) => setError(e instanceof Error ? e.message : "Errore caricamento"))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const selectTemplate = async (key: string) => {
+    setSelected(key);
+    setDetail(null);
+    setEditContent("");
+    setAiOpen(false);
+    setAiInstruction("");
+    setAiSuggestion(null);
+    setPromptTools(null);
+    setToolsOpen(false);
+    try {
+      const d = await getPromptTemplate(key);
+      setDetail(d);
+      setEditContent(d.template.content);
+      setChangeNote("");
+      // Load tools
+      setToolsLoading(true);
+      try {
+        const tools = await getPromptTools(key);
+        setPromptTools(tools);
+      } catch {
+        // endpoint non ancora implementato — ignora
+        setPromptTools({ assigned_tools: [], suggested_tools: [], available_tools: [] });
+      } finally {
+        setToolsLoading(false);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Errore caricamento template");
+    }
+  };
+
+  const loadAvailableTools = async () => {
+    if (availableTools.length > 0) return;
+    try {
+      const tools = await getAvailableMcpTools();
+      setAvailableTools(tools);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Errore caricamento tools");
+    }
+  };
+
+  const toggleToolSelection = (tool: PromptMcpTool) => {
+    if (!promptTools) return;
+    const isSelected = promptTools.assigned_tools.some(
+      t => t.tool_name === tool.tool_name && t.tool_server === tool.tool_server
+    );
+    if (isSelected) {
+      setPromptTools({
+        ...promptTools,
+        assigned_tools: promptTools.assigned_tools.filter(
+          t => !(t.tool_name === tool.tool_name && t.tool_server === tool.tool_server)
+        ),
+      });
+    } else {
+      setPromptTools({
+        ...promptTools,
+        assigned_tools: [...promptTools.assigned_tools, tool],
+      });
+    }
+  };
+
+  const saveTools = async () => {
+    if (!selected || !promptTools) return;
+    try {
+      await updatePromptTools(selected, promptTools.assigned_tools);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Errore salvataggio tools");
+    }
+  };
+
+  const runBatchAssign = async () => {
+    setBatchBusy(true);
+    setBatchResult(null);
+    try {
+      const res = await batchAssignAllTools();
+      setBatchResult(res);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Errore batch assign");
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const requestAiSuggestion = async () => {
+    if (!selected || !aiInstruction.trim()) return;
+    setAiBusy(true);
+    setAiSuggestion(null);
+    try {
+      const res = await aiSuggestPromptTemplate(selected, aiInstruction.trim());
+      setAiSuggestion(res.suggestion);
+      if (res.suggested_tools && res.suggested_tools.length > 0) {
+        setPromptTools((prev) => ({
+          assigned_tools: res.suggested_tools!,
+          suggested_tools: prev?.suggested_tools ?? [],
+          available_tools: prev?.available_tools ?? [],
+        }));
+        setAiAutoAssigned(res.suggested_tools.length);
+      } else {
+        setAiAutoAssigned(0);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Errore generazione AI");
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
+  const applyAiSuggestion = () => {
+    if (aiSuggestion) {
+      setEditContent(aiSuggestion);
+      setAiSuggestion(null);
+      setAiInstruction("");
+      setAiOpen(false);
+    }
+  };
+
+  const save = async () => {
+    if (!selected) return;
+    setSaving(true);
+    try {
+      const updated = await updatePromptTemplate(selected, editContent, changeNote || undefined);
+      // Reload detail to get fresh history
+      const d = await getPromptTemplate(selected);
+      setDetail(d);
+      setTemplates((prev) => prev.map((t) => (t.key === selected ? updated : t)));
+      setChangeNote("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Errore salvataggio");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const toggleActive = async (key: string, isActive: boolean) => {
+    try {
+      if (isActive) await disablePromptTemplate(key);
+      else await enablePromptTemplate(key);
+      setTemplates((prev) => prev.map((t) => (t.key === key ? { ...t, is_active: !isActive } : t)));
+      if (selected === key && detail) {
+        setDetail({ ...detail, template: { ...detail.template, is_active: !isActive } });
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Errore toggle");
+    }
+  };
+
+  const categories = Array.from(new Set(templates.map((t) => t.category)));
+  const nexusSuggestion = detail?.history.find(
+    (h) => h.changed_by === "nexus" && new Date(h.changed_at) > new Date(Date.now() - 86400000),
+  );
+  const dirty = detail ? editContent !== detail.template.content : false;
+
+  return (
+    <div>
+      <h1 style={{ fontSize: 20, fontWeight: 600, marginBottom: 6, color: tc.text }}>Prompt Templates</h1>
+      <p style={{ color: tc.textMuted, fontSize: 13, marginBottom: 12 }}>
+        Gestisci i prompt di sistema, le regole di quality scanning e le istruzioni di automazione. Modifiche salvate
+        direttamente su DB con versionamento.
+      </p>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 20 }}>
+        <button
+          onClick={runBatchAssign}
+          disabled={batchBusy}
+          style={{ padding: "7px 14px", background: batchBusy ? tc.bgHover : tc.accent, color: batchBusy ? tc.textMuted : "#fff", border: "none", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: batchBusy ? "default" : "pointer" }}
+        >
+          {batchBusy ? "Analisi in corso..." : "Auto-assegna tool a tutti i template"}
+        </button>
+        {batchResult && (
+          <span style={{ fontSize: 12, color: batchResult.errors > 0 ? tc.error : "#16a34a" }}>
+            &#10003; {batchResult.processed} template analizzati — {batchResult.assigned} con tool assegnati{batchResult.errors > 0 ? `, ${batchResult.errors} errori` : ""}
+          </span>
+        )}
+      </div>
+
+      {error && (
+        <div
+          style={{
+            padding: "10px 14px",
+            borderRadius: 6,
+            background: `${tc.error}14`,
+            border: `1px solid ${tc.error}`,
+            color: tc.error,
+            fontSize: 13,
+            marginBottom: 16,
+          }}
+        >
+          {error}
+          <button
+            onClick={() => setError(null)}
+            style={{
+              float: "right",
+              background: "transparent",
+              border: "none",
+              color: tc.error,
+              cursor: "pointer",
+              fontSize: 14,
+            }}
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "280px 1fr",
+          gap: 16,
+          border: `1px solid ${tc.border}`,
+          borderRadius: 12,
+          background: tc.bgCard,
+          minHeight: 500,
+          overflow: "hidden",
+        }}
+      >
+        {/* Sidebar list */}
+        <div
+          style={{
+            borderRight: `1px solid ${tc.border}`,
+            padding: 12,
+            overflowY: "auto",
+          }}
+        >
+          {loading ? (
+            <div style={{ color: tc.textMuted, fontSize: 13, padding: 12 }}>Caricamento...</div>
+          ) : categories.length === 0 ? (
+            <div style={{ color: tc.textMuted, fontSize: 13, padding: 12 }}>Nessun template</div>
+          ) : (
+            categories.map((cat) => {
+              const isExpanded = expandedCategories.has(cat);
+              return (
+              <div key={cat} style={{ marginBottom: 4 }}>
+                <div
+                  onClick={() => toggleCategory(cat)}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    fontSize: 11,
+                    fontWeight: 600,
+                    color: tc.textMuted,
+                    textTransform: "uppercase",
+                    letterSpacing: 0.5,
+                    marginBottom: isExpanded ? 6 : 0,
+                    padding: "4px 8px",
+                    borderRadius: 4,
+                    cursor: "pointer",
+                    userSelect: "none",
+                  }}
+                  onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = tc.bgHover; }}
+                  onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = "transparent"; }}
+                >
+                  <span>{cat}</span>
+                  <span style={{ fontSize: 10, opacity: 0.7 }}>{isExpanded ? "▾" : "▸"}</span>
+                </div>
+                {isExpanded && templates
+                  .filter((t) => t.category === cat)
+                  .map((t) => {
+                    const isActive = selected === t.key;
+                    return (
+                      <div
+                        key={t.key}
+                        onClick={() => selectTemplate(t.key)}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          padding: "8px 10px",
+                          borderRadius: 6,
+                          cursor: "pointer",
+                          fontSize: 13,
+                          background: isActive ? tc.bgHover : "transparent",
+                          color: t.is_active ? tc.text : tc.textMuted,
+                          textDecoration: t.is_active ? "none" : "line-through",
+                          marginBottom: 2,
+                        }}
+                        onMouseEnter={(e) => {
+                          if (!isActive) (e.currentTarget as HTMLDivElement).style.background = tc.bgHover;
+                        }}
+                        onMouseLeave={(e) => {
+                          if (!isActive) (e.currentTarget as HTMLDivElement).style.background = "transparent";
+                        }}
+                      >
+                        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {t.title}
+                        </span>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleActive(t.key, t.is_active);
+                          }}
+                          title={t.is_active ? "Disabilita regola" : "Abilita regola"}
+                          style={{
+                            background: "transparent",
+                            border: "none",
+                            cursor: "pointer",
+                            fontSize: 14,
+                            color: t.is_active ? "#22c55e" : tc.textMuted,
+                            marginLeft: 8,
+                            padding: 0,
+                          }}
+                        >
+                          {t.is_active ? "●" : "○"}
+                        </button>
+                      </div>
+                    );
+                  })}
+              </div>
+            );
+            })
+          )}
+        </div>
+
+        {/* Editor */}
+        <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 12, minWidth: 0 }}>
+          {!detail ? (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                height: "100%",
+                color: tc.textMuted,
+                fontSize: 13,
+              }}
+            >
+              Seleziona un template dalla lista
+            </div>
+          ) : (
+            <>
+              <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
+                <div style={{ minWidth: 0 }}>
+                  <h3 style={{ fontSize: 16, fontWeight: 600, margin: 0, color: tc.text }}>
+                    {detail.template.title}
+                  </h3>
+                  <div style={{ fontSize: 11, color: tc.textMuted, marginTop: 4 }}>
+                    <code>{detail.template.key}</code> · v{detail.template.version} ·{" "}
+                    {detail.template.updated_by} · {new Date(detail.template.updated_at).toLocaleString("it-IT")}
+                  </div>
+                </div>
+                {!detail.template.is_active && (
+                  <span
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 600,
+                      padding: "3px 8px",
+                      borderRadius: 4,
+                      background: `${tc.error}14`,
+                      color: tc.error,
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    Disabilitata
+                  </span>
+                )}
+              </div>
+
+              {nexusSuggestion && (
+                <div
+                  style={{
+                    border: `1px solid ${tc.accent}`,
+                    background: tc.accentBg,
+                    borderRadius: 6,
+                    padding: 10,
+                    fontSize: 12,
+                  }}
+                >
+                  <div style={{ fontWeight: 600, color: tc.accent, marginBottom: 4 }}>
+                    Nexus suggerisce una modifica
+                  </div>
+                  <div style={{ color: tc.textMuted, marginBottom: 8 }}>{nexusSuggestion.change_note}</div>
+                  <button
+                    onClick={() => setEditContent(nexusSuggestion.content)}
+                    style={{
+                      fontSize: 11,
+                      padding: "4px 10px",
+                      background: tc.accent,
+                      color: "#fff",
+                      border: "none",
+                      borderRadius: 4,
+                      cursor: "pointer",
+                    }}
+                  >
+                    Applica suggerimento
+                  </button>
+                </div>
+              )}
+
+              {detail.template.usage_context && (
+                <details
+                  style={{
+                    fontSize: 12,
+                    border: `1px solid ${tc.border}`,
+                    borderRadius: 6,
+                    padding: "8px 10px",
+                    background: tc.bg,
+                  }}
+                >
+                  <summary style={{ cursor: "pointer", color: tc.textMuted, fontWeight: 600 }}>
+                    Contesto d&apos;uso (dove viene usato questo prompt)
+                  </summary>
+                  <div
+                    style={{
+                      marginTop: 8,
+                      color: tc.text,
+                      fontSize: 12,
+                      lineHeight: 1.5,
+                      whiteSpace: "pre-wrap",
+                    }}
+                  >
+                    {detail.template.usage_context}
+                  </div>
+                </details>
+              )}
+
+              <div style={{ position: "relative", display: "flex", flexDirection: "column" }}>
+                <textarea
+                  value={editContent}
+                  onChange={(e) => setEditContent(e.target.value)}
+                  placeholder="Contenuto del prompt..."
+                  style={{
+                    width: "100%",
+                    minHeight: 480,
+                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                    fontSize: 13,
+                    lineHeight: 1.55,
+                    border: `2px solid ${tc.border}`,
+                    borderRadius: 8,
+                    padding: 14,
+                    background: tc.bg,
+                    color: tc.text,
+                    resize: "both",
+                    overflow: "auto",
+                    boxSizing: "border-box",
+                  }}
+                />
+                <div style={{ fontSize: 10, color: tc.textMuted, marginTop: 4, alignSelf: "flex-end" }}>
+                  Trascina l&apos;angolo in basso a destra per ridimensionare ↘
+                </div>
+              </div>
+
+              {/* AI Assistant panel */}
+              <div
+                style={{
+                  border: `1px solid ${aiOpen ? tc.accent : tc.border}`,
+                  borderRadius: 8,
+                  padding: 12,
+                  background: aiOpen ? `${tc.accent}08` : tc.bg,
+                  transition: "all 0.15s",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: tc.text, display: "flex", alignItems: "center", gap: 6 }}>
+                    <span>✨ Aiuto AI</span>
+                    <span style={{ fontSize: 11, color: tc.textMuted, fontWeight: 400 }}>
+                      Riscrivi il prompt con l&apos;assistenza di un modello (riceve il contesto d&apos;uso pre-inserito)
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => setAiOpen((v) => !v)}
+                    style={{
+                      padding: "4px 12px",
+                      background: aiOpen ? tc.bgHover : tc.accent,
+                      color: aiOpen ? tc.text : "#fff",
+                      border: "none",
+                      borderRadius: 6,
+                      fontSize: 12,
+                      fontWeight: 600,
+                      cursor: "pointer",
+                    }}
+                  >
+                    {aiOpen ? "Chiudi" : "Apri"}
+                  </button>
+                </div>
+
+                {aiOpen && (
+                  <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 10 }}>
+                    <textarea
+                      value={aiInstruction}
+                      onChange={(e) => setAiInstruction(e.target.value)}
+                      placeholder={`Cosa vuoi modificare? Es: "rendilo più conciso", "aggiungi una regola contro l'uso di console.log", "traduci in inglese", "aggiungi gestione async/await"...`}
+                      style={{
+                        width: "100%",
+                        minHeight: 80,
+                        fontSize: 12,
+                        fontFamily: "inherit",
+                        lineHeight: 1.5,
+                        border: `1px solid ${tc.border}`,
+                        borderRadius: 6,
+                        padding: 10,
+                        background: tc.bg,
+                        color: tc.text,
+                        resize: "vertical",
+                        boxSizing: "border-box",
+                      }}
+                    />
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button
+                        onClick={requestAiSuggestion}
+                        disabled={aiBusy || !aiInstruction.trim()}
+                        style={{
+                          padding: "6px 14px",
+                          background: !aiBusy && aiInstruction.trim() ? tc.accent : tc.bgHover,
+                          color: !aiBusy && aiInstruction.trim() ? "#fff" : tc.textMuted,
+                          border: "none",
+                          borderRadius: 6,
+                          fontSize: 12,
+                          fontWeight: 600,
+                          cursor: !aiBusy && aiInstruction.trim() ? "pointer" : "default",
+                        }}
+                      >
+                        {aiBusy ? "Generando..." : "Genera suggerimento"}
+                      </button>
+                      {aiSuggestion && (
+                        <button
+                          onClick={applyAiSuggestion}
+                          style={{
+                            padding: "6px 14px",
+                            background: "#22c55e",
+                            color: "#fff",
+                            border: "none",
+                            borderRadius: 6,
+                            fontSize: 12,
+                            fontWeight: 600,
+                            cursor: "pointer",
+                          }}
+                        >
+                          Sostituisci nel prompt
+                        </button>
+                      )}
+                    </div>
+                    {aiSuggestion && (
+                      <div
+                        style={{
+                          border: `1px solid ${tc.border}`,
+                          borderRadius: 6,
+                          padding: 10,
+                          background: tc.bgCard,
+                          maxHeight: 320,
+                          overflow: "auto",
+                          fontSize: 12,
+                          fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                          lineHeight: 1.5,
+                          color: tc.text,
+                          whiteSpace: "pre-wrap",
+                        }}
+                      >
+                        {aiSuggestion}
+                      </div>
+                    )}
+                    {aiAutoAssigned > 0 && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 10px", background: "#22c55e18", border: "1px solid #22c55e44", borderRadius: 6, fontSize: 11, color: "#16a34a" }}>
+                        <span>&#10003;</span>
+                        <span><strong>{aiAutoAssigned} tool MCP</strong> assegnati automaticamente a questo template</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* MCP Tools Section */}
+              <div
+                style={{
+                  border: `1px solid ${toolsOpen ? tc.accent : tc.border}`,
+                  borderRadius: 8,
+                  padding: 12,
+                  background: toolsOpen ? `${tc.accent}08` : tc.bg,
+                  transition: "all 0.15s",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: tc.text, display: "flex", alignItems: "center", gap: 6 }}>
+                    <span>🔧 MCP Tools</span>
+                    {promptTools && promptTools.assigned_tools.length > 0 && (
+                      <span style={{ fontSize: 11, color: tc.accent, fontWeight: 600, background: `${tc.accent}20`, padding: "2px 6px", borderRadius: 3 }}>
+                        {promptTools.assigned_tools.length}
+                      </span>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => {
+                      setToolsOpen(!toolsOpen);
+                      if (!toolsOpen) loadAvailableTools();
+                    }}
+                    style={{
+                      padding: "4px 12px",
+                      background: toolsOpen ? tc.bgHover : tc.accent,
+                      color: toolsOpen ? tc.text : "#fff",
+                      border: "none",
+                      borderRadius: 6,
+                      fontSize: 12,
+                      fontWeight: 600,
+                      cursor: "pointer",
+                    }}
+                  >
+                    {toolsOpen ? "Chiudi" : "Configura"}
+                  </button>
+                </div>
+
+                {toolsOpen && promptTools && (
+                  <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 10 }}>
+                    <div>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: tc.text, marginBottom: 8 }}>
+                        Tool assegnati ({promptTools.assigned_tools.length})
+                      </div>
+                      {promptTools.assigned_tools.length === 0 ? (
+                        <div style={{ fontSize: 12, color: tc.textMuted, padding: "8px 10px", background: tc.bg, borderRadius: 4 }}>
+                          Nessun tool assegnato. Selezionane uno dalla lista disponibile
+                        </div>
+                      ) : (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                          {promptTools.assigned_tools.map((tool, idx) => (
+                            <div
+                              key={idx}
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "space-between",
+                                padding: "8px 10px",
+                                background: tc.bgCard,
+                                borderRadius: 4,
+                                border: `1px solid ${tc.border}`,
+                              }}
+                            >
+                              <div>
+                                <div style={{ fontSize: 12, fontWeight: 600, color: tc.text }}>
+                                  {tool.tool_name}
+                                </div>
+                                <div style={{ fontSize: 11, color: tc.textMuted }}>
+                                  {tool.tool_server}
+                                </div>
+                              </div>
+                              <button
+                                onClick={() => toggleToolSelection(tool)}
+                                style={{
+                                  background: tc.error,
+                                  color: "#fff",
+                                  border: "none",
+                                  borderRadius: 4,
+                                  padding: "4px 8px",
+                                  fontSize: 11,
+                                  cursor: "pointer",
+                                }}
+                              >
+                                Rimuovi
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    <details style={{ fontSize: 12 }}>
+                      <summary style={{ cursor: "pointer", color: tc.textMuted, fontWeight: 600, marginBottom: 8 }}>
+                        Tool disponibili ({availableTools.length})
+                      </summary>
+                      {toolsLoading ? (
+                        <div style={{ color: tc.textMuted, padding: "8px 10px" }}>Caricamento tools...</div>
+                      ) : availableTools.length === 0 ? (
+                        <div style={{ color: tc.textMuted, padding: "8px 10px" }}>Nessun MCP tool installato</div>
+                      ) : (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 8, maxHeight: 300, overflowY: "auto" }}>
+                          {availableTools.map((tool, idx) => {
+                            const isSelected = promptTools.assigned_tools.some(
+                              t => t.tool_name === tool.name && t.tool_server === tool.server
+                            );
+                            return (
+                              <button
+                                key={idx}
+                                onClick={() => toggleToolSelection({ tool_name: tool.name, tool_server: tool.server, usage_context: tool.description })}
+                                style={{
+                                  padding: "8px 10px",
+                                  background: isSelected ? tc.accent : tc.bg,
+                                  color: isSelected ? "#fff" : tc.text,
+                                  border: `1px solid ${isSelected ? tc.accent : tc.border}`,
+                                  borderRadius: 4,
+                                  fontSize: 12,
+                                  cursor: "pointer",
+                                  textAlign: "left",
+                                  transition: "all 0.15s",
+                                }}
+                                onMouseEnter={(e) => {
+                                  if (!isSelected) (e.currentTarget as HTMLButtonElement).style.background = tc.bgHover;
+                                }}
+                                onMouseLeave={(e) => {
+                                  if (!isSelected) (e.currentTarget as HTMLButtonElement).style.background = tc.bg;
+                                }}
+                              >
+                                <div style={{ fontSize: 12, fontWeight: 600 }}>
+                                  {tool.name} {isSelected && "✓"}
+                                </div>
+                                <div style={{ fontSize: 11, color: isSelected ? "#fff7" : tc.textMuted }}>
+                                  {tool.server}
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </details>
+
+                    <button
+                      onClick={saveTools}
+                      style={{
+                        padding: "6px 12px",
+                        background: tc.accent,
+                        color: "#fff",
+                        border: "none",
+                        borderRadius: 6,
+                        fontSize: 12,
+                        fontWeight: 600,
+                        cursor: "pointer",
+                      }}
+                    >
+                      Salva Tools
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              <div style={{ display: "flex", gap: 8, alignItems: "stretch" }}>
+                <textarea
+                  value={changeNote}
+                  onChange={(e) => setChangeNote(e.target.value)}
+                  placeholder="Nota modifica (opzionale)"
+                  rows={2}
+                  style={{
+                    flex: 1,
+                    fontSize: 12,
+                    padding: "8px 10px",
+                    border: `1px solid ${tc.border}`,
+                    borderRadius: 6,
+                    background: tc.bg,
+                    color: tc.text,
+                    resize: "vertical",
+                    fontFamily: "inherit",
+                    boxSizing: "border-box",
+                  }}
+                />
+                <button
+                  onClick={save}
+                  disabled={saving || !dirty}
+                  style={{
+                    padding: "8px 20px",
+                    background: dirty && !saving ? tc.accent : tc.bgHover,
+                    color: dirty && !saving ? "#fff" : tc.textMuted,
+                    border: "none",
+                    borderRadius: 6,
+                    fontSize: 13,
+                    fontWeight: 600,
+                    cursor: dirty && !saving ? "pointer" : "default",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {saving ? "Salvataggio..." : "Salva"}
+                </button>
+              </div>
+
+              {detail.history.length > 0 && (
+                <details style={{ fontSize: 12 }}>
+                  <summary style={{ cursor: "pointer", color: tc.textMuted }}>
+                    Storico versioni ({detail.history.length})
+                  </summary>
+                  <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4, maxHeight: 200, overflowY: "auto" }}>
+                    {detail.history.map((h) => (
+                      <div
+                        key={h.id}
+                        style={{
+                          display: "flex",
+                          gap: 8,
+                          padding: "6px 8px",
+                          border: `1px solid ${tc.border}`,
+                          borderRadius: 4,
+                          fontSize: 11,
+                          alignItems: "center",
+                        }}
+                      >
+                        <span style={{ color: tc.textMuted, fontWeight: 600 }}>v{h.version}</span>
+                        <span
+                          style={{
+                            color:
+                              h.changed_by === "nexus"
+                                ? tc.accent
+                                : h.changed_by === "user"
+                                  ? "#16a34a"
+                                  : tc.textMuted,
+                            fontWeight: 600,
+                          }}
+                        >
+                          {h.changed_by}
+                        </span>
+                        <span style={{ color: tc.textMuted }}>
+                          {new Date(h.changed_at).toLocaleString("it-IT")}
+                        </span>
+                        {h.change_note && (
+                          <span style={{ color: tc.textMuted, fontStyle: "italic" }}>{h.change_note}</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,18 @@
+# Caso eval smoke: agente tester, generazione test unitari.
+name: tester_unit_basic
+agent_type: tester
+intent: test_generation
+state:
+  repo_lang: Rust
+  repo_summary: "Workspace Rust con crate mcp-core; usa tokio per async."
+input: |
+  Scrivi test unitari per la funzione parse_retry_after in retry.rs.
+  Coprire: input numerico, HTTP-date, vuoto, invalido.
+expected_tools:
+  - read_file
+  - write_file
+  - run_tests
+rubric:
+  must_render_without_residual_placeholder: true
+  must_contain_xml_tags: ["<role>", "<autonomia>", "<protocollo>", "<output_format>"]
+  forbidden_strings: ["{{lang_hint}}", "{{type_hint}}", "{{repo_summary}}"]

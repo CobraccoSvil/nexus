@@ -1,0 +1,17 @@
+[Unit]
+Description=IDEAI Plugin & MCP Connector Service (:4050)
+After=network.target postgresql.service nexus-core.service
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/opt/ideai
+EnvironmentFile=/opt/ideai/.env
+ExecStart=/opt/ideai/bin/plugin-service
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/ideai/plugins.log
+StandardError=append:/var/log/ideai/plugins.log
+
+[Install]
+WantedBy=multi-user.target

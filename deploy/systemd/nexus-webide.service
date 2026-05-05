@@ -1,0 +1,18 @@
+[Unit]
+Description=IDEAI Web IDE — Next.js (:3000)
+After=network.target nexus-core.service
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/opt/ideai/apps/web-ide
+EnvironmentFile=/opt/ideai/.env
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/ideai/webide.log
+StandardError=append:/var/log/ideai/webide.log
+
+[Install]
+WantedBy=multi-user.target

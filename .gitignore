@@ -1,0 +1,37 @@
+node_modules/
+.next/
+dist/
+build/
+.turbo/
+.venv/
+__pycache__/
+*.pyc
+target/
+coverage/
+.DS_Store
+.env
+.env.*
+!.env.example
+!.env.local.example
+!.env.phase0.example
+.idea/
+.vscode/
+tmp/
+artifacts/
+*.png
+*.jpg
+*.jpeg
+.claude/scheduled_tasks.lock
+stupefied-*/
+
+# File/backup locali accidentali
+.git.bak
+*.bak
+1
+
+# Progetti utente gestiti da Nexus.
+# Questa cartella contiene i repository clonati dagli utenti tramite Nexus
+# (es. /home/administrator/ideai/projects/redemptor). Sono progetti separati
+# con il loro proprio remote git: NON vanno tracciati nel repo Nexus.
+projects/
+

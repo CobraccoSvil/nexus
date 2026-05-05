@@ -1,0 +1,548 @@
+use axum::{
+    extract::{Extension, Path, Query, State},
+    Json,
+};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sqlx::{PgPool, Row};
+use uuid::Uuid;
+
+use crate::{
+    auth::Claims,
+    chat_learning::{api_error, ensure_project_access, parse_project_id, parse_user_id, ApiError, ApiResult},
+    AppState,
+};
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatSessionsQuery {
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateChatSessionRequest {
+    pub project_id: String,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionContext {
+    pub session_id: Uuid,
+    pub project_id: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionSummary {
+    id: String,
+    project_id: String,
+    title: String,
+    status: String,
+    message_count: i64,
+    last_message_at: Option<String>,
+    last_message_preview: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+pub(crate) async fn load_session_context(
+    db: &PgPool,
+    session_id: Uuid,
+    user_id: Uuid,
+) -> Result<SessionContext, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, project_id, user_id
+        FROM chat_sessions
+        WHERE id = $1
+        "#,
+    )
+    .bind(session_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let Some(row) = row else {
+        return Err(api_error(
+            axum::http::StatusCode::NOT_FOUND,
+            "Sessione chat non trovata",
+        ));
+    };
+
+    let owner: Option<Uuid> = row.try_get("user_id").unwrap_or(None);
+    if owner != Some(user_id) {
+        return Err(api_error(
+            axum::http::StatusCode::FORBIDDEN,
+            "Sessione chat non accessibile",
+        ));
+    }
+
+    let project_id: Uuid = row
+        .try_get("project_id")
+        .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    ensure_project_access(db, user_id, project_id).await?;
+
+    Ok(SessionContext {
+        session_id,
+        project_id,
+    })
+}
+
+pub(crate) async fn update_user_active_project(db: &PgPool, user_id: Uuid, project_id: Uuid) {
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO project_open_sessions (
+            id, user_id, project_id, last_opened_at, created_at, updated_at
+        )
+        VALUES (gen_random_uuid(), $1, $2, NOW(), NOW(), NOW())
+        ON CONFLICT (user_id, project_id)
+        DO UPDATE SET last_opened_at = NOW(), updated_at = NOW()
+        "#,
+    )
+    .bind(user_id)
+    .bind(project_id)
+    .execute(db)
+    .await;
+}
+
+pub async fn list_chat_sessions(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Query(query): Query<ChatSessionsQuery>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id_raw = query
+        .project_id
+        .as_deref()
+        .ok_or_else(|| api_error(axum::http::StatusCode::BAD_REQUEST, "projectId e' obbligatorio"))?;
+    let project_id = parse_project_id(project_id_raw)?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            s.id,
+            s.project_id,
+            s.title,
+            s.status,
+            s.created_at,
+            s.updated_at,
+            (
+                SELECT COUNT(*)
+                FROM chat_messages m
+                WHERE m.session_id = s.id
+                  AND m.deleted_at IS NULL
+            ) AS message_count,
+            (
+                SELECT m.created_at
+                FROM chat_messages m
+                WHERE m.session_id = s.id
+                  AND m.deleted_at IS NULL
+                ORDER BY m.created_at DESC
+                LIMIT 1
+            ) AS last_message_at,
+            (
+                SELECT LEFT(m.content, 180)
+                FROM chat_messages m
+                WHERE m.session_id = s.id
+                  AND m.deleted_at IS NULL
+                ORDER BY m.created_at DESC
+                LIMIT 1
+            ) AS last_message_preview
+        FROM chat_sessions s
+        WHERE s.project_id = $1
+          AND s.user_id = $2
+        ORDER BY COALESCE(
+            (
+                SELECT m.created_at
+                FROM chat_messages m
+                WHERE m.session_id = s.id
+                ORDER BY m.created_at DESC
+                LIMIT 1
+            ),
+            s.updated_at
+        ) DESC
+        LIMIT 50
+        "#,
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let sessions = rows
+        .iter()
+        .filter_map(|row| {
+            let id: Uuid = row.try_get("id").ok()?;
+            let project_id: Uuid = row.try_get("project_id").ok()?;
+            let title: String = row.try_get("title").ok()?;
+            let status: String = row.try_get("status").ok()?;
+            let message_count: i64 = row.try_get("message_count").ok()?;
+            let last_message_at: Option<DateTime<Utc>> = row.try_get("last_message_at").ok()?;
+            let last_message_preview: Option<String> = row.try_get("last_message_preview").ok()?;
+            let created_at: DateTime<Utc> = row.try_get("created_at").ok()?;
+            let updated_at: DateTime<Utc> = row.try_get("updated_at").ok()?;
+            Some(SessionSummary {
+                id: id.to_string(),
+                project_id: project_id.to_string(),
+                title,
+                status,
+                message_count,
+                last_message_at: last_message_at.map(|value| value.to_rfc3339()),
+                last_message_preview,
+                created_at: created_at.to_rfc3339(),
+                updated_at: updated_at.to_rfc3339(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(json!({ "sessions": sessions })))
+}
+
+pub async fn create_chat_session(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<CreateChatSessionRequest>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = parse_project_id(&body.project_id)?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    let session_id = Uuid::new_v4();
+    let title = body
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "Nuova sessione".to_string());
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat_sessions (id, project_id, user_id, title, status, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, 'active', NOW(), NOW())
+        "#,
+    )
+    .bind(session_id)
+    .bind(project_id)
+    .bind(user_id)
+    .bind(&title)
+    .execute(&state.db)
+    .await
+    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    update_user_active_project(&state.db, user_id, project_id).await;
+
+    Ok(Json(json!({
+        "session": {
+            "id": session_id.to_string(),
+            "projectId": project_id.to_string(),
+            "title": title,
+            "status": "active",
+        }
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameChatSessionRequest {
+    pub title: String,
+}
+
+pub async fn rename_chat_session(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(session_id_str): Path<String>,
+    Json(body): Json<RenameChatSessionRequest>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let session_id = Uuid::parse_str(&session_id_str)
+        .map_err(|_| api_error(axum::http::StatusCode::BAD_REQUEST, "session id non valido"))?;
+
+    let ctx = load_session_context(&state.db, session_id, user_id).await?;
+
+    let title = body.title.trim().to_string();
+    if title.is_empty() {
+        return Err(api_error(axum::http::StatusCode::BAD_REQUEST, "Il titolo non puo' essere vuoto"));
+    }
+
+    sqlx::query(
+        "UPDATE chat_sessions SET title = $1, updated_at = NOW() WHERE id = $2",
+    )
+    .bind(&title)
+    .bind(ctx.session_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({ "ok": true, "title": title })))
+}
+
+pub async fn delete_chat_session(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(session_id_str): Path<String>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let session_id = Uuid::parse_str(&session_id_str)
+        .map_err(|_| api_error(axum::http::StatusCode::BAD_REQUEST, "session id non valido"))?;
+
+    let ctx = load_session_context(&state.db, session_id, user_id).await?;
+
+    // Soft-delete messages
+    sqlx::query(
+        "UPDATE chat_messages SET deleted_at = NOW() WHERE session_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(ctx.session_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Hard-delete session
+    sqlx::query("DELETE FROM chat_sessions WHERE id = $1")
+        .bind(ctx.session_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn compact_chat_session(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(session_id_str): Path<String>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let session_id = Uuid::parse_str(&session_id_str)
+        .map_err(|_| api_error(axum::http::StatusCode::BAD_REQUEST, "session id non valido"))?;
+
+    let ctx = load_session_context(&state.db, session_id, user_id).await?;
+
+    // Guard: already compacted?
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM chat_sessions WHERE id = $1"
+    )
+    .bind(ctx.session_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if status == "compacted" {
+        return Err(api_error(axum::http::StatusCode::CONFLICT, "Sessione gia' compattata in memoria"));
+    }
+
+    // Load non-deleted messages
+    let rows = sqlx::query(
+        r#"
+        SELECT role, content FROM chat_messages
+        WHERE session_id = $1 AND deleted_at IS NULL
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(ctx.session_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if rows.is_empty() {
+        return Err(api_error(axum::http::StatusCode::UNPROCESSABLE_ENTITY, "Nessun messaggio da compattare"));
+    }
+
+    // Build messages JSON for summarization
+    let mut msgs: Vec<serde_json::Value> = rows
+        .iter()
+        .filter_map(|row| {
+            let role: String = row.try_get("role").ok()?;
+            let content: String = row.try_get("content").ok()?;
+            Some(json!({ "role": role, "content": content }))
+        })
+        .collect();
+
+    // Append summarization instruction
+    msgs.push(json!({
+        "role": "user",
+        "content": "Riassumi questa conversazione estraendo: le decisioni chiave prese, i cambiamenti al codice effettuati, i contesti e le conoscenze apprese utili per il progetto. Sii conciso e strutturato con bullet points."
+    }));
+
+    let messages_json = serde_json::to_string(&msgs)
+        .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Call Neural Core for summary (empty provider/model → uses defaults)
+    let summary_resp = state
+        .orchestrator
+        .neural
+        .generate_agent_turn("", "", &messages_json, "[]", 1500, "")
+        .await
+        .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Neural Core error: {e}")))?;
+
+    // Extract text from response (try multiple possible keys)
+    let summary_text = summary_resp
+        .get("content")
+        .and_then(|v| v.as_str())
+        .or_else(|| summary_resp.get("text").and_then(|v| v.as_str()))
+        .or_else(|| summary_resp.get("message").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if summary_text.is_empty() {
+        return Err(api_error(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Il modello non ha restituito un riassunto valido",
+        ));
+    }
+
+    // Embed the summary — guard: se dipendenze vettoriali down, skip (non bloccante)
+    let qdrant_ok = state.dependency_status.qdrant.load(std::sync::atomic::Ordering::Relaxed);
+    let embedder_ok = state.dependency_status.embedder.load(std::sync::atomic::Ordering::Relaxed);
+    let point_id = Uuid::new_v4().to_string();
+    if !qdrant_ok || !embedder_ok {
+        tracing::info!(
+            "chat_sessions: skip embed summary (qdrant={}, embedder={})",
+            qdrant_ok, embedder_ok
+        );
+    } else {
+        let vector = state
+            .orchestrator
+            .embed_text(&summary_text)
+            .await
+            .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Embedding error: {e}")))?;
+
+        // Store in Qdrant via vector_memory
+        let payload = json!({
+            "project_id": ctx.project_id.to_string(),
+            "session_id": ctx.session_id.to_string(),
+            "type": "session_memory",
+            "active": false,   // inactive until user activates
+            "text": summary_text,
+        });
+        crate::vector_memory::upsert_prompt_correction_point(
+            &state.db,
+            &point_id,
+            &vector,
+            payload,
+        )
+        .await
+        .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    // Persist to prompt_corrections table
+    let correction_id = Uuid::new_v4();
+    sqlx::query(r#"
+        INSERT INTO prompt_corrections
+            (id, project_id, session_id, intent, correction_text,
+             normalized_hint_hash, qdrant_point_id, active, status, type)
+        VALUES ($1, $2, $3, 'session_memory', $4, $5, $6, false, 'saved', 'session_memory')
+    "#)
+    .bind(correction_id)
+    .bind(ctx.project_id)
+    .bind(ctx.session_id)
+    .bind(&summary_text)
+    .bind(format!("session:{}", ctx.session_id))
+    .bind(&point_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Mark session as compacted
+    sqlx::query(
+        "UPDATE chat_sessions SET status = 'compacted', updated_at = NOW() WHERE id = $1"
+    )
+    .bind(ctx.session_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "summary": summary_text,
+        "pointId": point_id,
+    })))
+}
+
+pub async fn list_project_memories(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(project_id_str): Path<String>,
+) -> ApiResult {
+    let _user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&project_id_str)
+        .map_err(|_| api_error(axum::http::StatusCode::BAD_REQUEST, "project id non valido"))?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            pc.id, pc.session_id, pc.correction_text, pc.active, pc.created_at,
+            cs.title as session_title
+        FROM prompt_corrections pc
+        LEFT JOIN chat_sessions cs ON cs.id = pc.session_id
+        WHERE pc.project_id = $1 AND pc.type = 'session_memory'
+          AND pc.deleted_at IS NULL
+        ORDER BY pc.created_at DESC
+        "#,
+    )
+    .bind(project_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let memories: Vec<serde_json::Value> = rows.iter().map(|row| {
+        let id: Uuid = row.try_get("id").unwrap_or_default();
+        let session_id: Option<Uuid> = row.try_get("session_id").ok().flatten();
+        let text: String = row.try_get("correction_text").unwrap_or_default();
+        let active: bool = row.try_get("active").unwrap_or(false);
+        let created_at: DateTime<Utc> = row.try_get("created_at").unwrap_or_default();
+        let session_title: Option<String> = row.try_get("session_title").ok().flatten();
+        json!({
+            "id": id,
+            "sessionId": session_id,
+            "sessionTitle": session_title.unwrap_or_else(|| "Sessione rimossa".to_string()),
+            "summary": text,
+            "active": active,
+            "createdAt": created_at,
+        })
+    }).collect();
+
+    Ok(Json(json!({ "memories": memories })))
+}
+
+pub async fn toggle_project_memory(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(memory_id_str): Path<String>,
+) -> ApiResult {
+    let _user_id = parse_user_id(&claims)?;
+    let memory_id = Uuid::parse_str(&memory_id_str)
+        .map_err(|_| api_error(axum::http::StatusCode::BAD_REQUEST, "memory id non valido"))?;
+
+    // Flip the active flag
+    let new_active: bool = sqlx::query_scalar(
+        "UPDATE prompt_corrections SET active = NOT active, updated_at = NOW()
+         WHERE id = $1 AND type = 'session_memory'
+         RETURNING active"
+    )
+    .bind(memory_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Sync to Qdrant: retrieve point_id, then update payload
+    let qdrant_point_id: String = sqlx::query_scalar(
+        "SELECT qdrant_point_id FROM prompt_corrections WHERE id = $1"
+    )
+    .bind(memory_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or_default();
+
+    if !qdrant_point_id.is_empty() {
+        // Best-effort Qdrant payload update — ignore errors (DB is source of truth)
+        let _ = crate::vector_memory::set_point_active(&state.db, &qdrant_point_id, new_active).await;
+    }
+
+    Ok(Json(json!({ "ok": true, "active": new_active })))
+}

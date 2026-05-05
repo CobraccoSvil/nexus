@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package ai_orchestrator.mcp;
+
+message FileRef {
+  string project_id = 1;
+  string path = 2;
+  string branch = 3;
+}
+
+message AnalyzeFileRequest {
+  FileRef file = 1;
+  bool include_related_context = 2;
+}
+
+message AnalyzeWorkspaceRequest {
+  string project_id = 1;
+  repeated string paths = 2;
+}
+
+message ParseAiCommentsRequest {
+  FileRef file = 1;
+  string source = 2;
+}
+
+message StripAiCommentsRequest {
+  FileRef file = 1;
+  string source = 2;
+  string mode = 3;
+}
+
+message OptimizeContextRequest {
+  string project_id = 1;
+  string prompt = 2;
+  repeated string block_ids = 3;
+  uint32 token_budget = 4;
+}
+
+message SemanticSearchRequest {
+  string project_id = 1;
+  string query = 2;
+  uint32 limit = 3;
+}
+
+message GenerateFixRequest {
+  string finding_id = 1;
+  string project_id = 2;
+  string strategy = 3;
+}
+
+message ApplyChangePreviewRequest {
+  string project_id = 1;
+  string patch = 2;
+}
+
+message RunValidationRequest {
+  string project_id = 1;
+  repeated string scopes = 2;
+}
+
+message RunShadowDbValidationRequest {
+  string project_id = 1;
+  string migration_ref = 2;
+}
+
+message ChangeReportRequest {
+  string change_id = 1;
+}
+
+message ChatTurnRequest {
+  string session_id = 1;
+  string project_id = 2;
+  string profile_id = 3;
+  string message = 4;
+  repeated string active_file_paths = 5;
+}
+
+message MetricsSnapshotRequest {
+  string project_id = 1;
+}
+
+message DashboardDataRequest {
+  string project_id = 1;
+  string period = 2;
+}
+
+message OperationStatus {
+  bool ok = 1;
+  string message = 2;
+}
+
+message JsonPayload {
+  string json = 1;
+}
+
+service McpService {
+  rpc AnalyzeFile(AnalyzeFileRequest) returns (JsonPayload);
+  rpc AnalyzeWorkspace(AnalyzeWorkspaceRequest) returns (JsonPayload);
+  rpc ParseAiComments(ParseAiCommentsRequest) returns (JsonPayload);
+  rpc StripAiComments(StripAiCommentsRequest) returns (JsonPayload);
+  rpc OptimizeContext(OptimizeContextRequest) returns (JsonPayload);
+  rpc SemanticSearch(SemanticSearchRequest) returns (JsonPayload);
+  rpc GenerateFix(GenerateFixRequest) returns (JsonPayload);
+  rpc ApplyChangePreview(ApplyChangePreviewRequest) returns (JsonPayload);
+  rpc RunValidation(RunValidationRequest) returns (JsonPayload);
+  rpc RunShadowDbValidation(RunShadowDbValidationRequest) returns (JsonPayload);
+  rpc GetChangeReport(ChangeReportRequest) returns (JsonPayload);
+  rpc StartChat(ChatTurnRequest) returns (JsonPayload);
+  rpc SendChatTurn(ChatTurnRequest) returns (JsonPayload);
+  rpc StreamChat(ChatTurnRequest) returns (stream JsonPayload);
+  rpc GetChatHistory(ChatTurnRequest) returns (JsonPayload);
+  rpc GetMetricsSnapshot(MetricsSnapshotRequest) returns (JsonPayload);
+  rpc GetDashboardData(DashboardDataRequest) returns (JsonPayload);
+}
+

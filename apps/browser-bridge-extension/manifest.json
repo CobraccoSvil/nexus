@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "IDEAI Browser Bridge",
+  "version": "0.1.0",
+  "description": "Bridge fra Nexus (browser-bridge-mcp) e il browser dell'utente. Espone console, network e DOM via Chrome DevTools Protocol.",
+  "permissions": ["debugger", "tabs", "storage", "activeTab", "scripting"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "IDEAI Browser Bridge",
+    "default_popup": "popup.html"
+  },
+  "minimum_chrome_version": "116"
+}

@@ -1,0 +1,64 @@
+[package]
+name = "mcp-core"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+dotenvy.workspace = true
+redis.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+jsonwebtoken.workspace = true
+reqwest.workspace = true
+nexus-http.workspace = true
+sha2.workspace = true
+rand.workspace = true
+urlencoding.workspace = true
+base64.workspace = true
+mcp-token = { path = "../mcp-token" }
+mcp-ast = { path = "../mcp-ast" }
+mcp-quality = { path = "../mcp-quality" }
+mcp-db = { path = "../mcp-db" }
+mcp-comments = { path = "../mcp-comments" }
+mcp-learning = { path = "../mcp-learning" }
+mcp-proto = { path = "../mcp-proto" }
+nexus-auth = { path = "../nexus-auth" }
+nexus-types = { path = "../nexus-types" }
+nexus-orchestrator = { path = "../nexus-orchestrator" }
+ruvector = { path = "../ruvector" }
+dashmap.workspace = true
+futures.workspace = true
+regex.workspace = true
+tokio-stream.workspace = true
+thiserror = "1.0"
+async-trait = "0.1"
+once_cell = "1.20"
+tiberius = { version = "0.12", features = ["rustls", "tds73"], default-features = false }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# onnx: abilita OnnxMiniLmEmbedder (384-dim) in nexus-orchestrator per semantic tool search
+# Richiede CPU con AVX2 per libonnxruntime (Haswell e successivi)
+# Default: disabilitato (fallback a HashEmbedder)
+onnx = ["nexus-orchestrator/onnx"]
+
+# libc: usata in sandbox.rs::build_sandboxed_command per leggere uid/gid
+# del processo host (cosi' i container Docker non scrivono file root-owned
+# sui volumi bind-mount, evitando il bug "delete_project lascia dir orfana").
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

@@ -1,0 +1,97 @@
+{
+  "name": "ai-orchestrator",
+  "displayName": "AI-Orchestrator v2",
+  "description": "AI-assisted development with multi-model orchestration, code quality analysis, and knowledge extraction",
+  "version": "0.2.0",
+  "publisher": "cobracco",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Programming Languages", "Machine Learning", "Linters"],
+  "activationEvents": [
+    "onLanguage:typescript",
+    "onLanguage:javascript",
+    "onLanguage:rust",
+    "onLanguage:python"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ai-orchestrator.chat",
+        "title": "AI Chat",
+        "category": "AI Orchestrator"
+      },
+      {
+        "command": "ai-orchestrator.analyzeFile",
+        "title": "Analyze Current File",
+        "category": "AI Orchestrator"
+      },
+      {
+        "command": "ai-orchestrator.classifyIntent",
+        "title": "Classify Intent",
+        "category": "AI Orchestrator"
+      },
+      {
+        "command": "ai-orchestrator.showDashboard",
+        "title": "Show Dashboard",
+        "category": "AI Orchestrator"
+      },
+      {
+        "command": "ai-orchestrator.healthCheck",
+        "title": "Health Check",
+        "category": "AI Orchestrator"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ai-orchestrator",
+          "title": "AI Orchestrator",
+          "icon": "$(hubot)"
+        }
+      ]
+    },
+    "views": {
+      "ai-orchestrator": [
+        {
+          "type": "webview",
+          "id": "ai-orchestrator.chatView",
+          "name": "AI Chat"
+        },
+        {
+          "id": "ai-orchestrator.metricsView",
+          "name": "Metrics"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "AI Orchestrator",
+      "properties": {
+        "ai-orchestrator.mcpCoreUrl": {
+          "type": "string",
+          "default": "http://localhost:4000",
+          "description": "MCP Server Core URL"
+        },
+        "ai-orchestrator.neuralCoreUrl": {
+          "type": "string",
+          "default": "http://localhost:8001",
+          "description": "Neural Core REST URL"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src --ext .ts",
+    "test": "node -e \"console.log('no tests yet')\""
+  },
+  "dependencies": {
+    "@ai-orchestrator/types": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0"
+  }
+}

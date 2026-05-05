@@ -1,0 +1,372 @@
+use axum::{
+    extract::{Extension, Path as AxumPath, Query, State},
+    http::StatusCode,
+    Json,
+};
+use serde_json::{json, Value};
+use tokio::fs;
+use uuid::Uuid;
+
+use crate::{auth::Claims, AppState};
+use crate::projects::{
+    api_error, load_project_context, parse_user_id, resolve_relative_path,
+    resolve_workspace_target, to_relative, upsert_open_session, list_directory_nodes,
+    CreateEntryRequest, DeleteEntryRequest, FileQuery, RenameEntryRequest, SaveFileRequest,
+    SearchQuery, TreeQuery, EXCLUDED_NAMES,
+};
+
+type ApiError = (StatusCode, Json<Value>);
+type ApiResult = Result<Json<Value>, ApiError>;
+
+pub async fn get_project_tree(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<TreeQuery>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let context = load_project_context(&state.db, project_id, user_id).await?;
+    let target = match query.path.as_deref() {
+        Some(path) if !path.trim().is_empty() => resolve_relative_path(&context.root_path, path)?,
+        _ => context.root_path.clone(),
+    };
+    let nodes = list_directory_nodes(&context.root_path, &target)?;
+
+    Ok(Json(json!({
+        "path": query.path.unwrap_or_default(),
+        "nodes": nodes,
+    })))
+}
+
+pub async fn get_project_file(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<FileQuery>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let context = load_project_context(&state.db, project_id, user_id).await?;
+    let file_path = resolve_relative_path(&context.root_path, &query.path)?;
+    if !file_path.is_file() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Il percorso richiesto non e' un file",
+        ));
+    }
+
+    let content = fs::read_to_string(&file_path).await.map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "Impossibile leggere il file come testo UTF-8",
+        )
+    })?;
+
+    upsert_open_session(
+        &state.db,
+        user_id,
+        &context,
+        &[to_relative(&context.root_path, &file_path)],
+        context.details.root_path.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "path": to_relative(&context.root_path, &file_path),
+        "content": content,
+    })))
+}
+
+pub async fn save_project_file(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<SaveFileRequest>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let context = load_project_context(&state.db, project_id, user_id).await?;
+    if !context.access.can_write {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Non hai permessi di scrittura su questo progetto",
+        ));
+    }
+
+    let file_path = resolve_relative_path(&context.root_path, &body.path)?;
+    fs::write(&file_path, &body.content)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    upsert_open_session(
+        &state.db,
+        user_id,
+        &context,
+        &[to_relative(&context.root_path, &file_path)],
+        context.details.root_path.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "saved": true,
+        "path": to_relative(&context.root_path, &file_path),
+    })))
+}
+
+pub async fn create_project_entry(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<CreateEntryRequest>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let context = load_project_context(&state.db, project_id, user_id).await?;
+    if !context.access.can_write {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Non hai permessi di scrittura su questo progetto",
+        ));
+    }
+
+    let (relative_path, target_path) = resolve_workspace_target(&context.root_path, &body.path)?;
+    if target_path.exists() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "Esiste gia' un file o directory con questo percorso",
+        ));
+    }
+
+    let parent = target_path.parent().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "Impossibile determinare la cartella padre",
+        )
+    })?;
+    if !parent.exists() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "La cartella padre non esiste",
+        ));
+    }
+
+    match body.kind.trim() {
+        "directory" => {
+            fs::create_dir(&target_path)
+                .await
+                .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        "file" => {
+            fs::write(&target_path, body.content.as_deref().unwrap_or_default())
+                .await
+                .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "Il tipo deve essere 'file' o 'directory'",
+            ));
+        }
+    }
+
+    upsert_open_session(
+        &state.db,
+        user_id,
+        &context,
+        &[relative_path.clone()],
+        context.details.root_path.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "path": relative_path,
+        "kind": body.kind.trim(),
+    })))
+}
+
+pub async fn rename_project_entry(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<RenameEntryRequest>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let context = load_project_context(&state.db, project_id, user_id).await?;
+    if !context.access.can_write {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Non hai permessi di scrittura su questo progetto",
+        ));
+    }
+
+    let (_, old_path) = resolve_workspace_target(&context.root_path, &body.old_path)?;
+    if !old_path.exists() {
+        return Err(api_error(StatusCode::NOT_FOUND, "Il percorso da rinominare non esiste"));
+    }
+    let (new_relative_path, new_path) = resolve_workspace_target(&context.root_path, &body.new_path)?;
+    if new_path.exists() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "Il nuovo percorso esiste gia'",
+        ));
+    }
+    let parent = new_path.parent().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "Impossibile determinare la cartella padre",
+        )
+    })?;
+    if !parent.exists() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "La cartella padre del nuovo percorso non esiste",
+        ));
+    }
+
+    fs::rename(&old_path, &new_path)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    upsert_open_session(
+        &state.db,
+        user_id,
+        &context,
+        &[new_relative_path.clone()],
+        context.details.root_path.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "oldPath": body.old_path.trim().replace('\\', "/"),
+        "newPath": new_relative_path,
+    })))
+}
+
+pub async fn delete_project_entry(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<DeleteEntryRequest>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let context = load_project_context(&state.db, project_id, user_id).await?;
+    if !context.access.can_write {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Non hai permessi di scrittura su questo progetto",
+        ));
+    }
+
+    let (relative_path, target_path) = resolve_workspace_target(&context.root_path, &body.path)?;
+    if !target_path.exists() {
+        return Err(api_error(StatusCode::NOT_FOUND, "Il percorso da eliminare non esiste"));
+    }
+
+    let metadata = fs::metadata(&target_path)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(&target_path)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    } else {
+        fs::remove_file(&target_path)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "path": relative_path,
+    })))
+}
+
+pub async fn search_project(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<SearchQuery>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let context = load_project_context(&state.db, project_id, user_id).await?;
+    let term = query.q.trim();
+    if term.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Il testo di ricerca e' obbligatorio",
+        ));
+    }
+
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let mut stack = vec![context.root_path.clone()];
+    let mut matches = Vec::new();
+
+    while let Some(path) = stack.pop() {
+        if matches.len() >= limit {
+            break;
+        }
+        let entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            if matches.len() >= limit {
+                break;
+            }
+            let child_path = entry.path();
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let name = entry.file_name().to_string_lossy().to_string();
+            if EXCLUDED_NAMES.contains(&name.as_str()) {
+                continue;
+            }
+            if metadata.is_dir() {
+                stack.push(child_path);
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+
+            let content = match std::fs::read_to_string(&child_path) {
+                Ok(content) => content,
+                Err(_) => continue,
+            };
+
+            for (index, line) in content.lines().enumerate() {
+                if matches.len() >= limit {
+                    break;
+                }
+                if let Some(column) = line.find(term) {
+                    matches.push(json!({
+                        "path": to_relative(&context.root_path, &child_path),
+                        "line": index + 1,
+                        "column": column + 1,
+                        "preview": line.trim(),
+                    }));
+                }
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "query": term,
+        "results": matches,
+    })))
+}

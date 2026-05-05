@@ -1,0 +1,14 @@
+name: coder_scaffold_api
+agent_type: coder
+intent: code_generation
+state:
+  repo_lang: Python
+  repo_summary: "API FastAPI con PostgreSQL."
+rubric:
+  must_render_without_residual_placeholder: true
+  must_contain_xml_tags:
+    - "<role>"
+    - "<autonomia>"
+    - "<protocollo>"
+    - "<output_format>"
+  must_contain_in_protocol: ["IMPLEMENTA", "ESPLORA"]

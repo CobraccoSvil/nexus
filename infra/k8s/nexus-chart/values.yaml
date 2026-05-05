@@ -1,0 +1,82 @@
+replicaCount: 2
+
+image:
+  repository: nexus/llm-gateway
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 3001
+
+ingress:
+  enabled: false
+  className: nginx
+  host: nexus.internal
+  tls: []
+
+vllm:
+  enabled: true
+  image:
+    repository: vllm/vllm-openai
+    tag: latest
+  model: Qwen/Qwen2.5-Coder-32B-Instruct
+  dtype: float16
+  maxModelLen: 32768
+  port: 8000
+  # GPU node selector — imposta il nome del label della tua infra GPU
+  nodeSelector:
+    nvidia.com/gpu: "true"
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  resources:
+    limits:
+      nvidia.com/gpu: 1
+      memory: 80Gi
+    requests:
+      nvidia.com/gpu: 1
+      memory: 60Gi
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: 100Gi
+
+postgres:
+  host: postgres
+  port: 5432
+  database: nexus
+  user: nexus
+  # Usare un Secret K8s in produzione
+  passwordSecret: nexus-postgres-secret
+  passwordKey: password
+
+redis:
+  host: redis
+  port: 6379
+
+config:
+  profile: onprem
+  logLevel: info
+  redaction:
+    enabled: true
+    strictMode: true
+  features:
+    allowCloudTier2: false
+    allowCloudTier3: false
+    dlpEnabled: true
+
+langfuse:
+  enabled: true
+  host: http://langfuse:3000
+  secretKeySecret: nexus-langfuse-secret
+  secretKeyKey: secret-key
+
+presidio:
+  host: presidio
+  port: 5002
+
+hf:
+  tokenSecret: nexus-hf-secret
+  tokenKey: token

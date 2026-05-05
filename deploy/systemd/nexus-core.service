@@ -1,0 +1,18 @@
+[Unit]
+Description=IDEAI Core Platform (:4000)
+After=network.target postgresql.service redis.service nexus-neural.service
+Wants=nexus-neural.service
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/opt/ideai
+EnvironmentFile=/opt/ideai/.env
+ExecStart=/opt/ideai/bin/mcp-core
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/ideai/core.log
+StandardError=append:/var/log/ideai/core.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+name: tester_write_jest
+agent_type: tester
+intent: test_generation
+state:
+  repo_lang: TypeScript
+  repo_summary: "Progetto TypeScript con copertura di test da estendere tramite Jest."
+rubric:
+  must_render_without_residual_placeholder: true
+  must_contain_xml_tags:
+    - "<role>"
+    - "<autonomia>"
+    - "<protocollo>"
+    - "<output_format>"
+  must_contain_in_protocol: ["test", "PROGETTA"]

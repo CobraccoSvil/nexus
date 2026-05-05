@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8" />
+    <title>IDEAI Browser Bridge</title>
+    <style>
+      body { font-family: system-ui, sans-serif; min-width: 320px; padding: 12px; font-size: 13px; }
+      h1 { font-size: 14px; margin: 0 0 8px; }
+      label { display: block; margin: 8px 0 2px; font-weight: 600; }
+      input { width: 100%; padding: 4px 6px; box-sizing: border-box; font-family: monospace; }
+      button { margin-top: 10px; padding: 6px 10px; cursor: pointer; }
+      .status { margin-top: 10px; padding: 6px; border-radius: 4px; }
+      .ok { background: #e6ffed; color: #064; }
+      .err { background: #ffecec; color: #800; }
+      .row { display: flex; gap: 8px; align-items: center; }
+      .row button { margin-top: 0; }
+    </style>
+  </head>
+  <body>
+    <h1>IDEAI Browser Bridge</h1>
+    <label for="port">Porta daemon</label>
+    <input id="port" type="number" value="4055" min="1" max="65535" />
+    <label for="token">Token (file ~/.ideai/browser-bridge.token)</label>
+    <input id="token" type="text" placeholder="incolla il token qui" />
+    <div class="row">
+      <button id="save">Salva e riconnetti</button>
+      <button id="attach">Attach tab corrente</button>
+      <button id="detach">Detach tab corrente</button>
+    </div>
+    <div id="status" class="status">in attesa...</div>
+    <script src="popup.js"></script>
+  </body>
+</html>

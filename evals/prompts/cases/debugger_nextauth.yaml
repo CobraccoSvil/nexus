@@ -1,0 +1,23 @@
+# Caso eval smoke: agente debugger, log NextAuth 404.
+# Riproduce il problema reale osservato in chat (NextAuth /api/auth/* 404).
+name: debugger_nextauth_404
+agent_type: debugger
+intent: bug_fix
+state:
+  repo_lang: TypeScript
+  repo_summary: "App Next.js con autenticazione tramite NextAuth.js."
+input: |
+  Console output:
+  GET http://localhost:3002/api/auth/session 404 (Not Found)
+  GET http://localhost:3002/api/auth/providers 404 (Not Found)
+  ClientFetchError: Unexpected token '<', "<!DOCTYPE "... is not valid JSON
+expected_tools:
+  - list_files
+  - search_in_files
+  - read_file
+  - write_file
+rubric:
+  must_render_without_residual_placeholder: true
+  must_contain_xml_tags: ["<role>", "<autonomia>", "<protocollo>", "<output_format>"]
+  forbidden_strings: ["{{lang_hint}}", "{{type_hint}}", "{{repo_summary}}"]
+  must_contain_in_protocol: ["NextAuth", "404"]

@@ -1,0 +1,71 @@
+[tool.poetry]
+name = "ai-orchestrator-brain"
+version = "0.1.0"
+description = "Neural core for AI-Orchestrator v2"
+authors = ["Cobracco S.r.l."]
+packages = [{ include = "brain" }]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastapi = "^0.115.12"
+uvicorn = { extras = ["standard"], version = "^0.34.0" }
+pydantic = "^2.11.2"
+httpx = "^0.28.1"
+grpcio = "^1.68"
+grpcio-tools = "^1.68"
+protobuf = "^5.29"
+sentence-transformers = "^3.3"
+qdrant-client = "^1.12"
+openai = "^1.58"
+anthropic = "^0.40"
+google-generativeai = "^0.8"
+numpy = "^2.0"
+tiktoken = "^0.8"
+python-docx = "^1.1"
+langgraph = ">=0.2.0"
+langchain-core = ">=0.3.0"
+aiosqlite = ">=0.19.0"
+typing-extensions = ">=4.12"
+asyncpg = ">=0.31.0"
+sqlalchemy = {version = ">=2.0", extras = ["asyncio"]}
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.5"
+pytest-asyncio = "^0.24"
+pytest-cov = "^5.0"
+mypy = "^1.11"
+ruff = "^0.6"
+
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
+
+# --- Regole dogfood direttive Nexus ---
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+exclude = ["brain/__pycache__", "brain/grpc_server/.*_pb2.*\\.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["brain/grpc_server"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra --strict-markers --cov=brain --cov-report=term --cov-fail-under=60"
+testpaths = ["tests"]
+asyncio_mode = "auto"

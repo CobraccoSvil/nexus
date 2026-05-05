@@ -1,0 +1,386 @@
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+import { useTheme, useThemeColors } from "../../lib/theme";
+import { useI18n } from "../../lib/i18n";
+import { ProviderSettings, type BrowseDirectoriesResponse, type SettingEntry } from "./provider-settings";
+import { RoutingConfig } from "./routing-config";
+import { PluginManager } from "./plugin-manager";
+import { InfrastructureSettings } from "./infrastructure-settings";
+import { SecuritySettings } from "./security-settings";
+import { GatewayConfig } from "./gateway-config";
+import { getGatewayProviders } from "../../lib/api-client";
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+
+interface GatewayProvider {
+  name: string;
+  healthy: boolean;
+  last_check?: string;
+  error?: string;
+}
+
+export const CATEGORY_ORDER = ["providers", "routing", "security", "infrastructure", "embeddings", "quality", "learning", "auth", "custom"];
+
+interface SettingsPanelProps {
+  category?: string;
+}
+
+export function SettingsPanel({ category }: SettingsPanelProps) {
+  const tc = useThemeColors();
+  const { resolved } = useTheme();
+  const { t } = useI18n();
+  const [settings, setSettings] = useState<SettingEntry[]>([]);
+  const [editValues, setEditValues] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState<Record<string, boolean>>({});
+  const [saved, setSaved] = useState<Record<string, boolean>>({});
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [testResults, setTestResults] = useState<Record<string, string>>({});
+  const [gatewayProviders, setGatewayProviders] = useState<GatewayProvider[]>([]);
+  const [isBrowsingRoot, setIsBrowsingRoot] = useState(false);
+  const [browseBusy, setBrowseBusy] = useState(false);
+  const [browseError, setBrowseError] = useState<string | null>(null);
+  const [browseData, setBrowseData] = useState<BrowseDirectoriesResponse | null>(null);
+  const [newDirectoryName, setNewDirectoryName] = useState("");
+
+  // Proxy via Next.js /neural/* → brain :8001 (server-side, no CORS)
+  const NEURAL_BASE = "/neural";
+
+  const handleTestProvider = useCallback(async (provider: string) => {
+    setTestResults((current) => ({ ...current, [provider]: "testing..." }));
+    try {
+      const res = await fetch(`${NEURAL_BASE}/providers/${provider}/health`);
+      const data = await res.json();
+      const status = data.status || "unknown";
+      const reason = data.reason || data.message || data.error || "";
+      const detail = reason ? `${status}: ${reason}` : status;
+      setTestResults((current) => ({ ...current, [provider]: detail }));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "unreachable";
+      setTestResults((current) => ({ ...current, [provider]: `unreachable: ${msg}` }));
+    }
+  }, []);
+
+  // Ricarica le chiavi nel brain poi ri-testa il provider
+  const handleReloadProvider = useCallback(async (provider: string) => {
+    try {
+      await fetch(`${NEURAL_BASE}/reload-settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+    } catch {
+      // ignora errori di reload, prova comunque il test
+    }
+    await handleTestProvider(provider);
+  }, [handleTestProvider]);
+
+  const loadGatewayProviders = useCallback(async () => {
+    try {
+      const data = await getGatewayProviders();
+      const d = data as { providers?: GatewayProvider[] };
+      setGatewayProviders(Array.isArray(d?.providers) ? d.providers! : []);
+    } catch {
+      setGatewayProviders([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadGatewayProviders();
+    const gwInterval = setInterval(() => void loadGatewayProviders(), 10_000);
+    return () => clearInterval(gwInterval);
+  }, [loadGatewayProviders]);
+
+  const fetchSettings = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/settings`, { credentials: "include" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setSettings(data.settings || []);
+      setError(null);
+    } catch (fetchError) {
+      setError(fetchError instanceof Error ? fetchError.message : "Failed to load settings");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchSettings();
+  }, [fetchSettings]);
+
+
+  const handleSave = async (key: string) => {
+    const value = editValues[key];
+    if (value === undefined) return;
+
+    setSaving((current) => ({ ...current, [key]: true }));
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/setting/${key}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ value }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setSaved((current) => ({ ...current, [key]: true }));
+      setTimeout(() => setSaved((current) => ({ ...current, [key]: false })), 2000);
+      setEditValues((current) => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+      await fetchSettings();
+      // Se si salva una API key, ricarica il brain e ri-testa
+      if (key.endsWith("_api_key")) {
+        const providerName = key.replace("_api_key", "");
+        void handleReloadProvider(providerName);
+      }
+      // Se si salva la configurazione DNS, ricarica le impostazioni del Neural Core
+      if (key === "network_dns_servers") {
+        try {
+          await fetch(`${NEURAL_BASE}/reload-settings`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: "{}",
+          });
+        } catch { /* ignore */ }
+      }
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : "Save failed");
+    } finally {
+      setSaving((current) => ({ ...current, [key]: false }));
+    }
+  };
+
+  const handleSaveImmediate = async (key: string, value: string) => {
+    setSaving((current) => ({ ...current, [key]: true }));
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/setting/${key}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ value }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      await fetchSettings();
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : "Save failed");
+    } finally {
+      setSaving((current) => ({ ...current, [key]: false }));
+    }
+  };
+
+  const loadAdminDirectories = useCallback(async (path?: string) => {
+    setBrowseBusy(true);
+    setBrowseError(null);
+    try {
+      const url = new URL(`${API_BASE}/api/admin/fs/directories`);
+      if (path?.trim()) {
+        url.searchParams.set("path", path.trim());
+      }
+      const res = await fetch(url.toString(), { credentials: "include" });
+      if (!res.ok) {
+        let details = "";
+        try {
+          const payload = await res.json();
+          if (payload?.error && typeof payload.error === "string") {
+            details = ` - ${payload.error}`;
+          }
+        } catch {
+          // ignore parse errors
+        }
+        throw new Error(`API error ${res.status}: ${res.statusText}${details}`);
+      }
+      const data = (await res.json()) as BrowseDirectoriesResponse;
+      setBrowseData(data);
+    } catch (browseLoadError) {
+      setBrowseError(
+        browseLoadError instanceof Error
+          ? browseLoadError.message
+          : "Impossibile navigare il filesystem.",
+      );
+    } finally {
+      setBrowseBusy(false);
+    }
+  }, []);
+
+  const createAdminDirectory = useCallback(async () => {
+    if (!browseData || !newDirectoryName.trim()) return;
+    setBrowseBusy(true);
+    setBrowseError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/fs/directories/create`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          parent_path: browseData.currentPath,
+          name: newDirectoryName.trim(),
+        }),
+      });
+      if (!res.ok) {
+        let details = "";
+        try {
+          const payload = await res.json();
+          if (payload?.error && typeof payload.error === "string") {
+            details = ` - ${payload.error}`;
+          }
+        } catch {
+          // ignore parse errors
+        }
+        throw new Error(`API error ${res.status}: ${res.statusText}${details}`);
+      }
+      setNewDirectoryName("");
+      await loadAdminDirectories(browseData.currentPath);
+    } catch (createError) {
+      setBrowseError(
+        createError instanceof Error
+          ? createError.message
+          : "Impossibile creare la directory.",
+      );
+      setBrowseBusy(false);
+    }
+  }, [browseData, loadAdminDirectories, newDirectoryName]);
+
+  const items = category
+    ? settings.filter((setting) => setting.category === category)
+    : settings;
+  // Items della categoria gateway (per la sezione integrata nella pagina providers)
+  const gatewayItems = settings.filter((s) => s.category === "gateway");
+  const routingItems = category === "routing"
+    ? settings.filter(
+        (setting) =>
+          setting.category === "routing" ||
+          setting.key === "agent_parallel_enabled" ||
+          setting.key === "agent_parallel_max" ||
+          setting.key === "nexus_active_routing_pct",
+      )
+    : items;
+
+  const catKey = category ? (`cat.${category}` as Parameters<typeof t>[0]) : null;
+  const title = catKey ? t(catKey) : t("admin.settings");
+  const subtitle = category
+    ? t("settings.configure", { category: catKey ? t(catKey).toLowerCase() : category })
+    : t("settings.stored");
+
+  if (loading) {
+    return <div style={{ padding: 40, textAlign: "center", color: tc.textMuted }}>{t("settings.loading")}</div>;
+  }
+
+  if (error && settings.length === 0) {
+    return (
+      <div style={{ padding: 40, textAlign: "center" }}>
+        <div className="text-lg" style={{ color: tc.error, marginBottom: 12 }}>{t("settings.errorConnect")}</div>
+        <div className="text-base" style={{ color: tc.textMuted }}>{error}</div>
+        <div style={{ color: tc.textMuted, fontSize: 13, marginTop: 8 }}>
+          {t("settings.errorServer", { url: API_BASE })}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <h1 className="text-2xl font-semibold" style={{ marginBottom: 6 }}>{title}</h1>
+      <p className="text-base" style={{ color: tc.textMuted, marginBottom: 28 }}>{subtitle}</p>
+
+      {error && (
+        <div
+          style={{
+            padding: "10px 16px",
+            background: resolved === "dark" ? "#2d1215" : "#fef2f2",
+            border: `1px solid ${tc.error}`,
+            borderRadius: 8,
+            color: tc.error,
+            fontSize: 13,
+            marginBottom: 24,
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      {items.length === 0 && category !== "connectors" && (
+        <div style={{ padding: 40, textAlign: "center", color: tc.textMuted, fontSize: 13 }}>
+          {t("settings.noItems")}
+        </div>
+      )}
+
+      {category === "routing" ? (
+        <RoutingConfig settings={routingItems} onSaveComplete={fetchSettings} />
+      ) : category === "connectors" ? (
+        <PluginManager />
+      ) : category === "security" ? (
+        <SecuritySettings
+          items={items}
+          editValues={editValues}
+          saving={saving}
+          saved={saved}
+          onEditChange={(key, value) => setEditValues((current) => ({ ...current, [key]: value }))}
+          onSave={handleSave}
+        />
+      ) : category === "infrastructure" ? (
+        <InfrastructureSettings
+          items={items}
+          editValues={editValues}
+          saving={saving}
+          saved={saved}
+          onEditChange={(key, value) => setEditValues((current) => ({ ...current, [key]: value }))}
+          onSave={handleSave}
+          onOpenBrowse={(currentValue) => {
+            setIsBrowsingRoot(true);
+            if (!browseData) {
+              void loadAdminDirectories(currentValue);
+            }
+          }}
+        />
+      ) : (
+        <>
+          <ProviderSettings
+          items={items}
+          editValues={editValues}
+          saving={saving}
+          saved={saved}
+          testResults={testResults}
+          gatewayProviders={gatewayProviders}
+          isBrowsingRoot={isBrowsingRoot}
+          browseBusy={browseBusy}
+          browseError={browseError}
+          browseData={browseData}
+          newDirectoryName={newDirectoryName}
+          onEditChange={(key, value) => setEditValues((current) => ({ ...current, [key]: value }))}
+          onSave={handleSave}
+          onSaveImmediate={handleSaveImmediate}
+          onTestProvider={handleTestProvider}
+          onReloadProvider={handleReloadProvider}
+          onOpenBrowse={(currentValue) => {
+            setIsBrowsingRoot(true);
+            if (!browseData) {
+              void loadAdminDirectories(currentValue);
+            }
+          }}
+          onCloseBrowse={() => setIsBrowsingRoot(false)}
+          onLoadDirectories={loadAdminDirectories}
+          onCreateDirectory={createAdminDirectory}
+          onSetNewDirectoryName={setNewDirectoryName}
+          onSelectDirectory={(path) => setEditValues((current) => ({ ...current, projects_base_root: path }))}
+        />
+          {/* ── Sezione Gateway LLM integrata ── */}
+          <div style={{ marginTop: 40, borderTop: "1px solid var(--color-border)", paddingTop: 24 }}>
+            <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>Gateway LLM</h2>
+            <p style={{ fontSize: 13, color: "var(--color-textMuted)", marginBottom: 20 }}>
+              Hot-reload e parametri del gateway LLM.
+            </p>
+            <GatewayConfig
+              items={gatewayItems}
+              onSaveComplete={fetchSettings}
+              onRefreshProviders={loadGatewayProviders}
+            />
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

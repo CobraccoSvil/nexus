@@ -1,0 +1,53 @@
+# Profilo ON-PREMISE — solo vLLM locale, zero cloud
+profile: onprem
+
+providers:
+  anthropic:
+    enabled: false
+  openai:
+    enabled: false
+  mistral:
+    enabled: false
+
+vllm:
+  base_url: http://vllm:8000/v1
+  api_key: ""
+  model_name: Qwen/Qwen2.5-Coder-32B-Instruct
+  max_context_tokens: 32768
+
+redaction:
+  enabled: true
+  strict_mode: true  # strict mode per on-prem
+  presidio_grpc_url: presidio:50051
+
+telemetry:
+  enabled: true
+  otlp_endpoint: http://localhost:4318
+  log_level: info
+  service_name: nexus-llm-gateway
+
+database:
+  url: postgres://nexus:nexus@postgres:5432/nexus
+  pool_size: 20
+
+redis:
+  url: redis://redis:6379
+
+features:
+  allow_cloud_tier2: false
+  allow_cloud_tier3: false
+  dlp_enabled: true
+
+routing:
+  tier_0:
+    primary: vllm
+    secondary: null
+  tier_1:
+    primary: vllm
+    secondary: null
+  tier_2:
+    primary: vllm
+    secondary: null
+  tier_3:
+    primary: vllm
+    secondary: null
