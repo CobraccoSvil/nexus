@@ -166,6 +166,7 @@ export function ChatPanel({
     prevRunStatusRef.current = agentRun.status;
   }, [agentRun, onRunEnd]);
   const [input, setInput] = useState("");
+  const [forceProvider, setForceProvider] = useState(false);
   const autoSendPendingRef = useRef<string | null>(null);
   // Salva il provider hint in un ref per evitare che onExternalInputConsumed()
   // lo resetti prima che l'auto-send effect lo possa usare.
@@ -369,12 +370,17 @@ export function ChatPanel({
     // Se il provider e' "auto" e c'e' un hint esterno (es. generazione documenti),
     // usa il hint per forzare un provider/modello capace.
     const hint = providerHintOverride || externalProviderHint;
-    const effectiveProvider = selectedProvider !== "auto"
+    const shouldForce = forceProvider && selectedProvider !== "auto";
+    const effectiveProvider = shouldForce
       ? selectedProvider
-      : hint?.provider;
-    const effectiveModel = selectedProvider !== "auto"
+      : selectedProvider === "auto"
+        ? hint?.provider
+        : undefined;
+    const effectiveModel = shouldForce
       ? (selectedModel !== "auto" ? selectedModel : undefined)
-      : hint?.model;
+      : selectedProvider === "auto"
+        ? hint?.model
+        : undefined;
     void send(text, {
       profileId,
       activeFiles,
@@ -1314,9 +1320,13 @@ export function ChatPanel({
         attachmentError={attachmentError}
         selectedProvider={selectedProvider}
         onProviderChange={setSelectedProvider}
+        forceProvider={forceProvider}
+        onForceProviderChange={setForceProvider}
         selectedModel={selectedModel}
         onModelChange={setSelectedModel}
         providerModels={providerModels}
+        runProvider={agentRun?.provider ?? null}
+        runModel={agentRun?.model ?? null}
         automationMode={automationMode}
         onAutomationModeChange={setAutomationMode}
         supervisorMode={supervisorMode}

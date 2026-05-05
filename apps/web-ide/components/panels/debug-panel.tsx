@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
 import { getProjectServicesStatus, getOutputEvents } from "../../lib/api-client";
+import { promptFromDebugEntry } from "../../lib/chat-prompts";
 
 export type DebugLevel = "ERROR" | "WARN" | "INFO" | "DEBUG";
 
@@ -19,6 +20,7 @@ export interface DebugEntry {
 export interface DebugPanelProps {
   terminalLines?: string[];
   projectId?: string;
+  onSendToChat?: (message: string) => void;
 }
 
 const LOG_PATTERNS: Array<{
@@ -92,7 +94,7 @@ const NEURAL_WS = (
 
 type SourceFilter = "all" | "terminal" | string;
 
-export function DebugPanel({ projectId, terminalLines }: DebugPanelProps) {
+export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPanelProps) {
   const tc = useThemeColors();
   const [entries, setEntries] = useState<DebugEntry[]>([]);
   const [filters, setFilters] = useState<Record<DebugLevel, boolean>>({
@@ -251,6 +253,16 @@ export function DebugPanel({ projectId, terminalLines }: DebugPanelProps) {
     lineBufferRef.current = [];
     seenLogIdsRef.current.clear();
   }, []);
+  const sendEntryToChat = useCallback((entry: DebugEntry) => {
+    if (!onSendToChat) return;
+    if (entry.level !== "ERROR" && entry.level !== "WARN") return;
+    onSendToChat(promptFromDebugEntry({
+      level: entry.level,
+      timestamp: entry.timestamp,
+      source: entry.source,
+      message: entry.raw || entry.message,
+    }));
+  }, [onSendToChat]);
 
   const toggleExpand = useCallback((id: string) => {
     setEntries((prev) =>
@@ -463,6 +475,35 @@ export function DebugPanel({ projectId, terminalLines }: DebugPanelProps) {
               >
                 {entry.message}
               </span>
+              {onSendToChat && (entry.level === "ERROR" || entry.level === "WARN") && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    sendEntryToChat(entry);
+                  }}
+                  title={entry.level === "WARN"
+                    ? "Invia questo warning alla chat di Nexus"
+                    : "Invia questo errore alla chat di Nexus"}
+                  style={{
+                    marginLeft: 8,
+                    background: entry.level === "WARN" ? "rgba(245,158,11,0.90)" : "rgba(239,68,68,0.85)",
+                    color: entry.level === "WARN" ? "#111827" : "#fff",
+                    border: "none",
+                    borderRadius: 3,
+                    padding: "0 6px",
+                    fontSize: 10,
+                    cursor: "pointer",
+                    verticalAlign: "middle",
+                    lineHeight: "16px",
+                    height: 16,
+                    fontWeight: entry.level === "WARN" ? 700 : 600,
+                    flexShrink: 0,
+                  }}
+                >
+                  ↗ chat
+                </button>
+              )}
             </div>
           ))
         )}

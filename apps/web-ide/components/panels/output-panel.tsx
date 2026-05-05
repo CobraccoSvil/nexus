@@ -223,7 +223,37 @@ function renderRichText(text: string, opts: RenderRichTextOptions = {}): React.R
     // Le righe di inner exception (.NET "--->") fanno già parte del blocco
     // emesso dal pulsante della riga root: niente secondo pulsante.
     const isInnerException = /(?:^|\s)--->\s/.test(line);
-    const showSendBtn = kind === "error" && !isInnerException && !!opts.onSendErrorToChat;
+    const showSendBtn = (kind === "error" || kind === "warn") && !isInnerException && !!opts.onSendErrorToChat;
+    const sendBtnStyle =
+      kind === "warn"
+        ? {
+            marginLeft: 8,
+            background: "rgba(245,158,11,0.90)",
+            color: "#111827",
+            border: "none",
+            borderRadius: 3,
+            padding: "0 6px",
+            fontSize: 10,
+            cursor: "pointer",
+            verticalAlign: "middle",
+            lineHeight: "16px",
+            height: 16,
+            fontWeight: 700,
+          }
+        : {
+            marginLeft: 8,
+            background: "rgba(239,68,68,0.85)",
+            color: "#fff",
+            border: "none",
+            borderRadius: 3,
+            padding: "0 6px",
+            fontSize: 10,
+            cursor: "pointer",
+            verticalAlign: "middle",
+            lineHeight: "16px",
+            height: 16,
+            fontWeight: 600,
+          };
     return (
       <span key={i} style={{
         display: "block",
@@ -241,21 +271,10 @@ function renderRichText(text: string, opts: RenderRichTextOptions = {}): React.R
               const block = extractErrorBlock(text, i);
               opts.onSendErrorToChat?.(block);
             }}
-            title="Invia SOLO questo errore (con stack trace) alla chat di Nexus"
-            style={{
-              marginLeft: 8,
-              background: "rgba(239,68,68,0.85)",
-              color: "#fff",
-              border: "none",
-              borderRadius: 3,
-              padding: "0 6px",
-              fontSize: 10,
-              cursor: "pointer",
-              verticalAlign: "middle",
-              lineHeight: "16px",
-              height: 16,
-              fontWeight: 600,
-            }}
+            title={kind === "warn"
+              ? "Invia SOLO questo warning (con contesto) alla chat di Nexus"
+              : "Invia SOLO questo errore (con stack trace) alla chat di Nexus"}
+            style={sendBtnStyle}
           >
             ↗ chat
           </button>

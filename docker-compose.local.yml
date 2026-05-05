@@ -40,6 +40,10 @@ services:
       - "6334:6334"
     volumes:
       - qdrant-data:/qdrant/storage
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     restart: unless-stopped
 
   otel-collector:

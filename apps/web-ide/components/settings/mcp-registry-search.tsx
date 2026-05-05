@@ -50,8 +50,8 @@ function CatalogCard({
   return (
     <div
       style={{
-        background: tc.bgCard,
-        border: `1px solid ${tc.border}`,
+        background: alreadyAdded ? "#f59e0b12" : tc.bgCard,
+        border: `1px solid ${alreadyAdded ? "#f59e0b66" : tc.border}`,
         borderRadius: 10,
         padding: "14px 16px",
         display: "flex",
@@ -94,6 +94,25 @@ function CatalogCard({
             }}
           >
             ✓ Official
+          </span>
+        )}
+        {alreadyAdded && (
+          <span
+            style={{
+              fontSize: 10,
+              padding: "2px 6px",
+              borderRadius: 999,
+              background: "#f59e0b20",
+              color: "#b45309",
+              border: "1px solid #f59e0b66",
+              fontWeight: 700,
+              flexShrink: 0,
+              textTransform: "uppercase",
+              letterSpacing: "0.02em",
+            }}
+            title="Server MCP gia presente negli installati"
+          >
+            Già presente
           </span>
         )}
       </div>

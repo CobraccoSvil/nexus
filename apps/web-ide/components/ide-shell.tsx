@@ -1596,10 +1596,12 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           gridColumn: "1 / 5",
           display: "flex",
           alignItems: "center",
-          gap: 10,
+          columnGap: 10,
           padding: "0 12px",
           background: tc.bgHeader,
           borderBottom: `1px solid ${tc.border}`,
+          flexWrap: isMobileViewport ? "wrap" : "nowrap",
+          rowGap: isMobileViewport ? 6 : 0,
         }}
       >
         <strong style={{ fontSize: 13, letterSpacing: "0.08em", color: tc.text }}>NEXUS</strong>
@@ -1649,10 +1651,11 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           {isFullscreen ? "🗗" : "🗖"}
         </button>
         <UserHeader />
-        <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ flex: 1, minWidth: 0, order: isMobileViewport ? 10 : 0 }}>
           <ProjectSwitcher
             projects={projects}
             activeProjectId={activeProject?.id}
+            compact={isMobileViewport}
             onSelect={async (projectId) => {
               await handleOpenProject(projectId);
               window.history.replaceState(null, "", "/?project=" + projectId);
@@ -1666,41 +1669,57 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
             }}
           />
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginLeft: 8 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            columnGap: isNarrowViewport ? 8 : 10,
+            marginLeft: 8,
+            flexShrink: 0,
+            maxWidth: isNarrowViewport ? 320 : undefined,
+            overflowX: isNarrowViewport ? "auto" : "visible",
+            paddingBottom: isNarrowViewport ? 2 : 0,
+            order: isMobileViewport ? 11 : 0,
+            flexWrap: isMobileViewport ? "wrap" : "nowrap",
+            rowGap: isMobileViewport ? 6 : 0,
+            whiteSpace: "nowrap",
+          }}
+          aria-label="Stato provider AI"
+        >
           <span
             title={providerTitle("OpenAI", providerStatus.openai)}
             style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
           >
             <StatusDot ok={providerStatus.openai.ok} billing={providerStatus.openai.billing} />
-            OpenAI
+            {!isNarrowViewport && "OpenAI"}
           </span>
           <span
             title={providerTitle("Anthropic", providerStatus.anthropic)}
             style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
           >
             <StatusDot ok={providerStatus.anthropic.ok} billing={providerStatus.anthropic.billing} />
-            Anthropic
+            {!isNarrowViewport && "Anthropic"}
           </span>
           <span
             title={providerTitle("Google", providerStatus.google)}
             style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
           >
             <StatusDot ok={providerStatus.google.ok} billing={providerStatus.google.billing} />
-            Google
+            {!isNarrowViewport && "Google"}
           </span>
           <span
             title={providerTitle("DeepSeek", providerStatus.deepseek)}
             style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
           >
             <StatusDot ok={providerStatus.deepseek.ok} billing={providerStatus.deepseek.billing} />
-            DeepSeek
+            {!isNarrowViewport && "DeepSeek"}
           </span>
           <span
             title={providerTitle("Mistral", providerStatus.mistral)}
             style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
           >
             <StatusDot ok={providerStatus.mistral.ok} billing={providerStatus.mistral.billing} />
-            Mistral
+            {!isNarrowViewport && "Mistral"}
           </span>
         </div>
       </header>
@@ -2062,6 +2081,14 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
             playwrightRuns={playwrightRuns}
             onOpenFile={(path, line) => void openFileInGroup(path, line)}
             onSelectOutputChannel={setSelectedOutputChannel}
+            onRefreshPanel={(tab) => {
+              if (!activeProject) return;
+              if (tab === "services" || tab === "output") {
+                void loadOutputEvents(activeProject.id, selectedOutputChannel);
+                return;
+              }
+              void refreshOperationalViews(activeProject.id);
+            }}
             onClearPanel={(tab) => {
               switch (tab) {
                 case "problems": setProblemItems([]); break;

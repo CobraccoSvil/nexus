@@ -3,7 +3,7 @@
 
 INSERT INTO nexus_prompt_templates (key, category, title, content, updated_by) VALUES
 ('chat.precheck_message',
- 'chat',
+ 'system',
  'Precheck Messaggio Chat',
 $$Sei un assistente che analizza brevemente messaggi prima che vengano inviati a un sistema AI.
 Il tuo compito è rilevare problemi REALI e SIGNIFICATIVI. Rispondi SOLO con JSON valido, niente altro.

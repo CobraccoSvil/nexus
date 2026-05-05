@@ -87,10 +87,11 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
   }, []);
 
   useEffect(() => {
+    if (category !== "providers") return;
     void loadGatewayProviders();
     const gwInterval = setInterval(() => void loadGatewayProviders(), 10_000);
     return () => clearInterval(gwInterval);
-  }, [loadGatewayProviders]);
+  }, [category, loadGatewayProviders]);
 
   const fetchSettings = useCallback(async () => {
     try {
@@ -336,7 +337,7 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
             }
           }}
         />
-      ) : (
+      ) : category === "providers" ? (
         <>
           <ProviderSettings
           items={items}
@@ -380,6 +381,35 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
             />
           </div>
         </>
+      ) : (
+        <ProviderSettings
+          items={items}
+          editValues={editValues}
+          saving={saving}
+          saved={saved}
+          testResults={testResults}
+          isBrowsingRoot={isBrowsingRoot}
+          browseBusy={browseBusy}
+          browseError={browseError}
+          browseData={browseData}
+          newDirectoryName={newDirectoryName}
+          onEditChange={(key, value) => setEditValues((current) => ({ ...current, [key]: value }))}
+          onSave={handleSave}
+          onSaveImmediate={handleSaveImmediate}
+          onTestProvider={handleTestProvider}
+          onReloadProvider={handleReloadProvider}
+          onOpenBrowse={(currentValue) => {
+            setIsBrowsingRoot(true);
+            if (!browseData) {
+              void loadAdminDirectories(currentValue);
+            }
+          }}
+          onCloseBrowse={() => setIsBrowsingRoot(false)}
+          onLoadDirectories={loadAdminDirectories}
+          onCreateDirectory={createAdminDirectory}
+          onSetNewDirectoryName={setNewDirectoryName}
+          onSelectDirectory={(path) => setEditValues((current) => ({ ...current, projects_base_root: path }))}
+        />
       )}
     </div>
   );

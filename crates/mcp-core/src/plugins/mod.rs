@@ -23,11 +23,13 @@ use crate::{
 
 pub mod catalog;
 pub mod figma;
+pub mod integrate;
 pub mod install;
 pub mod runtime;
 
 pub use catalog::{list_installed_plugins, list_plugin_catalog};
 pub use figma::{figma_oauth_callback, get_figma_oauth_status, start_figma_oauth};
+pub use integrate::{draft_plugin_integration, publish_plugin_integration};
 pub use install::{
     install_plugin, migrate_legacy_mcp_server, toggle_plugin, uninstall_plugin, update_plugin,
 };
@@ -721,6 +723,25 @@ pub(super) fn detect_legacy_catalog_slug(
         }
         if command == "npx" && args.iter().any(|item| item.contains("@playwright/mcp")) {
             return Some("playwright-stdio");
+        }
+        // MCP standard servers (stdio) via npx @modelcontextprotocol/server-*
+        if command == "npx" && args.iter().any(|item| item.contains("@modelcontextprotocol/server-redis")) {
+            return Some("redis-stdio");
+        }
+        if command == "npx" && args.iter().any(|item| item.contains("@modelcontextprotocol/server-sqlite")) {
+            return Some("sqlite-stdio");
+        }
+        if command == "npx" && args.iter().any(|item| item.contains("@modelcontextprotocol/server-postgres")) {
+            return Some("postgres-stdio");
+        }
+        if command == "npx" && args.iter().any(|item| item.contains("@modelcontextprotocol/server-gitlab")) {
+            return Some("gitlab-stdio");
+        }
+        if command == "npx" && args.iter().any(|item| item.contains("@modelcontextprotocol/server-github")) {
+            return Some("github-stdio");
+        }
+        if command == "npx" && args.iter().any(|item| item.contains("@modelcontextprotocol/server-memory")) {
+            return Some("memory-stdio");
         }
     }
 

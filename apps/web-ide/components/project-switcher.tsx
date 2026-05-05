@@ -47,9 +47,10 @@ type ProjectSwitcherProps = {
   onSelect: (projectId: string) => Promise<void>;
   onRefreshProjects?: () => void;
   onRegister?: (absolutePath: string, name?: string) => Promise<void>;
+  compact?: boolean;
 };
 
-export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefreshProjects }: ProjectSwitcherProps) {
+export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefreshProjects, compact = false }: ProjectSwitcherProps) {
   const tc = useThemeColors();
   const [isPending, startTransition] = useTransition();
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -150,13 +151,15 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
           title="Selettore progetto"
           aria-label="Selettore progetto"
           style={{
-            minWidth: 220,
-            maxWidth: 360,
+            minWidth: compact ? 140 : 220,
+            maxWidth: compact ? 220 : 360,
             padding: "6px 10px",
             borderRadius: 8,
             border: `1px solid ${tc.border}`,
             background: tc.bgCard,
             color: tc.text,
+            flex: "1 1 auto",
+            width: "100%",
           }}
         >
           <option value="">Seleziona progetto</option>
@@ -174,8 +177,8 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
           aria-label="Gestisci progetti"
           style={{
             ...iconButtonStyle(tc, false, isModalOpen),
-            width: 32,
-            height: 32,
+            width: compact ? 28 : 32,
+            height: compact ? 28 : 32,
             fontSize: 14,
           }}
         >

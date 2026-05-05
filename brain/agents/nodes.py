@@ -523,18 +523,90 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             "executor_node: LOOP detected %s/%s ripete tool='%s' (signature=%s) %d+ volte. Abort.",
             provider, model, tool_name, loop_sig, LOOP_THRESHOLD,
         )
-        loop_msg = (
-            f"[LOOP RILEVATO] Il modello {provider}/{model} ha ripetuto il tool "
-            f"'{tool_name}' con stesso input {LOOP_THRESHOLD}+ volte senza progresso. "
-            f"Esecuzione interrotta per evitare stallo. "
-            f"Suggerimento: usa un modello piu' capace (es. anthropic/claude) o "
-            f"riformula il prompt in modo piu' specifico."
-        )
-        assistant_msg = AIMessage(content=loop_msg)
-        pending_tool_uses = []
-        stop_reason = "loop_detected"
-        result_text = loop_msg
-        new_signatures = []  # reset, non accumulare ulteriormente
+        # Auto-escalation: al primo loop proviamo automaticamente un modello più capace
+        # (evita di chiedere all'utente di cambiare provider/model manualmente).
+        escalations = int(state.get("auto_escalations") or 0)
+        tried_escalation = False
+        if escalations < 1 and _providers is not None and tools_json:
+            try:
+                # Purpose model DB-driven: configurabile dal router Rust.
+                fallback_provider = None
+                fallback_model = None
+                try:
+                    from brain.router.service import _routing_client_singleton
+                    decision2 = _routing_client_singleton().purpose_model(purpose="loop_fallback_default")
+                    if decision2.provider not in ("__router_unavailable__", "__no_capable_provider__"):
+                        fallback_provider = decision2.provider
+                        fallback_model = decision2.model
+                except Exception:
+                    pass
+
+                # Fallback soft: se purpose non disponibile, prova Anthropic se presente.
+                if not fallback_provider and _providers._providers.get("anthropic"):  # type: ignore[attr-defined]
+                    fallback_provider = "anthropic"
+                    fallback_model = "claude-sonnet-4-6"
+
+                if fallback_provider and fallback_model:
+                    p2 = _providers._providers.get(fallback_provider)  # type: ignore[attr-defined]
+                    if p2 is not None and hasattr(p2, "generate_agent_turn"):
+                        logger.info(
+                            "executor_node: LOOP -> auto-escalation %s/%s => %s/%s (tool=%s)",
+                            provider, model, fallback_provider, fallback_model, tool_name,
+                        )
+                        # Hint anti-loop nel system_text: chiede esplicitamente di NON ripetere il tool.
+                        anti_loop_hint = (
+                            "\n\n[ANTI-LOOP] Hai appena ripetuto la stessa tool call "
+                            f"('{tool_name}' con stesso input) più volte. "
+                            "Non ripetere la stessa tool call con lo stesso input. "
+                            "Se mancano informazioni, fai UNA richiesta più specifica "
+                            "oppure cambia strategia e riassumi lo stato."
+                        )
+                        system_text2 = (system_text or "") + anti_loop_hint
+
+                        # Riprova lo stesso turno agente con provider/model più capace.
+                        prov2 = await p2.generate_agent_turn(
+                            fallback_model,
+                            anth_messages,
+                            tools_json,
+                            max_tokens=effective_max_tokens,
+                            system_text=system_text2,
+                        )
+                        result_text = prov2.content or ""
+                        meta2 = prov2.metadata or {}
+                        stop_reason = meta2.get("stop_reason") or "end_turn"
+                        pending_tool_uses = list(meta2.get("tool_use_blocks") or [])
+                        assistant_content2 = meta2.get("assistant_content")
+                        if assistant_content2:
+                            assistant_msg = AIMessage(
+                                content="",
+                                additional_kwargs={"anthropic_content": assistant_content2},
+                            )
+                        else:
+                            assistant_msg = AIMessage(content=result_text)
+
+                        provider = fallback_provider
+                        model = fallback_model
+                        tried_escalation = True
+                        new_signatures = []  # reset signature accumulator dopo escalation
+            except Exception as exc:
+                logger.warning("executor_node: auto-escalation fallita: %s", exc)
+
+        if not tried_escalation:
+            loop_msg = (
+                f"[LOOP RILEVATO] Il modello {provider}/{model} ha ripetuto il tool "
+                f"'{tool_name}' con stesso input {LOOP_THRESHOLD}+ volte senza progresso. "
+                f"Esecuzione interrotta per evitare stallo. "
+                f"Suggerimento: usa un modello piu' capace (es. anthropic/claude) o "
+                f"riformula il prompt in modo piu' specifico."
+            )
+            assistant_msg = AIMessage(content=loop_msg)
+            pending_tool_uses = []
+            stop_reason = "loop_detected"
+            result_text = loop_msg
+            new_signatures = []  # reset, non accumulare ulteriormente
+        else:
+            # Persisti lo stato di escalation per evitare retry infiniti.
+            escalations += 1
 
     # Mantieni solo le ultime ~12 signature per non gonfiare lo state.
     updated_signatures = (recent + new_signatures)[-12:]
@@ -554,6 +626,7 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         "pending_tool_uses": pending_tool_uses,
         "stop_reason": stop_reason,
         "recent_tool_signatures": updated_signatures,
+        "auto_escalations": escalations if loop_sig is not None else int(state.get("auto_escalations") or 0),
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "cache_creation_tokens": cache_creation_tokens,

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { reloadGatewayConfig } from "../../lib/api-client";
+import { reloadGatewayConfig, updateAdminSetting } from "../../lib/api-client";
 
 interface GatewayConfigProps {
   items: Array<{ key: string; value: string; description: string; is_secret: boolean }>;
@@ -13,6 +13,9 @@ interface GatewayConfigProps {
 export function GatewayConfig({ items, onSaveComplete, onRefreshProviders }: GatewayConfigProps) {
   const [reloading, setReloading] = useState(false);
   const [reloadMsg, setReloadMsg] = useState<string | null>(null);
+  const [edit, setEdit] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState<Record<string, boolean>>({});
+  const [saveMsg, setSaveMsg] = useState<string | null>(null);
 
   const handleReload = async () => {
     setReloading(true);
@@ -28,6 +31,22 @@ export function GatewayConfig({ items, onSaveComplete, onRefreshProviders }: Gat
       setReloadMsg(`Errore: ${(e as Error).message}`);
     } finally {
       setReloading(false);
+    }
+  };
+
+  const handleSave = async (key: string) => {
+    const nextValue = (edit[key] ?? "").trim();
+    if (!nextValue) return;
+    setSaveMsg(null);
+    setSaving((prev) => ({ ...prev, [key]: true }));
+    try {
+      await updateAdminSetting(key, nextValue);
+      setSaveMsg(`Salvato ${key}. Ora clicca "Ricarica dal DB" per applicare al gateway.`);
+      onSaveComplete();
+    } catch (e: unknown) {
+      setSaveMsg(`Errore: ${(e as Error).message}`);
+    } finally {
+      setSaving((prev) => ({ ...prev, [key]: false }));
     }
   };
 
@@ -82,17 +101,76 @@ export function GatewayConfig({ items, onSaveComplete, onRefreshProviders }: Gat
             "health_check_interval_ms", "default_max_tokens"].map((key) => {
             const item = items.find((i) => i.key === key);
             if (!item) return null;
+            const value = edit[key] ?? item.value ?? "";
+            const isBusy = saving[key] ?? false;
             return (
               <div key={key} style={{
                 padding: "8px 12px", background: "var(--color-bgInput)",
                 borderRadius: 6, border: "1px solid var(--color-border)",
               }}>
                 <div style={{ fontSize: 10, color: "var(--color-textMuted)", marginBottom: 2 }}>{key}</div>
-                <div style={{ fontSize: 13, fontWeight: 600 }}>{item.value || "—"}</div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4, flexWrap: "wrap" }}>
+                  <input
+                    inputMode="numeric"
+                    value={value}
+                    onChange={(event) => setEdit((prev) => ({ ...prev, [key]: event.target.value }))}
+                    placeholder={item.value || "—"}
+                    style={{
+                      flex: "1 1 140px",
+                      fontFamily: "inherit",
+                      fontSize: 13,
+                      fontWeight: 600,
+                      padding: "6px 8px",
+                      borderRadius: 6,
+                      border: "1px solid var(--color-border)",
+                      background: "var(--color-bgCard)",
+                      color: "var(--color-text)",
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void handleSave(key)}
+                    disabled={isBusy || !value.trim() || value.trim() === (item.value ?? "").trim()}
+                    style={{
+                      padding: "6px 10px",
+                      borderRadius: 6,
+                      border: "1px solid var(--color-border)",
+                      background: isBusy ? "var(--color-bgInput)" : "var(--color-bgCard)",
+                      color: "var(--color-text)",
+                      cursor: isBusy ? "not-allowed" : "pointer",
+                      fontSize: 12,
+                      fontWeight: 700,
+                      opacity:
+                        isBusy || !value.trim() || value.trim() === (item.value ?? "").trim()
+                          ? 0.65
+                          : 1,
+                    }}
+                    title="Salva nel DB (poi usa 'Ricarica dal DB' sopra)"
+                  >
+                    {isBusy ? "Salvo..." : "Salva"}
+                  </button>
+                </div>
+                {item.description && (
+                  <div style={{ fontSize: 11, color: "var(--color-textMuted)", marginTop: 6 }}>
+                    {item.description}
+                  </div>
+                )}
               </div>
             );
           })}
         </div>
+        {saveMsg && (
+          <p
+            style={{
+              marginTop: 10,
+              fontSize: 12,
+              color: saveMsg.startsWith("Errore") ? "#f87171" : "#4ade80",
+              whiteSpace: "pre-wrap",
+            }}
+          >
+            {saveMsg}
+          </p>
+        )}
       </div>
     </div>
   );

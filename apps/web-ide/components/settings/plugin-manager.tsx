@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   createMcpServer,
   deleteMcpServer,
+  draftPluginIntegration,
   getFigmaOAuthStatus,
   installPlugin,
   listAdminSettings,
@@ -11,6 +12,7 @@ import {
   listMcpServers,
   listPluginCatalog,
   migrateLegacyMcpServerToPlugin,
+  publishPluginIntegration,
   testPlugin,
   togglePlugin,
   uninstallPlugin,
@@ -20,6 +22,8 @@ import {
   startFigmaOAuth,
   type AdminSettingEntry,
   type FigmaOAuthStatus,
+  type IntegratePluginDraftPayload,
+  type IntegratePluginDraftResult,
   type McpServer,
   type PluginCatalogItem,
   type PluginInstance,
@@ -89,6 +93,24 @@ function detectLegacyMigratableSlug(server: McpServer): string | null {
   if (command === "npx" && args.some((item) => item.includes("@playwright/mcp"))) {
     return "playwright-stdio";
   }
+  if (command === "npx" && args.some((item) => item.includes("@modelcontextprotocol/server-redis"))) {
+    return "redis-stdio";
+  }
+  if (command === "npx" && args.some((item) => item.includes("@modelcontextprotocol/server-sqlite"))) {
+    return "sqlite-stdio";
+  }
+  if (command === "npx" && args.some((item) => item.includes("@modelcontextprotocol/server-postgres"))) {
+    return "postgres-stdio";
+  }
+  if (command === "npx" && args.some((item) => item.includes("@modelcontextprotocol/server-gitlab"))) {
+    return "gitlab-stdio";
+  }
+  if (command === "npx" && args.some((item) => item.includes("@modelcontextprotocol/server-github"))) {
+    return "github-stdio";
+  }
+  if (command === "npx" && args.some((item) => item.includes("@modelcontextprotocol/server-memory"))) {
+    return "memory-stdio";
+  }
   return null;
 }
 
@@ -128,10 +150,12 @@ export function PluginManager() {
   const [info, setInfo] = useState<string | null>(null);
   const [catalogSearch, setCatalogSearch] = useState("");
   const [installScope, setInstallScope] = useState<"global" | "project" | "user">("global");
+  const [showAlreadyPresent, setShowAlreadyPresent] = useState(false);
   const [catalogReleaseChoice, setCatalogReleaseChoice] = useState<Record<string, string>>({});
   const [instanceReleaseChoice, setInstanceReleaseChoice] = useState<Record<string, string>>({});
   const [policyDrafts, setPolicyDrafts] = useState<Record<string, PolicyDraft>>({});
   const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({});
+  const [integrateDraft, setIntegrateDraft] = useState<IntegratePluginDraftResult | null>(null);
 
   const loadData = useCallback(async () => {
     setError(null);
@@ -228,6 +252,25 @@ export function PluginManager() {
     });
   }, [catalogSearch]);
 
+  const legacyServerKeys = useMemo(() => {
+    return new Set(
+      legacyConnectors.map((server) => `${server.name.toLowerCase()}::${server.transport}`),
+    );
+  }, [legacyConnectors]);
+
+  const visibleCuratedCatalog = useMemo(() => {
+    if (showAlreadyPresent) return filteredCatalog;
+    return filteredCatalog.filter((item) => !installedSlugSet.has(item.slug.toLowerCase()));
+  }, [filteredCatalog, installedSlugSet, showAlreadyPresent]);
+
+  const visibleLegacyPresetCatalog = useMemo(() => {
+    if (showAlreadyPresent) return filteredLegacyCatalog;
+    return filteredLegacyCatalog.filter((entry) => {
+      const legacyKey = `${entry.name.toLowerCase()}::${entry.transport}`;
+      return !legacyServerKeys.has(legacyKey);
+    });
+  }, [filteredLegacyCatalog, legacyServerKeys, showAlreadyPresent]);
+
   const requiredSecretRefs = useMemo(() => {
     const keys = new Set<string>();
     for (const item of catalog) {
@@ -249,12 +292,6 @@ export function PluginManager() {
     const normalized = raw.trim().toLowerCase();
     return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
   }, [figmaOAuthStatus?.preferStdioFallback, settingsByKey]);
-
-  const legacyServerKeys = useMemo(() => {
-    return new Set(
-      legacyConnectors.map((server) => `${server.name.toLowerCase()}::${server.transport}`),
-    );
-  }, [legacyConnectors]);
 
   const handleInstall = useCallback(
     async (item: PluginCatalogItem) => {
@@ -321,6 +358,84 @@ export function PluginManager() {
     },
     [catalogReleaseChoice, installScope, installedSlugSet, loadData, promptDialog],
   );
+
+  const handleIntegrateMcp = useCallback(async () => {
+    try {
+      setError(null);
+      setInfo(null);
+
+      const slug = await promptDialog(
+        "Slug (es. 'my-mcp-http' o 'my-mcp-stdio')",
+        "",
+        "Integra MCP → Catalogo (bozza)",
+      );
+      if (!slug?.trim()) return;
+
+      const name = await promptDialog("Nome visualizzato", "", "Integra MCP");
+      if (!name?.trim()) return;
+
+      const transportRaw = await promptDialog("Transport: 'http' oppure 'stdio'", "http", "Integra MCP");
+      if (!transportRaw?.trim()) return;
+      const transport = transportRaw.trim().toLowerCase() === "stdio" ? "stdio" : "http";
+
+      const payload: IntegratePluginDraftPayload = {
+        slug: slug.trim(),
+        name: name.trim(),
+        transport,
+        description: "",
+        defaultScope: "global",
+      };
+
+      if (transport === "http") {
+        const httpUrl = await promptDialog(
+          "URL del server MCP (es. https://example.com/mcp)",
+          "",
+          "Integra MCP (HTTP)",
+        );
+        if (!httpUrl?.trim()) return;
+        payload.httpUrl = httpUrl.trim();
+      } else {
+        const cmd = await promptDialog("Comando (es. npx, node, python)", "npx", "Integra MCP (stdio)");
+        if (!cmd?.trim()) return;
+        payload.stdioCommand = cmd.trim();
+
+        const argsCsv = await promptDialog(
+          "Args (CSV). Esempio: -y, @scope/pkg@latest, --flag",
+          "",
+          "Integra MCP (stdio)",
+        );
+        if (argsCsv?.trim()) {
+          payload.stdioArgs = normalizeCsv(argsCsv);
+        }
+      }
+
+      setBusyKey("integrate:draft");
+      const draft = await draftPluginIntegration(payload);
+      setIntegrateDraft(draft);
+
+      const topTools = draft.discoveredTools.slice(0, 12).map((t) => `- ${t.name}`).join("\n");
+      const ok = await confirmDialog(
+        `Tool scoperti: ${draft.toolCount}\n\n${topTools}${draft.toolCount > 12 ? "\n- …" : ""}\n\nVuoi pubblicare nel catalogo?`,
+        "Bozza creata",
+      );
+      if (!ok) return;
+
+      setBusyKey("integrate:publish");
+      const res = await publishPluginIntegration({
+        item: draft.item,
+        version: "1.0.0",
+        changelog: "Integrated via admin wizard",
+      });
+
+      setInfo(`Pubblicato nel catalogo: ${res.slug} (${res.version}).`);
+      setActiveTab("catalog");
+      await loadData();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Errore integrazione MCP.");
+    } finally {
+      setBusyKey(null);
+    }
+  }, [confirmDialog, loadData, promptDialog]);
 
   const handleToggle = useCallback(
     async (plugin: PluginInstance) => {
@@ -757,59 +872,8 @@ export function PluginManager() {
         </div>
       </div>
 
-      {requiredSecretRefs.length > 0 && (
-        <div className="card-sm flex-col-gap-8" style={{ marginBottom: 14 }}>
-          <div className="text-base font-bold">
-            Chiavi richieste dai plugin
-          </div>
-          <div className="text-sm text-muted">
-            Inserisci qui le chiavi mancanti. Le chiavi sono salvate lato server e non vengono restituite in chiaro.
-          </div>
-          {requiredSecretRefs.map((key) => {
-            const setting = settingsByKey.get(key);
-            const hasValue = setting?.has_value ?? false;
-            return (
-              <div key={key} style={{ display: "grid", gap: 6 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ fontFamily: "monospace", fontSize: 12, color: tc.text }}>{key}</span>
-                  <span
-                    style={{
-                      fontSize: 10,
-                      padding: "2px 6px",
-                      borderRadius: 999,
-                      border: `1px solid ${hasValue ? "#22c55e66" : tc.warning}`,
-                      color: hasValue ? "#16a34a" : tc.warning,
-                      textTransform: "uppercase",
-                      fontWeight: 600,
-                    }}
-                  >
-                    {hasValue ? "configurata" : "mancante"}
-                  </span>
-                </div>
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                  <input
-                    type="password"
-                    value={secretDrafts[key] ?? ""}
-                    placeholder="Inserisci valore segreto"
-                    onChange={(event) =>
-                      setSecretDrafts((prev) => ({ ...prev, [key]: event.target.value }))
-                    }
-                    style={inputStyle(tc)}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => void handleSaveSecret(key)}
-                    disabled={busyKey === `secret:${key}` || !(secretDrafts[key] ?? "").trim()}
-                    style={actionButtonStyle(tc, busyKey === `secret:${key}` || !(secretDrafts[key] ?? "").trim())}
-                  >
-                    {busyKey === `secret:${key}` ? "Salvo..." : "Salva chiave"}
-                  </button>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
+      {/* Nota UX: le chiavi richieste ora sono richieste nel contesto del singolo plugin (tab "Installati"),
+          così l'utente non deve cercarle in alto. */}
 
       {(error || info) && (
         <div className="text-sm" style={{
@@ -826,24 +890,49 @@ export function PluginManager() {
       )}
 
       <div className="flex-row" style={{ gap: 8, marginBottom: 14 }}>
-        {tabs.map((tab) => (
-          <button
-            key={tab.id}
-            type="button"
-            onClick={() => setActiveTab(tab.id)}
-            className="text-sm font-semibold"
-            style={{
-              borderRadius: 999,
-              border: `1px solid ${activeTab === tab.id ? tc.accent : tc.border}`,
-              background: activeTab === tab.id ? `${tc.accent}15` : tc.bgInput,
-              color: activeTab === tab.id ? tc.accent : tc.textMuted,
-              padding: "5px 12px",
-              cursor: "pointer",
-            }}
-          >
-            {tab.label}
-          </button>
-        ))}
+        <div className="flex-row" style={{ gap: 8, flexWrap: "wrap" }}>
+          {tabs.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => setActiveTab(tab.id)}
+              className="text-sm font-semibold"
+              style={{
+                borderRadius: 999,
+                border: `1px solid ${activeTab === tab.id ? tc.accent : tc.border}`,
+                background: activeTab === tab.id ? `${tc.accent}15` : tc.bgInput,
+                color: activeTab === tab.id ? tc.accent : tc.textMuted,
+                padding: "5px 12px",
+                cursor: "pointer",
+              }}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+        <div style={{ flex: 1 }} />
+        <button
+          type="button"
+          onClick={() => void handleIntegrateMcp()}
+          disabled={busyKey === "integrate:draft" || busyKey === "integrate:publish"}
+          className="text-sm font-semibold"
+          style={{
+            borderRadius: 999,
+            border: `1px solid ${tc.border}`,
+            background: tc.bgInput,
+            color: tc.text,
+            padding: "5px 12px",
+            cursor: "pointer",
+            opacity: busyKey === "integrate:draft" || busyKey === "integrate:publish" ? 0.7 : 1,
+          }}
+          title="Crea una entry nel catalogo via tool discovery"
+        >
+          {busyKey === "integrate:draft"
+            ? "Integro…"
+            : busyKey === "integrate:publish"
+              ? "Pubblico…"
+              : "+ Integra MCP"}
+        </button>
       </div>
 
       {activeTab === "installed" && (
@@ -858,6 +947,8 @@ export function PluginManager() {
             const releases = catalogItem?.releases ?? [];
             const selectedVersion = instanceReleaseChoice[plugin.id] || plugin.version || "";
             const isBusy = busyKey?.includes(plugin.id) ?? false;
+            const requiredKeys = (catalogItem?.requiredSecretRefs ?? []).map((k) => k.trim()).filter(Boolean);
+            const missingKeys = requiredKeys.filter((key) => !(settingsByKey.get(key)?.has_value ?? false));
             return (
               <div
                 key={plugin.id}
@@ -908,6 +999,49 @@ export function PluginManager() {
                   Versione: {plugin.version ?? "n/a"} · Health: {plugin.healthStatus}
                   {plugin.lastHealthMessage ? ` · ${plugin.lastHealthMessage}` : ""}
                 </div>
+
+                {missingKeys.length > 0 && plugin.canManage && (
+                  <div
+                    style={{
+                      border: `1px solid ${tc.warning}`,
+                      background: `${tc.warning}10`,
+                      borderRadius: 10,
+                      padding: "10px 12px",
+                      marginBottom: 10,
+                      display: "grid",
+                      gap: 8,
+                    }}
+                  >
+                    <div style={{ fontWeight: 700, fontSize: 12, color: tc.warning }}>
+                      Chiavi mancanti per usare questo MCP
+                    </div>
+                    <div style={{ fontSize: 12, color: tc.textMuted }}>
+                      Inserisci le chiavi richieste qui sotto. Sono salvate lato server e non vengono restituite in chiaro.
+                    </div>
+                    {missingKeys.map((key) => (
+                      <div key={key} style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                        <span style={{ fontFamily: "monospace", fontSize: 12, color: tc.text, minWidth: 220 }}>
+                          {key}
+                        </span>
+                        <input
+                          type="password"
+                          value={secretDrafts[key] ?? ""}
+                          placeholder="Inserisci valore segreto"
+                          onChange={(event) => setSecretDrafts((prev) => ({ ...prev, [key]: event.target.value }))}
+                          style={inputStyle(tc)}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => void handleSaveSecret(key)}
+                          disabled={busyKey === `secret:${key}` || !(secretDrafts[key] ?? "").trim()}
+                          style={actionButtonStyle(tc, busyKey === `secret:${key}` || !(secretDrafts[key] ?? "").trim())}
+                        >
+                          {busyKey === `secret:${key}` ? "Salvo..." : "Salva chiave"}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
 
                 <div className="flex-row" style={{ flexWrap: "wrap", gap: 8 }}>
                   <button
@@ -990,6 +1124,24 @@ export function PluginManager() {
               <option value="project">Scope progetto</option>
               <option value="user">Scope utente</option>
             </select>
+            <button
+              type="button"
+              onClick={() => setShowAlreadyPresent((v) => !v)}
+              style={{
+                border: `1px solid ${tc.border}`,
+                background: showAlreadyPresent ? `${tc.accent}15` : tc.bgInput,
+                color: showAlreadyPresent ? tc.accent : tc.textMuted,
+                borderRadius: 999,
+                padding: "5px 10px",
+                fontSize: 12,
+                cursor: "pointer",
+                fontWeight: 600,
+                whiteSpace: "nowrap",
+              }}
+              title="Mostra/nasconde elementi già presenti (installati o già aggiunti come legacy)"
+            >
+              {showAlreadyPresent ? "Mostra: tutti" : "Mostra: non presenti"}
+            </button>
           </div>
 
           <div
@@ -1006,7 +1158,7 @@ export function PluginManager() {
               Catalogo plugin curato (installazione plugin)
             </div>
             <div style={{ display: "grid", gap: 10 }}>
-              {filteredCatalog.map((item) => {
+              {visibleCuratedCatalog.map((item) => {
                 const selectedVersion = catalogReleaseChoice[item.id] || defaultReleaseVersion(item);
                 const alreadyInstalled = installedSlugSet.has(item.slug.toLowerCase());
                 const missingSecrets = item.requiredSecretRefs.filter((key) => {
@@ -1018,9 +1170,9 @@ export function PluginManager() {
                   <div
                     key={item.id}
                     style={{
-                      border: `1px solid ${tc.border}`,
+                      border: `1px solid ${alreadyInstalled ? "#f59e0b66" : tc.border}`,
                       borderRadius: 10,
-                      background: tc.bgCard,
+                      background: alreadyInstalled ? "#f59e0b12" : tc.bgCard,
                       padding: "10px 12px",
                     }}
                   >
@@ -1127,16 +1279,16 @@ export function PluginManager() {
               Se un plugin non è nel catalogo curato, puoi aggiungerlo come MCP legacy e poi migrarlo quando disponibile.
             </div>
             <div style={{ display: "grid", gap: 8 }}>
-              {filteredLegacyCatalog.map((entry) => {
+              {visibleLegacyPresetCatalog.map((entry) => {
                 const legacyKey = `${entry.name.toLowerCase()}::${entry.transport}`;
                 const alreadyAdded = legacyServerKeys.has(legacyKey);
                 return (
                   <div
                     key={entry.id}
                     style={{
-                      border: `1px solid ${tc.border}`,
+                      border: `1px solid ${alreadyAdded ? "#f59e0b66" : tc.border}`,
                       borderRadius: 10,
-                      background: tc.bgCard,
+                      background: alreadyAdded ? "#f59e0b12" : tc.bgCard,
                       padding: "10px 12px",
                     }}
                   >
@@ -1275,6 +1427,7 @@ export function PluginManager() {
           )}
           {legacyConnectors.map((server) => {
             const slug = detectLegacyMigratableSlug(server);
+            const isBuiltin = (server.transport as string) === "builtin";
             return (
               <div
                 key={server.id}
@@ -1302,6 +1455,21 @@ export function PluginManager() {
                   <span style={{ fontSize: 11, color: tc.textMuted }}>
                     {server.enabled ? "enabled" : "disabled"}
                   </span>
+                  {isBuiltin && (
+                    <span
+                      style={{
+                        fontSize: 10,
+                        border: "1px solid #22c55e66",
+                        borderRadius: 999,
+                        padding: "2px 6px",
+                        color: "#16a34a",
+                        textTransform: "uppercase",
+                      }}
+                      title="MCP integrato nel core Nexus (non è un legacy da migrare)"
+                    >
+                      integrato
+                    </span>
+                  )}
                   {slug && (
                     <span
                       style={{
@@ -1326,23 +1494,28 @@ export function PluginManager() {
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
                     <button
                       type="button"
-                      disabled={!slug || busyKey === `legacy-migrate:${server.id}`}
+                      disabled={isBuiltin || !slug || busyKey === `legacy-migrate:${server.id}`}
                       onClick={() => void handleMigrateLegacy(server)}
-                      style={actionButtonStyle(tc, !slug || busyKey === `legacy-migrate:${server.id}`)}
+                      style={actionButtonStyle(
+                        tc,
+                        isBuiltin || !slug || busyKey === `legacy-migrate:${server.id}`,
+                      )}
                     >
-                      {!slug
-                        ? "Non migrabile automaticamente"
+                      {isBuiltin
+                        ? "Già integrato"
+                        : !slug
+                          ? "Non migrabile automaticamente"
                         : busyKey === `legacy-migrate:${server.id}`
                           ? "Migrazione..."
                           : "Migra a plugin"}
                     </button>
                     <button
                       type="button"
-                      disabled={busyKey === `legacy-delete:${server.id}`}
+                      disabled={isBuiltin || busyKey === `legacy-delete:${server.id}`}
                       onClick={() => void handleDeleteLegacyMcp(server)}
-                      style={actionButtonStyle(tc, busyKey === `legacy-delete:${server.id}`)}
+                      style={actionButtonStyle(tc, isBuiltin || busyKey === `legacy-delete:${server.id}`)}
                     >
-                      {busyKey === `legacy-delete:${server.id}` ? "Elimino..." : "Elimina MCP"}
+                      {isBuiltin ? "Integrato" : busyKey === `legacy-delete:${server.id}` ? "Elimino..." : "Elimina MCP"}
                     </button>
                   </div>
                 </div>

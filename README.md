@@ -27,6 +27,22 @@ Enterprise monorepo scaffold for an AI-assisted development platform with:
 6. Start the neural core with `python -m brain.grpc_server.main`.
 7. Build and run the Rust core with Cargo once Rust is installed.
 
+## Database backups (WSL/dev)
+
+If you run the local stack in WSL with `./scripts/dev-wsl.sh`, the Postgres DB lives in a Docker volume.
+To avoid losing `settings` (OAuth/API keys/routing) on `docker compose down -v`, use the backup scripts:
+
+- Create a backup:
+  - `./scripts/db-backup.sh`
+- Restore from latest backup:
+  - `./scripts/db-restore.sh latest`
+- Restore from a specific file:
+  - `./scripts/db-restore.sh ./backups/postgres/nexus_YYYYmmdd_HHMMSS.dump`
+
+Notes:
+- Backups are stored in `./backups/postgres/` and are ignored by git.
+- Default retention keeps the last 40 dumps. Override with `KEEP_LAST=…`.
+
 ## Remote dev server
 
 

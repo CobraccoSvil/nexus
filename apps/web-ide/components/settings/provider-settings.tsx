@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { useTheme, useThemeColors } from "../../lib/theme";
 import { useI18n } from "../../lib/i18n";
 
@@ -93,6 +94,8 @@ export function ProviderSettings({
   const tc = useThemeColors();
   const { resolved } = useTheme();
   const { t } = useI18n();
+  const [embeddingMsg, setEmbeddingMsg] = useState<string | null>(null);
+  const [embeddingBusy, setEmbeddingBusy] = useState(false);
 
   // Set di chiavi _enabled già incorporate nei card delle API key — non vanno mostrate come card separati
   const embeddedEnabledKeys = new Set(PROVIDER_NAMES.map((p) => `${p}_enabled`));
@@ -476,6 +479,214 @@ export function ProviderSettings({
                   <span style={{ fontSize: 12, color: "var(--color-textSecondary)" }}>
                     {currentValue === "true" ? "Abilitata (50% costo rispetto alle chiamate sincrone)" : "Disabilitata"}
                   </span>
+                </div>
+              ) : setting.key === "quality_auto_scan" ? (
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4, flexWrap: "wrap" }}>
+                  <button
+                    onClick={() => {
+                      const newVal = currentValue === "true" ? "false" : "true";
+                      onEditChange(setting.key, newVal);
+                    }}
+                    style={{
+                      width: 44,
+                      height: 24,
+                      borderRadius: 12,
+                      border: "none",
+                      background: currentValue === "true" ? tc.success : tc.bgInput,
+                      cursor: "pointer",
+                      position: "relative",
+                      transition: "background 0.2s",
+                      flexShrink: 0,
+                      outline: `1px solid ${tc.border}`,
+                    }}
+                    title={currentValue === "true" ? "Attivo — clicca per disabilitare" : "Non attivo — clicca per abilitare"}
+                  >
+                    <span
+                      style={{
+                        position: "absolute",
+                        top: 3,
+                        left: currentValue === "true" ? 23 : 3,
+                        width: 18,
+                        height: 18,
+                        borderRadius: "50%",
+                        background: "#fff",
+                        transition: "left 0.2s",
+                        boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
+                      }}
+                    />
+                  </button>
+                  <span style={{ fontSize: 12, color: "var(--color-textSecondary)" }}>
+                    {currentValue === "true" ? "Auto-scan attivo" : "Auto-scan disattivo"}
+                  </span>
+                </div>
+              ) : setting.key === "quality_severity_threshold" ? (
+                <select
+                  value={currentValue || "medium"}
+                  onChange={(event) => onEditChange(setting.key, event.target.value)}
+                  style={{
+                    width: "100%",
+                    padding: "8px 12px",
+                    borderRadius: 6,
+                    border: `1px solid ${isEditing ? tc.accent : tc.border}`,
+                    background: "var(--color-bgInput)",
+                    color: tc.text,
+                    fontSize: 13,
+                    fontFamily: "inherit",
+                    boxSizing: "border-box",
+                    cursor: "pointer",
+                  }}
+                >
+                  {["low", "medium", "high"].map((opt) => (
+                    <option key={opt} value={opt}>
+                      {opt}
+                    </option>
+                  ))}
+                </select>
+              ) : setting.key === "embedding_model" ? (
+                <div style={{ display: "grid", gap: 8 }}>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                    <select
+                      value={
+                        (currentValue || "all-MiniLM-L6-v2") === "all-MiniLM-L6-v2"
+                          ? "all-MiniLM-L6-v2"
+                          : "__custom__"
+                      }
+                      onChange={(event) => {
+                        setEmbeddingMsg(null);
+                        const v = event.target.value;
+                        if (v === "__custom__") {
+                          // attiva custom
+                          if (currentValue === "all-MiniLM-L6-v2") onEditChange(setting.key, "");
+                          return;
+                        }
+                        onEditChange(setting.key, v);
+                      }}
+                      style={{
+                        flex: "1 1 220px",
+                        minWidth: 220,
+                        padding: "8px 12px",
+                        borderRadius: 6,
+                        border: `1px solid ${isEditing ? tc.accent : tc.border}`,
+                        background: "var(--color-bgInput)",
+                        color: tc.text,
+                        fontSize: 13,
+                        fontFamily: "inherit",
+                        boxSizing: "border-box",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <option value="all-MiniLM-L6-v2">all-MiniLM-L6-v2 (curato)</option>
+                      <option value="__custom__">Custom…</option>
+                    </select>
+
+                    <button
+                      type="button"
+                      disabled={embeddingBusy || !(currentValue ?? "").trim()}
+                      onClick={async () => {
+                        try {
+                          setEmbeddingBusy(true);
+                          setEmbeddingMsg(null);
+                          const res = await fetch("/api/admin/embeddings/validate", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            credentials: "include",
+                            body: JSON.stringify({ model: (currentValue ?? "").trim() }),
+                          });
+                          const data = await res.json().catch(() => ({}));
+                          if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+                          setEmbeddingMsg(`OK. dimensions=${data.dimensions}`);
+                        } catch (e) {
+                          setEmbeddingMsg(`Errore: ${e instanceof Error ? e.message : "validazione fallita"}`);
+                        } finally {
+                          setEmbeddingBusy(false);
+                        }
+                      }}
+                      style={{
+                        padding: "4px 10px",
+                        borderRadius: 6,
+                        border: "1px solid var(--color-border)",
+                        background: "var(--color-bgInput)",
+                        color: "var(--color-textSecondary)",
+                        fontSize: 11,
+                        cursor: embeddingBusy ? "not-allowed" : "pointer",
+                        fontFamily: "inherit",
+                        opacity: embeddingBusy ? 0.7 : 1,
+                      }}
+                      title="Verifica che il modello sia caricabile e legge la dimensione embeddings"
+                    >
+                      {embeddingBusy ? "..." : "Valida"}
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={embeddingBusy || !(currentValue ?? "").trim()}
+                      onClick={async () => {
+                        try {
+                          setEmbeddingBusy(true);
+                          setEmbeddingMsg(null);
+                          const res = await fetch("/api/admin/embeddings/apply", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            credentials: "include",
+                            body: JSON.stringify({ model: (currentValue ?? "").trim(), reindex: true }),
+                          });
+                          const data = await res.json().catch(() => ({}));
+                          if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+                          setEmbeddingMsg(
+                            `Applicato. dim=${data.dimensions}, collection=${data.qdrantCollection}. Reindex completato.`,
+                          );
+                        } catch (e) {
+                          setEmbeddingMsg(`Errore: ${e instanceof Error ? e.message : "apply fallito"}`);
+                        } finally {
+                          setEmbeddingBusy(false);
+                        }
+                      }}
+                      style={{
+                        padding: "4px 10px",
+                        borderRadius: 6,
+                        border: "1px solid var(--color-border)",
+                        background: tc.accentBg,
+                        color: tc.accent,
+                        fontSize: 11,
+                        cursor: embeddingBusy ? "not-allowed" : "pointer",
+                        fontFamily: "inherit",
+                        opacity: embeddingBusy ? 0.7 : 1,
+                      }}
+                      title="Applica il modello e fa reindex (reset della collection dedicata)"
+                    >
+                      {embeddingBusy ? "..." : "Applica + Reindex"}
+                    </button>
+                  </div>
+
+                  {(currentValue || "") !== "all-MiniLM-L6-v2" && (
+                    <input
+                      type="text"
+                      value={currentValue}
+                      placeholder="es. sentence-transformers/all-MiniLM-L6-v2 oppure BAAI/bge-small-en-v1.5"
+                      onChange={(event) => onEditChange(setting.key, event.target.value)}
+                      style={{
+                        width: "100%",
+                        padding: "8px 12px",
+                        borderRadius: 6,
+                        border: `1px solid ${isEditing ? tc.accent : tc.border}`,
+                        background: "var(--color-bgInput)",
+                        color: tc.text,
+                        fontSize: 13,
+                        fontFamily: "inherit",
+                        boxSizing: "border-box",
+                      }}
+                    />
+                  )}
+
+                  <div style={{ fontSize: 11, color: "var(--color-textMuted)" }}>
+                    Custom richiede validazione: Nexus legge la dimensione dal Neural Core e crea una collection Qdrant dedicata.
+                    Con “Applica + Reindex” la collection viene resettata (vector size coerente).
+                  </div>
+                  {embeddingMsg && (
+                    <div style={{ fontSize: 12, color: embeddingMsg.startsWith("Errore") ? tc.error : tc.success }}>
+                      {embeddingMsg}
+                    </div>
+                  )}
                 </div>
               ) : (
                 <input

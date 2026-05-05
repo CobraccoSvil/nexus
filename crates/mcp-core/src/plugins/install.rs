@@ -604,18 +604,41 @@ pub async fn migrate_legacy_mcp_server(
     if let Some((existing_id, _, _, _)) =
         find_duplicate_instance_anywhere(&state.db, catalog.id, &catalog.slug).await?
     {
-        sqlx::query(
-            "UPDATE mcp_servers SET plugin_instance_id = $2, updated_at = NOW() WHERE id = $1",
+        // Esiste già un plugin instance per questo catalog item.
+        // Se quell'istanza ha già un adapter mcp_servers collegato, NON possiamo collegarne un secondo
+        // (vincolo UNIQUE su mcp_servers.plugin_instance_id). In quel caso, rendiamo la migrazione idempotente:
+        // ritorniamo l'istanza esistente e puliamo il legacy server duplicato.
+        let existing_adapter = sqlx::query(
+            "SELECT id FROM mcp_servers WHERE plugin_instance_id = $1 LIMIT 1",
         )
-        .bind(server_id)
         .bind(existing_id)
-        .execute(&state.db)
+        .fetch_optional(&state.db)
         .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .ok()
+        .flatten();
+
+        if existing_adapter.is_some() {
+            // Il plugin è già operativo con un adapter: rimuovi il duplicato legacy per evitare confusione in UI.
+            let _ = sqlx::query("DELETE FROM mcp_servers WHERE id = $1")
+                .bind(server_id)
+                .execute(&state.db)
+                .await;
+        } else {
+            // Nessun adapter ancora collegato: possiamo "promuovere" il legacy server collegandolo al plugin.
+            sqlx::query(
+                "UPDATE mcp_servers SET plugin_instance_id = $2, updated_at = NOW() WHERE id = $1",
+            )
+            .bind(server_id)
+            .bind(existing_id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
 
         return Ok(Json(json!({
             "ok": true,
             "linkedExisting": true,
+            "alreadyMigrated": existing_adapter.is_some(),
             "pluginInstanceId": existing_id.to_string(),
             "slug": catalog.slug,
         })));

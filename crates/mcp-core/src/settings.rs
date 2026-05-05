@@ -145,6 +145,58 @@ fn map_create_dir_error(error: std::io::Error) -> ApiError {
 }
 
 async fn ensure_required_settings(state: &super::AppState) {
+    // DLP settings: seed nel DB così la UI "Sicurezza & Privacy" ha sempre i toggle disponibili.
+    // I valori di default vengono presi da env (NEXUS_DLP_*). Se l'utente ha già impostato qualcosa
+    // nel DB (valore non vuoto), non lo sovrascriviamo.
+    let dlp_enabled = std::env::var("NEXUS_DLP_ENABLED").unwrap_or_else(|_| "true".to_string());
+    let allow_tier2 = std::env::var("NEXUS_ALLOW_CLOUD_TIER2").unwrap_or_else(|_| "true".to_string());
+    let allow_tier3 = std::env::var("NEXUS_ALLOW_CLOUD_TIER3").unwrap_or_else(|_| "false".to_string());
+
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO settings (key, value, category, description, is_secret, updated_at)
+        VALUES
+          ('dlp_enabled', $1, 'security', 'Abilita/disabilita il Data Loss Prevention (classificazione sensibilità Tier).', FALSE, NOW())
+        ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value,
+            updated_at = NOW()
+        WHERE settings.value IS NULL OR btrim(settings.value) = ''
+        "#,
+    )
+    .bind(&dlp_enabled)
+    .execute(&state.db)
+    .await;
+
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO settings (key, value, category, description, is_secret, updated_at)
+        VALUES
+          ('dlp_allow_cloud_tier2', $1, 'security', 'Se true, consente di inviare Tier 2 (sensibili) verso provider cloud.', FALSE, NOW())
+        ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value,
+            updated_at = NOW()
+        WHERE settings.value IS NULL OR btrim(settings.value) = ''
+        "#,
+    )
+    .bind(&allow_tier2)
+    .execute(&state.db)
+    .await;
+
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO settings (key, value, category, description, is_secret, updated_at)
+        VALUES
+          ('dlp_allow_cloud_tier3', $1, 'security', 'Se true, consente di inviare Tier 3 (critici) verso provider cloud (sconsigliato).', FALSE, NOW())
+        ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value,
+            updated_at = NOW()
+        WHERE settings.value IS NULL OR btrim(settings.value) = ''
+        "#,
+    )
+    .bind(&allow_tier3)
+    .execute(&state.db)
+    .await;
+
     let _ = sqlx::query(
         r#"
         INSERT INTO settings (key, value, category, description, is_secret, updated_at)

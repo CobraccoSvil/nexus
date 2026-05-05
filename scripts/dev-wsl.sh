@@ -117,12 +117,23 @@ fi
 
 # ── Docker locale ──────────────────────────────────────────────────────────────
 info "Avvio servizi Docker locali (redis, qdrant, monitoring)..."
-docker compose -f docker-compose.local.yml up -d --quiet-pull
+if ss -tln 2>/dev/null | grep -qE '(:|\.)6379\s'; then
+    warn "Porta 6379 già in uso: userò Redis già attivo su localhost e NON avvierò il container redis."
+    docker compose -f docker-compose.local.yml up -d --quiet-pull postgres-nexus qdrant otel-collector jaeger prometheus grafana
+else
+    docker compose -f docker-compose.local.yml up -d --quiet-pull
+fi
 
 info "Attesa redis..."
-for i in $(seq 1 30); do
-    docker compose -f docker-compose.local.yml exec -T redis redis-cli ping &>/dev/null && break || sleep 1
-done
+if ss -tln 2>/dev/null | grep -qE '(:|\.)6379\s'; then
+    for i in $(seq 1 30); do
+        redis-cli ping &>/dev/null && break || sleep 1
+    done
+else
+    for i in $(seq 1 30); do
+        docker compose -f docker-compose.local.yml exec -T redis redis-cli ping &>/dev/null && break || sleep 1
+    done
+fi
 
 # ── Node deps ──────────────────────────────────────────────────────────────────
 if [ ! -d node_modules ]; then
@@ -171,22 +182,31 @@ sleep 3
 
 # ── Nexus Gateway (Node.js/TypeScript, :4060) ─────────────────────────────────
 info "Avvio Nexus LLM Gateway (:4060)..."
-pkill -f "tsx.*server.ts" 2>/dev/null || true
+pkill -f "$REPO_ROOT/apps/nexus-gateway/src/server.ts" 2>/dev/null || true
 sleep 0.5
-nohup "$REPO_ROOT/apps/nexus-gateway/node_modules/.bin/tsx" watch \
-    --env-file="$REPO_ROOT/.env" \
-    "$REPO_ROOT/apps/nexus-gateway/src/server.ts" \
-    > "$LOG_DIR/nexus-gateway.log" 2>&1 &
+# In background affidabile: evitiamo watcher e --env-file (che può fallire con interop Windows/WSL).
+# Carichiamo `.env` in bash e avviamo il server una volta (hot-reload non necessario in dev quotidiano).
+setsid bash -lc "set -a && source \"$REPO_ROOT/.env\" && set +a && exec \"$REPO_ROOT/apps/nexus-gateway/node_modules/.bin/tsx\" \"$REPO_ROOT/apps/nexus-gateway/src/server.ts\" > \"$LOG_DIR/nexus-gateway.log\" 2>&1" &
 echo $! > "$LOG_DIR/nexus-gateway.pid"
-sleep 3
+
+# Smoke check porta
+for i in $(seq 1 10); do
+    if ss -tln 2>/dev/null | grep -qE '(:|\.)4060\s'; then
+        break
+    fi
+    sleep 0.4
+done
+if ! ss -tln 2>/dev/null | grep -qE '(:|\.)4060\s'; then
+    warn "Nexus Gateway non in ascolto su :4060 (controlla $LOG_DIR/nexus-gateway.log)"
+fi
 
 # ── Web IDE (Next.js) ──────────────────────────────────────────────────────────
 info "Avvio Web IDE (Next.js, :3000)..."
 pkill -f "next dev" 2>/dev/null || true
 pkill -f "next-server" 2>/dev/null || true
-# setsid + nohup per isolare dalla sessione WSL ed evitare SIGHUP alla chiusura del terminale
-setsid bash -c "nohup ${REPO_ROOT}/apps/web-ide/node_modules/.bin/next dev -H 0.0.0.0 \
-    > ${LOG_DIR}/webide.log 2>&1" &
+# setsid + nohup per isolare dalla sessione WSL ed evitare SIGHUP alla chiusura del terminale.
+# Nota: teniamo il redirect dentro bash -lc per preservare cwd e log coerenti.
+setsid bash -lc "cd \"${REPO_ROOT}/apps/web-ide\" && nohup ./node_modules/.bin/next dev -H 0.0.0.0 -p 3000 > \"${LOG_DIR}/webide.log\" 2>&1" &
 echo $! > "$LOG_DIR/webide.pid"
 sleep 5
 

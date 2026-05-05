@@ -6,6 +6,20 @@ export function getApiBaseUrl(): string {
   return API_BASE;
 }
 
+/** Route Next.js che proxyano verso admin-service (:4010) — NON devono puntare a mcp-core (:4000). */
+function adminServiceUrl(path: string): string {
+  const p = path.startsWith("/") ? path : `/${path}`;
+  if (typeof window !== "undefined") {
+    return `/api/admin${p}`;
+  }
+  // SSR: niente host relativo — proxa via Next sullo stesso origin dev (Web IDE).
+  const origin =
+    process.env.NEXT_INTERNAL_ORIGIN ||
+    process.env.NEXT_PUBLIC_APP_ORIGIN ||
+    "http://127.0.0.1:3000";
+  return `${origin}/api/admin${p}`;
+}
+
 async function fetchJson<T>(url: string, init?: RequestInit, timeoutMs = 30000): Promise<T> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort("timeout"), timeoutMs);
@@ -465,6 +479,35 @@ export async function updateAdminSetting(
     method: "PUT",
     body: JSON.stringify({ value }),
   });
+}
+
+// --- Admin Routing: Purpose models ---
+export interface PurposeModelEntry {
+  purpose: string;
+  provider: string;
+  model_id: string;
+  notes?: string | null;
+  updated_at: string;
+}
+
+export async function listAdminPurposeModels(): Promise<{ items: PurposeModelEntry[] }> {
+  return fetchJson(`${API_BASE}/api/admin/routing/purpose-models`);
+}
+
+export async function updateAdminPurposeModel(
+  purpose: string,
+  body: { provider: string; model_id: string; notes?: string | null },
+): Promise<{ status: string; purpose: string }> {
+  return fetchJson(`${API_BASE}/api/admin/routing/purpose-model/${encodeURIComponent(purpose)}`, {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function resolveInternalPurposeModel(
+  purpose: string,
+): Promise<{ purpose: string; provider: string; model: string; rationale: string }> {
+  return fetchJson(`${API_BASE}/api/internal/routing/purpose?purpose=${encodeURIComponent(purpose)}`);
 }
 
 // --- Prompt Templates ---
@@ -1907,6 +1950,68 @@ export async function migrateLegacyMcpServerToPlugin(
   });
 }
 
+// --- Plugin integration (admin) ---
+
+export interface IntegratePluginDraftPayload {
+  slug: string;
+  name: string;
+  description?: string;
+  transport: "http" | "stdio";
+  httpUrl?: string;
+  headers?: Record<string, string>;
+  stdioCommand?: string;
+  stdioArgs?: string[];
+  envVars?: Record<string, string>;
+  defaultScope?: "global" | "project" | "user";
+  requiredSecretRefs?: string[];
+  optionalSecretRefs?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface IntegratePluginDraftResult {
+  item: Record<string, unknown>;
+  discoveredTools: Array<{
+    name: string;
+    description?: string;
+    inputSchema?: unknown;
+  }>;
+  toolCount: number;
+}
+
+export async function draftPluginIntegration(
+  payload: IntegratePluginDraftPayload,
+): Promise<IntegratePluginDraftResult> {
+  return fetchJson(`${adminServiceUrl("/plugins/integrate/draft")}`, {
+    method: "POST",
+    body: JSON.stringify({
+      slug: payload.slug,
+      name: payload.name,
+      description: payload.description ?? "",
+      transport: payload.transport,
+      httpUrl: payload.httpUrl,
+      headers: payload.headers ?? {},
+      stdioCommand: payload.stdioCommand,
+      stdioArgs: payload.stdioArgs ?? [],
+      envVars: payload.envVars ?? {},
+      defaultScope: payload.defaultScope ?? "global",
+      requiredSecretRefs: payload.requiredSecretRefs ?? [],
+      optionalSecretRefs: payload.optionalSecretRefs ?? [],
+      metadata: payload.metadata ?? {},
+    }),
+  });
+}
+
+export async function publishPluginIntegration(payload: {
+  item: Record<string, unknown>;
+  version?: string;
+  changelog?: string;
+}): Promise<{ ok: boolean; catalogItemId: string; slug: string; version: string }> {
+  return fetchJson(`${adminServiceUrl("/plugins/integrate/publish")}`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 // --- Billing ---
 
 export interface BillingPrice {
@@ -3144,25 +3249,25 @@ export interface PromptDashboardData {
 }
 
 export async function listPromptExperiments(): Promise<{ experiments: PromptExperiment[]; total: number }> {
-  return fetchJson(`${API_BASE}/api/admin/prompt-experiments`);
+  return fetchJson(`${adminServiceUrl("/prompt-experiments")}`);
 }
 
 export async function getPromptExperiment(id: string): Promise<PromptExperiment> {
-  return fetchJson(`${API_BASE}/api/admin/prompt-experiments/${encodeURIComponent(id)}`);
+  return fetchJson(`${adminServiceUrl(`/prompt-experiments/${encodeURIComponent(id)}`)}`);
 }
 
 export async function forcePromoteExperiment(id: string): Promise<{ ok: boolean; decision: string }> {
-  return fetchJson(`${API_BASE}/api/admin/prompt-experiments/${encodeURIComponent(id)}/promote`, {
+  return fetchJson(`${adminServiceUrl(`/prompt-experiments/${encodeURIComponent(id)}/promote`)}`, {
     method: "POST",
   });
 }
 
 export async function forceDiscardExperiment(id: string): Promise<{ ok: boolean; decision: string }> {
-  return fetchJson(`${API_BASE}/api/admin/prompt-experiments/${encodeURIComponent(id)}/discard`, {
+  return fetchJson(`${adminServiceUrl(`/prompt-experiments/${encodeURIComponent(id)}/discard`)}`, {
     method: "POST",
   });
 }
 
 export async function getPromptDashboard(): Promise<PromptDashboardData> {
-  return fetchJson(`${API_BASE}/api/admin/prompt-dashboard`);
+  return fetchJson(`${adminServiceUrl("/prompt-dashboard")}`);
 }

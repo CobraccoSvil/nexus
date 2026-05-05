@@ -6,6 +6,7 @@ import { DebugPanel } from "./debug-panel";
 import { OutputPanel } from "./output-panel";
 import { OptimizationPanel } from "./optimization-panel";
 import { RunPanel } from "./run-panel";
+import { promptFromPlaywrightRun, promptFromPort, promptFromProblem } from "../../lib/chat-prompts";
 import type {
   AITraceEvent,
   OutputChannel,
@@ -40,6 +41,7 @@ export interface BottomPanelManagerProps {
   onOpenFile: (path: string, line?: number) => void;
   onSelectOutputChannel: (id: string) => void;
   onClearPanel?: (tab: PanelTab) => void;
+  onRefreshPanel?: (tab: PanelTab) => void;
   onSendToChat?: (message: string) => void;
   onAutoSendToChat?: (message: string) => void;
   agentRunEndSignal?: number;
@@ -93,6 +95,7 @@ export function BottomPanelManager({
   onOpenFile,
   onSelectOutputChannel,
   onClearPanel,
+  onRefreshPanel,
   onSendToChat,
   onAutoSendToChat,
   agentRunEndSignal,
@@ -101,8 +104,26 @@ export function BottomPanelManager({
   const tc = useThemeColors();
 
   const clearBar = (tab: PanelTab, hasContent: boolean) =>
-    hasContent ? (
+    (hasContent || onRefreshPanel) ? (
       <div style={{ display: "flex", justifyContent: "flex-end", padding: "4px 8px", borderBottom: `1px solid ${tc.border}`, flexShrink: 0 }}>
+        {onRefreshPanel && (
+          <button
+            onClick={() => onRefreshPanel(tab)}
+            title="Ricarica contenuto"
+            style={{
+              background: "none",
+              border: `1px solid ${tc.border}`,
+              borderRadius: 4,
+              color: tc.textMuted,
+              cursor: "pointer",
+              padding: "2px 8px",
+              fontSize: 11,
+              marginRight: 6,
+            }}
+          >
+            Refresh
+          </button>
+        )}
         <button
           onClick={() => onClearPanel?.(tab)}
           title="Cancella contenuto"
@@ -115,6 +136,7 @@ export function BottomPanelManager({
             padding: "2px 8px",
             fontSize: 11,
           }}
+          disabled={!hasContent}
         >
           Clear
         </button>
@@ -139,19 +161,58 @@ export function BottomPanelManager({
             <div style={{ color: tc.textMuted }}>Nessun problema aperto.</div>
           ) : (
             problemItems.map((item) => (
-              <button
+              <div
                 key={item.id}
-                onClick={() => item.filePath && onOpenFile(item.filePath, item.line ?? 1)}
-                style={listRowButton(tc)}
+                style={{
+                  display: "flex",
+                  alignItems: "stretch",
+                  gap: 8,
+                }}
               >
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                  <span style={{ color: tc.text, fontSize: 12 }}>{item.message}</span>
-                  <span style={{ color: severityColor(item.severity, tc), fontSize: 11 }}>{item.severity}</span>
-                </div>
-                <div style={{ color: tc.textMuted, fontSize: 11 }}>
-                  {item.source}{item.filePath ? ` • ${item.filePath}${item.line ? `:${item.line}` : ""}` : ""}
-                </div>
-              </button>
+                <button
+                  onClick={() => item.filePath && onOpenFile(item.filePath, item.line ?? 1)}
+                  style={{ ...listRowButton(tc), flex: 1, minWidth: 0 }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", columnGap: 10 }}>
+                    <span style={{ color: tc.text, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {item.message}
+                    </span>
+                    <span style={{ color: severityColor(item.severity, tc), fontSize: 11, flexShrink: 0 }}>
+                      {item.severity}
+                    </span>
+                  </div>
+                  <div style={{ color: tc.textMuted, fontSize: 11, marginTop: 4 }}>
+                    {item.source}{item.filePath ? ` • ${item.filePath}${item.line ? `:${item.line}` : ""}` : ""}
+                  </div>
+                </button>
+                {onSendToChat && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onSendToChat(promptFromProblem(item));
+                    }}
+                    title="Invia in chat un prompt per risolvere"
+                    style={{
+                      flexShrink: 0,
+                      marginLeft: 2,
+                      background: "rgba(239,68,68,0.85)",
+                      color: "#fff",
+                      border: "none",
+                      borderRadius: 3,
+                      padding: "0 6px",
+                      fontSize: 10,
+                      cursor: "pointer",
+                      verticalAlign: "middle",
+                      lineHeight: "16px",
+                      height: 16,
+                      fontWeight: 600,
+                    }}
+                    aria-label="Chiedi a Nexus"
+                  >
+                    ↗ chat
+                  </button>
+                )}
+              </div>
             ))
           )}
         </div>
@@ -172,7 +233,7 @@ export function BottomPanelManager({
       />
     );
 
-    if (activePanelTab === "debug") return <DebugPanel projectId={project.id} />;
+    if (activePanelTab === "debug") return <DebugPanel projectId={project.id} onSendToChat={onSendToChat} />;
 
     if (activePanelTab === "run") return (
       <RunPanel
@@ -208,7 +269,34 @@ export function BottomPanelManager({
                   }}>
                     {port.port}
                   </span>
-                  <span style={{ color: tc.text, fontWeight: 500 }}>{port.label || `Porta ${port.port}`}</span>
+                  <span style={{ color: tc.text, fontWeight: 500, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {port.label || `Porta ${port.port}`}
+                  </span>
+                  {onSendToChat && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                      onSendToChat(promptFromPort(port));
+                      }}
+                      title="Invia questa porta alla chat di Nexus"
+                      style={{
+                        background: "rgba(239,68,68,0.85)",
+                        color: "#fff",
+                        border: "none",
+                        borderRadius: 3,
+                        padding: "0 6px",
+                        fontSize: 10,
+                        cursor: "pointer",
+                        verticalAlign: "middle",
+                        lineHeight: "16px",
+                        height: 16,
+                        fontWeight: 600,
+                        flexShrink: 0,
+                      }}
+                    >
+                      ↗ chat
+                    </button>
+                  )}
                 </div>
                 {port.url ? (
                   <a
@@ -318,6 +406,31 @@ export function BottomPanelManager({
                 </div>
                 {run.summary && <div style={{ color: tc.textSecondary, fontSize: 12, marginTop: 6 }}>{run.summary}</div>}
                 <div style={{ color: tc.textMuted, fontSize: 11, marginTop: 6 }}>{new Date(run.createdAt).toLocaleString()}</div>
+                {onSendToChat && run.status === "failed" && (
+                  <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
+                    <button
+                      onClick={() => {
+                        onSendToChat(promptFromPlaywrightRun(run));
+                      }}
+                      title="Invia questo run fallito alla chat di Nexus"
+                      style={{
+                        background: "rgba(239,68,68,0.85)",
+                        color: "#fff",
+                        border: "none",
+                        borderRadius: 3,
+                        padding: "0 6px",
+                        fontSize: 10,
+                        cursor: "pointer",
+                        verticalAlign: "middle",
+                        lineHeight: "16px",
+                        height: 16,
+                        fontWeight: 600,
+                      }}
+                    >
+                      ↗ chat
+                    </button>
+                  </div>
+                )}
               </div>
             ))
           )}

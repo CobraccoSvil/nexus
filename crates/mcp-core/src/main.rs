@@ -610,6 +610,10 @@ async fn main() -> anyhow::Result<()> {
                 "/api/internal/routing/catalog",
                 get(internal_routing::list_catalog),
             )
+            .route(
+                "/api/internal/routing/purpose",
+                get(internal_routing::resolve_purpose),
+            )
             // /api/internal/learning/feedback — sostituisce la chiamata gRPC
             // submit_feedback da brain Python. Rust diventa unico writer
             // della Q-table (vedi internal_learning.rs).
@@ -1574,6 +1578,20 @@ async fn main() -> anyhow::Result<()> {
                     middleware::require_auth,
                 )),
             )
+            .route(
+                "/api/admin/plugins/integrate/draft",
+                post(plugins::draft_plugin_integration).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
+            )
+            .route(
+                "/api/admin/plugins/integrate/publish",
+                post(plugins::publish_plugin_integration).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
+            )
             // Admin routes (require admin role)
             .route(
                 "/api/admin/settings",
@@ -1788,6 +1806,27 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/admin/watchdog-status",
                 get(task_watchdog::watchdog_status_handler)
+                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+            )
+            .route(
+                "/api/admin/embeddings/validate",
+                post(environment::embeddings_validate_handler)
+                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+            )
+            .route(
+                "/api/admin/embeddings/apply",
+                post(environment::embeddings_apply_handler)
+                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+            )
+            // Admin — purpose models (nexus_purpose_model)
+            .route(
+                "/api/admin/routing/purpose-models",
+                get(admin::routing::list_purpose_models)
+                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+            )
+            .route(
+                "/api/admin/routing/purpose-model/:purpose",
+                put(admin::routing::update_purpose_model)
                     .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
             )
             .route(

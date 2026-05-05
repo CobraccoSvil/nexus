@@ -596,3 +596,163 @@ pub async fn gateway_reload_handler(
         Err(e) => Err((StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() })))),
     }
 }
+
+// ── Embeddings: custom model validation + reindex ─────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateEmbeddingModelRequest {
+    pub model: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyEmbeddingModelRequest {
+    pub model: String,
+    pub reindex: bool,
+}
+
+async fn upsert_setting_value(db: &sqlx::PgPool, key: &str, value: &str, category: &str, description: &str) {
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO settings (key, value, category, description, is_secret, updated_at)
+        VALUES ($1, $2, $3, $4, FALSE, NOW())
+        ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value,
+            category = EXCLUDED.category,
+            description = EXCLUDED.description,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(key)
+    .bind(value)
+    .bind(category)
+    .bind(description)
+    .execute(db)
+    .await;
+}
+
+fn sanitize_collection_suffix(raw: &str) -> String {
+    raw.trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+async fn probe_embedding_dimensions(model: &str) -> Result<u64, ApiError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .unwrap_or_default();
+    let neural_url =
+        std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://localhost:8001".to_string());
+    let resp = client
+        .post(format!("{}/embed", neural_url.trim_end_matches('/')))
+        .json(&json!({ "model": model, "text": "dimension probe", "texts": [] }))
+        .send()
+        .await
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, format!("Neural Core non raggiungibile: {e}")))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("Validazione fallita (HTTP {status}): {text}"),
+        ));
+    }
+
+    let payload: serde_json::Value = resp.json().await.unwrap_or(json!({}));
+    let dim = payload.get("dimensions").and_then(|v| v.as_u64()).unwrap_or(0);
+    if dim == 0 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Impossibile determinare la dimensione embeddings",
+        ));
+    }
+    Ok(dim)
+}
+
+pub async fn embeddings_validate_handler(
+    State(_state): State<AppState>,
+    Json(body): Json<ValidateEmbeddingModelRequest>,
+) -> ApiResult {
+    let model = body.model.trim();
+    if model.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "model richiesto"));
+    }
+    let dim = probe_embedding_dimensions(model).await?;
+    Ok(Json(json!({ "ok": true, "model": model, "dimensions": dim })))
+}
+
+pub async fn embeddings_apply_handler(
+    State(state): State<AppState>,
+    Json(body): Json<ApplyEmbeddingModelRequest>,
+) -> ApiResult {
+    let model = body.model.trim();
+    if model.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "model richiesto"));
+    }
+
+    let dim = probe_embedding_dimensions(model).await?;
+    let suffix = sanitize_collection_suffix(&format!("{}-{}", dim, model));
+    let collection = format!("code_embeddings_{}", suffix);
+
+    // Reindex = reset della collection dedicata (drop/create) con dimensione corretta.
+    if body.reindex {
+        let qdrant_url =
+            std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string());
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_default();
+        let base = qdrant_url.trim_end_matches('/');
+        let delete_url = format!("{}/collections/{}", base, urlencoding::encode(&collection));
+        let _ = client.delete(&delete_url).send().await; // ignore errors (404 etc.)
+
+        let create_url = format!("{}/collections/{}", base, urlencoding::encode(&collection));
+        let create_body = json!({ "vectors": { "size": dim, "distance": "Cosine" } });
+        let resp = client
+            .put(&create_url)
+            .json(&create_body)
+            .send()
+            .await
+            .map_err(|e| api_error(StatusCode::BAD_GATEWAY, format!("Qdrant non raggiungibile: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Qdrant create collection fallito (HTTP {status}): {text}"),
+            ));
+        }
+    }
+
+    upsert_setting_value(
+        &state.db,
+        "embedding_model",
+        model,
+        "embeddings",
+        "Sentence-transformers model",
+    )
+    .await;
+    upsert_setting_value(
+        &state.db,
+        "qdrant_collection",
+        &collection,
+        "infrastructure",
+        "Qdrant collection name",
+    )
+    .await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "model": model,
+        "dimensions": dim,
+        "qdrantCollection": collection,
+        "reindexed": body.reindex
+    })))
+}

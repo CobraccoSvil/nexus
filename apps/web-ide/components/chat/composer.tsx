@@ -16,9 +16,13 @@ export interface ComposerProps {
   attachmentError: string | null;
   selectedProvider: string;
   onProviderChange: (value: string) => void;
+  forceProvider: boolean;
+  onForceProviderChange: (value: boolean) => void;
   selectedModel: string;
   onModelChange: (value: string) => void;
   providerModels: string[];
+  runProvider?: string | null;
+  runModel?: string | null;
   automationMode: "study" | "confirm" | "automatic";
   onAutomationModeChange: (value: "study" | "confirm" | "automatic") => void;
   supervisorMode: "none" | "anomaly" | "interleaved" | "continuous";
@@ -53,9 +57,13 @@ export function Composer({
   attachmentError,
   selectedProvider,
   onProviderChange,
+  forceProvider,
+  onForceProviderChange,
   selectedModel,
   onModelChange,
   providerModels,
+  runProvider = null,
+  runModel = null,
   automationMode,
   onAutomationModeChange,
   supervisorMode,
@@ -127,7 +135,18 @@ export function Composer({
     minWidth: 0,
   } as const;
 
-  const isProviderLocked = selectedProvider !== "auto";
+  const isProviderLocked = selectedProvider !== "auto" && forceProvider;
+  const showOverrideMismatch =
+    isProviderLocked &&
+    !!runProvider &&
+    runProvider !== selectedProvider &&
+    isAgentRunning;
+  const showModelMismatch =
+    isProviderLocked &&
+    selectedModel !== "auto" &&
+    !!runModel &&
+    runModel !== selectedModel &&
+    isAgentRunning;
 
   const AUTOMATION_OPTIONS = [
     { value: "study", label: "Studio" },
@@ -288,7 +307,7 @@ export function Composer({
           <select
             value={selectedProvider}
             onChange={(e) => onProviderChange(e.target.value)}
-            title={isProviderLocked ? `Provider bloccato su ${selectedProvider} — passa ad Auto per il routing intelligente` : "Routing automatico: sceglie il modello migliore per ogni task"}
+            title={isProviderLocked ? `Provider forzato su ${selectedProvider} — disattiva "Forza" o passa ad Auto per routing intelligente` : "Routing automatico: sceglie il modello migliore per ogni task"}
             style={{
               ...selectStyle,
               border: `1px solid ${isProviderLocked ? "#f97316" : tc.border}`,
@@ -302,6 +321,22 @@ export function Composer({
             ))}
           </select>
           {selectedProvider !== "auto" && (
+            <button
+              type="button"
+              onClick={() => onForceProviderChange(!forceProvider)}
+              title={forceProvider ? "Override attivo: il provider selezionato viene forzato" : "Override disattivo: il routing può scegliere un provider diverso"}
+              style={{
+                ...selectStyle,
+                border: `1px solid ${forceProvider ? "#f97316" : tc.border}`,
+                background: forceProvider ? "#f9731612" : tc.bgCard,
+                color: forceProvider ? "#f97316" : tc.textSecondary,
+                fontWeight: forceProvider ? 700 : 500,
+              }}
+            >
+              {forceProvider ? "Forza ✓" : "Forza"}
+            </button>
+          )}
+          {selectedProvider !== "auto" && forceProvider && (
             <select
               value={selectedModel}
               onChange={(e) => onModelChange(e.target.value)}
@@ -317,6 +352,34 @@ export function Composer({
                 <option key={model} value={model}>{model}</option>
               ))}
             </select>
+          )}
+          {(runProvider || runModel) && (
+            <span
+              title="Provider/model effettivo dell'ultima run"
+              style={{
+                ...selectStyle,
+                border: `1px solid ${showOverrideMismatch ? "#ef4444" : tc.border}`,
+                background: showOverrideMismatch ? "rgba(239,68,68,0.10)" : tc.bgCard,
+                color: showOverrideMismatch ? "#ef4444" : tc.textMuted,
+                fontWeight: 600,
+              }}
+            >
+              run: {runProvider ?? "?"}/{runModel ?? "?"}
+            </span>
+          )}
+          {(showOverrideMismatch || showModelMismatch) && (
+            <span
+              title="La run non sta rispettando l'override. Possibili cause: provider in cooldown/quota, modello non disponibile, fallback del router."
+              style={{
+                ...selectStyle,
+                border: "1px solid #ef4444",
+                background: "rgba(239,68,68,0.10)",
+                color: "#ef4444",
+                fontWeight: 700,
+              }}
+            >
+              ⚠ override → fallback
+            </span>
           )}
           <select
             value={automationMode}

@@ -20,6 +20,59 @@ use serde::Deserialize;
 
 use crate::AppState;
 
+#[derive(Debug, Deserialize)]
+pub struct PurposeQuery {
+    pub purpose: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct PurposeResolveResponse {
+    pub purpose: String,
+    pub provider: String,
+    pub model: String,
+    pub rationale: String,
+}
+
+/// Handler `GET /api/internal/routing/purpose?purpose=...`
+/// Risolve (provider, model) da `nexus_purpose_model` tramite RoutingMatrixCache.
+pub async fn resolve_purpose(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<PurposeQuery>,
+) -> impl IntoResponse {
+    let purpose = q.purpose.trim();
+    if purpose.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing `purpose`".to_string()).into_response();
+    }
+    // Usa la cache DB-driven: nessun fallback hardcoded.
+    let matrix = match state.orchestrator.routing_matrix.current() {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("routing_matrix non disponibile: {e}"),
+            )
+                .into_response();
+        }
+    };
+    match matrix.purpose_model(purpose) {
+        Some((provider, model)) => (
+            StatusCode::OK,
+            Json(PurposeResolveResponse {
+                purpose: purpose.to_string(),
+                provider,
+                model,
+                rationale: "purpose_model".to_string(),
+            }),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            format!("purpose model non trovato: {purpose}"),
+        )
+            .into_response(),
+    }
+}
+
 /// Body della richiesta `POST /api/internal/routing/decide`.
 #[derive(Debug, Deserialize)]
 pub struct RoutingDecideRequest {

@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useTheme, useThemeColors } from "../../lib/theme";
 import { NexusMetricsPanel } from "./nexus-metrics-panel";
 import { NexusWorkersPanel } from "./nexus-workers-panel";
+import { listAdminPurposeModels, resolveInternalPurposeModel, updateAdminPurposeModel, type PurposeModelEntry } from "../../lib/api-client";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
@@ -28,6 +29,7 @@ interface RoutingConfigState {
   tokenBudget: string;
   maxTokenBudget: string;
   behaviorMode: BehaviorMode;
+  purposeModels: Record<string, { provider: ProviderName; model_id: string; notes?: string | null }>;
 }
 
 const PROVIDERS: ProviderName[] = ["anthropic", "openai", "google", "deepseek", "mistral"];
@@ -172,6 +174,7 @@ function buildRoutingState(settings: SettingEntry[]): RoutingConfigState {
     tokenBudget: get("token_budget") || "4096",
     maxTokenBudget: get("max_token_budget") || "32000",
     behaviorMode: (get("nexus_behavior_mode") || "manuale") as BehaviorMode,
+    purposeModels: {},
   };
 }
 
@@ -231,6 +234,12 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
   const tc = useThemeColors();
   const { resolved } = useTheme();
   const [config, setConfig] = useState<RoutingConfigState>(() => buildRoutingState(settings));
+  const [purposeLoading, setPurposeLoading] = useState(false);
+  const [purposeError, setPurposeError] = useState<string | null>(null);
+  const [purposeSaved, setPurposeSaved] = useState(false);
+  const [purposeSaving, setPurposeSaving] = useState<Record<string, boolean>>({});
+  const [purposeTestBusy, setPurposeTestBusy] = useState<Record<string, boolean>>({});
+  const [purposeTestMsg, setPurposeTestMsg] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -268,6 +277,32 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
       parseInt(settings.find((s) => s.key === "nexus_active_routing_pct")?.value ?? "0", 10) || 0;
     setNexusRoutingPct(Math.max(0, Math.min(100, parsedNexusPct)));
   }, [settings]);
+
+  useEffect(() => {
+    let active = true;
+    setPurposeLoading(true);
+    setPurposeError(null);
+    listAdminPurposeModels()
+      .then((res) => {
+        if (!active) return;
+        const pm: RoutingConfigState["purposeModels"] = {};
+        for (const it of (res.items ?? []) as PurposeModelEntry[]) {
+          const prov = it.provider as ProviderName;
+          if (!PROVIDERS.includes(prov)) continue;
+          pm[it.purpose] = { provider: prov, model_id: it.model_id, notes: it.notes ?? null };
+        }
+        setConfig((prev) => ({ ...prev, purposeModels: pm }));
+      })
+      .catch((e) => {
+        if (!active) return;
+        setPurposeError(e instanceof Error ? e.message : "Impossibile caricare purpose models");
+      })
+      .finally(() => {
+        if (!active) return;
+        setPurposeLoading(false);
+      });
+    return () => { active = false; };
+  }, []);
 
   const saveParallelSettings = async () => {
     setParallelSaving(true);
@@ -381,6 +416,59 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
   };
 
   const extraSettings = settings.filter((setting) => !MANAGED_ROUTING_KEYS.has(setting.key));
+
+  const PURPOSE_KEYS: Array<{ key: string; label: string; desc: string }> = [
+    { key: "loop_fallback_default", label: "Loop fallback", desc: "Modello usato quando un agent va in loop su tool call ripetute." },
+    { key: "admin_fallback_default", label: "Admin fallback", desc: "Fallback admin per prompt/templates quando serve un modello più capace." },
+    { key: "docs_generator", label: "Docs generator", desc: "Generazione documenti (report, release notes, ecc.)." },
+    { key: "custom_instructions", label: "Custom instructions", desc: "Generazione istruzioni custom per progetti." },
+    { key: "chat_title_generator", label: "Chat title", desc: "Generazione titolo sessioni chat." },
+    { key: "chat_feedback_generator", label: "Chat feedback", desc: "Generazione feedback/riassunti." },
+    { key: "google_batch", label: "Google batch", desc: "Fallback per batch tasks (se configurato)." },
+    { key: "agent_tier_opus", label: "Agent tier: Opus", desc: "Tier per agent ad alto impatto." },
+    { key: "agent_tier_sonnet", label: "Agent tier: Sonnet", desc: "Tier per agent general purpose." },
+    { key: "agent_tier_haiku", label: "Agent tier: Haiku", desc: "Tier per task rapidi/low-cost." },
+  ];
+
+  const savePurposeModel = async (purpose: string) => {
+    const pm = config.purposeModels[purpose];
+    if (!pm) return;
+    setPurposeSaving((prev) => ({ ...prev, [purpose]: true }));
+    setPurposeError(null);
+    setPurposeSaved(false);
+    try {
+      await updateAdminPurposeModel(purpose, {
+        provider: pm.provider,
+        model_id: pm.model_id,
+        notes: pm.notes ?? null,
+      });
+      setPurposeSaved(true);
+      setTimeout(() => setPurposeSaved(false), 2000);
+    } catch (e) {
+      setPurposeError(e instanceof Error ? e.message : "Errore salvataggio purpose model");
+    } finally {
+      setPurposeSaving((prev) => ({ ...prev, [purpose]: false }));
+    }
+  };
+
+  const testPurposeModel = async (purpose: string) => {
+    setPurposeTestBusy((prev) => ({ ...prev, [purpose]: true }));
+    setPurposeTestMsg((prev) => ({ ...prev, [purpose]: "" }));
+    try {
+      const res = await resolveInternalPurposeModel(purpose);
+      setPurposeTestMsg((prev) => ({
+        ...prev,
+        [purpose]: `OK: ${res.provider}/${res.model} (${res.rationale || "purpose_model"})`,
+      }));
+    } catch (e) {
+      setPurposeTestMsg((prev) => ({
+        ...prev,
+        [purpose]: `ERRORE: ${e instanceof Error ? e.message : "test fallito"}`,
+      }));
+    } finally {
+      setPurposeTestBusy((prev) => ({ ...prev, [purpose]: false }));
+    }
+  };
 
   return (
     <div className="flex-col-gap-20">
@@ -502,6 +590,146 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
                 </div>
               </div>
             )}
+          </div>
+
+          {/* ── Purpose models (DB-driven) ── */}
+          <div className="card-sm" style={{ background: tc.bgHover }}>
+            <div className="flex-row" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <div>
+                <div className="text-base font-bold">Purpose models</div>
+                <div className="text-sm text-muted" style={{ marginTop: 3 }}>
+                  Modelli per task interni (non routing utente). Includono il fallback automatico su loop tool-use.
+                </div>
+              </div>
+              {purposeLoading && <span className="text-sm text-muted">Caricamento…</span>}
+              {purposeSaved && <span className="text-sm font-semibold" style={{ color: tc.success }}>Salvato ✓</span>}
+            </div>
+            {purposeError && (
+              <div style={{
+                padding: "8px 10px",
+                borderRadius: 8,
+                border: `1px solid ${tc.error}`,
+                background: resolved === "dark" ? "#2d1215" : "#fef2f2",
+                color: "var(--color-error)",
+                marginBottom: 10,
+                fontSize: 12,
+              }}>
+                {purposeError}
+              </div>
+            )}
+            <div style={{ display: "grid", gap: 10 }}>
+              {PURPOSE_KEYS.map((p) => {
+                const pm = config.purposeModels[p.key] ?? { provider: "anthropic" as ProviderName, model_id: PROVIDER_MODELS.anthropic[0], notes: null };
+                const savingThis = !!purposeSaving[p.key];
+                const testBusy = !!purposeTestBusy[p.key];
+                const testMsg = purposeTestMsg[p.key];
+                return (
+                  <div key={p.key} style={{
+                    display: "grid",
+                    gridTemplateColumns: "170px 160px 1fr auto auto",
+                    gap: 10,
+                    alignItems: "center",
+                    padding: "8px 10px",
+                    borderRadius: 8,
+                    border: `1px solid ${tc.border}`,
+                    background: "var(--color-bgInput)",
+                  }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: tc.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {p.label}
+                      </div>
+                      <div style={{ fontSize: 11, color: tc.textMuted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {p.desc}
+                      </div>
+                      <div style={{ fontSize: 10, color: tc.textMuted, marginTop: 2, fontFamily: "monospace" }}>{p.key}</div>
+                      {!!testMsg && (
+                        <div style={{ marginTop: 4, fontSize: 10, color: testMsg.startsWith("OK:") ? tc.success : tc.error }}>
+                          {testMsg}
+                        </div>
+                      )}
+                    </div>
+
+                    <select
+                      value={pm.provider}
+                      onChange={(e) => {
+                        const provider = e.target.value as ProviderName;
+                        const firstModel = PROVIDER_MODELS[provider]?.[0] ?? "";
+                        setConfig((c) => ({
+                          ...c,
+                          purposeModels: {
+                            ...c.purposeModels,
+                            [p.key]: { ...pm, provider, model_id: firstModel || pm.model_id },
+                          },
+                        }));
+                      }}
+                      style={{ ...inputStyle(tc), padding: "6px 8px", fontSize: 12 }}
+                    >
+                      {PROVIDERS.map((prov) => (
+                        <option key={prov} value={prov}>{labelProvider(prov)}</option>
+                      ))}
+                    </select>
+
+                    <select
+                      value={pm.model_id}
+                      onChange={(e) => {
+                        const model_id = e.target.value;
+                        setConfig((c) => ({
+                          ...c,
+                          purposeModels: { ...c.purposeModels, [p.key]: { ...pm, model_id } },
+                        }));
+                      }}
+                      style={{ ...inputStyle(tc), padding: "6px 8px", fontSize: 12 }}
+                    >
+                      {(PROVIDER_MODELS[pm.provider] ?? []).map((m) => (
+                        <option key={m} value={m}>{m}</option>
+                      ))}
+                    </select>
+
+                    <button
+                      onClick={() => void savePurposeModel(p.key)}
+                      disabled={savingThis}
+                      className="btn btn-secondary"
+                      style={{
+                        padding: "6px 10px",
+                        background: savingThis ? tc.bgInput : tc.bgCard,
+                        color: tc.text,
+                        border: `1px solid ${tc.border}`,
+                        borderRadius: 8,
+                        cursor: savingThis ? "wait" : "pointer",
+                        fontSize: 12,
+                        whiteSpace: "nowrap",
+                      }}
+                      title="Salva questo purpose model"
+                    >
+                      {savingThis ? "…" : "Salva"}
+                    </button>
+
+                    {p.key === "loop_fallback_default" ? (
+                      <button
+                        onClick={() => void testPurposeModel(p.key)}
+                        disabled={testBusy}
+                        className="btn btn-secondary"
+                        style={{
+                          padding: "6px 10px",
+                          background: testBusy ? tc.bgInput : tc.bgCard,
+                          color: tc.text,
+                          border: `1px solid ${tc.border}`,
+                          borderRadius: 8,
+                          cursor: testBusy ? "wait" : "pointer",
+                          fontSize: 12,
+                          whiteSpace: "nowrap",
+                        }}
+                        title="Testa la risoluzione runtime del fallback su loop"
+                      >
+                        {testBusy ? "…" : "Test"}
+                      </button>
+                    ) : (
+                      <div />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           </div>
 
           {/* ── Configurazione manuale (visibile solo in modalità Manuale) ── */}

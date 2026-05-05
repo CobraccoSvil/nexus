@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+import urllib.parse
 
 import numpy as np
 
@@ -202,6 +203,70 @@ class _RoutingClient:
                 provider="__router_unavailable__",
                 model="__router_unavailable__",
                 rationale=f"Rust router non disponibile: {e}",
+                confidence=0.0,
+            )
+
+    def purpose_model(self, *, purpose: str) -> RoutingDecision:
+        """Resolve (provider, model) for an internal purpose via Rust endpoint.
+
+        Purpose models are DB-driven (nexus_purpose_model) and configurable from admin UI.
+        """
+        import time
+        import urllib.request
+        import urllib.error
+        import json as _json
+
+        p = (purpose or "").strip()
+        if not p:
+            return RoutingDecision(
+                provider="__router_unavailable__",
+                model="__router_unavailable__",
+                rationale="purpose vuoto",
+                confidence=0.0,
+            )
+        # Cache TTL condivisa: chiave purpose + behavior_mode fittizio
+        key = (f"purpose:{p}", "purpose")
+        now = time.monotonic()
+        entry = self._cache.get(key)
+        if entry and now - entry[0] < self._CACHE_TTL_S:
+            return entry[1]
+
+        url = f"{self._base}/api/internal/routing/purpose?purpose={urllib.parse.quote(p)}"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=self._DEFAULT_TIMEOUT_S) as resp:
+                payload = _json.loads(resp.read().decode("utf-8"))
+            payload_provider = payload.get("provider")
+            payload_model = payload.get("model")
+            if not payload_provider or not payload_model:
+                return RoutingDecision(
+                    provider="__router_unavailable__",
+                    model="__router_unavailable__",
+                    rationale="purpose payload malformato (provider/model mancanti)",
+                    confidence=0.0,
+                )
+            decision = RoutingDecision(
+                provider=payload_provider,
+                model=payload_model,
+                rationale=payload.get("rationale", "purpose_model"),
+                confidence=0.95,
+            )
+            self._cache[key] = (now, decision)
+            return decision
+        except urllib.error.HTTPError as he:
+            logger.warning("Routing purpose HTTP error: %s", he)
+            return RoutingDecision(
+                provider="__router_unavailable__",
+                model="__router_unavailable__",
+                rationale=f"purpose HTTP {he.code}",
+                confidence=0.0,
+            )
+        except (urllib.error.URLError, TimeoutError, _json.JSONDecodeError, OSError) as e:
+            logger.error("Routing purpose non raggiungibile (%s)", e)
+            return RoutingDecision(
+                provider="__router_unavailable__",
+                model="__router_unavailable__",
+                rationale=f"purpose non disponibile: {e}",
                 confidence=0.0,
             )
 

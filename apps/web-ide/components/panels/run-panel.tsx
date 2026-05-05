@@ -673,6 +673,7 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
           const stateText = svc.crash_loop
             ? "crash-loop (si riavvia continuamente)"
             : stateLabel(svc.state, svc.sub);
+          const showQuickChat = !!onSendToChat && (svc.state === "failed" || svc.crash_loop) && !svc.last_error;
           return (
             <div key={svc.unit} style={{ marginBottom:6 }}>
               <div style={{ display:"flex",alignItems:"center",gap:8 }}>
@@ -683,6 +684,39 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
                 <span style={{ flexShrink:0,fontSize:11,color:col,fontFamily:'"JetBrains Mono", monospace' }}>
                   {stateText}
                 </span>
+                {showQuickChat && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const msg = [
+                        `Il servizio "${svc.short}" (unit: ${svc.unit}) è in stato ${svc.state}${svc.crash_loop ? " (crash-loop)" : ""}.`,
+                        "",
+                        "Richiesta:",
+                        `- Esegui/usa: journalctl --user -u ${svc.unit} -n 80 --no-pager`,
+                        "- Identifica la causa root e proponi una fix concreta (file/righe).",
+                        "- Dammi un test plan minimo per verificare il fix.",
+                      ].join("\n");
+                      onSendToChat?.(msg);
+                    }}
+                    title="Invia diagnosi rapida alla chat di Nexus"
+                    style={{
+                      background: "rgba(239,68,68,0.85)",
+                      color: "#fff",
+                      border: "none",
+                      borderRadius: 3,
+                      padding: "0 6px",
+                      fontSize: 10,
+                      cursor: "pointer",
+                      verticalAlign: "middle",
+                      lineHeight: "16px",
+                      height: 16,
+                      fontWeight: 600,
+                      flexShrink: 0,
+                    }}
+                  >
+                    ↗ chat
+                  </button>
+                )}
                 <div style={{ display:"flex",gap:3,flexShrink:0 }}>
                   {(() => {
                     // Mostra solo le azioni sensate per lo stato corrente

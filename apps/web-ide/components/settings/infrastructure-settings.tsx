@@ -483,7 +483,7 @@ export function InfrastructureSettings({
           </button>
         )}
         {saved[setting.key] && (
-          <span style={{ color: "#22c55e", fontSize: 12, fontWeight: 600 }}>\u2713</span>
+          <span style={{ color: "#22c55e", fontSize: 12, fontWeight: 600 }}>✓</span>
         )}
       </div>
     );
