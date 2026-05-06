@@ -131,7 +131,7 @@ function SingleRunPanel({
               {/* Token totali */}
               {metrics.totalTokens > 0 && (
                 <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                  <span style={{ opacity: 0.6 }}>Tokens:</span>
+                  <span style={{ opacity: 0.6 }}>Token totali:</span>
                   <span style={{ fontFamily: "monospace", fontWeight: 600, color: tc.text }}>
                     {metrics.totalTokens.toLocaleString()}
                   </span>
@@ -151,7 +151,7 @@ function SingleRunPanel({
               {/* Cache hit rate */}
               {metrics.cacheHitRate > 0 && (
                 <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                  <span style={{ opacity: 0.6 }}>Cache hit:</span>
+                  <span style={{ opacity: 0.6 }}>Hit cache:</span>
                   <span style={{ fontFamily: "monospace", fontWeight: 600, color: "#22c55e" }}>
                     {metrics.cacheHitRate.toFixed(1)}%
                   </span>
@@ -161,7 +161,7 @@ function SingleRunPanel({
               {/* Latency massima */}
               {metrics.maxLatency > 0 && (
                 <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                  <span style={{ opacity: 0.6 }}>Latency:</span>
+                  <span style={{ opacity: 0.6 }}>Latenza:</span>
                   <span style={{ fontFamily: "monospace", fontWeight: 600, color: tc.text }}>
                     {metrics.maxLatency}ms
                   </span>
@@ -271,7 +271,7 @@ function SingleRunPanel({
 
                     {step.toolName === "supervisor_check" ? (
                       <span style={{ color: "#8b5cf6", fontWeight: 600 }}>
-                        👁 supervisor
+                        👁 supervisore
                       </span>
                     ) : (
                       <span style={{ fontFamily: "monospace" }}>{step.toolName}</span>
@@ -334,7 +334,7 @@ function SingleRunPanel({
                         <>
                           {step.usage.promptTokens !== undefined && (
                             <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                              <span style={{ opacity: 0.7 }}>Input tokens:</span>
+                              <span style={{ opacity: 0.7 }}>Token in input:</span>
                               <span style={{ fontFamily: "monospace", fontWeight: 500 }}>
                                 {step.usage.promptTokens.toLocaleString()}
                               </span>
@@ -342,7 +342,7 @@ function SingleRunPanel({
                           )}
                           {step.usage.completionTokens !== undefined && (
                             <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                              <span style={{ opacity: 0.7 }}>Output tokens:</span>
+                              <span style={{ opacity: 0.7 }}>Token in output:</span>
                               <span style={{ fontFamily: "monospace", fontWeight: 500 }}>
                                 {step.usage.completionTokens.toLocaleString()}
                               </span>
@@ -358,7 +358,7 @@ function SingleRunPanel({
                           )}
                           {step.usage.cacheReadTokens !== undefined && step.usage.cacheReadTokens > 0 && (
                             <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                              <span style={{ opacity: 0.7 }}>Cache read:</span>
+                              <span style={{ opacity: 0.7 }}>Letture da cache:</span>
                               <span style={{ fontFamily: "monospace", fontWeight: 500, color: "#22c55e" }}>
                                 {step.usage.cacheReadTokens.toLocaleString()}
                               </span>
@@ -380,7 +380,7 @@ function SingleRunPanel({
                       {/* Latency */}
                       {step.latencyMs !== undefined && (
                         <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                          <span style={{ opacity: 0.7 }}>Latency:</span>
+                          <span style={{ opacity: 0.7 }}>Latenza:</span>
                           <span style={{ fontFamily: "monospace", fontWeight: 500 }}>
                             {step.latencyMs}ms
                           </span>
@@ -390,7 +390,7 @@ function SingleRunPanel({
                       {/* Temperature */}
                       {step.temperature !== undefined && (
                         <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                          <span style={{ opacity: 0.7 }}>Temperature:</span>
+                          <span style={{ opacity: 0.7 }}>Temperatura:</span>
                           <span style={{ fontFamily: "monospace", fontWeight: 500 }}>
                             {step.temperature.toFixed(2)}
                           </span>

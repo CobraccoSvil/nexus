@@ -129,6 +129,17 @@ pub(super) static NEXUS_TOOLS: &[ToolDef] = &[
         description: "Aggiorna il contenuto di un prompt template nel database. Cambia il comportamento di Nexus senza rebuild.",
         schema: r#"{"type":"object","required":["key","content"],"properties":{"key":{"type":"string","description":"Chiave del template (es. 'system.nexus_base', 'chat.precheck_message')"},"content":{"type":"string","description":"Nuovo contenuto del prompt"},"change_note":{"type":"string","description":"Nota sul cambiamento (per la cronologia)"}}}"#,
     },
+    // ── mcp_runtime (discovery + call) ────────────────────────────────────
+    ToolDef {
+        name: "nexus_mcp_tool_search",
+        description: "Cerca tra TUTTI i tool MCP disponibili (builtin + esterni abilitati) e ritorna risultati con server_id e schema. Usalo per scoprire tool a runtime senza inviare tutte le definizioni al provider.",
+        schema: r#"{"type":"object","required":["query"],"properties":{"query":{"type":"string","description":"Query testuale (nome tool, descrizione, keyword)"},"limit":{"type":"integer","description":"Max risultati (default: 10)","default":10}}}"#,
+    },
+    ToolDef {
+        name: "nexus_mcp_tool_call",
+        description: "Esegue un tool MCP (anche esterno) usando server_id + tool_name + arguments. Sicuro: verifica che il server sia accessibile e applica la policy del plugin se presente.",
+        schema: r#"{"type":"object","required":["server_id","tool_name","arguments"],"properties":{"server_id":{"type":"string","description":"UUID del server MCP"},"tool_name":{"type":"string","description":"Nome tool originale (es. 'list_issues')"},"arguments":{"type":"object","description":"Argomenti JSON per il tool (secondo il suo input_schema)"}}}"#,
+    },
     // ── admin_settings ────────────────────────────────────────────────────
     ToolDef {
         name: "nexus_admin_setting_get",

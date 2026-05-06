@@ -4,10 +4,12 @@
 //! Cache miss e chiavi inesistenti restituiscono `None`.
 
 use axum::{extract::{Path, State}, Json, http::StatusCode};
+use axum::response::IntoResponse;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -633,7 +635,7 @@ pub async fn batch_assign_tools_handler(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
 
-    // Carica solo i tool Nexus Builtin (principali) con descrizioni troncate
+    // Carica TUTTI i tool MCP abilitati (inclusi server esterni gestiti) con descrizioni troncate.
     let tool_rows = sqlx::query(
         r#"SELECT DISTINCT
             mcp_tools.tool_name as name,
@@ -642,8 +644,7 @@ pub async fn batch_assign_tools_handler(
         FROM mcp_server_tools as mcp_tools
         JOIN mcp_servers ON mcp_tools.server_id = mcp_servers.id
         WHERE mcp_servers.enabled = true
-          AND mcp_servers.name = 'Nexus Builtin'
-        ORDER BY mcp_tools.tool_name"#,
+        ORDER BY mcp_servers.name, mcp_tools.tool_name"#,
     )
     .fetch_all(&state.db)
     .await
@@ -652,7 +653,7 @@ pub async fn batch_assign_tools_handler(
     if tool_rows.is_empty() {
         return Ok(Json(serde_json::json!({
             "processed": 0, "assigned": 0, "skipped": templates.len(), "errors": 0,
-            "message": "Nessun tool Nexus Builtin disponibile"
+            "message": "Nessun tool MCP disponibile"
         })));
     }
 
@@ -660,18 +661,27 @@ pub async fn batch_assign_tools_handler(
         .iter()
         .map(|r| {
             let name: String = r.get("name");
+            let server: String = r.get("server_name");
             let desc: Option<String> = r.try_get("description").ok().flatten();
             let short_desc = desc.as_deref().unwrap_or("");
             let short_desc = if short_desc.len() > 90 { &short_desc[..90] } else { short_desc };
-            format!("- {}: {}", name, short_desc)
+            format!("- [{}] {}: {}", server, name, short_desc)
         })
         .collect::<Vec<_>>()
         .join("\n");
 
-    let tool_map: std::collections::HashMap<String, String> = tool_rows
-        .iter()
-        .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("server_name")))
-        .collect();
+    // Mappa per lookup:
+    // - by_pair: (server, tool_name) -> true
+    // - by_name: tool_name -> set(server) per gestire collisioni e richiedere disambiguazione quando serve.
+    let mut tool_by_pair: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut tool_servers_by_name: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for r in &tool_rows {
+        let name: String = r.get("name");
+        let server: String = r.get("server_name");
+        tool_by_pair.insert((server.clone(), name.clone()));
+        tool_servers_by_name.entry(name).or_default().insert(server);
+    }
 
     // Set dei provider che hanno fallito - evita di ritentarli per ogni template
     let mut broken_providers: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -679,6 +689,7 @@ pub async fn batch_assign_tools_handler(
     let mut processed = 0usize;
     let mut assigned = 0usize;
     let mut errors = 0usize;
+    let mut total_tools_selected = 0usize;
     let mut results: Vec<serde_json::Value> = Vec::new();
 
     for row in &templates {
@@ -688,9 +699,39 @@ pub async fn batch_assign_tools_handler(
         let content_text: String = row.get("content");
         let content_preview: String = content_text.chars().take(400).collect();
 
+        // Obiettivo: assegnare SOLO i tool effettivamente necessari, minimizzando token/costo.
+        // Logica adattiva:
+        // - fino a BASE_MAX accettiamo anche tool senza "usage_context"
+        // - oltre BASE_MAX, accettiamo solo tool con usage_context (giustificazione) per evitare over-assign.
+        // - HARD_MAX resta un limite di sicurezza.
+        const BASE_MAX: usize = 3;
+        const HARD_MAX: usize = 8;
+
         let tool_prompt = format!(
-            "Agente AI: {} (categoria: {})\nRuolo: {}\n\nTool disponibili:\n{}\n\nSeleziona 4-8 tool che questo agente usa frequentemente.\nRispondi SOLO con array JSON: [{{\"tool_name\":\"nome\",\"tool_server\":\"Nexus Builtin\"}}]\nSe nessun tool serve: []",
-            title, category, content_preview, tools_list,
+            "Sei un esperto nell'assegnazione MINIMALE di tool MCP ai prompt template di Nexus.\n\n\
+Prompt template: {key}\n\
+Titolo: {title}\n\
+Categoria: {category}\n\
+Contenuto (estratto):\n---\n{role}\n---\n\n\
+Tool disponibili (tutti i server MCP abilitati):\n{tools_list}\n\n\
+Obiettivo: seleziona SOLO i tool indispensabili per applicare questo prompt template.\n\
+- Se non servono tool: rispondi []\n\
+- Se servono tool: scegli tipicamente 0–{base_max} tool\n\
+- Puoi arrivare fino a {hard_max} SOLO se strettamente necessario, e SOLO se fornisci `usage_context` per ogni tool extra\n\
+- Evita tool \"generici\" se non sono strettamente necessari (ogni tool aumenta token/costo)\n\n\
+Rispondi SOLO con un array JSON.\n\
+Formati accettati:\n\
+  [\"tool_name\", ...] (solo se il nome è univoco tra i server)\n\
+  [\"server::tool_name\", ...] (consigliato se ci sono omonimi)\n\
+oppure\n\
+  [{{\"tool_name\":\"...\",\"tool_server\":\"...\",\"usage_context\":\"breve motivazione d'uso\"}}, ...]\n",
+            key = key,
+            title = title,
+            category = category,
+            role = content_preview,
+            tools_list = tools_list,
+            base_max = BASE_MAX,
+            hard_max = HARD_MAX,
         );
 
         processed += 1;
@@ -720,24 +761,94 @@ pub async fn batch_assign_tools_handler(
                 match serde_json::from_str::<serde_json::Value>(json_slice) {
                     Ok(arr) if arr.is_array() => {
                         let arr_ref = arr.as_array().unwrap();
-                        let prompt_tools: Vec<PromptMcpTool> = arr_ref.iter().filter_map(|item| {
+                        // Parsing robusto:
+                        // - accetta ["tool_name", ...]
+                        // - accetta [{tool_name, usage_context?}, ...]
+                        // - ignora tool non presenti in tool_map
+                        // - de-duplica
+                        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        let mut prompt_tools: Vec<PromptMcpTool> = Vec::new();
+
+                        for item in arr_ref {
+                            // 1) String: "tool" oppure "server::tool"
+                            // 2) Object: {tool_name, tool_server?, usage_context?}
+                            let mut name: Option<String> = None;
+                            let mut server: Option<String> = None;
+                            let mut usage_ctx_opt: Option<String> = None;
+
                             if let Some(s) = item.as_str() {
-                                tool_map.get(s).map(|srv| PromptMcpTool {
-                                    tool_name: s.to_string(),
-                                    tool_server: srv.clone(),
-                                    usage_context: None,
-                                })
+                                let s = s.trim();
+                                if let Some((srv, nm)) = s.split_once("::") {
+                                    let srv = srv.trim();
+                                    let nm = nm.trim();
+                                    if !srv.is_empty() && !nm.is_empty() {
+                                        server = Some(srv.to_string());
+                                        name = Some(nm.to_string());
+                                    }
+                                } else if !s.is_empty() {
+                                    name = Some(s.to_string());
+                                }
                             } else if let Some(obj) = item.as_object() {
-                                let name = obj.get("tool_name").and_then(|v| v.as_str())?;
-                                let server = obj.get("tool_server").and_then(|v| v.as_str())
-                                    .unwrap_or("Nexus Builtin").to_string();
-                                if tool_map.contains_key(name) {
-                                    Some(PromptMcpTool { tool_name: name.to_string(), tool_server: server, usage_context: None })
-                                } else { None }
-                            } else { None }
-                        }).collect();
+                                name = obj
+                                    .get("tool_name")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty());
+                                server = obj
+                                    .get("tool_server")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty());
+                                usage_ctx_opt = obj
+                                    .get("usage_context")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.trim())
+                                    .filter(|s| !s.is_empty())
+                                    .map(|s| s.to_string());
+                            }
+
+                            let Some(tool_name) = name else { continue; };
+
+                            // Se server non specificato:
+                            // - accetta solo se il tool_name è univoco tra i server
+                            // - se ambiguo, richiede "server::tool" o tool_server nel JSON.
+                            let tool_server = if let Some(srv) = server {
+                                srv
+                            } else {
+                                let servers = tool_servers_by_name.get(&tool_name);
+                                match servers {
+                                    Some(s) if s.len() == 1 => s.iter().next().cloned().unwrap_or_default(),
+                                    _ => continue, // ambiguo o inesistente
+                                }
+                            };
+
+                            if !tool_by_pair.contains(&(tool_server.clone(), tool_name.clone())) {
+                                continue;
+                            }
+
+                            let dedup_key = format!("{}::{}", tool_server, tool_name);
+                            if !seen.insert(dedup_key) {
+                                continue;
+                            }
+
+                            // Oltre BASE_MAX accettiamo solo tool con usage_context.
+                            if prompt_tools.len() >= BASE_MAX && usage_ctx_opt.is_none() {
+                                continue;
+                            }
+
+                            prompt_tools.push(PromptMcpTool {
+                                tool_name,
+                                tool_server: tool_server,
+                                usage_context: usage_ctx_opt,
+                            });
+
+                            if prompt_tools.len() >= HARD_MAX {
+                                break;
+                            }
+                        }
 
                         let count = prompt_tools.len();
+                        total_tools_selected += count;
                         let tools_json = serde_json::to_value(&prompt_tools).unwrap_or_default();
                         let _ = sqlx::query(
                             "UPDATE nexus_prompt_templates SET mcp_tools_json=$1, updated_at=NOW() WHERE key=$2"
@@ -766,14 +877,64 @@ pub async fn batch_assign_tools_handler(
         }
     }
 
+    let avg_tools = if processed > 0 { (total_tools_selected as f64) / (processed as f64) } else { 0.0 };
     Ok(Json(serde_json::json!({
         "status": "completed",
         "processed": processed,
         "assigned": assigned,
         "skipped": processed - assigned - errors,
         "errors": errors,
+        "avg_tools_per_template": avg_tools,
+        "base_max_tools_per_template": 3,
+        "hard_max_tools_per_template": 8,
         "results": results,
     })))
+}
+
+/// POST /api/internal/prompt-templates/batch-assign-tools
+///
+/// Versione "internal" (no auth) della batch tool-assignment.
+/// Usata da servizi interni (es. plugin-service) quando cambia il parco MCP
+/// disponibile (install/disable/delete) e serve riallineare `mcp_tools_json`
+/// su TUTTI i prompt template minimizzando i tool assegnati.
+pub async fn internal_batch_assign_tools_handler(
+    State(state): State<crate::AppState>,
+) -> impl IntoResponse {
+    // Evita che più trigger (create/delete/toggle/test MCP) lancino batch paralleli:
+    // - se già in esecuzione, marca "pending" e ritorna subito
+    // - al termine, se pending=true, rilancia una volta
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    static PENDING: AtomicBool = AtomicBool::new(false);
+
+    if RUNNING.swap(true, Ordering::SeqCst) {
+        PENDING.store(true, Ordering::SeqCst);
+        return (StatusCode::ACCEPTED, Json(serde_json::json!({
+            "queued": false,
+            "running": true,
+            "pending": true
+        }))).into_response();
+    }
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        let _ = batch_assign_tools_handler(State(state_clone)).await;
+        RUNNING.store(false, Ordering::SeqCst);
+        if PENDING.swap(false, Ordering::SeqCst) {
+            // rilancia una sola volta (se arrivati altri trigger durante l'esecuzione)
+            let state_clone2 = state.clone();
+            RUNNING.store(true, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _ = batch_assign_tools_handler(State(state_clone2)).await;
+                RUNNING.store(false, Ordering::SeqCst);
+            });
+        }
+    });
+
+    (StatusCode::ACCEPTED, Json(serde_json::json!({
+        "queued": true,
+        "running": true,
+        "pending": false
+    }))).into_response()
 }
 /// GET /api/admin/prompt-templates/:key/tools
 pub async fn get_prompt_tools_handler(

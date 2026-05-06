@@ -622,6 +622,10 @@ async fn main() -> anyhow::Result<()> {
                 post(internal_learning::submit_feedback),
             )
             .route(
+                "/api/internal/prompt-templates/batch-assign-tools",
+                post(prompt_templates::internal_batch_assign_tools_handler),
+            )
+            .route(
                 "/api/chat",
                 post(chat_messages::legacy_chat).layer(axum_mw::from_fn_with_state(
                     state.clone(),

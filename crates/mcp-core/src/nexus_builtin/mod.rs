@@ -21,6 +21,7 @@ mod run_config;
 mod git;
 mod project;
 mod prompt_admin;
+mod mcp_runtime;
 mod docs;
 mod services;
 
@@ -48,6 +49,7 @@ use prompt_admin::{
     handle_prompt_template_list, handle_prompt_template_update,
     handle_admin_setting_get, handle_admin_setting_update,
 };
+use mcp_runtime::{handle_mcp_tool_search, handle_mcp_tool_call};
 use docs::{
     bump_version, get_project_slug,
     handle_doc_generate, handle_doc_update, handle_doc_list,
@@ -132,6 +134,9 @@ pub async fn execute(
         // ── prompt_template ───────────────────────────────────────────
         "nexus_prompt_template_list" => handle_prompt_template_list(db, &arguments).await,
         "nexus_prompt_template_update" => handle_prompt_template_update(db, &arguments).await,
+        // ── mcp_runtime (discovery + call) ────────────────────────────
+        "nexus_mcp_tool_search" => handle_mcp_tool_search(db, user_id, project_id, &arguments).await,
+        "nexus_mcp_tool_call" => handle_mcp_tool_call(db, user_id, project_id, &arguments).await,
         // ── admin_settings ────────────────────────────────────────────
         "nexus_admin_setting_get" => {
             if user_role != "admin" {

@@ -1688,6 +1688,7 @@ export interface McpServer {
   canManage?: boolean;
   createdAt: string;
   tools?: McpServerTool[];
+  linkedTemplatesCount?: number;
 }
 
 export interface CreateMcpServerPayload {

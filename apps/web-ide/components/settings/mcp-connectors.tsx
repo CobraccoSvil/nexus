@@ -494,6 +494,22 @@ function ServerCard({ server, onToggle, onDelete, onConfirmDelete, onRefresh, tc
             >
               {server.scope}
             </span>
+            {typeof server.linkedTemplatesCount === "number" && (
+              <span
+                title="Numero di prompt template che usano questo MCP (via tool_server)"
+                style={{
+                  fontSize: 10,
+                  padding: "1px 6px",
+                  borderRadius: 999,
+                  background: `${tc.border}18`,
+                  color: tc.textMuted,
+                  border: `1px solid ${tc.border}`,
+                  fontWeight: 600,
+                }}
+              >
+                {server.linkedTemplatesCount} prompt
+              </span>
+            )}
           </div>
 
           {server.description && (

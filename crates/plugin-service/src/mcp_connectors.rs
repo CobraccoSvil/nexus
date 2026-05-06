@@ -31,6 +31,21 @@ use nexus_types::{api_error, parse_user_id, ApiResult};
 use crate::mcp_client::{self, McpServerConfig, McpTransport};
 use crate::AppState;
 
+async fn trigger_prompt_template_tool_reassignment() {
+    // Fire-and-forget: non blocchiamo l'API utente.
+    // Endpoint internal lato mcp-core (trusted localhost).
+    let base = std::env::var("MCP_CORE_URL").unwrap_or_else(|_| "http://127.0.0.1:4000".to_string());
+    let url = format!("{}/api/internal/prompt-templates/batch-assign-tools", base.trim_end_matches('/'));
+    tokio::spawn(async move {
+        let _ = reqwest::Client::new()
+            .post(url)
+            // Deve solo accodare il job: la risposta dovrebbe essere rapida.
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
+    });
+}
+
 // -- Request/Response types --
 
 #[derive(Debug, Deserialize)]
@@ -218,6 +233,34 @@ pub async fn list_mcp_servers(
 ) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
 
+    // Conteggio: quanti prompt template (attivi) fanno riferimento a ciascun tool_server.
+    // Nota: oggi l'associazione tool è salvata in `nexus_prompt_templates.mcp_tools_json`
+    // come array di oggetti {tool_name, tool_server, usage_context?}.
+    let counts_rows = sqlx::query(
+        r#"
+        SELECT
+          (elem->>'tool_server') AS tool_server,
+          COUNT(DISTINCT t.key)  AS linked_templates
+        FROM nexus_prompt_templates t
+        JOIN LATERAL jsonb_array_elements(COALESCE(t.mcp_tools_json, '[]'::jsonb)) AS elem ON true
+        WHERE t.is_active = true
+          AND (elem->>'tool_server') IS NOT NULL
+        GROUP BY (elem->>'tool_server')
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let mut linked_by_server: HashMap<String, i64> = HashMap::new();
+    for r in counts_rows {
+        let srv: Option<String> = r.try_get("tool_server").ok();
+        let cnt: Option<i64> = r.try_get("linked_templates").ok();
+        if let (Some(srv), Some(cnt)) = (srv, cnt) {
+            linked_by_server.insert(srv, cnt);
+        }
+    }
+
     let rows = sqlx::query(
         "SELECT id, plugin_instance_id, name, description, icon_url, transport, url, command, args, env_vars, headers,
                 enabled, scope, user_id, created_at
@@ -233,6 +276,8 @@ pub async fn list_mcp_servers(
     let mut servers: Vec<Value> = Vec::new();
     for r in &rows {
         let mut s = row_to_json(r, can_manage_server(r, user_id, &claims.role));
+        let server_name = r.try_get::<String, _>("name").unwrap_or_default();
+        let linked_templates = linked_by_server.get(&server_name).copied().unwrap_or(0);
         let srv_id: Uuid = r.try_get("id").unwrap_or(Uuid::nil());
         let tools = sqlx::query(
             "SELECT tool_name, description FROM mcp_server_tools WHERE server_id = $1 ORDER BY tool_name",
@@ -251,6 +296,7 @@ pub async fn list_mcp_servers(
         .collect::<Vec<_>>();
 
         s["tools"] = json!(tools);
+        s["linkedTemplatesCount"] = json!(linked_templates);
         servers.push(s);
     }
 
@@ -455,6 +501,9 @@ pub async fn delete_mcp_server(
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Un MCP è stato rimosso: riallinea le assegnazioni tool per togliere riferimenti obsoleti.
+    trigger_prompt_template_tool_reassignment().await;
+
     Ok(Json(json!({ "deleted": true })))
 }
 
@@ -498,6 +547,8 @@ pub async fn toggle_mcp_server(
         ));
     }
 
+    // Il set di tool disponibili per i prompt cambia (server abilitato/disabilitato).
+    trigger_prompt_template_tool_reassignment().await;
     Ok(Json(json!({ "id": server_id.to_string(), "enabled": body.enabled })))
 }
 
@@ -578,6 +629,9 @@ pub async fn test_mcp_server(
                 .await
                 .ok();
             }
+
+            // I tool del server potrebbero essere cambiati: riallinea le assegnazioni.
+            trigger_prompt_template_tool_reassignment().await;
 
             let tool_list: Vec<Value> = tools
                 .iter()

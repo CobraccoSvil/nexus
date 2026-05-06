@@ -1,25 +1,41 @@
 # lefthook.yml — hook git gestiti da lefthook.
-#
+
 # Installazione:
 #   pnpm add -D -w lefthook
 #   pnpm exec lefthook install
-#
-# L'hook pre-commit esegue pnpm verify solo se ci sono file staged di codice.
-# Per saltare in emergenza: `LEFTHOOK=0 git commit ...`.
+
+# Pre-commit veloce: turbo typecheck/lint + cargo check.
+# Suite completa via script verify e CI.
+
+# Emergenza: LEFTHOOK=0
 
 pre-commit:
   parallel: false
   commands:
-    verify:
-      glob: "*.{ts,tsx,js,jsx,rs,toml,yaml,yml,json}"
-      run: pnpm verify
-      fail_text: "pnpm verify ha fallito: correggi gli errori prima di committare."
+    turbo_quick:
+      glob:
+        - "*.ts"
+        - "*.tsx"
+        - "*.js"
+        - "*.jsx"
+        - "*.json"
+      run: pnpm exec turbo run typecheck lint --continue
+      fail_text: pre-commit turbo fallito: correggi typecheck/lint.
+
+    cargo_check_quick:
+      glob:
+        - "*.rs"
+        - "*.toml"
+        - "*.yaml"
+        - "*.yml"
+      run: cargo check --workspace
+      fail_text: pre-commit cargo fallito: correggi cargo check.
 
 commit-msg:
   commands:
     no-emoji:
       run: |
         if grep -P "[\x{1F300}-\x{1FAFF}\x{2600}-\x{27BF}]" "{1}" >/dev/null; then
-          echo "Commit message contiene emoji: rimuovile (direttiva editoriale)." >&2
+          echo "Commit message contiene emoji: rimuovile - direttiva editoriale" >&2
           exit 1
         fi

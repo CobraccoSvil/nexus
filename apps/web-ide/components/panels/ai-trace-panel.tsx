@@ -200,7 +200,7 @@ function TraceCard({
             padding: "1px 6px",
           }}
         >
-          {trace.messagesSent} msg
+          {trace.messagesSent} messaggi
         </span>
         <span
           style={{
@@ -212,7 +212,7 @@ function TraceCard({
             padding: "1px 6px",
           }}
         >
-          {trace.toolsCount} tools
+          {trace.toolsCount} strumenti
         </span>
         {((trace.inputTokens ?? 0) > 0 || (trace.outputTokens ?? 0) > 0) && (() => {
           const cost = calcCost(trace.model, trace.inputTokens ?? 0, trace.outputTokens ?? 0, trace.cacheReadTokens ?? 0);
@@ -228,7 +228,7 @@ function TraceCard({
                   padding: "1px 6px",
                   fontFamily: '"JetBrains Mono", monospace',
                 }}
-                title={`Input: ${trace.inputTokens ?? 0} tok | Output: ${trace.outputTokens ?? 0} tok${(trace.cacheReadTokens ?? 0) > 0 ? ` | Cache hit: ${trace.cacheReadTokens} tok` : ""}${cost != null ? ` | Costo stimato: ${formatCost(cost)}` : ""}`}
+                title={`Ingresso: ${trace.inputTokens ?? 0} tok | Uscita: ${trace.outputTokens ?? 0} tok${(trace.cacheReadTokens ?? 0) > 0 ? ` | Letture cache: ${trace.cacheReadTokens} tok` : ""}${cost != null ? ` | Costo stimato: ${formatCost(cost)}` : ""}`}
               >
                 ↑{trace.inputTokens ?? 0} ↓{trace.outputTokens ?? 0}
                 {(trace.cacheReadTokens ?? 0) > 0 && <span style={{ color: tc.success, marginLeft: 4 }}>⚡{trace.cacheReadTokens}</span>}
