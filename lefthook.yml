@@ -20,7 +20,7 @@ pre-commit:
         - "*.jsx"
         - "*.json"
       run: pnpm exec turbo run typecheck lint --continue
-      fail_text: pre-commit turbo fallito: correggi typecheck/lint.
+      fail_text: "pre-commit turbo fallito: correggi typecheck/lint."
 
     cargo_check_quick:
       glob:
@@ -29,7 +29,7 @@ pre-commit:
         - "*.yaml"
         - "*.yml"
       run: cargo check --workspace
-      fail_text: pre-commit cargo fallito: correggi cargo check.
+      fail_text: "pre-commit cargo fallito: correggi cargo check."
 
 commit-msg:
   commands:
