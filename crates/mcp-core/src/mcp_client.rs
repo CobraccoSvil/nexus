@@ -250,18 +250,22 @@ pub async fn list_tools_stdio(
     args: &[String],
     env_vars: &HashMap<String, String>,
 ) -> Result<Vec<McpTool>, McpError> {
+    let init_msg = build_jsonrpc_with_id(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "ideai-mcp-client", "version": "1.0" }
+        }),
+    );
+    let list_msg = build_jsonrpc_with_id(2, "tools/list", json!({}));
     let output = run_stdio_jsonrpc(
         command,
         args,
         env_vars,
-        &[
-            build_jsonrpc("initialize", json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": { "name": "ideai-mcp-client", "version": "1.0" }
-            })),
-            build_jsonrpc("tools/list", json!({})),
-        ],
+        2,
+        &[init_msg, list_msg],
     )
     .await?;
 
@@ -274,7 +278,11 @@ pub async fn list_tools_stdio(
         }
     }
 
-    Ok(vec![])
+    if output.trim().is_empty() {
+        Ok(vec![])
+    } else {
+        Err(McpError::Protocol(output))
+    }
 }
 
 /// Esegue un tool su un server MCP stdio.
@@ -285,18 +293,26 @@ pub async fn call_tool_stdio(
     tool_name: &str,
     arguments: Value,
 ) -> Result<McpToolResult, McpError> {
+    let init_msg = build_jsonrpc_with_id(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "ideai-mcp-client", "version": "1.0" }
+        }),
+    );
+    let call_msg = build_jsonrpc_with_id(
+        2,
+        "tools/call",
+        json!({ "name": tool_name, "arguments": arguments }),
+    );
     let output = run_stdio_jsonrpc(
         command,
         args,
         env_vars,
-        &[
-            build_jsonrpc("initialize", json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": { "name": "ideai-mcp-client", "version": "1.0" }
-            })),
-            build_jsonrpc("tools/call", json!({ "name": tool_name, "arguments": arguments })),
-        ],
+        2,
+        &[init_msg, call_msg],
     )
     .await?;
 
@@ -323,23 +339,36 @@ fn build_jsonrpc(method: &str, params: Value) -> String {
     .to_string()
 }
 
+fn build_jsonrpc_with_id(id: u64, method: &str, params: Value) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params
+    })
+    .to_string()
+}
+
 async fn run_stdio_jsonrpc(
     command: &str,
     args: &[String],
     env_vars: &HashMap<String, String>,
+    expected_response_id: u64,
     messages: &[String],
 ) -> Result<String, McpError> {
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let mut cmd = tokio::process::Command::new(command);
     cmd.args(args)
         .envs(env_vars)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
 
     let mut child = cmd.spawn().map_err(McpError::Io)?;
     let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
 
     for msg in messages {
         stdin.write_all(msg.as_bytes()).await.map_err(McpError::Io)?;
@@ -347,15 +376,52 @@ async fn run_stdio_jsonrpc(
     }
     drop(stdin);
 
-    let out = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        child.wait_with_output(),
-    )
-    .await
-    .map_err(|_| McpError::Timeout)?
-    .map_err(McpError::Io)?;
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut stdout_lines = BufReader::new(stdout).lines();
+    let mut stderr_lines = BufReader::new(stderr).lines();
 
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(30));
+    tokio::pin!(deadline);
+
+    let mut saw_expected_response = false;
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                break;
+            }
+            line = stdout_lines.next_line() => {
+                match line {
+                    Ok(Some(l)) => {
+                        if !l.trim().is_empty() {
+                            if let Ok(v) = serde_json::from_str::<Value>(&l) {
+                                if v.get("id").and_then(Value::as_u64) == Some(expected_response_id)
+                                    && (v.get("result").is_some() || v.get("error").is_some())
+                                {
+                                    saw_expected_response = true;
+                                }
+                            }
+                            out_lines.push(l);
+                            if saw_expected_response {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            line = stderr_lines.next_line() => {
+                if let Ok(Some(l)) = line {
+                    if !l.trim().is_empty() {
+                        out_lines.push(l);
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = child.kill().await;
+    Ok(out_lines.join("\n"))
 }
 
 fn parse_tools_response(result: Value) -> Result<Vec<McpTool>, McpError> {

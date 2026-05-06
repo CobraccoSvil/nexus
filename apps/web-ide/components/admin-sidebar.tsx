@@ -18,7 +18,13 @@ const settingsSubKeys = [
   { key: "auth", href: "/admin/settings/auth" as Route },
 ];
 
-export function AdminSidebar({ compact = false }: { compact?: boolean }) {
+export function AdminSidebar({
+  compact = false,
+  onNavigate,
+}: {
+  compact?: boolean;
+  onNavigate?: () => void;
+}) {
   const pathname = usePathname();
   const tc = useThemeColors();
   const { t } = useI18n();
@@ -70,6 +76,7 @@ export function AdminSidebar({ compact = false }: { compact?: boolean }) {
       <Link
         href={"/admin" as Route}
         className="flex-row-gap-10 text-base transition-all"
+        onClick={onNavigate}
         style={{
           padding: compact ? "9px 12px" : "10px 16px",
           margin: compact ? "0 6px" : "0 8px",
@@ -107,6 +114,7 @@ export function AdminSidebar({ compact = false }: { compact?: boolean }) {
               key={item.key}
               href={item.href}
               className="text-sm transition-all"
+              onClick={onNavigate}
               style={{
                 display: "block",
                 padding: compact ? "6px 12px" : "6px 16px",
@@ -134,6 +142,7 @@ export function AdminSidebar({ compact = false }: { compact?: boolean }) {
             key={item.href}
             href={item.href}
             className="flex-row-gap-10 text-base transition-all"
+            onClick={onNavigate}
             style={{
               padding: compact ? "9px 12px" : "10px 16px",
               margin: compact ? "0 6px" : "0 8px",

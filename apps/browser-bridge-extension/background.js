@@ -1,4 +1,4 @@
-// Service worker MV3 per IDEAI Browser Bridge.
+// Service worker MV3 per Nexus Browser Bridge.
 //
 // Responsabilita`:
 //   - Mantenere una connessione WebSocket al daemon browser-bridge-mcp
@@ -15,7 +15,7 @@
 //     riparte al prossimo evento o quando l'utente apre il popup.
 
 const DEFAULT_PORT = 4055;
-const EXT_VERSION = "0.1.0";
+const EXT_VERSION = "0.1.1";
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
 

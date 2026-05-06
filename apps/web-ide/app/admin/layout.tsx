@@ -20,6 +20,7 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
   const tc = useThemeColors();
   const { t } = useI18n();
   const [viewportWidth, setViewportWidth] = useState(1280);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -30,6 +31,9 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
   }, []);
 
   const compactSidebar = viewportWidth < 1100;
+  useEffect(() => {
+    if (!compactSidebar) setMobileNavOpen(false);
+  }, [compactSidebar]);
 
   return (
     <div
@@ -55,6 +59,26 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+          {compactSidebar && (
+            <button
+              type="button"
+              aria-label="Apri menu"
+              onClick={() => setMobileNavOpen(true)}
+              style={{
+                width: 36,
+                height: 36,
+                borderRadius: 10,
+                border: `1px solid ${tc.border}`,
+                background: tc.bgCard,
+                color: tc.text,
+                display: "grid",
+                placeItems: "center",
+                cursor: "pointer",
+              }}
+            >
+              <span style={{ fontSize: 18, lineHeight: 1 }}>☰</span>
+            </button>
+          )}
           <strong style={{ letterSpacing: "0.08em", fontSize: 14 }}>NEXUS</strong>
           <span
             style={{
@@ -73,8 +97,8 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
           <UserHeader />
         </div>
       </header>
-      <div style={{ display: "flex", flexDirection: compactSidebar ? "column" : "row", flex: 1, overflow: "hidden" }}>
-        <AdminSidebar compact={compactSidebar} />
+      <div style={{ display: "flex", flexDirection: "row", flex: 1, overflow: "hidden" }}>
+        {!compactSidebar && <AdminSidebar compact={false} />}
         <main
           className="no-scrollbar"
           style={{
@@ -87,6 +111,71 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
           {children}
         </main>
       </div>
+
+      {compactSidebar && mobileNavOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Menu admin"
+          onClick={() => setMobileNavOpen(false)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.45)",
+            zIndex: 50,
+            display: "flex",
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 280,
+              maxWidth: "85vw",
+              height: "100%",
+              borderRight: `1px solid ${tc.border}`,
+              background: tc.bgSidebar,
+              boxShadow: "0 12px 40px rgba(0,0,0,0.35)",
+              display: "flex",
+              flexDirection: "column",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                padding: "10px 12px",
+                borderBottom: `1px solid ${tc.border}`,
+                background: tc.bgHeader,
+              }}
+            >
+              <strong style={{ letterSpacing: "0.08em", fontSize: 12 }}>MENU</strong>
+              <button
+                type="button"
+                aria-label="Chiudi menu"
+                onClick={() => setMobileNavOpen(false)}
+                style={{
+                  width: 34,
+                  height: 34,
+                  borderRadius: 10,
+                  border: `1px solid ${tc.border}`,
+                  background: tc.bgCard,
+                  color: tc.text,
+                  display: "grid",
+                  placeItems: "center",
+                  cursor: "pointer",
+                }}
+              >
+                ✕
+              </button>
+            </div>
+            <AdminSidebar
+              compact
+              onNavigate={() => setMobileNavOpen(false)}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

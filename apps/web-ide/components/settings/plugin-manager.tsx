@@ -77,6 +77,16 @@ function healthColor(status: string) {
   return "#94a3b8";
 }
 
+function isNexusBrowserBridgeLocal(server: McpServer): boolean {
+  if (server.transport !== "http") return false;
+  const url = (server.url ?? "").trim().toLowerCase();
+  return (
+    url === "http://127.0.0.1:4055/mcp" ||
+    url === "http://localhost:4055/mcp" ||
+    url === "http://0.0.0.0:4055/mcp"
+  );
+}
+
 function detectLegacyMigratableSlug(server: McpServer): string | null {
   if (server.transport === "http") {
     const url = (server.url ?? "").toLowerCase();
@@ -137,6 +147,7 @@ function toLegacyPayload(entry: CatalogEntry) {
 export function PluginManager() {
   const tc = useThemeColors();
   const { confirmDialog, promptDialog } = useGlobalDialog();
+  const builtinToolHints = ["nexus_mcp_tool_search", "nexus_mcp_tool_call"];
 
   const [activeTab, setActiveTab] = useState<ManagerTab>("installed");
   const [catalog, setCatalog] = useState<PluginCatalogItem[]>([]);
@@ -148,6 +159,17 @@ export function PluginManager() {
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  const [testStatusByPluginId, setTestStatusByPluginId] = useState<
+    Record<
+      string,
+      {
+        success: boolean;
+        toolCount: number;
+        error?: string;
+        at: string;
+      }
+    >
+  >({});
   const [catalogSearch, setCatalogSearch] = useState("");
   const [installScope, setInstallScope] = useState<"global" | "project" | "user">("global");
   const [showAlreadyPresent, setShowAlreadyPresent] = useState(false);
@@ -345,6 +367,15 @@ export function PluginManager() {
         const installedPlugin = await installPlugin(payload);
         const testResult = await testPlugin(installedPlugin.pluginInstanceId);
         await loadData();
+        setTestStatusByPluginId((prev) => ({
+          ...prev,
+          [installedPlugin.pluginInstanceId]: {
+            success: testResult.success,
+            toolCount: testResult.toolCount,
+            error: testResult.error,
+            at: new Date().toISOString(),
+          },
+        }));
         setInfo(
           testResult.success
             ? `Plugin ${item.name} installato e testato (${testResult.toolCount} tool).`
@@ -464,6 +495,15 @@ export function PluginManager() {
       try {
         const result = await testPlugin(plugin.id);
         await loadData();
+        setTestStatusByPluginId((prev) => ({
+          ...prev,
+          [plugin.id]: {
+            success: result.success,
+            toolCount: result.toolCount,
+            error: result.error,
+            at: new Date().toISOString(),
+          },
+        }));
         setInfo(
           result.success
             ? `${plugin.name}: test ok (${result.toolCount} tool).`
@@ -494,6 +534,15 @@ export function PluginManager() {
         await updatePluginVersion(plugin.id, selectedVersion);
         const testResult = await testPlugin(plugin.id);
         await loadData();
+        setTestStatusByPluginId((prev) => ({
+          ...prev,
+          [plugin.id]: {
+            success: testResult.success,
+            toolCount: testResult.toolCount,
+            error: testResult.error,
+            at: new Date().toISOString(),
+          },
+        }));
         setInfo(
           testResult.success
             ? `${plugin.name} aggiornato a ${selectedVersion} e testato.`
@@ -532,6 +581,15 @@ export function PluginManager() {
         await updatePluginVersion(plugin.id, rollbackVersion);
         const testResult = await testPlugin(plugin.id);
         await loadData();
+        setTestStatusByPluginId((prev) => ({
+          ...prev,
+          [plugin.id]: {
+            success: testResult.success,
+            toolCount: testResult.toolCount,
+            error: testResult.error,
+            at: new Date().toISOString(),
+          },
+        }));
         setInfo(
           testResult.success
             ? `${plugin.name} rollback completato a ${rollbackVersion}.`
@@ -876,16 +934,29 @@ export function PluginManager() {
           così l'utente non deve cercarle in alto. */}
 
       {(error || info) && (
-        <div className="text-sm" style={{
+        <div
+          style={{
+            position: "sticky",
+            top: 8,
+            zIndex: 20,
             marginBottom: 12,
-            padding: "8px 10px",
-            borderRadius: 8,
-            border: `1px solid ${error ? tc.error : "#22c55e55"}`,
-            background: error ? `${tc.error}14` : "#22c55e12",
-            color: error ? tc.error : "#16a34a",
-            whiteSpace: "pre-wrap",
-          }}>
-          {error ?? info}
+          }}
+        >
+          <div
+            className="text-sm"
+            style={{
+              padding: "8px 10px",
+              borderRadius: 8,
+              border: `1px solid ${error ? tc.error : "#22c55e55"}`,
+              background: error ? `${tc.error}14` : "#22c55e12",
+              color: error ? tc.error : "#16a34a",
+              whiteSpace: "pre-wrap",
+              boxShadow: "0 8px 24px rgba(0,0,0,0.08)",
+              backdropFilter: "blur(6px)",
+            }}
+          >
+            {error ?? info}
+          </div>
         </div>
       )}
 
@@ -949,6 +1020,7 @@ export function PluginManager() {
             const isBusy = busyKey?.includes(plugin.id) ?? false;
             const requiredKeys = (catalogItem?.requiredSecretRefs ?? []).map((k) => k.trim()).filter(Boolean);
             const missingKeys = requiredKeys.filter((key) => !(settingsByKey.get(key)?.has_value ?? false));
+            const lastTest = testStatusByPluginId[plugin.id];
             return (
               <div
                 key={plugin.id}
@@ -999,6 +1071,20 @@ export function PluginManager() {
                   Versione: {plugin.version ?? "n/a"} · Health: {plugin.healthStatus}
                   {plugin.lastHealthMessage ? ` · ${plugin.lastHealthMessage}` : ""}
                 </div>
+                {lastTest && (
+                  <div
+                    className="text-xs"
+                    style={{
+                      marginBottom: 10,
+                      color: lastTest.success ? "#16a34a" : tc.error,
+                      whiteSpace: "pre-wrap",
+                    }}
+                  >
+                    {lastTest.success
+                      ? `Test: ok (${lastTest.toolCount} tool) · ${new Date(lastTest.at).toLocaleString()}`
+                      : `Test: fallito (${lastTest.error ?? "errore sconosciuto"}) · ${new Date(lastTest.at).toLocaleString()}`}
+                  </div>
+                )}
 
                 {missingKeys.length > 0 && plugin.canManage && (
                   <div
@@ -1428,6 +1514,7 @@ export function PluginManager() {
           {legacyConnectors.map((server) => {
             const slug = detectLegacyMigratableSlug(server);
             const isBuiltin = (server.transport as string) === "builtin";
+            const isNexusBridge = isNexusBrowserBridgeLocal(server);
             return (
               <div
                 key={server.id}
@@ -1470,6 +1557,21 @@ export function PluginManager() {
                       integrato
                     </span>
                   )}
+                  {isNexusBridge && !isBuiltin && (
+                    <span
+                      style={{
+                        fontSize: 10,
+                        border: "1px solid #22c55e66",
+                        borderRadius: 999,
+                        padding: "2px 6px",
+                        color: "#16a34a",
+                        textTransform: "uppercase",
+                      }}
+                      title="Connettore locale Nexus Browser Bridge: è già un MCP HTTP pronto all'uso (migrazione non necessaria)."
+                    >
+                      integrato
+                    </span>
+                  )}
                   {slug && (
                     <span
                       style={{
@@ -1490,19 +1592,59 @@ export function PluginManager() {
                     ? server.url
                     : `${server.command ?? ""} ${(server.args ?? []).join(" ")}`.trim()}
                 </div>
+                {isBuiltin && (
+                  <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
+                    <div
+                      style={{
+                        fontSize: 12,
+                        color: tc.textMuted,
+                        fontWeight: 600,
+                      }}
+                      title="Tool esposti dal server integrato Nexus Builtin"
+                    >
+                      Tool disponibili (Nexus Builtin)
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                      {builtinToolHints.map((name) => (
+                        <span
+                          key={name}
+                          style={{
+                            fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                            fontSize: 11,
+                            padding: "3px 6px",
+                            borderRadius: 999,
+                            border: `1px solid ${tc.border}`,
+                            background: tc.bgInput,
+                            color: tc.text,
+                          }}
+                        >
+                          {name}
+                        </span>
+                      ))}
+                    </div>
+                    <div style={{ fontSize: 11, color: tc.textMuted }}>
+                      Questi tool servono per scoprire/eseguire tool MCP esterni a runtime (senza inviare tutta la lista al provider).
+                    </div>
+                    <div style={{ fontSize: 11, color: tc.textMuted }}>
+                      Elenco completo: <strong>Admin → Template Prompt → MCP Tools → Tool disponibili</strong>.
+                    </div>
+                  </div>
+                )}
                 <div style={{ marginTop: 8 }}>
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
                     <button
                       type="button"
-                      disabled={isBuiltin || !slug || busyKey === `legacy-migrate:${server.id}`}
+                      disabled={isBuiltin || isNexusBridge || !slug || busyKey === `legacy-migrate:${server.id}`}
                       onClick={() => void handleMigrateLegacy(server)}
                       style={actionButtonStyle(
                         tc,
-                        isBuiltin || !slug || busyKey === `legacy-migrate:${server.id}`,
+                        isBuiltin || isNexusBridge || !slug || busyKey === `legacy-migrate:${server.id}`,
                       )}
                     >
                       {isBuiltin
                         ? "Già integrato"
+                        : isNexusBridge
+                          ? "Connettore Nexus"
                         : !slug
                           ? "Non migrabile automaticamente"
                         : busyKey === `legacy-migrate:${server.id}`

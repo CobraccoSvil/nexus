@@ -1,12 +1,13 @@
 "use client";
 
 // Sezione admin: gestione installazione automatica dell'estensione Chrome
-// "IDEAI Browser Bridge". Recupera lo stato dal daemon browser-bridge-mcp via
+// "Nexus Browser Bridge". Recupera lo stato dal daemon browser-bridge-mcp via
 // /api/admin/browser-bridge/info e offre i link per scaricare gli script di
 // installazione policy (Windows / Linux) generati a runtime dal daemon.
 
 import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../../lib/theme";
+import { createMcpServer } from "../../../lib/api-client";
 
 type Info = {
   extension_id: string | null;
@@ -22,6 +23,9 @@ type Info = {
 const PROXY_INFO = "/api/admin/browser-bridge/info";
 const PROXY_PS1 = "/api/admin/browser-bridge/install.ps1";
 const PROXY_SH  = "/api/admin/browser-bridge/install.sh";
+const PROXY_UNINSTALL_PS1 = "/api/admin/browser-bridge/uninstall.ps1";
+const PROXY_UNINSTALL_SH  = "/api/admin/browser-bridge/uninstall.sh";
+const MCP_URL = "http://127.0.0.1:4055/mcp";
 
 export default function BrowserBridgePage() {
   const tc = useThemeColors();
@@ -29,6 +33,8 @@ export default function BrowserBridgePage() {
   const [loading, setLoading]     = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [dlError, setDlError]     = useState<string | null>(null);
+  const [registerBusy, setRegisterBusy] = useState(false);
+  const [registerMsg, setRegisterMsg] = useState<string | null>(null);
 
   const fetchInfo = useCallback(async () => {
     setLoading(true);
@@ -74,13 +80,67 @@ export default function BrowserBridgePage() {
     }
   }, []);
 
+  const registerAsMcp = useCallback(async () => {
+    setRegisterMsg(null);
+    setRegisterBusy(true);
+    try {
+      await createMcpServer({
+        name: "Nexus Browser Bridge (local)",
+        description: "Bridge locale verso estensione Chrome (daemon browser-bridge-mcp).",
+        transport: "http",
+        url: MCP_URL,
+        scope: "user",
+      });
+      setRegisterMsg("Registrato come MCP. Ora lo trovi in Template Prompt → MCP Tools → Tool disponibili.");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // Se esiste già, l'API può rispondere con 409/400: mostriamo un messaggio utile.
+      setRegisterMsg(`Registrazione MCP non riuscita: ${msg}`);
+    } finally {
+      setRegisterBusy(false);
+    }
+  }, []);
+
   // ----- stili -----
+  const headerWrap: React.CSSProperties = {
+    border: `1px solid ${tc.border}`,
+    borderRadius: 14,
+    padding: 16,
+    background: `radial-gradient(1000px 520px at 10% 10%, ${tc.accent}22, transparent 55%),
+                 radial-gradient(900px 440px at 90% 0%, #22c55e14, transparent 55%),
+                 ${tc.bgCard}`,
+    marginBottom: 14,
+  };
+  const logo: React.CSSProperties = {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    background: tc.accent,
+    color: "#fff",
+    display: "grid",
+    placeItems: "center",
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+    fontWeight: 900,
+    fontSize: 20,
+    boxShadow: `0 16px 40px ${tc.accent}30`,
+    flexShrink: 0,
+  };
   const card: React.CSSProperties = {
     background: tc.bgCard,
     border: `1px solid ${tc.border}`,
     borderRadius: 10,
     padding: 20,
     marginBottom: 16,
+  };
+  const pill: React.CSSProperties = {
+    fontSize: 11,
+    padding: "4px 8px",
+    borderRadius: 999,
+    border: `1px solid ${tc.border}`,
+    background: tc.bgInput,
+    color: tc.textMuted,
+    fontWeight: 700,
+    textTransform: "uppercase",
   };
   const codeBox: React.CSSProperties = {
     background: tc.bgInput,
@@ -93,12 +153,21 @@ export default function BrowserBridgePage() {
     overflowX: "auto",
     whiteSpace: "nowrap",
   };
-  const btn = (primary: boolean, disabled: boolean): React.CSSProperties => ({
+  const urlBox: React.CSSProperties = {
+    ...codeBox,
+    whiteSpace: "normal",
+    wordBreak: "break-all",
+    overflowX: "hidden",
+  };
+  const btn = (
+    variant: "primary" | "secondary",
+    disabled: boolean,
+  ): React.CSSProperties => ({
     padding: "9px 16px",
     borderRadius: 6,
-    border: `1px solid ${tc.accent}`,
-    background: primary ? tc.accent : "transparent",
-    color: primary ? "#fff" : tc.accent,
+    border: `1px solid ${variant === "primary" ? tc.accent : tc.border}`,
+    background: variant === "primary" ? tc.accent : tc.bgInput,
+    color: variant === "primary" ? "#fff" : tc.text,
     cursor: disabled ? "not-allowed" : "pointer",
     fontWeight: 600,
     fontSize: 13,
@@ -108,26 +177,71 @@ export default function BrowserBridgePage() {
   });
 
   const ready = !!(info && info.extension_id && info.crx_available && !info.error);
+  const daemonReachable = !!(info && !info.error);
+  const healthUrl = "http://127.0.0.1:4055/health";
 
   return (
     <div>
-      <h1 style={{ fontSize: 20, fontWeight: 700, marginBottom: 6, color: tc.text }}>
-        Browser Bridge
-      </h1>
-      <p style={{ color: tc.textMuted, fontSize: 13, marginBottom: 20 }}>
-        Installa l&apos;estensione Chrome che permette a Nexus di leggere console, errori e
-        rete del browser e di guidarne la navigazione in test autonomi.
-        L&apos;installazione e&apos; silenziosa via Chrome Enterprise Policy: basta un
-        singolo lancio &quot;Esegui come amministratore&quot; dello script generato.
-      </p>
+      <div style={headerWrap}>
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <div style={logo}>N</div>
+          <div style={{ minWidth: 240, flex: 1 }}>
+            <div style={{ fontSize: 18, fontWeight: 800, color: tc.text, lineHeight: 1.15 }}>
+              Nexus Browser Bridge
+            </div>
+            <div style={{ color: tc.textMuted, fontSize: 13, marginTop: 4, lineHeight: 1.45 }}>
+              Estensione Chrome che permette a Nexus di leggere <strong>console</strong>, <strong>errori</strong> e{" "}
+              <strong>rete</strong> del browser e guidare la navigazione nei test.
+              Installazione silenziosa via <strong>Chrome Enterprise Policy</strong>.
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <span
+              style={{
+                ...pill,
+                border: `1px solid ${daemonReachable ? "#22c55e55" : tc.border}`,
+                background: daemonReachable ? "#22c55e14" : tc.bgInput,
+                color: daemonReachable ? "#16a34a" : tc.textMuted,
+              }}
+              title={daemonReachable ? "Daemon raggiungibile" : "Daemon non raggiungibile"}
+            >
+              {daemonReachable ? "daemon: ok" : "daemon: down"}
+            </span>
+            <span
+              style={{
+                ...pill,
+                border: `1px solid ${ready ? "#22c55e55" : tc.border}`,
+                background: ready ? "#22c55e14" : tc.bgInput,
+                color: ready ? "#16a34a" : tc.textMuted,
+              }}
+              title={ready ? "CRX e chiave presenti" : "CRX/chiave mancanti"}
+            >
+              {ready ? "crx: pronto" : "crx: non pronto"}
+            </span>
+            <button onClick={fetchInfo} style={btn("secondary", loading)} disabled={loading}>
+              {loading ? "Aggiorno..." : "Ricarica"}
+            </button>
+          </div>
+        </div>
+      </div>
 
       {/* --- stato daemon --- */}
       <div style={card}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
           <strong style={{ fontSize: 14, color: tc.text }}>Stato daemon</strong>
-          <button onClick={fetchInfo} style={btn(false, loading)} disabled={loading}>
-            {loading ? "Aggiorno..." : "Ricarica"}
-          </button>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ fontSize: 12, color: tc.textMuted }}>
+              endpoint: <code style={codeBox}>http://127.0.0.1:4055</code>
+            </span>
+            <button
+              type="button"
+              onClick={() => void navigator.clipboard?.writeText("http://127.0.0.1:4055")}
+              style={btn("secondary", false)}
+              title="Copia URL base"
+            >
+              Copia
+            </button>
+          </div>
         </div>
 
         {fetchError && (
@@ -165,6 +279,42 @@ export default function BrowserBridgePage() {
             </div>
           </div>
         )}
+
+        {daemonReachable && (
+          <div style={{ marginTop: 14, display: "grid", gap: 8 }}>
+            <div style={{ fontSize: 12, color: tc.textMuted }}>
+              Per usare questo Bridge anche nella logica MCP (tool disponibili, auto-assegna, runtime tool search/call),
+              registralo come connettore MCP HTTP.
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "72px 1fr auto", gap: 8, alignItems: "center" }}>
+              <span style={{ ...pill, textTransform: "none", fontWeight: 600 }}>MCP</span>
+              <code style={urlBox}>{MCP_URL}</code>
+              <button
+                type="button"
+                onClick={() => void navigator.clipboard?.writeText(MCP_URL)}
+                style={btn("secondary", false)}
+                title="Copia URL MCP"
+              >
+                Copia
+              </button>
+            </div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+              <button
+                onClick={registerAsMcp}
+                style={btn("primary", registerBusy)}
+                disabled={registerBusy}
+                title="Crea un MCP server 'Nexus Browser Bridge (local)' puntato al daemon locale"
+              >
+                {registerBusy ? "Registro..." : "Registra come MCP"}
+              </button>
+              {registerMsg && (
+                <span style={{ fontSize: 12, color: registerMsg.startsWith("Registrato") ? "#16a34a" : "#c33" }}>
+                  {registerMsg}
+                </span>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* --- download script --- */}
@@ -185,7 +335,7 @@ export default function BrowserBridgePage() {
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           <button
             onClick={() => download(PROXY_PS1, "install-browser-bridge.ps1")}
-            style={btn(true, !ready)}
+            style={btn("primary", !ready)}
             disabled={!ready}
             title={ready ? "Scarica script installazione policy Chrome (Windows)" : "Daemon non pronto o CRX assente"}
           >
@@ -193,11 +343,30 @@ export default function BrowserBridgePage() {
           </button>
           <button
             onClick={() => download(PROXY_SH, "install-browser-bridge.sh")}
-            style={btn(false, !ready)}
+            style={btn("secondary", !ready)}
             disabled={!ready}
             title={ready ? "Scarica script installazione policy Chrome (Linux)" : "Daemon non pronto o CRX assente"}
           >
             Scarica .sh (Linux)
+          </button>
+        </div>
+
+        <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <button
+            onClick={() => download(PROXY_UNINSTALL_PS1, "uninstall-browser-bridge.ps1")}
+            style={btn("secondary", !daemonReachable)}
+            disabled={!daemonReachable}
+            title={daemonReachable ? "Scarica script rimozione policy Chrome (Windows)" : "Daemon non raggiungibile"}
+          >
+            Script rimozione .ps1
+          </button>
+          <button
+            onClick={() => download(PROXY_UNINSTALL_SH, "uninstall-browser-bridge.sh")}
+            style={btn("secondary", !daemonReachable)}
+            disabled={!daemonReachable}
+            title={daemonReachable ? "Scarica script rimozione policy Chrome (Linux)" : "Daemon non raggiungibile"}
+          >
+            Script rimozione .sh
           </button>
         </div>
 
@@ -234,12 +403,71 @@ export default function BrowserBridgePage() {
         )}
       </div>
 
+      {/* --- diagnostica --- */}
+      <div style={card}>
+        <strong style={{ fontSize: 14, color: tc.text }}>Diagnostica rapida</strong>
+        <p style={{ color: tc.textMuted, fontSize: 12, margin: "8px 0 12px" }}>
+          Link utili per verificare subito daemon, update manifest e CRX.
+        </p>
+
+        <div style={{ display: "grid", gap: 10 }}>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            <span style={{ ...pill, textTransform: "none", fontWeight: 600 }}>Health</span>
+            <code style={codeBox}>{healthUrl}</code>
+            <button
+              type="button"
+              onClick={() => void navigator.clipboard?.writeText(healthUrl)}
+              style={btn("secondary", false)}
+            >
+              Copia
+            </button>
+            <a href={healthUrl} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: tc.accent }}>
+              Apri
+            </a>
+          </div>
+
+          {info?.update_url && (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <span style={{ ...pill, textTransform: "none", fontWeight: 600 }}>Update XML</span>
+              <code style={codeBox}>{info.update_url}</code>
+              <button
+                type="button"
+                onClick={() => void navigator.clipboard?.writeText(info.update_url)}
+                style={btn("secondary", false)}
+              >
+                Copia
+              </button>
+              <a href={info.update_url} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: tc.accent }}>
+                Apri
+              </a>
+            </div>
+          )}
+
+          {info?.crx_url && (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <span style={{ ...pill, textTransform: "none", fontWeight: 600 }}>CRX</span>
+              <code style={codeBox}>{info.crx_url}</code>
+              <button
+                type="button"
+                onClick={() => void navigator.clipboard?.writeText(info.crx_url)}
+                style={btn("secondary", false)}
+              >
+                Copia
+              </button>
+              <a href={info.crx_url} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: tc.accent }}>
+                Apri
+              </a>
+            </div>
+          )}
+        </div>
+      </div>
+
       {/* --- dopo l'installazione --- */}
       <div style={card}>
         <strong style={{ fontSize: 14, color: tc.text }}>Dopo l&apos;installazione</strong>
         <ol style={{ color: tc.textMuted, fontSize: 13, margin: "10px 0 0 18px", lineHeight: 1.8 }}>
           <li>Riavvia Chrome (o apri un&apos;istanza nuova).</li>
-          <li>L&apos;icona <strong>IDEAI Browser Bridge</strong> appare nella toolbar.</li>
+          <li>L&apos;icona <strong>Nexus Browser Bridge</strong> appare nella toolbar.</li>
           <li>
             Cliccala: incolla il token da{" "}
             <code>~/.ideai/browser-bridge.token</code> e premi{" "}

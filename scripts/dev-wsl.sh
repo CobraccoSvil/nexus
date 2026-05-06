@@ -158,16 +158,27 @@ sleep 4
 # ── Microservizi Rust ──────────────────────────────────────────────────────────
 start_rust_svc() {
     local name="$1"
+    shift || true
     local bin="$RUST_BIN/$name"
     info "Avvio ${name}..."
     pkill -f "$name" 2>/dev/null || true
     sleep 0.5
+    # Permette di passare variabili d'ambiente extra come "KEY=VALUE".
+    # Esempio: start_rust_svc "browser-bridge-mcp" BROWSER_BRIDGE_BIND_HOST="0.0.0.0"
+    for pair in "$@"; do
+        export "$pair"
+    done
     if [ -f "$bin" ]; then
         nohup "$bin" > "$LOG_DIR/${name}.log" 2>&1 &
     else
         warn "${name}: binario non trovato, uso cargo run"
         nohup cargo run -p "$name" > "$LOG_DIR/${name}.log" 2>&1 &
     fi
+    # Cleanup env vars extra per non inquinare gli altri servizi.
+    for pair in "$@"; do
+        local varname="${pair%%=*}"
+        unset "$varname"
+    done
     echo $! > "$LOG_DIR/${name}.pid"
 }
 
@@ -178,6 +189,9 @@ start_rust_svc "billing-service"
 start_rust_svc "chat-service"
 start_rust_svc "doc-service"
 start_rust_svc "plugin-service"
+# WSL2: esponiamo il bridge su 0.0.0.0 per permettere a Chrome Windows
+# di raggiungere http://127.0.0.1:4055/extension/update.xml via port-forward.
+start_rust_svc "browser-bridge-mcp" BROWSER_BRIDGE_BIND_HOST="0.0.0.0" BROWSER_BRIDGE_PUBLIC_HOST="127.0.0.1"
 sleep 3
 
 # ── Nexus Gateway (Node.js/TypeScript, :4060) ─────────────────────────────────
@@ -210,6 +224,19 @@ setsid bash -lc "cd \"${REPO_ROOT}/apps/web-ide\" && nohup ./node_modules/.bin/n
 echo $! > "$LOG_DIR/webide.pid"
 sleep 5
 
+# ── Smoke check Browser Bridge daemon (:4055) ─────────────────────────────────
+for i in $(seq 1 10); do
+    if ss -tln 2>/dev/null | grep -qE '(:|\.)4055\s'; then
+        break
+    fi
+    sleep 0.4
+done
+if ss -tln 2>/dev/null | grep -qE '(:|\.)4055\s'; then
+    success "Browser Bridge daemon in ascolto su :4055"
+else
+    warn "Browser Bridge daemon NON in ascolto su :4055 (controlla $LOG_DIR/browser-bridge-mcp.log)"
+fi
+
 # ── Status finale ──────────────────────────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════════════"
@@ -219,6 +246,7 @@ echo "  Web IDE         →  http://localhost:3000"
 echo "  Core API        →  http://localhost:4000"
 echo "  Nexus Gateway   →  http://localhost:4060"
 echo "  Nexus Health    →  http://localhost:4060/health"
+echo "  Browser Bridge  →  http://127.0.0.1:4055/health"
 echo "  Jaeger UI       →  http://localhost:16686"
 echo "  Grafana         →  http://localhost:3001  (admin/admin)"
 echo "  Prometheus      →  http://localhost:9090"

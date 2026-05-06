@@ -1,4 +1,4 @@
-# Pacchettizza l'estensione IDEAI Browser Bridge da Windows.
+# Pacchettizza l'estensione Nexus Browser Bridge da Windows.
 #
 # Produce in dist/:
 #   browser-bridge-extension-<ver>.zip
@@ -37,7 +37,7 @@ Write-Host "==> Chrome: $Chrome"
 $ZipPath = Join-Path $Dist "$BaseName.zip"
 if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
 Compress-Archive -Path `
-    (Join-Path $Src "manifest.json"),(Join-Path $Src "background.js"),(Join-Path $Src "popup.html"),(Join-Path $Src "popup.js") `
+    (Join-Path $Src "manifest.json"),(Join-Path $Src "background.js"),(Join-Path $Src "popup.html"),(Join-Path $Src "popup.js"),(Join-Path $Src "icon128.png") `
     -DestinationPath $ZipPath -Force
 Write-Host "==> $ZipPath"
 
@@ -45,7 +45,7 @@ Write-Host "==> $ZipPath"
 $PackDir = Join-Path $Dist "_pack-$Version"
 if (Test-Path $PackDir) { Remove-Item -Recurse -Force $PackDir }
 New-Item -ItemType Directory -Path $PackDir | Out-Null
-Copy-Item (Join-Path $Src "manifest.json"),(Join-Path $Src "background.js"),(Join-Path $Src "popup.html"),(Join-Path $Src "popup.js") -Destination $PackDir
+Copy-Item (Join-Path $Src "manifest.json"),(Join-Path $Src "background.js"),(Join-Path $Src "popup.html"),(Join-Path $Src "popup.js"),(Join-Path $Src "icon128.png") -Destination $PackDir
 
 $Key = Join-Path $Dist "key.pem"
 if (Test-Path $Key) {

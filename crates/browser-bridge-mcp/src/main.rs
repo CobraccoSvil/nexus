@@ -173,6 +173,14 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(4055);
 
+    // Per WSL2: per permettere a Chrome su Windows di raggiungere l'update.xml,
+    // bisogna ascoltare su 0.0.0.0 (WSL forward -> localhost Windows).
+    // Default rimane loopback per sicurezza.
+    let bind_host = std::env::var("BROWSER_BRIDGE_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    // Host "pubblico" usato per generare gli URL negli script/install e update.xml.
+    // In WSL2 conviene usare 127.0.0.1 (lato Windows) o "localhost".
+    let public_host = std::env::var("BROWSER_BRIDGE_PUBLIC_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+
     let token = generate_token();
     persist_token_and_port(&token, port)?;
 
@@ -183,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
         tabs: Arc::new(DashMap::new()),
     };
 
-    let assets = extension_assets::ExtensionAssets::from_env("127.0.0.1", port);
+    let assets = extension_assets::ExtensionAssets::from_env(&public_host, port);
     let app = Router::new()
         .route("/handshake", get(handshake))
         .route("/ws", get(ws_upgrade))
@@ -192,8 +200,8 @@ async fn main() -> anyhow::Result<()> {
         .with_state(hub)
         .nest("/extension", extension_assets::router().with_state(assets));
 
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    tracing::info!(%addr, "browser-bridge-mcp in ascolto su loopback");
+    let addr: SocketAddr = format!("{bind_host}:{port}").parse()?;
+    tracing::info!(%addr, bind_host = %bind_host, public_host = %public_host, "browser-bridge-mcp in ascolto");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

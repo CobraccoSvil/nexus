@@ -498,6 +498,16 @@ async fn resolve_plugin_runtime_config(
     let mut env_vars = value_to_string_map(static_env.as_object());
     let mut figma_token = resolve_secret_value(db, "figma_oauth_token").await;
 
+    // Redis MCP stdio: se non configurato, usa la setting infrastrutturale `redis_url`.
+    // Questo evita "health unknown"/test falliti per default non-informativi.
+    if plugin_slug.eq_ignore_ascii_case("redis-stdio") && !env_vars.contains_key("REDIS_URL") {
+        if let Some(url) = get_setting(db, "redis_url").await {
+            if !url.trim().is_empty() {
+                env_vars.insert("REDIS_URL".to_string(), url);
+            }
+        }
+    }
+
     if let Some(bindings_headers) = get_json_object(secret_bindings, "headers") {
         for (header_name, setting_key_raw) in bindings_headers {
             if let Some(setting_key) = setting_key_raw.as_str() {

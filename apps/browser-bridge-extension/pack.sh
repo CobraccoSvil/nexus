@@ -1,5 +1,5 @@
 #!/bin/bash
-# Pacchettizza l'estensione IDEAI Browser Bridge in .zip e .crx.
+# Pacchettizza l'estensione Nexus Browser Bridge in .zip e .crx.
 #
 # Uso:
 #   ./pack.sh                # produce dist/*.zip e (se Chrome/Chromium presente) dist/*.crx
@@ -40,6 +40,10 @@ files = ["manifest.json", "background.js", "popup.html", "popup.js"]
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
     for f in files:
         z.write(os.path.join(src, f), arcname=f)
+    # icon (optional)
+    icon = os.path.join(src, "icon128.png")
+    if os.path.exists(icon):
+        z.write(icon, arcname="icon128.png")
 PY
 fi
 echo "    ok ($(du -h "${DIST}/${NAME}.zip" | cut -f1))"
@@ -67,6 +71,7 @@ PACKDIR="${DIST}/_pack-${VERSION}"
 rm -rf "$PACKDIR"
 mkdir -p "$PACKDIR"
 cp "${SRC}/manifest.json" "${SRC}/background.js" "${SRC}/popup.html" "${SRC}/popup.js" "$PACKDIR"/
+[ -f "${SRC}/icon128.png" ] && cp "${SRC}/icon128.png" "$PACKDIR"/ || true
 
 KEY="${DIST}/key.pem"
 if [ -f "$KEY" ]; then

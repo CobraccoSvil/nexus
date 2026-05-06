@@ -4,6 +4,8 @@
 //!   - `GET /api/admin/browser-bridge/info`        -> JSON status + URL asset
 //!   - `GET /api/admin/browser-bridge/install.ps1` -> script PowerShell di installazione
 //!   - `GET /api/admin/browser-bridge/install.sh`  -> script bash di installazione
+//!   - `GET /api/admin/browser-bridge/uninstall.ps1` -> script PowerShell di rimozione
+//!   - `GET /api/admin/browser-bridge/uninstall.sh`  -> script bash di rimozione
 //!   - `GET /api/admin/browser-bridge/extension.crx` -> .crx scaricabile
 //!
 //! Razionale: dall'admin UI l'utente clicca "Installa estensione browser",
@@ -35,6 +37,8 @@ where
         .route("/info", get(info))
         .route("/install.ps1", get(install_ps1))
         .route("/install.sh", get(install_sh))
+        .route("/uninstall.ps1", get(uninstall_ps1))
+        .route("/uninstall.sh", get(uninstall_sh))
         .route("/extension.crx", get(extension_crx))
 }
 
@@ -52,6 +56,14 @@ async fn install_sh() -> Response {
 
 async fn extension_crx() -> Response {
     proxy("/extension/extension.crx", "application/x-chrome-extension").await
+}
+
+async fn uninstall_ps1() -> Response {
+    proxy("/extension/uninstall.ps1", "text/plain; charset=utf-8").await
+}
+
+async fn uninstall_sh() -> Response {
+    proxy("/extension/uninstall.sh", "text/x-shellscript; charset=utf-8").await
 }
 
 async fn proxy(path: &str, content_type: &'static str) -> Response {

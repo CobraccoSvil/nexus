@@ -47,8 +47,33 @@ impl ExtensionAssets {
         self.dist_dir.join("key.pem")
     }
 
-    fn crx_path(&self) -> Option<PathBuf> {
-        find_first_with_ext(&self.dist_dir, "crx")
+    fn crx_path_for_version(&self, version: Option<&str>) -> Option<PathBuf> {
+        let candidates = std::fs::read_dir(&self.dist_dir).ok()?;
+        let mut crxs: Vec<PathBuf> = candidates
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("crx"))
+            .collect();
+        crxs.sort();
+
+        if let Some(v) = version {
+            // Prefer CRX che contiene la versione nel filename (es. browser-bridge-extension-0.1.1.crx)
+            let needle = format!("-{v}.crx");
+            if let Some(best) = crxs.iter().rev().find(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.contains(&needle))
+                    .unwrap_or(false)
+            }) {
+                return Some(best.to_path_buf());
+            }
+            // Se è stata richiesta una versione specifica e non c'è match,
+            // NON facciamo fallback su una versione diversa: Chrome fallirebbe l'installazione/upgrade.
+            return None;
+        }
+
+        // Fallback: ultimo CRX (legacy)
+        crxs.into_iter().next_back()
     }
 
     fn manifest_version(&self) -> Option<String> {
@@ -152,6 +177,8 @@ pub fn router() -> Router<ExtensionAssets> {
         .route("/update.xml", get(serve_update_xml))
         .route("/install.ps1", get(serve_install_ps1))
         .route("/install.sh", get(serve_install_sh))
+        .route("/uninstall.ps1", get(serve_uninstall_ps1))
+        .route("/uninstall.sh", get(serve_uninstall_sh))
 }
 
 #[derive(Serialize)]
@@ -171,21 +198,39 @@ async fn info(State(a): State<ExtensionAssets>) -> impl IntoResponse {
         Ok(s) => (Some(s), None),
         Err(e) => (None, Some(e.to_string())),
     };
+    let manifest_ver = a.manifest_version();
+    let crx_path = a.crx_path_for_version(manifest_ver.as_deref());
+    let crx_available = crx_path.is_some();
+    let mut error = err;
+
+    if error.is_none() && manifest_ver.is_some() && !crx_available {
+        error = Some(format!(
+            "CRX versione {} non trovato in {} (esegui pack.ps1/pack.sh)",
+            manifest_ver.clone().unwrap_or_default(),
+            a.dist_dir.display()
+        ));
+    }
+
     Json(ExtensionInfo {
         extension_id: id,
-        version: a.manifest_version(),
-        crx_available: a.crx_path().is_some(),
+        version: manifest_ver,
+        crx_available,
         crx_url: a.crx_url(),
         update_url: a.update_url(),
         install_windows_url: format!("http://{}:{}/extension/install.ps1", a.bind_host, a.bind_port),
         install_linux_url: format!("http://{}:{}/extension/install.sh", a.bind_host, a.bind_port),
-        error: err,
+        error,
     })
 }
 
 async fn serve_crx(State(a): State<ExtensionAssets>) -> Response {
-    let Some(path) = a.crx_path() else {
-        return (StatusCode::NOT_FOUND, "crx non disponibile (esegui pack.ps1)").into_response();
+    let manifest_ver = a.manifest_version();
+    let Some(path) = a.crx_path_for_version(manifest_ver.as_deref()) else {
+        return (
+            StatusCode::NOT_FOUND,
+            "crx non disponibile per la versione corrente (esegui pack.ps1/pack.sh)",
+        )
+            .into_response();
     };
     match tokio::fs::read(&path).await {
         Ok(bytes) => {
@@ -210,6 +255,17 @@ async fn serve_update_xml(State(a): State<ExtensionAssets>) -> Response {
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     let version = a.manifest_version().unwrap_or_else(|| "0.0.0".to_string());
+    // Se manca il CRX della stessa versione, Chrome fallisce l'installazione/upgrade.
+    if a.crx_path_for_version(Some(&version)).is_none() {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            format!(
+                "CRX versione {version} non trovato in {} (rigenera con pack.ps1/pack.sh)",
+                a.dist_dir.display()
+            ),
+        )
+            .into_response();
+    }
     let body = format!(
         r#"<?xml version='1.0' encoding='UTF-8'?>
 <gupdate xmlns='http://www.google.com/update2/response' protocol='2.0'>
@@ -243,6 +299,24 @@ async fn serve_install_sh(State(a): State<ExtensionAssets>) -> Response {
     text_response(body, "text/x-shellscript; charset=utf-8")
 }
 
+async fn serve_uninstall_ps1(State(a): State<ExtensionAssets>) -> Response {
+    let id = match compute_extension_id(&a.key_path()) {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let body = render_powershell_uninstall(&id);
+    text_response(body, "text/plain; charset=utf-8")
+}
+
+async fn serve_uninstall_sh(State(a): State<ExtensionAssets>) -> Response {
+    let id = match compute_extension_id(&a.key_path()) {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let body = render_bash_uninstall(&id);
+    text_response(body, "text/x-shellscript; charset=utf-8")
+}
+
 fn text_response(body: String, content_type: &'static str) -> Response {
     let mut resp = Response::new(Body::from(body));
     resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
@@ -261,7 +335,7 @@ fn render_powershell(extension_id: &str, manifest_url: &str) -> String {
     })
     .to_string();
     format!(
-        r#"# IDEAI Browser Bridge - installazione automatica via Chrome Enterprise Policy
+        r#"# Nexus Browser Bridge - installazione automatica via Chrome Enterprise Policy
 # Generato dal daemon browser-bridge-mcp. Esegui come Amministratore.
 #Requires -RunAsAdministrator
 $ErrorActionPreference = "Stop"
@@ -295,21 +369,65 @@ Write-Host "Riavvia Chrome: l'estensione verra` installata silenziosamente."
     )
 }
 
+fn render_powershell_uninstall(extension_id: &str) -> String {
+    let json_pkg = json!({ "extension_id": extension_id }).to_string();
+    format!(
+        r#"# Nexus Browser Bridge - rimozione policy Chrome (Windows)
+# Generato dal daemon browser-bridge-mcp. Esegui come Amministratore.
+#Requires -RunAsAdministrator
+$ErrorActionPreference = "Stop"
+$cfg = '{json_pkg}' | ConvertFrom-Json
+$key = "HKLM:\Software\Policies\Google\Chrome\ExtensionInstallForcelist"
+
+if (-not (Test-Path $key)) {{
+  Write-Host "Policy non presente: nulla da rimuovere."
+  exit 0
+}}
+
+$existing = Get-ItemProperty $key -ErrorAction SilentlyContinue
+if ($existing) {{
+  $existing.PSObject.Properties |
+    Where-Object {{ $_.Name -match '^\d+$' -and $_.Value -like ($cfg.extension_id + ';*') }} |
+    ForEach-Object {{ Remove-ItemProperty -Path $key -Name $_.Name -ErrorAction SilentlyContinue }}
+}}
+
+Write-Host "Policy rimossa (extension ID: $($cfg.extension_id))."
+Write-Host "Chiudi e riapri Chrome: l'estensione non sara' piu' forzata e potrai rimuoverla normalmente."
+"#
+    )
+}
+
 fn render_bash(extension_id: &str, manifest_url: &str) -> String {
     format!(
         r#"#!/bin/bash
-# IDEAI Browser Bridge - installazione via Chrome managed policy (Linux).
+# Nexus Browser Bridge - installazione via Chrome managed policy (Linux).
 # Esegui con sudo. Riavvia Chrome dopo.
 set -euo pipefail
 DIR="/etc/opt/chrome/policies/managed"
 sudo mkdir -p "$DIR"
-sudo tee "$DIR/ideai-browser-bridge.json" >/dev/null <<JSON
+sudo tee "$DIR/nexus-browser-bridge.json" >/dev/null <<JSON
 {{
   "ExtensionInstallForcelist": [ "{extension_id};{manifest_url}" ]
 }}
 JSON
-echo "Policy installata in $DIR/ideai-browser-bridge.json (id: {extension_id})."
+echo "Policy installata in $DIR/nexus-browser-bridge.json (id: {extension_id})."
 echo "Riavvia Chrome per completare l'installazione."
+"#
+    )
+}
+
+fn render_bash_uninstall(extension_id: &str) -> String {
+    // Rimuove sia il nome nuovo che quello legacy per compatibilita`.
+    format!(
+        r#"#!/bin/bash
+# Nexus Browser Bridge - rimozione policy Chrome (Linux).
+# Esegui con sudo. Riavvia Chrome dopo.
+set -euo pipefail
+DIR="/etc/opt/chrome/policies/managed"
+
+sudo rm -f "$DIR/nexus-browser-bridge.json" "$DIR/ideai-browser-bridge.json" || true
+echo "Policy rimossa (id: {extension_id})."
+echo "Riavvia Chrome: l'estensione non sara' piu' forzata e potrai rimuoverla normalmente."
 "#
     )
 }
