@@ -306,9 +306,11 @@ pub async fn detect_run_configs(
     // e non devono mai proporre porte riservate (es. 3000).
     for s in &mut suggestions {
         let Some(obj) = s.as_object_mut() else { continue; };
-        let label = obj.get("label").and_then(|v| v.as_str()).unwrap_or("");
-        let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        let is_webish = role == "web" || role == "frontend" || label.to_lowercase().contains("dev") || label.to_lowercase().contains("serve");
+        // Clone dei campi usati come key, per evitare borrow immutabile+mutabile su `obj`.
+        let label: String = obj.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let role: String = obj.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let lower_label = label.to_lowercase();
+        let is_webish = role == "web" || role == "frontend" || lower_label.contains("dev") || lower_label.contains("serve");
         if !is_webish { continue; }
         let env = obj.entry("env").or_insert_with(|| json!({}));
         let Some(env_obj) = env.as_object_mut() else { continue; };
@@ -316,7 +318,7 @@ pub async fn detect_run_configs(
         let port_missing = !env_obj.contains_key("PORT");
         let port_is_default = env_obj.get("PORT").and_then(|v| v.as_str()).map(|v| v == "5000").unwrap_or(false);
         if port_missing || port_is_default {
-            let p = deterministic_project_port_for_key(&project_id, label, &state.port_registry).await;
+            let p = deterministic_project_port_for_key(&project_id, &label, &state.port_registry).await;
             env_obj.insert("PORT".to_string(), json!(p.to_string()));
         }
     }
