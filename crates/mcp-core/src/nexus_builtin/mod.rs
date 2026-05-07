@@ -49,7 +49,11 @@ use prompt_admin::{
     handle_prompt_template_list, handle_prompt_template_update,
     handle_admin_setting_get, handle_admin_setting_update,
 };
-use mcp_runtime::{handle_mcp_tool_search, handle_mcp_tool_call};
+use mcp_runtime::{
+    handle_mcp_tool_search, handle_mcp_tool_search_with_neural,
+    handle_mcp_tool_call, handle_mcp_tool_reindex,
+};
+pub use mcp_runtime::index_tool;
 use docs::{
     bump_version, get_project_slug,
     handle_doc_generate, handle_doc_update, handle_doc_list,
@@ -96,6 +100,19 @@ pub async fn seed_tools_and_server(db: &PgPool) {
     tracing::info!("Nexus Builtin MCP server: {} tool registrati", NEXUS_TOOLS.len());
 }
 
+/// Scatena il reindex semantico dei tool builtin (e di tutti i tool MCP abilitati)
+/// in background. Da chiamare subito dopo `seed_tools_and_server()` al startup.
+/// Il delay di 30s garantisce che il server sia completamente inizializzato prima
+/// di aprire connessioni a Qdrant e all'embedder.
+pub fn spawn_tool_reindex(db: PgPool, neural: crate::orchestrator::NeuralCoreClient) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let args = serde_json::json!({ "force": false });
+        let result = handle_mcp_tool_reindex(&db, Some(&neural), &args).await;
+        tracing::info!("tool_reindex background completato: {}", result);
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch principale
 // ---------------------------------------------------------------------------
@@ -134,9 +151,15 @@ pub async fn execute(
         // ── prompt_template ───────────────────────────────────────────
         "nexus_prompt_template_list" => handle_prompt_template_list(db, &arguments).await,
         "nexus_prompt_template_update" => handle_prompt_template_update(db, &arguments).await,
-        // ── mcp_runtime (discovery + call) ────────────────────────────
+        // ── mcp_runtime (discovery + call + reindex) ──────────────────
         "nexus_mcp_tool_search" => handle_mcp_tool_search(db, user_id, project_id, &arguments).await,
         "nexus_mcp_tool_call" => handle_mcp_tool_call(db, user_id, project_id, &arguments).await,
+        "nexus_mcp_tool_reindex" => {
+            if user_role != "admin" {
+                return "[Accesso negato] nexus_mcp_tool_reindex richiede ruolo admin.".to_string();
+            }
+            handle_mcp_tool_reindex(db, None, &arguments).await
+        }
         // ── admin_settings ────────────────────────────────────────────
         "nexus_admin_setting_get" => {
             if user_role != "admin" {
@@ -1178,6 +1201,36 @@ pub async fn execute(
             let _ = (user_id, project_id);
             format!("[Nexus Builtin] Tool '{}' non riconosciuto.", tool_name)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Variante con NeuralCoreClient per ricerca semantica tool MCP
+// ---------------------------------------------------------------------------
+
+/// Come `execute()`, ma passa `neural` a nexus_mcp_tool_search e nexus_mcp_tool_reindex
+/// per abilitare la ricerca semantica Qdrant e l'indicizzazione embedding.
+pub async fn execute_with_neural(
+    db: &PgPool,
+    user_id: Uuid,
+    project_id: Uuid,
+    user_role: &str,
+    neural: &crate::orchestrator::NeuralCoreClient,
+    tool_name: &str,
+    arguments: Value,
+) -> String {
+    match tool_name {
+        "nexus_mcp_tool_search" => {
+            handle_mcp_tool_search_with_neural(db, neural, user_id, project_id, &arguments).await
+        }
+        "nexus_mcp_tool_reindex" => {
+            if user_role != "admin" {
+                return "[Accesso negato] nexus_mcp_tool_reindex richiede ruolo admin.".to_string();
+            }
+            handle_mcp_tool_reindex(db, Some(neural), &arguments).await
+        }
+        // Tutti gli altri tool non usano neural: delega a execute()
+        other => execute(db, user_id, project_id, user_role, other, arguments).await,
     }
 }
 

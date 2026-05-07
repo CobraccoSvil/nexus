@@ -639,6 +639,46 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
       },
       "required": ["files", "task"]
     }
+  },
+  {
+    "name": "nexus_mcp_tool_search",
+    "description": "Cerca tra tutti i tool MCP disponibili (builtin + plugin abilitati) usando ricerca semantica (Qdrant) o testuale (ILIKE fallback). Usa questo tool per scoprire quale tool invocare invece di ricevere tutte le definizioni: riduce drasticamente il payload token. Restituisce server_id, tool_name, description e input_schema.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Query in linguaggio naturale (es. 'esegui test cargo', 'leggi file', 'crea branch git')"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Numero massimo di risultati (default: 10, max: 50)"
+        }
+      },
+      "required": ["query"]
+    }
+  },
+  {
+    "name": "nexus_mcp_tool_call",
+    "description": "Invoca un tool MCP specifico usando server_id e tool_name ottenuti da nexus_mcp_tool_search. Applica le policy di sicurezza del plugin. Non usare per tool builtin standard (read_file, git_*, ecc.) che sono già disponibili direttamente.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "server_id": {
+          "type": "string",
+          "description": "UUID del server MCP (ottenuto da nexus_mcp_tool_search)"
+        },
+        "tool_name": {
+          "type": "string",
+          "description": "Nome originale del tool (es. 'list_issues', 'create_branch')"
+        },
+        "arguments": {
+          "type": "object",
+          "description": "Argomenti JSON per il tool secondo il suo input_schema"
+        }
+      },
+      "required": ["server_id", "tool_name", "arguments"]
+    }
   }
 ]"#;
 
@@ -956,6 +996,21 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
             tool_recall_context(ctx, &query, &source, limit).await
         }
         "batch_analyze_code" => tool_batch_analyze_code(ctx, input).await,
+        // ── Nexus Builtin tool (prefisso nexus_*) ──────────────────────────
+        // Dispatch verso nexus_builtin::execute_with_neural per usare
+        // la ricerca semantica quando neural è disponibile (Qdrant).
+        other if other.starts_with("nexus_") => {
+            crate::nexus_builtin::execute_with_neural(
+                &ctx.db,
+                ctx.user_id,
+                ctx.project_id,
+                &ctx.user_role,
+                &ctx.neural,
+                other,
+                input.clone(),
+            )
+            .await
+        }
         other => {
             // Suggerisci il tool corretto in base al nome errato chiamato
             let hint = match other {

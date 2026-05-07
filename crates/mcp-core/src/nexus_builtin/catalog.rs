@@ -140,6 +140,11 @@ pub(super) static NEXUS_TOOLS: &[ToolDef] = &[
         description: "Esegue un tool MCP (anche esterno) usando server_id + tool_name + arguments. Sicuro: verifica che il server sia accessibile e applica la policy del plugin se presente.",
         schema: r#"{"type":"object","required":["server_id","tool_name","arguments"],"properties":{"server_id":{"type":"string","description":"UUID del server MCP"},"tool_name":{"type":"string","description":"Nome tool originale (es. 'list_issues')"},"arguments":{"type":"object","description":"Argomenti JSON per il tool (secondo il suo input_schema)"}}}"#,
     },
+    ToolDef {
+        name: "nexus_mcp_tool_reindex",
+        description: "Rigenera l'indice semantico Qdrant di tutti i tool MCP (o solo quelli non ancora indicizzati). Richiede ruolo admin. Utile dopo importazione massiva di server MCP o per forzare la risincronizzazione.",
+        schema: r#"{"type":"object","properties":{"force":{"type":"boolean","description":"Se true, reindicizza tutti i tool anche se l'hash non è cambiato. Default: false."}}}"#,
+    },
     // ── admin_settings ────────────────────────────────────────────────────
     ToolDef {
         name: "nexus_admin_setting_get",

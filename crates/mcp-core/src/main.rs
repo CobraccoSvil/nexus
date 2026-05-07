@@ -485,6 +485,9 @@ async fn main() -> anyhow::Result<()> {
     };
     chat_learning::spawn_vector_compaction_scheduler(state.clone());
     nexus_builtin::seed_tools_and_server(&state.db).await;
+    // Reindex semantico Qdrant dei tool MCP (fire-and-forget, +30s delay).
+    // Indicizza solo i tool con embedding mancante o hash cambiato.
+    nexus_builtin::spawn_tool_reindex(state.db.clone(), state.orchestrator.neural.clone());
 
     // Worker `provider_health_probe`: pinga ogni 5 minuti i provider LLM
     // configurati per accertarne la salute reale e aggiornare cooldown +
