@@ -2,6 +2,19 @@ import type { ProblemItem, PortEntry, PlaywrightRunSummary } from "./api-client"
 
 type Severity = "error" | "warn" | "info";
 
+/** Prefisso comune: i testi lunghi “solo analisi” spingevano l’LLM a rispondere senza tool. */
+function operativePreamble(): string {
+  return [
+    "ISTRUZIONE OPERATIVA (obbligatoria — Nexus):",
+    "",
+    "Non limitarti a diagnosticare o a elencare ipotesi in chat. Se il problema è risolvibile nel codice/config del progetto attivo, DEVI usare i tool (lettura file, edit, comandi di verifica) e applicare modifiche concrete, poi riassumere file cambiati e come verificare.",
+    "Solo se è impossibile agire (mancano segreti, permessi, servizi offline), spiega cosa blocca dopo aver tentato ciò che puoi.",
+    "",
+    "---",
+    "",
+  ].join("\n");
+}
+
 function normalizeSeverity(input: string | undefined): Severity {
   const s = (input ?? "").toLowerCase();
   if (s.includes("warn")) return "warn";
@@ -22,19 +35,20 @@ export function promptFromProblem(item: ProblemItem): string {
   const req =
     sev === "warn"
       ? [
-          "Richiesta:",
-          "1) Dimmi se è un warning innocuo o un problema reale (e perché).",
-          "2) Se è reale: fix concreta (file/righe) e come verificarla.",
-          "3) Se è falso positivo: come silenziarlo correttamente senza nascondere errori veri.",
+          "Passi (in ordine — con tool sul repo):",
+          "1) Verifica se è innocuo o un problema reale.",
+          "2) Se reale: applica fix nel codice (patch) e dimostra con verifica.",
+          "3) Se falso positivo: configurazione o soppressione corretta (senza nascondere errori veri).",
         ]
       : [
-          "Richiesta:",
-          "1) Root cause più probabile con ragionamento.",
-          "2) File/righe da controllare e fix concreta.",
-          "3) Test plan minimo per validare.",
+          "Passi (in ordine — con tool sul repo):",
+          "1) Trova root cause partendo dai file indicati e dal messaggio.",
+          "2) Implementa la fix (patch) e tieni i cambiamenti minimi.",
+          "3) Esegui verifica (build/lint/test/comando rilevante).",
         ];
 
   return [
+    operativePreamble(),
     header(sev, "Problema rilevato"),
     "",
     `- Severità: ${item.severity}`,
@@ -54,6 +68,7 @@ export function promptFromProblem(item: ProblemItem): string {
 export function promptFromPort(port: PortEntry): string {
   const sev: Severity = port.url ? "info" : "warn";
   return [
+    operativePreamble(),
     header(sev, "Porta rilevata"),
     "",
     `- Porta: ${port.port ?? "(n/a)"}`,
@@ -74,6 +89,7 @@ export function promptFromPort(port: PortEntry): string {
 export function promptFromPlaywrightRun(run: PlaywrightRunSummary): string {
   const sev: Severity = run.status === "failed" ? "error" : run.status === "passed" ? "info" : "warn";
   return [
+    operativePreamble(),
     header(sev, "Run Playwright"),
     "",
     `- Run: ${run.label}`,
@@ -90,11 +106,25 @@ export function promptFromPlaywrightRun(run: PlaywrightRunSummary): string {
     .join("\n");
 }
 
+/** Log a singola riga o prefisso senza stack → chiedi esplicitamente ricerca nel repo invece di “raccogliere log”. */
+function debugLogLooksTruncated(message: string): boolean {
+  const t = message.trim();
+  if (t.length < 120) return true;
+  if (/exception data:\s*$/i.test(t)) return true;
+  if (/^.{0,200}(exception data|inner exception|--->)\s*:?\s*$/i.test(t)) return true;
+  if (/exception|fail|unhandled|stacktrace/i.test(t) && !/\b(at\s+[\w.]+\(|\.cs:\d+)/i.test(t) && t.length < 500) {
+    return true;
+  }
+  return false;
+}
+
 export function promptFromDebugEntry(args: {
   level: "ERROR" | "WARN";
   timestamp?: string;
   source?: string;
   message: string;
+  /** Righe di log vicine (stesso flusso Debug) per eccezioni/stack multi-riga */
+  contextLines?: string[];
 }): string {
   const sev: Severity = args.level === "WARN" ? "warn" : "error";
   const where =
@@ -104,31 +134,55 @@ export function promptFromDebugEntry(args: {
         ? "- Sorgente: terminale"
         : "- Sorgente: (non specificata)";
 
+  const ctx = (args.contextLines ?? []).map((l) => l.trimEnd()).filter(Boolean);
+  const truncated = debugLogLooksTruncated(args.message) && ctx.length === 0;
+  const truncatedNote = truncated
+    ? [
+        "Nota su questo log:",
+        "Il testo principale può essere tronco (journalctl/singola riga). NON limitarti a ‘spiegare’ l’errore: usa i tool sul progetto per trovare file/route/tipo citati o correlati, confrontare con il codice e applicare fix. Se serve più log runtime, dopo la patch indica come riprodurre e dove guardare — ma la priorità è intervenire sul codice nel repo.",
+        "",
+      ]
+    : [];
+  const contextBlock =
+    ctx.length > 0
+      ? [
+          "Contesto (righe adiacenti dalla console Debug, stesso flusso — possono includere stack trace o InnerException):",
+          ...ctx.map((line) => (line.length > 2000 ? `${line.slice(0, 2000)}… [troncato]` : line)),
+          "",
+        ]
+      : [];
+
   const req =
     sev === "warn"
       ? [
-          "Richiesta:",
-          "1) È innocuo o è un problema reale? (perché)",
-          "2) Se reale: fix concreta (file/righe) e come verificarla.",
-          "3) Se è noise: come ridurlo senza perdere segnale.",
+          "Azione richiesta (ordine — tool sul progetto attivo):",
+          "1) Conferma se è rumore/spam o un problema reale confrontando con codice/config.",
+          "2) Se reale: modifica mirata (patch) nel repo; evita solo consigli testuali.",
+          "3) Verifica con comando o test minimi (es. build/lint/endpoint o run del servizio).",
+          "4) Riassunto: cosa cambiato, perché, come verificare.",
         ]
       : [
-          "Richiesta:",
-          "1) Root cause probabile con ragionamento.",
-          "2) Come riprodurre e quali log raccogliere.",
-          "3) Fix concreta + test plan minimo.",
+          "Azione richiesta (ordine — NON fare solo analisi o ‘root cause’ in teoria):",
+          "1) Collega il messaggio al codice: identifica stack tecnologica dal servizio/log (es. .NET → progetto/endpoint/handlers) e cerca nel workspace stringhe, tipi eccezione, route o nomi file citati (search_in_files / grep).",
+          "2) Apri i file coinvolti con read_file; individua condizione o bug concreto che spiega l’errore.",
+          "3) Implementa una correzione minima sicura (patch) nel repository; se servono config o env, aggiorna file tracciati nel repo o documenta il valore richiesto senza allucinare segreti.",
+          "4) Verifica con il comando appropriato (es. `dotnet build` / test progetto, `npm test`, curl sull’API, riavvio servizio) e riporta esito. Se non puoi eseguire, indica esattamente quale comando l’utente deve lanciare.",
+          "5) Output finale: file modificati, diff concettuale, comando di verifica e (se noto) come riprodurre il caso con 1–2 passi.",
         ];
 
   return [
+    operativePreamble(),
     header(sev, "Console Debug"),
     "",
     `- Livello: ${args.level}`,
     args.timestamp ? `- Timestamp: ${args.timestamp}` : undefined,
     where,
     "",
-    "Messaggio:",
+    "Messaggio principale (riga selezionata):",
     args.message,
     "",
+    ...contextBlock,
+    ...truncatedNote,
     ...req,
   ]
     .filter(Boolean)

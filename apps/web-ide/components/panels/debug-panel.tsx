@@ -92,6 +92,26 @@ const NEURAL_WS = (
   process.env.NEXT_PUBLIC_NEURAL_URL || "http://localhost:8001"
 ).replace(/^http/, "ws");
 
+/** Righe vicine nella lista Debug (ordine di arrivo) per stack/eccezioni multi-riga */
+const DEBUG_CHAT_CTX_BEFORE = 15;
+const DEBUG_CHAT_CTX_AFTER = 15;
+const DEBUG_CHAT_CTX_MAX = 50;
+
+function adjacentDebugLines(entries: DebugEntry[], focusId: string): string[] {
+  const idx = entries.findIndex((e) => e.id === focusId);
+  if (idx < 0) return [];
+  const start = Math.max(0, idx - DEBUG_CHAT_CTX_BEFORE);
+  const end = Math.min(entries.length, idx + DEBUG_CHAT_CTX_AFTER + 1);
+  const out: string[] = [];
+  for (let j = start; j < end; j++) {
+    if (j === idx) continue;
+    const line = (entries[j].raw || entries[j].message).trimEnd();
+    if (line) out.push(line);
+    if (out.length >= DEBUG_CHAT_CTX_MAX) break;
+  }
+  return out;
+}
+
 type SourceFilter = "all" | "terminal" | string;
 
 export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPanelProps) {
@@ -253,16 +273,23 @@ export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPane
     lineBufferRef.current = [];
     seenLogIdsRef.current.clear();
   }, []);
-  const sendEntryToChat = useCallback((entry: DebugEntry) => {
-    if (!onSendToChat) return;
-    if (entry.level !== "ERROR" && entry.level !== "WARN") return;
-    onSendToChat(promptFromDebugEntry({
-      level: entry.level,
-      timestamp: entry.timestamp,
-      source: entry.source,
-      message: entry.raw || entry.message,
-    }));
-  }, [onSendToChat]);
+  const sendEntryToChat = useCallback(
+    (entry: DebugEntry) => {
+      if (!onSendToChat) return;
+      if (entry.level !== "ERROR" && entry.level !== "WARN") return;
+      const contextLines = adjacentDebugLines(entries, entry.id);
+      onSendToChat(
+        promptFromDebugEntry({
+          level: entry.level,
+          timestamp: entry.timestamp,
+          source: entry.source,
+          message: entry.raw || entry.message,
+          contextLines: contextLines.length > 0 ? contextLines : undefined,
+        }),
+      );
+    },
+    [onSendToChat, entries],
+  );
 
   const toggleExpand = useCallback((id: string) => {
     setEntries((prev) =>
@@ -483,8 +510,8 @@ export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPane
                     sendEntryToChat(entry);
                   }}
                   title={entry.level === "WARN"
-                    ? "Invia questo warning alla chat di Nexus"
-                    : "Invia questo errore alla chat di Nexus"}
+                    ? "Apre la chat, invia subito e avvia l’agente in modalità conferma (patch + tool)"
+                    : "Apre la chat, invia subito e avvia l’agente in modalità conferma (patch + tool)"}
                   style={{
                     marginLeft: 8,
                     background: entry.level === "WARN" ? "rgba(245,158,11,0.90)" : "rgba(239,68,68,0.85)",
