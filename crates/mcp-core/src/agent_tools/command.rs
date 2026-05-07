@@ -9,6 +9,51 @@ const RUN_COMMAND_PROBE_SECS: u64 = 10;
 const RUN_TESTS_DEFAULT_TIMEOUT: u64 = 120;
 const RUN_TESTS_MAX_TIMEOUT: u64 = 300;
 
+/// Progetto con DB registrato e `allow_ddl_override = false` (default): schema change solo via migration.
+async fn strict_migration_only_project(ctx: &AgentToolContext) -> bool {
+    match sqlx::query_scalar::<_, bool>(
+        "SELECT allow_ddl_override FROM project_database_config WHERE project_id = $1 LIMIT 1",
+    )
+    .bind(ctx.project_id)
+    .fetch_optional(&*ctx.db)
+    .await
+    {
+        Ok(Some(false)) => true,
+        _ => false,
+    }
+}
+
+fn shell_command_bypasses_migration_policy(cmd: &str) -> bool {
+    let c = cmd.to_lowercase();
+    c.contains("flyway")
+        || c.contains("liquibase")
+        || c.contains("alembic upgrade")
+        || c.contains("alembic downgrade")
+        || c.contains("prisma migrate")
+        || c.contains("dotnet ef database update")
+        || c.contains("sqlx migrate")
+        || c.contains("knex migrate")
+        || c.contains("manage.py migrate")
+        || c.contains("rails db:migrate")
+        || c.contains("rake db:migrate")
+        || (c.contains("-f ") && (c.contains("migrat") || c.contains("/migrations/") || c.contains("\\migrations\\")))
+}
+
+fn shell_looks_like_sql_cli_with_ddl(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    let sql_cli = lower.contains("psql")
+        || lower.contains("sqlcmd")
+        || lower.contains("sqlite3")
+        || lower.starts_with("mysql")
+        || lower.contains(" mysql ")
+        || lower.contains("/mysql ")
+        || lower.contains("mysql -");
+    if !sql_cli {
+        return false;
+    }
+    crate::nexus_tools::db_helper::contains_ddl_statement(cmd)
+}
+
 pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> String {
     let command = match input.get("command").and_then(Value::as_str) {
         Some(s) => s.to_string(),
@@ -16,6 +61,20 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
     };
     if command.trim().is_empty() {
         return "[Errore: comando vuoto]".to_string();
+    }
+
+    if strict_migration_only_project(ctx).await
+        && !shell_command_bypasses_migration_policy(&command)
+        && shell_looks_like_sql_cli_with_ddl(&command)
+    {
+        return format!(
+            "[BLOCCATO — policy database progetto]\n\
+             Questo progetto richiede modifiche di schema solo tramite migration versionate (file nel repo + registro Nexus). Non eseguire DDL con psql/mysql/sqlcmd ad-hoc.\n\
+             Usa i tool `project_db_create_migration` e `project_db_apply_migration`, oppure il tool di migration dello stack (Flyway, Alembic, Prisma, dotnet ef, ecc.).\n\
+             Per eccezioni controllate, un admin può impostare `allow_ddl_override` sulla connessione DB del progetto.\n\
+             ---\nComando: {}",
+            command.chars().take(400).collect::<String>()
+        );
     }
 
     let explicit_bg = input.get("background").and_then(Value::as_bool).unwrap_or(false);

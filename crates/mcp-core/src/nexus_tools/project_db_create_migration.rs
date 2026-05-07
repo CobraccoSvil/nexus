@@ -23,7 +23,7 @@ impl NexusToolHandler for ProjectDbCreateMigrationTool {
             .map_err(|e| NexusToolError::BadInput(format!("db connect: {}", e)))?;
 
         let config_row: Option<sqlx::postgres::PgRow> = sqlx::query(
-            r#"SELECT migration_tool, migration_path, allow_ddl_override
+            r#"SELECT migration_tool, migration_path
                FROM project_database_config WHERE project_id = $1"#
         )
         .bind(ctx.project_id)
@@ -45,8 +45,6 @@ impl NexusToolHandler for ProjectDbCreateMigrationTool {
         let migration_path: String = config.try_get::<Option<String>, _>("migration_path")
             .unwrap_or_default()
             .unwrap_or_else(|| "migrations".into());
-        let allow_override: bool = config.try_get("allow_ddl_override").unwrap_or(false);
-
         let migration_tool = tool_str.as_deref()
             .and_then(MigrationTool::from_str)
             .unwrap_or(MigrationTool::GenericSql);
@@ -59,7 +57,9 @@ impl NexusToolHandler for ProjectDbCreateMigrationTool {
         };
 
         let runner = MigrationRunner::new(db_ctx);
-        let file_path = runner.create_migration(name, sql, !allow_override)
+        // Sempre false: il SQL della migration DEVE poter contenere DDL (CREATE/ALTER/…).
+        // allow_ddl_override riguarda solo DDL ad-hoc via API override / shell, non i file migration.
+        let file_path = runner.create_migration(name, sql, false)
             .await
             .map_err(|e| NexusToolError::BadInput(e.to_string()))?;
 

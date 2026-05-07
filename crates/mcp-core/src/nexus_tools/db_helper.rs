@@ -22,14 +22,12 @@ const DDL_KEYWORDS: &[&str] = &[
 ];
 
 /// Controlla se un testo SQL contiene istruzioni DDL che modificano lo schema.
-#[allow(dead_code)]
 pub fn contains_ddl_statement(sql: &str) -> bool {
     let upper = sql.to_uppercase();
     DDL_KEYWORDS.iter().any(|kw| upper.contains(kw))
 }
 
 /// Restituisce payload JSON strutturato DDL_BLOCKED serializzato come stringa.
-/// Usato da agent_loop.rs per intercettare DDL diretto sui progetti.
 #[allow(dead_code)]
 pub fn ddl_blocked_response(project_id: uuid::Uuid) -> String {
     serde_json::json!({

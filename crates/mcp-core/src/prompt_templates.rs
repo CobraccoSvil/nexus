@@ -3,7 +3,7 @@
 //! La `TemplateCache` mantiene prompt caricati dal DB con TTL configurabile.
 //! Cache miss e chiavi inesistenti restituiscono `None`.
 
-use axum::{extract::{Path, State}, Json, http::StatusCode};
+use axum::{extract::{Path, State}, Json, http::StatusCode, Extension};
 use axum::response::IntoResponse;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -138,6 +138,23 @@ pub async fn get_template_or_default(
         }
     }
 }
+
+/// Suffix sempre accodato a `system.nexus_base` per i run agente (**non** in Study mode).
+///
+/// Rafforza un comportamento tool-first quando l’utente chiede fix concreti, anche se il
+/// contenuto DB del template è troppo permissivo sul “solo spiegazioni”.
+pub const AGENT_ACT_FIRST_SUFFIX: &str = r#"
+
+=== NEXUS — REGOLE OPERATIVE HARD (obbligatorie quando i tool sono abilitati) ===
+- Se l’utente chiede di **risolvere** qualcosa (errori runtime, ClientFetchError / JSON-vs-HTML, bug, build/test falliti, problemi Auth/API, «sistema», «correggi», «applica la fix»):
+  • **Non** chiudere con una sola analisi o checklist in chat senza aver usato i tool.
+  • **Devi** usare file e terminale del progetto attivo (`list_files`, `read_file` / `read_file_lines`, `search_in_files`; se serve prima `request_tools` con categoria semantic poi `search_codebase_semantic`; `edit_file` / `write_file`; `run_command` per lint/build/smoke/curl).
+  • Se qualcosa **blocca** davvero (segreti, permessi, servizio offline), dopo i tentativi spiega in **una** riga tecnica cosa manca — non sostituire l’azione con un saggio lungo.
+- **Schema database dell’applicazione** (CREATE/ALTER/DROP/TRUNCATE su tabelle, indici, tipi, ecc.): **non** applicare mai DDL ad-hoc con `psql`/`mysql`/CLI. Usa il percorso ufficiale Nexus: `project_db_create_migration` per registrare SQL in file di migration versionati nel repo, poi `project_db_apply_migration` per applicare. Lo storico `project_migration_history` + file in `migration_path` garantiscono ricostruibilità dell’ambiente. Comandi tipo Flyway/Liquibase/Alembic/Prisma migrate/`dotnet ef database update` che applicano migration già versionate sono conformi.
+- Progetti annidati (es. `projects/<nome>/...`): tutti i path sotto la **Root** del progetto attivo nel contesto; non assumere checkout casuali fuori sandbox.
+- Risposta finale: file toccati, cosa è cambiato, come verificare (comando o URL già eseguito / provabile).
+=== FINE REGOLE ===
+"#;
 
 /// GET /api/prompt-templates
 pub async fn list_templates_handler(
@@ -379,8 +396,11 @@ async fn generate_with_admin_fallback(
     routing_matrix: &crate::routing_matrix::RoutingMatrix,
     prompt: &str,
     broken_providers: &mut std::collections::HashSet<String>,
+    billing_user_id: uuid::Uuid,
+    billing_project_id: uuid::Uuid,
 ) -> Result<serde_json::Value, String> {
     use crate::orchestrator::default_model_for_provider;
+    use crate::billing::{self, UsageNumbers};
 
     // Carica l'ordine provider dall'admin (stesso campo usato dall'agent loop)
     let hierarchy_str: Option<String> = sqlx::query_scalar(
@@ -404,8 +424,46 @@ async fn generate_with_admin_fallback(
 
     for provider in &providers {
         let model = default_model_for_provider(routing_matrix, provider);
+        // Billing: riserva prima di chiamare il provider, finalizza dopo.
+        // Nota: qui non abbiamo un token_budget esplicito; stimiamo un upper bound.
+        let prompt_tokens = mcp_token::count_tokens(prompt) as i32;
+        let estimated_completion_tokens = 800i32;
+        let reservation = match billing::reserve_usage(
+            db,
+            billing_user_id,
+            billing_project_id,
+            provider,
+            &model,
+            prompt_tokens,
+            estimated_completion_tokens,
+            serde_json::json!({
+                "feature": "batch_assign_tools",
+                "via": "prompt_templates::generate_with_admin_fallback",
+            }),
+        )
+        .await
+        {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::error!("batch: billing reserve FAILED (provider={provider} model={model}): {e}");
+                None
+            }
+        };
+
         match neural.generate_completion(provider, &model, prompt).await {
             Ok(v) => {
+                // Finalizza il costo con i token reali (se presenti), altrimenti usa stima.
+                let usage_numbers: UsageNumbers = billing::extract_usage_numbers(
+                    &v,
+                    prompt_tokens,
+                    estimated_completion_tokens,
+                );
+                if let Some(res) = &reservation {
+                    if let Err(e) = billing::finalize_usage(db, res, uuid::Uuid::new_v4(), &usage_numbers).await {
+                        tracing::error!("batch: billing finalize FAILED: {e}");
+                    }
+                }
+
                 let content = v["content"].as_str().unwrap_or("");
                 let lower = content.to_lowercase();
                 // Controlla se la risposta è un errore di quota/credito/rate limit
@@ -430,6 +488,10 @@ async fn generate_with_admin_fallback(
                 return Ok(v);
             }
             Err(e) => {
+                // In caso di errore, rilascia la riserva (non conteggiare).
+                if let Some(res) = &reservation {
+                    billing::release_usage(db, res, "provider_error").await;
+                }
                 tracing::warn!("batch: provider {} errore gRPC: {}, marcato broken", provider, e);
                 broken_providers.insert(provider.clone());
                 continue;
@@ -624,10 +686,41 @@ ISTRUZIONI PER LA TUA RISPOSTA:
     })))
 }
 
-/// POST /api/admin/prompt-templates/batch-assign-tools
-pub async fn batch_assign_tools_handler(
+async fn batch_assign_tools_impl(
     State(state): State<crate::AppState>,
+    billing_user_id: uuid::Uuid,
+    billing_project_id: uuid::Uuid,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Marker “hard” per rendere verificabile che il job è partito e che scrive sul DB giusto.
+    // Non dipende da orchestrator_runs/run_id e non blocca il job se fallisce.
+    {
+        let marker_id = uuid::Uuid::new_v4();
+        if let Err(e) = sqlx::query(
+            r#"
+            INSERT INTO ai_usage_ledger (
+                id, user_id, project_id, provider, model,
+                prompt_tokens, completion_tokens, total_tokens,
+                input_cost, output_cost, total_cost, currency,
+                status, details
+            ) VALUES ($1, $2, $3, 'internal', 'batch_assign_tools_job', 0, 0, 0, 0, 0, 0, 'EUR', 'reserved', $4)
+            "#,
+        )
+        .bind(marker_id)
+        .bind(billing_user_id)
+        .bind(billing_project_id)
+        .bind(serde_json::json!({
+            "feature": "batch_assign_tools",
+            "event": "job_started",
+        }))
+        .execute(&state.db)
+        .await
+        {
+            tracing::error!("batch_assign_tools: marker insert FAILED: {e}");
+        } else {
+            tracing::info!("batch_assign_tools: marker inserted ledger_id={marker_id}");
+        }
+    }
+
     let templates = sqlx::query(
         "SELECT key, title, content, category FROM nexus_prompt_templates WHERE is_active = true ORDER BY category, key",
     )
@@ -657,15 +750,14 @@ pub async fn batch_assign_tools_handler(
         })));
     }
 
+    // Token/costo: NON includere descrizioni qui (sono tantissime e fanno esplodere il prompt).
+    // Lista minima, disambiguata: "server::tool".
     let tools_list = tool_rows
         .iter()
         .map(|r| {
             let name: String = r.get("name");
             let server: String = r.get("server_name");
-            let desc: Option<String> = r.try_get("description").ok().flatten();
-            let short_desc = desc.as_deref().unwrap_or("");
-            let short_desc = if short_desc.len() > 90 { &short_desc[..90] } else { short_desc };
-            format!("- [{}] {}: {}", server, name, short_desc)
+            format!("- {}::{}", server, name)
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -750,6 +842,8 @@ oppure\n\
             &matrix_arc,
             &tool_prompt,
             &mut broken_providers,
+            billing_user_id,
+            billing_project_id,
         ).await;
 
         match tool_result {
@@ -847,6 +941,38 @@ oppure\n\
                             }
                         }
 
+                        // Token saver “hard”: se il catalogo tool è grande, non assegnare tool specifici.
+                        // Assegna solo i 2 meta-tool builtin che permettono discovery+call runtime
+                        // (riduce enormemente il payload tools_json inviato al provider nei turni agente).
+                        if tool_rows.len() >= 80 && !prompt_tools.is_empty() {
+                            // Un server MCP deve esporre entrambi i meta-tool (ordine HashSet non deterministico).
+                            let servers: std::collections::HashSet<String> =
+                                tool_by_pair.iter().map(|(srv, _)| srv.clone()).collect();
+                            let mut meta_server: Option<String> = None;
+                            for srv in servers {
+                                let search_pair = (srv.clone(), "nexus_mcp_tool_search".to_string());
+                                let call_pair = (srv.clone(), "nexus_mcp_tool_call".to_string());
+                                if tool_by_pair.contains(&search_pair) && tool_by_pair.contains(&call_pair) {
+                                    meta_server = Some(srv);
+                                    break;
+                                }
+                            }
+                            if let Some(srv) = meta_server {
+                                prompt_tools = vec![
+                                    PromptMcpTool {
+                                        tool_name: "nexus_mcp_tool_search".to_string(),
+                                        tool_server: srv.clone(),
+                                        usage_context: Some("Cerca tool MCP disponibili solo quando servono (riduce token).".to_string()),
+                                    },
+                                    PromptMcpTool {
+                                        tool_name: "nexus_mcp_tool_call".to_string(),
+                                        tool_server: srv,
+                                        usage_context: Some("Invoca un tool MCP specifico (server_id + tool_name).".to_string()),
+                                    },
+                                ];
+                            }
+                        }
+
                         let count = prompt_tools.len();
                         total_tools_selected += count;
                         let tools_json = serde_json::to_value(&prompt_tools).unwrap_or_default();
@@ -891,6 +1017,105 @@ oppure\n\
     })))
 }
 
+/// POST /api/admin/prompt-templates/batch-assign-tools
+///
+/// Endpoint "admin": avvia in background e ritorna subito (evita blocchi UI).
+pub async fn batch_assign_tools_handler(
+    State(state): State<crate::AppState>,
+    Extension(claims): Extension<crate::auth::Claims>,
+) -> impl IntoResponse {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    static PENDING: AtomicBool = AtomicBool::new(false);
+
+    if RUNNING.swap(true, Ordering::SeqCst) {
+        PENDING.store(true, Ordering::SeqCst);
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "queued": false,
+                "running": true,
+                "pending": true
+            })),
+        )
+            .into_response();
+    }
+
+    let state_clone = state.clone();
+    let claims_sub = claims.sub.clone();
+    tokio::spawn(async move {
+        // Billing: usa l'utente autenticato + progetto più recente (necessari per FK).
+        let user_id = match uuid::Uuid::parse_str(&claims_sub) {
+            Ok(u) => u,
+            Err(_) => sqlx::query_scalar::<_, uuid::Uuid>(
+                "SELECT id FROM users ORDER BY created_at DESC LIMIT 1",
+            )
+            .fetch_one(&state_clone.db)
+            .await
+            .unwrap_or_else(|_| {
+                tracing::error!(
+                    "batch: impossibile risolvere user_id per billing (claims non UUID e nessun utente?)"
+                );
+                uuid::Uuid::nil()
+            }),
+        };
+
+        let project_id = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT id FROM projects ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_one(&state_clone.db)
+        .await
+        .unwrap_or_else(|_| {
+            tracing::error!("batch: impossibile risolvere project_id per billing (nessun progetto?)");
+            uuid::Uuid::nil()
+        });
+
+        if user_id.is_nil() || project_id.is_nil() {
+            // Senza FK valide non possiamo scrivere su ledger: abort job.
+            RUNNING.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        let _ = batch_assign_tools_impl(State(state_clone), user_id, project_id).await;
+        RUNNING.store(false, Ordering::SeqCst);
+        if PENDING.swap(false, Ordering::SeqCst) {
+            let state_clone2 = state.clone();
+            RUNNING.store(true, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let user_id2 = sqlx::query_scalar::<_, uuid::Uuid>(
+                    "SELECT id FROM users ORDER BY created_at DESC LIMIT 1",
+                )
+                .fetch_one(&state_clone2.db)
+                .await
+                .unwrap_or(uuid::Uuid::nil());
+
+                let project_id2 = sqlx::query_scalar::<_, uuid::Uuid>(
+                    "SELECT id FROM projects ORDER BY created_at DESC LIMIT 1",
+                )
+                .fetch_one(&state_clone2.db)
+                .await
+                .unwrap_or(uuid::Uuid::nil());
+
+                if !user_id2.is_nil() && !project_id2.is_nil() {
+                    let _ = batch_assign_tools_impl(State(state_clone2), user_id2, project_id2).await;
+                }
+                RUNNING.store(false, Ordering::SeqCst);
+            });
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "queued": true,
+            "running": true,
+            "pending": false
+        })),
+    )
+        .into_response()
+}
+
 /// POST /api/internal/prompt-templates/batch-assign-tools
 ///
 /// Versione "internal" (no auth) della batch tool-assignment.
@@ -917,14 +1142,51 @@ pub async fn internal_batch_assign_tools_handler(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        let _ = batch_assign_tools_handler(State(state_clone)).await;
+        // Trigger interno: usa ultimo user/progetto come “contabilità di sistema”.
+        let user_id = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT id FROM users ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&state_clone.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(uuid::Uuid::new_v4);
+
+        let project_id = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT id FROM projects ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&state_clone.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(uuid::Uuid::new_v4);
+
+        let _ = batch_assign_tools_impl(State(state_clone), user_id, project_id).await;
         RUNNING.store(false, Ordering::SeqCst);
         if PENDING.swap(false, Ordering::SeqCst) {
             // rilancia una sola volta (se arrivati altri trigger durante l'esecuzione)
             let state_clone2 = state.clone();
             RUNNING.store(true, Ordering::SeqCst);
             tokio::spawn(async move {
-                let _ = batch_assign_tools_handler(State(state_clone2)).await;
+                let user_id2 = sqlx::query_scalar::<_, uuid::Uuid>(
+                    "SELECT id FROM users ORDER BY created_at DESC LIMIT 1",
+                )
+                .fetch_optional(&state_clone2.db)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(uuid::Uuid::new_v4);
+
+                let project_id2 = sqlx::query_scalar::<_, uuid::Uuid>(
+                    "SELECT id FROM projects ORDER BY created_at DESC LIMIT 1",
+                )
+                .fetch_optional(&state_clone2.db)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(uuid::Uuid::new_v4);
+
+                let _ = batch_assign_tools_impl(State(state_clone2), user_id2, project_id2).await;
                 RUNNING.store(false, Ordering::SeqCst);
             });
         }
