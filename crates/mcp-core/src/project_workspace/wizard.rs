@@ -17,6 +17,11 @@ pub async fn wizard_detect_services(
 
     let mut suggestions: Vec<serde_json::Value> = Vec::new();
 
+    // Porta deterministica per suggerimenti web: evita conflitti già in fase di analisi.
+    async fn suggest_port(state: &AppState, project_id: &Uuid, key: &str) -> u16 {
+        super::services::deterministic_project_port_for_key(project_id, key, &state.port_registry).await
+    }
+
     // ── 1. package.json / pnpm ─────────────────────────────────────────────
     let pkg_paths = find_files_named(&root, "package.json", 6).await;
     for pkg_path in &pkg_paths {
@@ -47,6 +52,7 @@ pub async fn wizard_detect_services(
                             "command":  pkg_manager,
                             "args":     ["run", script_name],
                             "cwd":      cwd,
+                            "env":      { "PORT": suggest_port(&state, &project_id, &svc_short).await.to_string() },
                             "existing": false,
                         }));
                         break; // un solo script per package.json
@@ -76,6 +82,7 @@ pub async fn wizard_detect_services(
             "command":  "dotnet",
             "args":     ["run", "--project", proj_arg],
             "cwd":      cwd,
+            "env":      { "PORT": suggest_port(&state, &project_id, &svc_short).await.to_string() },
             "existing": false,
         }));
     }

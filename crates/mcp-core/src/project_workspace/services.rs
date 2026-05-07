@@ -799,6 +799,16 @@ fn project_bucket_start(project_id: &Uuid) -> u16 {
     PROJECT_PORT_RANGE_START + (idx as u16) * PROJECT_PORT_BUCKET_SIZE
 }
 
+fn stable_hash_u16(input: &str) -> u16 {
+    // FNV-1a 32-bit, then fold to u16. Stable across runs/platforms.
+    let mut h: u32 = 2166136261;
+    for b in input.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    (h ^ (h >> 16)) as u16
+}
+
 /// Trova una porta libera *nel bucket deterministico* del progetto.
 /// Fallback: se il bucket è pieno (o collisioni esterne), ripiega su `find_free_port(PROJECT_PORT_RANGE_START, ...)`.
 pub(super) async fn find_free_project_port(
@@ -828,6 +838,38 @@ pub(super) async fn find_free_project_port(
 
     // Bucket pieno o tutte occupate: fallback su scan globale nel range progetti.
     find_free_port(PROJECT_PORT_RANGE_START, registry).await
+}
+
+/// Porta deterministica per un dato servizio/config all'interno del bucket del progetto.
+/// Usa `service_key` come input stabile (es. label o short name) e linear-probing nel bucket.
+pub(super) async fn deterministic_project_port_for_key(
+    project_id: &Uuid,
+    service_key: &str,
+    registry: &crate::port_registry::PortRegistryCache,
+) -> u16 {
+    let start = project_bucket_start(project_id);
+    let end = (start + PROJECT_PORT_BUCKET_SIZE).saturating_sub(1);
+    let reserved: std::collections::HashSet<u16> = NEXUS_RESERVED_PORTS.iter().copied().collect();
+    let allocated: std::collections::HashSet<u16> = registry
+        .current()
+        .await
+        .all_allocated_ports()
+        .into_iter()
+        .collect();
+
+    let mut offset = stable_hash_u16(service_key) % PROJECT_PORT_BUCKET_SIZE;
+    let mut tries: u16 = 0;
+    while tries < PROJECT_PORT_BUCKET_SIZE {
+        let port = start.saturating_add(offset);
+        if port >= start && port <= end && !reserved.contains(&port) && !allocated.contains(&port) {
+            if tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await.is_ok() {
+                return port;
+            }
+        }
+        offset = (offset + 1) % PROJECT_PORT_BUCKET_SIZE;
+        tries += 1;
+    }
+    find_free_project_port(project_id, registry).await
 }
 
 /// Trova la prima porta TCP libera a partire da `start`, escludendo le porte

@@ -6,7 +6,7 @@ use super::wizard::{
     detect_dotnet_suggestions, detect_playwright_suggestions,
     refine_with_nexus,
 };
-use super::services::{NEXUS_RESERVED_PORTS, find_free_port, find_free_project_port, is_web_service_script};
+use super::services::{NEXUS_RESERVED_PORTS, find_free_port, find_free_project_port, deterministic_project_port_for_key, is_web_service_script};
 
 /// Scans a project directory and returns suggested run configurations (con tag role/essential/group).
 /// Calcola i suggerimenti di run-config scansionando il filesystem.
@@ -301,6 +301,25 @@ pub async fn detect_run_configs(
 
     // --- Cache assente/stale: riscansiona ---
     let mut suggestions = compute_run_config_suggestions(root);
+
+    // Normalizza le porte già in fase di analisi: i progetti devono usare bucket deterministico,
+    // e non devono mai proporre porte riservate (es. 3000).
+    for s in &mut suggestions {
+        let Some(obj) = s.as_object_mut() else { continue; };
+        let label = obj.get("label").and_then(|v| v.as_str()).unwrap_or("");
+        let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let is_webish = role == "web" || role == "frontend" || label.to_lowercase().contains("dev") || label.to_lowercase().contains("serve");
+        if !is_webish { continue; }
+        let env = obj.entry("env").or_insert_with(|| json!({}));
+        let Some(env_obj) = env.as_object_mut() else { continue; };
+        // Se l'heuristica aveva messo PORT=5000 o non c'è PORT, scegli una porta deterministica per questa run-config.
+        let port_missing = !env_obj.contains_key("PORT");
+        let port_is_default = env_obj.get("PORT").and_then(|v| v.as_str()).map(|v| v == "5000").unwrap_or(false);
+        if port_missing || port_is_default {
+            let p = deterministic_project_port_for_key(&project_id, label, &state.port_registry).await;
+            env_obj.insert("PORT".to_string(), json!(p.to_string()));
+        }
+    }
 
     // Rifinitura AI opzionale
     let source = if use_ai && !suggestions.is_empty() {
