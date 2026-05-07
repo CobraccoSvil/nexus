@@ -522,6 +522,78 @@ pub async fn launch_run_config(
         ));
     }
 
+    fn parse_port_token(s: &str) -> Option<u16> {
+        let t = s.trim();
+        if t.is_empty() { return None; }
+        // strip common wrappers
+        let t = t.trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ';');
+        t.parse::<u16>().ok()
+    }
+
+    fn extract_cli_port_hint(command: &str) -> Option<u16> {
+        // Best-effort: detect common patterns like "--port 3000", "--port=3000", "-p 3000", "-p3000"
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+        let mut i = 0usize;
+        while i < tokens.len() {
+            let tok = tokens[i];
+            if tok == "--port" || tok == "-p" {
+                if let Some(next) = tokens.get(i + 1).and_then(|v| parse_port_token(v)) {
+                    return Some(next);
+                }
+            }
+            if let Some(v) = tok.strip_prefix("--port=") {
+                if let Some(p) = parse_port_token(v) { return Some(p); }
+            }
+            if let Some(v) = tok.strip_prefix("-p") {
+                if v.len() >= 2 {
+                    if let Some(p) = parse_port_token(v) { return Some(p); }
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn looks_like_web_server_command(command: &str) -> bool {
+        let lower = command.to_lowercase();
+        // Node/web frameworks (common in managed projects)
+        lower.contains(" next dev")
+            || lower.contains(" next start")
+            || lower.contains(" vite")
+            || lower.contains(" nuxt")
+            || lower.contains(" astro")
+            || lower.contains(" react-scripts start")
+            || lower.contains(" serve ")
+            || lower.contains(" pnpm run dev")
+            || lower.contains(" npm run dev")
+            || lower.contains(" yarn dev")
+            || lower.contains(" pnpm dev")
+            || lower.contains(" npm start")
+            || lower.contains(" dotnet run")
+    }
+
+    fn rewrite_port_flags(command: &str, target_port: u16) -> String {
+        // Minimal rewriting to avoid conflicts with Nexus reserved ports.
+        // This does NOT attempt to be a shell parser; it covers common dev flags.
+        let p = target_port.to_string();
+        let mut out = command.to_string();
+        for bad in ["3000", "4000", "4010", "4020", "4030", "4040", "4050", "4060", "8001"] {
+            out = out.replace(&format!("--port={}", bad), &format!("--port={}", p));
+            out = out.replace(&format!("--port {}", bad), &format!("--port {}", p));
+            out = out.replace(&format!("-p {}", bad), &format!("-p {}", p));
+            out = out.replace(&format!("-p{}", bad), &format!("-p{}", p));
+            out = out.replace(&format!("localhost:{}", bad), &format!("localhost:{}", p));
+            out = out.replace(&format!("127.0.0.1:{}", bad), &format!("127.0.0.1:{}", p));
+        }
+        // If it's clearly Next and no explicit port flag, add one (Next dev/start does not reliably honor PORT env).
+        let lower = out.to_lowercase();
+        let has_flag = lower.contains("--port") || lower.split_whitespace().any(|t| t == "-p" || t.starts_with("-p"));
+        if (lower.contains("next dev") || lower.contains("next start")) && !has_flag {
+            out.push_str(&format!(" -p {}", p));
+        }
+        out
+    }
+
     // Build env vars come HashMap — passate direttamente alla sandbox Docker.
     // Non si usa più il prefisso shell "KEY=val CMD" per evitare injection e
     // per garantire che le variabili non siano visibili nell'output di `ps`.
@@ -544,11 +616,36 @@ pub async fn launch_run_config(
     }
 
     // Build full command string (args appendati al comando base)
-    let full_cmd = if args.is_empty() {
+    let full_cmd_raw = if args.is_empty() {
         command.clone()
     } else {
         format!("{} {}", command, args.join(" "))
     };
+
+    // Guardrail: i servizi di progetto non devono mai usare porte riservate (incl. 3000).
+    // Se il run config non imposta PORT ma il comando sembra un web server (o contiene un hint porta),
+    // assegniamo una porta dal range progetti (5000+) e riscriviamo i flag più comuni.
+    let reserved: std::collections::HashSet<u16> = NEXUS_RESERVED_PORTS.iter().copied().collect();
+    let configured_hint = extract_cli_port_hint(&full_cmd_raw);
+    let should_force_port = looks_like_web_server_command(&full_cmd_raw) || configured_hint.is_some();
+    let forced_port: Option<u16> = if should_force_port && !env_vars.contains_key("PORT") {
+        Some(find_free_port(5000, &state.port_registry).await)
+    } else {
+        env_vars.get("PORT").and_then(|s| parse_port_token(s))
+    };
+
+    if let Some(p) = forced_port {
+        if reserved.contains(&p) {
+            // extra safety; should not happen because find_free_port excludes reserved
+            let safe = find_free_port(5000, &state.port_registry).await;
+            env_vars.insert("PORT".to_string(), safe.to_string());
+        } else if !env_vars.contains_key("PORT") {
+            env_vars.insert("PORT".to_string(), p.to_string());
+        }
+    }
+
+    let final_port = env_vars.get("PORT").and_then(|s| parse_port_token(s)).unwrap_or(0);
+    let full_cmd = if final_port > 0 { rewrite_port_flags(&full_cmd_raw, final_port) } else { full_cmd_raw };
 
     // Se l'immagine del progetto è già stata buildata in precedenza, usala.
     // Non buildare automaticamente qui — il build è lento e causerebbe timeout.

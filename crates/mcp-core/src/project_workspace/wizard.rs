@@ -321,10 +321,81 @@ pub async fn wizard_install_service(
         format!("{} {}", resolved_command, args.join(" "))
     };
 
-    // Blocco Environment= per variabili d'ambiente
-    let env_lines: String = body["env"].as_object()
-        .map(|e| e.iter().map(|(k, v)| format!("Environment={}={}\n", k, v.as_str().unwrap_or(""))).collect())
-        .unwrap_or_default();
+    fn parse_port_token(s: &str) -> Option<u16> {
+        let t = s.trim();
+        if t.is_empty() { return None; }
+        let t = t.trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ';');
+        t.parse::<u16>().ok()
+    }
+
+    fn looks_like_web_server_command(command: &str) -> bool {
+        let lower = command.to_lowercase();
+        lower.contains(" next dev")
+            || lower.contains(" next start")
+            || lower.contains(" vite")
+            || lower.contains(" nuxt")
+            || lower.contains(" astro")
+            || lower.contains(" react-scripts start")
+            || lower.contains(" pnpm run dev")
+            || lower.contains(" npm run dev")
+            || lower.contains(" yarn dev")
+            || lower.contains(" pnpm dev")
+            || lower.contains(" npm start")
+            || lower.contains(" dotnet run")
+    }
+
+    fn rewrite_port_flags(command: &str, target_port: u16) -> String {
+        let p = target_port.to_string();
+        let mut out = command.to_string();
+        for bad in ["3000", "4000", "4010", "4020", "4030", "4040", "4050", "4060", "8001"] {
+            out = out.replace(&format!("--port={}", bad), &format!("--port={}", p));
+            out = out.replace(&format!("--port {}", bad), &format!("--port {}", p));
+            out = out.replace(&format!("-p {}", bad), &format!("-p {}", p));
+            out = out.replace(&format!("-p{}", bad), &format!("-p{}", p));
+            out = out.replace(&format!("localhost:{}", bad), &format!("localhost:{}", p));
+            out = out.replace(&format!("127.0.0.1:{}", bad), &format!("127.0.0.1:{}", p));
+        }
+        let lower = out.to_lowercase();
+        let has_flag = lower.contains("--port") || lower.split_whitespace().any(|t| t == "-p" || t.starts_with("-p"));
+        if (lower.contains("next dev") || lower.contains("next start")) && !has_flag {
+            out.push_str(&format!(" -p {}", p));
+        }
+        out
+    }
+
+    // Blocco Environment= per variabili d'ambiente (con policy porte: mai usare porte riservate Nexus, incl. 3000).
+    let reserved: std::collections::HashSet<u16> = services::NEXUS_RESERVED_PORTS.iter().copied().collect();
+    let mut env_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Some(obj) = body["env"].as_object() {
+        for (k, v) in obj {
+            env_map.insert(k.clone(), v.as_str().unwrap_or("").to_string());
+        }
+    }
+
+    let wants_port = looks_like_web_server_command(&exec_start);
+    let existing_port = env_map.get("PORT").and_then(|v| parse_port_token(v));
+    let final_port = if wants_port {
+        let port = existing_port.unwrap_or_else(|| 5000);
+        let ok = !reserved.contains(&port)
+            && state.port_registry.is_port_available(port).await
+            && tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await.is_ok();
+        let actual = if ok { port } else { services::find_free_port(5000, &state.port_registry).await };
+        env_map.insert("PORT".to_string(), actual.to_string());
+        Some(actual)
+    } else {
+        None
+    };
+
+    let exec_start = if let Some(p) = final_port {
+        rewrite_port_flags(&exec_start, p)
+    } else {
+        exec_start
+    };
+
+    let env_lines: String = env_map
+        .iter()
+        .map(|(k, v)| format!("Environment={}={}\n", k, v))
+        .collect();
 
     let unit_content = format!(
         "[Unit]\nDescription={}\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory={}\n{}ExecStart={}\nRestart=on-failure\nRestartSec=5\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n",
