@@ -205,6 +205,65 @@ pub async fn restart_all_project_services(
     Ok(Json(json!({ "slug": slug, "restarted": results })))
 }
 
+/// POST /api/projects/:id/services/stop-all
+/// Ferma tutti i `{slug}-*.service` del progetto e rilascia le porte dal port_registry.
+pub async fn stop_all_project_services(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let context = load_project_context(&state.db, project_id, user_id).await?;
+    let slug = context.details.name.to_lowercase().replace([' ', '_'], "-");
+
+    let prefix = format!("{}-", slug);
+    let list = tokio::process::Command::new("systemctl")
+        .args(["--user", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"])
+        .output()
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let list_str = String::from_utf8_lossy(&list.stdout);
+    let units: Vec<String> = list_str
+        .lines()
+        .filter_map(|line| {
+            let unit = line.split_whitespace().next()?;
+            if unit.starts_with(&prefix) { Some(unit.to_string()) } else { None }
+        })
+        .collect();
+
+    // Helper: rilascia porte dal registry leggendo il unit file.
+    async fn release_ports_for_unit(state: &AppState, unit_name: &str) {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let unit_path = format!("{}/.config/systemd/user/{}", home, unit_name);
+        if let Ok(content) = tokio::fs::read_to_string(&unit_path).await {
+            let ports = extract_ports_from_unit(&content);
+            for p in ports {
+                let _ = state.port_registry.release(p).await;
+            }
+        }
+    }
+
+    let mut stopped = Vec::new();
+    for unit in &units {
+        let out = tokio::process::Command::new("systemctl")
+            .args(["--user", "stop", unit])
+            .output()
+            .await;
+        release_ports_for_unit(&state, unit).await;
+        match out {
+            Ok(o) => stopped.push(json!({
+                "unit": unit,
+                "ok": o.status.success(),
+                "stderr": String::from_utf8_lossy(&o.stderr).to_string(),
+            })),
+            Err(e) => stopped.push(json!({ "unit": unit, "ok": false, "stderr": e.to_string() })),
+        }
+    }
+    Ok(Json(json!({ "slug": slug, "stopped": stopped })))
+}
+
 // ── POST /api/projects/:id/services/cleanup-ports ───────────────────────────
 /// Termina i processi che occupano porte rilevate per il progetto MA non sono
 /// gestiti da systemd `{slug}-*.service` (porte "orfane" o conflittuali).
@@ -720,6 +779,57 @@ pub(super) const NEXUS_RESERVED_PORTS: &[u16] = &[
     16686, // Jaeger UI
 ];
 
+/// Range dedicato ai servizi dei progetti gestiti (deve evitare conflitti con Nexus e con servizi host comuni).
+/// Scelta conservativa: porte alte non privilegiate, fuori dal range Nexus e fuori dai DB.
+pub(super) const PROJECT_PORT_RANGE_START: u16 = 20000;
+pub(super) const PROJECT_PORT_RANGE_END: u16 = 39999;
+/// Numero porte per progetto nel bucket deterministico.
+pub(super) const PROJECT_PORT_BUCKET_SIZE: u16 = 50;
+
+fn project_bucket_start(project_id: &Uuid) -> u16 {
+    // Hash stabile: usa i primi 8 byte (big-endian) del UUID.
+    let b = project_id.as_bytes();
+    let mut v: u64 = 0;
+    for i in 0..8 {
+        v = (v << 8) | (b[i] as u64);
+    }
+    let buckets: u64 =
+        ((PROJECT_PORT_RANGE_END - PROJECT_PORT_RANGE_START + 1) as u64) / (PROJECT_PORT_BUCKET_SIZE as u64);
+    let idx = if buckets == 0 { 0 } else { v % buckets };
+    PROJECT_PORT_RANGE_START + (idx as u16) * PROJECT_PORT_BUCKET_SIZE
+}
+
+/// Trova una porta libera *nel bucket deterministico* del progetto.
+/// Fallback: se il bucket è pieno (o collisioni esterne), ripiega su `find_free_port(PROJECT_PORT_RANGE_START, ...)`.
+pub(super) async fn find_free_project_port(
+    project_id: &Uuid,
+    registry: &crate::port_registry::PortRegistryCache,
+) -> u16 {
+    let reserved: std::collections::HashSet<u16> = NEXUS_RESERVED_PORTS.iter().copied().collect();
+    let allocated: std::collections::HashSet<u16> = registry
+        .current()
+        .await
+        .all_allocated_ports()
+        .into_iter()
+        .collect();
+
+    let start = project_bucket_start(project_id);
+    let end = (start + PROJECT_PORT_BUCKET_SIZE).saturating_sub(1);
+
+    let mut port = start;
+    while port <= end {
+        if !reserved.contains(&port) && !allocated.contains(&port) {
+            if tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await.is_ok() {
+                return port;
+            }
+        }
+        port += 1;
+    }
+
+    // Bucket pieno o tutte occupate: fallback su scan globale nel range progetti.
+    find_free_port(PROJECT_PORT_RANGE_START, registry).await
+}
+
 /// Trova la prima porta TCP libera a partire da `start`, escludendo le porte
 /// riservate da Nexus E quelle gia' allocate nel registro centralizzato.
 pub(super) async fn find_free_port(start: u16, registry: &crate::port_registry::PortRegistryCache) -> u16 {
@@ -734,6 +844,13 @@ pub(super) async fn find_free_port(start: u16, registry: &crate::port_registry::
     loop {
         if port > 65000 { return start; } // fallback di sicurezza
         if reserved.contains(&port) || allocated.contains(&port) { port += 1; continue; }
+        // Evita assegnazioni fuori dal range progetti quando start è nel range progetti.
+        if start >= PROJECT_PORT_RANGE_START && start <= PROJECT_PORT_RANGE_END {
+            if port < PROJECT_PORT_RANGE_START || port > PROJECT_PORT_RANGE_END {
+                port = PROJECT_PORT_RANGE_START;
+                continue;
+            }
+        }
         if tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await.is_ok() {
             return port;
         }

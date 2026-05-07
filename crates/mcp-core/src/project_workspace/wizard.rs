@@ -379,7 +379,7 @@ pub async fn wizard_install_service(
         let ok = !reserved.contains(&port)
             && state.port_registry.is_port_available(port).await
             && tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await.is_ok();
-        let actual = if ok { port } else { services::find_free_port(5000, &state.port_registry).await };
+        let actual = if ok { port } else { services::find_free_project_port(&project_id, &state.port_registry).await };
         env_map.insert("PORT".to_string(), actual.to_string());
         Some(actual)
     } else {

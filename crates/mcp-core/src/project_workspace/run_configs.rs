@@ -6,7 +6,7 @@ use super::wizard::{
     detect_dotnet_suggestions, detect_playwright_suggestions,
     refine_with_nexus,
 };
-use super::services::{NEXUS_RESERVED_PORTS, find_free_port, is_web_service_script};
+use super::services::{NEXUS_RESERVED_PORTS, find_free_port, find_free_project_port, is_web_service_script};
 
 /// Scans a project directory and returns suggested run configurations (con tag role/essential/group).
 /// Calcola i suggerimenti di run-config scansionando il filesystem.
@@ -607,7 +607,7 @@ pub async fn launch_run_config(
                 let is_free = !reserved.contains(&configured_port)
                     && state.port_registry.is_port_available(configured_port).await
                     && tokio::net::TcpListener::bind(format!("127.0.0.1:{}", configured_port)).await.is_ok();
-                let actual_port = if is_free { configured_port } else { find_free_port(5000, &state.port_registry).await };
+                let actual_port = if is_free { configured_port } else { find_free_project_port(&project_id, &state.port_registry).await };
                 env_vars.insert("PORT".to_string(), actual_port.to_string());
             } else {
                 env_vars.insert(k.clone(), val_str);
@@ -629,7 +629,7 @@ pub async fn launch_run_config(
     let configured_hint = extract_cli_port_hint(&full_cmd_raw);
     let should_force_port = looks_like_web_server_command(&full_cmd_raw) || configured_hint.is_some();
     let forced_port: Option<u16> = if should_force_port && !env_vars.contains_key("PORT") {
-        Some(find_free_port(5000, &state.port_registry).await)
+        Some(find_free_project_port(&project_id, &state.port_registry).await)
     } else {
         env_vars.get("PORT").and_then(|s| parse_port_token(s))
     };
@@ -637,7 +637,7 @@ pub async fn launch_run_config(
     if let Some(p) = forced_port {
         if reserved.contains(&p) {
             // extra safety; should not happen because find_free_port excludes reserved
-            let safe = find_free_port(5000, &state.port_registry).await;
+            let safe = find_free_project_port(&project_id, &state.port_registry).await;
             env_vars.insert("PORT".to_string(), safe.to_string());
         } else if !env_vars.contains_key("PORT") {
             env_vars.insert("PORT".to_string(), p.to_string());
