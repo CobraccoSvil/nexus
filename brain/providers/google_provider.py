@@ -260,19 +260,14 @@ class GoogleProvider(BaseProvider):
 
 
 def _clean_schema_for_google(schema: dict) -> dict:
-    """Rimuovi chiavi non supportate da Google genai dagli schema JSON."""
-    skip_keys = {"additionalProperties", "$schema", "default"}
-    cleaned: dict = {}
-    for k, v in schema.items():
-        if k in skip_keys:
-            continue
-        if isinstance(v, dict):
-            cleaned[k] = _clean_schema_for_google(v)
-        elif k == "properties" and isinstance(v, dict):
-            cleaned[k] = {pk: _clean_schema_for_google(pv) if isinstance(pv, dict) else pv for pk, pv in v.items()}
-        else:
-            cleaned[k] = v
-    return cleaned
+    """Rimuovi chiavi non supportate da Google genai e applica compressione (BP6).
+
+    Delega al modulo condiviso _schema_utils.compress_schema che rimuove
+    additionalProperties/$schema/default/examples/title, tronca description
+    a 200 char e enum a 10 valori. Backward compatible con callers esistenti.
+    """
+    from ._schema_utils import compress_schema
+    return compress_schema(schema)
 
 
 def _convert_messages_to_google(messages: list[dict]) -> list[Any]:

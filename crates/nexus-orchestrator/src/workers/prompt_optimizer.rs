@@ -234,6 +234,25 @@ Rispondi con JSON nel formato:
             weaknesses = weakness_text,
         );
 
+        // ── BP9 follow-up (Batch API) ─────────────────────────────────────
+        // L'infrastruttura DB e' pronta in mig 0121:
+        //   - tabella nexus_anthropic_batches (tracking batch in volo)
+        //   - flag settings.prompt_optimizer_use_batch_api (default false)
+        //
+        // Per attivare la Batch API (50% sconto token):
+        // 1. Leggere il flag prompt_optimizer_use_batch_api dal DB
+        // 2. Se true: accumulare N richieste in un buffer
+        // 3. POST https://api.anthropic.com/v1/messages/batches con custom_id
+        //    per ogni richiesta, persistere anthropic_batch_id in DB
+        // 4. Worker separato (poll ogni 5min) che chiama
+        //    GET /v1/messages/batches/{id}/results per batch ended
+        // 5. Una volta recuperati, marca batch come 'ended' e processa le
+        //    risposte (parsing identico al flusso sincrono attuale)
+        //
+        // Tradeoff: latenza fino a 24h per ottenere le varianti, ma 50% in
+        // meno di costo. Adatto per il prompt_optimizer perche' le varianti
+        // non servono in real-time. Manteniamo il flusso sincrono finche'
+        // l'admin non attiva esplicitamente il flag.
         let client = reqwest::Client::new();
         let body = serde_json::json!({
             "model": "claude-3-5-haiku-20241022",

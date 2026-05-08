@@ -134,6 +134,7 @@ pub async fn resolve_active_price(
     model: &str,
 ) -> anyhow::Result<PriceSnapshot> {
     let currency = get_platform_currency(db).await?;
+    // 1) Prima prova: currency di piattaforma (default EUR)
     let price = sqlx::query_as::<_, PriceSnapshot>(
         r#"
         SELECT input_cost_per_million_tokens::float8,
@@ -152,11 +153,43 @@ pub async fn resolve_active_price(
     )
     .bind(provider)
     .bind(model)
-    .bind(currency)
+    .bind(&currency)
     .fetch_optional(db)
     .await?;
 
-    price.ok_or_else(|| anyhow::anyhow!("price_not_configured:{provider}/{model}"))
+    if let Some(p) = price {
+        return Ok(p);
+    }
+
+    // 2) Fallback: se il catalogo è in USD (o altra currency) e la base è EUR,
+    //    scegli il prezzo attivo più recente in qualunque currency.
+    let fallback = sqlx::query_as::<_, PriceSnapshot>(
+        r#"
+        SELECT input_cost_per_million_tokens::float8,
+               output_cost_per_million_tokens::float8,
+               currency
+        FROM ai_price_catalog
+        WHERE provider = $1
+          AND model = $2
+          AND is_enabled = TRUE
+          AND effective_from <= NOW()
+          AND (effective_to IS NULL OR effective_to > NOW())
+        ORDER BY effective_from DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(provider)
+    .bind(model)
+    .fetch_optional(db)
+    .await?;
+
+    // Ultimo fallback: se manca completamente la voce (provider/model non censiti),
+    // non bloccare l'esecuzione: registra comunque i token con costo=0 (verificabile).
+    Ok(fallback.unwrap_or(PriceSnapshot {
+        input_cost_per_million_tokens: 0.0,
+        output_cost_per_million_tokens: 0.0,
+        currency,
+    }))
 }
 
 fn calculate_cost(
@@ -410,7 +443,7 @@ pub async fn finalize_usage(
     sqlx::query(
         r#"
         UPDATE ai_usage_ledger
-        SET run_id = $2,
+        SET run_id = (SELECT id FROM orchestrator_runs WHERE id = $2),
             prompt_tokens = $3,
             completion_tokens = $4,
             total_tokens = $5,

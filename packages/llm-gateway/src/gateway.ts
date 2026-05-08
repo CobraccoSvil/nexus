@@ -234,6 +234,35 @@ export class LLMGateway {
     };
   }
 
+  /**
+   * Preview “deterministico” del routing: ritorna provider primario, modello risolto e tier effettivo.
+   * Serve per calcoli di quota/costo *prima* della chiamata al provider (calcolo perfetto).
+   *
+   * Nota: non applica rate limit per evitare doppio conteggio; il rate limit resta in `complete/stream`.
+   */
+  async preview(req: LLMRequest): Promise<{ primaryName: ProviderName; resolvedModel: string; effectiveTier: SensitivityTier }> {
+    // Classificazione sensitivity (stessa logica di `complete`)
+    const classification = await this.classifier.classify(req.messages);
+    this.policy.validateTierClaim(req.metadata.sensitivity_tier, classification.tier);
+    const effectiveTier = Math.max(req.metadata.sensitivity_tier, classification.tier) as SensitivityTier;
+
+    // Policy routing (stesso meccanismo)
+    const { primaryName, privacyRerouted } = this.buildFallbackChain(effectiveTier);
+
+    // Alias resolution del modello per il provider primario
+    let resolvedModel = req.model;
+    try {
+      resolvedModel = this.resolver.resolve(req.model, primaryName as any, effectiveTier);
+    } catch {
+      // fallback: usa req.model
+      resolvedModel = req.model;
+    }
+
+    // Se privacy-rerouted verso provider locale, il primaryName è già quello; resolvedModel coerente.
+    void privacyRerouted; // solo per chiarezza (nessuna side-effect qui)
+    return { primaryName, resolvedModel, effectiveTier };
+  }
+
   async complete(req: LLMRequest): Promise<LLMResponse> {
     // 1. Rate limit
     this.rateLimiter.checkTenant(req.metadata.tenant_id);
@@ -256,18 +285,29 @@ export class LLMGateway {
     this.rateLimiter.checkProvider(primaryName);
 
     // 5. Risoluzione alias modello per ogni provider della catena (fallback-safe)
+    // Miglioria token/latency: se un provider NON è compatibile col modello richiesto/alias,
+    // lo escludiamo dalla chain invece di provarlo e fallire (riduce retry e 503 generici).
     const modelPerProvider = new Map<string, string>();
-    {
-      // Se privacy-rerouted verso provider locale, risolvi solo per quel provider
-      const providersToResolve = privacyRerouted
-        ? [primaryName]
-        : (this.policy.decide(effectiveTier, "").providers);
-      for (const pName of providersToResolve) {
-        try {
-          const m = this.resolver.resolve(req.model, pName as any, effectiveTier);
-          modelPerProvider.set(pName, m);
-        } catch { /* provider non compatibile col modello — usa req.model */ }
+    const providersToResolve = privacyRerouted
+      ? [primaryName]
+      : this.policy.decide(effectiveTier, "").providers;
+
+    // Risolvi modello per ciascun provider; se fallisce, segnala incompatibilità.
+    const incompatible = new Set<string>();
+    for (const pName of providersToResolve) {
+      try {
+        const m = this.resolver.resolve(req.model, pName as any, effectiveTier);
+        modelPerProvider.set(pName, m);
+      } catch {
+        // Se il modello è prefissato (es. "anthropic/..") e non c'è fallback, questo provider è incompatibile
+        // e va escluso dalla chain per questa richiesta.
+        incompatible.add(pName);
       }
+    }
+
+    // Applica filtro chain quando abbiamo incompatibilità (solo path non-privacy-rerouted).
+    if (!privacyRerouted && incompatible.size > 0) {
+      chain.filterInPlace((p) => !incompatible.has(p.name));
     }
     chain.modelPerProvider = modelPerProvider;
     const resolvedModel = modelPerProvider.get(primaryName) ?? req.model;
@@ -379,8 +419,23 @@ export class LLMGateway {
     }
 
     this.rateLimiter.checkProvider(primaryName);
-    const resolvedModel = this.resolver.resolve(req.model, primaryName, effectiveTier);
-    yield* provider.stream({ ...req, model: resolvedModel });
+    const resolvedModel = (() => {
+      try {
+        return this.resolver.resolve(req.model, primaryName, effectiveTier);
+      } catch {
+        return req.model;
+      }
+    })();
+
+    for await (const chunk of provider.stream({ ...req, model: resolvedModel })) {
+      // Arricchisce i chunk con provider/modello per telemetria lato API gateway
+      // (campi opzionali: retro-compatibili per i client).
+      if (chunk.usage || chunk.finish_reason) {
+        yield { ...(chunk as any), provider_used: primaryName, model_used: resolvedModel };
+      } else {
+        yield chunk;
+      }
+    }
   }
 
   startHealthChecks(intervalMs = 60_000) {

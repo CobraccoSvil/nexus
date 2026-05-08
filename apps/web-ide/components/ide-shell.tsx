@@ -438,6 +438,10 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   const [pendingChatMessage, setPendingChatMessage] = useState<string | undefined>(undefined);
   const [pendingAutoSend, setPendingAutoSend] = useState(false);
   const [pendingProviderHint, setPendingProviderHint] = useState<{ provider?: string; model?: string } | undefined>(undefined);
+  /** Per messaggi da pannelli diagnostic (debug, problemi, ecc.): un turno con agente + tool anche se la chat era in «Studio». */
+  const [pendingExternalAutomation, setPendingExternalAutomation] = useState<
+    "study" | "confirm" | "automatic" | undefined
+  >(undefined);
   const [agentRunEndSignal, setAgentRunEndSignal] = useState(0);
   const [leftWidth, setLeftWidth] = useState(300);
   const [rightWidth, setRightWidth] = useState(430);
@@ -1422,7 +1426,13 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               externalInput={pendingChatMessage}
               externalAutoSend={pendingAutoSend}
               externalProviderHint={pendingProviderHint}
-              onExternalInputConsumed={() => { setPendingChatMessage(undefined); setPendingAutoSend(false); setPendingProviderHint(undefined); }}
+              externalAutomationOverride={pendingExternalAutomation}
+              onExternalInputConsumed={() => {
+                setPendingChatMessage(undefined);
+                setPendingAutoSend(false);
+                setPendingProviderHint(undefined);
+                setPendingExternalAutomation(undefined);
+              }}
               onTracesChange={setAiTraces}
               hasRunningServices={outputChannels.some((ch) => ch.label?.startsWith("●"))}
               onRunEnd={(run) => {
@@ -2111,8 +2121,16 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
                 case "playwright": setPlaywrightRuns([]); break;
               }
             }}
-            onSendToChat={(msg) => setPendingChatMessage(msg)}
-            onAutoSendToChat={(msg) => { setPendingChatMessage(msg); setPendingAutoSend(true); }}
+            onSendToChat={(msg) => {
+              setPendingChatMessage(msg);
+              setPendingAutoSend(true);
+              setPendingExternalAutomation("confirm");
+            }}
+            onAutoSendToChat={(msg) => {
+              setPendingChatMessage(msg);
+              setPendingAutoSend(true);
+              setPendingExternalAutomation("confirm");
+            }}
             agentRunEndSignal={agentRunEndSignal}
             traces={aiTraces}
             onClearTraces={() => setAiTraces([])}

@@ -21,6 +21,15 @@ aliases:
     min_tier: 0
     max_tier: 2
 
+  # Alias “veloce” usato dai client/UI.
+  # Deve essere sempre risolvibile su almeno un provider economico e disponibile.
+  claude-fast:
+    cloud_primary: deepseek/deepseek-chat
+    cloud_secondary: mistral/mistral-small-latest
+    onprem: null
+    min_tier: 0
+    max_tier: 2
+
   sensitive-only:
     cloud_primary: null
     cloud_secondary: null

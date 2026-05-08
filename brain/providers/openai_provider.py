@@ -225,13 +225,20 @@ class OpenAIProvider(BaseProvider):
 
 
 def _anthropic_tool_to_openai(tool: dict) -> dict:
-    """Converte un tool definition Anthropic nel formato OpenAI function."""
+    """Converte un tool definition Anthropic nel formato OpenAI function.
+
+    Applica anche la compressione dello schema (BP6 piano riduzione token):
+    rimuove additionalProperties/$schema/examples, tronca description e enum.
+    """
+    from ._schema_utils import compress_schema, _truncate_text, DEFAULT_TOOL_DESCR_MAX
+
+    raw_schema = tool.get("input_schema", {"type": "object", "properties": {}})
     return {
         "type": "function",
         "function": {
             "name": tool["name"],
-            "description": tool.get("description", ""),
-            "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
+            "description": _truncate_text(tool.get("description", ""), DEFAULT_TOOL_DESCR_MAX),
+            "parameters": compress_schema(raw_schema),
         },
     }
 

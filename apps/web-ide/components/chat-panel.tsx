@@ -95,6 +95,7 @@ export function ChatPanel({
   externalInput,
   externalAutoSend,
   externalProviderHint,
+  externalAutomationOverride,
   onExternalInputConsumed,
   onTracesChange,
   hasRunningServices = false,
@@ -119,6 +120,8 @@ export function ChatPanel({
   externalInput?: string;
   externalAutoSend?: boolean;
   externalProviderHint?: { provider?: string; model?: string };
+  /** Se impostato con input esterno, questo invio usa la modalità indicata (es. `confirm` da pannello debug). */
+  externalAutomationOverride?: "study" | "confirm" | "automatic";
   onExternalInputConsumed?: () => void;
   onTracesChange?: (traces: AITraceEvent[]) => void;
   hasRunningServices?: boolean;
@@ -171,11 +174,15 @@ export function ChatPanel({
   // Salva il provider hint in un ref per evitare che onExternalInputConsumed()
   // lo resetti prima che l'auto-send effect lo possa usare.
   const pendingProviderHintRef = useRef<{ provider?: string; model?: string } | undefined>(undefined);
+  const automationOnceRef = useRef<"study" | "confirm" | "automatic" | null>(null);
   useEffect(() => {
     if (externalInput) {
       if (externalAutoSend) {
         autoSendPendingRef.current = externalInput;
         pendingProviderHintRef.current = externalProviderHint;
+      }
+      if (externalAutomationOverride) {
+        automationOnceRef.current = externalAutomationOverride;
       }
       setInput(externalInput);
       onExternalInputConsumed?.();
@@ -381,12 +388,14 @@ export function ChatPanel({
       : selectedProvider === "auto"
         ? hint?.model
         : undefined;
+    const modeForSend = automationOnceRef.current ?? automationMode;
+    automationOnceRef.current = null;
     void send(text, {
       profileId,
       activeFiles,
       providerOverride: effectiveProvider,
       modelOverride: effectiveModel,
-      automationMode,
+      automationMode: modeForSend,
       supervisorMode: supervisorMode !== "none" ? supervisorMode : undefined,
       attachments,
     });

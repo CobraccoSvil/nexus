@@ -151,6 +151,10 @@ pub const AGENT_ACT_FIRST_SUFFIX: &str = r#"
   • **Devi** usare file e terminale del progetto attivo (`list_files`, `read_file` / `read_file_lines`, `search_in_files`; se serve prima `request_tools` con categoria semantic poi `search_codebase_semantic`; `edit_file` / `write_file`; `run_command` per lint/build/smoke/curl).
   • Se qualcosa **blocca** davvero (segreti, permessi, servizio offline), dopo i tentativi spiega in **una** riga tecnica cosa manca — non sostituire l’azione con un saggio lungo.
 - **Schema database dell’applicazione** (CREATE/ALTER/DROP/TRUNCATE su tabelle, indici, tipi, ecc.): **non** applicare mai DDL ad-hoc con `psql`/`mysql`/CLI. Usa il percorso ufficiale Nexus: `project_db_create_migration` per registrare SQL in file di migration versionati nel repo, poi `project_db_apply_migration` per applicare. Lo storico `project_migration_history` + file in `migration_path` garantiscono ricostruibilità dell’ambiente. Comandi tipo Flyway/Liquibase/Alembic/Prisma migrate/`dotnet ef database update` che applicano migration già versionate sono conformi.
+- **Credenziali / DB esterni**: non chiedere mai di “recuperare password” o fare procedure invasive. Se un’azione richiede accesso DB:
+  • prova PRIMA il percorso Nexus (`project_db_detect`, `project_db_create_migration`, `project_db_apply_migration`) che usa connessioni/config già registrate nel progetto.
+  • se manca una connessione/config: chiedi SOLO di configurarla nel pannello “Project DB” o di fornire una connection string *non segreta* tramite secret manager del progetto. Non ripetere avvisi; una sola richiesta chiara con i campi mancanti.
+- **Anti-spam**: non ripetere la stessa frase/avvertenza. Se devi rifiutare o sei bloccato, fallo UNA volta e poi passa a: cosa serve + prossimo comando/azione.
 - Progetti annidati (es. `projects/<nome>/...`): tutti i path sotto la **Root** del progetto attivo nel contesto; non assumere checkout casuali fuori sandbox.
 - Risposta finale: file toccati, cosa è cambiato, come verificare (comando o URL già eseguito / provabile).
 === FINE REGOLE ===

@@ -100,6 +100,7 @@ export function ProjectDbPanel({ project }: Props) {
     connection_string?: string;
     hints: string[];
   } | null>(null);
+  const [detectedTestResult, setDetectedTestResult] = useState<ProjectDbTestResult | null>(null);
 
   const load = useCallback(async () => {
     if (!projectId) {
@@ -224,8 +225,20 @@ export function ProjectDbPanel({ project }: Props) {
       allow_ddl_override: source?.allow_ddl_override ?? config?.allow_ddl_override ?? f.allow_ddl_override,
       connection_string: "",
     }));
-    // Reset campi separati per nuova immissione
-    setConnFields({ host: "", port: "5432", database: "", username: "", password: "" });
+    // Reset campi separati per nuova immissione (oppure precompila se abbiamo una connessione rilevata)
+    const detected = (detectedConfig?.connection_string ?? "").trim();
+    const parsed = detected ? parseConnectionString(detected) : null;
+    setConnFields(
+      parsed
+        ? {
+            host: parsed.host,
+            port: parsed.port || "5432",
+            database: parsed.database,
+            username: parsed.username,
+            password: parsed.password, // solo se presente nella stringa (es. .env); altrimenti resta vuota
+          }
+        : { host: "", port: "5432", database: "", username: "", password: "" }
+    );
     setUseConnFields(true);
     setTestResult(null);
     setDetectHints(null);
@@ -306,6 +319,7 @@ export function ProjectDbPanel({ project }: Props) {
     setError(null);
     setActionMsg(null);
     setDetectHints(null);
+    setDetectedTestResult(null);
     try {
       const res = await detectProjectDb(projectId);
       setInitForm((f) => ({
@@ -316,6 +330,18 @@ export function ProjectDbPanel({ project }: Props) {
         migration_path: res.migration_path ?? f.migration_path,
         connection_string: res.connection_string ?? f.connection_string,
       }));
+      const detectedConn = (res.connection_string ?? "").trim();
+      const parsed = detectedConn ? parseConnectionString(detectedConn) : null;
+      if (parsed) {
+        setUseConnFields(true);
+        setConnFields({
+          host: parsed.host,
+          port: parsed.port || "5432",
+          database: parsed.database,
+          username: parsed.username,
+          password: parsed.password,
+        });
+      }
       setDetectHints(res.hints ?? []);
       setShowInit(true);
       setActionMsg(
@@ -325,6 +351,29 @@ export function ProjectDbPanel({ project }: Props) {
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : "Errore rilevamento");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleTestDetected = async () => {
+    if (!projectId) return;
+    const connStr = (detectedConfig?.connection_string ?? "").trim();
+    if (!connStr) {
+      setDetectedTestResult({ ok: false, error: "Nessuna connection string rilevata." });
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setDetectedTestResult(null);
+    try {
+      const res = await testProjectDbConnection(projectId, {
+        engine: detectedConfig?.engine ?? undefined,
+        connection_string: connStr,
+      });
+      setDetectedTestResult(res);
+    } catch (e) {
+      setDetectedTestResult({ ok: false, error: e instanceof Error ? e.message : "Errore test" });
     } finally {
       setBusy(false);
     }
@@ -826,6 +875,19 @@ export function ProjectDbPanel({ project }: Props) {
                   migration_path: detectedConfig.migration_path ?? f.migration_path,
                   connection_string: detectedConfig.connection_string ?? f.connection_string,
                 }));
+                const parsed = detectedConfig.connection_string
+                  ? parseConnectionString(detectedConfig.connection_string)
+                  : null;
+                if (parsed) {
+                  setUseConnFields(true);
+                  setConnFields({
+                    host: parsed.host,
+                    port: parsed.port || "5432",
+                    database: parsed.database,
+                    username: parsed.username,
+                    password: parsed.password,
+                  });
+                }
                 setDetectHints(detectedConfig.hints);
                 setTestResult(null);
                 setShowInit(true);
@@ -845,6 +907,60 @@ export function ProjectDbPanel({ project }: Props) {
             >
               Usa questa configurazione
             </button>
+
+            <button
+              type="button"
+              onClick={() => void handleTestDetected()}
+              disabled={busy || !detectedConfig.connection_string}
+              style={{
+                alignSelf: "flex-start",
+                padding: "2px 8px",
+                borderRadius: 4,
+                border: `1px solid ${tc.border}`,
+                background: tc.bgCard,
+                color: tc.textSecondary,
+                cursor: busy ? "not-allowed" : "pointer",
+                fontSize: 10,
+                fontWeight: 600,
+                marginTop: 2,
+              }}
+              title="Esegue un test di connessione usando la config rilevata (senza salvare)."
+            >
+              {busy ? "Test…" : "Testa config rilevata"}
+            </button>
+
+            {detectedTestResult && (
+              <div
+                style={{
+                  marginTop: 4,
+                  fontSize: 10,
+                  padding: "4px 6px",
+                  borderRadius: 4,
+                  background: detectedTestResult.ok ? "#22c55e20" : `${tc.error}20`,
+                  border: `1px solid ${detectedTestResult.ok ? "#22c55e40" : `${tc.error}40`}`,
+                  color: detectedTestResult.ok ? "#22c55e" : tc.error,
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-word",
+                }}
+              >
+                {detectedTestResult.ok
+                  ? `OK · ${detectedTestResult.server_version?.slice(0, 60) ?? ""} · ${detectedTestResult.table_count ?? 0} tabelle · ${detectedTestResult.latency_ms ?? 0}ms`
+                  : `Errore: ${detectedTestResult.error ?? "sconosciuto"}`}
+                {!detectedTestResult.ok && detectedTestResult.hint && (
+                  <div
+                    style={{
+                      marginTop: 4,
+                      fontSize: 10,
+                      color: tc.textMuted,
+                      borderTop: `1px solid ${tc.border}`,
+                      paddingTop: 4,
+                    }}
+                  >
+                    {detectedTestResult.hint}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}

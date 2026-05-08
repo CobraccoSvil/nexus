@@ -336,19 +336,22 @@ pub async fn wizard_install_service(
     }
 
     fn looks_like_web_server_command(command: &str) -> bool {
+        // Deve funzionare anche quando `command` è un path assoluto (es. /usr/bin/npm)
+        // e quando l'argomento contiene più token.
         let lower = command.to_lowercase();
-        lower.contains(" next dev")
-            || lower.contains(" next start")
-            || lower.contains(" vite")
-            || lower.contains(" nuxt")
-            || lower.contains(" astro")
-            || lower.contains(" react-scripts start")
-            || lower.contains(" pnpm run dev")
-            || lower.contains(" npm run dev")
-            || lower.contains(" yarn dev")
-            || lower.contains(" pnpm dev")
-            || lower.contains(" npm start")
-            || lower.contains(" dotnet run")
+        // Match basati su word-boundary per evitare dipendenze dalla presenza di spazi iniziali.
+        let has = |pat: &str| lower.contains(pat);
+        has("next dev")
+            || has("next start")
+            || has("react-scripts start")
+            || has("vite")
+            || has("nuxt")
+            || has("astro")
+            || (has("pnpm") && has("run") && has(" dev"))
+            || (has("npm") && has("run") && has(" dev"))
+            || (has("npm") && has(" start"))
+            || (has("yarn") && has(" dev"))
+            || (has("dotnet") && has(" run"))
     }
 
     fn rewrite_port_flags(command: &str, target_port: u16) -> String {
@@ -379,15 +382,30 @@ pub async fn wizard_install_service(
         }
     }
 
-    let wants_port = looks_like_web_server_command(&exec_start);
+    let kind = body["kind"].as_str().unwrap_or("");
+    let wants_port = matches!(kind, "npm" | "pnpm" | "dotnet") || looks_like_web_server_command(&exec_start);
     let existing_port = env_map.get("PORT").and_then(|v| parse_port_token(v));
     let final_port = if wants_port {
-        let port = existing_port.unwrap_or_else(|| 5000);
+        // Se il client non passa PORT, assegnalo in modo deterministico nel bucket progetto.
+        // Questo evita che servizi web finiscano su 3000/3002 per fallback e garantisce stabilità.
+        let port = match existing_port {
+            Some(p) => p,
+            None => super::services::deterministic_project_port_for_key(
+                &project_id,
+                short,
+                &state.port_registry,
+            )
+            .await,
+        };
         let ok = !reserved.contains(&port)
             && state.port_registry.is_port_available(port).await
             && tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await.is_ok();
         let actual = if ok { port } else { services::find_free_project_port(&project_id, &state.port_registry).await };
         env_map.insert("PORT".to_string(), actual.to_string());
+        // .NET: usa ASPNETCORE_URLS per forzare la porta (PORT da solo non basta).
+        if kind == "dotnet" && !env_map.contains_key("ASPNETCORE_URLS") {
+            env_map.insert("ASPNETCORE_URLS".to_string(), format!("http://0.0.0.0:{}", actual));
+        }
         Some(actual)
     } else {
         None

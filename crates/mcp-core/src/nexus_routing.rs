@@ -357,6 +357,7 @@ mod tests {
             by_intent_mode: HashMap::new(),
             default_models: HashMap::new(),
             purpose_models,
+            escalations: HashMap::new(),
             loaded_at: Instant::now(),
         }
     }
@@ -480,6 +481,7 @@ mod tests {
             by_intent_mode: HashMap::new(),
             default_models: HashMap::new(),
             purpose_models: HashMap::new(),
+            escalations: HashMap::new(),
             loaded_at: Instant::now(),
         };
         assert!(agent_type_to_model(&AgentType::Coder, &empty_matrix).is_none());

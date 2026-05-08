@@ -85,7 +85,8 @@ class PostgresCheckpointer(BaseCheckpointSaver):
             sslmode = qs.pop("sslmode", ["require"])[0]
             ssl_kwarg: dict = {"ssl": False} if sslmode in ("disable", "allow", "prefer") else {}
             clean_url = urlunparse(parsed._replace(
-                scheme=parsed.scheme.replace("postgres://", "postgresql://").replace("postgres", "postgresql"),
+                # Normalizza lo scheme senza “doppio replace” (bug: "postgresql" -> "postgresqlql")
+                scheme=("postgresql" if parsed.scheme == "postgres" else parsed.scheme),
                 query=urlencode({k: v[0] for k, v in qs.items()}),
             ))
             self.pool = await asyncpg.create_pool(

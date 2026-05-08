@@ -7,8 +7,35 @@ from typing import Any, AsyncIterator
 
 from .base import BaseProvider, ProviderCatalogEntry, ProviderResult
 from .error_handler import format_error_result
+from ._schema_utils import compress_tool_list, measure_tools_bytes
 
 logger = logging.getLogger(__name__)
+
+
+# TTL cache per il blocco system prompt (BP2 piano riduzione token).
+# Anthropic supporta "5m" (default) e "1h" (beta extended-cache-ttl).
+# Il system prompt cambia raramente: 1h massimizza il cache hit rate fra turni
+# distanti. I breakpoint sulla history restano sul default 5m perche' la storia
+# muta ad ogni turno.
+# Override possibile via env per test: NEXUS_ANTHROPIC_SYSTEM_CACHE_TTL=5m
+_SYSTEM_CACHE_TTL = os.getenv("NEXUS_ANTHROPIC_SYSTEM_CACHE_TTL", "1h").strip()
+if _SYSTEM_CACHE_TTL not in ("5m", "1h"):
+    logger.warning(
+        "NEXUS_ANTHROPIC_SYSTEM_CACHE_TTL=%r non valido, uso default '1h'",
+        _SYSTEM_CACHE_TTL,
+    )
+    _SYSTEM_CACHE_TTL = "1h"
+
+
+def _system_cache_control() -> dict:
+    """Cache control block per il system prompt.
+
+    Per TTL 1h serve il beta header 'extended-cache-ttl-2025-04-11' che il
+    client Anthropic aggiunge automaticamente quando rileva il campo ttl.
+    """
+    if _SYSTEM_CACHE_TTL == "5m":
+        return {"type": "ephemeral"}
+    return {"type": "ephemeral", "ttl": _SYSTEM_CACHE_TTL}
 
 
 class AnthropicProvider(BaseProvider):
@@ -119,11 +146,11 @@ class AnthropicProvider(BaseProvider):
                 system_blocks = [{
                     "type": "text",
                     "text": system_text,
-                    "cache_control": {"type": "ephemeral"},
+                    "cache_control": _system_cache_control(),
                 }]
                 logger.info(
-                    "System prompt separato: %d chars (cached)",
-                    len(system_text),
+                    "System prompt separato: %d chars (cached ttl=%s)",
+                    len(system_text), _SYSTEM_CACHE_TTL,
                 )
             else:
                 # Fallback legacy: split su marker per backward compat
@@ -147,7 +174,7 @@ class AnthropicProvider(BaseProvider):
                         system_blocks = [{
                             "type": "text",
                             "text": static_part,
-                            "cache_control": {"type": "ephemeral"},
+                            "cache_control": _system_cache_control(),
                         }]
                         effective_messages = [
                             {"role": "user", "content": dynamic_part},
@@ -272,7 +299,19 @@ class AnthropicProvider(BaseProvider):
             if system_blocks:
                 kwargs["system"] = system_blocks
             if tools:
-                kwargs["tools"] = tools
+                # Comprimi tool defs per ridurre peso JSON inviato (BP6).
+                # I campi additionalProperties/$schema/examples/etc vengono rimossi,
+                # description tronche a 200 char, enum a 10 valori.
+                compressed_tools = compress_tool_list(tools, schema_key="input_schema")
+                if logger.isEnabledFor(logging.DEBUG):
+                    bytes_before = measure_tools_bytes(tools)
+                    bytes_after = measure_tools_bytes(compressed_tools)
+                    logger.debug(
+                        "anthropic tool_defs compression: %d -> %d bytes (-%.0f%%)",
+                        bytes_before, bytes_after,
+                        100 * (1 - bytes_after / max(1, bytes_before)),
+                    )
+                kwargs["tools"] = compressed_tools
             if use_thinking:
                 kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
                 kwargs["betas"] = ["interleaved-thinking-2025-05-14"]
@@ -374,7 +413,7 @@ class AnthropicProvider(BaseProvider):
                 system_blocks = [{
                     "type": "text",
                     "text": system_text,
-                    "cache_control": {"type": "ephemeral"},
+                    "cache_control": _system_cache_control(),
                 }]
             else:
                 _CACHE_SPLIT_MARKERS = ("Richiesta corrente:", "User request:")
@@ -388,7 +427,7 @@ class AnthropicProvider(BaseProvider):
                             split_at = idx
                             break
                     if split_at > 200:
-                        system_blocks = [{"type": "text", "text": raw[:split_at].strip(), "cache_control": {"type": "ephemeral"}}]
+                        system_blocks = [{"type": "text", "text": raw[:split_at].strip(), "cache_control": _system_cache_control()}]
                         effective_messages = [{"role": "user", "content": raw[split_at:].strip()}, *effective_messages[1:]]
 
             KEEP_RECENT = 12
@@ -471,7 +510,8 @@ class AnthropicProvider(BaseProvider):
             if system_blocks:
                 stream_kwargs["system"] = system_blocks
             if tools:
-                stream_kwargs["tools"] = tools
+                # Stessa compressione del path non-streaming (BP6).
+                stream_kwargs["tools"] = compress_tool_list(tools, schema_key="input_schema")
             if use_thinking:
                 stream_kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
                 stream_kwargs["betas"] = ["interleaved-thinking-2025-05-14"]

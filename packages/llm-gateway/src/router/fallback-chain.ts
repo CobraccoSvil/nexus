@@ -9,6 +9,11 @@ export class FallbackChain {
     private statuses: Map<string, ProviderStatus>
   ) {}
 
+  /** Rimuove provider incompatibili per questa richiesta (es. model alias non risolvibile). */
+  filterInPlace(predicate: (p: LLMProvider) => boolean) {
+    this.providers = this.providers.filter(predicate);
+  }
+
   async complete(req: LLMRequest): Promise<LLMResponse & { attempts: number }> {
     let lastError: Error | null = null;
     let attempts = 0;

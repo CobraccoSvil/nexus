@@ -94,4 +94,10 @@ export interface LLMStreamChunk {
   };
   finish_reason?: LLMResponse["finish_reason"];
   usage?: LLMResponse["usage"];
+  /**
+   * Opzionale: quando disponibile, permette telemetria affidabile lato gateway
+   * anche per lo streaming (provider/modello usati).
+   */
+  provider_used?: string;
+  model_used?: string;
 }

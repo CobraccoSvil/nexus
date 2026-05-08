@@ -56,6 +56,78 @@ class AgentProfile:
         allow = set(self.allowed_tools)
         return [t for t in tools_json if t.get("name") in allow or t.get("name") in self._ALWAYS_ON_TOOLS]
 
+    def filter_tools_for_intent(
+        self, tools_json: list[dict], intent: str | None,
+    ) -> list[dict]:
+        """Doppio filtraggio: whitelist profilo + restrizione per intent (BP5).
+
+        Per intent specifici (chat, analyze, review) non serve l'intero
+        toolset edit/run -- riduciamo le tool defs inviate al modello.
+        Per intent edit-heavy o sconosciuti torniamo al filtraggio standard.
+        """
+        first_pass = self.filter_tools(tools_json)
+        if not intent:
+            return first_pass
+        intent_subset = _INTENT_TOOL_SUBSET.get(intent)
+        if intent_subset is None:
+            return first_pass
+        if "*" in intent_subset:
+            return first_pass
+        allow = set(intent_subset)
+        return [t for t in first_pass
+                if t.get("name") in allow or t.get("name") in self._ALWAYS_ON_TOOLS]
+
+
+# ── Mapping intent → subset di tool (BP5 piano riduzione token) ─────────────
+# Gli intent sono prodotti dal SemanticRouter (brain/agents/router.py).
+# Per ogni intent dichiariamo un sottoinsieme massimo di tool consentiti.
+# Il filtro effettivo intersecta questo subset con la whitelist del profilo:
+# entrambi devono permettere il tool perche' arrivi al modello.
+#
+# Convenzioni:
+# - "*" come unico elemento: nessun filtro per intent (usa solo whitelist profilo)
+# - lista vuota: nessun tool inviato (utile per chat puramente conversazionali)
+#
+# I tool in AgentProfile._ALWAYS_ON_TOOLS bypassano sempre questo filtro.
+# Mantenere coerente con i nomi tool definiti nel registry Rust/Python.
+_INTENT_TOOL_SUBSET: dict[str, list[str]] = {
+    # Conversazione generica: nessun tool, riduce drammaticamente il payload.
+    "chat": [],
+    "general_chat": [],
+    # Analisi e review: solo lettura.
+    "analyze": [
+        "read_file", "read_file_lines", "list_files", "search_in_files",
+        "search_codebase_semantic", "search_file_semantic",
+        "scan_code_quality", "git_status",
+    ],
+    "review": [
+        "read_file", "read_file_lines", "list_files", "search_in_files",
+        "search_codebase_semantic", "git_status",
+    ],
+    "code_read": [
+        "read_file", "read_file_lines", "list_files", "search_in_files",
+        "search_codebase_semantic", "search_file_semantic",
+    ],
+    # Refactor: lettura + edit, niente run_command/run_tests (evita side-effects
+    # accidentali su intent ambigui).
+    "refactor": [
+        "read_file", "read_file_lines", "list_files", "search_in_files",
+        "search_codebase_semantic", "write_file", "edit_file",
+        "git_status", "git_stage",
+    ],
+    # Edit/code/implement/fix: nessun filtro intent (usa profilo).
+    "code": ["*"],
+    "code_edit": ["*"],
+    "implement": ["*"],
+    "fix": ["*"],
+    "debug": ["*"],
+    # Doc generation: lettura + scrittura.
+    "doc_generate": [
+        "read_file", "read_file_lines", "list_files", "search_in_files",
+        "write_file", "edit_file",
+    ],
+}
+
 
 # ── Catalog interno: 4 core + 13 github + 20 specialized + 23 general = 60 ──
 

@@ -172,6 +172,11 @@ export interface SendChatMessageOptions {
   automationMode?: "study" | "confirm" | "automatic";
   supervisorMode?: "none" | "anomaly" | "interleaved" | "continuous";
   attachments?: ChatAttachment[];
+  // BP13 piano riduzione token: limita la finestra di messaggi inviati al
+  // backend. Il backend ricostruisce il contesto piu' vecchio dal DB e/o
+  // dal summarizer (BP4). Default: 30 messaggi -- copre i 6 protetti dal
+  // summarizer + 24 messaggi recenti.
+  messageWindowSize?: number;
 }
 
 export interface FeedbackErrorResponse {
@@ -882,6 +887,9 @@ export async function sendChatMessage(
       automationMode: options.automationMode ?? "confirm",
       supervisorMode: options.supervisorMode ?? "none",
       attachments: options.attachments ?? [],
+      // BP13: dichiara la finestra di messaggi che il client e' disposto a
+      // inviare. Il backend usa questo hint per pruning lato suo.
+      messageWindowSize: options.messageWindowSize ?? 30,
     }),
   }, 120000);
 }
@@ -3073,6 +3081,7 @@ export interface ServiceWizardSuggestion {
   command: string;
   args: string[];
   cwd: string;
+  env?: Record<string, string>; // env suggerito (es. PORT deterministico)
   existing: boolean;   // true se il .service è già installato
 }
 

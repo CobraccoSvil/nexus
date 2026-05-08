@@ -14,10 +14,14 @@ import {
   launchRunConfig,
   detectRunConfigs,
   getProjectServicesStatus,
+  controlProjectService,
+  getProjectPorts,
 } from "../../lib/api-client";
 import type {
   EditorTabState,
   GitRepositoryState,
+  PortEntry,
+  ProjectServiceEntry,
   RunConfigItem,
   UserProjectDetails,
   WorkspaceTreeNode,
@@ -241,6 +245,12 @@ function RunDebugView({
   /** Set degli "short" name dei servizi systemd installati per il progetto.
    *  Usato per nascondere i run config che li duplicherebbero. */
   const [systemdShorts, setSystemdShorts] = useState<Set<string>>(new Set());
+  /** Stato live dei servizi systemd del progetto (per sezione "Servizi"). */
+  const [systemdSvcs, setSystemdSvcs] = useState<ProjectServiceEntry[]>([]);
+  /** Porte rilevate (per link "Apri"). */
+  const [ports, setPorts] = useState<PortEntry[]>([]);
+  const [svcBusy, setSvcBusy] = useState<Record<string, boolean>>({});
+  const [svcMsg, setSvcMsg] = useState<string>("");
   /** Categorie collassate dall'utente (chiavi in CATEGORY_LABEL) */
   const [collapsed, setCollapsed] = useState<Set<Category>>(() => new Set());
   /** "show all" forza il rendering di tutto (anche stop e duplicati) per debug */
@@ -256,13 +266,69 @@ function RunDebugView({
     const refresh = async () => {
       try {
         const r = await getProjectServicesStatus(projectId);
-        if (!cancelled) setSystemdShorts(new Set((r.services ?? []).map(s => s.short)));
+        if (cancelled) return;
+        const svcs = r.services ?? [];
+        setSystemdShorts(new Set(svcs.map(s => s.short)));
+        setSystemdSvcs(svcs);
       } catch { /* ignora */ }
     };
     refresh();
     const t = window.setInterval(refresh, 8000);
     return () => { cancelled = true; window.clearInterval(t); };
   }, [projectId]);
+
+  // Polling porte rilevate per link "Apri" (molto leggero).
+  useEffect(() => {
+    if (!projectId) { setPorts([]); return; }
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const r = await getProjectPorts(projectId);
+        if (!cancelled) setPorts(r.ports ?? []);
+      } catch { /* ignora */ }
+    };
+    refresh();
+    const t = window.setInterval(refresh, 10000);
+    return () => { cancelled = true; window.clearInterval(t); };
+  }, [projectId]);
+
+  const svcUrlFor = (svc: ProjectServiceEntry): string | null => {
+    const p =
+      ports.find(pp => pp.service === svc.short)
+      ?? ports.find(pp =>
+        (pp.label ?? "").toLowerCase().includes(svc.short.toLowerCase())
+        || (pp.label ?? "").toLowerCase().includes(svc.unit.replace(".service", "").toLowerCase())
+      );
+    return p?.url ?? null;
+  };
+
+  const handleSvcAction = async (svc: ProjectServiceEntry, action: "start" | "stop" | "restart") => {
+    if (!projectId) return;
+    const key = `${svc.unit}-${action}`;
+    setSvcBusy(p => ({ ...p, [key]: true }));
+    setSvcMsg("");
+    try {
+      const r = await controlProjectService(projectId, svc.short, action);
+      setSvcMsg(r.ok ? `${svc.short}: ${action} completato` : `${svc.short}: errore (${r.stderr || "fallito"})`);
+      // Refresh immediato per aggiornare stato/porte
+      setTimeout(async () => {
+        try {
+          const s = await getProjectServicesStatus(projectId);
+          setSystemdSvcs(s.services ?? []);
+          setSystemdShorts(new Set((s.services ?? []).map(x => x.short)));
+        } catch { /* ignore */ }
+        try {
+          const p = await getProjectPorts(projectId);
+          setPorts(p.ports ?? []);
+        } catch { /* ignore */ }
+      }, 900);
+    } catch {
+      setSvcMsg(`${svc.short}: errore di rete`);
+    } finally {
+      setSvcBusy(p => ({ ...p, [key]: false }));
+      setTimeout(() => setSvcMsg(""), 6000);
+    }
+  };
 
   const toggleCategory = (cat: Category) => {
     setCollapsed(prev => {
@@ -489,6 +555,102 @@ function RunDebugView({
 
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: 10, display: "flex", flexDirection: "column", gap: 8 }}>
         {error && <div style={{ color: tc.error, fontSize: 11, padding: "4px 0" }}>{error}</div>}
+
+        {/* Servizi (systemd) — shortcut operativi. NON lanciano npm direttamente. */}
+        {projectId && (
+          <div style={{ border: `1px solid ${tc.border}`, borderRadius: 10, background: tc.bgCard, padding: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <div style={{ fontSize: 11, fontWeight: 800, color: tc.textMuted, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                Servizi
+              </div>
+              <div style={{ fontSize: 10, color: tc.textMuted }}>
+                {systemdSvcs.length > 0 ? `${systemdSvcs.length}` : "0"}
+              </div>
+            </div>
+            {systemdSvcs.length === 0 ? (
+              <div style={{ color: tc.textMuted, fontSize: 12 }}>
+                Nessun servizio systemd installato. Usa <strong>Run &amp; Debug → + Configura</strong> per crearli.
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {systemdSvcs.map((svc) => {
+                  const url = svcUrlFor(svc);
+                  const isActive = svc.state === "active";
+                  const startBusy = !!svcBusy[`${svc.unit}-start`];
+                  const stopBusy = !!svcBusy[`${svc.unit}-stop`];
+                  const rstBusy = !!svcBusy[`${svc.unit}-restart`];
+                  const anyBusy = startBusy || stopBusy || rstBusy;
+                  return (
+                    <div key={svc.unit} style={{ border: `1px solid ${tc.border}`, borderRadius: 8, padding: "8px 10px" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <span
+                          title={`${svc.state}${svc.sub ? ` (${svc.sub})` : ""}`}
+                          style={{
+                            width: 7, height: 7, borderRadius: "50%",
+                            background: isActive ? "#22c55e" : (svc.state === "failed" ? "#ef4444" : "#6b7280"),
+                            display: "inline-block", flexShrink: 0,
+                          }}
+                        />
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                            <span style={{ fontSize: 12, fontWeight: 700, color: tc.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {svc.short}
+                            </span>
+                            <span style={{ fontSize: 10, color: tc.textMuted, fontFamily: '"JetBrains Mono", monospace' }}>
+                              {svc.state}{svc.sub ? `/${svc.sub}` : ""}
+                            </span>
+                          </div>
+                          {url && (
+                            <a
+                              href={url}
+                              target="_blank"
+                              rel="noreferrer"
+                              style={{ fontSize: 10, color: tc.accent, textDecoration: "none", fontFamily: '"JetBrains Mono", monospace' }}
+                            >
+                              {url}
+                            </a>
+                          )}
+                        </div>
+                        <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                          {!isActive && (
+                            <button
+                              onClick={() => handleSvcAction(svc, "start")}
+                              disabled={anyBusy}
+                              style={{ background: "transparent", border: `1px solid #22c55e`, color: "#22c55e", borderRadius: 6, padding: "2px 8px", fontSize: 11, cursor: anyBusy ? "wait" : "pointer", opacity: anyBusy ? 0.6 : 1 }}
+                            >
+                              {startBusy ? "…" : "start"}
+                            </button>
+                          )}
+                          {isActive && (
+                            <button
+                              onClick={() => handleSvcAction(svc, "stop")}
+                              disabled={anyBusy}
+                              style={{ background: "transparent", border: `1px solid #ef4444`, color: "#ef4444", borderRadius: 6, padding: "2px 8px", fontSize: 11, cursor: anyBusy ? "wait" : "pointer", opacity: anyBusy ? 0.6 : 1 }}
+                            >
+                              {stopBusy ? "…" : "stop"}
+                            </button>
+                          )}
+                          <button
+                            onClick={() => handleSvcAction(svc, "restart")}
+                            disabled={anyBusy}
+                            style={{ background: "transparent", border: `1px solid #f59e0b`, color: "#f59e0b", borderRadius: 6, padding: "2px 8px", fontSize: 11, cursor: anyBusy ? "wait" : "pointer", opacity: anyBusy ? 0.6 : 1 }}
+                          >
+                            {rstBusy ? "…" : "restart"}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {svcMsg && (
+              <div style={{ fontSize: 11, marginTop: 8, color: svcMsg.includes("errore") ? tc.error : "#22c55e" }}>
+                {svcMsg}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Auto-detect suggestions panel */}
         {suggestions && (

@@ -2643,6 +2643,7 @@ mod tests {
             by_intent_mode: HashMap::new(),
             default_models: HashMap::new(),
             purpose_models: HashMap::new(),
+            escalations: HashMap::new(),
             loaded_at: std::time::Instant::now(),
         };
         let thr = TokenThresholds::defaults();

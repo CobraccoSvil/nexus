@@ -11,6 +11,7 @@
     "format": "prettier --check .",
     "verify": "bash scripts/verify.sh",
     "smoke": "bash scripts/smoke-services.sh",
+    "e2e:debug-chat": "node scripts/debug-console-agent-e2e.mjs",
     "eval:prompts:smoke": "python3 evals/prompts/smoke_runner.py",
     "xtask": "cargo run -p xtask --",
     "prepare": "lefthook install || true"

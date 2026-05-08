@@ -11,6 +11,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -819,41 +820,110 @@ pub struct BulkToolResult {
     pub tools_count: usize,
 }
 
-pub async fn batch_assign_tools_handler(
-    State(state): State<AppState>,
-    Json(req): Json<Option<BulkAssignToolsReq>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+static BATCH_ASSIGN_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BATCH_ASSIGN_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Riduce drasticamente gli strumenti assegnati quando il catalogo MCP DB è grande: solo ricerca+call runtime.
+fn apply_meta_builtin_tools_substitution(
+    catalog_mcp_tools_count: usize,
+    tool_pairs: &HashSet<(String, String)>,
+    normalized: &mut Vec<serde_json::Value>,
+) {
+    if catalog_mcp_tools_count < 80 || normalized.is_empty() {
+        return;
+    }
+    let servers: HashSet<String> = tool_pairs.iter().map(|(srv, _)| srv.clone()).collect();
+    let mut meta_server: Option<String> = None;
+    for srv in servers {
+        let search_pair = (srv.clone(), "nexus_mcp_tool_search".to_string());
+        let call_pair = (srv.clone(), "nexus_mcp_tool_call".to_string());
+        if tool_pairs.contains(&search_pair) && tool_pairs.contains(&call_pair) {
+            meta_server = Some(srv);
+            break;
+        }
+    }
+    let Some(srv) = meta_server else {
+        return;
+    };
+    let usage_search = "Cerca tool MCP disponibili solo quando servono (riduce token).";
+    let usage_call = "Invoca un tool MCP specifico (server_id + tool_name).";
+    *normalized = vec![
+        serde_json::json!({
+            "tool_name": "nexus_mcp_tool_search",
+            "tool_server": srv.clone(),
+            "usage_context": usage_search,
+        }),
+        serde_json::json!({
+            "tool_name": "nexus_mcp_tool_call",
+            "tool_server": srv,
+            "usage_context": usage_call,
+        }),
+    ];
+}
+
+async fn run_batch_assign_tools_job(
+    state: AppState,
+    req: Option<BulkAssignToolsReq>,
+) -> Result<serde_json::Value, String> {
     // Carica template: per default tutti (non solo 'agent')
-    let query = if let Some(keys) = req.as_ref().and_then(|r| r.template_keys.as_ref()).filter(|k| !k.is_empty()) {
+    let query = if let Some(keys) = req
+        .as_ref()
+        .and_then(|r| r.template_keys.as_ref())
+        .filter(|k| !k.is_empty())
+    {
         sqlx::query_as::<_, (String, String, String, String)>(
-            "SELECT key, title, content, category FROM nexus_prompt_templates WHERE key = ANY($1) ORDER BY key"
+            "SELECT key, title, content, category FROM nexus_prompt_templates WHERE key = ANY($1) ORDER BY key",
         )
         .bind(keys)
         .fetch_all(&state.db)
         .await
     } else {
         sqlx::query_as::<_, (String, String, String, String)>(
-            "SELECT key, title, content, category FROM nexus_prompt_templates ORDER BY key"
+            "SELECT key, title, content, category FROM nexus_prompt_templates ORDER BY key",
         )
         .fetch_all(&state.db)
         .await
     }
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+    .map_err(|e| e.to_string())?;
 
-    let brain_url = std::env::var("NEURAL_CORE_REST_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-    let client = nexus_http::NexusClient::with_timeout(45).inner().clone();
+    let brain_url =
+        std::env::var("NEURAL_CORE_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+    let client = nexus_http::NexusClient::with_timeout(30).inner().clone();
 
-    // Lista tool disponibili (calcolata una volta sola)
-    let tools_list = nexus_builtin_tools()
-        .iter()
-        .map(|t| {
-            let desc = t.description.as_deref().unwrap_or("(no desc)");
-            let short_desc = if desc.len() > 100 { &desc[..100] } else { desc };
-            format!("- {}: {}", t.name, short_desc)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Lista compatta token-saver (stesso formato di mcp-core): `server::tool` senza descrizioni lunghe.
+    let mut tool_lines: Vec<String> = Vec::new();
+    let mut tool_by_pair: HashSet<(String, String)> = HashSet::new();
+
+    for t in nexus_builtin_tools().iter() {
+        tool_lines.push(format!("- {}::{}", t.server, t.name));
+    }
+
+    let rows = sqlx::query(
+        r#"SELECT DISTINCT
+            mcp_tools.name,
+            mcp_servers.name as server_name
+        FROM mcp_server_tools as mcp_tools
+        JOIN mcp_servers ON mcp_tools.server_id = mcp_servers.id
+        WHERE mcp_servers.enabled = true
+        ORDER BY mcp_servers.name, mcp_tools.name"#,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let catalog_mcp_tools_count = rows.len();
+
+    for row in &rows {
+        let name: String = row.get("name");
+        let server_name: String = row.get("server_name");
+        tool_by_pair.insert((server_name.clone(), name.clone()));
+        tool_lines.push(format!("- {}::{}", server_name, name));
+    }
+
+    let tools_list = tool_lines.join("\n");
+
+    const BASE_MAX: usize = 3;
+    const HARD_MAX: usize = 8;
 
     let mut results: Vec<serde_json::Value> = Vec::new();
     let mut assigned = 0usize;
@@ -861,25 +931,27 @@ pub async fn batch_assign_tools_handler(
     let mut errors = 0usize;
 
     for (key, title, content, category) in &query {
-        let content_preview: String = content.chars().take(500).collect();
+        let content_preview: String = content.chars().take(700).collect();
 
         let prompt = format!(
-            r#"Sei un esperto di configurazione agenti AI.
+            r#"Sei un esperto di configurazione tool per prompt template.
 
 TEMPLATE:
   Chiave: {key}
   Titolo: {title}
   Categoria: {category}
-  Contenuto (prime 500 chars): {content_preview}
+  Contenuto (prime 700 chars): {content_preview}
 
-TOOL DISPONIBILI (formato: - nome: descrizione):
+TOOL DISPONIBILI (formato compatto: `- server_esatto::nome_tool`; copia `tool_server` e `tool_name` esattamente così come appaiono prima di `::` e dopo):
 {tools_list}
 
-ISTRUZIONE: Seleziona 4-8 tool che questo agente userebbe FREQUENTEMENTE nei suoi task tipici.
-Criteri: includi tool pertinenti al ruolo specifico. Escludi tool non correlati al dominio.
+ISTRUZIONE:
+- Seleziona SOLO i tool indispensabili per questo template (massimo {BASE_MAX} in assenza di motivi forti).
+- Puoi superare {BASE_MAX} SOLO se aggiungi un campo usage_context non vuoto per ogni tool extra, fino a un massimo HARD di {HARD_MAX}.
+- Evita tool generici/non correlati.
 
 Rispondi con SOLO un array JSON valido, nessun testo aggiuntivo:
-[{{"tool_name":"nexus_fs_read","tool_server":"nexus_builtin"}},{{"tool_name":"nexus_git_status","tool_server":"nexus_builtin"}}]"#,
+[{{"tool_name":"read_file","tool_server":"nexus_builtin"}},{{"tool_name":"browser.navigate","tool_server":"Nexus Browser Bridge (localci)","usage_context":"navigazione E2E"}}]"#,
         );
 
         match client
@@ -899,10 +971,49 @@ Rispondi con SOLO un array JSON valido, nessun testo aggiuntivo:
                     match serde_json::from_str::<serde_json::Value>(&json_str) {
                         Ok(tools_val) if tools_val.is_array() => {
                             let Some(tools_arr) = tools_val.as_array() else { continue };
-                            let count = tools_arr.len();
+                            let mut normalized: Vec<serde_json::Value> = Vec::new();
+
+                            for (idx, item) in tools_arr.iter().enumerate() {
+                                let Some(obj) = item.as_object() else { continue };
+                                let tool_name = obj.get("tool_name").and_then(|v| v.as_str()).unwrap_or("").trim();
+                                let tool_server = obj.get("tool_server").and_then(|v| v.as_str()).unwrap_or("").trim();
+                                if tool_name.is_empty() || tool_server.is_empty() {
+                                    continue;
+                                }
+                                let usage_context = obj
+                                    .get("usage_context")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty());
+
+                                // Cap logic: allow beyond BASE_MAX only with usage_context
+                                if idx < BASE_MAX {
+                                    normalized.push(serde_json::json!({
+                                        "tool_name": tool_name,
+                                        "tool_server": tool_server,
+                                    }));
+                                } else if normalized.len() < HARD_MAX {
+                                    if let Some(uc) = usage_context {
+                                        normalized.push(serde_json::json!({
+                                            "tool_name": tool_name,
+                                            "tool_server": tool_server,
+                                            "usage_context": uc,
+                                        }));
+                                    }
+                                }
+                            }
+
+                            apply_meta_builtin_tools_substitution(
+                                catalog_mcp_tools_count,
+                                &tool_by_pair,
+                                &mut normalized,
+                            );
+
+                            let count = normalized.len();
                             if count > 0 {
+                                let tools_val = serde_json::Value::Array(normalized);
                                 let _ = sqlx::query(
-                                    "UPDATE nexus_prompt_templates SET mcp_tools_json = $1, updated_at = NOW() WHERE key = $2"
+                                    "UPDATE nexus_prompt_templates SET mcp_tools_json = $1, updated_at = NOW() WHERE key = $2",
                                 )
                                 .bind(&tools_val)
                                 .bind(key)
@@ -917,7 +1028,7 @@ Rispondi con SOLO un array JSON valido, nessun testo aggiuntivo:
                         }
                         _ => {
                             errors += 1;
-                            results.push(serde_json::json!({"key": key, "status": "parse_error", "raw": &json_str[..json_str.len().min(100)]}));
+                            results.push(serde_json::json!({"key": key, "status": "parse_error", "raw": &json_str[..json_str.len().min(120)]}));
                         }
                     }
                 } else {
@@ -932,12 +1043,61 @@ Rispondi con SOLO un array JSON valido, nessun testo aggiuntivo:
         }
     }
 
-    Ok(Json(serde_json::json!({
+    Ok(serde_json::json!({
         "status": "completed",
         "processed": query.len(),
         "assigned": assigned,
         "skipped": skipped,
         "errors": errors,
         "results": results,
-    })))
+        "base_max_tools_per_template": BASE_MAX,
+        "hard_max_tools_per_template": HARD_MAX,
+    }))
+}
+
+pub async fn batch_assign_tools_handler(
+    State(state): State<AppState>,
+    Json(req): Json<Option<BulkAssignToolsReq>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Modalità asincrona (non blocca UI): esegui in background con debounce.
+    if BATCH_ASSIGN_RUNNING
+        .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+        .is_ok()
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            let _ = run_batch_assign_tools_job(state_clone, req).await;
+            BATCH_ASSIGN_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+
+            // Se nel frattempo è arrivata un'altra richiesta, riesegui una volta.
+            if BATCH_ASSIGN_PENDING.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                if BATCH_ASSIGN_RUNNING
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok()
+                {
+                    let state_clone2 = state.clone();
+                    tokio::spawn(async move {
+                        let _ = run_batch_assign_tools_job(state_clone2, None).await;
+                        BATCH_ASSIGN_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                    });
+                }
+            }
+        });
+
+        Ok(Json(serde_json::json!({
+            "status": "queued",
+            "message": "Assegnazione tool avviata in background.",
+        })))
+    } else {
+        BATCH_ASSIGN_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(Json(serde_json::json!({
+            "status": "queued",
+            "message": "Assegnazione tool già in corso: richiesta accodata.",
+        })))
+    }
 }

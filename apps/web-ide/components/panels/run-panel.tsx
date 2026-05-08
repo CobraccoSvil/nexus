@@ -101,7 +101,13 @@ interface WizardInstallModalProps {
 }
 
 function WizardInstallModal({ svc, onInstall, onCancel, tc }: WizardInstallModalProps) {
-  const [env, setEnv] = useState("");
+  const [env, setEnv] = useState(() => {
+    const obj = (svc.env ?? {}) as Record<string, string>;
+    const lines = Object.entries(obj)
+      .filter(([k, v]) => k && v != null && String(v).length > 0)
+      .map(([k, v]) => `${k}=${v}`);
+    return lines.join("\n");
+  });
   const [desc, setDesc] = useState(svc.label);
   const [saving, setSaving] = useState(false);
 
@@ -130,8 +136,8 @@ function WizardInstallModal({ svc, onInstall, onCancel, tc }: WizardInstallModal
         </div>
         <label style={{ fontSize:11,color:tc.textMuted }}>Descrizione</label>
         <input style={inp} value={desc} onChange={e=>setDesc(e.target.value)} />
-        <label style={{ fontSize:11,color:tc.textMuted }}>Variabili ambiente extra (KEY=VALUE, una per riga)</label>
-        <textarea style={{ ...inp,height:64,resize:"vertical" }} value={env} onChange={e=>setEnv(e.target.value)} placeholder="PORT=3001" />
+        <label style={{ fontSize:11,color:tc.textMuted }}>Variabili ambiente (KEY=VALUE, una per riga)</label>
+        <textarea style={{ ...inp,height:64,resize:"vertical" }} value={env} onChange={e=>setEnv(e.target.value)} placeholder="PORT=20000" />
         <div style={{ fontSize:10,color:tc.textMuted }}>
           Verrà creato <code>~/.config/systemd/user/{svc.unit}</code> e abilitato con systemctl --user enable.
         </div>
