@@ -465,6 +465,11 @@ pub async fn update_setting(
         Err(e) => return Json(serde_json::json!({ "status": "error", "error": e.to_string() })),
     };
 
+    // Invalida cache DLP se è cambiata una chiave di configurazione DLP
+    if matches!(key.as_str(), "dlp_enabled" | "dlp_allow_cloud_tier2" | "dlp_allow_cloud_tier3") {
+        crate::dlp::invalidate_dlp_cache();
+    }
+
     // Propaga impostazioni di connessione come variabili d'ambiente di processo
     // (effetto immediato per tutti i nuovi client nexus-http, no riavvio)
     match key.as_str() {
@@ -521,6 +526,15 @@ pub async fn bulk_update(
             Ok(_) => updated += 1,
             Err(e) => errors.push(format!("{}: {}", entry.key, e)),
         }
+    }
+
+    // Se sono state cambiate chiavi DLP, invalida la cache in-process
+    let has_dlp_key = body
+        .settings
+        .iter()
+        .any(|e| matches!(e.key.as_str(), "dlp_enabled" | "dlp_allow_cloud_tier2" | "dlp_allow_cloud_tier3"));
+    if has_dlp_key {
+        crate::dlp::invalidate_dlp_cache();
     }
 
     // Se è stata salvata almeno una API key, ricarica automaticamente le chiavi nel brain

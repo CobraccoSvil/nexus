@@ -1999,6 +1999,53 @@ pub async fn send_chat_message(
         }
     }
 
+    // ── DLP check (Nexus Sicurezza & Privacy) ────────────────────────────────
+    // Classifica la sensibilità del contenuto utente prima di inviarlo al brain.
+    // Eseguito qui — prima sia di spawn_agent_run sia di run_turn — così copre
+    // tutti i percorsi (modalità agente + studio + fallback).
+    {
+        let tier = crate::dlp::classify_sensitivity(content);
+        if tier >= crate::dlp::SensitivityTier::Sensitive {
+            let check_provider = effective_provider_override.as_deref().unwrap_or("anthropic");
+            if let Some(dlp_msg) = crate::dlp::check_dlp_policy_db(check_provider, tier, &state.db).await {
+                if dlp_msg.contains("DLP Block") {
+                    // Salva il messaggio di errore come risposta assistant in DB
+                    // così l'utente vede il motivo del blocco nell'interfaccia.
+                    let err_id = insert_message(
+                        &state.db,
+                        context.session_id,
+                        context.project_id,
+                        "assistant",
+                        &dlp_msg,
+                        json!({
+                            "provider": "system",
+                            "model": "dlp",
+                            "intent": "dlp_block",
+                        }),
+                        Some(user_message_id),
+                    )
+                    .await
+                    .ok();
+                    if let Some(err_msg_id) = err_id {
+                        if let Ok(err_row) = load_message_by_id(&state.db, err_msg_id).await {
+                            if let Ok(err_msg) = to_message_view(&err_row) {
+                                return Ok(Json(json!({
+                                    "sessionId": context.session_id.to_string(),
+                                    "userMessage": user_message,
+                                    "assistantMessage": err_msg,
+                                    "dlpBlocked": true,
+                                })));
+                            }
+                        }
+                    }
+                    return Err(api_error(StatusCode::FORBIDDEN, dlp_msg));
+                } else {
+                    tracing::warn!("DLP: {}", dlp_msg);
+                }
+            }
+        }
+    }
+
     // ── Modalita' agente: dispatcha al loop agente invece del singolo turn ──
     if automation_mode != AutomationMode::Study {
         if let Some(result) = spawn_agent_run(&state, SpawnAgentParams {

@@ -1165,14 +1165,39 @@ pub async fn admin_list_vector_compaction_runs(
     Ok(Json(json!({ "runs": runs })))
 }
 
+/// Parsa il cron expression letto da DB e restituisce (hour, minute).
+/// Formato atteso: "MIN HOUR * * *" (es. "0 2 * * *").
+/// Fallback: (2, 0) ovvero 02:00.
+fn parse_compaction_cron(cron: &str) -> (u32, u32) {
+    let parts: Vec<&str> = cron.split_whitespace().collect();
+    if parts.len() >= 2 {
+        let minute = parts[0].parse::<u32>().unwrap_or(0).min(59);
+        let hour = parts[1].parse::<u32>().unwrap_or(2).min(23);
+        return (hour, minute);
+    }
+    (2, 0)
+}
+
 pub fn spawn_vector_compaction_scheduler(state: AppState) {
     tokio::spawn(async move {
         loop {
+            // Legge il cron dalla setting DB ad ogni iterazione (permette hot-reload).
+            let cron_str = sqlx::query_scalar::<_, String>(
+                "SELECT value FROM settings WHERE key = 'vector_compaction_schedule_cron'",
+            )
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "0 2 * * *".to_string());
+
+            let (hour, minute) = parse_compaction_cron(&cron_str);
+
             let now = Local::now();
             let today = now.date_naive();
             let mut next = today
-                .and_hms_opt(2, 0, 0)
-                .unwrap_or_else(|| today.and_hms_milli_opt(2, 0, 0, 0).expect("valid 02:00"));
+                .and_hms_opt(hour, minute, 0)
+                .unwrap_or_else(|| today.and_hms_milli_opt(hour, minute, 0, 0).expect("valid time"));
 
             if now.naive_local() >= next {
                 next += chrono::Duration::days(1);
@@ -1181,6 +1206,12 @@ pub fn spawn_vector_compaction_scheduler(state: AppState) {
             let wait = (next - now.naive_local())
                 .to_std()
                 .unwrap_or_else(|_| Duration::from_secs(60 * 60));
+
+            tracing::info!(
+                "vector_compaction_scheduler: prossima run alle {:02}:{:02} (cron='{}', wait={:.0}min)",
+                hour, minute, cron_str,
+                wait.as_secs_f64() / 60.0
+            );
             tokio::time::sleep(wait).await;
 
             // Guard: se Qdrant e' down, skip compaction (il watchdog la marcherebbe comunque stale)
@@ -1191,4 +1222,209 @@ pub fn spawn_vector_compaction_scheduler(state: AppState) {
             let _ = run_vector_compaction(&state.db, None, "scheduled", None).await;
         }
     });
+}
+
+// ─── Admin: Prompt Corrections ────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct CreatePromptCorrectionBody {
+    /// Testo della correzione (es. "Quando l'utente chiede X, intende Y").
+    pub text: String,
+    /// Intent associato (opzionale, es. "code_edit").
+    pub intent: Option<String>,
+    /// Progetto di appartenenza (opzionale — se assente usa un progetto globale).
+    pub project_id: Option<Uuid>,
+}
+
+/// POST /api/admin/prompt-corrections
+/// Inserisce una correzione prompt in PostgreSQL e in Qdrant.
+pub async fn admin_create_prompt_correction(
+    State(state): State<AppState>,
+    Extension(_claims): Extension<Claims>,
+    Json(body): Json<CreatePromptCorrectionBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let text = body.text.trim().to_string();
+    if text.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "il campo 'text' non può essere vuoto"})),
+        ));
+    }
+
+    // Usa il progetto fornito o il primo disponibile come scope globale.
+    let project_id: Uuid = match body.project_id {
+        Some(id) => id,
+        None => {
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects ORDER BY created_at ASC LIMIT 1")
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("DB error: {e}")})),
+                    )
+                })?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": "nessun progetto trovato — specificare project_id"})),
+                    )
+                })?
+        }
+    };
+
+    // Genera embedding tramite l'orchestrator.
+    let embedding = state
+        .orchestrator
+        .embed_text(&text)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("embedding fallito: {e}")})),
+            )
+        })?;
+
+    // Hash per deduplicazione.
+    let hash = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(text.as_bytes());
+        format!("{:x}", h.finalize())[..16].to_string()
+    };
+
+    let point_id = Uuid::new_v4().to_string();
+    let intent = body.intent.clone().unwrap_or_else(|| "general".to_string());
+
+    let payload = json!({
+        "correction_id": point_id,
+        "text": text,
+        "intent": intent,
+        "project_id": project_id.to_string(),
+    });
+
+    vector_memory::upsert_prompt_correction_point(
+        &state.db,
+        &point_id,
+        &embedding,
+        payload,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("upsert Qdrant fallito: {e}")})),
+        )
+    })?;
+
+    // Persiste in PostgreSQL.
+    let correction_id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO prompt_corrections
+            (project_id, intent, correction_text, normalized_hint_hash, qdrant_point_id, active, status)
+        VALUES ($1, $2, $3, $4, $5, true, 'open')
+        ON CONFLICT (qdrant_point_id) DO UPDATE
+            SET correction_text = EXCLUDED.correction_text,
+                updated_at = NOW()
+        RETURNING id
+        "#,
+    )
+    .bind(project_id)
+    .bind(&intent)
+    .bind(&text)
+    .bind(&hash)
+    .bind(&point_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("DB insert fallito: {e}")})),
+        )
+    })?;
+
+    Ok(Json(json!({
+        "id": correction_id.to_string(),
+        "qdrant_point_id": point_id,
+        "intent": intent,
+        "project_id": project_id.to_string(),
+        "text": text,
+        "active": true,
+    })))
+}
+
+/// GET /api/admin/prompt-corrections
+/// Lista le correzioni attive.
+pub async fn admin_list_prompt_corrections(
+    State(state): State<AppState>,
+    Extension(_claims): Extension<Claims>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT id, project_id, intent, correction_text, qdrant_point_id,
+               active, status, retrieved_count, created_at
+        FROM prompt_corrections
+        WHERE deleted_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 100
+        "#
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("DB error: {e}")})),
+        )
+    })?;
+
+    let corrections: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.id.to_string(),
+                "projectId": r.project_id.to_string(),
+                "intent": r.intent,
+                "text": r.correction_text,
+                "qdrantPointId": r.qdrant_point_id,
+                "active": r.active,
+                "status": r.status,
+                "retrievedCount": r.retrieved_count,
+                "createdAt": r.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({"corrections": corrections, "total": corrections.len()})))
+}
+
+/// DELETE /api/admin/prompt-corrections/:id
+/// Soft-delete di una correzione (marca deleted_at e disabilita).
+pub async fn admin_delete_prompt_correction(
+    State(state): State<AppState>,
+    Extension(_claims): Extension<Claims>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let affected = sqlx::query(
+        "UPDATE prompt_corrections SET deleted_at = NOW(), active = false, updated_at = NOW() WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("DB error: {e}")})),
+        )
+    })?
+    .rows_affected();
+
+    if affected == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "correzione non trovata"})),
+        ));
+    }
+
+    Ok(Json(json!({"deleted": true, "id": id.to_string()})))
 }

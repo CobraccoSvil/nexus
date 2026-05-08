@@ -1,8 +1,127 @@
 //! Data Loss Prevention: classificazione sensibilità testo e policy routing.
 //!
-//! Estratto da `agent_loop.rs` durante la Fase 4 del refactor Nexus. Tipi e
-//! funzioni restano invariati; il loop agente vero e proprio e' ora nel
-//! brain LangGraph (Python).
+//! Estratto da `agent_loop.rs` durante la Fase 4 del refactor Nexus.
+//! I settings DLP vengono letti dal DB (`settings` table) con cache 60s.
+//! Nessuna lettura di variabili d'ambiente a runtime: la configurazione
+//! viene gestita tramite Admin → Sicurezza → DLP (chiavi dlp_enabled,
+//! dlp_allow_cloud_tier2, dlp_allow_cloud_tier3).
+
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+use sqlx::PgPool;
+use tracing::{debug, warn};
+
+const DLP_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Configurazione DLP caricata dal DB con timestamp per il refresh.
+#[derive(Clone, Debug)]
+struct DlpConfigCache {
+    enabled: bool,
+    allow_cloud_tier2: bool,
+    allow_cloud_tier3: bool,
+    loaded_at: Instant,
+}
+
+impl DlpConfigCache {
+    /// Valori predefiniti conservativi: DLP attivo, Tier 2 permesso, Tier 3 bloccato.
+    fn default_conservative() -> Self {
+        Self {
+            enabled: true,
+            allow_cloud_tier2: true,
+            allow_cloud_tier3: false,
+            loaded_at: Instant::now() - DLP_REFRESH_INTERVAL * 2, // forza reload immediato
+        }
+    }
+
+    fn is_stale(&self) -> bool {
+        self.loaded_at.elapsed() >= DLP_REFRESH_INTERVAL
+    }
+}
+
+static DLP_CACHE: OnceLock<Mutex<DlpConfigCache>> = OnceLock::new();
+
+fn get_cache() -> &'static Mutex<DlpConfigCache> {
+    DLP_CACHE.get_or_init(|| Mutex::new(DlpConfigCache::default_conservative()))
+}
+
+/// Carica i 3 parametri DLP dalla tabella `settings`.
+/// In caso di errore DB usa i valori conservativi (DLP attivo, Tier 3 bloccato).
+async fn fetch_dlp_config_from_db(db: &PgPool) -> DlpConfigCache {
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT key, value FROM settings WHERE key IN ('dlp_enabled', 'dlp_allow_cloud_tier2', 'dlp_allow_cloud_tier3')",
+    )
+    .fetch_all(db)
+    .await;
+
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("DLP: impossibile caricare config dal DB ({}). Uso valori conservativi.", e);
+            return DlpConfigCache {
+                enabled: true,
+                allow_cloud_tier2: true,
+                allow_cloud_tier3: false,
+                loaded_at: Instant::now(),
+            };
+        }
+    };
+
+    let mut enabled = true;
+    let mut allow_tier2 = true;
+    let mut allow_tier3 = false;
+
+    for (key, value) in rows {
+        let v = value.trim().to_lowercase();
+        match key.as_str() {
+            "dlp_enabled" => enabled = v != "false",
+            "dlp_allow_cloud_tier2" => allow_tier2 = v != "false",
+            "dlp_allow_cloud_tier3" => allow_tier3 = v == "true",
+            _ => {}
+        }
+    }
+
+    DlpConfigCache { enabled, allow_cloud_tier2: allow_tier2, allow_cloud_tier3: allow_tier3, loaded_at: Instant::now() }
+}
+
+/// Invalida la cache DLP: il prossimo check ricaricherà dal DB.
+/// Chiamato da `settings.rs` dopo il salvataggio di una chiave DLP.
+pub fn invalidate_dlp_cache() {
+    if let Some(mutex) = DLP_CACHE.get() {
+        // try_lock per non bloccare mai — se il lock è preso da un check concorrente
+        // il reload avverrà comunque entro 60s.
+        if let Ok(mut guard) = mutex.try_lock() {
+            guard.loaded_at = Instant::now() - DLP_REFRESH_INTERVAL * 2;
+            debug!("DLP: cache invalidata, prossimo check ricarica dal DB");
+        }
+    }
+}
+
+/// Verifica la policy DLP leggendo la configurazione dal DB (cache 60s).
+/// Ritorna `None` se il provider/tier sono compatibili, `Some(msg)` se c'è
+/// un blocco o un avviso.
+///
+/// Il caller decide come gestire `Some`:
+/// - Messaggio contenente "DLP Block" → ritornare errore 403
+/// - Messaggio contenente "DLP Warning"/"DLP Notice" → loggare e proseguire
+pub async fn check_dlp_policy_db(provider: &str, tier: SensitivityTier, db: &PgPool) -> Option<String> {
+    let cache = get_cache();
+    let config = {
+        let guard = cache.lock().await;
+        if !guard.is_stale() {
+            // Cache valida: clona e rilascia subito il lock
+            guard.clone()
+        } else {
+            drop(guard);
+            let fresh = fetch_dlp_config_from_db(db).await;
+            let mut guard = cache.lock().await;
+            *guard = fresh.clone();
+            fresh
+        }
+    };
+
+    check_dlp_policy_with_config(provider, tier, config.enabled, config.allow_cloud_tier2, config.allow_cloud_tier3)
+}
 
 /// Tier di sensibilità dei dati inviati al provider LLM.
 /// Usato per applicare policy di routing: tier alto = solo provider locale.
@@ -94,73 +213,8 @@ pub fn classify_sensitivity(text: &str) -> SensitivityTier {
     SensitivityTier::Public
 }
 
-/// Determina se il provider scelto è compatibile con il tier di sensibilità.
-/// Rispetta le env var `NEXUS_DLP_ENABLED`, `NEXUS_ALLOW_CLOUD_TIER2`, `NEXUS_ALLOW_CLOUD_TIER3`.
-/// Ritorna None se compatibile, Some(warning_message) se incompatibile o con avviso.
-#[allow(dead_code)]
-pub fn check_dlp_policy(provider: &str, tier: SensitivityTier) -> Option<String> {
-    let dlp_enabled = std::env::var("NEXUS_DLP_ENABLED")
-        .map(|v| v.trim().to_lowercase() != "false")
-        .unwrap_or(true);
-
-    if !dlp_enabled {
-        return None; // DLP disabilitato, nessun controllo
-    }
-
-    // Provider locali/EU non hanno restrizioni
-    let is_local_or_eu = matches!(provider.to_lowercase().as_str(), "ollama" | "mistral" | "onprem");
-    if is_local_or_eu {
-        return None;
-    }
-
-    // Provider cloud (openai, anthropic, google, deepseek)
-    match tier {
-        SensitivityTier::Critical => {
-            let allow_tier3 = std::env::var("NEXUS_ALLOW_CLOUD_TIER3")
-                .map(|v| v.trim().to_lowercase() == "true")
-                .unwrap_or(false);
-            if !allow_tier3 {
-                Some(format!(
-                    "DLP Block: il messaggio contiene dati critici (Tier 3: chiavi API, password, PII) \
-che non possono essere inviati a **{}** (provider cloud). \
-Usa un modello locale (Ollama) o rimuovi i dati sensibili. \
-Puoi abilitare il bypass impostando `NEXUS_ALLOW_CLOUD_TIER3=true` (sconsigliato).",
-                    provider
-                ))
-            } else {
-                Some(format!(
-                    "DLP Warning: il messaggio contiene dati critici (Tier 3) inviati a **{}** \
-— NEXUS_ALLOW_CLOUD_TIER3=true è attivo ma sconsigliato.",
-                    provider
-                ))
-            }
-        }
-        SensitivityTier::Sensitive => {
-            let allow_tier2 = std::env::var("NEXUS_ALLOW_CLOUD_TIER2")
-                .map(|v| v.trim().to_lowercase() != "false")
-                .unwrap_or(true);
-            if !allow_tier2 {
-                Some(format!(
-                    "DLP Block: il messaggio contiene dati sensibili (Tier 2: email, credenziali env) \
-che non possono essere inviati a **{}**. \
-Imposta `NEXUS_ALLOW_CLOUD_TIER2=true` per abilitare oppure usa Ollama.",
-                    provider
-                ))
-            } else {
-                Some(format!(
-                    "DLP Notice: il messaggio contiene dati sensibili (Tier 2) inviati a **{}** \
-— assicurati che sia intenzionale.",
-                    provider
-                ))
-            }
-        }
-        _ => None, // Tier 0-1: nessun problema
-    }
-}
-
-/// Versione di check_dlp_policy con configurazione dal DB (override rispetto alle env var).
-/// Usata dai chiamanti che caricano i settings DLP dal database.
-#[allow(dead_code)]
+/// Verifica la policy DLP con configurazione esplicita (bool).
+/// Funzione core usata da `check_dlp_policy_db` dopo il caricamento della cache.
 pub fn check_dlp_policy_with_config(
     provider: &str,
     tier: SensitivityTier,

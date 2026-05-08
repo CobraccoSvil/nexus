@@ -8,6 +8,7 @@ from typing import Any, AsyncIterator
 from .base import BaseProvider, ProviderCatalogEntry, ProviderResult
 from .error_handler import format_error_result
 from .openai_provider import _anthropic_tool_to_openai, _convert_messages_to_openai
+from ._schema_utils import compress_tool_list
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +116,8 @@ class DeepSeekProvider(BaseProvider):
 
             # deepseek-reasoner non supporta tool calling
             supports_tools = model != "deepseek-reasoner"
-            oai_tools = [_anthropic_tool_to_openai(t) for t in tools] if tools and supports_tools else []
+            compressed = compress_tool_list(tools) if tools and supports_tools else []
+            oai_tools = [_anthropic_tool_to_openai(t) for t in compressed] if compressed else []
 
             kwargs_call: dict[str, Any] = {
                 "model": model,

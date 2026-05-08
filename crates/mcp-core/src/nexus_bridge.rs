@@ -283,7 +283,48 @@ impl NexusBridge {
         //   CleanupWorker, SessionPersistenceWorker, QLearningReplayWorker,
         //   ReplicationWorker, ClusteringWorker
         let scheduler = Arc::new(LearningScheduler::new());
-        scheduler.register(Arc::new(UltralearnWorker::new()));
+
+        // Legge learning_auto_extract e learning_min_confidence dal DB (se disponibile).
+        // auto_extract=false disabilita UltralearnWorker; min_confidence sovrascrive la soglia.
+        let (auto_extract, min_confidence): (bool, f32) = if let Some(ref p) = pool {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let auto = sqlx::query_scalar::<_, String>(
+                        "SELECT value FROM settings WHERE key = 'learning_auto_extract'",
+                    )
+                    .fetch_optional(p.as_ref())
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|v| !v.trim().eq_ignore_ascii_case("false"))
+                    .unwrap_or(true);
+
+                    let conf = sqlx::query_scalar::<_, String>(
+                        "SELECT value FROM settings WHERE key = 'learning_min_confidence'",
+                    )
+                    .fetch_optional(p.as_ref())
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+                    .unwrap_or(0.5);
+
+                    (auto, conf)
+                })
+            })
+        } else {
+            (true, 0.5)
+        };
+
+        if auto_extract {
+            scheduler.register(Arc::new(UltralearnWorker::new().with_min_quality(min_confidence)));
+            info!(
+                "UltralearnWorker registrato: auto_extract=true, min_confidence={:.2}",
+                min_confidence
+            );
+        } else {
+            info!("UltralearnWorker disabilitato: learning_auto_extract=false");
+        }
         scheduler.register(Arc::new(AuditWorker::new()));
         scheduler.register(Arc::new(MetricsAggregationWorker::new()));
         scheduler.register(Arc::new(VersioningWorker::new()));

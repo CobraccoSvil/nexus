@@ -1730,6 +1730,22 @@ async fn main() -> anyhow::Result<()> {
                     axum_mw::from_fn_with_state(state.clone(), middleware::require_admin),
                 ),
             )
+            // Prompt corrections (prompt_corrections Qdrant + Postgres)
+            .route(
+                "/api/admin/prompt-corrections",
+                get(chat_learning::admin_list_prompt_corrections)
+                    .post(chat_learning::admin_create_prompt_correction)
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_admin,
+                    )),
+            )
+            .route(
+                "/api/admin/prompt-corrections/:id",
+                delete(chat_learning::admin_delete_prompt_correction).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_admin),
+                ),
+            )
             // Long-running patterns CRUD
             .route(
                 "/api/admin/long-running",
