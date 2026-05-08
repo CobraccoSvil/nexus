@@ -97,6 +97,12 @@ pub struct RoutingDecideRequest {
     /// Identifier del profilo agente (analogo a project_id, riservato).
     #[serde(default)]
     pub profile_id: Option<String>,
+    /// Modalita' di routing scelta dall'utente per questa sessione/chat.
+    /// Sovrascrive il `nexus_behavior_mode` globale DB per questa singola richiesta.
+    /// Valori accettati: "veloce" | "economica" | "bilanciata" | "approfondita" | "dinamico" | "manuale".
+    /// Se assente o stringa vuota, si usa il valore DB globale come fallback.
+    #[serde(default)]
+    pub behavior_mode: Option<String>,
 }
 
 /// Handler `POST /api/internal/routing/decide`.
@@ -126,6 +132,7 @@ pub async fn decide_routing(
             body.provider_override.as_deref(),
             body.model_override.as_deref(),
             body.context_message_count,
+            body.behavior_mode.as_deref().filter(|v| !v.trim().is_empty()),
         )
         .await;
     // Se nessun provider e' utilizzabile, ritorna 503 ma comunque con il body
@@ -160,6 +167,7 @@ pub async fn decide_routing_get(
         .orchestrator
         .resolve_agent_provider_detailed(
             &state.db, "", "", &q.message, None, None, 0,
+            q.mode.as_deref().filter(|v| !v.trim().is_empty()),
         )
         .await;
     (StatusCode::OK, Json(result)).into_response()

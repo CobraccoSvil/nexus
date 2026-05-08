@@ -1353,6 +1353,9 @@ impl Orchestrator {
         provider_override: Option<&str>,
         model_override: Option<&str>,
         context_message_count: usize,
+        // Modalita' scelta per la singola sessione (es. dal dropdown chat).
+        // Se `Some`, sovrascrive `nexus_behavior_mode` DB solo per questa chiamata.
+        behavior_mode_session: Option<&str>,
     ) -> RoutingResolveResult {
         // Snapshot della routing matrix DB (cache 60s, lock-free clone Arc).
         // Se la matrice non e' caricata (DB down all'avvio), ritorniamo
@@ -1380,15 +1383,21 @@ impl Orchestrator {
             }
         };
         let matrix = &*matrix_arc;
+        // Risolve il behavior_mode effettivo: sessione > DB globale.
+        // Caricato prima di resolve_agent_provider per passarlo coerentemente.
+        let routing_for_mode = Self::load_routing_config(db).await.unwrap_or_default();
+        let configured_behavior_mode = behavior_mode_session
+            .filter(|v| !v.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| routing_for_mode.behavior_mode.clone());
+
         let (provider, model) = self
-            .resolve_agent_provider(db, _project_id, _profile_id, message, provider_override, model_override, context_message_count)
+            .resolve_agent_provider(db, _project_id, _profile_id, message, provider_override, model_override, context_message_count, Some(&configured_behavior_mode))
             .await;
         // Riclassifica via classifier LLM (gemini-flash, cache 24h) con fallback
         // keyword + promozione agentic. Vedi `classify_intent_async`.
         let (intent, confidence) = self.classify_intent_with_db_thresholds(message).await;
-        let routing = Self::load_routing_config(db).await.unwrap_or_default();
         let risky = is_risky_task(message);
-        let configured_behavior_mode = routing.behavior_mode.clone();
         let effective_mode = if risky && configured_behavior_mode != "approfondita" {
             "approfondita".to_string()
         } else if configured_behavior_mode == "dinamico" {
@@ -1508,6 +1517,9 @@ impl Orchestrator {
         provider_override: Option<&str>,
         model_override: Option<&str>,
         context_message_count: usize,
+        // Override del behavior_mode per questa singola chiamata (sessione utente).
+        // Se `Some`, sostituisce `routing.behavior_mode` letto dal DB.
+        behavior_mode_override: Option<&str>,
     ) -> (String, String) {
         // Snapshot della routing matrix DB (cache 60s, await sul lock se busy).
         // Se la matrice non e' caricata (caso impossibile dopo init() che ha
@@ -1542,8 +1554,13 @@ impl Orchestrator {
         let context_bonus = ((context_message_count / 10) as u32 * 1_000).min(6_000);
         let estimated_tokens = base_estimated.saturating_add(context_bonus);
         let (intent, _confidence) = self.classify_intent_with_db_thresholds(message).await;
-        // La RoutingConfig admin può sovrascrivere il modello per provider
+        // La RoutingConfig admin può sovrascrivere il modello per provider.
+        // Il behavior_mode effettivo: override sessione > DB globale.
         let routing = Self::load_routing_config(db).await.unwrap_or_default();
+        let effective_behavior_mode: String = behavior_mode_override
+            .filter(|v| !v.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| routing.behavior_mode.clone());
         // Task rischioso ha PRIORITA' assoluta: salta il ramo dinamico (catalogo
         // prezzi sceglie modelli "light" per costo, ma per task distruttivi
         // serve un modello capable). L'override mode -> approfondita applicato
@@ -1558,7 +1575,7 @@ impl Orchestrator {
         // Saltiamo candidates() e provider_models perché altrimenti riordinano sempre
         // sui provider configurati nell'admin (anthropic/openai prima) e applicano
         // il provider_model_<x> override → risultato: il dinamico non sceglie mai nulla.
-        if routing.behavior_mode == "dinamico" && !risky_pre {
+        if effective_behavior_mode == "dinamico" && !risky_pre {
             // Risolvi tier/capability dalla cache intent_capability (mig 0110)
             // invece dal match Rust statico (rimosso). Se intent non mappato,
             // default light/chat (caso tipico di intent legacy non in seed).
@@ -1601,16 +1618,16 @@ impl Orchestrator {
         // i modelli leggeri (mistral-small, gpt-4.1-nano) tendono a interpretare
         // liberamente le richieste distruttive (es. "elimina file Docker" ->
         // ricrea i file). Per task ad alto impatto serve un modello capable.
-        let effective_mode = if is_risky_task(message) && routing.behavior_mode != "approfondita" {
+        let effective_mode = if is_risky_task(message) && effective_behavior_mode != "approfondita" {
             tracing::info!(
                 "Agent routing: task rischioso rilevato (mode {} -> approfondita)",
-                routing.behavior_mode
+                effective_behavior_mode
             );
             "approfondita"
-        } else if routing.behavior_mode == "dinamico" {
+        } else if effective_behavior_mode == "dinamico" {
             "bilanciata"
         } else {
-            routing.behavior_mode.as_str()
+            effective_behavior_mode.as_str()
         };
 
         let (pref_provider, thresholds) = self.routing_helpers_for(intent).await;

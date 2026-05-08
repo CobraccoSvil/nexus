@@ -1089,6 +1089,7 @@ async fn spawn_agent_run(
             effective_override.as_deref(),
             effective_model_override.as_deref(),
             context_message_count,
+            None, // behavior_mode_session: nessun override per il pre-check routing
         )
         .await;
 
