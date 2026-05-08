@@ -177,7 +177,7 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
     }
     match tokio::fs::write(&target, content).await {
         Ok(()) => {
-            // Re-indicizza il file nel code index in background
+            // Re-indicizza il file nel code index + eventuale auto-scan qualità (in background)
             let db_bg = ctx.db.clone();
             let neural_bg = ctx.neural.clone();
             let project_id_bg = ctx.project_id;
@@ -185,6 +185,7 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
             let target_bg = target.clone();
             tokio::spawn(async move {
                 let _ = crate::projects::reindex_single_file(&db_bg, &neural_bg, project_id_bg, &root_bg, &target_bg).await;
+                crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &target_bg).await;
             });
             format!("File '{}' scritto con successo ({} byte)", path_str, content.len())
         }
@@ -469,7 +470,7 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
             };
             match tokio::fs::write(&target, &new_content).await {
                 Ok(()) => {
-                    // Re-indicizza il file nel code index in background
+                    // Re-indicizza il file nel code index + eventuale auto-scan qualità (in background)
                     let db_bg = ctx.db.clone();
                     let neural_bg = ctx.neural.clone();
                     let project_id_bg = ctx.project_id;
@@ -477,6 +478,7 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
                     let target_bg = target.clone();
                     tokio::spawn(async move {
                         let _ = crate::projects::reindex_single_file(&db_bg, &neural_bg, project_id_bg, &root_bg, &target_bg).await;
+                        crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &target_bg).await;
                     });
                     format!(
                         "File '{}' modificato con successo ({} byte → {} byte)",
