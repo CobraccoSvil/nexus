@@ -148,9 +148,29 @@ async fn check_frontend_process() -> EnvironmentCheck {
 }
 
 async fn check_migrations(db_url: &str) -> EnvironmentCheck {
+    // Risolve il path di sqlx-cli: prima il path esplicito, poi cerca nel PATH via `which`.
+    let sqlx_path = if std::path::Path::new("/home/administrator/.cargo/bin/sqlx").exists() {
+        "/home/administrator/.cargo/bin/sqlx".to_string()
+    } else {
+        let which_out = Command::new("which").arg("sqlx").output().await;
+        match which_out {
+            Ok(o) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            }
+            _ => {
+                // sqlx-cli non installato: id dedicato per mostrare il pulsante di installazione
+                return EnvironmentCheck::warn(
+                    "migrations_sqlx_missing",
+                    "DB Migrations",
+                    "sqlx-cli non installato",
+                );
+            }
+        }
+    };
+
     let result = timeout(
         Duration::from_secs(10),
-        Command::new("/home/administrator/.cargo/bin/sqlx")
+        Command::new(&sqlx_path)
             .args(["migrate", "info", "--database-url", db_url])
             .output(),
     )
@@ -168,7 +188,12 @@ async fn check_migrations(db_url: &str) -> EnvironmentCheck {
                 EnvironmentCheck::warn("migrations", "DB Migrations", format!("{pending} pending"))
             }
         }
-        _ => EnvironmentCheck::warn("migrations", "DB Migrations", "sqlx not found or timed out"),
+        Ok(Err(_)) => EnvironmentCheck::warn(
+            "migrations_sqlx_missing",
+            "DB Migrations",
+            "sqlx-cli non trovato",
+        ),
+        Err(_) => EnvironmentCheck::warn("migrations", "DB Migrations", "sqlx timeout"),
     }
 }
 
@@ -384,6 +409,44 @@ pub async fn fix_environment(
                 }
                 Ok(Err(e)) => Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
                 Err(_) => Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, "Timeout")),
+            }
+        }
+
+        "install_sqlx_cli" => {
+            // Installa sqlx-cli con supporto solo postgres (più veloce, ~2-3 min).
+            // Usa il cargo del sistema (PATH ereditato da mcp-core) oppure il path
+            // esplicito ~/.cargo/bin/cargo come fallback.
+            let cargo_bin = if std::path::Path::new("/home/administrator/.cargo/bin/cargo").exists() {
+                "/home/administrator/.cargo/bin/cargo".to_string()
+            } else {
+                "cargo".to_string()
+            };
+
+            let result = timeout(
+                Duration::from_secs(300), // 5 minuti: compilazione da sorgente
+                Command::new(&cargo_bin)
+                    .args([
+                        "install",
+                        "sqlx-cli",
+                        "--no-default-features",
+                        "--features",
+                        "native-tls,postgres",
+                        "--locked",
+                    ])
+                    .envs(std::env::vars()) // propaga PATH, CARGO_HOME, ecc.
+                    .output(),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(out)) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    let output = format!("{stdout}{stderr}");
+                    Ok(Json(json!({ "ok": out.status.success(), "output": output })))
+                }
+                Ok(Err(e)) => Ok(Json(json!({ "ok": false, "output": format!("Errore avvio cargo: {e}") }))),
+                Err(_) => Ok(Json(json!({ "ok": false, "output": "Timeout dopo 300s. Riprova." }))),
             }
         }
 

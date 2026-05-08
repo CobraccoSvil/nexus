@@ -252,8 +252,19 @@ function CheckRow({
 
           {showFix && check.id === "migrations" && (
             <FixButton
-              label="🔄 Esegui migrazioni"
+              label="Esegui migrazioni"
               action="run_migrations"
+              checkId={check.id}
+              fixLoading={fixLoading}
+              fixOutputs={fixOutputs}
+              onFix={onFix}
+            />
+          )}
+
+          {showFix && check.id === "migrations_sqlx_missing" && (
+            <FixButton
+              label="Installa sqlx-cli"
+              action="install_sqlx_cli"
               checkId={check.id}
               fixLoading={fixLoading}
               fixOutputs={fixOutputs}
