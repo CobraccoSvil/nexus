@@ -65,6 +65,21 @@ class AgentRouterClient:
         self._stub: agent_router_pb2_grpc.AgentRouterStub | None = None
 
     async def _ensure_channel(self) -> agent_router_pb2_grpc.AgentRouterStub:
+        # Ricreo il canale se assente oppure se lo stato non e' piu' attivo
+        # (TRANSIENT_FAILURE / SHUTDOWN) — gestisce il reconnect automatico
+        # dopo che il server viene avviato in un secondo momento.
+        if self._channel is not None:
+            try:
+                state = self._channel.get_state(try_to_connect=False)
+                # grpc.ChannelConnectivity: IDLE=0, CONNECTING=1, READY=2,
+                # TRANSIENT_FAILURE=3, SHUTDOWN=4
+                if state.value >= 4:  # SHUTDOWN
+                    await self._channel.close()
+                    self._channel = None
+                    self._stub = None
+            except Exception:
+                self._channel = None
+                self._stub = None
         if self._stub is None:
             self._channel = grpc.aio.insecure_channel(self.address)
             self._stub = agent_router_pb2_grpc.AgentRouterStub(self._channel)

@@ -65,7 +65,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use serde_json::json;
 use sqlx::PgPool;
 use tokio::sync::broadcast;
@@ -114,6 +114,12 @@ struct AppState {
     /// Aggiornato dal task_watchdog ogni 60s. Consultato dai task background
     /// (quality scan) per decidere se avviare operazioni vettoriali.
     dependency_status: task_watchdog::DependencyStatusRef,
+    /// Set dei project_id la cui indicizzazione semantica e' attualmente in corso.
+    /// Usato da `spawn_code_index_if_needed` per evitare lanci duplicati.
+    pub(crate) indexing_projects: Arc<DashSet<Uuid>>,
+    /// Set dei project_id per cui il file watcher inotify e' gia' attivo.
+    /// Evita di avviare watcher duplicati sullo stesso progetto.
+    pub(crate) watching_projects: Arc<DashSet<Uuid>>,
 }
 
 #[tokio::main]
@@ -482,6 +488,8 @@ async fn main() -> anyhow::Result<()> {
         intent_capability: intent_capability_cache,
         port_registry: port_registry_cache,
         dependency_status: std::sync::Arc::new(task_watchdog::DependencyStatus::new()),
+        indexing_projects: Arc::new(DashSet::new()),
+        watching_projects: Arc::new(DashSet::new()),
     };
     chat_learning::spawn_vector_compaction_scheduler(state.clone());
     nexus_builtin::seed_tools_and_server(&state.db).await;

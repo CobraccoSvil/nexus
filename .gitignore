@@ -33,7 +33,7 @@ stupefied-*/
 # Questa cartella contiene i repository clonati dagli utenti tramite Nexus
 # (es. /home/administrator/ideai/projects/redemptor). Sono progetti separati
 # con il loro proprio remote git: NON vanno tracciati nel repo Nexus.
-projects/
+/projects/
 
 # Backup DB locali (pg_dump)
 backups/

@@ -2067,6 +2067,8 @@ pub async fn send_chat_message(
             user_role: claims.role.clone(),
             nexus_agent_type_hint: body.agent_type_hint.clone(),
         }).await {
+            // Avvia il file watcher anche in modalita' agente asincrona.
+            update_user_active_project(&state, user_id, context.project_id).await;
             return Ok(Json(json!({
                 "sessionId": context.session_id.to_string(),
                 "userMessage": user_message,
@@ -2158,7 +2160,7 @@ pub async fn send_chat_message(
     .execute(&state.db)
     .await;
 
-    update_user_active_project(&state.db, user_id, context.project_id).await;
+    update_user_active_project(&state, user_id, context.project_id).await;
 
     Ok(Json(json!({
         "sessionId": context.session_id.to_string(),
@@ -2437,7 +2439,7 @@ pub async fn resend_chat_message(
             user_role: claims.role.clone(),
             nexus_agent_type_hint: None, // resend non usa hint
         }).await {
-            update_user_active_project(&state.db, user_id, project_id).await;
+            update_user_active_project(&state, user_id, project_id).await;
             return Ok(Json(json!({
                 "sessionId": session_id.to_string(),
                 "userMessage": resent_user_message,
@@ -2469,7 +2471,7 @@ pub async fn resend_chat_message(
     )
     .await?;
 
-    update_user_active_project(&state.db, user_id, project_id).await;
+    update_user_active_project(&state, user_id, project_id).await;
 
     Ok(Json(json!({
         "sessionId": session_id.to_string(),
@@ -2521,7 +2523,7 @@ pub async fn delete_chat_message(
     let project_id: Uuid = row
         .try_get("project_id")
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    update_user_active_project(&state.db, user_id, project_id).await;
+    update_user_active_project(&state, user_id, project_id).await;
 
     Ok(Json(json!({
         "ok": true,

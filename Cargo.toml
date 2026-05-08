@@ -53,6 +53,7 @@ dashmap = "5"
 nexus-http = { path = "crates/nexus-http" }
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
+notify = { version = "6", features = ["serde"] }
 
 [workspace.dependencies.tonic-build]
 version = "0.12"
