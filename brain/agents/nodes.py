@@ -123,6 +123,70 @@ _retriever: InteractionRetriever | None = None
 _tool_runner: ToolRunnerClient | None = None
 _agent_router: AgentRouterClient | None = None
 
+# ── Learning config (DB-backed, cache 60s) ───────────────────────────────────
+# Letti dalla tabella `settings`: learning_auto_extract e learning_min_confidence.
+# Stessa convenzione di reflection_config: nessuna env var, nessun hardcode,
+# fallback conservativo se DB non raggiungibile.
+import threading as _threading
+
+_learning_cfg_lock = _threading.Lock()
+_learning_cfg_cache: dict[str, Any] | None = None
+_learning_cfg_ts: float = 0.0
+_LEARNING_CFG_TTL = 60.0
+_LEARNING_CFG_DEFAULTS: dict[str, Any] = {
+    "auto_extract": True,
+    "min_confidence": 0.6,
+}
+
+
+def _get_learning_config() -> dict[str, Any]:
+    """Restituisce {auto_extract: bool, min_confidence: float} dal DB con cache 60s.
+
+    Se DB non raggiungibile o psycopg2 mancante, usa i safe_defaults conservativi
+    (auto_extract=True, min_confidence=0.6) e mantiene l'ultima cache valida.
+    """
+    global _learning_cfg_cache, _learning_cfg_ts
+    import os
+
+    now = time.monotonic()
+    with _learning_cfg_lock:
+        if _learning_cfg_cache is not None and now - _learning_cfg_ts < _LEARNING_CFG_TTL:
+            return _learning_cfg_cache
+
+    database_url = os.environ.get("DATABASE_URL", "")
+    if not database_url:
+        logger.warning("learning_config: DATABASE_URL non impostato, uso safe_defaults")
+        with _learning_cfg_lock:
+            _learning_cfg_cache = dict(_LEARNING_CFG_DEFAULTS)
+            _learning_cfg_ts = now
+        return dict(_LEARNING_CFG_DEFAULTS)
+
+    try:
+        import psycopg2  # type: ignore[import-untyped]
+        conn = psycopg2.connect(database_url)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT key, value FROM settings "
+                    "WHERE key IN ('learning_auto_extract','learning_min_confidence')"
+                )
+                rows = dict(cur.fetchall())
+        finally:
+            conn.close()
+        cfg: dict[str, Any] = {
+            "auto_extract": rows.get("learning_auto_extract", "true").strip().lower() != "false",
+            "min_confidence": float(rows.get("learning_min_confidence", "0.6") or "0.6"),
+        }
+    except Exception as exc:
+        logger.error("learning_config: errore lettura DB: %s — uso cache o defaults", exc)
+        with _learning_cfg_lock:
+            return dict(_learning_cfg_cache) if _learning_cfg_cache is not None else dict(_LEARNING_CFG_DEFAULTS)
+
+    with _learning_cfg_lock:
+        _learning_cfg_cache = cfg
+        _learning_cfg_ts = now
+    return cfg
+
 
 def configure_services(
     providers: Any,
@@ -1237,8 +1301,31 @@ async def learner_node(state: AgentState) -> dict[str, Any]:
 
     qdrant_id: str | None = None
 
-    # Salva embedding in Qdrant
-    if _retriever is not None and user_input and result:
+    # Stima reward preliminare (euristica base, senza reflection — disponibile subito).
+    # Usata per filtrare il salvataggio Qdrant: interazioni di bassa qualita'
+    # non devono inquinare il RAG (esempi falliti degradano il retrieval futuro).
+    stop_reason_pre = state.get("stop_reason") or "end_turn"
+    prelim_reward = (
+        1.0 if stop_reason_pre == "end_turn" and result
+        else 0.4 if stop_reason_pre == "end_turn"
+        else 0.0 if stop_reason_pre == "error"
+        else 0.3  # cap iterazioni o altro
+    )
+
+    # Leggi config learning dal DB (cache 60s). Stessa convenzione di reflection_config.
+    lcfg = _get_learning_config()
+    save_to_qdrant = lcfg["auto_extract"] and prelim_reward >= lcfg["min_confidence"]
+
+    if not lcfg["auto_extract"]:
+        logger.debug("learner_node: salvataggio Qdrant saltato (learning_auto_extract=false)")
+    elif prelim_reward < lcfg["min_confidence"]:
+        logger.debug(
+            "learner_node: salvataggio Qdrant saltato (reward_prelim=%.2f < min_confidence=%.2f, stop=%s)",
+            prelim_reward, lcfg["min_confidence"], stop_reason_pre,
+        )
+
+    # Salva embedding in Qdrant solo se qualita' sufficiente e auto_extract abilitato
+    if _retriever is not None and user_input and result and save_to_qdrant:
         interaction_text = f"Input: {user_input}\nOutput: {result}"
         qdrant_id = str(uuid.uuid4())
         payload: dict[str, Any] = {

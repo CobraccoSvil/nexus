@@ -307,7 +307,7 @@ impl NexusBridge {
                     .ok()
                     .flatten()
                     .and_then(|v| v.trim().parse::<f32>().ok())
-                    .unwrap_or(0.5);
+                    .unwrap_or(0.6); // allineato al seed DB (0002_settings.sql)
 
                     (auto, conf)
                 })
