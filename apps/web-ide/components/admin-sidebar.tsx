@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import type { Route } from "next";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
@@ -29,24 +30,65 @@ export function AdminSidebar({
   const tc = useThemeColors();
   const { t } = useI18n();
 
-  const isSettingsActive = pathname === "/admin" || pathname.startsWith("/admin/settings");
-
-  const topItems = [
-    { label: "Profili", href: "/admin/profiles" as Route, icon: "PR" },
-    { label: "Template Prompt", href: "/admin/prompts" as Route, icon: "PT" },
-    { label: "Dashboard Prompt", href: "/admin/prompts/dashboard" as Route, icon: "DP" },
-    { label: "Feedback AI", href: "/admin/ai-feedback" as Route, icon: "F" },
-    { label: "Database Nexus", href: "/admin/nexus-database" as Route, icon: "DN" },
-    { label: "Apprendimento Progetto", href: "/admin/project-learning" as Route, icon: "AP" },
-    { label: "Manutenzione Vettori", href: "/admin/vector-maintenance" as Route, icon: "MV" },
-    { label: "Fatturazione", href: "/admin/billing" as Route, icon: "FA" },
-    { label: t("admin.appearance"), href: "/admin/appearance" as Route, icon: "A" },
-    { label: t("admin.language"), href: "/admin/language" as Route, icon: "L" },
-    { label: t("admin.users"), href: "/admin/users" as Route, icon: "U" },
-    { label: "Processi Lunghi", href: "/admin/long-running" as Route, icon: "PL" },
-    { label: "Porting Progetto", href: "/admin/project-porting" as Route, icon: "PP" },
-    { label: "Browser Bridge", href: "/admin/browser-bridge" as Route, icon: "BB" },
+  const menuGroups = [
+    {
+      key: "ai-prompt",
+      label: "AI & Prompt",
+      icon: "AI",
+      items: [
+        { label: "Template Prompt", href: "/admin/prompts" as Route, icon: "PT" },
+        { label: "Dashboard Prompt", href: "/admin/prompts/dashboard" as Route, icon: "DP" },
+        { label: "Feedback AI", href: "/admin/ai-feedback" as Route, icon: "F" },
+        { label: "Apprendimento Progetto", href: "/admin/project-learning" as Route, icon: "AP" },
+      ],
+    },
+    {
+      key: "dati-vettori",
+      label: "Dati & Vettori",
+      icon: "DV",
+      items: [
+        { label: "Database Nexus", href: "/admin/nexus-database" as Route, icon: "DN" },
+        { label: "Manutenzione Vettori", href: "/admin/vector-maintenance" as Route, icon: "MV" },
+        { label: "Porting Progetto", href: "/admin/project-porting" as Route, icon: "PP" },
+      ],
+    },
+    {
+      key: "utenti-accesso",
+      label: "Utenti & Accesso",
+      icon: "UA",
+      items: [
+        { label: "Profili", href: "/admin/profiles" as Route, icon: "PR" },
+        { label: t("admin.users"), href: "/admin/users" as Route, icon: "U" },
+        { label: "Fatturazione", href: "/admin/billing" as Route, icon: "FA" },
+      ],
+    },
+    {
+      key: "sistema",
+      label: "Sistema",
+      icon: "SI",
+      items: [
+        { label: t("admin.appearance"), href: "/admin/appearance" as Route, icon: "A" },
+        { label: t("admin.language"), href: "/admin/language" as Route, icon: "L" },
+        { label: "Processi Lunghi", href: "/admin/long-running" as Route, icon: "PL" },
+        { label: "Browser Bridge", href: "/admin/browser-bridge" as Route, icon: "BB" },
+      ],
+    },
   ];
+
+  // Inizializza aperto il gruppo che contiene la pagina attiva
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>(() => {
+    const initial: Record<string, boolean> = {};
+    for (const group of menuGroups) {
+      initial[group.key] = group.items.some((item) => pathname.startsWith(item.href));
+    }
+    return initial;
+  });
+
+  const toggleGroup = (key: string) => {
+    setOpenGroups((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
+
+  const isSettingsActive = pathname === "/admin" || pathname.startsWith("/admin/settings");
 
   return (
     <nav
@@ -73,6 +115,7 @@ export function AdminSidebar({
         {t("admin.configuration")}
       </div>
 
+      {/* ── Sezione Impostazioni (con sotto-voci) ── */}
       <Link
         href={"/admin" as Route}
         className="flex-row-gap-10 text-base transition-all"
@@ -135,40 +178,88 @@ export function AdminSidebar({
 
       <div style={{ height: 8 }} />
 
-      {topItems.map((item) => {
-        const isActive = pathname === item.href;
+      {/* ── Gruppi collassabili ── */}
+      {menuGroups.map((group) => {
+        const isOpen = !!openGroups[group.key];
+        const groupActive = group.items.some((item) => pathname.startsWith(item.href));
+
         return (
-          <Link
-            key={item.href}
-            href={item.href}
-            className="flex-row-gap-10 text-base transition-all"
-            onClick={onNavigate}
-            style={{
-              padding: compact ? "9px 12px" : "10px 16px",
-              margin: compact ? "0 6px" : "0 8px",
-              borderRadius: 8,
-              textDecoration: "none",
-              fontWeight: isActive ? 600 : 400,
-              color: isActive ? tc.accent : tc.textSecondary,
-              background: isActive ? tc.bgActive : "transparent",
-            }}
-          >
-            <span
-              className="flex-row font-bold text-sm"
+          <div key={group.key}>
+            {/* Intestazione gruppo */}
+            <button
+              type="button"
+              onClick={() => toggleGroup(group.key)}
+              className="flex-row-gap-10 text-base transition-all"
               style={{
-                width: 28,
-                height: 28,
-                borderRadius: 6,
-                background: isActive ? tc.accent : tc.border,
-                color: isActive ? "#fff" : tc.textMuted,
-                justifyContent: "center",
+                padding: compact ? "9px 12px" : "10px 16px",
+                margin: compact ? "0 6px" : "0 8px",
+                width: `calc(100% - ${compact ? 12 : 16}px)`,
+                borderRadius: 8,
+                background: "transparent",
+                border: "none",
+                cursor: "pointer",
+                textAlign: "left",
+                fontWeight: groupActive ? 600 : 400,
+                color: groupActive ? tc.accent : tc.textSecondary,
+                display: "flex",
                 alignItems: "center",
+                gap: 10,
+                fontSize: 14,
               }}
             >
-              {item.icon}
-            </span>
-            {item.label}
-          </Link>
+              <span
+                className="flex-row font-bold text-sm"
+                style={{
+                  width: 28,
+                  height: 28,
+                  flexShrink: 0,
+                  borderRadius: 6,
+                  background: groupActive ? tc.accent : tc.border,
+                  color: groupActive ? "#fff" : tc.textMuted,
+                  justifyContent: "center",
+                  alignItems: "center",
+                  display: "flex",
+                  fontSize: 10,
+                }}
+              >
+                {group.icon}
+              </span>
+              <span style={{ flex: 1 }}>{group.label}</span>
+              <span style={{ fontSize: 10, color: tc.textMuted, marginRight: 6 }}>
+                {isOpen ? "▾" : "▸"}
+              </span>
+            </button>
+
+            {/* Sotto-voci del gruppo */}
+            {isOpen && (
+              <div className="flex-col" style={{ marginLeft: compact ? 20 : 32, gap: 1 }}>
+                {group.items.map((item) => {
+                  const active = pathname === item.href;
+                  return (
+                    <Link
+                      key={item.href}
+                      href={item.href}
+                      className="text-sm transition-all"
+                      onClick={onNavigate}
+                      style={{
+                        display: "block",
+                        padding: compact ? "6px 12px" : "6px 16px",
+                        margin: compact ? "0 6px" : "0 8px",
+                        borderRadius: 6,
+                        textDecoration: "none",
+                        color: active ? tc.accent : tc.textMuted,
+                        fontWeight: active ? 600 : 400,
+                        background: active ? tc.bgActive : "transparent",
+                        borderLeft: "2px solid transparent",
+                      }}
+                    >
+                      {item.label}
+                    </Link>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         );
       })}
     </nav>

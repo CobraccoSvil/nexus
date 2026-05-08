@@ -41,6 +41,12 @@ const nextConfig: NextConfig = {
     // non ancora attivi — le loro route cadono nel fallback /api/:path* → backend
     const brain = process.env.BRAIN_URL || "http://localhost:8001";
     return [
+      // Embeddings validate/apply → mcp-core (porta 4000), non admin-service (4010)
+      // Le route sono implementate in crates/mcp-core/src/environment.rs
+      {
+        source: "/api/admin/embeddings/:path*",
+        destination: `${backend}/api/admin/embeddings/:path*`,
+      },
       {
         source: "/api/admin/:path*",
         destination: `${adminService}/api/admin/:path*`,
