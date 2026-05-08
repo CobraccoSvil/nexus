@@ -812,9 +812,12 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
       const data = await getGatewayProviders();
       type GwEntry = {
         name: string;
-        healthy: boolean;
+        // null = gateway offline, stato dall'ultimo health probe o mai misurato
+        healthy: boolean | null;
+        configured?: boolean;
         error?: string;
         cooldown_seconds_remaining?: number;
+        last_health_check_at?: string;
       };
       const gwList = (data?.providers as GwEntry[]) ?? [];
       const resolve = (key: ProviderKey): ProviderHealthState => {
@@ -833,6 +836,12 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
             billing: true,
             reason: `${gw.error ?? "In cooldown"} (${remaining} rimanenti). Nexus userà automaticamente un altro provider.`,
           };
+        }
+        // healthy null = gateway offline ma il provider era in lista (stato storico
+        // dall'health probe o provider mai testato). Mostriamo grigio (ok: null)
+        // invece di rosso per non allarmare su uno stato non aggiornato.
+        if (gw.healthy === null || gw.healthy === undefined) {
+          return { ok: null };
         }
         return gw.healthy
           ? { ok: true }

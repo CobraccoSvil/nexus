@@ -983,18 +983,24 @@ fn check_db_queries_in_loops(lines: &[&str], file_path: &str, overrides: &RuleOv
             || (t.starts_with("return") && t.contains("</"))
     });
 
-    // Pattern che indicano un loop
-    let loop_re = Regex::new(r"\b(for|while|forEach|map|flatMap|reduce|each|loop)\b").unwrap();
-    // Pattern che indicano una query DB o chiamata HTTP/fetch dentro il loop.
+    // Pattern che indicano un loop.
+    // `for` e `while` richiedono esplicitamente `(` dopo (con eventuale spazio) per evitare
+    // false match su parole come "for user" dentro template literal o commenti.
+    // `forEach`, `map`, `flatMap`, `reduce`, `each`, `loop` vengono lasciati come word boundary
+    // perché in pratica appaiono sempre come metodi (`.forEach(`, `.map(`, ecc.).
+    let loop_re = Regex::new(r"\b(for|while)\s*\(|\b(forEach|flatMap|reduce|each|loop)\b").unwrap();
+    // Pattern che indicano una query DB dentro il loop.
     // Per file con JSX: pattern molto restrittivo (solo ORM/client espliciti, no fetch generico).
-    // Per file backend: pattern esteso.
+    // Per file backend: pattern esteso MA limitato a veri driver/ORM DB — `await fetch(` e metodi
+    // HTTP generici (.get/.post/.fetch/.read) sono ESCLUSI: sono chiamate HTTP, non query DB, e
+    // causavano falsi positivi su webhook handler e API route (es. Stripe, PayPal, ecc.).
     let query_re = if has_jsx_return {
         Regex::new(
             r"(?i)\.query\(|\.execute\(|\.findOne\(|\.findAll\(|prisma\.\w+\.\w+\(|knex\(|db\.\w+\(|await\s+\w+\.(query|execute|findOne|findAll|select|load)\b"
         ).unwrap()
     } else {
         Regex::new(
-            r"(?i)\b(select|insert|update|delete)\b.*\b(from|into|set)\b|\.query\(|\.execute\(|\.findOne\(|\.findAll\(|await\s+\w+\.(get|post|fetch|query|execute|find|select|load|read)\b|prisma\.\w+\.\w+\(|knex\(|db\.\w+\(|await\s+fetch\("
+            r"(?i)\b(select|insert|update|delete)\b.*\b(from|into|set)\b|\.query\(|\.execute\(|\.findOne\(|\.findAll\(|await\s+\w+\.(query|execute|findOne|findAll|select|load)\b|prisma\.\w+\.\w+\(|knex\(|db\.\w+\("
         ).unwrap()
     };
     // Pattern che suggeriscono ordinamento/filtro in codice invece che in DB

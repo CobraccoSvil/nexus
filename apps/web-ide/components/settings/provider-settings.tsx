@@ -9,8 +9,11 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
 export interface GatewayProvider {
   name: string;
-  healthy: boolean;
+  // null = gateway offline, stato dall'ultimo health probe o mai misurato
+  healthy: boolean | null;
+  configured?: boolean;
   last_check?: string;
+  last_health_check_at?: string;
   error?: string;
 }
 

@@ -534,6 +534,58 @@ pub async fn gateway_providers_handler(
         .map(|r| (r.provider.clone(), r))
         .collect();
 
+    // Query presenza API key per provider (usata nel fallback se gateway offline).
+    // Mappa: "anthropic" -> true se anthropic_api_key non è vuoto.
+    #[derive(sqlx::FromRow)]
+    struct SettingsRow {
+        key: String,
+        value: String,
+    }
+    let settings_rows: Vec<SettingsRow> = sqlx::query_as::<_, SettingsRow>(
+        "SELECT key, value FROM settings WHERE category = 'providers' AND key LIKE '%_api_key'",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let api_key_configured: std::collections::HashMap<String, bool> = settings_rows
+        .into_iter()
+        .map(|r| {
+            let provider = r.key.trim_end_matches("_api_key").to_string();
+            (provider, !r.value.trim().is_empty())
+        })
+        .collect();
+
+    // Lista fallback costruita da health_map + api_key_configured + cooldown_map.
+    // Usata quando il gateway TypeScript (4060) non è raggiungibile, così i LED
+    // mostrano l'ultimo stato noto invece di essere tutti grigi.
+    const KNOWN_PROVIDERS_LIST: [&str; 5] = ["anthropic", "openai", "google", "deepseek", "mistral"];
+    let providers_fallback: Vec<serde_json::Value> = KNOWN_PROVIDERS_LIST.iter().map(|&name| {
+        let configured = api_key_configured.get(name).copied().unwrap_or(false);
+        let mut p = json!({
+            "name": name,
+            "configured": configured,
+            "healthy": serde_json::Value::Null,
+        });
+        if let Some(h) = health_map.get(name) {
+            p["healthy"] = json!(h.healthy);
+            p["last_health_check_at"] = json!(h.checked_at.to_rfc3339());
+            if let Some(lat) = h.latency_ms {
+                p["last_health_latency_ms"] = json!(lat);
+            }
+            if let Some(kind) = &h.error_kind {
+                p["last_known_error_kind"] = json!(kind);
+            }
+        }
+        if let Some((secs, reason)) = cooldown_map.get(name) {
+            p["healthy"] = json!(false);
+            p["cooldown_seconds_remaining"] = json!(secs);
+            p["error"] = json!(reason.clone().unwrap_or_else(||
+                format!("In cooldown ({}s rimanenti) — l'AI userà un altro provider", secs)
+            ));
+        }
+        p
+    }).collect();
+
     match client
         .get(format!("{}/providers", gw_url.trim_end_matches('/')))
         .header("Authorization", format!("Bearer {}", gw_token))
@@ -621,8 +673,20 @@ pub async fn gateway_providers_handler(
                 "cooldown_active": cooldown_map.len(),
             })))
         }
-        Ok(r) => Ok(Json(json!({ "gateway_url": gw_url, "providers": [], "error": format!("HTTP {}", r.status()) }))),
-        Err(e) => Ok(Json(json!({ "gateway_url": gw_url, "providers": [], "error": e.to_string() }))),
+        Ok(r) => Ok(Json(json!({
+            "gateway_url": gw_url,
+            "providers": providers_fallback,
+            "gateway_offline": true,
+            "error": format!("HTTP {}", r.status()),
+            "cooldown_active": cooldown_map.len(),
+        }))),
+        Err(e) => Ok(Json(json!({
+            "gateway_url": gw_url,
+            "providers": providers_fallback,
+            "gateway_offline": true,
+            "error": e.to_string(),
+            "cooldown_active": cooldown_map.len(),
+        }))),
     }
 }
 

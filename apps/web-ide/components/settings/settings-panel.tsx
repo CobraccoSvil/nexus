@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useTheme, useThemeColors } from "../../lib/theme";
 import { useI18n } from "../../lib/i18n";
-import { ProviderSettings, type BrowseDirectoriesResponse, type SettingEntry } from "./provider-settings";
+import { ProviderSettings, type BrowseDirectoriesResponse, type GatewayProvider, type SettingEntry } from "./provider-settings";
 import { RoutingConfig } from "./routing-config";
 import { PluginManager } from "./plugin-manager";
 import { InfrastructureSettings } from "./infrastructure-settings";
@@ -13,12 +13,6 @@ import { getGatewayProviders } from "../../lib/api-client";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
-interface GatewayProvider {
-  name: string;
-  healthy: boolean;
-  last_check?: string;
-  error?: string;
-}
 
 export const CATEGORY_ORDER = ["providers", "routing", "security", "infrastructure", "embeddings", "quality", "learning", "auth", "custom"];
 

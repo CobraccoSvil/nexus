@@ -142,6 +142,12 @@ export function OptimizationPanel({ projectId, onSendToChat, onAutoSendToChat, a
   // Usato per: fix singoli + ultimo file della coda auto-fix (che non ha iterazione successiva).
   const pendingMarkOnNextRunRef = useRef<QualityFinding[]>([]);
 
+  // Contatore di retry per finding: evita loop infinito quando lo scanner produce un falso positivo
+  // persistente (es. `await fetch()` classificato erroneamente come query DB). Dopo MAX_FIX_RETRIES
+  // tentativi senza successo, il finding viene rimosso dalla coda automatica e lasciato all'utente.
+  const MAX_FIX_RETRIES = 2;
+  const fixRetryCountRef = useRef<Map<string, number>>(new Map());
+
   // Deep review (Gemini Batch API) state
   const [deepReviewJobId, setDeepReviewJobId] = useState<string | null>(() => {
     try { const s = sessionStorage.getItem(storageKey); return s ? JSON.parse(s).deepReviewJobId ?? null : null; } catch { return null; }
@@ -308,6 +314,8 @@ export function OptimizationPanel({ projectId, onSendToChat, onAutoSendToChat, a
 
         // Marca come fixed solo i finding effettivamente risolti
         if (resolved.length > 0) {
+          // Reset del contatore retry per i finding risolti (non servono più)
+          for (const f of resolved) fixRetryCountRef.current.delete(f.id);
           await markBatchFixedRef.current(resolved.map(f => f.id));
           // NON chiamare fetchFindings qui: markBatchFixed fa già l'aggiornamento
           // ottimistico della UI; fetchFindings sovrascriverebbe lo stato ottimistico
@@ -322,8 +330,22 @@ export function OptimizationPanel({ projectId, onSendToChat, onAutoSendToChat, a
         if (stillPresent.length > 0) {
           const sendFn = onAutoSendToChat ?? onSendToChat;
           if (sendFn) {
+            const toRetry: QualityFinding[] = [];
+            const exhausted: QualityFinding[] = [];
             for (const f of stillPresent) {
+              const prev = fixRetryCountRef.current.get(f.id) ?? 0;
+              if (prev >= MAX_FIX_RETRIES) {
+                // Tentativi esauriti: non inviare altri messaggi automatici.
+                // Il finding rimane visibile nella lista; l'utente lo gestirà manualmente.
+                exhausted.push(f);
+              } else {
+                fixRetryCountRef.current.set(f.id, prev + 1);
+                toRetry.push(f);
+              }
+            }
+            for (const f of toRetry) {
               const suggestion = retryHintForCategory(f.category, f.title);
+              const retriesLeft = MAX_FIX_RETRIES - (fixRetryCountRef.current.get(f.id) ?? 0);
               const retryMsg = [
                 `⚠️ **Verifica post-fix fallita** per \`${f.filePath}\`:`,
                 `Il problema **${f.title}** è ancora presente — ${f.detail}.`,
@@ -331,11 +353,16 @@ export function OptimizationPanel({ projectId, onSendToChat, onAutoSendToChat, a
                 suggestion,
                 `Usa \`read_file_lines\` per leggere lo stato attuale del file, poi \`edit_file\` per applicare le modifiche.`,
                 `Se ritieni che il problema sia un FALSO POSITIVO (es. il pattern segnalato non è reale nel codice), spiega perché in chat e NON modificare il file: l'utente potrà marcarlo come "non rilevante".`,
-              ].join("\n");
+                retriesLeft === 0 ? `⚠️ Ultimo tentativo automatico — se anche questo fallisce, il finding resterà in lista per revisione manuale.` : "",
+              ].filter(Boolean).join("\n");
               sendFn(retryMsg);
             }
-            // Rimette i finding non risolti in pending per il prossimo run dell'agente
-            pendingMarkOnNextRunRef.current = stillPresent;
+            // Rimette in pending solo i finding che hanno ancora tentativi disponibili
+            pendingMarkOnNextRunRef.current = toRetry;
+            // I finding con retry esauriti: rimuovi il contatore per non sporcare la mappa
+            for (const f of exhausted) {
+              fixRetryCountRef.current.delete(f.id);
+            }
           } else {
             // Nessun canale di invio disponibile: segna come fixed comunque
             await markBatchFixedRef.current(stillPresent.map(f => f.id));
@@ -437,6 +464,7 @@ export function OptimizationPanel({ projectId, onSendToChat, onAutoSendToChat, a
     // i finding rilevati di nuovo non sono stati risolti.
     fixedInSessionRef.current = new Set();
     pendingMarkOnNextRunRef.current = [];
+    fixRetryCountRef.current = new Map(); // reset contatori retry ad ogni nuova scansione
     try {
       const result = await runQualityScan(projectId);
       setScanResult(result);
