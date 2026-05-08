@@ -28,6 +28,16 @@ use tracing::{debug, info, warn};
 /// e overhead di query.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Regola di escalation per model cascading (BP8 piano riduzione token).
+/// Caricata dalle colonne escalation_threshold_tokens / escalation_provider /
+/// escalation_model_id di nexus_routing_matrix (mig 0120).
+#[derive(Debug, Clone)]
+pub struct EscalationRule {
+    pub threshold_tokens: i32,
+    pub provider: String,
+    pub model_id: String,
+}
+
 /// Matrice immutable con tutte le entry attive.
 #[derive(Debug, Clone)]
 pub struct RoutingMatrix {
@@ -39,6 +49,10 @@ pub struct RoutingMatrix {
     /// Vedi migrazione 0102: chat_title_generator, chat_feedback_generator,
     /// docs_generator, custom_instructions, admin_fallback_default, google_batch.
     pub purpose_models: HashMap<String, (String, String)>,
+    /// Regole di escalation token-based per (intent, behavior_mode).
+    /// NB: una entry esiste solo se l'admin ha configurato escalation per
+    /// quella combinazione (mig 0120).
+    pub escalations: HashMap<(String, String), EscalationRule>,
     /// Quando e' stata caricata l'ultima volta (per debug/UI)
     pub loaded_at: Instant,
 }
@@ -49,6 +63,26 @@ impl RoutingMatrix {
         self.by_intent_mode
             .get(&(intent.to_string(), behavior_mode.to_string()))
             .cloned()
+    }
+
+    /// Lookup con cascading basato sul budget token stimato (BP8).
+    /// Se per (intent, mode) esiste una regola di escalation e
+    /// `est_tokens >= threshold`, restituisce il modello escalation; altrimenti
+    /// il modello base. Il caller passa la stima del context window richiesto
+    /// per il turno (system + history + tools).
+    pub fn lookup_with_budget(
+        &self,
+        intent: &str,
+        behavior_mode: &str,
+        est_tokens: i32,
+    ) -> Option<(String, String)> {
+        let key = (intent.to_string(), behavior_mode.to_string());
+        if let Some(rule) = self.escalations.get(&key) {
+            if est_tokens >= rule.threshold_tokens {
+                return Some((rule.provider.clone(), rule.model_id.clone()));
+            }
+        }
+        self.by_intent_mode.get(&key).cloned()
     }
 
     /// Modello di default per un provider.
@@ -125,6 +159,7 @@ impl RoutingMatrix {
             by_intent_mode,
             default_models,
             purpose_models: HashMap::new(),
+            escalations: HashMap::new(),
             loaded_at: Instant::now(),
         }
     }
@@ -132,8 +167,21 @@ impl RoutingMatrix {
 
 /// Carica la matrice dal DB. Ritorna `Err` se DB irraggiungibile o tabelle vuote.
 async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
-    let matrix_rows = sqlx::query_as::<_, (String, String, String, String)>(
-        r#"SELECT intent, behavior_mode, provider, model_id
+    // Estesa con le 3 colonne escalation_* (mig 0120). Le colonne sono
+    // nullable: usiamo Option per leggerle senza rompere se la migrazione
+    // 0120 non e' applicata (graceful fallback: nessuna escalation).
+    type RoutingRow = (
+        String,         // intent
+        String,         // behavior_mode
+        String,         // provider
+        String,         // model_id
+        Option<i32>,    // escalation_threshold_tokens
+        Option<String>, // escalation_provider
+        Option<String>, // escalation_model_id
+    );
+    let matrix_rows = sqlx::query_as::<_, RoutingRow>(
+        r#"SELECT intent, behavior_mode, provider, model_id,
+                  escalation_threshold_tokens, escalation_provider, escalation_model_id
            FROM nexus_routing_matrix
            WHERE is_active = true
            ORDER BY intent, behavior_mode, priority DESC"#,
@@ -170,10 +218,23 @@ async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
     }
 
     let mut by_intent_mode: HashMap<(String, String), (String, String)> = HashMap::new();
-    for (intent, mode, provider, model_id) in matrix_rows {
+    let mut escalations: HashMap<(String, String), EscalationRule> = HashMap::new();
+    for (intent, mode, provider, model_id, esc_thr, esc_prov, esc_model) in matrix_rows {
+        let key = (intent.clone(), mode.clone());
         by_intent_mode
-            .entry((intent, mode))
+            .entry(key.clone())
             .or_insert((provider, model_id));
+        // Inserisci escalation solo se tutti e tre i campi sono presenti
+        // (admin ha completato la configurazione).
+        if let (Some(thr), Some(prov), Some(model)) = (esc_thr, esc_prov, esc_model) {
+            if thr > 0 && !prov.is_empty() && !model.is_empty() {
+                escalations.entry(key).or_insert(EscalationRule {
+                    threshold_tokens: thr,
+                    provider: prov,
+                    model_id: model,
+                });
+            }
+        }
     }
 
     let default_models: HashMap<String, String> = default_rows.into_iter().collect();
@@ -186,6 +247,7 @@ async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
         by_intent_mode,
         default_models,
         purpose_models,
+        escalations,
         loaded_at: Instant::now(),
     })
 }
@@ -345,6 +407,7 @@ mod tests {
             by_intent_mode,
             default_models,
             purpose_models,
+            escalations: HashMap::new(),
             loaded_at: Instant::now(),
         }
     }

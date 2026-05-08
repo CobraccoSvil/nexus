@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use serde_json::{json, Value};
+use sqlx::PgPool;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -24,6 +25,80 @@ use crate::agent_tools::AGENT_TOOLS_JSON;
 /// URL REST del brain (FastAPI). Default allineato al port di `--rest` del brain.
 fn brain_rest_url() -> String {
     std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string())
+}
+
+/// Costruisce il JSON tools da inviare al brain applicando la discovery mode.
+///
+/// Logica:
+/// - Legge `mcp_tool_search_hard_limit` dal DB (default 20).
+/// - Conta i tool MCP esterni abilitati e accessibili a user/project.
+/// - Se count < soglia: include le definizioni dei tool MCP nel payload
+///   (il brain li vede direttamente senza dover cercare).
+/// - Se count >= soglia: invia solo AGENT_TOOLS_JSON (che contiene già
+///   `nexus_mcp_tool_search` + `nexus_mcp_tool_call`). Il brain usa la
+///   ricerca semantica per scoprire i tool a runtime — discovery mode.
+pub async fn build_tools_json_for_agent(
+    db: &PgPool,
+    user_id: Uuid,
+    project_id: Uuid,
+) -> Value {
+    // Legge soglia dal DB
+    let hard_limit: i64 = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'mcp_tool_search_hard_limit'",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|v| v.trim().parse().ok())
+    .unwrap_or(20);
+
+    // Conta tool MCP esterni abilitati e accessibili
+    let mcp_tool_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM mcp_servers s
+           JOIN mcp_server_tools t ON t.server_id = s.id
+           WHERE s.enabled = true
+             AND s.transport != 'builtin'
+             AND (
+               s.scope = 'global'
+               OR (s.scope = 'user'    AND s.user_id    = $1)
+               OR (s.scope = 'project' AND s.project_id = $2)
+             )"#,
+    )
+    .bind(user_id)
+    .bind(project_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(0_i64);
+
+    let base_tools: Value =
+        serde_json::from_str(AGENT_TOOLS_JSON).unwrap_or_else(|_| json!([]));
+
+    if mcp_tool_count < hard_limit && mcp_tool_count > 0 {
+        // Catalogo piccolo: include le definizioni MCP direttamente
+        tracing::debug!(
+            "build_tools_json: {} tool MCP < soglia {}, includo definizioni dirette",
+            mcp_tool_count, hard_limit
+        );
+        let mcp_tools = crate::mcp_connectors::load_mcp_tools_for_agent(db, user_id, Some(project_id)).await;
+        if mcp_tools.is_empty() {
+            return base_tools;
+        }
+        let mut all = base_tools.as_array().cloned().unwrap_or_default();
+        all.extend(mcp_tools);
+        json!(all)
+    } else {
+        // Discovery mode (catalogo vuoto o >= soglia): solo AGENT_TOOLS_JSON
+        // nexus_mcp_tool_search è già incluso — il brain lo usa per scoprire i tool
+        if mcp_tool_count >= hard_limit {
+            tracing::debug!(
+                "build_tools_json: discovery mode ({} tool MCP >= soglia {})",
+                mcp_tool_count, hard_limit
+            );
+        }
+        base_tools
+    }
 }
 
 /// Riconosce gli errori del provider AI che indicano "credito esaurito" / "quota
@@ -135,13 +210,10 @@ pub async fn run_via_brain(
     initial_msg: String,
     step_tx: broadcast::Sender<AgentStepEvent>,
     conversation_history: Vec<serde_json::Value>,
+    tools_json: Value,
 ) -> AgentRunResult {
     let run_id_str = run_id.to_string();
     let url = format!("{}/agent/run/stream", brain_rest_url().trim_end_matches('/'));
-
-    // Tools: riutilizziamo lo schema nativo già definito per AgentLoop.
-    let tools_json: Value =
-        serde_json::from_str(AGENT_TOOLS_JSON).unwrap_or_else(|_| json!([]));
 
     let body = json!({
         "thread_id": run_id_str,

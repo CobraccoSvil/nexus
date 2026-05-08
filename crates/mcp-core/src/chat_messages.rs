@@ -1422,6 +1422,14 @@ async fn spawn_agent_run(
     let neural_for_embed = state.orchestrator.neural.clone();
     let recent_history_for_brain = recent_history;
 
+    // Calcola il payload tools dinamico (discovery mode vs inline) prima dello spawn
+    let tools_json_for_brain = crate::brain_agent_client::build_tools_json_for_agent(
+        &state.db,
+        params.user_id,
+        params.project_id,
+    )
+    .await;
+
     tokio::spawn(async move {
         tracing::info!(
             "spawn_agent_run: delega al brain LangGraph run_id={}",
@@ -1470,6 +1478,7 @@ async fn spawn_agent_run(
                 initial_msg_clone.clone(),
                 tx_for_brain.clone(),
                 recent_history_for_brain.clone(),
+                tools_json_for_brain.clone(),
             )
             .await;
 
@@ -1805,6 +1814,9 @@ pub async fn send_chat_message(
 
     let system_context = {
         let mut ctx = system_prompt;
+        if automation_mode != AutomationMode::Study {
+            ctx.push_str(crate::prompt_templates::AGENT_ACT_FIRST_SUFFIX);
+        }
         if let Some(ref gh) = github_username {
             ctx.push_str(&format!(" Account GitHub: @{gh}."));
         }
@@ -1920,6 +1932,13 @@ pub async fn send_chat_message(
                         let resume_history =
                             build_recent_conversation_history(&db_clone2, session_id_r, 8).await;
 
+                        let tools_for_resume = crate::brain_agent_client::build_tools_json_for_agent(
+                            &db_clone2,
+                            user_id,
+                            project_id_r,
+                        )
+                        .await;
+
                         let result = crate::brain_agent_client::run_via_brain(
                             new_run_id,
                             session_id_r,
@@ -1929,6 +1948,7 @@ pub async fn send_chat_message(
                             resume_prompt,
                             tx,
                             resume_history,
+                            tools_for_resume,
                         )
                         .await;
                         channels2.remove(&new_run_id);
@@ -2342,6 +2362,9 @@ pub async fn resend_chat_message(
                  Git: usa credenziali utente autenticato. Per cloni parti da $NEXUS_TERMINAL_ROOT.\n\
                  Profili: quando noti stack tecnico ricorrente, crea/aggiorna profilo con create_profile/update_profile.",
             );
+            if automation_mode != AutomationMode::Study {
+                ctx.push_str(crate::prompt_templates::AGENT_ACT_FIRST_SUFFIX);
+            }
             if let Some(ref gh) = github_username {
                 ctx.push_str(&format!(" Account GitHub: @{gh}."));
             }

@@ -41,6 +41,40 @@ pub async fn test_plugin(
                     .await;
                 }
 
+                // Indicizzazione semantica Qdrant (fire-and-forget)
+                {
+                    let db_idx = state.db.clone();
+                    let neural_idx = state.orchestrator.neural.clone();
+                    let server_id = resolution.mcp_server_id;
+                    let server_name = resolution.mcp_server_name.clone();
+                    let tools_meta: Vec<(String, String)> = tools
+                        .iter()
+                        .map(|t| (t.name.clone(), t.description.clone().unwrap_or_default()))
+                        .collect();
+                    tokio::spawn(async move {
+                        let scope: String = sqlx::query_scalar(
+                            "SELECT COALESCE(scope, 'user') FROM mcp_servers WHERE id=$1",
+                        )
+                        .bind(server_id)
+                        .fetch_optional(&db_idx)
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or_else(|| "user".to_string());
+                        for (tname, tdesc) in &tools_meta {
+                            if let Err(e) = crate::nexus_builtin::index_tool(
+                                &db_idx, &neural_idx, server_id, &server_name, tname, tdesc, &scope,
+                            )
+                            .await
+                            {
+                                tracing::debug!(
+                                    "plugin index_tool {}/{}: {}",
+                                    server_name, tname, e
+                                );
+                            }
+                        }
+                    });
+                }
+
                 let policy_row = sqlx::query(
                     "SELECT mode, tools FROM plugin_instance_tool_policies WHERE plugin_instance_id = $1",
                 )
