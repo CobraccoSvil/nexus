@@ -559,14 +559,27 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // AgentRouter gRPC server (Fase 5f refactor): espone il Q-Learning
-    // router di nexus-orchestrator al brain. Gated da env flag.
-    if std::env::var("ENABLE_AGENT_ROUTER").ok().as_deref() == Some("1") {
-        let addr: SocketAddr = std::env::var("AGENT_ROUTER_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:50072".to_string())
-            .parse()
-            .expect("AGENT_ROUTER_ADDR non valido");
-        if let Err(e) = agent_router_server::spawn_agent_router_server(addr).await {
-            tracing::error!("AgentRouter server: avvio fallito: {e}");
+    // router di nexus-orchestrator al brain.
+    // Priorita' abilitazione: env ENABLE_AGENT_ROUTER=1 (override emergenza)
+    // > settings.agent_router_enabled nel DB (admin panel) > default false.
+    {
+        let env_override = std::env::var("ENABLE_AGENT_ROUTER").ok().as_deref() == Some("1");
+        let db_enabled = settings::get_setting(&state.db, "agent_router_enabled")
+            .await
+            .ok()
+            .flatten()
+            .map(|v| v.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if env_override || db_enabled {
+            let addr: SocketAddr = std::env::var("AGENT_ROUTER_ADDR")
+                .unwrap_or_else(|_| "127.0.0.1:50072".to_string())
+                .parse()
+                .expect("AGENT_ROUTER_ADDR non valido");
+            if let Err(e) = agent_router_server::spawn_agent_router_server(addr).await {
+                tracing::error!("AgentRouter server: avvio fallito: {e}");
+            }
+        } else {
+            tracing::info!("AgentRouter gRPC: disabilitato (agent_router_enabled=false in DB)");
         }
     }
 
