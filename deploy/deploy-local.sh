@@ -168,7 +168,7 @@ if $RUST_ONLY; then
         stop_service "$svc"
         [ -f "${RELEASE_DIR}/${svc}" ] && cp "${RELEASE_DIR}/${svc}" "${RELEASE_DIR}/${svc}" || true
     done
-    start_service "mcp-core" ENABLE_TOOL_RUNNER=1
+    start_service "mcp-core"
     sleep 3
     for svc in admin-service chat-service billing-service doc-service plugin-service; do
         start_service "$svc"
@@ -215,10 +215,11 @@ disown || true
 sleep 2
 
 log "Avvio mcp-core..."
-# ENABLE_TOOL_RUNNER=1 attiva il gRPC ToolRunner su :50071 (richiesto dal brain
-# Python per invocare i tool MCP — read_file, str_replace, ecc.). Senza, l'AI
-# non può eseguire azioni e finisce con "0 step".
-start_service "mcp-core" ENABLE_TOOL_RUNNER=1
+# ToolRunner e AgentRouter sono abilitati dalla tabella settings nel DB
+# (chiavi tool_runner_enabled, agent_router_enabled — categoria agent).
+# Le env var ENABLE_TOOL_RUNNER / ENABLE_AGENT_ROUTER restano come override
+# di emergenza ma non devono essere passate qui in condizioni normali.
+start_service "mcp-core"
 sleep 3
 
 log "Avvio microservizi..."

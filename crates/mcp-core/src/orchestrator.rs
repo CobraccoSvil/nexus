@@ -1,6 +1,18 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
+
+/// Flag globale per il classificatore LLM degli intent.
+/// Inizializzato da `main.rs` dopo la lettura del DB (settings.llm_classifier_enabled).
+/// L'env var `NEXUS_LLM_CLASSIFIER_ENABLED` resta come override di emergenza
+/// (applicata a ogni chiamata, priorita' piu' alta del valore atomico).
+static LLM_CLASSIFIER_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Imposta il valore del flag dal DB all'avvio. Chiamato da `main.rs`.
+pub fn set_llm_classifier_enabled(val: bool) {
+    LLM_CLASSIFIER_ENABLED.store(val, Ordering::Relaxed);
+}
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -360,9 +372,11 @@ async fn classify_intent_async_with_threshold(
     min_confidence: f32,
     timeout_seconds: f32,
 ) -> (&'static str, f32) {
-    let llm_enabled = std::env::var("NEXUS_LLM_CLASSIFIER_ENABLED")
-        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
-        .unwrap_or(true);
+    // Priorita': env var override > AtomicBool inizializzato dal DB in main.rs.
+    let llm_enabled = match std::env::var("NEXUS_LLM_CLASSIFIER_ENABLED").as_deref() {
+        Ok(v) => !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => LLM_CLASSIFIER_ENABLED.load(Ordering::Relaxed),
+    };
 
     if !llm_enabled || message.trim().is_empty() {
         return classify_intent_with_agentic_promotion(message);

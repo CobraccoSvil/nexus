@@ -497,13 +497,59 @@ async fn main() -> anyhow::Result<()> {
     // Indicizza solo i tool con embedding mancante o hash cambiato.
     nexus_builtin::spawn_tool_reindex(state.db.clone(), state.orchestrator.neural.clone());
 
-    // Worker `provider_health_probe`: pinga ogni 5 minuti i provider LLM
-    // configurati per accertarne la salute reale e aggiornare cooldown +
-    // LED nello statusbar PRIMA del primo errore reale dell'utente.
-    // Disattivabile via env NEXUS_PROVIDER_HEALTH_PROBE_ENABLED=false.
+    // ── Lettura batch settings DB ────────────────────────────────────────────
+    // Leggiamo in parallelo tutti i flag comportamentali dalla tabella settings.
+    // I valori sono usati nei blocchi successivi. Le env var restano come
+    // override di emergenza con priorita' piu' alta (gestita in ogni blocco).
+    let (
+        s_llm_classifier,
+        s_health_probe_enabled,
+        s_health_probe_interval,
+        s_tool_runner,
+        s_http_timeout,
+        s_http_pool,
+    ) = tokio::join!(
+        settings::get_setting(&state.db, "llm_classifier_enabled"),
+        settings::get_setting(&state.db, "provider_health_probe_enabled"),
+        settings::get_setting(&state.db, "provider_health_probe_interval_s"),
+        settings::get_setting(&state.db, "tool_runner_enabled"),
+        settings::get_setting(&state.db, "http_timeout_secs"),
+        settings::get_setting(&state.db, "http_pool_max"),
+    );
+
+    // Inizializza il flag AtomicBool per il classificatore LLM.
+    let llm_classifier_db = s_llm_classifier.ok().flatten()
+        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true);
+    crate::orchestrator::set_llm_classifier_enabled(llm_classifier_db);
+    tracing::info!(
+        "llm_classifier_enabled: {} (fonte: DB{})",
+        llm_classifier_db,
+        if std::env::var("NEXUS_LLM_CLASSIFIER_ENABLED").is_ok() { " + env override attivo" } else { "" }
+    );
+
+    // Inizializza la configurazione HTTP globale (timeout, pool) dal DB.
+    let http_timeout = s_http_timeout.ok().flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let http_pool = s_http_pool.ok().flatten()
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    nexus_http::init_global_config(http_timeout, http_pool);
+
+    // Worker `provider_health_probe`: pinga periodicamente i provider LLM
+    // per rilevare cooldown / quota esaurita PRIMA del primo errore utente.
+    // Valore canonico: settings.provider_health_probe_enabled/interval_s nel DB.
+    // Override emergenza: NEXUS_PROVIDER_HEALTH_PROBE_ENABLED, NEXUS_PROVIDER_HEALTH_PROBE_INTERVAL_S.
+    let probe_enabled = s_health_probe_enabled.ok().flatten()
+        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true);
+    let probe_interval = s_health_probe_interval.ok().flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(300);
     provider_health_probe::spawn_health_probe(
         std::sync::Arc::new(state.orchestrator.clone()),
         state.db.clone(),
+        probe_enabled,
+        probe_interval,
     );
 
     // Worker `task_watchdog`: monitora proattivamente le dipendenze
@@ -538,23 +584,31 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ToolRunner gRPC server (Fase 1 refactor orchestrazione LangGraph).
-    // Esposto verso il brain Python/LangGraph. Gated da env var per non
-    // disturbare deploy esistenti.
-    if std::env::var("ENABLE_TOOL_RUNNER").ok().as_deref() == Some("1") {
-        let addr: SocketAddr = std::env::var("TOOL_RUNNER_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:50071".to_string())
-            .parse()
-            .expect("TOOL_RUNNER_ADDR non valido");
-        let deps = tool_runner_server::ToolRunnerDeps {
-            db: state.db.clone(),
-            neural: state.orchestrator.neural.clone(),
-            agent_channels: state.agent_channels.clone(),
-            terminal_consumers: state.terminal_consumers.clone(),
-            template_cache: state.template_cache.clone(),
-            dependency_status: state.dependency_status.clone(),
-        };
-        if let Err(e) = tool_runner_server::spawn_tool_runner_server(deps, addr).await {
-            tracing::error!("ToolRunner server: avvio fallito: {e}");
+    // Valore canonico: settings.tool_runner_enabled nel DB (admin panel).
+    // Override emergenza: ENABLE_TOOL_RUNNER=1 (priorita' piu' alta del DB).
+    {
+        let env_override = std::env::var("ENABLE_TOOL_RUNNER").ok().as_deref() == Some("1");
+        let db_enabled = s_tool_runner.ok().flatten()
+            .map(|v| v.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if env_override || db_enabled {
+            let addr: SocketAddr = std::env::var("TOOL_RUNNER_ADDR")
+                .unwrap_or_else(|_| "127.0.0.1:50071".to_string())
+                .parse()
+                .expect("TOOL_RUNNER_ADDR non valido");
+            let deps = tool_runner_server::ToolRunnerDeps {
+                db: state.db.clone(),
+                neural: state.orchestrator.neural.clone(),
+                agent_channels: state.agent_channels.clone(),
+                terminal_consumers: state.terminal_consumers.clone(),
+                template_cache: state.template_cache.clone(),
+                dependency_status: state.dependency_status.clone(),
+            };
+            if let Err(e) = tool_runner_server::spawn_tool_runner_server(deps, addr).await {
+                tracing::error!("ToolRunner server: avvio fallito: {e}");
+            }
+        } else {
+            tracing::info!("ToolRunner gRPC: disabilitato (tool_runner_enabled=false in DB)");
         }
     }
 

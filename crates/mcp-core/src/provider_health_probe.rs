@@ -60,19 +60,24 @@ const SLOW_COOLDOWN_S: u64 = 60;
 /// Avvia il worker in background. Restituisce subito; il loop gira per
 /// l'intera vita del processo.
 ///
-/// Chiamato da `main.rs` con `tokio::spawn`.
-pub fn spawn_health_probe(orchestrator: Arc<Orchestrator>, db: PgPool) {
-    let enabled = std::env::var("NEXUS_PROVIDER_HEALTH_PROBE_ENABLED")
-        .map(|v| v != "false" && v != "0")
-        .unwrap_or(true);
+/// Chiamato da `main.rs` con i valori letti dal DB (tabella settings).
+/// Override di emergenza via env: `NEXUS_PROVIDER_HEALTH_PROBE_ENABLED`,
+/// `NEXUS_PROVIDER_HEALTH_PROBE_INTERVAL_S` (priorita' piu' alta del DB).
+pub fn spawn_health_probe(orchestrator: Arc<Orchestrator>, db: PgPool, enabled: bool, interval_s: u64) {
+    // L'env var resta come override di emergenza (priorita' > DB).
+    let enabled = match std::env::var("NEXUS_PROVIDER_HEALTH_PROBE_ENABLED").as_deref() {
+        Ok("false") | Ok("0") => false,
+        Ok("true") | Ok("1") => true,
+        _ => enabled,
+    };
     if !enabled {
-        tracing::info!("provider_health_probe: DISABILITATO via env (NEXUS_PROVIDER_HEALTH_PROBE_ENABLED=false)");
+        tracing::info!("provider_health_probe: DISABILITATO (provider_health_probe_enabled=false)");
         return;
     }
     let interval_s = std::env::var("NEXUS_PROVIDER_HEALTH_PROBE_INTERVAL_S")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(300)
+        .unwrap_or(interval_s)
         .max(60);
     tracing::info!(
         "provider_health_probe: avvio worker (interval={}s, providers={:?})",

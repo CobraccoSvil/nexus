@@ -8,6 +8,7 @@ from typing import Any, AsyncIterator
 from .base import BaseProvider, ProviderCatalogEntry, ProviderResult
 from .error_handler import format_error_result
 from ._schema_utils import compress_tool_list, measure_tools_bytes
+from brain.agents import thinking_config as _thinking_config
 
 logger = logging.getLogger(__name__)
 
@@ -17,14 +18,24 @@ logger = logging.getLogger(__name__)
 # Il system prompt cambia raramente: 1h massimizza il cache hit rate fra turni
 # distanti. I breakpoint sulla history restano sul default 5m perche' la storia
 # muta ad ogni turno.
-# Override possibile via env per test: NEXUS_ANTHROPIC_SYSTEM_CACHE_TTL=5m
-_SYSTEM_CACHE_TTL = os.getenv("NEXUS_ANTHROPIC_SYSTEM_CACHE_TTL", "1h").strip()
-if _SYSTEM_CACHE_TTL not in ("5m", "1h"):
-    logger.warning(
-        "NEXUS_ANTHROPIC_SYSTEM_CACHE_TTL=%r non valido, uso default '1h'",
-        _SYSTEM_CACHE_TTL,
-    )
-    _SYSTEM_CACHE_TTL = "1h"
+# Valore canonico: settings.anthropic_system_cache_ttl nel DB (admin panel).
+# Override emergenza: NEXUS_ANTHROPIC_SYSTEM_CACHE_TTL=5m (priorita' massima).
+def _load_system_cache_ttl() -> str:
+    from brain.utils.settings_db import get_setting as _gs
+    # 1. Env var override (emergenza)
+    env_val = os.getenv("NEXUS_ANTHROPIC_SYSTEM_CACHE_TTL", "").strip()
+    if env_val in ("5m", "1h"):
+        return env_val
+    if env_val:
+        logger.warning("NEXUS_ANTHROPIC_SYSTEM_CACHE_TTL=%r non valido, ignoro e leggo DB", env_val)
+    # 2. DB
+    db_val = _gs("anthropic_system_cache_ttl", "1h").strip()
+    if db_val not in ("5m", "1h"):
+        logger.warning("anthropic_system_cache_ttl DB=%r non valido, uso '1h'", db_val)
+        return "1h"
+    return db_val
+
+_SYSTEM_CACHE_TTL = _load_system_cache_ttl()
 
 
 def _system_cache_control() -> dict:
@@ -123,8 +134,14 @@ class AnthropicProvider(BaseProvider):
         tools: list[dict],
         max_tokens: int = 4096,
         system_text: str = "",
+        extended_thinking: bool = False,
     ) -> ProviderResult:
-        """Esegue un turno agente con tool_use support nativo Anthropic."""
+        """Esegue un turno agente con tool_use support nativo Anthropic.
+
+        extended_thinking=True abilita il budget di ragionamento interno (8k token).
+        Il parametro e' opt-in: NON attivare per default perche' ogni chiamata
+        thinking aggiunge fino a 8000 token di output addebitati a prezzo pieno.
+        """
         if not self._api_key:
             return ProviderResult(
                 provider=self.name, model=model,
@@ -288,8 +305,12 @@ class AnthropicProvider(BaseProvider):
 
             THINKING_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7",
                                 "claude-sonnet-4-5", "claude-opus-4-5"}
-            thinking_budget = 8000
-            use_thinking = model in THINKING_MODELS and max_tokens > thinking_budget
+            # Budget e abilitazione letti dal DB via thinking_config (categoria 'agent').
+            # Modificabili dall'admin senza rideploy — TTL cache 60s.
+            # Il parametro extended_thinking (legacy) viene IGNORATO: la sorgente
+            # di verita' e' esclusivamente il DB per evitare costi imprevisti.
+            thinking_budget = _thinking_config.budget_tokens()
+            use_thinking = _thinking_config.enabled() and model in THINKING_MODELS and max_tokens > thinking_budget
 
             kwargs: dict[str, Any] = {
                 "model": model,
@@ -392,6 +413,7 @@ class AnthropicProvider(BaseProvider):
         tools: list[dict],
         max_tokens: int = 8192,
         system_text: str = "",
+        extended_thinking: bool = False,
     ):
         """Streaming di un turno agente: yielda token parziali poi il risultato finale.
 
@@ -495,12 +517,12 @@ class AnthropicProvider(BaseProvider):
                         if mid_idx != user_indices[-3]:
                             effective_messages = _apply_cache_breakpoint(effective_messages, mid_idx)
 
-            # Abilita extended thinking per modelli che lo supportano (Sonnet/Opus 4+).
-            # Budget: 8k token. Budget deve essere < max_tokens.
+            # Budget e abilitazione letti dal DB via thinking_config (categoria 'agent').
+            # Stessa logica del path non-streaming: sorgente di verita' e' il DB.
             THINKING_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7",
                                 "claude-sonnet-4-5", "claude-opus-4-5"}
-            thinking_budget = 8000
-            use_thinking = model in THINKING_MODELS and max_tokens > thinking_budget
+            thinking_budget = _thinking_config.budget_tokens()
+            use_thinking = _thinking_config.enabled() and model in THINKING_MODELS and max_tokens > thinking_budget
 
             stream_kwargs: dict[str, Any] = {
                 "model": model,

@@ -18,6 +18,20 @@ from .ollama_provider import OllamaProvider
 
 logger = logging.getLogger(__name__)
 
+# ── Billing enabled ───────────────────────────────────────────────────────────
+# Valore canonico: settings.brain_billing_enabled nel DB (admin panel).
+# Override emergenza: NEXUS_BRAIN_BILLING=on (priorita' massima).
+def _brain_billing_enabled() -> bool:
+    """Restituisce True se il ledger billing e' attivo."""
+    from brain.utils.settings_db import get_bool_setting as _gbs
+    env_val = os.environ.get("NEXUS_BRAIN_BILLING", "").strip().lower()
+    if env_val in ("on", "1", "true"):
+        return True
+    if env_val in ("off", "0", "false"):
+        return False
+    # Nessun env var: leggi dal DB
+    return _gbs("brain_billing_enabled", False)
+
 _BILLING_CTX_CACHE: tuple[str, str] | None = None
 _BILLING_CTX_TS: float = 0.0
 
@@ -77,7 +91,7 @@ def _lookup_price_any_currency(provider: str, model: str) -> tuple[float, float,
 
 def _record_usage(provider: str, model: str, usage: dict[str, Any] | None, details: dict[str, Any]) -> None:
     """Scrive su ai_usage_ledger (best-effort)."""
-    if os.environ.get("NEXUS_BRAIN_BILLING", "off").lower() != "on":
+    if not _brain_billing_enabled():
         return
     if not usage:
         return
@@ -130,7 +144,7 @@ def _enforce_quota_estimate(provider: str, model: str, estimated_prompt_tokens: 
 
     Nota: non abbiamo user/project nel gRPC → usiamo _billing_context() (contabilità di sistema).
     """
-    if os.environ.get("NEXUS_BRAIN_BILLING", "off").lower() != "on":
+    if not _brain_billing_enabled():
         return (True, "")
     user_id, project_id = _billing_context()
     if not user_id or not project_id:

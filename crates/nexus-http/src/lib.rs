@@ -48,13 +48,39 @@ impl Default for NexusHttpConfig {
     fn default() -> Self { Self::from_env() }
 }
 
+/// Configurazione globale inizializzata da `main.rs` dopo la lettura del DB.
+/// Se non inizializzata, `build_client` ricade su `from_env()`.
+/// L'env var (NEXUS_HTTP_TIMEOUT_SECS, NEXUS_HTTP_POOL_MAX) resta come override.
+static GLOBAL_CONFIG: std::sync::OnceLock<NexusHttpConfig> = std::sync::OnceLock::new();
+
+/// Inizializza la configurazione globale con i valori letti dal DB.
+/// I parametri `None` mantengono il default da env/costante.
+/// Idempotente: la seconda chiamata non ha effetto (OnceLock).
+pub fn init_global_config(timeout_secs: Option<u64>, pool_max: Option<usize>) {
+    let mut cfg = NexusHttpConfig::from_env();
+    // L'env var ha priorita' sulla lettura DB: applica override DB solo se
+    // l'env var non e' impostata.
+    if timeout_secs.is_some()
+        && std::env::var("NEXUS_HTTP_TIMEOUT_SECS").is_err()
+    {
+        cfg.timeout_secs = timeout_secs.unwrap();
+    }
+    if pool_max.is_some()
+        && std::env::var("NEXUS_HTTP_POOL_MAX").is_err()
+    {
+        cfg.pool_max = pool_max.unwrap();
+    }
+    let _ = GLOBAL_CONFIG.set(cfg);
+}
+
 /// Costruisce un `reqwest::Client` ottimizzato con le impostazioni Nexus.
 ///
-/// Se `NEXUS_PROXY` e impostato, le richieste HTTPS vengono inoltrate al proxy che
-/// gestisce autonomamente la risoluzione DNS — utile in ambienti con DNS limitato
-/// senza modificare configurazioni di sistema.
+/// Usa la configurazione globale inizializzata da `init_global_config` se
+/// disponibile, altrimenti cade su `from_env()`.
+/// Se `NEXUS_PROXY` e' impostato, le richieste HTTPS vengono inoltrate al proxy.
 pub fn build_client() -> Client {
-    build_client_with_config(&NexusHttpConfig::from_env())
+    let config = GLOBAL_CONFIG.get_or_init(NexusHttpConfig::from_env);
+    build_client_with_config(config)
 }
 
 pub fn build_client_with_config(config: &NexusHttpConfig) -> Client {
