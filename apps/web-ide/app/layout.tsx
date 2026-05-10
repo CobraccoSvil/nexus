@@ -1,7 +1,5 @@
 import type { ReactNode } from "react";
-// @ts-expect-error - CSS side-effect import senza tipi
 import "./globals.css";
-// @ts-expect-error - xterm CSS import senza tipi
 import "@xterm/xterm/css/xterm.css";
 import { ThemeBody } from "./theme-body";
 

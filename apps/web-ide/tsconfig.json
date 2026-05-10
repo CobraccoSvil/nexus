@@ -13,8 +13,7 @@
     ],
     "noEmit": true,
     "incremental": true,
-    "isolatedModules": true,
-    "ignoreDeprecations": "6.0"
+    "isolatedModules": true
   },
   "include": [
     "**/*.ts",
