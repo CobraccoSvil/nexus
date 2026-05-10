@@ -100,15 +100,28 @@ export function ProviderSettings({
   const [embeddingMsg, setEmbeddingMsg] = useState<string | null>(null);
   const [embeddingBusy, setEmbeddingBusy] = useState(false);
 
-  // Catalogo modelli per i dropdown _model
+  // Catalogo modelli per i dropdown _model.
+  // Stato esplicito (loading/error/ok) per evitare il fallback silenzioso al
+  // textbox quando il fetch e' in flight o fallisce — il dropdown deve sempre
+  // apparire per i setting *_model, con messaggio chiaro all'utente se il
+  // catalogo non arriva.
   const [modelCatalog, setModelCatalog] = useState<Array<{ provider: string; model: string }>>([]);
+  const [modelCatalogStatus, setModelCatalogStatus] = useState<"loading" | "ok" | "error">("loading");
   useEffect(() => {
     fetch("/api/models", { credentials: "include" })
-      .then((r) => r.ok ? r.json() : null)
-      .then((d) => {
-        if (d?.models) setModelCatalog(d.models as Array<{ provider: string; model: string }>);
+      .then(async (r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
       })
-      .catch(() => undefined);
+      .then((d) => {
+        const models = Array.isArray(d?.models) ? d.models as Array<{ provider: string; model: string }> : [];
+        setModelCatalog(models);
+        setModelCatalogStatus(models.length > 0 ? "ok" : "error");
+      })
+      .catch(() => {
+        setModelCatalog([]);
+        setModelCatalogStatus("error");
+      });
   }, []);
 
   // Set di chiavi _enabled già incorporate nei card delle API key — non vanno mostrate come card separati
@@ -668,40 +681,61 @@ export function ProviderSettings({
                     </div>
                   )}
                 </div>
-              ) : setting.key.endsWith("_model") && setting.key !== "embedding_model" && modelCatalog.length > 0 ? (
-                /* Dropdown modelli per qualsiasi setting *_model (es. reflection_model, summarizer_model) */
-                <select
-                  value={currentValue}
-                  onChange={(event) => {
-                    onEditChange(setting.key, event.target.value);
-                    setTimeout(() => void onSave(setting.key), 50);
-                  }}
-                  style={{
-                    width: "100%",
-                    padding: "8px 12px",
-                    borderRadius: 6,
-                    border: `1px solid ${isEditing ? tc.accent : tc.border}`,
-                    background: "var(--color-bgInput)",
-                    color: tc.text,
-                    fontSize: 13,
-                    fontFamily: "inherit",
-                    boxSizing: "border-box",
-                    cursor: "pointer",
-                  }}
-                >
-                  {/* Raggruppati per provider */}
-                  {Array.from(new Set(modelCatalog.map((m) => m.provider))).sort().map((provider) => (
-                    <optgroup key={provider} label={provider}>
-                      {modelCatalog
-                        .filter((m) => m.provider === provider)
-                        .map((m) => (
-                          <option key={m.model} value={m.model}>
-                            {m.model}
-                          </option>
-                        ))}
-                    </optgroup>
-                  ))}
-                </select>
+              ) : setting.key.endsWith("_model") && setting.key !== "embedding_model" ? (
+                /* Dropdown modelli per qualsiasi setting *_model (es. reflection_model, summarizer_model).
+                   Sempre presente; gestisce loading/error/ok espliciti.
+                   Il valore corrente viene preservato come opzione anche se non
+                   compare nel catalogo (modelli legacy o con typo). */
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <select
+                    value={currentValue}
+                    disabled={modelCatalogStatus === "loading"}
+                    onChange={(event) => {
+                      onEditChange(setting.key, event.target.value);
+                      setTimeout(() => void onSave(setting.key), 50);
+                    }}
+                    style={{
+                      width: "100%",
+                      padding: "8px 12px",
+                      borderRadius: 6,
+                      border: `1px solid ${isEditing ? tc.accent : tc.border}`,
+                      background: "var(--color-bgInput)",
+                      color: tc.text,
+                      fontSize: 13,
+                      fontFamily: "inherit",
+                      boxSizing: "border-box",
+                      cursor: modelCatalogStatus === "loading" ? "wait" : "pointer",
+                    }}
+                  >
+                    {/* Valore corrente come prima opzione, anche se non e' nel catalogo */}
+                    {currentValue && !modelCatalog.some((m) => m.model === currentValue) && (
+                      <option value={currentValue}>
+                        {currentValue} (corrente — non nel catalogo)
+                      </option>
+                    )}
+                    {modelCatalogStatus === "loading" && modelCatalog.length === 0 && (
+                      <option value="" disabled>Caricamento modelli...</option>
+                    )}
+                    {/* Raggruppati per provider */}
+                    {Array.from(new Set(modelCatalog.map((m) => m.provider))).sort().map((provider) => (
+                      <optgroup key={provider} label={provider}>
+                        {modelCatalog
+                          .filter((m) => m.provider === provider)
+                          .map((m) => (
+                            <option key={m.model} value={m.model}>
+                              {m.model}
+                            </option>
+                          ))}
+                      </optgroup>
+                    ))}
+                  </select>
+                  {modelCatalogStatus === "error" && (
+                    <div style={{ fontSize: 11, color: tc.error }}>
+                      Errore: catalogo modelli non caricato. Verifica che mcp-core sia
+                      raggiungibile e che ai_price_catalog contenga modelli con is_enabled=TRUE.
+                    </div>
+                  )}
+                </div>
               ) : (
                 <input
                   type={setting.is_secret ? "password" : "text"}
