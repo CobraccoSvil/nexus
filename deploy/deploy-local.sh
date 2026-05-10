@@ -132,12 +132,55 @@ start_service() {
     echo "  ${name} PID=${pid} log=${logfile}"
 }
 
+# Mappa dei servizi con eventuali env var extra necessarie all'avvio.
+# Formato: "nome:VAR1=val1:VAR2=val2" — le coppie dopo il primo ":" sono env var.
+declare -A SERVICE_ENV
+SERVICE_ENV["browser-bridge-mcp"]="BROWSER_BRIDGE_PORT=${BROWSER_BRIDGE_PORT:-4055}"
+
+start_service_with_env() {
+    local name="$1"
+    local extra_env="${SERVICE_ENV[$name]:-}"
+    if [ -n "$extra_env" ]; then
+        start_service "$name" "$extra_env"
+    else
+        start_service "$name"
+    fi
+}
+
+stop_webide() {
+    pkill -f "server\.js" 2>/dev/null || true
+    pkill -f "next-server" 2>/dev/null || true
+    pkill -f "next start"  2>/dev/null || true
+    sleep 1
+}
+
+start_webide() {
+    local logfile="/tmp/nexus-webide.log"
+    setsid nohup env NODE_ENV=production node "${ROOT}/apps/web-ide/server.js" \
+        > "$logfile" 2>&1 < /dev/null &
+    disown || true
+    echo "  web-ide PID=$! log=${logfile}"
+}
+
+build_webide() {
+    log "Build web-ide (Next.js)..."
+    cd "${ROOT}/apps/web-ide"
+    NODE_ENV=production node_modules/.bin/next build
+    cd "$ROOT"
+}
+
 # ── Restart singolo servizio ──────────────────────────────────────────────────
 if [ -n "$SINGLE_SERVICE" ]; then
     log "Restart ${SINGLE_SERVICE}..."
-    stop_service "$SINGLE_SERVICE"
-    cargo build --release -p "$SINGLE_SERVICE" 2>&1 | tail -5
-    start_service "$SINGLE_SERVICE"
+    if [ "$SINGLE_SERVICE" = "web-ide" ]; then
+        build_webide
+        stop_webide
+        start_webide
+    else
+        stop_service "$SINGLE_SERVICE"
+        cargo build --release -p "$SINGLE_SERVICE" 2>&1 | tail -5
+        start_service_with_env "$SINGLE_SERVICE"
+    fi
     sleep 2
     log "Fatto."
     exit 0
@@ -145,15 +188,10 @@ fi
 
 # ── Solo web-ide ──────────────────────────────────────────────────────────────
 if $WEB_ONLY; then
-    log "Build web-ide..."
-    cd "$ROOT"
-    NODE_ENV=production pnpm --filter @ai-orchestrator/web-ide build 2>&1 | tail -10
-    stop_service "next-server"
-    stop_service "next start"
-    stop_service "node server.js"
-    setsid nohup env NODE_ENV=production pnpm --filter @ai-orchestrator/web-ide start > /tmp/nexus-webide.log 2>&1 < /dev/null &
-    disown
-    echo "  web-ide PID=$!"
+    build_webide
+    stop_webide
+    start_webide
+    sleep 3
     log "Fatto."
     exit 0
 fi
@@ -166,14 +204,13 @@ if $RUST_ONLY; then
     log "Restart servizi Rust..."
     for svc in mcp-core admin-service chat-service billing-service doc-service plugin-service browser-bridge-mcp; do
         stop_service "$svc"
-        [ -f "${RELEASE_DIR}/${svc}" ] && cp "${RELEASE_DIR}/${svc}" "${RELEASE_DIR}/${svc}" || true
     done
     start_service "mcp-core"
     sleep 3
     for svc in admin-service chat-service billing-service doc-service plugin-service; do
         start_service "$svc"
     done
-    start_service "browser-bridge-mcp" BROWSER_BRIDGE_PORT="${BROWSER_BRIDGE_PORT:-4055}"
+    start_service_with_env "browser-bridge-mcp"
     sleep 2
     log "Fatto."
     exit 0
@@ -184,24 +221,22 @@ log "Build Rust (release)..."
 cd "$ROOT"
 cargo build --release --workspace 2>&1 | tail -10
 
-log "Build web-ide (Next.js)..."
-NODE_ENV=production pnpm --filter @ai-orchestrator/web-ide build 2>&1 | tail -10
+build_webide
 
 log "Arresto servizi in esecuzione..."
-for svc in mcp-core admin-service chat-service billing-service doc-service plugin-service browser-bridge-mcp next-server "next start" "brain.grpc_server.main" "node server.js" "nexus-gateway"; do
+for svc in mcp-core admin-service chat-service billing-service doc-service plugin-service browser-bridge-mcp "brain.grpc_server.main" "nexus-gateway" "apps/nexus-gateway"; do
     stop_service "$svc"
 done
-pkill -f 'apps/nexus-gateway' 2>/dev/null || true
+stop_webide
 sleep 2
 
 log "Avvio Neural Core (Python) con REST endpoint su :8001..."
-setsid nohup env DATABASE_URL="${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}" python3 -m brain.grpc_server.main --rest > /tmp/nexus-neural.log 2>&1 < /dev/null &
+setsid nohup env DATABASE_URL="${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}" \
+    python3 -m brain.grpc_server.main --rest > /tmp/nexus-neural.log 2>&1 < /dev/null &
 disown || true
 sleep 4
 
 log "Avvio Nexus Gateway (Node.js su :4060)..."
-pkill -f 'apps/nexus-gateway' 2>/dev/null || true
-sleep 1
 setsid nohup env \
     NODE_ENV=production \
     DATABASE_URL="${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}" \
@@ -229,24 +264,40 @@ done
 sleep 3
 
 log "Avvio browser-bridge-mcp..."
-start_service "browser-bridge-mcp" BROWSER_BRIDGE_PORT="${BROWSER_BRIDGE_PORT:-4055}"
+start_service_with_env "browser-bridge-mcp"
 sleep 1
 
 log "Avvio web-ide..."
-setsid nohup env NODE_ENV=production pnpm --filter @ai-orchestrator/web-ide start > /tmp/nexus-webide.log 2>&1 < /dev/null &
-disown || true
-echo "  web-ide PID=$!"
+start_webide
 sleep 3
 
 echo ""
 log "Porte attive:"
-ss -tlnp 2>/dev/null | grep -E '3000|4000|4010|4020|4030|4040|4050' || true
+ss -tlnp 2>/dev/null | grep -E '3000|4000|4010|4020|4030|4040|4050|4055|4060|8001' || true
 
 echo ""
 log "Health check:"
-for port in 4000 4010 4020 4030 4040 4050; do
-    code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/health" 2>/dev/null || echo "down")
-    [ "$code" = "200" ] && echo "  :${port} OK" || echo "  :${port} ${code}"
+declare -A PORT_LABEL=(
+    [3000]="web-ide          "
+    [4000]="mcp-core         "
+    [4010]="admin-service    "
+    [4020]="chat-service     "
+    [4030]="doc-service      "
+    [4040]="billing-service  "
+    [4050]="plugin-service   "
+    [4055]="browser-bridge   "
+    [4060]="nexus-gateway    "
+    [8001]="brain (Python)   "
+)
+for port in 3000 4000 4010 4020 4030 4040 4050 4055 4060 8001; do
+    label="${PORT_LABEL[$port]}"
+    # Per brain usa /health, per web-ide controlla semplicemente la connessione TCP
+    if [ "$port" = "3000" ]; then
+        code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/" 2>/dev/null || echo "down")
+    else
+        code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/health" 2>/dev/null || echo "down")
+    fi
+    [ "$code" = "200" ] && echo "  :${port} ${label} OK" || echo "  :${port} ${label} ${code}"
 done
 
 echo ""
