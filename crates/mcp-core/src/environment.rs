@@ -112,6 +112,54 @@ async fn check_tool_runner() -> EnvironmentCheck {
     }
 }
 
+/// Controlla i 5 microservizi Rust ausiliari (admin, chat, doc, billing, plugin).
+/// Li verifica in parallelo con TCP connect (1s timeout); restituisce un check
+/// aggregato con il dettaglio per ciascun servizio.
+async fn check_microservices() -> EnvironmentCheck {
+    let services = [
+        ("admin-service",   4010u16),
+        ("chat-service",    4020),
+        ("doc-service",     4030),
+        ("billing-service", 4040),
+        ("plugin-service",  4050),
+    ];
+
+    let mut results: Vec<(&str, bool)> = Vec::with_capacity(services.len());
+    let handles: Vec<_> = services.iter().map(|(name, port)| {
+        let addr = format!("127.0.0.1:{port}");
+        let p = *port;
+        (*name, tokio::spawn(async move {
+            timeout(
+                Duration::from_secs(1),
+                tokio::net::TcpStream::connect(format!("127.0.0.1:{p}")),
+            )
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false)
+        }))
+    }).collect();
+
+    for (name, handle) in handles {
+        let ok = handle.await.unwrap_or(false);
+        results.push((name, ok));
+    }
+
+    let ok_count = results.iter().filter(|(_, ok)| *ok).count();
+    let total = results.len();
+    let detail = results.iter()
+        .map(|(name, ok)| format!("{}: {}", name, if *ok { "ok" } else { "down" }))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if ok_count == total {
+        EnvironmentCheck::ok("microservices", "Microservizi (admin/chat/doc/billing/plugin)", format!("{ok_count}/{total} operativi"))
+    } else if ok_count > 0 {
+        EnvironmentCheck::warn("microservices", "Microservizi (admin/chat/doc/billing/plugin)", format!("{ok_count}/{total} operativi — {detail}"))
+    } else {
+        EnvironmentCheck::error("microservices", "Microservizi (admin/chat/doc/billing/plugin)", format!("0/{total} operativi — {detail}"))
+    }
+}
+
 async fn check_brain_service() -> EnvironmentCheck {
     let result = Command::new("pgrep")
         .args(["-f", "brain.grpc_server.main|nexus-brain|uvicorn"])
@@ -258,6 +306,7 @@ pub async fn get_environment_status(
         migrations_check,
         providers_check,
         disk_check,
+        microservices_check,
     ) = tokio::join!(
         check_db(&state.db),
         check_playwright_libs(),
@@ -268,6 +317,7 @@ pub async fn get_environment_status(
         check_migrations(&db_url),
         check_ai_providers(&state.db),
         check_disk_space(),
+        check_microservices(),
     );
 
     let backend_check = check_backend_process();
@@ -279,6 +329,7 @@ pub async fn get_environment_status(
         brain_check,
         tool_runner_check,
         backend_check,
+        microservices_check,
         frontend_check,
         migrations_check,
         providers_check,
