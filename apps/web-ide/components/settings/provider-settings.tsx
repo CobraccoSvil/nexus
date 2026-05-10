@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useTheme, useThemeColors } from "../../lib/theme";
 import { useI18n } from "../../lib/i18n";
 
@@ -99,6 +99,17 @@ export function ProviderSettings({
   const { t } = useI18n();
   const [embeddingMsg, setEmbeddingMsg] = useState<string | null>(null);
   const [embeddingBusy, setEmbeddingBusy] = useState(false);
+
+  // Catalogo modelli per i dropdown _model
+  const [modelCatalog, setModelCatalog] = useState<Array<{ provider: string; model: string }>>([]);
+  useEffect(() => {
+    fetch("/api/models", { credentials: "include" })
+      .then((r) => r.ok ? r.json() : null)
+      .then((d) => {
+        if (d?.models) setModelCatalog(d.models as Array<{ provider: string; model: string }>);
+      })
+      .catch(() => undefined);
+  }, []);
 
   // Set di chiavi _enabled già incorporate nei card delle API key — non vanno mostrate come card separati
   const embeddedEnabledKeys = new Set(PROVIDER_NAMES.map((p) => `${p}_enabled`));
@@ -657,6 +668,40 @@ export function ProviderSettings({
                     </div>
                   )}
                 </div>
+              ) : setting.key.endsWith("_model") && setting.key !== "embedding_model" && modelCatalog.length > 0 ? (
+                /* Dropdown modelli per qualsiasi setting *_model (es. reflection_model, summarizer_model) */
+                <select
+                  value={currentValue}
+                  onChange={(event) => {
+                    onEditChange(setting.key, event.target.value);
+                    setTimeout(() => void onSave(setting.key), 50);
+                  }}
+                  style={{
+                    width: "100%",
+                    padding: "8px 12px",
+                    borderRadius: 6,
+                    border: `1px solid ${isEditing ? tc.accent : tc.border}`,
+                    background: "var(--color-bgInput)",
+                    color: tc.text,
+                    fontSize: 13,
+                    fontFamily: "inherit",
+                    boxSizing: "border-box",
+                    cursor: "pointer",
+                  }}
+                >
+                  {/* Raggruppati per provider */}
+                  {Array.from(new Set(modelCatalog.map((m) => m.provider))).sort().map((provider) => (
+                    <optgroup key={provider} label={provider}>
+                      {modelCatalog
+                        .filter((m) => m.provider === provider)
+                        .map((m) => (
+                          <option key={m.model} value={m.model}>
+                            {m.model}
+                          </option>
+                        ))}
+                    </optgroup>
+                  ))}
+                </select>
               ) : (
                 <input
                   type={setting.is_secret ? "password" : "text"}
