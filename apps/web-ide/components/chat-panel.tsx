@@ -8,7 +8,7 @@ import {
   type FormEvent,
 } from "react";
 import { useChat } from "../lib/use-chat";
-import { listProjectMemories, precheckChatMessage, getProjectDbConfig, type AITraceEvent, type ChatAttachment, type PrecheckResult, type ProjectDbConfig } from "../lib/api-client";
+import { listProjectMemories, precheckChatMessage, getProjectDbConfig, listAdminSettings, type AITraceEvent, type ChatAttachment, type PrecheckResult, type ProjectDbConfig } from "../lib/api-client";
 import { useThemeColors } from "../lib/theme";
 import { useI18n } from "../lib/i18n";
 import { useGlobalDialog } from "./global-dialog-provider";
@@ -146,6 +146,16 @@ export function ChatPanel({
       if (cfg.configured) setDbStatus(cfg);
     }).catch(() => {});
   }, [projectId, hasProject]); // ricarica anche quando il pannello viene chiuso
+  const [narrationWarnAfterMs, setNarrationWarnAfterMs] = useState<number | undefined>(undefined);
+  const [narrationWarnAfterChars, setNarrationWarnAfterChars] = useState<number | undefined>(undefined);
+  useEffect(() => {
+    listAdminSettings().then(({ settings }) => {
+      const ms = settings.find((s) => s.key === "agent_narration_warn_after_ms");
+      const chars = settings.find((s) => s.key === "agent_narration_warn_after_chars");
+      if (ms?.has_value) setNarrationWarnAfterMs(Number(ms.value));
+      if (chars?.has_value) setNarrationWarnAfterChars(Number(chars.value));
+    }).catch(() => {});
+  }, []);
   const { messages, isLoading, isReady, isReconnecting, error, busyByMessage, agentRun, agentSteps, agentRuns, agentStepsMap, tokenUsage, traces, streamingToken, send, resend, remove, feedbackError, confirmAgent, cancelRun } =
     useChat(projectId, profileId, { sessionId });
   const prevAgentActiveRef = useRef(false);
@@ -219,7 +229,7 @@ export function ChatPanel({
   const lastStepAt = agentSteps.length > 0
     ? Math.max(...agentSteps.map((s) => new Date(s.createdAt ?? 0).getTime()))
     : Date.now();
-  const secondsSinceLastStep = Math.floor((nowTick - lastStepAt) / 1000);
+  const secondsSinceLastStep = Math.max(0, Math.floor((nowTick - lastStepAt) / 1000));
   const isAgentStuck = isAgentRunning && secondsSinceLastStep > 60;
 
   // Auto-abort: se nessun nuovo step parte entro 3 minuti, ferma automaticamente
@@ -954,6 +964,8 @@ export function ChatPanel({
               t={t as (key: string) => string}
               onConfirm={handleConfirmAgent}
               streamingToken={agentRun.status === "running" ? streamingToken : undefined}
+              narrationWarnAfterMs={narrationWarnAfterMs}
+              narrationWarnAfterChars={narrationWarnAfterChars}
             />
           )}
 

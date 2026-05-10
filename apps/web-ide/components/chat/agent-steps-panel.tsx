@@ -7,6 +7,72 @@ import { MarkdownBlock } from "./markdown-renderer";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
+// Fallback hardcoded usati se il backend non restituisce i valori da settings DB.
+// I valori configurabili sono in: settings.agent_narration_warn_after_ms / _after_chars
+const NARRATION_WARN_AFTER_MS_DEFAULT = 30_000;
+const NARRATION_WARN_AFTER_CHARS_DEFAULT = 1500;
+
+function NarrationStatusBadge({
+  startedAtIso,
+  charCount,
+  tc,
+  warnAfterMs = NARRATION_WARN_AFTER_MS_DEFAULT,
+  warnAfterChars = NARRATION_WARN_AFTER_CHARS_DEFAULT,
+}: {
+  startedAtIso: string;
+  charCount: number;
+  tc: ThemeColors;
+  warnAfterMs?: number;
+  warnAfterChars?: number;
+}) {
+  const [, forceTick] = React.useReducer((n: number) => n + 1, 0);
+  React.useEffect(() => {
+    const id = window.setInterval(() => forceTick(), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  const elapsedMs = Math.max(0, Date.now() - new Date(startedAtIso).getTime());
+  const isWarn = elapsedMs >= warnAfterMs || charCount >= warnAfterChars;
+  const seconds = Math.floor(elapsedMs / 1000);
+  return (
+    <div
+      style={{
+        fontSize: 11,
+        fontWeight: 500,
+        color: isWarn ? "#f59e0b" : tc.textMuted,
+        background: isWarn ? "#f59e0b22" : `${tc.border}30`,
+        border: `1px solid ${isWarn ? "#f59e0b66" : tc.border}`,
+        borderRadius: 6,
+        padding: "4px 8px",
+        marginBottom: 6,
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+      }}
+      title={
+        isWarn
+          ? "L'agente sta producendo solo testo senza chiamare tool. Possibile loop di narrazione (annuncio-senza-azione)."
+          : "L'agente sta ragionando, nessuna tool call effettuata finora."
+      }
+    >
+      <span
+        style={{
+          width: 6,
+          height: 6,
+          borderRadius: "50%",
+          background: isWarn ? "#f59e0b" : "#22c55e",
+          animation: isWarn ? "pulse 1s infinite" : undefined,
+          flex: "none",
+        }}
+      />
+      <span>
+        {isWarn
+          ? `Solo testo da ${seconds}s (${charCount} char) · possibile narrazione a vuoto`
+          : `Ragionamento in corso · ${seconds}s · nessun tool chiamato`}
+      </span>
+    </div>
+  );
+}
+
 export interface AgentStepsPanelProps {
   agentRun: AgentRunInfo;
   agentSteps: AgentStep[];
@@ -17,6 +83,9 @@ export interface AgentStepsPanelProps {
   agentRuns?: Map<string, AgentRunInfo>;
   agentStepsMap?: Map<string, AgentStep[]>;
   streamingToken?: string;
+  // Soglie per il badge di narrazione — lette da settings DB, fallback ai default hardcoded
+  narrationWarnAfterMs?: number;
+  narrationWarnAfterChars?: number;
 }
 
 function SingleRunPanel({
@@ -27,6 +96,8 @@ function SingleRunPanel({
   onConfirm,
   label,
   streamingToken,
+  narrationWarnAfterMs,
+  narrationWarnAfterChars,
 }: {
   run: AgentRunInfo;
   steps: AgentStep[];
@@ -35,6 +106,8 @@ function SingleRunPanel({
   onConfirm: (runId: string, approved: boolean) => void;
   label?: string;
   streamingToken?: string;
+  narrationWarnAfterMs?: number;
+  narrationWarnAfterChars?: number;
 }) {
   const [expandedMetrics, setExpandedMetrics] = React.useState(false);
   const [expandedStepIndex, setExpandedStepIndex] = React.useState<number | null>(null);
@@ -488,6 +561,15 @@ function SingleRunPanel({
       )}
       {run.status === "running" && streamingToken && (
         <div style={{ color: tc.text, fontSize: 13, wordBreak: "break-word" }}>
+          {steps.length === 0 && (
+            <NarrationStatusBadge
+              startedAtIso={run.createdAt}
+              charCount={streamingToken.length}
+              tc={tc}
+              warnAfterMs={narrationWarnAfterMs}
+              warnAfterChars={narrationWarnAfterChars}
+            />
+          )}
           <MarkdownBlock content={streamingToken} />
           <span
             style={{
@@ -525,6 +607,8 @@ export function AgentStepsPanel({
   agentRuns,
   agentStepsMap,
   streamingToken,
+  narrationWarnAfterMs,
+  narrationWarnAfterChars,
 }: AgentStepsPanelProps) {
   const [activeTab, setActiveTab] = useState<string>(agentRun.runId);
 
@@ -649,6 +733,8 @@ export function AgentStepsPanel({
           onConfirm={onConfirm}
           label={isMulti ? activeRunData.label : ""}
           streamingToken={activeRunData.run.runId === agentRun.runId ? streamingToken : undefined}
+          narrationWarnAfterMs={narrationWarnAfterMs}
+          narrationWarnAfterChars={narrationWarnAfterChars}
         />
       )}
     </div>
