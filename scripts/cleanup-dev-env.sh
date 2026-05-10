@@ -20,6 +20,16 @@
 
 set -euo pipefail
 
+# ── Setup PATH per tool di sviluppo ──────────────────────────────────────────
+# Lo script gira in non-interactive shell, che non sourccia .bashrc. Carichiamo
+# esplicitamente gli env per cargo, pnpm, node — installati sotto $HOME.
+# shellcheck disable=SC1091
+[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
+# nvm può lasciare variabili non definite, disattivo set -u durante il source
+# shellcheck disable=SC1091
+[ -f "$HOME/.nvm/nvm.sh" ] && { set +u; source "$HOME/.nvm/nvm.sh"; set -u; }
+export PATH="$HOME/.cargo/bin:$HOME/.local/share/pnpm:$HOME/.local/bin:/usr/local/bin:$PATH"
+
 # ── Costanti ────────────────────────────────────────────────────────────────
 readonly REPO_ROOT="/home/administrator/ideai"
 readonly BACKUP_DIR="/home/administrator/backups"
@@ -102,6 +112,18 @@ preflight() {
         exit 1
     fi
     ok "Docker raggiungibile"
+
+    # Tool di sviluppo (cargo, pnpm) servono ai passi 5-6
+    if command -v cargo >/dev/null 2>&1; then
+        ok "cargo: $(command -v cargo) ($(cargo --version 2>/dev/null | head -1))"
+    else
+        warn "cargo non trovato nel PATH — il passo 'cargo clean' verra' saltato"
+    fi
+    if command -v pnpm >/dev/null 2>&1; then
+        ok "pnpm: $(command -v pnpm) ($(pnpm --version 2>/dev/null))"
+    else
+        warn "pnpm non trovato nel PATH — il passo 'node_modules reinstall' verra' saltato"
+    fi
 
     # Backup dir
     mkdir -p "$BACKUP_DIR"
@@ -226,6 +248,11 @@ cleanup_target() {
     CURRENT_STEP="cargo-clean"
     log "═══ cargo clean (recupera ~18 GB) ═══"
 
+    if ! command -v cargo >/dev/null 2>&1; then
+        warn "cargo non disponibile, skip step"
+        return 0
+    fi
+
     if [ ! -d "$REPO_ROOT/target" ]; then
         ok "target/ già pulito (no-op)"
         return 0
@@ -241,7 +268,10 @@ cleanup_target() {
     fi
 
     cd "$REPO_ROOT"
-    cargo clean --workspace >>"$LOG_FILE" 2>&1
+    if ! cargo clean --workspace >>"$LOG_FILE" 2>&1; then
+        err "cargo clean fallito (vedi $LOG_FILE)"
+        return 1
+    fi
     ok "cargo clean completato"
 
     if [ -d "$REPO_ROOT/target" ]; then
@@ -255,6 +285,11 @@ cleanup_target() {
 cleanup_node_modules() {
     CURRENT_STEP="node-modules-clean-install"
     log "═══ Reinstall pulito di node_modules ═══"
+
+    if ! command -v pnpm >/dev/null 2>&1; then
+        warn "pnpm non disponibile, skip step"
+        return 0
+    fi
 
     if ! confirm "Pulire e reinstallare TUTTI i node_modules del monorepo? Puo' richiedere 3-5 min"; then
         warn "Skip node_modules clean install"
