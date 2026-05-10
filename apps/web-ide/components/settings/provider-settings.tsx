@@ -444,24 +444,27 @@ export function ProviderSettings({
 
               <div style={{ color: "var(--color-textMuted)", fontSize: 12, marginBottom: 6 }}>{setting.description}</div>
 
-              {setting.key === "google_batch_api_enabled" ? (
+              {(currentValue === "true" || currentValue === "false") && !setting.is_secret ? (
+                /* Toggle generico: cattura automaticamente qualsiasi setting con valore true/false */
                 <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4 }}>
                   <button
                     onClick={() => {
                       const newVal = currentValue === "true" ? "false" : "true";
-                      onEditChange(setting.key, newVal);
+                      void onSaveImmediate(setting.key, newVal);
                     }}
+                    disabled={isSaving}
                     style={{
                       width: 44,
                       height: 24,
                       borderRadius: 12,
                       border: "none",
                       background: currentValue === "true" ? tc.success : tc.bgInput,
-                      cursor: "pointer",
+                      cursor: isSaving ? "not-allowed" : "pointer",
                       position: "relative",
                       transition: "background 0.2s",
                       flexShrink: 0,
                       outline: `1px solid ${tc.border}`,
+                      opacity: isSaving ? 0.7 : 1,
                     }}
                     title={currentValue === "true" ? "Attivo — clicca per disabilitare" : "Non attivo — clicca per abilitare"}
                   >
@@ -479,48 +482,11 @@ export function ProviderSettings({
                       }}
                     />
                   </button>
-                  <span style={{ fontSize: 12, color: "var(--color-textSecondary)" }}>
-                    {currentValue === "true" ? "Abilitata (50% costo rispetto alle chiamate sincrone)" : "Disabilitata"}
+                  <span style={{ fontSize: 12, color: currentValue === "true" ? tc.success : "var(--color-textMuted)" }}>
+                    {currentValue === "true" ? "ON" : "OFF"}
                   </span>
-                </div>
-              ) : setting.key === "quality_auto_scan" ? (
-                <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4, flexWrap: "wrap" }}>
-                  <button
-                    onClick={() => {
-                      const newVal = currentValue === "true" ? "false" : "true";
-                      onEditChange(setting.key, newVal);
-                    }}
-                    style={{
-                      width: 44,
-                      height: 24,
-                      borderRadius: 12,
-                      border: "none",
-                      background: currentValue === "true" ? tc.success : tc.bgInput,
-                      cursor: "pointer",
-                      position: "relative",
-                      transition: "background 0.2s",
-                      flexShrink: 0,
-                      outline: `1px solid ${tc.border}`,
-                    }}
-                    title={currentValue === "true" ? "Attivo — clicca per disabilitare" : "Non attivo — clicca per abilitare"}
-                  >
-                    <span
-                      style={{
-                        position: "absolute",
-                        top: 3,
-                        left: currentValue === "true" ? 23 : 3,
-                        width: 18,
-                        height: 18,
-                        borderRadius: "50%",
-                        background: "#fff",
-                        transition: "left 0.2s",
-                        boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
-                      }}
-                    />
-                  </button>
-                  <span style={{ fontSize: 12, color: "var(--color-textSecondary)" }}>
-                    {currentValue === "true" ? "Auto-scan attivo" : "Auto-scan disattivo"}
-                  </span>
+                  {isSaving && <span style={{ fontSize: 10, color: "var(--color-textMuted)" }}>...</span>}
+                  {isSaved && <span style={{ fontSize: 10, color: tc.success }}>✓</span>}
                 </div>
               ) : setting.key === "quality_severity_threshold" ? (
                 <select

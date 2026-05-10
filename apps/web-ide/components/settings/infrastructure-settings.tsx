@@ -129,6 +129,8 @@ interface InfrastructureSettingsProps {
   onSave: (key: string) => void;
   /** For browsing directories (projects_base_root) */
   onOpenBrowse?: (currentValue: string) => void;
+  /** Salvataggio immediato senza passare per editValues (usato dai toggle) */
+  onSaveImmediate?: (key: string, value: string) => void;
 }
 
 export function InfrastructureSettings({
@@ -139,6 +141,7 @@ export function InfrastructureSettings({
   onEditChange,
   onSave,
   onOpenBrowse,
+  onSaveImmediate,
 }: InfrastructureSettingsProps) {
   const tc = useThemeColors();
   const { resolved } = useTheme();
@@ -441,6 +444,50 @@ export function InfrastructureSettings({
   function renderSettingInput(setting: SettingEntry) {
     const currentValue = editValues[setting.key] ?? setting.value;
     const isEdited = editValues[setting.key] !== undefined && editValues[setting.key] !== setting.value;
+    const isSaving = saving[setting.key] ?? false;
+    const isSaved = saved[setting.key] ?? false;
+
+    // Toggle per valori booleani (true/false)
+    if ((currentValue === "true" || currentValue === "false") && !setting.is_secret) {
+      return (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4 }}>
+          <button
+            onClick={() => {
+              const newVal = currentValue === "true" ? "false" : "true";
+              if (onSaveImmediate) {
+                void onSaveImmediate(setting.key, newVal);
+              } else {
+                onEditChange(setting.key, newVal);
+                setTimeout(() => onSave(setting.key), 50);
+              }
+            }}
+            disabled={isSaving}
+            style={{
+              width: 44, height: 24, borderRadius: 12, border: "none",
+              background: currentValue === "true" ? tc.success : tc.bgInput,
+              cursor: isSaving ? "not-allowed" : "pointer",
+              position: "relative", transition: "background 0.2s",
+              flexShrink: 0, outline: `1px solid ${tc.border}`,
+              opacity: isSaving ? 0.7 : 1,
+            }}
+            title={currentValue === "true" ? "Attivo — clicca per disabilitare" : "Non attivo — clicca per abilitare"}
+          >
+            <span style={{
+              position: "absolute", top: 3,
+              left: currentValue === "true" ? 23 : 3,
+              width: 18, height: 18, borderRadius: "50%",
+              background: "#fff", transition: "left 0.2s",
+              boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
+            }} />
+          </button>
+          <span style={{ fontSize: 12, color: currentValue === "true" ? tc.success : "var(--color-textMuted)" }}>
+            {currentValue === "true" ? "ON" : "OFF"}
+          </span>
+          {isSaving && <span style={{ fontSize: 10, color: "var(--color-textMuted)" }}>...</span>}
+          {isSaved && <span style={{ fontSize: 10, color: tc.success }}>✓</span>}
+        </div>
+      );
+    }
 
     return (
       <div className="flex-row" style={{ gap: 8, alignItems: "center" }}>

@@ -14,7 +14,7 @@ import { getGatewayProviders } from "../../lib/api-client";
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
 
-export const CATEGORY_ORDER = ["providers", "routing", "security", "infrastructure", "embeddings", "quality", "learning", "auth", "custom"];
+export const CATEGORY_ORDER = ["providers", "routing", "security", "infrastructure", "embeddings", "quality", "learning", "agent", "optimizer", "reflection", "auth", "custom"];
 
 interface SettingsPanelProps {
   category?: string;
@@ -324,6 +324,7 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
           saved={saved}
           onEditChange={(key, value) => setEditValues((current) => ({ ...current, [key]: value }))}
           onSave={handleSave}
+          onSaveImmediate={handleSaveImmediate}
           onOpenBrowse={(currentValue) => {
             setIsBrowsingRoot(true);
             if (!browseData) {
