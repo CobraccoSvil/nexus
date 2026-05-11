@@ -143,6 +143,7 @@ fn to_message_view(row: &sqlx::postgres::PgRow) -> Result<ChatMessageView, ApiEr
             .map(ToOwned::to_owned),
         run_id: metadata
             .get("runId")
+            .or_else(|| metadata.get("agentRunId"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         prompt_tokens: metadata.get("promptTokens").and_then(Value::as_i64),
@@ -2798,6 +2799,7 @@ pub async fn feedback_error(
         .map(ToOwned::to_owned);
     let run_id = metadata
         .get("runId")
+        .or_else(|| metadata.get("agentRunId"))
         .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok());
 

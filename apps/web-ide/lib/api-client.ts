@@ -152,7 +152,7 @@ export interface ChatMessage {
   totalTokens?: number;
   totalCost?: number;
   currency?: string;
-  automationMode?: "study" | "confirm" | "automatic";
+  automationMode?: "study" | "confirm" | "automatic" | "agent";
   resendOfMessageId?: string;
 }
 

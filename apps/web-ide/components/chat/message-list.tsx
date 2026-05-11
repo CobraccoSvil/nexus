@@ -696,7 +696,7 @@ export function MessageList({
             </div>
 
             {/* Pannello step agente (caricamento lazy dal DB) */}
-            {!isUser && message.runId && (
+            {!isUser && message.runId && message.automationMode === "agent" && (
               <AgentRunStepsInline runId={message.runId} tc={tc} />
             )}
 
