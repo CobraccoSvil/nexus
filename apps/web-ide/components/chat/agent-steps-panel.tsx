@@ -12,6 +12,82 @@ type ThemeColors = ReturnType<typeof useThemeColors>;
 const NARRATION_WARN_AFTER_MS_DEFAULT = 30_000;
 const NARRATION_WARN_AFTER_CHARS_DEFAULT = 1500;
 
+/** Troncamento intelligente: mostra i primi N caratteri con toggle "mostra tutto". */
+function TruncatedContent({
+  content,
+  maxChars = 500,
+  tc,
+  mono = false,
+}: {
+  content: string;
+  maxChars?: number;
+  tc: ThemeColors;
+  mono?: boolean;
+}) {
+  const [expanded, setExpanded] = React.useState(false);
+  const isTruncated = content.length > maxChars;
+  const display = expanded || !isTruncated ? content : content.slice(0, maxChars) + "...";
+
+  return (
+    <div>
+      <pre
+        style={{
+          fontFamily: mono ? "monospace" : "inherit",
+          fontSize: 11,
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+          margin: 0,
+          maxHeight: expanded ? 600 : 200,
+          overflowY: "auto",
+          color: tc.text,
+          background: `${tc.bgInput}60`,
+          borderRadius: 4,
+          padding: "6px 8px",
+        }}
+      >
+        {display}
+      </pre>
+      {isTruncated && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          style={{
+            fontSize: 10,
+            color: tc.accent,
+            background: "none",
+            border: "none",
+            cursor: "pointer",
+            padding: "2px 0",
+            fontWeight: 600,
+          }}
+        >
+          {expanded ? "Comprimi" : `Mostra tutto (${content.length.toLocaleString()} car.)`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** Formatta tool input come testo leggibile, nascondendo payload enormi. */
+function formatToolInput(input: Record<string, unknown>): string {
+  const lines: string[] = [];
+  for (const [key, value] of Object.entries(input)) {
+    if (typeof value === "string" && value.length > 300) {
+      lines.push(`${key}: [${value.length} car.]`);
+    } else if (typeof value === "object" && value !== null) {
+      const json = JSON.stringify(value);
+      if (json.length > 300) {
+        lines.push(`${key}: [oggetto, ${json.length} car.]`);
+      } else {
+        lines.push(`${key}: ${json}`);
+      }
+    } else {
+      lines.push(`${key}: ${String(value)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
 function NarrationStatusBadge({
   startedAtIso,
   charCount,
@@ -295,6 +371,14 @@ function SingleRunPanel({
 
             return groups.map(({ step, count, firstIndex, lastIndex }) => {
               const hasExtendedMetrics = step.usage || step.costUsd || step.latencyMs || step.temperature !== undefined;
+              const hasToolDetail = step.toolInput && Object.keys(step.toolInput).length > 0;
+              const hasToolResult = Boolean(step.toolResult);
+              const isExpandable = hasExtendedMetrics || hasToolDetail || hasToolResult;
+              const isExpanded = expandedStepIndex === step.stepIndex;
+              const statusBorderColor =
+                step.status === "failed" ? tc.error :
+                step.status === "running" ? tc.accent :
+                "#22c55e";
 
               return (
                 <div
@@ -306,27 +390,27 @@ function SingleRunPanel({
                   }}
                 >
                   <div
-                    onClick={() => hasExtendedMetrics && setExpandedStepIndex(expandedStepIndex === step.stepIndex ? null : step.stepIndex)}
+                    onClick={() => isExpandable && setExpandedStepIndex(isExpanded ? null : step.stepIndex)}
                     style={{
                       display: "flex",
                       alignItems: "center",
                       gap: 6,
                       fontSize: 12,
                       color: step.status === "failed" ? tc.error : tc.textSecondary,
-                      cursor: hasExtendedMetrics ? "pointer" : "default",
-                      padding: hasExtendedMetrics ? "2px 4px" : "0",
+                      cursor: isExpandable ? "pointer" : "default",
+                      padding: isExpandable ? "2px 4px" : "0",
                       borderRadius: 3,
                       transition: "background 0.15s",
-                      background: expandedStepIndex === step.stepIndex ? `${tc.border}15` : "transparent",
+                      background: isExpanded ? `${tc.border}15` : "transparent",
                     }}
                     onMouseEnter={(e) => {
-                      if (hasExtendedMetrics && e.currentTarget instanceof HTMLElement) {
+                      if (isExpandable && e.currentTarget instanceof HTMLElement) {
                         e.currentTarget.style.background = `${tc.border}20`;
                       }
                     }}
                     onMouseLeave={(e) => {
-                      if (hasExtendedMetrics && e.currentTarget instanceof HTMLElement) {
-                        e.currentTarget.style.background = expandedStepIndex === step.stepIndex ? `${tc.border}15` : "transparent";
+                      if (isExpandable && e.currentTarget instanceof HTMLElement) {
+                        e.currentTarget.style.background = isExpanded ? `${tc.border}15` : "transparent";
                       }
                     }}
                   >
@@ -335,16 +419,16 @@ function SingleRunPanel({
                       {count > 1 ? `${firstIndex + 1}–${lastIndex + 1}` : `${firstIndex + 1}.`}
                     </span>
 
-                    {/* Icona expand se ha metriche */}
-                    {hasExtendedMetrics && (
+                    {/* Icona expand */}
+                    {isExpandable && (
                       <span style={{ fontSize: 10, opacity: 0.6, minWidth: 12, textAlign: "center" }}>
-                        {expandedStepIndex === step.stepIndex ? "▼" : "▶"}
+                        {isExpanded ? "▼" : "▶"}
                       </span>
                     )}
 
                     {step.toolName === "supervisor_check" ? (
                       <span style={{ color: "#8b5cf6", fontWeight: 600 }}>
-                        👁 supervisore
+                        supervisore
                       </span>
                     ) : (
                       <span style={{ fontFamily: "monospace" }}>{step.toolName}</span>
@@ -353,7 +437,7 @@ function SingleRunPanel({
                     {step.status === "running" && <span style={{ opacity: 0.6 }}>...</span>}
 
                     {step.status === "completed" && step.toolName !== "supervisor_check" && (
-                      <span style={{ color: "#22c55e" }}>✓</span>
+                      <span style={{ color: "#22c55e" }}>ok</span>
                     )}
                     {step.status === "completed" && step.toolName === "supervisor_check" && step.toolResult && (
                       <span style={{
@@ -364,9 +448,9 @@ function SingleRunPanel({
                         {step.toolResult}
                       </span>
                     )}
-                    {step.status === "failed" && <span style={{ color: tc.error }}>✗</span>}
+                    {step.status === "failed" && <span style={{ color: tc.error }}>errore</span>}
 
-                    {/* Badge contatore — visibile solo se ci sono più step raggruppati */}
+                    {/* Badge contatore */}
                     {count > 1 && (
                       <span style={{
                         marginLeft: 2,
@@ -380,13 +464,13 @@ function SingleRunPanel({
                         fontVariantNumeric: "tabular-nums",
                         lineHeight: "16px",
                       }}>
-                        ×{count}
+                        x{count}
                       </span>
                     )}
                   </div>
 
-                  {/* Dettagli estesi dello step */}
-                  {expandedStepIndex === step.stepIndex && hasExtendedMetrics && (
+                  {/* Dettagli espansi dello step: input, risultato, metriche */}
+                  {isExpanded && (
                     <div
                       style={{
                         marginLeft: 20,
@@ -394,99 +478,122 @@ function SingleRunPanel({
                         paddingRight: 8,
                         paddingTop: 6,
                         paddingBottom: 6,
-                        borderLeft: `2px solid ${tc.border}40`,
+                        borderLeft: `2px solid ${statusBorderColor}40`,
                         fontSize: 11,
                         color: tc.textSecondary,
-                        display: "grid",
-                        gridTemplateColumns: "1fr 1fr",
-                        gap: 6,
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 8,
                       }}
                     >
-                      {/* Token consumati */}
-                      {step.usage && (
-                        <>
-                          {step.usage.promptTokens !== undefined && (
-                            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                              <span style={{ opacity: 0.7 }}>Token in input:</span>
-                              <span style={{ fontFamily: "monospace", fontWeight: 500 }}>
-                                {step.usage.promptTokens.toLocaleString()}
-                              </span>
-                            </div>
+                      {/* Parametri di input del tool */}
+                      {hasToolDetail && (
+                        <div>
+                          <div style={{ fontWeight: 600, marginBottom: 4, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.05em", opacity: 0.7 }}>
+                            Parametri
+                          </div>
+                          <TruncatedContent
+                            content={formatToolInput(step.toolInput)}
+                            maxChars={400}
+                            tc={tc}
+                            mono
+                          />
+                        </div>
+                      )}
+
+                      {/* Risultato del tool */}
+                      {hasToolResult && (
+                        <div>
+                          <div style={{
+                            fontWeight: 600,
+                            marginBottom: 4,
+                            fontSize: 10,
+                            textTransform: "uppercase",
+                            letterSpacing: "0.05em",
+                            opacity: 0.7,
+                            color: step.status === "failed" ? tc.error : undefined,
+                          }}>
+                            {step.status === "failed" ? "Errore" : "Risultato"}
+                          </div>
+                          <TruncatedContent
+                            content={step.toolResult!}
+                            maxChars={500}
+                            tc={tc}
+                            mono
+                          />
+                        </div>
+                      )}
+
+                      {/* Placeholder per step in corso */}
+                      {step.status === "running" && !hasToolResult && (
+                        <div style={{ fontStyle: "italic", fontSize: 11, opacity: 0.6 }}>
+                          In attesa di risultato...
+                        </div>
+                      )}
+
+                      {/* Metriche estese (se presenti) */}
+                      {hasExtendedMetrics && (
+                        <div
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "1fr 1fr",
+                            gap: 6,
+                            paddingTop: 4,
+                            borderTop: `1px solid ${tc.border}30`,
+                          }}
+                        >
+                          {step.usage && (
+                            <>
+                              {step.usage.promptTokens !== undefined && (
+                                <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                                  <span style={{ opacity: 0.7 }}>Token in:</span>
+                                  <span style={{ fontFamily: "monospace", fontWeight: 500 }}>
+                                    {step.usage.promptTokens.toLocaleString()}
+                                  </span>
+                                </div>
+                              )}
+                              {step.usage.completionTokens !== undefined && (
+                                <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                                  <span style={{ opacity: 0.7 }}>Token out:</span>
+                                  <span style={{ fontFamily: "monospace", fontWeight: 500 }}>
+                                    {step.usage.completionTokens.toLocaleString()}
+                                  </span>
+                                </div>
+                              )}
+                              {step.usage.cacheReadTokens !== undefined && step.usage.cacheReadTokens > 0 && (
+                                <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                                  <span style={{ opacity: 0.7 }}>Cache letti:</span>
+                                  <span style={{ fontFamily: "monospace", fontWeight: 500, color: "#22c55e" }}>
+                                    {step.usage.cacheReadTokens.toLocaleString()}
+                                  </span>
+                                </div>
+                              )}
+                            </>
                           )}
-                          {step.usage.completionTokens !== undefined && (
+                          {step.costUsd !== undefined && (
                             <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                              <span style={{ opacity: 0.7 }}>Token in output:</span>
-                              <span style={{ fontFamily: "monospace", fontWeight: 500 }}>
-                                {step.usage.completionTokens.toLocaleString()}
-                              </span>
-                            </div>
-                          )}
-                          {step.usage.totalTokens !== undefined && (
-                            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                              <span style={{ opacity: 0.7 }}>Totale token:</span>
+                              <span style={{ opacity: 0.7 }}>Costo:</span>
                               <span style={{ fontFamily: "monospace", fontWeight: 600 }}>
-                                {step.usage.totalTokens.toLocaleString()}
+                                ${step.costUsd.toFixed(6)}
                               </span>
                             </div>
                           )}
-                          {step.usage.cacheReadTokens !== undefined && step.usage.cacheReadTokens > 0 && (
+                          {step.latencyMs !== undefined && (
                             <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                              <span style={{ opacity: 0.7 }}>Letture da cache:</span>
-                              <span style={{ fontFamily: "monospace", fontWeight: 500, color: "#22c55e" }}>
-                                {step.usage.cacheReadTokens.toLocaleString()}
+                              <span style={{ opacity: 0.7 }}>Latenza:</span>
+                              <span style={{ fontFamily: "monospace", fontWeight: 500 }}>
+                                {step.latencyMs}ms
                               </span>
                             </div>
                           )}
-                        </>
-                      )}
-
-                      {/* Costo */}
-                      {step.costUsd !== undefined && (
-                        <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                          <span style={{ opacity: 0.7 }}>Costo:</span>
-                          <span style={{ fontFamily: "monospace", fontWeight: 600 }}>
-                            ${step.costUsd.toFixed(6)}
-                          </span>
-                        </div>
-                      )}
-
-                      {/* Latency */}
-                      {step.latencyMs !== undefined && (
-                        <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                          <span style={{ opacity: 0.7 }}>Latenza:</span>
-                          <span style={{ fontFamily: "monospace", fontWeight: 500 }}>
-                            {step.latencyMs}ms
-                          </span>
-                        </div>
-                      )}
-
-                      {/* Temperature */}
-                      {step.temperature !== undefined && (
-                        <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                          <span style={{ opacity: 0.7 }}>Temperatura:</span>
-                          <span style={{ fontFamily: "monospace", fontWeight: 500 }}>
-                            {step.temperature.toFixed(2)}
-                          </span>
-                        </div>
-                      )}
-
-                      {/* Top P */}
-                      {step.topP !== undefined && (
-                        <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                          <span style={{ opacity: 0.7 }}>Top P:</span>
-                          <span style={{ fontFamily: "monospace", fontWeight: 500 }}>
-                            {step.topP.toFixed(2)}
-                          </span>
-                        </div>
-                      )}
-
-                      {/* Timestamp */}
-                      {step.createdAt && (
-                        <div style={{ display: "flex", gap: 4, alignItems: "center", gridColumn: "1 / -1", fontSize: 10 }}>
-                          <span style={{ opacity: 0.6 }}>Eseguito:</span>
-                          <span style={{ fontFamily: "monospace", color: tc.textMuted }}>
-                            {new Date(step.createdAt).toLocaleTimeString()}
-                          </span>
+                          {step.createdAt && (
+                            <div style={{ display: "flex", gap: 4, alignItems: "center", gridColumn: "1 / -1", fontSize: 10 }}>
+                              <span style={{ opacity: 0.6 }}>Eseguito:</span>
+                              <span style={{ fontFamily: "monospace", color: tc.textMuted }}>
+                                {new Date(step.createdAt).toLocaleTimeString()}
+                              </span>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>

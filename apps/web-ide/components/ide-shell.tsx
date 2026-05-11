@@ -52,7 +52,7 @@ import { useGlobalDialog } from "./global-dialog-provider";
 import { useMultiChat } from "../lib/use-multi-chat";
 import { useProfiles, DEFAULT_PROFILE_ID } from "../lib/use-profiles";
 import { ProjectSwitcher } from "./project-switcher";
-import { UserHeader } from "./user-header";
+import { UserSidebarMenu } from "./user-header";
 import type { SidebarView } from "./sidebar/sidebar-manager";
 import type { PanelTab } from "./panels/bottom-panel-manager";
 import { TruncatedText } from "./truncated-text";
@@ -1623,7 +1623,20 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           rowGap: isMobileViewport ? 6 : 0,
         }}
       >
-        <strong style={{ fontSize: 13, letterSpacing: "0.08em", color: tc.text }}>NEXUS</strong>
+        <a
+          href="/?site"
+          title="Vedi sito"
+          style={{
+            fontSize: 13,
+            letterSpacing: "0.08em",
+            color: tc.text,
+            fontWeight: 700,
+            textDecoration: "none",
+            cursor: "pointer",
+          }}
+        >
+          NEXUS
+        </a>
         <TruncatedText
           text={activeProject?.name ?? "Nessun progetto"}
           maxWidth={220}
@@ -1669,7 +1682,6 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
         >
           {isFullscreen ? "🗗" : "🗖"}
         </button>
-        <UserHeader />
         <div style={{ flex: 1, minWidth: 0, order: isMobileViewport ? 10 : 0 }}>
           <ProjectSwitcher
             projects={projects}
@@ -1886,6 +1898,12 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
             {item.icon}
           </button>
         ))}
+
+        {/* Spacer per spingere il menu utente in fondo */}
+        <div style={{ flex: 1 }} />
+
+        {/* Menu utente in fondo alla activity bar */}
+        <UserSidebarMenu buttonSize={activityButtonSize} tc={tc} />
       </aside>
 
       {/* ── Primary sidebar ───────────────────────────────────────────────── */}

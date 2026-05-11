@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import type { RefObject } from "react";
-import type { ChatMessage } from "../../lib/api-client";
+import type { ChatMessage, AgentRunInfo, AgentStep } from "../../lib/api-client";
+import { getAgentRun } from "../../lib/api-client";
 import type { useThemeColors } from "../../lib/theme";
 import { MarkdownBlock } from "./markdown-renderer";
 
@@ -183,6 +184,272 @@ function RunSummaryGroup({ messages, tc }: { messages: ChatMessage[]; tc: ThemeC
               </div>
             );
           })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Pannello step agente inline (caricamento lazy da DB via runId) ──
+
+function StepStatusBadge({ status, tc }: { status: AgentStep["status"]; tc: ThemeColors }) {
+  const config: Record<string, { label: string; color: string; bg: string }> = {
+    completed: { label: "ok", color: "#22c55e", bg: "#22c55e18" },
+    failed: { label: "errore", color: tc.error, bg: `${tc.error}18` },
+    running: { label: "in corso", color: tc.accent, bg: `${tc.accent}18` },
+    skipped: { label: "saltato", color: tc.textMuted, bg: `${tc.border}20` },
+    provider_unavailable: { label: "provider n/d", color: "#f59e0b", bg: "#f59e0b18" },
+    awaiting_confirmation: { label: "in attesa", color: "#8b5cf6", bg: "#8b5cf618" },
+  };
+  const c = config[status] ?? config.running;
+  return (
+    <span style={{
+      fontSize: 10,
+      fontWeight: 600,
+      color: c.color,
+      background: c.bg,
+      borderRadius: 4,
+      padding: "1px 5px",
+      whiteSpace: "nowrap",
+    }}>
+      {c.label}
+    </span>
+  );
+}
+
+function InlineTruncated({ text, maxLen = 400, tc, mono = true }: { text: string; maxLen?: number; tc: ThemeColors; mono?: boolean }) {
+  const [full, setFull] = useState(false);
+  const truncated = text.length > maxLen;
+  const display = full || !truncated ? text : text.slice(0, maxLen) + "...";
+  return (
+    <div>
+      <pre style={{
+        fontFamily: mono ? "monospace" : "inherit",
+        fontSize: 11,
+        whiteSpace: "pre-wrap",
+        wordBreak: "break-word",
+        margin: 0,
+        maxHeight: full ? 500 : 160,
+        overflowY: "auto",
+        color: tc.text,
+        background: `${tc.bgInput ?? tc.border}40`,
+        borderRadius: 4,
+        padding: "4px 6px",
+      }}>
+        {display}
+      </pre>
+      {truncated && (
+        <button
+          type="button"
+          onClick={() => setFull(v => !v)}
+          style={{ fontSize: 10, color: tc.accent, background: "none", border: "none", cursor: "pointer", padding: "2px 0", fontWeight: 600 }}
+        >
+          {full ? "Comprimi" : `Mostra tutto (${text.length.toLocaleString()} car.)`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function formatStepInput(input: Record<string, unknown>): string {
+  const lines: string[] = [];
+  for (const [key, val] of Object.entries(input)) {
+    if (typeof val === "string" && val.length > 300) {
+      lines.push(`${key}: [${val.length} car.]`);
+    } else if (typeof val === "object" && val !== null) {
+      const j = JSON.stringify(val);
+      lines.push(j.length > 300 ? `${key}: [oggetto, ${j.length} car.]` : `${key}: ${j}`);
+    } else {
+      lines.push(`${key}: ${String(val)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function AgentRunStepsInline({ runId, tc }: { runId: string; tc: ThemeColors }) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [runInfo, setRunInfo] = useState<AgentRunInfo | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [expandedIdx, setExpandedIdx] = useState<number | null>(null);
+
+  const load = useCallback(async () => {
+    if (runInfo) { setOpen(v => !v); return; }
+    setLoading(true);
+    setError(null);
+    try {
+      const info = await getAgentRun(runId);
+      setRunInfo(info);
+      setOpen(true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Errore nel caricamento");
+    } finally {
+      setLoading(false);
+    }
+  }, [runId, runInfo]);
+
+  const steps = runInfo?.steps ?? [];
+
+  return (
+    <div style={{ marginTop: 6 }}>
+      <button
+        type="button"
+        onClick={load}
+        disabled={loading}
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 5,
+          fontSize: 11,
+          fontWeight: 600,
+          color: tc.accent,
+          background: `${tc.accent}10`,
+          border: `1px solid ${tc.accent}30`,
+          borderRadius: 6,
+          padding: "3px 10px",
+          cursor: loading ? "wait" : "pointer",
+          transition: "background 0.15s",
+        }}
+      >
+        <span style={{ fontSize: 10 }}>{open ? "▼" : "▶"}</span>
+        {loading
+          ? "Caricamento step..."
+          : runInfo
+            ? `${open ? "Nascondi" : "Mostra"} ${steps.length} step eseguiti`
+            : "Mostra step agente"}
+      </button>
+
+      {error && (
+        <div style={{ fontSize: 11, color: tc.error, marginTop: 4 }}>{error}</div>
+      )}
+
+      {open && runInfo && steps.length > 0 && (
+        <div style={{
+          marginTop: 6,
+          border: `1px solid ${tc.border}`,
+          borderRadius: 8,
+          background: `${tc.bgCard}`,
+          overflow: "hidden",
+        }}>
+          {/* Header riepilogo run */}
+          <div style={{
+            padding: "6px 10px",
+            borderBottom: `1px solid ${tc.border}`,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            fontSize: 11,
+            color: tc.textMuted,
+            flexWrap: "wrap",
+          }}>
+            <span style={{ fontWeight: 600, color: tc.text }}>
+              {runInfo.provider}/{runInfo.model}
+            </span>
+            <StepStatusBadge status={
+              runInfo.status === "completed" ? "completed" :
+              runInfo.status === "failed" ? "failed" : "running"
+            } tc={tc} />
+            <span>{steps.length} step</span>
+            {runInfo.iterationCount > 0 && <span>{runInfo.iterationCount} iterazioni</span>}
+          </div>
+
+          {/* Lista step */}
+          <div style={{ padding: "4px 0" }}>
+            {steps.map((step) => {
+              const isExp = expandedIdx === step.stepIndex;
+              const hasInput = step.toolInput && Object.keys(step.toolInput).length > 0;
+              const hasResult = Boolean(step.toolResult);
+              const clickable = hasInput || hasResult;
+              const borderColor =
+                step.status === "failed" ? tc.error :
+                step.status === "running" ? tc.accent : "#22c55e";
+
+              return (
+                <div key={step.stepIndex}>
+                  {/* Riga step */}
+                  <div
+                    onClick={() => clickable && setExpandedIdx(isExp ? null : step.stepIndex)}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      padding: "4px 10px",
+                      cursor: clickable ? "pointer" : "default",
+                      background: isExp ? `${tc.border}10` : "transparent",
+                      transition: "background 0.12s",
+                    }}
+                    onMouseEnter={(e) => { if (clickable && e.currentTarget instanceof HTMLElement) e.currentTarget.style.background = `${tc.border}18`; }}
+                    onMouseLeave={(e) => { if (clickable && e.currentTarget instanceof HTMLElement) e.currentTarget.style.background = isExp ? `${tc.border}10` : "transparent"; }}
+                  >
+                    <span style={{ minWidth: 22, textAlign: "right", opacity: 0.5, fontSize: 10, fontVariantNumeric: "tabular-nums" }}>
+                      {step.stepIndex + 1}.
+                    </span>
+                    {clickable && (
+                      <span style={{ fontSize: 9, opacity: 0.5, minWidth: 10 }}>
+                        {isExp ? "▼" : "▶"}
+                      </span>
+                    )}
+                    <span style={{ fontFamily: "monospace", fontSize: 11, color: tc.text }}>
+                      {step.toolName}
+                    </span>
+                    <StepStatusBadge status={step.status} tc={tc} />
+                  </div>
+
+                  {/* Dettaglio espanso */}
+                  {isExp && (
+                    <div style={{
+                      marginLeft: 32,
+                      marginRight: 10,
+                      marginBottom: 6,
+                      paddingLeft: 8,
+                      paddingTop: 4,
+                      paddingBottom: 4,
+                      borderLeft: `2px solid ${borderColor}40`,
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 6,
+                    }}>
+                      {hasInput && (
+                        <div>
+                          <div style={{ fontWeight: 600, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.05em", opacity: 0.6, marginBottom: 3 }}>
+                            Parametri
+                          </div>
+                          <InlineTruncated text={formatStepInput(step.toolInput)} tc={tc} />
+                        </div>
+                      )}
+                      {hasResult && (
+                        <div>
+                          <div style={{
+                            fontWeight: 600,
+                            fontSize: 10,
+                            textTransform: "uppercase",
+                            letterSpacing: "0.05em",
+                            opacity: 0.6,
+                            marginBottom: 3,
+                            color: step.status === "failed" ? tc.error : undefined,
+                          }}>
+                            {step.status === "failed" ? "Errore" : "Risultato"}
+                          </div>
+                          <InlineTruncated text={step.toolResult!} maxLen={500} tc={tc} />
+                        </div>
+                      )}
+                      {step.createdAt && (
+                        <div style={{ fontSize: 10, opacity: 0.5, fontFamily: "monospace" }}>
+                          {new Date(step.createdAt).toLocaleTimeString()}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {open && runInfo && steps.length === 0 && (
+        <div style={{ fontSize: 11, color: tc.textMuted, marginTop: 4, fontStyle: "italic" }}>
+          Nessuno step registrato per questo run.
         </div>
       )}
     </div>
@@ -427,6 +694,11 @@ export function MessageList({
                 );
               })()}
             </div>
+
+            {/* Pannello step agente (caricamento lazy dal DB) */}
+            {!isUser && message.runId && (
+              <AgentRunStepsInline runId={message.runId} tc={tc} />
+            )}
 
             {/* Usage badge per messaggi assistant con dati token */}
             {!isUser && (message.totalTokens ?? 0) > 0 && (

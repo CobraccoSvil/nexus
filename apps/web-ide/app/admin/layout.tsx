@@ -79,7 +79,20 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
               <span style={{ fontSize: 18, lineHeight: 1 }}>☰</span>
             </button>
           )}
-          <strong style={{ letterSpacing: "0.08em", fontSize: 14 }}>NEXUS</strong>
+          <a
+            href="/?site"
+            title={t("admin.link.site")}
+            style={{
+              letterSpacing: "0.08em",
+              fontSize: 14,
+              fontWeight: 700,
+              color: tc.text,
+              textDecoration: "none",
+              cursor: "pointer",
+            }}
+          >
+            NEXUS
+          </a>
           <span
             style={{
               padding: "4px 12px",
