@@ -33,6 +33,29 @@ export function UserHeader() {
       <span style={{ fontSize: 12, color: tc.textSecondary }}>
         {user.github_username || user.display_name}
       </span>
+      {/* Link al sito statico (landing page) — sempre visibile */}
+      <a
+        href="/?site"
+        title={t("admin.link.site")}
+        aria-label={t("admin.link.site")}
+        style={{
+          height: 26,
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          borderRadius: 5,
+          border: `1px solid ${tc.border}`,
+          background: "transparent",
+          color: tc.textMuted,
+          fontSize: 11,
+          textDecoration: "none",
+          padding: "0 8px",
+          fontWeight: 600,
+          letterSpacing: "0.04em",
+        }}
+      >
+        SITE
+      </a>
       {user.role === "admin" && !isAdminArea && (
         <a
           href="/admin"

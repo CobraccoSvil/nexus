@@ -114,10 +114,18 @@ class MistralProvider(BaseProvider):
             if system_text:
                 oai_messages.insert(0, {"role": "system", "content": system_text})
 
-            # Modelli Mistral che supportano il function calling / tool use
+            # Modelli Mistral che supportano il function calling / tool use.
             # Riferimento: https://docs.mistral.ai/capabilities/function_calling/
-            TOOL_CAPABLE = ("large", "codestral", "mistral-small", "ministral")
-            supports_tools = any(cap in model for cap in TOOL_CAPABLE)
+            # (ultimo aggiornamento: 2025-05)
+            # - mistral-large-* : sì
+            # - mistral-medium-* : sì
+            # - mistral-small-* : sì
+            # - codestral-*     : sì
+            # - ministral-*     : sì
+            # - open-mistral-nemo: sì (a partire da mistral-nemo-2407)
+            # - open-mistral-7b / mixtral-*: no (modelli deprecati/open weights)
+            _TOOL_CAPABLE = ("large", "medium", "small", "codestral", "ministral", "nemo", "pixtral")
+            supports_tools = any(cap in model.lower() for cap in _TOOL_CAPABLE)
             compressed = compress_tool_list(tools) if tools and supports_tools else []
             oai_tools = [_anthropic_tool_to_openai(t) for t in compressed] if compressed else []
 
@@ -128,15 +136,11 @@ class MistralProvider(BaseProvider):
             }
             if oai_tools:
                 kwargs_call["tools"] = oai_tools
-                # Forza tool use solo se non ci sono ancora risultati di tool nella cronologia.
-                # Senza questo, Codestral risponde in testo puro anche quando riceve le definizioni.
-                # "any" = DEVE chiamare almeno un tool; lo usiamo solo al primo turno
-                # (nessun msg "tool" in history), poi "auto" per permettere terminazione naturale.
-                has_tool_results = any(
-                    m.get("role") == "tool"
-                    for m in oai_messages
-                )
-                kwargs_call["tool_choice"] = "auto" if has_tool_results else "any"
+                # Usa sempre "auto": il modello sceglie liberamente se invocare un tool o
+                # rispondere in testo. "any" forzava la tool call ma causava loop infiniti
+                # di safety-refusal nei modelli small (il modello generava testo invece di
+                # chiamare un tool, riempiendo tutta la finestra di output con ripetizioni).
+                kwargs_call["tool_choice"] = "auto"
 
             response = await client.chat.completions.create(**kwargs_call)
             choice = response.choices[0]
@@ -155,15 +159,32 @@ class MistralProvider(BaseProvider):
 
             # Se finish_reason=length il JSON del tool call è troncato → non tentare il parse
             if choice.finish_reason == "length":
-                logger.error(
-                    "Mistral response TRUNCATED (finish_reason=length): "
-                    "il modello ha raggiunto max_tokens. tool_calls=%s text_len=%d. "
-                    "Restituisco end_turn per evitare parse di JSON incompleto.",
-                    bool(msg.tool_calls), len(text_content),
-                )
+                # Tronca la risposta al primo blocco sensato (<=1500 char) per evitare
+                # di restituire all'utente migliaia di ripetizioni da loop di safety-refusal.
+                truncated_content = (text_content or "").strip()
+                if len(truncated_content) > 1500:
+                    # Prende il testo fino al primo punto fermo o fine paragrafo
+                    cutoff = truncated_content.find("\n\n", 200)
+                    if cutoff == -1:
+                        cutoff = truncated_content.find(". ", 200)
+                    if cutoff == -1 or cutoff > 1500:
+                        cutoff = 1500
+                    truncated_content = truncated_content[: cutoff + 1].strip()
+                    logger.warning(
+                        "Mistral response TRUNCATED (finish_reason=length) — "
+                        "testo originale %d char ridotto a %d char (anti-loop).",
+                        len(text_content), len(truncated_content),
+                    )
+                else:
+                    logger.error(
+                        "Mistral response TRUNCATED (finish_reason=length): "
+                        "il modello ha raggiunto max_tokens. tool_calls=%s text_len=%d. "
+                        "Restituisco end_turn per evitare parse di JSON incompleto.",
+                        bool(msg.tool_calls), len(text_content),
+                    )
                 return ProviderResult(
                     provider=self.name, model=model,
-                    content=text_content or "[Risposta troncata: max_tokens raggiunto. Riprova con un messaggio più breve.]",
+                    content=truncated_content or "[Risposta troncata: max_tokens raggiunto. Riprova con un messaggio più breve.]",
                     metadata={
                         "stop_reason": "end_turn",
                         "tool_use_blocks": [],

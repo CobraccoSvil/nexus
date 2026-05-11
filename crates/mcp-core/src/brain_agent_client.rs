@@ -37,10 +37,102 @@ fn brain_rest_url() -> String {
 /// - Se count >= soglia: invia solo AGENT_TOOLS_JSON (che contiene già
 ///   `nexus_mcp_tool_search` + `nexus_mcp_tool_call`). Il brain usa la
 ///   ricerca semantica per scoprire i tool a runtime — discovery mode.
+/// Fallback hardcoded della whitelist read-only per modalita' `study`.
+/// USATA SOLO se `settings.automation.study_mode_readonly_tools` non e'
+/// leggibile dal DB (DB down all'avvio). Mantenuta minima: l'admin deve
+/// poter ampliare la lista via UI senza redeploy.
+///
+/// La sorgente autoritativa e' `settings.automation.study_mode_readonly_tools`
+/// (mig 0132): CSV di nomi tool. Letta da `load_study_mode_readonly_tools()`.
+const STUDY_MODE_READONLY_TOOLS_FALLBACK: &[&str] = &[
+    "read_file",
+    "read_file_lines",
+    "list_files",
+    "search_in_files",
+    "search_codebase_semantic",
+    "get_project_structure",
+    "git_status",
+    "git_log",
+    "git_diff",
+    "nexus_mcp_tool_search",
+];
+
+/// Legge la whitelist read-only per study mode da `settings`.
+/// Ritorna sempre una lista non vuota: in caso di DB down o chiave assente,
+/// usa il fallback hardcoded `STUDY_MODE_READONLY_TOOLS_FALLBACK`.
+async fn load_study_mode_readonly_tools(db: &PgPool) -> Vec<String> {
+    let csv: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM settings WHERE key = 'automation.study_mode_readonly_tools'"
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    match csv {
+        Some(s) if !s.trim().is_empty() => s
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
+        _ => {
+            tracing::warn!(
+                "load_study_mode_readonly_tools: settings.automation.study_mode_readonly_tools assente, uso fallback ({} tool)",
+                STUDY_MODE_READONLY_TOOLS_FALLBACK.len(),
+            );
+            STUDY_MODE_READONLY_TOOLS_FALLBACK
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        }
+    }
+}
+
+/// Filtra il JSON di tool in base al `automation_mode`.
+///
+/// - `Automatic`: nessun filtro (l'utente vuole massima autonomia)
+/// - `Confirm`: nessun filtro lato Rust — il gating avviene a livello di
+///   HITL nel brain Python (`AwaitingConfirmation` prima di edit/write)
+/// - `Study`: solo tool read-only (filtro difensivo basato sulla whitelist
+///   passata in `readonly_tools_whitelist` — letta da DB dal caller).
+fn filter_tools_by_automation_mode(
+    tools: Value,
+    mode: &crate::orchestrator::AutomationMode,
+    readonly_tools_whitelist: &[String],
+) -> Value {
+    use crate::orchestrator::AutomationMode;
+    match mode {
+        AutomationMode::Automatic | AutomationMode::Confirm => tools,
+        AutomationMode::Study => {
+            // In study, l'agente puo' SOLO leggere/analizzare. Filtriamo
+            // qualunque tool non esplicitamente in whitelist.
+            let arr = match tools.as_array() {
+                Some(a) => a,
+                None => return Value::Array(Vec::new()),
+            };
+            let filtered: Vec<Value> = arr
+                .iter()
+                .filter(|t| {
+                    let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    readonly_tools_whitelist.iter().any(|w| w == name)
+                })
+                .cloned()
+                .collect();
+            tracing::info!(
+                "automation_mode=study: filtrati {} tool → {} read-only esposti (whitelist={} tool)",
+                arr.len(),
+                filtered.len(),
+                readonly_tools_whitelist.len(),
+            );
+            Value::Array(filtered)
+        }
+    }
+}
+
 pub async fn build_tools_json_for_agent(
     db: &PgPool,
     user_id: Uuid,
     project_id: Uuid,
+    automation_mode: &crate::orchestrator::AutomationMode,
 ) -> Value {
     // Legge soglia dal DB
     let hard_limit: i64 = sqlx::query_scalar::<_, String>(
@@ -75,7 +167,7 @@ pub async fn build_tools_json_for_agent(
     let base_tools: Value =
         serde_json::from_str(AGENT_TOOLS_JSON).unwrap_or_else(|_| json!([]));
 
-    if mcp_tool_count < hard_limit && mcp_tool_count > 0 {
+    let full_tools = if mcp_tool_count < hard_limit && mcp_tool_count > 0 {
         // Catalogo piccolo: include le definizioni MCP direttamente
         tracing::debug!(
             "build_tools_json: {} tool MCP < soglia {}, includo definizioni dirette",
@@ -83,11 +175,12 @@ pub async fn build_tools_json_for_agent(
         );
         let mcp_tools = crate::mcp_connectors::load_mcp_tools_for_agent(db, user_id, Some(project_id)).await;
         if mcp_tools.is_empty() {
-            return base_tools;
+            base_tools
+        } else {
+            let mut all = base_tools.as_array().cloned().unwrap_or_default();
+            all.extend(mcp_tools);
+            json!(all)
         }
-        let mut all = base_tools.as_array().cloned().unwrap_or_default();
-        all.extend(mcp_tools);
-        json!(all)
     } else {
         // Discovery mode (catalogo vuoto o >= soglia): solo AGENT_TOOLS_JSON
         // nexus_mcp_tool_search è già incluso — il brain lo usa per scoprire i tool
@@ -98,7 +191,14 @@ pub async fn build_tools_json_for_agent(
             );
         }
         base_tools
-    }
+    };
+
+    // Gating finale per automation_mode: in `study` filtriamo a solo
+    // read-only. `confirm` e `automatic` passano la lista intera.
+    // La whitelist e' letta da `settings.automation.study_mode_readonly_tools`
+    // (mig 0132) — niente lista hardcoded nel codice (regola G CLAUDE.md).
+    let readonly_whitelist = load_study_mode_readonly_tools(db).await;
+    filter_tools_by_automation_mode(full_tools, automation_mode, &readonly_whitelist)
 }
 
 /// Riconosce gli errori del provider AI che indicano "credito esaurito" / "quota
@@ -201,6 +301,11 @@ fn classify_provider_error(
 /// Ritorna un `AgentRunResult` compatibile con quello prodotto da
 /// `AgentLoop::run`, in modo che il chiamante (`spawn_agent_run`)
 /// possa persistere su DB l'esito senza differenze.
+/// Esegue il run agente via brain (SSE streaming).
+///
+/// `sse_max_silence_secs`: soglia silenzio SSE in secondi. Letta dal caller
+/// via `settings.routing.sse_heartbeat_max_silence_secs` (mig 0132).
+/// Tipico: 120s. Range pratico [60, 600]. Il brain emette ping ogni 30s.
 pub async fn run_via_brain(
     run_id: Uuid,
     session_id: Uuid,
@@ -211,6 +316,7 @@ pub async fn run_via_brain(
     step_tx: broadcast::Sender<AgentStepEvent>,
     conversation_history: Vec<serde_json::Value>,
     tools_json: Value,
+    sse_max_silence_secs: u64,
 ) -> AgentRunResult {
     let run_id_str = run_id.to_string();
     let url = format!("{}/agent/run/stream", brain_rest_url().trim_end_matches('/'));
@@ -228,8 +334,14 @@ pub async fn run_via_brain(
         "run_id": run_id_str,
     });
 
+    // Solo connect_timeout: il timeout sulla connessione TCP iniziale.
+    // Il precedente timeout monolitico di 1200s sull'intera request impediva
+    // run legittimamente lunghi (build Rust, Playwright su suite grandi, ecc.).
+    // Il controllo di attivita' e' ora gestito dal timeout per-silence nel
+    // loop SSE: se il brain non emette eventi (inclusi ping heartbeat) per
+    // MAX_SILENCE_SECS secondi, il loop esce considerando il brain bloccato.
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(600))
+        .connect_timeout(Duration::from_secs(30))
         .build()
     {
         Ok(c) => c,
@@ -271,14 +383,34 @@ pub async fn run_via_brain(
     let mut acc_total_tokens: u32 = 0;
     let mut acc_total_cost: f64 = 0.0;
 
-    while let Some(chunk) = stream.next().await {
-        let bytes = match chunk {
-            Ok(b) => b,
-            Err(e) => {
+    // Timeout per-silence: se il brain non emette alcun chunk SSE (inclusi i
+    // ping heartbeat ogni ~30s) per `sse_max_silence_secs` secondi, il run
+    // viene considerato bloccato e il loop esce. Valore letto dal caller via
+    // `settings.routing.sse_heartbeat_max_silence_secs` (mig 0132).
+    // I ping del brain resettano il timer implicitamente: ogni chunk ricevuto
+    // riavvia il wait_for.
+    let max_silence = Duration::from_secs(sse_max_silence_secs);
+    loop {
+        let chunk_opt = tokio::time::timeout(max_silence, stream.next()).await;
+        let bytes = match chunk_opt {
+            Err(_elapsed) => {
+                tracing::warn!(
+                    "brain SSE silenzioso per {}s: run interrotto (brain bloccato?)",
+                    sse_max_silence_secs
+                );
+                last_error = Some(format!(
+                    "brain SSE silenzioso per {}s senza eventi",
+                    sse_max_silence_secs
+                ));
+                break;
+            }
+            Ok(None) => break,
+            Ok(Some(Err(e))) => {
                 tracing::error!("brain SSE stream chunk error: {e}");
                 last_error = Some(format!("SSE chunk: {e}"));
                 break;
             }
+            Ok(Some(Ok(b))) => b,
         };
         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -463,6 +595,13 @@ pub async fn run_via_brain(
 
                     last_stop_reason = Some("error".to_string());
                     last_error = Some(msg);
+                }
+                "ping" => {
+                    // Heartbeat del brain: il run e' ancora attivo.
+                    // Il timer MAX_SILENCE viene resettato implicitamente
+                    // dalla ricezione di questo chunk (tokio::time::timeout
+                    // si riavvia ad ogni Ok). Nessuna azione necessaria.
+                    tracing::debug!("brain SSE ping: run attivo");
                 }
                 _ => {
                     // Eventi sconosciuti: ignoriamo.
@@ -650,5 +789,194 @@ fn fail_result(
         total_cost: 0.0,
         error_class: None,
         stop_reason: Some("error".to_string()),
+    }
+}
+
+// =====================================================================
+// TEST L3: Tool gating per automation_mode
+// =====================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestrator::AutomationMode;
+
+    /// Whitelist di test (replica della seed DB in mig 0132).
+    /// In produzione la whitelist autoritativa viene letta da
+    /// `settings.automation.study_mode_readonly_tools`.
+    fn test_whitelist() -> Vec<String> {
+        vec![
+            "read_file", "read_file_lines", "list_files", "search_in_files",
+            "search_codebase_semantic", "get_project_structure", "get_file_diff",
+            "git_status", "git_log", "git_diff",
+            "list_services", "read_service_output",
+            "nexus_mcp_tool_search", "list_profiles", "get_profile",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+
+    fn make_test_tools() -> Value {
+        json!([
+            { "name": "read_file", "description": "..." },
+            { "name": "list_files", "description": "..." },
+            { "name": "search_in_files", "description": "..." },
+            { "name": "write_file", "description": "..." },
+            { "name": "edit_file", "description": "..." },
+            { "name": "run_command", "description": "..." },
+            { "name": "git_status", "description": "..." },
+            { "name": "git_commit", "description": "..." },
+            { "name": "delete_file", "description": "..." },
+            { "name": "nexus_mcp_tool_search", "description": "..." },
+        ])
+    }
+
+    #[test]
+    fn automatic_mode_non_filtra_nessun_tool() {
+        // Modalita' automatic: l'utente vuole massima autonomia, tutti i
+        // tool restano esposti (write_file, edit_file, run_command, ecc.).
+        let tools = make_test_tools();
+        let original_len = tools.as_array().unwrap().len();
+        let wl = test_whitelist();
+        let filtered = filter_tools_by_automation_mode(tools, &AutomationMode::Automatic, &wl);
+        assert_eq!(filtered.as_array().unwrap().len(), original_len);
+    }
+
+    #[test]
+    fn confirm_mode_non_filtra_lato_rust() {
+        // Confirm: il gating e' a livello HITL nel brain Python (interrupt prima
+        // di edit/write). Lato Rust non filtriamo, esponiamo tutto.
+        let tools = make_test_tools();
+        let original_len = tools.as_array().unwrap().len();
+        let wl = test_whitelist();
+        let filtered = filter_tools_by_automation_mode(tools, &AutomationMode::Confirm, &wl);
+        assert_eq!(filtered.as_array().unwrap().len(), original_len);
+    }
+
+    #[test]
+    fn study_mode_filtra_a_solo_readonly() {
+        // Study: l'agente DEVE solo analizzare. Filtraggio difensivo:
+        // anche se il modello ignora le istruzioni del prompt, NON puo'
+        // chiamare un tool che non gli e' stato esposto.
+        let tools = make_test_tools();
+        let wl = test_whitelist();
+        let filtered = filter_tools_by_automation_mode(tools, &AutomationMode::Study, &wl);
+        let names: Vec<&str> = filtered
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        // Devono restare i tool read-only
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"list_files"));
+        assert!(names.contains(&"search_in_files"));
+        assert!(names.contains(&"git_status"));
+        assert!(names.contains(&"nexus_mcp_tool_search"));
+        // NON devono esserci tool che scrivono / eseguono / eliminano
+        assert!(!names.contains(&"write_file"), "write_file vietato in study");
+        assert!(!names.contains(&"edit_file"), "edit_file vietato in study");
+        assert!(!names.contains(&"run_command"), "run_command vietato in study");
+        assert!(!names.contains(&"git_commit"), "git_commit vietato in study");
+        assert!(!names.contains(&"delete_file"), "delete_file vietato in study");
+    }
+
+    #[test]
+    fn study_mode_su_array_vuoto_ritorna_array_vuoto() {
+        let empty = json!([]);
+        let wl = test_whitelist();
+        let filtered = filter_tools_by_automation_mode(empty, &AutomationMode::Study, &wl);
+        assert!(filtered.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn study_mode_su_non_array_ritorna_array_vuoto() {
+        // Robustezza: se il JSON in input non e' un array (regressione/bug),
+        // ritorniamo array vuoto invece di crashare.
+        let bad = json!({"not": "an array"});
+        let wl = test_whitelist();
+        let filtered = filter_tools_by_automation_mode(bad, &AutomationMode::Study, &wl);
+        assert!(filtered.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn study_mode_whitelist_db_driven_personalizzabile() {
+        // Caso paradigmatico DB-driven: l'admin puo' restringere o ampliare
+        // la whitelist via UPDATE settings senza redeploy. Test simula una
+        // whitelist piu' ristretta.
+        let tools = make_test_tools();
+        let restricted_wl = vec!["read_file".to_string()];
+        let filtered = filter_tools_by_automation_mode(
+            tools,
+            &AutomationMode::Study,
+            &restricted_wl,
+        );
+        let names: Vec<&str> = filtered
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        // Solo read_file passa (whitelist personalizzata)
+        assert_eq!(names, vec!["read_file"]);
+    }
+
+    #[test]
+    fn study_mode_whitelist_vuota_blocca_tutti_i_tool() {
+        // Edge case: se l'admin svuota la whitelist nel DB, l'agente in
+        // study mode non puo' chiamare nessun tool (massima sicurezza).
+        let tools = make_test_tools();
+        let empty_wl: Vec<String> = Vec::new();
+        let filtered = filter_tools_by_automation_mode(
+            tools,
+            &AutomationMode::Study,
+            &empty_wl,
+        );
+        assert!(filtered.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn study_mode_filtra_tool_mcp_non_in_whitelist() {
+        // Tool MCP esterni (non in whitelist) vengono filtrati anche se
+        // sembrano innocui. Whitelist conservativa per design.
+        let tools = json!([
+            { "name": "read_file" },
+            { "name": "external_mcp_tool_that_writes" },
+            { "name": "send_email" },
+        ]);
+        let wl = test_whitelist();
+        let filtered = filter_tools_by_automation_mode(tools, &AutomationMode::Study, &wl);
+        let names: Vec<&str> = filtered
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(names, vec!["read_file"]);
+    }
+
+    #[test]
+    fn fallback_whitelist_contiene_tool_minimi_sicuri() {
+        // Il fallback hardcoded (STUDY_MODE_READONLY_TOOLS_FALLBACK) e' usato
+        // solo se il DB e' down. Deve contenere ALMENO i tool di base per
+        // permettere all'agente di leggere file e cercare nel codebase.
+        let must_have = ["read_file", "list_files", "search_in_files", "git_status"];
+        for tool in &must_have {
+            assert!(
+                STUDY_MODE_READONLY_TOOLS_FALLBACK.contains(tool),
+                "tool minimo '{}' mancante dalla fallback whitelist",
+                tool
+            );
+        }
+        // E NON deve contenere tool che scrivono
+        let must_not_have = ["write_file", "edit_file", "run_command", "delete_file"];
+        for tool in &must_not_have {
+            assert!(
+                !STUDY_MODE_READONLY_TOOLS_FALLBACK.contains(tool),
+                "tool pericoloso '{}' presente nel fallback (deve essere escluso)",
+                tool
+            );
+        }
     }
 }

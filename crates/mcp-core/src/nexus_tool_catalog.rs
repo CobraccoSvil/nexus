@@ -872,6 +872,7 @@ impl NexusToolCatalog {
             test_module_count::TestModuleCountTool,
             test_proptest_count::TestProptestCountTool,
             test_quickcheck_count::TestQuickcheckCountTool,
+            test_playwright::TestPlaywrightTool,
             test_run_integration::TestRunIntegrationTool,
             test_run_quiet::TestRunQuietTool,
             test_run_unit::TestRunUnitTool,
@@ -1614,6 +1615,14 @@ impl NexusToolCatalog {
         self.register_with_handler(
             NexusToolSpec::new("test_workflow_files", NexusToolCategory::Testing, "List .github/workflows/*.yml with test mentions"),
             Arc::new(TestWorkflowFilesTool),
+        );
+        self.register_with_handler(
+            NexusToolSpec::new(
+                "test_playwright",
+                NexusToolCategory::Testing,
+                "Run Playwright e2e test suite (`npx playwright test`) with pass/fail counts",
+            ),
+            Arc::new(TestPlaywrightTool),
         );
 
         // ── Security extras (Fase 9O, 20 new) ─────────────────────────────

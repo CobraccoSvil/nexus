@@ -23,6 +23,19 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+class SummaryModelUnavailable(Exception):
+    """Sollevata quando il modello per il summarizer non puo' essere risolto
+    da `nexus_purpose_model` (DB irraggiungibile o purpose `conversation_summary`
+    non configurato).
+
+    Regola G di CLAUDE.md: vietato silently-fallback a un modello hardcoded.
+    Il caller (`summarize_if_needed`) gestisce l'eccezione skippando il
+    summarizer per quel turno — la conversazione continua senza compressione.
+    """
+    pass
+
+
 # Soglia: avvia il summarizer quando il contesto stimato supera questa frazione
 # di MAX_CONTEXT_CHARS (importato da nodes.py). Configurabile via env per test.
 SUMMARY_TRIGGER_FRACTION = 0.60
@@ -137,8 +150,9 @@ async def summarize_old_messages(
         "Produci ora il riassunto seguendo il formato richiesto."
     )
 
-    # Selezione provider: preferisce Anthropic (Haiku), fallback su OpenAI o
-    # qualsiasi altro provider che esponga generate_completion_async.
+    # Selezione provider: preferisce Anthropic (Haiku), fallback su OpenAI o altri.
+    # Nota: `providers` e' ProviderRegistry — usare il registry direttamente per
+    # evitare di chiamare metodi sul singolo provider che non li espone.
     use_provider = "anthropic" if providers._providers.get("anthropic") else None
     if use_provider is None:
         for name in ("openai", "deepseek", "google"):
@@ -148,18 +162,34 @@ async def summarize_old_messages(
     if use_provider is None:
         logger.warning("summarizer: nessun provider disponibile")
         return None
-
-    use_model = model or _resolve_summary_model(use_provider)
-
-    prov = providers._providers.get(use_provider)
-    if prov is None or not hasattr(prov, "generate_completion_async"):
+    # Verifica che il registry esponga generate_completion_async (e' un metodo del registry,
+    # NON dei singoli provider — controlla prima di chiamare per evitare AttributeError silente).
+    if not hasattr(providers, "generate_completion_async"):
+        logger.warning("summarizer: ProviderRegistry senza generate_completion_async, skip")
         return None
+
+    if model:
+        use_model = model
+    else:
+        try:
+            use_model = _resolve_summary_model(use_provider)
+        except SummaryModelUnavailable as exc:
+            # Regola G: niente fallback hardcoded. Se il modello non e'
+            # configurato in DB, saltiamo il summarizer per questo turno —
+            # la conversazione continuera' senza compressione finche'
+            # l'admin non popola `nexus_purpose_model` (purpose='conversation_summary').
+            logger.warning(
+                "summarizer: modello non risolvibile da DB (%s), skip summarizer per questo turno",
+                exc,
+            )
+            return None
 
     full_prompt = f"{_SUMMARIZE_SYSTEM}\n\n{user_prompt}"
     t0 = time.monotonic()
     try:
         result = await asyncio.wait_for(
-            prov.generate_completion_async(
+            providers.generate_completion_async(
+                use_provider,
                 use_model,
                 full_prompt,
                 max_tokens=SUMMARY_MAX_TOKENS,
@@ -215,27 +245,60 @@ async def summarize_old_messages(
 
 
 def _resolve_summary_model(provider: str) -> str:
-    """Risolve il modello da usare per il summarizer.
+    """Risolve il modello da usare per il summarizer leggendo
+    `nexus_purpose_model` (purpose='conversation_summary').
 
-    Tenta nexus_purpose_model con purpose='conversation_summary'. Fallback a
-    Haiku per Anthropic / gpt-4o-mini per OpenAI / gemini-flash per Google.
+    Comportamento (regola G di CLAUDE.md):
+    - DB OK e purpose configurato: ritorna `model_id` letto dal DB
+    - DB irraggiungibile o purpose mancante: solleva `SummaryModelUnavailable`
+
+    Niente fallback hardcoded: se il modello non e' configurato il caller
+    (`summarize_if_needed`) deve degradare correttamente (skip summarizer)
+    invece di scegliere un modello a caso.
+
+    Il parametro `provider` e' usato solo per logging diagnostico (l'admin
+    sceglie provider+model insieme tramite `nexus_purpose_model`).
     """
+    import os
+    database_url = os.environ.get("DATABASE_URL", "")
+    if not database_url:
+        raise SummaryModelUnavailable(
+            "DATABASE_URL non impostata: impossibile leggere "
+            "nexus_purpose_model. Configurare la variabile d'ambiente."
+        )
     try:
-        from brain.providers.api_key_loader import _get_pool  # type: ignore
-        # Best-effort lookup sincrono dal DB. Se fallisce uso fallback.
-        # Non blocco: se il DB e' lento il summarizer perde solo il routing
-        # custom ma usa comunque un modello sensato.
-    except Exception:
-        pass
+        import psycopg2  # type: ignore[import-untyped]
+        conn = psycopg2.connect(database_url)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT provider, model_id FROM nexus_purpose_model "
+                    "WHERE purpose = 'conversation_summary'",
+                )
+                row = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        raise SummaryModelUnavailable(
+            f"DB irraggiungibile: {exc}. Verifica Postgres e migrazione 0102."
+        ) from exc
 
-    fallback = {
-        "anthropic": "claude-haiku-4-5-20251001",
-        "openai": "gpt-4o-mini",
-        "google": "gemini-2.5-flash",
-        "deepseek": "deepseek-chat",
-        "mistral": "mistral-small-latest",
-    }
-    return fallback.get(provider, "claude-haiku-4-5-20251001")
+    if not row:
+        raise SummaryModelUnavailable(
+            "purpose 'conversation_summary' non configurato in nexus_purpose_model. "
+            "Applicare la migrazione 0102 e popolare la tabella."
+        )
+    db_provider, db_model = row
+    if db_provider != provider:
+        logger.debug(
+            "summarizer: provider corrente '%s' diverso da quello in purpose_model '%s', "
+            "uso comunque il modello dal DB",
+            provider, db_provider,
+        )
+    logger.debug(
+        "summarizer: modello da DB purpose_model: %s/%s", db_provider, db_model
+    )
+    return db_model
 
 
 async def _persist_summary_audit(

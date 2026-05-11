@@ -27,6 +27,7 @@ pub(crate) mod git;
 pub(crate) mod service;
 pub(crate) mod sandbox;
 pub(crate) mod command;
+pub(crate) mod testing;
 
 // Re-export per uso interno crate (tool_run_tests è chiamato da agent_loop, in teoria).
 pub(crate) use command::tool_run_tests;
@@ -400,6 +401,47 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         "filter": {
           "type": "string",
           "description": "Filtro per eseguire solo test specifici (nome test, file, modulo). Viene aggiunto al comando del framework."
+        }
+      }
+    }
+  },
+  {
+    "name": "run_playwright_tests",
+    "description": "Usa questo tool per eseguire i test Playwright end-to-end del progetto. A differenza di run_tests, questo tool legge automaticamente le porte assegnate da Nexus al progetto e imposta BASE_URL sul server corretto. Può avviare il dev server automaticamente se non è in esecuzione. Salva i risultati nel pannello Playwright dell'IDE.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "filter": {
+          "type": "string",
+          "description": "Filtro per eseguire solo alcuni test (es. 'auth' esegue tutti i file con 'auth' nel nome)"
+        },
+        "project": {
+          "type": "string",
+          "description": "Progetto Playwright (es. 'chromium', 'firefox', 'webkit'). Ometti per eseguire tutti i browser configurati."
+        },
+        "base_url": {
+          "type": "string",
+          "description": "URL base del server da testare (es. 'http://localhost:3000'). Se omesso, viene letto dalla porta allocata da Nexus per questo progetto."
+        },
+        "workers": {
+          "type": "integer",
+          "description": "Numero di worker paralleli (default: 1)"
+        },
+        "reporter": {
+          "type": "string",
+          "description": "Formato output: 'list' (default), 'line', 'dot'"
+        },
+        "timeout_secs": {
+          "type": "integer",
+          "description": "Timeout totale per l'intero run in secondi (default: 600, max: 900)"
+        },
+        "test_timeout_ms": {
+          "type": "integer",
+          "description": "Timeout per il singolo test in millisecondi (default: 10000 = 10s, max: 60000). Con backend non disponibile, 10s è sufficiente (connection refused < 1s). Aumentare a 30000 se i test richiedono caricamento lento o upload di file."
+        },
+        "auto_start_server": {
+          "type": "boolean",
+          "description": "Se true e il dev server non è raggiungibile, lo avvia automaticamente con run_service prima dei test (default: false)"
         }
       }
     }
@@ -995,6 +1037,7 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
             let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(5).min(10) as usize;
             tool_recall_context(ctx, &query, &source, limit).await
         }
+        "run_playwright_tests" => testing::tool_run_playwright_tests(ctx, input).await,
         "batch_analyze_code" => tool_batch_analyze_code(ctx, input).await,
         // ── Nexus Builtin tool (prefisso nexus_*) ──────────────────────────
         // Dispatch verso nexus_builtin::execute_with_neural per usare

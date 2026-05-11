@@ -5,6 +5,16 @@ import logging
 import os
 from typing import Any, AsyncIterator
 
+# Modelli della serie "reasoning" di OpenAI che non accettano temperature, top_p
+# e usano max_completion_tokens invece di max_tokens.
+_O_SERIES_MODELS = frozenset({"o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini"})
+
+
+def _is_o_series(model: str) -> bool:
+    """Restituisce True se il modello e' della serie reasoning (o1/o3/o4-mini)."""
+    model_lower = model.lower()
+    return any(model_lower == m or model_lower.startswith(m + "-") for m in _O_SERIES_MODELS)
+
 from .base import BaseProvider, ProviderCatalogEntry, ProviderResult
 from .error_handler import format_error_result
 
@@ -67,12 +77,19 @@ class OpenAIProvider(BaseProvider):
             )
         try:
             client = self._get_client()
-            response = await client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=kwargs.get("max_tokens", 4096),
-                temperature=kwargs.get("temperature", 0.7),
-            )
+            max_tok = kwargs.get("max_tokens", 4096)
+            create_kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if _is_o_series(model):
+                # I modelli reasoning non accettano temperature/top_p
+                # e usano max_completion_tokens al posto di max_tokens.
+                create_kwargs["max_completion_tokens"] = max_tok
+            else:
+                create_kwargs["max_tokens"] = max_tok
+                create_kwargs["temperature"] = kwargs.get("temperature", 0.7)
+            response = await client.chat.completions.create(**create_kwargs)
             choice = response.choices[0]
             return ProviderResult(
                 provider=self.name,
@@ -122,9 +139,19 @@ class OpenAIProvider(BaseProvider):
 
             kwargs_call: dict[str, Any] = {
                 "model": model,
-                "max_tokens": max_tokens,
                 "messages": oai_messages,
             }
+            # I modelli reasoning (o1/o3/o4-mini) usano max_completion_tokens
+            # e non accettano temperature, top_p.
+            # I system messages devono essere inviati come ruolo "developer"
+            # (non "system") per o1/o3 — altrimenti l'API restituisce 400.
+            if _is_o_series(model):
+                kwargs_call["max_completion_tokens"] = max_tokens
+                # Converti il system message già inserito in testa a "developer"
+                if oai_messages and oai_messages[0].get("role") == "system":
+                    oai_messages[0] = {"role": "developer", "content": oai_messages[0]["content"]}
+            else:
+                kwargs_call["max_tokens"] = max_tokens
             if oai_tools:
                 kwargs_call["tools"] = oai_tools
 
@@ -196,13 +223,18 @@ class OpenAIProvider(BaseProvider):
             return
         try:
             client = self._get_client()
-            stream = await client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=kwargs.get("max_tokens", 4096),
-                temperature=kwargs.get("temperature", 0.7),
-                stream=True,
-            )
+            max_tok = kwargs.get("max_tokens", 4096)
+            stream_kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": True,
+            }
+            if _is_o_series(model):
+                stream_kwargs["max_completion_tokens"] = max_tok
+            else:
+                stream_kwargs["max_tokens"] = max_tok
+                stream_kwargs["temperature"] = kwargs.get("temperature", 0.7)
+            stream = await client.chat.completions.create(**stream_kwargs)
             async for chunk in stream:
                 delta = chunk.choices[0].delta
                 if delta.content:

@@ -285,6 +285,9 @@ export default function LandingPage() {
             <a href="#usecases" className="text-lg font-normal no-underline" style={{ color: C.muted }}>
               {t("landing.usecases")}
             </a>
+            <a href="#comparison" className="text-lg font-normal no-underline" style={{ color: C.muted }}>
+              {t("landing.comparison")}
+            </a>
 
             {/* Language switcher */}
             <div style={{ position: "relative" }}>
@@ -390,6 +393,9 @@ export default function LandingPage() {
           </a>
           <a href="#usecases" onClick={() => setMenuOpen(false)} className="text-lg font-normal no-underline" style={{ color: C.text }}>
             {t("landing.usecases")}
+          </a>
+          <a href="#comparison" onClick={() => setMenuOpen(false)} className="text-lg font-normal no-underline" style={{ color: C.text }}>
+            {t("landing.comparison")}
           </a>
         </div>
       )}
@@ -524,6 +530,14 @@ export default function LandingPage() {
           <FeatureCard icon="🔄" title={t("landing.feat.speed")} desc={t("landing.feat.speedDesc")} />
           <FeatureCard icon="🛡️" title={t("landing.feat.terminal")} desc={t("landing.feat.terminalDesc")} />
           <FeatureCard icon="🔗" title={t("landing.feat.github")} desc={t("landing.feat.githubDesc")} />
+          <FeatureCard icon="🧠" title={t("landing.feat.nlu")} desc={t("landing.feat.nluDesc")} />
+          <FeatureCard icon="🔒" title={t("landing.feat.dlp")} desc={t("landing.feat.dlpDesc")} />
+          <FeatureCard icon="🔧" title={t("landing.feat.tools")} desc={t("landing.feat.toolsDesc")} />
+          <FeatureCard icon="🏠" title={t("landing.feat.onprem")} desc={t("landing.feat.onpremDesc")} />
+          <FeatureCard icon="📚" title={t("landing.feat.learning")} desc={t("landing.feat.learningDesc")} />
+          <FeatureCard icon="📝" title={t("landing.feat.prompts")} desc={t("landing.feat.promptsDesc")} />
+          <FeatureCard icon="📄" title={t("landing.feat.docs")} desc={t("landing.feat.docsDesc")} />
+          <FeatureCard icon="🌐" title={t("landing.feat.browser")} desc={t("landing.feat.browserDesc")} />
         </div>
       </section>
 
@@ -679,8 +693,8 @@ export default function LandingPage() {
           }}
         >
           <StatCard value="<1ms" label={t("landing.stat.speed")} color={C.accent} mobile={mobile} />
-          <StatCard value="60" label={t("landing.stat.cost")} color="#8b5cf6" mobile={mobile} />
-          <StatCard value="314" label={t("landing.stat.agents")} color="#ec4899" mobile={mobile} />
+          <StatCard value="60+" label={t("landing.stat.cost")} color="#8b5cf6" mobile={mobile} />
+          <StatCard value="70+" label={t("landing.stat.agents")} color="#ec4899" mobile={mobile} />
           <StatCard value="12" label={t("landing.stat.context")} color="#22d3ee" mobile={mobile} />
         </div>
 
@@ -760,62 +774,159 @@ export default function LandingPage() {
         </div>
 
 
-        {/* New Features: Step 5-8 */}
+        {/* ─── COMPARISON TABLE ─── */}
         <section
+          id="comparison"
           style={{
             position: "relative",
-            padding: mobile ? "60px 24px 80px" : "100px 48px",
+            padding: mobile ? "60px 16px 80px" : "100px 48px",
             maxWidth: 1200,
             margin: "0 auto",
-            textAlign: "center",
           }}
         >
-          <div className="absolute rounded-full" style={{ width: 400, height: 400, background: `radial-gradient(circle, rgba(100,200,150,0.2), transparent 70%)`, filter: "blur(90px)", top: -100, right: "10%", pointerEvents: "none" }}></div>
-          
-          <div style={{ position: "relative", zIndex: 1 }}>
-            <div className="inline-block rounded-full" style={{ padding: "6px 16px", background: "rgba(100,200,150,0.12)", border: `1px solid rgba(100,200,150,0.25)`, fontSize: 13, fontWeight: 600, color: "#64c896", marginBottom: 24 }}>
-              ✨ Step 5-8: Advanced Tool Selection
-            </div>
-            
-            <h2 style={{ fontSize: mobile ? 32 : 40, fontWeight: 800, color: "#fff", margin: "0 0 24px", lineHeight: 1.2 }}>
-              Smarter Tool Selection.<br/>
-              <span style={{ background: `linear-gradient(135deg, #64c896, #22d3ee)`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>Less Context, More Precision.</span>
+          <Blob color={C.cyan} size={mobile ? 300 : 500} top={-150} left="10%" />
+          <Blob color={C.purple} size={mobile ? 250 : 400} bottom={-100} right="5%" />
+
+          <div style={{ textAlign: "center", marginBottom: mobile ? 36 : 64, position: "relative", zIndex: 1 }}>
+            <h2 className="font-bold mb-4" style={{ fontSize: mobile ? 28 : 40, color: "#fff" }}>
+              {t("landing.compTitle")}
             </h2>
-            
-            <p style={{ fontSize: mobile ? 14 : 16, color: C.muted, maxWidth: 600, margin: "0 auto 40px", lineHeight: 1.7 }}>
-              ONNX 384-dim embeddings + CachedEmbedder for semantic tool selection. Confidence scoring, analytics, and batch assignment — all production-ready.
+            <p style={{ fontSize: mobile ? 14 : 16, color: C.muted }}>
+              {t("landing.compDesc")}
             </p>
-            
-            <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "repeat(2, 1fr)", gap: 20, marginTop: 32 }}>
-              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20 }}>
-                <div style={{ fontSize: 28, marginBottom: 8 }}>🧠</div>
-                <h3 style={{ fontSize: 16, fontWeight: 700, margin: "0 0 8px", color: "#fff" }}>ONNX 384-dim Embeddings</h3>
-                <p style={{ fontSize: 13, color: C.muted, margin: 0 }}>3x better semantic quality. MiniLM with AVX2 support, fallback to HashEmbedder.</p>
-              </div>
-              
-              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20 }}>
-                <div style={{ fontSize: 28, marginBottom: 8 }}>💾</div>
-                <h3 style={{ fontSize: 16, fontWeight: 700, margin: "0 0 8px", color: "#fff" }}>CachedEmbedder (10k)</h3>
-                <p style={{ fontSize: 13, color: C.muted, margin: 0 }}>~1ms cache hits, 60-80% hit rate. RwLock-safe concurrent access.</p>
-              </div>
-              
-              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20 }}>
-                <div style={{ fontSize: 28, marginBottom: 8 }}>📊</div>
-                <h3 style={{ fontSize: 16, fontWeight: 700, margin: "0 0 8px", color: "#fff" }}>Confidence Scoring</h3>
-                <p style={{ fontSize: 13, color: C.muted, margin: 0 }}>Every tool selection tracked: confidence (0-1), method (Semantic/Keyword/Lazy), analytics.</p>
-              </div>
-              
-              <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 20 }}>
-                <div style={{ fontSize: 28, marginBottom: 8 }}>🤖</div>
-                <h3 style={{ fontSize: 16, fontWeight: 700, margin: "0 0 8px", color: "#fff" }}>Batch Tool Assignment</h3>
-                <p style={{ fontSize: 13, color: C.muted, margin: 0 }}>AI classifies tools for 60 templates. POST endpoint, mcp_tools_json saved to DB.</p>
-              </div>
-            </div>
-            
-            <div style={{ marginTop: 40, padding: "20px 24px", background: "rgba(100,200,150,0.08)", border: `1px solid rgba(100,200,150,0.2)`, borderRadius: 8 }}>
-              <p style={{ fontSize: 13, color: C.muted, margin: 0 }}>
-                <strong style={{ color: "#64c896" }}>70% token savings:</strong> Semantic search reduces tool definitions from 31 to 7-9 tools per request.
+          </div>
+
+          {/* Comparison table */}
+          <div style={{ position: "relative", zIndex: 1, overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
+            <table
+              style={{
+                width: "100%",
+                minWidth: mobile ? 700 : 900,
+                borderCollapse: "separate",
+                borderSpacing: 0,
+                background: C.surface,
+                border: `1px solid ${C.border}`,
+                borderRadius: 12,
+                overflow: "hidden",
+                fontSize: mobile ? 12 : 14,
+              }}
+            >
+              <thead>
+                <tr>
+                  {[
+                    t("landing.comp.feature"),
+                    "Nexus",
+                    "Cursor",
+                    "Copilot",
+                    "Windsurf",
+                    "Devin",
+                    "Bolt",
+                    "Claude Code",
+                    "Aider",
+                  ].map((h, i) => (
+                    <th
+                      key={i}
+                      style={{
+                        padding: mobile ? "10px 8px" : "14px 16px",
+                        textAlign: i === 0 ? "left" : "center",
+                        borderBottom: `1px solid ${C.border}`,
+                        color: i === 1 ? C.accent : "#fff",
+                        fontWeight: i === 1 ? 800 : 600,
+                        fontSize: i === 1 ? (mobile ? 13 : 15) : undefined,
+                        whiteSpace: "nowrap",
+                        background: i === 1 ? "rgba(91,163,230,0.08)" : "transparent",
+                      }}
+                    >
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {([
+                  ["landing.comp.multiProvider", true, "~", false, false, false, false, false, "~"],
+                  ["landing.comp.mlRouting", true, false, false, false, false, false, false, false],
+                  ["landing.comp.onprem", true, false, false, false, "~", false, false, false],
+                  ["landing.comp.dlp", true, false, false, false, false, false, false, false],
+                  ["landing.comp.agents", true, false, false, false, false, false, false, false],
+                  ["landing.comp.tools", true, false, false, false, false, false, "~", false],
+                  ["landing.comp.learning", true, false, false, false, false, false, false, false],
+                  ["landing.comp.qualityGuard", true, false, false, false, false, false, false, false],
+                  ["landing.comp.openSource", true, false, false, false, false, false, false, true],
+                  ["landing.comp.promptCache", true, false, false, false, false, false, true, false],
+                ] as [string, ...(boolean | string)[]][]).map((row, ri) => (
+                  <tr key={ri}>
+                    {row.map((cell, ci) => (
+                      <td
+                        key={ci}
+                        style={{
+                          padding: mobile ? "10px 8px" : "12px 16px",
+                          textAlign: ci === 0 ? "left" : "center",
+                          borderBottom: ri < 9 ? `1px solid ${C.border}` : "none",
+                          color: ci === 0 ? C.text : undefined,
+                          fontWeight: ci === 0 ? 500 : 400,
+                          background: ci === 1 ? "rgba(91,163,230,0.05)" : "transparent",
+                          whiteSpace: ci === 0 ? "nowrap" : undefined,
+                        }}
+                      >
+                        {ci === 0
+                          ? t(cell as any)
+                          : cell === true
+                            ? "✅"
+                            : cell === "~"
+                              ? "⚠️"
+                              : "—"}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Detail cards below comparison */}
+          <div style={{ position: "relative", zIndex: 1, marginTop: mobile ? 40 : 64 }}>
+            <div style={{ textAlign: "center", marginBottom: mobile ? 24 : 40 }}>
+              <h3 className="font-bold" style={{ fontSize: mobile ? 22 : 28, color: "#fff" }}>
+                {t("landing.compDetailsTitle")}
+              </h3>
+              <p style={{ fontSize: mobile ? 13 : 15, color: C.muted, maxWidth: 560, margin: "8px auto 0" }}>
+                {t("landing.compDetailsDesc")}
               </p>
+            </div>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: mobile ? "1fr" : "repeat(3, 1fr)",
+                gap: mobile ? 16 : 20,
+              }}
+            >
+              {([
+                { key: "routing" as const, color: C.accent, icon: "⚡" },
+                { key: "privacy" as const, color: "#8b5cf6", icon: "🔒" },
+                { key: "cost" as const, color: "#22d3ee", icon: "💰" },
+              ]).map(({ key, color, icon }) => (
+                <div
+                  key={key}
+                  style={{
+                    background: C.surface,
+                    border: `1px solid ${C.border}`,
+                    borderRadius: 16,
+                    padding: mobile ? "24px 20px" : "32px 28px",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 12,
+                  }}
+                >
+                  <div style={{ fontSize: 28 }}>{icon}</div>
+                  <h4 style={{ fontSize: mobile ? 16 : 18, fontWeight: 700, margin: 0, color }}>
+                    {t(`landing.compDetail.${key}` as any)}
+                  </h4>
+                  <p className="text-muted leading-relaxed m-0" style={{ fontSize: mobile ? 13 : 14 }}>
+                    {t(`landing.compDetail.${key}Desc` as any)}
+                  </p>
+                </div>
+              ))}
             </div>
           </div>
         </section>
@@ -842,6 +953,7 @@ export default function LandingPage() {
             <a href="#features" style={{ color: C.muted, textDecoration: "none" }}>{t("landing.features")}</a>
             <a href="#impact" style={{ color: C.muted, textDecoration: "none" }}>{t("landing.benefits")}</a>
             <a href="#usecases" style={{ color: C.muted, textDecoration: "none" }}>{t("landing.usecases")}</a>
+            <a href="#comparison" style={{ color: C.muted, textDecoration: "none" }}>{t("landing.comparison")}</a>
             <a href="/login" style={{ color: C.muted, textDecoration: "none" }}>{t("landing.login")}</a>
           </div>
         </div>

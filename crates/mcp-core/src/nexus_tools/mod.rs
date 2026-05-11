@@ -231,6 +231,7 @@ pub mod test_mock_count;
 pub mod test_module_count;
 pub mod test_proptest_count;
 pub mod test_quickcheck_count;
+pub mod test_playwright;
 pub mod test_run_integration;
 pub mod test_run_quiet;
 pub mod test_run_unit;

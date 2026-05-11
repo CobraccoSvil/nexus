@@ -36,6 +36,19 @@ class BaseProvider(abc.ABC):
         yield  # type: ignore
 
     @abc.abstractmethod
+    async def generate_agent_turn(
+        self,
+        model: str,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int = 4096,
+        system_text: str = "",
+    ) -> "ProviderResult":
+        """Esegue un turno agente con tool calling. Normalizza l'output al formato Anthropic
+        (stop_reason, tool_use_blocks, assistant_content, usage con input_tokens/output_tokens)."""
+        ...
+
+    @abc.abstractmethod
     async def test_connection(self) -> dict[str, Any]:
         ...
 

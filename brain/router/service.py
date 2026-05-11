@@ -14,10 +14,19 @@ _INTENT_EXEMPLARS: dict[str, list[str]] = {
     "fix": [
         "fix this bug", "debug the error", "why is it crashing",
         "resolve the issue", "patch the vulnerability", "hotfix needed",
+        # Pannello Ottimizzazione Nexus: "Fix questo problema nel file X: ..."
+        "fix questo problema nel file", "fix this problem in the file",
+        "risolvi questo problema nel file", "correggi questo problema nel file",
+        "fix the issue in the file", "fix the problem in the file",
     ],
     "refactor": [
         "refactor this code", "clean up the implementation", "improve code quality",
         "simplify the logic", "extract a function", "reduce complexity",
+        # Pannello Ottimizzazione Nexus: "Long function X — N lines (threshold: 50)"
+        "long function", "funzione troppo lunga", "lines threshold",
+        "the function is too long", "function exceeds threshold",
+        "spezza questa funzione", "estrai funzioni helper", "extract helper functions",
+        "refactorizza questa funzione troppo lunga", "reduce function length",
     ],
     "test": [
         "write tests", "add unit tests", "create test cases",
@@ -25,12 +34,29 @@ _INTENT_EXEMPLARS: dict[str, list[str]] = {
     ],
     "docs": [
         "write documentation", "add comments", "document the API",
-        "update the README", "explain this code", "add JSDoc",
+        "update the README", "add JSDoc",
         "genera documento", "genera documentazione", "genera analisi",
         "analisi tecnica", "analisi funzionale", "genera report",
         "release notes", "diagramma ER", "gestione progetto",
         "genera l'analisi", "documenta il progetto", "scrivi documentazione",
         "crea documento", "genera il documento", "document generation",
+    ],
+    # ── code_read: lettura/ispezione di file e codice sorgente ──────────────
+    # Distingue le query di LETTURA (vuole vedere il contenuto) da quelle di
+    # DOCUMENTAZIONE (vuole produrre testo descrittivo). Senza questo intent
+    # separato, "leggi il file X" e "elenca i file" cadevano su `docs` e il
+    # RAG inline (BP7) non si attivava mai.
+    "code_read": [
+        "read the file", "show me the file", "view the file content",
+        "list files in the directory", "what files are in", "ls the folder",
+        "cat the file", "how many lines", "quante righe ha il file",
+        "leggi il file", "mostra il file", "mostra il contenuto del file",
+        "elenca i file", "elenca le directory", "lista dei file",
+        "cosa contiene il file", "cosa c'è nel file", "mostrami il codice",
+        "show me the code", "view this file", "read this code",
+        "mostra il codice di", "leggi il codice", "apri il file",
+        "conta le righe", "quante funzioni", "cosa fa questa classe",
+        "elenco dei file", "struttura del progetto", "tree della cartella",
     ],
     "architecture": [
         "design the system", "create the architecture", "plan the migration",
@@ -336,10 +362,41 @@ class SemanticRouter:
     def _classify_by_keywords(message: str) -> dict[str, str]:
         lowered = message.lower()
         intent_keywords = {
-            "fix": ["/fix", "bug", "error", "crash", "broken", "debug", "issue", "patch"],
-            "refactor": ["/refactor", "refactor", "clean", "simplify", "extract", "improve"],
+            # fix/refactor valutati PRIMA di code_read: il pannello Ottimizzazione
+            # invia messaggi tipo "Fix questo problema nel file ...: Long function"
+            # che senza questa priorita' cadrebbero su code_read (vede "nel file").
+            "fix": [
+                "/fix", "bug", "error", "crash", "broken", "debug", "issue", "patch",
+                "fix questo problema", "fix this problem", "risolvi questo problema",
+                "risolvi il problema", "correggi questo", "correggi il",
+                "fix the issue", "fix the bug",
+            ],
+            "refactor": [
+                "/refactor", "refactor", "clean", "simplify", "extract", "improve",
+                "long function", "funzione troppo lunga", "troppe righe",
+                "threshold:", "lines (threshold", "righe (soglia",
+                "riduci la funzione", "spezza la funzione", "split function",
+                "troppo lunga", "eccessivamente lunga",
+            ],
+            # code_read va valutato DOPO fix/refactor per evitare che "leggi il
+            # file" / "elenca i file" cadano su docs (solo perché "explain" e
+            # "mostra" matchano gli exemplar della documentazione). Con fix/refactor
+            # prima, i messaggi del pannello Ottimizzazione vengono instradati correttamente.
+            "code_read": [
+                "leggi il file", "leggi file", "leggi il codice",
+                "mostra il file", "mostrami il file", "mostrami il codice",
+                "elenca i file", "elenca file", "lista file", "lista dei file",
+                "elenco file", "elenco dei file", "struttura del progetto",
+                "quante righe", "quante funzioni", "quante classi",
+                "cosa contiene il file", "cosa c'è nel file",
+                "read the file", "read file", "show the file", "view file",
+                "list files", "list the files", "cat ", "head ", "tail ",
+                "how many lines", "how many functions",
+                "cosa fa questa classe", "cosa fa questa funzione",
+                "tree della cartella", "mostra il contenuto",
+            ],
             "test": ["/test", "test", "coverage", "assert", "spec"],
-            "docs": ["/docs", "document", "readme", "jsdoc", "comment", "explain",
+            "docs": ["/docs", "document", "readme", "jsdoc", "comment",
                      "genera documento", "genera analisi", "analisi tecnica",
                      "analisi funzionale", "genera report", "release notes",
                      "diagramma er", "gestione progetto", "genera l'analisi",

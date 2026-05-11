@@ -178,11 +178,12 @@ class OllamaProvider(BaseProvider):
 
             ollama_messages.extend(messages)
 
+            temperature = kwargs.get("temperature", 0.7)
             payload = {
                 "model": model,
                 "messages": ollama_messages,
                 "stream": False,
-                "options": {"num_predict": max_tokens, "temperature": 0.3},
+                "options": {"num_predict": max_tokens, "temperature": temperature},
             }
 
             # Aggiungi tool definition per modelli che supportano tool_use
@@ -207,22 +208,31 @@ class OllamaProvider(BaseProvider):
             content_text = msg.get("content", "")
             tool_calls_raw = msg.get("tool_calls", [])
 
-            # Normalizza tool_calls al formato Nexus
-            tool_calls = []
+            # Normalizza tool_calls al formato standard Anthropic (tool_use_blocks)
+            tool_use_blocks: list[dict] = []
+            assistant_content: list[dict] = []
             for tc in tool_calls_raw:
                 fn = tc.get("function", {})
-                tool_calls.append({
+                block = {
                     "id": tc.get("id", f"ollama_{fn.get('name', 'tool')}"),
-                    "type": "tool_use",
                     "name": fn.get("name"),
                     "input": fn.get("arguments", {}),
-                })
+                }
+                tool_use_blocks.append(block)
+                assistant_content.append({"type": "tool_use", **block})
+
+            if not tool_use_blocks and content_text:
+                assistant_content.append({"type": "text", "text": content_text})
 
             stop_reason = "end_turn"
-            if tool_calls:
+            if tool_use_blocks:
                 stop_reason = "tool_use"
             elif data.get("done_reason") == "length":
                 stop_reason = "max_tokens"
+
+            # Normalizza usage al formato standard (input_tokens / output_tokens)
+            eval_count = data.get("eval_count", 0)
+            prompt_eval_count = data.get("prompt_eval_count", 0)
 
             return ProviderResult(
                 provider=self.name,
@@ -230,9 +240,12 @@ class OllamaProvider(BaseProvider):
                 content=content_text,
                 metadata={
                     "stop_reason": stop_reason,
-                    "tool_calls": tool_calls,
-                    "eval_count": data.get("eval_count", 0),
-                    "prompt_eval_count": data.get("prompt_eval_count", 0),
+                    "tool_use_blocks": tool_use_blocks,
+                    "assistant_content": assistant_content,
+                    "usage": {
+                        "input_tokens": prompt_eval_count,
+                        "output_tokens": eval_count,
+                    },
                 },
             )
 

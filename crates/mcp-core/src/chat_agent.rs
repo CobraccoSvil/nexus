@@ -367,7 +367,7 @@ pub async fn cancel_agent_run(
 
     sqlx::query(
         "UPDATE agent_runs SET status='cancelled', completed_at=NOW(), \
-         final_answer='Elaborazione interrotta dall''utente.' WHERE id=$1",
+         final_answer='Operazione annullata.' WHERE id=$1",
     )
     .bind(run_id)
     .execute(&state.db)

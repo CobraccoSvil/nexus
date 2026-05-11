@@ -22,6 +22,18 @@ from brain.grpc_server.generated import tool_runner_pb2, tool_runner_pb2_grpc  #
 
 logger = logging.getLogger(__name__)
 
+# Timeout gRPC (secondi) per tool che richiedono esecuzione lunga.
+# Tool non presenti in questa mappa usano il default di 120s.
+_TOOL_TIMEOUT_OVERRIDES: dict[str, float] = {
+    "run_playwright_tests": 900.0,  # Playwright: fino a 15 min + margine (42 test ~8-10 min)
+    "run_command": 300.0,           # Comandi shell arbitrari
+    "run_tests": 300.0,             # Test runner generico
+    "build_project": 600.0,         # Build (npm/cargo/mvn)
+    "install_dependencies": 300.0,  # pnpm/npm install
+}
+
+_DEFAULT_TOOL_TIMEOUT: float = 120.0
+
 
 @dataclass
 class ToolResult:
@@ -55,9 +67,21 @@ class ToolRunnerClient:
         self._channel: grpc.aio.Channel | None = None
         self._stub: tool_runner_pb2_grpc.ToolRunnerStub | None = None
 
+    # Limite massimo per messaggi gRPC ricevuti da mcp-core.
+    # Il default gRPC e' 4MB: tool come search_in_files su codebase grandi
+    # possono restituire risultati piu' grandi. 16MB copre la stragrande
+    # maggioranza dei casi senza consumare memoria eccessiva.
+    _GRPC_MAX_MSG_BYTES = 16 * 1024 * 1024  # 16MB
+
     async def _ensure_channel(self) -> tool_runner_pb2_grpc.ToolRunnerStub:
         if self._stub is None:
-            self._channel = grpc.aio.insecure_channel(self.address)
+            self._channel = grpc.aio.insecure_channel(
+                self.address,
+                options=[
+                    ("grpc.max_receive_message_length", self._GRPC_MAX_MSG_BYTES),
+                    ("grpc.max_send_message_length", self._GRPC_MAX_MSG_BYTES),
+                ],
+            )
             self._stub = tool_runner_pb2_grpc.ToolRunnerStub(self._channel)
         return self._stub
 
@@ -75,13 +99,16 @@ class ToolRunnerClient:
         session_id: str,
         tool_use_id: str,
         correlation_id: str | None = None,
-        timeout: float | None = 120.0,
+        timeout: float | None = None,
     ) -> ToolResult:
         """Esecuzione unaria.
 
         `tool_input` puo' essere un dict (serializzato) oppure una
         stringa JSON gia' pronta.
         """
+        if timeout is None:
+            timeout = _TOOL_TIMEOUT_OVERRIDES.get(tool_name, _DEFAULT_TOOL_TIMEOUT)
+
         stub = await self._ensure_channel()
         if isinstance(tool_input, str):
             input_json = tool_input

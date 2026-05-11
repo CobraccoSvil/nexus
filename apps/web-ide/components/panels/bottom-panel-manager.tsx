@@ -6,7 +6,7 @@ import { DebugPanel } from "./debug-panel";
 import { OutputPanel } from "./output-panel";
 import { OptimizationPanel } from "./optimization-panel";
 import { RunPanel } from "./run-panel";
-import { promptFromPlaywrightRun, promptFromPort, promptFromProblem } from "../../lib/chat-prompts";
+import { promptFromPlaywrightRun, promptFromPort, promptFromProblem, promptEnablePlaywright, promptRunPlaywrightTests } from "../../lib/chat-prompts";
 import type {
   AITraceEvent,
   OutputChannel,
@@ -327,23 +327,11 @@ export function BottomPanelManager({
     // playwright
     const handleRunPlaywright = () => {
       if (!onSendToChat) return;
-      onSendToChat(
-        "Esegui i test Playwright del progetto.\n" +
-        "1. usa `run_command` con `pnpm exec playwright test --reporter=list 2>&1 | tail -60` nella directory del progetto\n" +
-        "2. Riporta il risultato: quanti test passano, quanti falliscono, eventuali errori\n" +
-        "3. Se tutti i test falliscono con 'cannot open shared object file', segnalalo chiaramente (dipendenze di sistema mancanti)"
-      );
+      onSendToChat(promptRunPlaywrightTests());
     };
     const handleEnablePlaywright = () => {
       if (!onSendToChat) return;
-      onSendToChat(
-        "Abilita Playwright nel progetto. Esegui questi step nell'ordine:\n" +
-        "1. usa `run_command` per installare le dipendenze: `pnpm add -D @playwright/test` nella directory del progetto\n" +
-        "2. usa `run_command` per installare i browser: `pnpm exec playwright install --with-deps chromium` nella directory del progetto\n" +
-        "3. crea il file `playwright.config.ts` nella root del progetto con una configurazione base (baseURL http://localhost:3000, testDir e2e, solo chromium, retries 1, timeout 30s)\n" +
-        "4. crea la directory `e2e/` con un file `e2e/example.spec.ts` che contiene un test minimale (navigazione alla home e verifica del titolo)\n" +
-        "5. Riporta il risultato finale: conferma che Playwright e' abilitato e pronto, elenca i file creati"
-      );
+      onSendToChat(promptEnablePlaywright(ports));
     };
     return (
       <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>

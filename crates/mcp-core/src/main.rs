@@ -29,6 +29,7 @@ mod middleware;
 mod orchestrator;
 mod routing_config;
 mod routing_matrix;
+mod routing_slots;
 mod project_files;
 mod project_git;
 mod project_workspace;
@@ -436,6 +437,10 @@ async fn main() -> anyhow::Result<()> {
         routing_config::RoutingThresholdsCache::init_thresholds(db.clone()).await;
     let intent_capability_cache =
         routing_config::IntentCapabilityCache::init_intent_capability(db.clone()).await;
+    // Cache matrice slot-based (mig 0133, Livello 4 NLU). Diversamente dalle
+    // altre cache, non panica se assente: il routing classico (intent,mode)
+    // resta il fallback predefinito quando la matrice slots non e' popolata.
+    let slots_matrix_cache = routing_slots::SlotsRoutingMatrixCache::init(&db).await;
 
     // Cache registro porte (mig 0114): porte TCP allocate ai progetti.
     // Non panica se tabella vuota (nessuna allocazione al primo avvio).
@@ -455,6 +460,7 @@ async fn main() -> anyhow::Result<()> {
             routing_matrix_cache.clone(),
             routing_thresholds_cache.clone(),
             intent_capability_cache.clone(),
+            slots_matrix_cache.clone(),
         );
         if nexus_gw.is_healthy().await {
             tracing::info!("Nexus Gateway disponibile su {gw_url} — PATH A attivo");

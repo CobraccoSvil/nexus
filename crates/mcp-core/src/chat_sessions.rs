@@ -90,7 +90,7 @@ pub(crate) async fn load_session_context(
     })
 }
 
-pub(crate) async fn update_user_active_project(db: &PgPool, user_id: Uuid, project_id: Uuid) {
+pub(crate) async fn update_user_active_project(state: &AppState, user_id: Uuid, project_id: Uuid) {
     let _ = sqlx::query(
         r#"
         INSERT INTO project_open_sessions (
@@ -103,8 +103,11 @@ pub(crate) async fn update_user_active_project(db: &PgPool, user_id: Uuid, proje
     )
     .bind(user_id)
     .bind(project_id)
-    .execute(db)
+    .execute(&state.db)
     .await;
+
+    // Avvia indicizzazione semantica in background se non ancora eseguita.
+    crate::projects::indexing::spawn_code_index_if_needed(state, project_id).await;
 }
 
 pub async fn list_chat_sessions(
@@ -234,7 +237,7 @@ pub async fn create_chat_session(
     .await
     .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    update_user_active_project(&state.db, user_id, project_id).await;
+    update_user_active_project(&state, user_id, project_id).await;
 
     Ok(Json(json!({
         "session": {

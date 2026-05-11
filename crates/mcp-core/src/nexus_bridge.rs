@@ -465,8 +465,13 @@ impl NexusBridge {
 
         // ── 4. Periodic learning workers ─────────────────────────────────────
         // Avvia il loop periodico per CleanupWorker, MemoryConsolidationWorker,
-        // MetricsAggregationWorker (trigger = Periodic o Both).
-        // Intervallo di default: 60 secondi.
+        // MetricsAggregationWorker, PromptOptimizerWorker (trigger = Periodic o Both).
+        // Intervallo: 1800 secondi (30 minuti).
+        // NOTA COSTI: il PromptOptimizerWorker chiama direttamente l'API Anthropic
+        // (claude-haiku, max_tokens=4096) per ogni prompt candidato ad ogni tick.
+        // A 60s generava fino a 1440 chiamate/giorno. A 1800s = max 48 chiamate/giorno.
+        // L'optimizer puo' essere disabilitato completamente via DB:
+        //   UPDATE settings SET value='false' WHERE key='optimizer_enabled';
         // Il JoinHandle viene salvato in `periodic_handle` per poter essere
         // abortito durante il graceful shutdown (evita worker orfani).
         {
@@ -474,7 +479,7 @@ impl NexusBridge {
             let ns        = bridge.observability_ns.clone();
             let router    = bridge.router.clone();
             let handle = scheduler.start_periodic_loop(
-                Duration::from_secs(60),
+                Duration::from_secs(1800),
                 Arc::new(move || {
                     LearningContext::new()
                         .with_namespace(ns.clone())
@@ -482,7 +487,7 @@ impl NexusBridge {
                 }),
             );
             *bridge.periodic_handle.lock().await = Some(handle);
-            info!("Learning workers: periodic loop avviato (interval=60s)");
+            info!("Learning workers: periodic loop avviato (interval=1800s)");
         }
     }
 

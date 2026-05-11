@@ -38,6 +38,7 @@ const translations = {
     "admin.configuration": "Configuration",
     "admin.badge": "ADMIN",
     "admin.link.ide": "IDE",
+    "admin.link.site": "View site",
 
     // Settings
     "settings.stored": "All settings are stored in PostgreSQL. Changes take effect immediately.",
@@ -143,7 +144,7 @@ const translations = {
 
     // Landing
     "landing.badge": "Multi-Agent Orchestration Platform",
-    "landing.heroTitle1": "60 agents. 314 tools.",
+    "landing.heroTitle1": "60+ agents. 70+ tools. 5 providers.",
     "landing.heroTitle2": "One platform to build everything.",
     "landing.heroDesc": "Nexus routes every task to the right agent in <1ms via Q-Learning, stores semantic memory in a native Rust vector DB, and runs 12 learning workers continuously — a self-improving development platform.",
     "landing.cta": "Get started",
@@ -188,6 +189,50 @@ const translations = {
     "landing.mockChat1": "Q-Learning selected CoderAgent (q=0.87, ε=0.05). Running 3 parallel agents on this task.",
     "landing.mockChat2": "Supervisor (Interleaved): run clean. 12 workers active. RuVector: 847K vectors indexed.",
     "landing.navbar.access": "Sign in",
+    "landing.comparison": "vs Others",
+
+    // New features (7-12)
+    "landing.feat.nlu": "NLU Intelligent Routing",
+    "landing.feat.nluDesc": "4-level classification: keyword, LLM classifier with provider chain, slot-filling (action/target/framework/scope) and automatic disambiguation. Every request reaches the right model.",
+    "landing.feat.dlp": "DLP 4-Tier Security",
+    "landing.feat.dlpDesc": "Sensitivity classification from Public to Critical. Pre-flight redaction of secrets and PII, sensitivity-aware routing that blocks critical data from incompatible providers.",
+    "landing.feat.tools": "70+ Native MCP Tools",
+    "landing.feat.toolsDesc": "Git, Cargo, security scan, SAST, AST analysis, refactoring, doc generation, database introspection, deploy checks, consensus voting — all in-process, zero network overhead.",
+    "landing.feat.onprem": "On-Premise & Self-Hosted",
+    "landing.feat.onpremDesc": "Full deployment on your infrastructure with Docker. Supports vLLM for local models. Zero cloud dependency — your code and data never leave your network.",
+    "landing.feat.learning": "Project Learning & Memory",
+    "landing.feat.learningDesc": "Qdrant-backed semantic memory per project. Prompt corrections with auto-apply, RAG-enriched context injection, conversation summaries and continuous feedback loop.",
+    "landing.feat.prompts": "Admin Prompt System",
+    "landing.feat.promptsDesc": "60+ system templates editable from the admin panel without rebuild. AI-powered improvement suggestions, batch tool assignment, version history and usage analytics.",
+    "landing.feat.docs": "Professional Document Generation",
+    "landing.feat.docsDesc": "Generates IEEE 830 Functional Analysis, Technical Analysis, ER Diagrams, Project Management plans and Release Notes — professional .docx documents directly from your codebase.",
+    "landing.feat.browser": "Browser Bridge (Chrome Extension)",
+    "landing.feat.browserDesc": "Chrome extension that connects the browser to the IDE in real time. The agent can inspect pages, interact with the DOM, run tests on live sites and debug frontend issues directly.",
+
+    // Comparison section
+    "landing.compTitle": "Nexus vs. the market.",
+    "landing.compDesc": "Compared to the most popular AI development tools — feature by feature.",
+    "landing.comp.feature": "Feature",
+    "landing.comp.multiProvider": "Multi-Provider (5+)",
+    "landing.comp.mlRouting": "ML Routing (Q-Learning)",
+    "landing.comp.onprem": "On-Premise / Self-Hosted",
+    "landing.comp.dlp": "DLP 4-Tier Security",
+    "landing.comp.agents": "60+ Specialized Agents",
+    "landing.comp.tools": "70+ Builtin Tools",
+    "landing.comp.learning": "Project Learning",
+    "landing.comp.qualityGuard": "Quality Guard & Reflection",
+    "landing.comp.openSource": "Open Source / Self-Hostable",
+    "landing.comp.promptCache": "Advanced Prompt Caching",
+
+    // Competitor details section
+    "landing.compDetailsTitle": "What sets Nexus apart.",
+    "landing.compDetailsDesc": "Beyond the comparison table — the architectural differences that matter in production.",
+    "landing.compDetail.routing": "Routing Intelligence",
+    "landing.compDetail.routingDesc": "While Cursor uses simple Auto mode and Copilot assigns a fixed model, Nexus runs a Q-Learning router with HNSW similarity, slot-filling extraction and 4-level escalation chain — all data-driven from DB, zero hardcoding.",
+    "landing.compDetail.privacy": "Data Sovereignty",
+    "landing.compDetail.privacyDesc": "Every competitor except Aider requires sending code to their cloud. Nexus runs entirely on your infrastructure: PostgreSQL, Redis, Qdrant, vLLM — complete control over where your code goes.",
+    "landing.compDetail.cost": "Cost Control",
+    "landing.compDetail.costDesc": "No credits, no opaque pricing. You use your own API keys with real-time token tracking, per-provider cost monitoring, prompt caching (90% savings on Anthropic), and configurable quota policies per user and project.",
   },
 
   it: {
@@ -222,6 +267,7 @@ const translations = {
     "admin.configuration": "Configurazione",
     "admin.badge": "ADMIN",
     "admin.link.ide": "IDE",
+    "admin.link.site": "Vedi sito",
 
     "settings.stored": "Tutte le impostazioni sono salvate in PostgreSQL. Le modifiche hanno effetto immediato.",
     "settings.configure": "Configura le impostazioni di {category}.",
@@ -319,7 +365,7 @@ const translations = {
 
     // Landing
     "landing.badge": "Piattaforma di Orchestrazione Multi-Agente",
-    "landing.heroTitle1": "60 agenti. 314 tool.",
+    "landing.heroTitle1": "60+ agenti. 70+ tool. 5 provider.",
     "landing.heroTitle2": "Una piattaforma per costruire tutto.",
     "landing.heroDesc": "Nexus instrada ogni task all'agente giusto in <1ms via Q-Learning, salva la memoria semantica in un vector DB Rust nativo, e mantiene 12 learning worker attivi — una piattaforma di sviluppo che migliora da sola.",
     "landing.cta": "Inizia ora",
@@ -364,6 +410,50 @@ const translations = {
     "landing.mockChat1": "Q-Learning ha selezionato CoderAgent (q=0.87, ε=0.05). 3 agenti paralleli attivi su questo task.",
     "landing.mockChat2": "Supervisore (Interleaved): esecuzione pulita. 12 worker attivi. RuVector: 847K vettori indicizzati.",
     "landing.navbar.access": "Accedi",
+    "landing.comparison": "vs Altri",
+
+    // Nuove feature (7-12)
+    "landing.feat.nlu": "Routing NLU Intelligente",
+    "landing.feat.nluDesc": "Classificazione a 4 livelli: keyword, classificatore LLM con catena di provider, slot-filling (azione/target/framework/scope) e disambiguazione automatica. Ogni richiesta raggiunge il modello giusto.",
+    "landing.feat.dlp": "Sicurezza DLP 4 Livelli",
+    "landing.feat.dlpDesc": "Classificazione di sensibilita da Public a Critical. Redazione preventiva di segreti e PII, routing sensibilita-aware che blocca dati critici verso provider incompatibili.",
+    "landing.feat.tools": "70+ Tool MCP Nativi",
+    "landing.feat.toolsDesc": "Git, Cargo, scansione sicurezza, SAST, analisi AST, refactoring, generazione documenti, introspezione DB, check deploy, voto di consenso — tutti in-process, zero overhead di rete.",
+    "landing.feat.onprem": "On-Premise & Self-Hosted",
+    "landing.feat.onpremDesc": "Deploy completo sulla tua infrastruttura con Docker. Supporto vLLM per modelli locali. Zero dipendenza cloud — il tuo codice e i tuoi dati non escono mai dalla tua rete.",
+    "landing.feat.learning": "Apprendimento e Memoria Progetto",
+    "landing.feat.learningDesc": "Memoria semantica Qdrant per progetto. Correzioni prompt con auto-apply, iniezione contesto arricchita RAG, riassunti conversazione e feedback loop continuo.",
+    "landing.feat.prompts": "Sistema Prompt Admin",
+    "landing.feat.promptsDesc": "60+ template di sistema modificabili dal pannello admin senza rebuild. Suggerimenti di miglioramento AI, assegnazione batch tool, storico versioni e analitiche di utilizzo.",
+    "landing.feat.docs": "Generazione Documenti Professionali",
+    "landing.feat.docsDesc": "Genera Analisi Funzionale IEEE 830, Analisi Tecnica, Diagrammi ER, Piani di Gestione Progetto e Release Notes — documenti .docx professionali direttamente dal tuo codebase.",
+    "landing.feat.browser": "Browser Bridge (Estensione Chrome)",
+    "landing.feat.browserDesc": "Estensione Chrome che connette il browser all'IDE in tempo reale. L'agente puo ispezionare pagine, interagire col DOM, eseguire test su siti live e fare debug di problemi frontend direttamente.",
+
+    // Sezione confronto
+    "landing.compTitle": "Nexus vs. il mercato.",
+    "landing.compDesc": "Confronto con i piu popolari strumenti di sviluppo AI — funzionalita per funzionalita.",
+    "landing.comp.feature": "Funzionalita",
+    "landing.comp.multiProvider": "Multi-Provider (5+)",
+    "landing.comp.mlRouting": "Routing ML (Q-Learning)",
+    "landing.comp.onprem": "On-Premise / Self-Hosted",
+    "landing.comp.dlp": "Sicurezza DLP 4 Livelli",
+    "landing.comp.agents": "60+ Agenti Specializzati",
+    "landing.comp.tools": "70+ Tool Integrati",
+    "landing.comp.learning": "Apprendimento Progetto",
+    "landing.comp.qualityGuard": "Quality Guard & Riflessione",
+    "landing.comp.openSource": "Open Source / Self-Hostable",
+    "landing.comp.promptCache": "Prompt Caching Avanzato",
+
+    // Dettagli confronto
+    "landing.compDetailsTitle": "Cosa distingue Nexus.",
+    "landing.compDetailsDesc": "Oltre la tabella di confronto — le differenze architetturali che contano in produzione.",
+    "landing.compDetail.routing": "Intelligenza di Routing",
+    "landing.compDetail.routingDesc": "Mentre Cursor usa un semplice Auto mode e Copilot assegna un modello fisso, Nexus esegue un router Q-Learning con similarita HNSW, estrazione slot-filling e catena di escalation a 4 livelli — tutto data-driven da DB, zero hardcoding.",
+    "landing.compDetail.privacy": "Sovranita dei Dati",
+    "landing.compDetail.privacyDesc": "Ogni competitor tranne Aider richiede di inviare il codice al loro cloud. Nexus gira interamente sulla tua infrastruttura: PostgreSQL, Redis, Qdrant, vLLM — controllo completo su dove va il tuo codice.",
+    "landing.compDetail.cost": "Controllo dei Costi",
+    "landing.compDetail.costDesc": "Niente crediti, niente pricing opaco. Usi le tue API key con tracking token in tempo reale, monitoraggio costi per provider, prompt caching (90% di risparmio su Anthropic) e policy di quota configurabili per utente e progetto.",
   },
 
   es: {
@@ -398,6 +488,7 @@ const translations = {
     "admin.configuration": "Configuración",
     "admin.badge": "ADMIN",
     "admin.link.ide": "IDE",
+    "admin.link.site": "Ver sitio",
 
     "settings.stored": "Todos los ajustes se almacenan en PostgreSQL. Los cambios surten efecto inmediatamente.",
     "settings.configure": "Configura los ajustes de {category}.",
@@ -494,7 +585,7 @@ const translations = {
 
     // Landing
     "landing.badge": "Plataforma de Orquestación Multi-Agente",
-    "landing.heroTitle1": "60 agentes. 314 herramientas.",
+    "landing.heroTitle1": "60+ agentes. 70+ herramientas. 5 proveedores.",
     "landing.heroTitle2": "Una plataforma para construir todo.",
     "landing.heroDesc": "Nexus enruta cada tarea al agente correcto en <1ms via Q-Learning, guarda memoria semántica en una BD vectorial Rust nativa, y mantiene 12 workers de aprendizaje activos — una plataforma que mejora sola.",
     "landing.cta": "Empieza ahora",
@@ -539,6 +630,50 @@ const translations = {
     "landing.mockChat1": "Q-Learning seleccionó CoderAgent (q=0.87, ε=0.05). 3 agentes paralelos activos en esta tarea.",
     "landing.mockChat2": "Supervisor (Interleaved): ejecución limpia. 12 workers activos. RuVector: 847K vectores indexados.",
     "landing.navbar.access": "Acceder",
+    "landing.comparison": "vs Otros",
+
+    // Nuevas features (7-12)
+    "landing.feat.nlu": "Routing NLU Inteligente",
+    "landing.feat.nluDesc": "Clasificacion a 4 niveles: keyword, clasificador LLM con cadena de proveedores, slot-filling (accion/target/framework/scope) y desambiguacion automatica. Cada solicitud llega al modelo correcto.",
+    "landing.feat.dlp": "Seguridad DLP 4 Niveles",
+    "landing.feat.dlpDesc": "Clasificacion de sensibilidad de Public a Critical. Redaccion preventiva de secretos y PII, routing sensibilidad-aware que bloquea datos criticos hacia proveedores incompatibles.",
+    "landing.feat.tools": "70+ Herramientas MCP Nativas",
+    "landing.feat.toolsDesc": "Git, Cargo, escaneo seguridad, SAST, analisis AST, refactoring, generacion de documentos, introspeccion DB, checks de deploy, votacion de consenso — todo in-process, cero overhead de red.",
+    "landing.feat.onprem": "On-Premise & Self-Hosted",
+    "landing.feat.onpremDesc": "Deploy completo en tu infraestructura con Docker. Soporte vLLM para modelos locales. Cero dependencia cloud — tu codigo y datos nunca salen de tu red.",
+    "landing.feat.learning": "Aprendizaje y Memoria de Proyecto",
+    "landing.feat.learningDesc": "Memoria semantica Qdrant por proyecto. Correcciones de prompt con auto-apply, inyeccion de contexto enriquecida RAG, resumenes de conversacion y feedback loop continuo.",
+    "landing.feat.prompts": "Sistema de Prompts Admin",
+    "landing.feat.promptsDesc": "60+ templates de sistema editables desde el panel admin sin rebuild. Sugerencias de mejora AI, asignacion batch de herramientas, historial de versiones y analiticas de uso.",
+    "landing.feat.docs": "Generacion de Documentos Profesionales",
+    "landing.feat.docsDesc": "Genera Analisis Funcional IEEE 830, Analisis Tecnico, Diagramas ER, Planes de Gestion de Proyecto y Release Notes — documentos .docx profesionales directamente desde tu codebase.",
+    "landing.feat.browser": "Browser Bridge (Extension Chrome)",
+    "landing.feat.browserDesc": "Extension Chrome que conecta el navegador al IDE en tiempo real. El agente puede inspeccionar paginas, interactuar con el DOM, ejecutar tests en sitios live y depurar problemas frontend directamente.",
+
+    // Seccion comparacion
+    "landing.compTitle": "Nexus vs. el mercado.",
+    "landing.compDesc": "Comparado con las herramientas de desarrollo AI mas populares — funcion por funcion.",
+    "landing.comp.feature": "Funcionalidad",
+    "landing.comp.multiProvider": "Multi-Proveedor (5+)",
+    "landing.comp.mlRouting": "Routing ML (Q-Learning)",
+    "landing.comp.onprem": "On-Premise / Self-Hosted",
+    "landing.comp.dlp": "Seguridad DLP 4 Niveles",
+    "landing.comp.agents": "60+ Agentes Especializados",
+    "landing.comp.tools": "70+ Herramientas Integradas",
+    "landing.comp.learning": "Aprendizaje de Proyecto",
+    "landing.comp.qualityGuard": "Quality Guard & Reflexion",
+    "landing.comp.openSource": "Open Source / Self-Hostable",
+    "landing.comp.promptCache": "Prompt Caching Avanzado",
+
+    // Detalles comparacion
+    "landing.compDetailsTitle": "Lo que distingue a Nexus.",
+    "landing.compDetailsDesc": "Mas alla de la tabla comparativa — las diferencias arquitecturales que importan en produccion.",
+    "landing.compDetail.routing": "Inteligencia de Routing",
+    "landing.compDetail.routingDesc": "Mientras Cursor usa un simple Auto mode y Copilot asigna un modelo fijo, Nexus ejecuta un router Q-Learning con similitud HNSW, extraccion slot-filling y cadena de escalacion a 4 niveles — todo data-driven desde DB, cero hardcoding.",
+    "landing.compDetail.privacy": "Soberania de Datos",
+    "landing.compDetail.privacyDesc": "Cada competidor excepto Aider requiere enviar el codigo a su cloud. Nexus corre enteramente en tu infraestructura: PostgreSQL, Redis, Qdrant, vLLM — control completo sobre donde va tu codigo.",
+    "landing.compDetail.cost": "Control de Costos",
+    "landing.compDetail.costDesc": "Sin creditos, sin pricing opaco. Usas tus propias API keys con tracking de tokens en tiempo real, monitoreo de costos por proveedor, prompt caching (90% de ahorro en Anthropic) y politicas de cuota configurables por usuario y proyecto.",
   },
 } as const;
 

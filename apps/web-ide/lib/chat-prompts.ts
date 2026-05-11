@@ -2,7 +2,7 @@ import type { ProblemItem, PortEntry, PlaywrightRunSummary } from "./api-client"
 
 type Severity = "error" | "warn" | "info";
 
-/** Prefisso comune: i testi lunghi “solo analisi” spingevano l’LLM a rispondere senza tool. */
+/** Prefisso comune: i testi lunghi "solo analisi" spingevano l'LLM a rispondere senza tool. */
 function operativePreamble(): string {
   return [
     "ISTRUZIONE OPERATIVA (obbligatoria — Nexus):",
@@ -106,7 +106,124 @@ export function promptFromPlaywrightRun(run: PlaywrightRunSummary): string {
     .join("\n");
 }
 
-/** Log a singola riga o prefisso senza stack → chiedi esplicitamente ricerca nel repo invece di “raccogliere log”. */
+/** Porta preferita tra quelle Nexus: dev > app > http > web > minima disponibile */
+function pickBestPort(ports: PortEntry[]): number {
+  const priority = ["dev", "app", "http", "web"];
+  for (const label of priority) {
+    const entry = ports.find((p) => p.label?.toLowerCase() === label && p.port != null);
+    if (entry?.port != null) return entry.port;
+  }
+  const sorted = ports.filter((p) => p.port != null).sort((a, b) => (a.port ?? 0) - (b.port ?? 0));
+  return sorted[0]?.port ?? 3000;
+}
+
+/**
+ * Prompt per abilitare Playwright in un progetto Nexus.
+ * Usa la porta allocata da Nexus come fallback hardcoded nel config generato;
+ * il config legge comunque BASE_URL dall'ambiente, che run_playwright_tests imposta a runtime.
+ */
+export function promptEnablePlaywright(ports: PortEntry[]): string {
+  const port = pickBestPort(ports);
+
+  const configLines = [
+    "import { defineConfig, devices } from '@playwright/test';",
+    "",
+    "const BASE_URL =",
+    "  process.env.BASE_URL ||",
+    "  process.env.PLAYWRIGHT_BASE_URL ||",
+    `  'http://localhost:${port}';`,
+    "",
+    "const port = (() => {",
+    "  try {",
+    `    return parseInt(new URL(BASE_URL).port || '${port}', 10);`,
+    "  } catch {",
+    `    return ${port};`,
+    "  }",
+    "})();",
+    "",
+    "export default defineConfig({",
+    "  testDir: './e2e',",
+    "  fullyParallel: true,",
+    "  forbidOnly: !!process.env.CI,",
+    "  retries: process.env.CI ? 2 : 1,",
+    "  workers: process.env.CI ? 1 : undefined,",
+    "  timeout: 30_000,",
+    "  reporter: process.env.CI ? 'list' : 'html',",
+    "  use: {",
+    "    baseURL: BASE_URL,",
+    "    trace: 'on-first-retry',",
+    "  },",
+    "  projects: [",
+    "    { name: 'chromium', use: { ...devices['Desktop Chrome'] } },",
+    "  ],",
+    "  webServer: {",
+    "    command: `PORT=${port} pnpm dev`,",
+    "    url: BASE_URL,",
+    "    reuseExistingServer: true,",
+    "    timeout: 60_000,",
+    "    stdout: 'pipe',",
+    "    stderr: 'pipe',",
+    "  },",
+    "});",
+  ].join("\n");
+
+  const exampleSpec = [
+    "import { test, expect } from '@playwright/test';",
+    "",
+    "test('homepage carica senza errori', async ({ page }) => {",
+    "  await page.goto('/');",
+    "  await expect(page).toHaveTitle(/.*/);",
+    "});",
+  ].join("\n");
+
+  return [
+    operativePreamble(),
+    `Abilita Playwright nel progetto. Porta dev Nexus assegnata: ${port} (BASE_URL default: http://localhost:${port}).`,
+    "",
+    "Esegui questi step nell'ordine:",
+    "1. Installa dipendenze: usa `run_command` con `pnpm add -D @playwright/test` nella root del progetto",
+    "2. Installa browser: usa `run_command` con `pnpm exec playwright install --with-deps chromium`",
+    "3. Crea il file `playwright.config.ts` nella root del progetto con questo contenuto ESATTO:",
+    "",
+    "```typescript",
+    configLines,
+    "```",
+    "",
+    "IMPORTANTE: il config legge BASE_URL dall'ambiente — il tool `run_playwright_tests` la imposta automaticamente con la porta Nexus corretta.",
+    "",
+    "4. Crea la directory `e2e/` con un file `e2e/example.spec.ts` minimale:",
+    "",
+    "```typescript",
+    exampleSpec,
+    "```",
+    "",
+    "5. Verifica che il config sia valido: usa `run_command` con `pnpm exec playwright test --list` (deve listare i test senza errori di compilazione)",
+    "6. Riporta il risultato finale: file creati, eventuali errori di installazione o configurazione",
+  ].join("\n");
+}
+
+/**
+ * Prompt per eseguire i test Playwright tramite il tool dedicato di Nexus.
+ * Invita esplicitamente l'agente a usare run_playwright_tests invece di run_command.
+ */
+export function promptRunPlaywrightTests(): string {
+  return [
+    operativePreamble(),
+    "Esegui i test Playwright del progetto usando il tool dedicato Nexus.",
+    "",
+    "Usa il tool `run_playwright_tests` (NON `run_command` con pnpm exec). Il tool:",
+    "- legge automaticamente le porte allocate in nexus_port_allocations per questo progetto",
+    "- imposta BASE_URL con la porta Nexus corretta prima di lanciare Playwright",
+    "- avvia il server dev se non e' ancora in ascolto (imposta auto_start_server: true)",
+    "- salva pass/fail nel pannello Playwright di Nexus",
+    "",
+    "Parametri consigliati: { auto_start_server: true, reporter: \"list\" }",
+    "",
+    "Dopo l'esecuzione riporta: test passati, test falliti, nomi dei test falliti (se presenti).",
+  ].join("\n");
+}
+
+/** Log a singola riga o prefisso senza stack → chiedi esplicitamente ricerca nel repo invece di "raccogliere log". */
 function debugLogLooksTruncated(message: string): boolean {
   const t = message.trim();
   if (t.length < 120) return true;
@@ -139,7 +256,7 @@ export function promptFromDebugEntry(args: {
   const truncatedNote = truncated
     ? [
         "Nota su questo log:",
-        "Il testo principale può essere tronco (journalctl/singola riga). NON limitarti a ‘spiegare’ l’errore: usa i tool sul progetto per trovare file/route/tipo citati o correlati, confrontare con il codice e applicare fix. Se serve più log runtime, dopo la patch indica come riprodurre e dove guardare — ma la priorità è intervenire sul codice nel repo.",
+        "Il testo principale può essere tronco (journalctl/singola riga). NON limitarti a 'spiegare' l'errore: usa i tool sul progetto per trovare file/route/tipo citati o correlati, confrontare con il codice e applicare fix. Se serve più log runtime, dopo la patch indica come riprodurre e dove guardare — ma la priorità è intervenire sul codice nel repo.",
         "",
       ]
     : [];
@@ -162,11 +279,11 @@ export function promptFromDebugEntry(args: {
           "4) Riassunto: cosa cambiato, perché, come verificare.",
         ]
       : [
-          "Azione richiesta (ordine — NON fare solo analisi o ‘root cause’ in teoria):",
+          "Azione richiesta (ordine — NON fare solo analisi o 'root cause' in teoria):",
           "1) Collega il messaggio al codice: identifica stack tecnologica dal servizio/log (es. .NET → progetto/endpoint/handlers) e cerca nel workspace stringhe, tipi eccezione, route o nomi file citati (search_in_files / grep).",
-          "2) Apri i file coinvolti con read_file; individua condizione o bug concreto che spiega l’errore.",
+          "2) Apri i file coinvolti con read_file; individua condizione o bug concreto che spiega l'errore.",
           "3) Implementa una correzione minima sicura (patch) nel repository; se servono config o env, aggiorna file tracciati nel repo o documenta il valore richiesto senza allucinare segreti.",
-          "4) Verifica con il comando appropriato (es. `dotnet build` / test progetto, `npm test`, curl sull’API, riavvio servizio) e riporta esito. Se non puoi eseguire, indica esattamente quale comando l’utente deve lanciare.",
+          "4) Verifica con il comando appropriato (es. `dotnet build` / test progetto, `npm test`, curl sull'API, riavvio servizio) e riporta esito. Se non puoi eseguire, indica esattamente quale comando l'utente deve lanciare.",
           "5) Output finale: file modificati, diff concettuale, comando di verifica e (se noto) come riprodurre il caso con 1–2 passi.",
         ];
 

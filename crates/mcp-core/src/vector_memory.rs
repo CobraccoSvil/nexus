@@ -665,6 +665,21 @@ pub async fn search_code_index(
     Ok(hits)
 }
 
+/// Ritorna `true` se il progetto ha almeno un file indicizzato in `file_index_hashes`.
+/// Query O(1) sull'indice — usata da `spawn_code_index_if_needed` per evitare
+/// di rilanciare l'indicizzazione su progetti gia' processati.
+pub async fn has_code_index(db: &PgPool, project_id: Uuid) -> bool {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT COUNT(*) FROM file_index_hashes WHERE project_id = $1 LIMIT 1",
+    )
+    .bind(project_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    row.map(|(c,)| c > 0).unwrap_or(false)
+}
+
 pub async fn delete_code_index_points(db: &PgPool, project_id: Uuid) -> anyhow::Result<()> {
     ensure_code_index_collection(db).await?;
     let (base_url, collection) = qdrant_code_index_config(db).await?;

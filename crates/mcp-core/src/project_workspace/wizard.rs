@@ -417,6 +417,67 @@ pub async fn wizard_install_service(
         exec_start
     };
 
+    // ── Variabili cross-servizio ──────────────────────────────────────────────
+    // Inietta automaticamente l'URL del backend/frontend tra i servizi sibling
+    // già allocati al progetto. Evita porte hardcoded nei file .service.
+    // Si esegue dopo l'assegnazione di PORT/ASPNETCORE_URLS per includere la
+    // porta appena allocata nelle ricerche sibling.
+    {
+        #[derive(sqlx::FromRow)]
+        struct PortLabel { port: i32, label: String }
+        let sibling_rows: Vec<PortLabel> = sqlx::query_as(
+            "SELECT port, label FROM nexus_port_allocations \
+             WHERE project_id = $1 AND label != $2 ORDER BY port ASC",
+        )
+        .bind(project_id)
+        .bind(short)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+        let sibling_ports: Vec<(i32, String)> = sibling_rows
+            .into_iter()
+            .map(|r| (r.port, r.label))
+            .collect();
+
+        let exec_lower = exec_start.to_lowercase();
+        let is_frontend = matches!(kind, "npm" | "pnpm")
+            || exec_lower.contains("next")
+            || exec_lower.contains("vite")
+            || exec_lower.contains("react-scripts")
+            || exec_lower.contains("nuxt")
+            || exec_lower.contains("astro");
+
+        if is_frontend {
+            // BACKEND_API_URL: porta sibling con label "backend-*" o "api-*"
+            let backend_sibling = sibling_ports.iter().find(|item| {
+                let l = item.1.to_lowercase();
+                l.starts_with("backend") || l.starts_with("api-") || l.starts_with("api_")
+            });
+            if let Some((port, _)) = backend_sibling {
+                if !env_map.contains_key("BACKEND_API_URL")
+                    && !env_map.contains_key("BACKEND_API_INTERNAL_URL")
+                {
+                    env_map.insert(
+                        "BACKEND_API_URL".to_string(),
+                        format!("http://127.0.0.1:{}", port),
+                    );
+                }
+            }
+            // NEXTAUTH_URL: per Next.js, se non già impostata esplicitamente
+            let wants_nextauth = exec_lower.contains("next")
+                || (exec_lower.contains("npm") && exec_lower.contains("start"))
+                || (exec_lower.contains("pnpm") && exec_lower.contains("start"));
+            if wants_nextauth && !env_map.contains_key("NEXTAUTH_URL") {
+                if let Some(p) = env_map.get("PORT").and_then(|s| s.parse::<u16>().ok()) {
+                    env_map.insert(
+                        "NEXTAUTH_URL".to_string(),
+                        format!("http://localhost:{}", p),
+                    );
+                }
+            }
+        }
+    }
+
     let env_lines: String = env_map
         .iter()
         .map(|(k, v)| format!("Environment={}={}\n", k, v))

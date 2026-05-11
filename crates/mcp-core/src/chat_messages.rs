@@ -810,6 +810,52 @@ fn summarize_title(content: &str) -> String {
     normalized.chars().take(61).collect::<String>() + "..."
 }
 
+/// Mappa intent canonico → descrizione human-readable in italiano per
+/// il messaggio di disambiguazione mostrato all'utente. Ritorna `None` per
+/// intent sconosciuti (il caller usa il nome canonico come fallback).
+fn intent_human_description(intent: &str) -> Option<&'static str> {
+    Some(match intent {
+        "chat" => "rispondere con una spiegazione testuale",
+        "debug" => "analizzare l'errore o il fallimento per trovare la causa radice",
+        "fix" => "applicare una correzione mirata a un bug noto",
+        "refactor" => "riorganizzare il codice senza cambiarne il comportamento",
+        "test" => "scrivere o migliorare test (nuovi casi di test)",
+        "docs" => "scrivere/aggiornare documentazione",
+        "code_read" => "leggere ed esaminare file di codice esistenti",
+        "architecture" => "fare design o pianificare una migrazione",
+        "file_ops" => "creare/eliminare/spostare file",
+        "system_admin" => "configurare servizi, utenti o deploy",
+        _ => return None,
+    })
+}
+
+/// Costruisce il messaggio di disambiguazione mostrato all'utente quando
+/// il classifier non e' sicuro tra 2+ intent plausibili. Lista le opzioni
+/// con etichetta (A/B/C) per facilitare la risposta.
+fn build_disambiguation_message(c: &crate::orchestrator::ClassifiedIntent) -> String {
+    let mut s = String::from(
+        "Per dare la risposta giusta ho bisogno di un chiarimento — la tua richiesta puo' \
+         essere interpretata in piu' modi. Quale di queste opzioni descrive meglio cosa vuoi?\n\n"
+    );
+    let labels = ["A", "B", "C"];
+    for (idx, cand) in c.candidates.iter().take(3).enumerate() {
+        let desc = intent_human_description(&cand.intent).unwrap_or(cand.intent.as_str());
+        s.push_str(&format!(
+            "**{}.** {} (intent: `{}`, confidence {:.0}%)\n",
+            labels[idx],
+            desc,
+            cand.intent,
+            cand.confidence * 100.0,
+        ));
+    }
+    s.push_str(
+        "\nRispondi indicando la lettera (es. \"A\") oppure descrivi piu' precisamente \
+         cosa vuoi che faccia. Se preferisci che proceda senza chiedere, imposta la \
+         modalita' di automazione su \"Automatico\"."
+    );
+    s
+}
+
 async fn insert_message(
     db: &PgPool,
     session_id: Uuid,
@@ -1052,17 +1098,102 @@ async fn spawn_agent_run(
     let (tx, _rx) = broadcast::channel::<AgentStepEvent>(256);
     state.agent_channels.insert(run_id, tx.clone());
 
+    // ─────────────────────────────────────────────────────────────────
+    // Disambiguation step (best practice NLU)
+    // ─────────────────────────────────────────────────────────────────
+    // Se il classifier marca il task come ambiguo (top confidence < 0.70
+    // oppure margine < 0.15 sul secondo candidato) E l'utente NON e' in
+    // modalita' "automatic", inseriamo un messaggio assistant che chiede
+    // chiarimenti invece di indovinare. Riferimento: Rasa/Dialogflow/LUIS.
+    //
+    // Modalita' automatic salta la disambiguazione: l'utente vuole che il
+    // sistema agisca anche con incertezza moderata (top candidato vince).
+    let classified = state
+        .orchestrator
+        .classify_intent_full(&params.content)
+        .await;
+    if classified.is_ambiguous
+        && !matches!(params.automation_mode, AutomationMode::Automatic)
+    {
+        tracing::info!(
+            "spawn_agent_run: intent ambiguo (conf={:.2}, candidati={}), chiedo disambiguazione",
+            classified.confidence, classified.candidates.len(),
+        );
+        let disambig_msg = build_disambiguation_message(&classified);
+        let meta = json!({
+            "kind": "disambiguation_request",
+            "intent": classified.intent,
+            "confidence": classified.confidence,
+            "candidates": classified.candidates,
+        });
+        let _ = insert_message(
+            &state.db,
+            params.session_id,
+            params.project_id,
+            "assistant",
+            &disambig_msg,
+            meta,
+            Some(params.user_message_id),
+        )
+        .await;
+        // Rimuoviamo il canale broadcast: non avviamo l'agent run.
+        state.agent_channels.remove(&run_id);
+        return None;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Routing slot-based (Livello 4 NLU, mig 0133)
+    // ─────────────────────────────────────────────────────────────────
+    // Prima del routing classico (intent, behavior_mode), proviamo la
+    // matrice slots: e' piu' precisa perche' indicizzata su 4 slot
+    // canonici (action_verb, target_type, framework, scope) estratti
+    // dal classifier LLM. Se nessun match O slots incompleti, cadiamo
+    // sul routing classico testato. Soglia confidence: 0.60.
+    //
+    // Safety-net: se il classifier LLM non ha estratto slot (es. JSON
+    // parse fail con Gemini Flash) ma il messaggio chiaramente descrive
+    // una "test failure resolution" via keyword detection, ricostruiamo
+    // slots minimi euristicamente per non perdere il routing capable.
+    let effective_slots = if classified.slots.is_complete() {
+        classified.slots.clone()
+    } else {
+        crate::routing_slots::infer_slots_heuristic(&params.content)
+    };
+    let slot_routing_hit = if params.provider_override.is_none()
+        && params.model_override.is_none()
+    {
+        state.orchestrator.route_by_slots(&effective_slots, 0.60).await
+    } else {
+        None
+    };
+
     // Routing intelligente: Neural Core classifica l'intent e sceglie il provider ottimale
     // (es. "fix" → anthropic, "chat" → openai, ecc.) invece di usare sempre il primo in lista.
     // Il profile_provider ha priorità sul routing automatico, ma non sul provider_override utente.
-    let effective_override = params
-        .provider_override
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| params.profile_provider.filter(|v| !v.trim().is_empty()));
-    let effective_model_override = params
-        .model_override
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| params.profile_model.filter(|v| !v.trim().is_empty()));
+    let effective_override = if let Some((slot_provider, _slot_model, _src)) = &slot_routing_hit {
+        // Slot routing ha vinto: forziamo il provider scelto come override
+        // (il modello viene applicato sotto, dopo il routing classico, sovrascrivendolo).
+        Some(slot_provider.clone())
+    } else {
+        params
+            .provider_override
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| params.profile_provider.filter(|v| !v.trim().is_empty()))
+    };
+    let effective_model_override = if let Some((_slot_provider, slot_model, _src)) = &slot_routing_hit {
+        Some(slot_model.clone())
+    } else {
+        params
+            .model_override
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| params.profile_model.filter(|v| !v.trim().is_empty()))
+    };
+    if let Some((p, m, src)) = &slot_routing_hit {
+        tracing::info!(
+            "spawn_agent_run: routing slot-based {} → {}/{}",
+            src, p, m
+        );
+    }
 
     // Conta i messaggi esistenti nella sessione per calibrare il routing:
     // sessioni con molti messaggi indicano task lunghi (es. "continua") che
@@ -1423,13 +1554,25 @@ async fn spawn_agent_run(
     let neural_for_embed = state.orchestrator.neural.clone();
     let recent_history_for_brain = recent_history;
 
-    // Calcola il payload tools dinamico (discovery mode vs inline) prima dello spawn
+    // Calcola il payload tools dinamico (discovery mode vs inline) prima dello spawn.
+    // Il filtering per automation_mode avviene dentro build_tools_json_for_agent:
+    // in `study` esporta solo tool read-only (gating difensivo), in `confirm` e
+    // `automatic` esporta la lista completa.
     let tools_json_for_brain = crate::brain_agent_client::build_tools_json_for_agent(
         &state.db,
         params.user_id,
         params.project_id,
+        &params.automation_mode,
     )
     .await;
+
+    // Lettura della soglia SSE silence da settings (mig 0132). Cache 60s
+    // tramite RoutingThresholdsCache: la doppia chiamata e' gratis.
+    // Fallback al default tecnico (120s) se DB non disponibile.
+    let sse_max_silence_secs: u64 = match state.orchestrator.routing_thresholds.current_async().await {
+        Ok(t) => t.sse_heartbeat_max_silence_secs,
+        Err(_) => 120,
+    };
 
     tokio::spawn(async move {
         tracing::info!(
@@ -1480,6 +1623,7 @@ async fn spawn_agent_run(
                 tx_for_brain.clone(),
                 recent_history_for_brain.clone(),
                 tools_json_for_brain.clone(),
+                sse_max_silence_secs,
             )
             .await;
 
@@ -1609,6 +1753,33 @@ async fn spawn_agent_run(
         .bind(result.total_cost)
         .execute(&db_clone)
         .await;
+
+        // Persisti gli step del run su agent_steps (fix bug: la tabella veniva letta
+        // da chat_agent.rs:121,195 ma non scritta — dashboard "AI Workspace" mostrava
+        // sempre storia vuota, reflection non poteva correlare step con outcome).
+        // Gli step sono gia' raccolti in-memory dal brain_agent_client durante il loop SSE.
+        if !result.steps.is_empty() {
+            for step in &result.steps {
+                let _ = sqlx::query(
+                    "INSERT INTO agent_steps \
+                     (id, run_id, step_index, tool_name, tool_input, tool_result, status, created_at) \
+                     VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW())",
+                )
+                .bind(run_id)
+                .bind(step.step_index as i32)
+                .bind(&step.tool_name)
+                .bind(&step.tool_input)
+                .bind(step.tool_result.as_deref())
+                .bind(step.status.as_str())
+                .execute(&db_clone)
+                .await;
+            }
+            tracing::debug!(
+                "agent_run {}: {} step persistiti in agent_steps",
+                run_id,
+                result.steps.len()
+            );
+        }
     });
 
     Some(SpawnAgentResult {
@@ -1920,6 +2091,7 @@ pub async fn send_chat_message(
                     let automation_r = automation_mode.clone();
                     let supervisor_r = prev_supervisor;
                     let template_cache_r = state.template_cache.clone();
+                    let routing_thresholds_for_resume = state.orchestrator.routing_thresholds.clone();
                     let user_role_r = claims.role.clone();
 
                     let _ = (&neural2, &term2, &automation_r, &supervisor_r, &user_role_r, &proj, &prev_messages_json);
@@ -1939,8 +2111,18 @@ pub async fn send_chat_message(
                             &db_clone2,
                             user_id,
                             project_id_r,
+                            &automation_r,
                         )
                         .await;
+
+                        // Re-leggo soglia SSE silence (mig 0132) — cache 60s.
+                        let sse_silence_resume: u64 = match routing_thresholds_for_resume
+                            .current_async()
+                            .await
+                        {
+                            Ok(t) => t.sse_heartbeat_max_silence_secs,
+                            Err(_) => 120,
+                        };
 
                         let result = crate::brain_agent_client::run_via_brain(
                             new_run_id,
@@ -1952,6 +2134,7 @@ pub async fn send_chat_message(
                             tx,
                             resume_history,
                             tools_for_resume,
+                            sse_silence_resume,
                         )
                         .await;
                         channels2.remove(&new_run_id);

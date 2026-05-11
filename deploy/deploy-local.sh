@@ -1,10 +1,14 @@
 #!/bin/bash
 # Deploy IDEAI in locale su WSL.
-# Uso: ./deploy/deploy-local.sh [--rust] [--web] [--service <nome>] [--sync]
+# Uso: ./deploy/deploy-local.sh [--rust] [--web] [--service <nome>] [--menu] [--debug] [--sync]
 #
 #   --rust              build + restart solo backend Rust
 #   --web               build + restart solo web-ide (Next.js)
-#   --service <nome>    restart solo il servizio indicato (es. mcp-core)
+#   --service <nome>    restart solo il servizio indicato (es. mcp-core, brain, nexus-gateway, web-ide)
+#   --menu              mostra menu interattivo per scegliere il servizio
+#                       (equivalente a --service senza nome)
+#   --debug             compila Rust in debug (stacktrace completi, compilazione rapida)
+#   --list-services     elenca i servizi disponibili e esce
 #   --sync              sincronizza worktree Windows -> WSL prima del deploy
 #   --sync-only         sincronizza e basta (senza build/restart)
 #   (senza flag)        build tutto + restart tutti i servizi
@@ -12,8 +16,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RELEASE_DIR="${ROOT}/target/release"
 ENV_FILE="${ROOT}/.env"
+# Directory binari — impostata dopo il parsing dei flag (release o debug)
+BIN_DIR=""
+CARGO_PROFILE_FLAG=""
 
 export PATH="/home/administrator/.cargo/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 export HOME=/home/administrator
@@ -37,8 +43,31 @@ log() { echo "==> $*"; }
 RUST_ONLY=false
 WEB_ONLY=false
 SINGLE_SERVICE=""
+SHOW_MENU=false
+LIST_SERVICES=false
 DO_SYNC=false
 SYNC_ONLY=false
+DEBUG_BUILD=false
+
+# ─── Catalogo servizi gestibili via --service ────────────────────────────────
+# Formato: nome|kind|descrizione
+#   kind = rust       → binario Rust in target/{release,debug}, gestito da start_service()
+#          web-ide    → Next.js, build + start_webide()
+#          brain      → Python module brain.grpc_server.main
+#          gateway    → Node.js dist/server.js con env var aggiuntive
+#          builtin    → microservizi Rust comuni (admin/chat/billing/...)
+SERVICES_CATALOG=(
+    "mcp-core|rust|Routing AI, agent runner, ToolRunner gRPC (porta 4000)"
+    "brain|brain|Neural Core Python: classifier, agenti LangGraph, embeddings (porta 8001)"
+    "web-ide|web-ide|Frontend Next.js (porta 3000)"
+    "nexus-gateway|gateway|API gateway LLM (porta 4060) — Node.js"
+    "admin-service|builtin|Backend admin UI (porta 4010)"
+    "chat-service|builtin|Backend chat UI (porta 4020)"
+    "doc-service|builtin|Backend doc generator (porta 4030)"
+    "billing-service|builtin|Backend billing/quote (porta 4040)"
+    "plugin-service|builtin|Backend plugin manager (porta 4050)"
+    "browser-bridge-mcp|builtin|MCP browser bridge (porta 4055)"
+)
 
 # Worktree Windows montato in WSL (autodetect dal path dello script)
 WIN_WORKTREE=""
@@ -83,14 +112,34 @@ sync_from_windows() {
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --rust)       RUST_ONLY=true ;;
-        --web)        WEB_ONLY=true ;;
-        --service)    shift; SINGLE_SERVICE="${1:-}" ;;
-        --sync)       DO_SYNC=true ;;
-        --sync-only)  SYNC_ONLY=true; DO_SYNC=true ;;
+        --rust)            RUST_ONLY=true ;;
+        --web)             WEB_ONLY=true ;;
+        --service)
+            shift
+            SINGLE_SERVICE="${1:-}"
+            # `--service` senza nome → apre il menu interattivo
+            if [ -z "$SINGLE_SERVICE" ]; then SHOW_MENU=true; fi
+            ;;
+        --menu)            SHOW_MENU=true ;;
+        --list-services)   LIST_SERVICES=true ;;
+        --debug)           DEBUG_BUILD=true ;;
+        --sync)            DO_SYNC=true ;;
+        --sync-only)       SYNC_ONLY=true; DO_SYNC=true ;;
     esac
     shift
 done
+
+# ── Configura profilo build Rust (debug/release) ────────────────────────────
+if $DEBUG_BUILD; then
+    BIN_DIR="${ROOT}/target/debug"
+    CARGO_PROFILE_FLAG=""
+    export RUST_BACKTRACE=1
+    export RUST_LOG="${RUST_LOG:-debug}"
+    log "Modalita DEBUG: stacktrace completi, RUST_BACKTRACE=1, compilazione rapida"
+else
+    BIN_DIR="${ROOT}/target/release"
+    CARGO_PROFILE_FLAG="--release"
+fi
 
 if $DO_SYNC; then
     sync_from_windows
@@ -108,7 +157,7 @@ stop_service() {
 start_service() {
     local name="$1"
     shift
-    local bin="${RELEASE_DIR}/${name}"
+    local bin="${BIN_DIR}/${name}"
     local logfile="/tmp/nexus-${name}.log"
     # Esporta le variabili extra (es. ENABLE_TOOL_RUNNER=1) nell'ambiente corrente
     # prima di lanciare il processo, poi le rimuove per non inquinare il resto.
@@ -118,7 +167,7 @@ start_service() {
     done
     if [ ! -f "$bin" ]; then
         log "ATTENZIONE: ${bin} non trovato, avvio tramite cargo run"
-        setsid nohup bash -c "cd ${ROOT} && cargo run -p ${name} --release" > "$logfile" 2>&1 < /dev/null &
+        setsid nohup bash -c "cd ${ROOT} && cargo run -p ${name} ${CARGO_PROFILE_FLAG}" > "$logfile" 2>&1 < /dev/null &
     else
         setsid nohup "$bin" > "$logfile" 2>&1 < /dev/null &
     fi
@@ -147,6 +196,99 @@ start_service_with_env() {
     fi
 }
 
+stop_brain() {
+    pkill -f 'brain.grpc_server.main' 2>/dev/null || true
+    sleep 1
+}
+
+start_brain() {
+    local logfile="/tmp/nexus-neural.log"
+    setsid nohup env \
+        DATABASE_URL="${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}" \
+        python3 -m brain.grpc_server.main --rest \
+        > "$logfile" 2>&1 < /dev/null &
+    local pid=$!
+    disown || true
+    echo "  brain PID=${pid} log=${logfile}"
+}
+
+stop_gateway() {
+    pkill -f 'apps/nexus-gateway/dist/server\.js' 2>/dev/null || true
+    sleep 1
+}
+
+start_gateway() {
+    local logfile="/tmp/nexus-gateway.log"
+    setsid nohup env \
+        NODE_ENV=production \
+        DATABASE_URL="${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}" \
+        POSTGRES_URL="${POSTGRES_URL:-${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}}" \
+        NEXUS_GATEWAY_PORT="${NEXUS_GATEWAY_PORT:-4060}" \
+        NEXUS_LLM_POLICY_FILE="${NEXUS_LLM_POLICY_FILE:-${ROOT}/config/policies/default.yaml}" \
+        NEXUS_MODEL_ALIASES_FILE="${NEXUS_MODEL_ALIASES_FILE:-${ROOT}/config/model-aliases.yaml}" \
+        JWT_SECRET="${JWT_SECRET:-}" \
+        node "${ROOT}/apps/nexus-gateway/dist/server.js" \
+        > "$logfile" 2>&1 < /dev/null &
+    local pid=$!
+    disown || true
+    echo "  nexus-gateway PID=${pid} log=${logfile}"
+}
+
+# Ritorna il `kind` di un servizio (rust|brain|gateway|web-ide|builtin) o
+# vuoto se il nome non e' nel catalogo.
+service_kind() {
+    local name="$1"
+    for entry in "${SERVICES_CATALOG[@]}"; do
+        IFS='|' read -r sn kind _desc <<< "$entry"
+        if [ "$sn" = "$name" ]; then
+            echo "$kind"
+            return
+        fi
+    done
+    echo ""
+}
+
+list_services() {
+    echo "Servizi disponibili (--service <nome>):"
+    printf "  %-22s %-12s %s\n" "NOME" "TIPO" "DESCRIZIONE"
+    for entry in "${SERVICES_CATALOG[@]}"; do
+        IFS='|' read -r sn kind desc <<< "$entry"
+        printf "  %-22s %-12s %s\n" "$sn" "$kind" "$desc"
+    done
+}
+
+# Menu interattivo: mostra la lista numerata, legge la scelta da stdin.
+# Imposta SINGLE_SERVICE alla scelta dell'utente. Esce con 1 se annullato.
+prompt_service_menu() {
+    echo ""
+    echo "═════════════════════════════════════════════════════════════════════"
+    echo " Quale servizio vuoi riavviare?"
+    echo "═════════════════════════════════════════════════════════════════════"
+    local i=1
+    local names=()
+    for entry in "${SERVICES_CATALOG[@]}"; do
+        IFS='|' read -r sn kind desc <<< "$entry"
+        printf "  %2d) %-22s [%-7s] %s\n" "$i" "$sn" "$kind" "$desc"
+        names+=("$sn")
+        i=$((i+1))
+    done
+    echo "   0) annulla"
+    echo ""
+    local choice
+    read -r -p "Scegli [0-${#names[@]}]: " choice
+    if [ -z "$choice" ] || [ "$choice" = "0" ]; then
+        echo "Annullato."
+        exit 0
+    fi
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#names[@]}" ]; then
+        echo "Scelta non valida: $choice" >&2
+        exit 1
+    fi
+    SINGLE_SERVICE="${names[$((choice-1))]}"
+    echo "→ Selezionato: $SINGLE_SERVICE"
+    echo ""
+}
+
 stop_webide() {
     pkill -f "server\.js" 2>/dev/null || true
     pkill -f "next-server" 2>/dev/null || true
@@ -169,18 +311,50 @@ build_webide() {
     cd "$ROOT"
 }
 
+# ── Gestione --list-services e --menu (devono precedere il branch --service) ──
+if $LIST_SERVICES; then
+    list_services
+    exit 0
+fi
+
+if $SHOW_MENU; then
+    prompt_service_menu
+fi
+
 # ── Restart singolo servizio ──────────────────────────────────────────────────
 if [ -n "$SINGLE_SERVICE" ]; then
-    log "Restart ${SINGLE_SERVICE}..."
-    if [ "$SINGLE_SERVICE" = "web-ide" ]; then
-        build_webide
-        stop_webide
-        start_webide
-    else
-        stop_service "$SINGLE_SERVICE"
-        cargo build --release -p "$SINGLE_SERVICE" 2>&1 | tail -5
-        start_service_with_env "$SINGLE_SERVICE"
+    kind=$(service_kind "$SINGLE_SERVICE")
+    if [ -z "$kind" ]; then
+        # Compat: se il nome non e' nel catalogo, lo trattiamo come rust legacy
+        # (la vecchia behavior dello script). Logga avviso ma procedi.
+        log "AVVISO: '${SINGLE_SERVICE}' non e' in SERVICES_CATALOG, provo come rust binary."
+        kind="rust"
     fi
+    log "Restart ${SINGLE_SERVICE} (kind=${kind})..."
+    case "$kind" in
+        rust|builtin)
+            stop_service "$SINGLE_SERVICE"
+            cargo build ${CARGO_PROFILE_FLAG} -p "$SINGLE_SERVICE" 2>&1 | tail -5
+            start_service_with_env "$SINGLE_SERVICE"
+            ;;
+        brain)
+            stop_brain
+            start_brain
+            ;;
+        gateway)
+            stop_gateway
+            start_gateway
+            ;;
+        web-ide)
+            build_webide
+            stop_webide
+            start_webide
+            ;;
+        *)
+            echo "Errore: kind sconosciuto '${kind}' per '${SINGLE_SERVICE}'" >&2
+            exit 1
+            ;;
+    esac
     sleep 2
     log "Fatto."
     exit 0
@@ -198,9 +372,9 @@ fi
 
 # ── Solo Rust ─────────────────────────────────────────────────────────────────
 if $RUST_ONLY; then
-    log "Build Rust (release)..."
+    log "Build Rust ($($DEBUG_BUILD && echo 'debug' || echo 'release'))..."
     cd "$ROOT"
-    cargo build --release --workspace 2>&1 | tail -10
+    cargo build ${CARGO_PROFILE_FLAG} --workspace 2>&1 | tail -10
     log "Restart servizi Rust..."
     for svc in mcp-core admin-service chat-service billing-service doc-service plugin-service browser-bridge-mcp; do
         stop_service "$svc"
@@ -217,9 +391,9 @@ if $RUST_ONLY; then
 fi
 
 # ── Build + restart completo ──────────────────────────────────────────────────
-log "Build Rust (release)..."
+log "Build Rust ($($DEBUG_BUILD && echo 'debug' || echo 'release'))..."
 cd "$ROOT"
-cargo build --release --workspace 2>&1 | tail -10
+cargo build ${CARGO_PROFILE_FLAG} --workspace 2>&1 | tail -10
 
 build_webide
 

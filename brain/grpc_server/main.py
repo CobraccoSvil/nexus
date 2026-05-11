@@ -1245,9 +1245,25 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
         acc_total_cost = 0.0
         end_turn_emitted = False
         try:
-            async for event in graph.astream(  # type: ignore[union-attr]
+            # Heartbeat: ogni attesa di evento ha un timeout di 30s.
+            # Se il brain e' in elaborazione senza produrre output (tool lento,
+            # LLM streaming lento, attesa gRPC), emette un ping SSE per segnalare
+            # a mcp-core Rust che il run e' ancora attivo.
+            # Cosi' mcp-core puo' usare un timeout per-silence (120s) invece del
+            # timeout monolitico fisso sulla connessione SSE.
+            _aiter = graph.astream(  # type: ignore[union-attr]
                 initial_state, config=config, stream_mode="updates"
-            ):
+            ).__aiter__()
+            while True:
+                try:
+                    event = await asyncio.wait_for(_aiter.__anext__(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    # Brain in elaborazione, nessun evento negli ultimi 30s.
+                    # Emetti ping per segnalare attivita' a mcp-core.
+                    yield 'data: {"type":"ping"}\n\n'
+                    continue
+                except StopAsyncIteration:
+                    break
                 # event = {"<node_name>": <delta_dict>}
                 for node, delta in event.items():
                     if not isinstance(delta, dict):

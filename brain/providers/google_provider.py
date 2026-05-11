@@ -125,6 +125,7 @@ class GoogleProvider(BaseProvider):
         tools: list[dict],
         max_tokens: int = 4096,
         system_text: str = "",
+        temperature: float = 0.7,
     ) -> ProviderResult:
         """Turno agente con function calling Google Gemini, normalizzato al formato Anthropic."""
         if not self._api_key:
@@ -157,9 +158,14 @@ class GoogleProvider(BaseProvider):
                     ))
                 google_tools = [types.Tool(function_declarations=func_decls)]
 
+            # I modelli "thinking" (gemini-2.0/2.5-flash-thinking-exp, gemini-2.5-pro-exp)
+            # ignorano temperature (usano il loro thinking budget interno) ma non danno errore.
+            # Settiamo None per i thinking model per evitare warning nell'API.
+            _is_thinking = "thinking" in model.lower() or "gemini-2.5-pro" in model.lower()
+            config_temperature = None if _is_thinking else temperature
             config = types.GenerateContentConfig(
                 max_output_tokens=max_tokens,
-                temperature=0.3,
+                temperature=config_temperature,
                 tools=google_tools,
             )
             if system_text:

@@ -25,9 +25,10 @@ export function middleware(request: NextRequest) {
     return NextResponse.next();
   }
 
-  // Landing page: authenticated users go to /ide, others see landing
+  // Landing page: authenticated users go to /ide, others see landing.
+  // ?site bypassa il redirect per mostrare la landing anche agli utenti loggati.
   if (pathname === "/") {
-    if (token) {
+    if (token && !request.nextUrl.searchParams.has("site")) {
       return NextResponse.redirect(new URL("/ide", request.url));
     }
     return NextResponse.next();

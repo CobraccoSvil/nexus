@@ -5,6 +5,16 @@ import logging
 import os
 from typing import Any, AsyncIterator
 
+# Modelli DeepSeek "reasoning" che non accettano temperature, top_p
+# e non supportano tool calling.
+_DEEPSEEK_REASONING_MODELS = frozenset({"deepseek-reasoner"})
+
+
+def _is_deepseek_reasoning(model: str) -> bool:
+    """Restituisce True se il modello e' un modello reasoning DeepSeek (R1/R2)."""
+    model_lower = model.lower()
+    return model_lower in _DEEPSEEK_REASONING_MODELS or "deepseek-r" in model_lower
+
 from .base import BaseProvider, ProviderCatalogEntry, ProviderResult
 from .error_handler import format_error_result
 from .openai_provider import _anthropic_tool_to_openai, _convert_messages_to_openai
@@ -65,12 +75,15 @@ class DeepSeekProvider(BaseProvider):
             )
         try:
             client = self._get_client()
-            response = await client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=kwargs.get("max_tokens", 4096),
-                temperature=kwargs.get("temperature", 0.7),
-            )
+            create_kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": kwargs.get("max_tokens", 4096),
+            }
+            # I modelli reasoning (deepseek-reasoner / R1) non accettano temperature.
+            if not _is_deepseek_reasoning(model):
+                create_kwargs["temperature"] = kwargs.get("temperature", 0.7)
+            response = await client.chat.completions.create(**create_kwargs)
             choice = response.choices[0]
             return ProviderResult(
                 provider=self.name,
@@ -114,8 +127,9 @@ class DeepSeekProvider(BaseProvider):
             if system_text:
                 oai_messages.insert(0, {"role": "system", "content": system_text})
 
-            # deepseek-reasoner non supporta tool calling
-            supports_tools = model != "deepseek-reasoner"
+            # I modelli reasoning (deepseek-reasoner / R1) non supportano tool calling
+            # e non accettano temperature.
+            supports_tools = not _is_deepseek_reasoning(model)
             compressed = compress_tool_list(tools) if tools and supports_tools else []
             oai_tools = [_anthropic_tool_to_openai(t) for t in compressed] if compressed else []
 
@@ -182,13 +196,15 @@ class DeepSeekProvider(BaseProvider):
             return
         try:
             client = self._get_client()
-            stream = await client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=kwargs.get("max_tokens", 4096),
-                temperature=kwargs.get("temperature", 0.7),
-                stream=True,
-            )
+            stream_kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": kwargs.get("max_tokens", 4096),
+                "stream": True,
+            }
+            if not _is_deepseek_reasoning(model):
+                stream_kwargs["temperature"] = kwargs.get("temperature", 0.7)
+            stream = await client.chat.completions.create(**stream_kwargs)
             async for chunk in stream:
                 delta = chunk.choices[0].delta
                 if delta.content:

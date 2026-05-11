@@ -436,4 +436,184 @@ mod tests {
         let m = make_test_matrix();
         assert_eq!(m.default_model("xai"), None);
     }
+
+    // =====================================================================
+    // TEST SCALABILITA' PROVIDER/MODELLI
+    // =====================================================================
+    // Validano che la matrice di routing supporti scaling intra-provider
+    // (stesso intent con behavior_mode diverso → modello piu' capace) e
+    // copertura completa di tutti i 5 provider configurati.
+
+    #[test]
+    fn fallback_safe_copre_tutti_e_5_i_provider_default() {
+        // Garanzia: ogni provider supportato ha un default_model. Senza questa
+        // garanzia, fallback chain in chat_messages.rs:1505 puo' fallire
+        // silenziosamente quando passa a un provider senza default in DB.
+        let m = RoutingMatrix::fallback_safe();
+        for provider in &["openai", "anthropic", "google", "mistral", "deepseek"] {
+            assert!(
+                m.default_model(provider).is_some(),
+                "default_model('{}') deve essere configurato per la fallback chain",
+                provider
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_distingue_behavior_mode_per_stesso_intent() {
+        // Scaling intra-mode: chat_breve in 4 mode diversi → 4 (provider, model)
+        // diversi. Verifica la non-degenerazione: il behavior_mode discrimina davvero.
+        let m = RoutingMatrix::fallback_safe();
+        let mut found_models = std::collections::HashSet::new();
+        for mode in &["veloce", "economica", "bilanciata", "approfondita"] {
+            if let Some((_p, model)) = m.lookup("chat_breve", mode) {
+                found_models.insert(model);
+            }
+        }
+        assert!(
+            found_models.len() >= 3,
+            "chat_breve deve mappare a >= 3 modelli distinti per mode diversi, trovati: {:?}",
+            found_models
+        );
+    }
+
+    #[test]
+    fn lookup_intent_agentici_richiedono_modelli_capable() {
+        // Gli intent rischiosi (file_ops, system_admin, debug, architecture) in mode
+        // approfondita devono usare modelli "heavy" (Claude Sonnet/Opus). Mai modelli
+        // light come gpt-4.1-nano o gemini-flash-lite.
+        let m = RoutingMatrix::fallback_safe();
+        let light_models = [
+            "gemini-2.5-flash-lite",
+            "gpt-4.1-nano",
+            "claude-haiku-3-5",
+            "mistral-small-latest",
+            "deepseek-chat",
+        ];
+        for intent in &["file_ops", "system_admin", "debug", "architecture"] {
+            if let Some((_p, model)) = m.lookup(intent, "approfondita") {
+                assert!(
+                    !light_models.contains(&model.as_str()),
+                    "intent '{}' mode 'approfondita' non puo' usare modello light '{}'",
+                    intent, model
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lookup_e_case_sensitive_su_intent() {
+        // Defense in depth: se il classificatore agentico ritorna "FILE_OPS"
+        // (uppercase), lookup deve fallire invece di rispondere come "file_ops".
+        // Questo forza il chiamante a normalizzare l'input.
+        let m = RoutingMatrix::fallback_safe();
+        assert!(m.lookup("file_ops", "bilanciata").is_some());
+        assert!(m.lookup("FILE_OPS", "bilanciata").is_none());
+        assert!(m.lookup("File_Ops", "bilanciata").is_none());
+    }
+
+    #[test]
+    fn lookup_ritorna_none_per_combinazione_mode_invalida() {
+        // Se il classificatore propone mode "ultra_veloce" inesistente,
+        // lookup deve dire None (no silent fallback a una mode random).
+        let m = RoutingMatrix::fallback_safe();
+        assert_eq!(m.lookup("file_ops", "ultra_veloce"), None);
+        assert_eq!(m.lookup("chat_breve", ""), None);
+    }
+
+    #[test]
+    fn total_entries_somma_tutte_e_3_le_mappe() {
+        let mut m = make_test_matrix();
+        m.escalations.insert(
+            ("file_ops".to_string(), "bilanciata".to_string()),
+            EscalationRule {
+                threshold_tokens: 10000,
+                provider: "anthropic".to_string(),
+                model_id: "claude-opus-4-6".to_string(),
+            },
+        );
+        // 2 entry by_intent_mode + 2 default + 1 purpose = 5 (escalations escluse)
+        assert_eq!(m.total_entries(), 5);
+    }
+
+    #[test]
+    fn purpose_model_ritorna_tupla_provider_modello() {
+        let m = make_test_matrix();
+        let pm = m.purpose_model("chat_title_generator");
+        assert_eq!(
+            pm,
+            Some(("openai".to_string(), "gpt-4.1-nano".to_string()))
+        );
+        assert_eq!(m.purpose_model("inesistente"), None);
+    }
+
+    #[test]
+    fn fallback_safe_garantisce_coverage_intent_critici() {
+        // Smoke test: i 9 intent critici devono avere almeno una entry in
+        // mode "bilanciata" (mode di default per la maggior parte dei turni).
+        let m = RoutingMatrix::fallback_safe();
+        let intent_critici = [
+            "chat_breve", "chat_media", "chat_lunga",
+            "file_ops", "system_admin", "debug", "architecture",
+            "refactor", "fix_complesso",
+        ];
+        for intent in &intent_critici {
+            let mode = if intent.starts_with("chat") { "bilanciata" } else { "bilanciata" };
+            assert!(
+                m.lookup(intent, mode).is_some(),
+                "intent critico '{}' senza routing in mode 'bilanciata' — fallback chain rotta",
+                intent
+            );
+        }
+    }
+
+    #[test]
+    fn escalation_for_ritorna_none_quando_assente() {
+        let m = make_test_matrix();
+        let key = ("file_ops".to_string(), "approfondita".to_string());
+        assert!(m.escalations.get(&key).is_none());
+    }
+
+    #[test]
+    fn lookup_with_budget_applica_escalation_oltre_soglia() {
+        // BP8: lookup_with_budget deve ritornare il modello escalation
+        // quando est_tokens supera la threshold, e il modello base altrimenti.
+        let mut m = make_test_matrix();
+        // Aggiunge base entry per il caso sotto threshold
+        m.by_intent_mode.insert(
+            ("refactor".to_string(), "bilanciata".to_string()),
+            ("openai".to_string(), "gpt-4.1-mini".to_string()),
+        );
+        // Aggiunge regola escalation per token grandi
+        m.escalations.insert(
+            ("refactor".to_string(), "bilanciata".to_string()),
+            EscalationRule {
+                threshold_tokens: 50_000,
+                provider: "anthropic".to_string(),
+                model_id: "claude-sonnet-4-6".to_string(),
+            },
+        );
+        // Sotto soglia: modello base
+        let base = m.lookup_with_budget("refactor", "bilanciata", 10_000);
+        assert_eq!(base, Some(("openai".to_string(), "gpt-4.1-mini".to_string())));
+        // Sopra soglia: modello escalation
+        let esc = m.lookup_with_budget("refactor", "bilanciata", 60_000);
+        assert_eq!(
+            esc,
+            Some(("anthropic".to_string(), "claude-sonnet-4-6".to_string()))
+        );
+    }
+
+    #[test]
+    fn fallback_safe_ha_almeno_24_intent_mode_entries() {
+        // Soglia minima: la matrice di test deve coprire abbastanza casi
+        // perche' qualsiasi cambio nella seed migration 0101 (rimozione
+        // accidentale di intent) faccia fallire i test.
+        let m = RoutingMatrix::fallback_safe();
+        assert!(
+            m.by_intent_mode.len() >= 24,
+            "fallback_safe ha {} entries, atteso >= 24 (seed mig 0101)",
+            m.by_intent_mode.len()
+        );
+    }
 }

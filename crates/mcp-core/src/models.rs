@@ -59,8 +59,10 @@ pub async fn list_models(
 ) -> Json<Value> {
     let result: Result<Vec<ModelCatalogEntry>, _> = if let Some(ref provider) = params.provider {
         sqlx::query_as(
-            r#"SELECT provider, model, display_name, input_cost_per_million_tokens,
-               output_cost_per_million_tokens, currency, performance_tier, speed_tier,
+            r#"SELECT provider, model, display_name,
+               input_cost_per_million_tokens::float8 AS input_cost_per_million_tokens,
+               output_cost_per_million_tokens::float8 AS output_cost_per_million_tokens,
+               currency, performance_tier, speed_tier,
                capabilities, context_window, supports_tool_use, batch_discount_pct,
                is_featured, is_enabled
                FROM ai_price_catalog
@@ -72,8 +74,10 @@ pub async fn list_models(
         .await
     } else {
         sqlx::query_as(
-            r#"SELECT provider, model, display_name, input_cost_per_million_tokens,
-               output_cost_per_million_tokens, currency, performance_tier, speed_tier,
+            r#"SELECT provider, model, display_name,
+               input_cost_per_million_tokens::float8 AS input_cost_per_million_tokens,
+               output_cost_per_million_tokens::float8 AS output_cost_per_million_tokens,
+               currency, performance_tier, speed_tier,
                capabilities, context_window, supports_tool_use, batch_discount_pct,
                is_featured, is_enabled
                FROM ai_price_catalog

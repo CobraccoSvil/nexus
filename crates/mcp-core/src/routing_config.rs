@@ -41,6 +41,15 @@ pub struct RoutingThresholds {
     pub token_threshold_chat_media: u32,
     pub token_threshold_complex_fix: u32,
     pub token_threshold_long_context: u32,
+    /// L2 (disambiguation): top intent confidence sotto questa soglia →
+    /// richiesta di chiarimento all'utente. Sorgente: `settings.routing.ambiguity_min_confidence` (mig 0132).
+    pub ambiguity_min_confidence: f32,
+    /// L2 (disambiguation): margine (top − second_candidate) sotto questa soglia →
+    /// richiesta di chiarimento. Sorgente: `settings.routing.ambiguity_min_margin` (mig 0132).
+    pub ambiguity_min_margin: f32,
+    /// L3 / Heartbeat SSE: secondi di silenzio stream brain→mcp-core prima
+    /// di considerare il run bloccato. Sorgente: `settings.routing.sse_heartbeat_max_silence_secs` (mig 0132).
+    pub sse_heartbeat_max_silence_secs: u64,
     pub loaded_at: Instant,
 }
 
@@ -59,6 +68,11 @@ impl RoutingThresholds {
             token_threshold_chat_media: 1_500,
             token_threshold_complex_fix: 3_000,
             token_threshold_long_context: 6_000,
+            // Default tecnici per i nuovi parametri (mig 0132). Usati solo
+            // come ricovero parziale se la chiave manca dal DB.
+            ambiguity_min_confidence: 0.70,
+            ambiguity_min_margin: 0.15,
+            sse_heartbeat_max_silence_secs: 120,
             loaded_at: Instant::now(),
         }
     }
@@ -131,6 +145,10 @@ async fn fetch_thresholds_from_db(db: &PgPool) -> Result<RoutingThresholds, Stri
         token_threshold_chat_media: parse_u32("routing.token_threshold_chat_media", 1_500),
         token_threshold_complex_fix: parse_u32("routing.token_threshold_complex_fix", 3_000),
         token_threshold_long_context: parse_u32("routing.token_threshold_long_context", 6_000),
+        // Nuovi parametri (mig 0132)
+        ambiguity_min_confidence: parse_f32("routing.ambiguity_min_confidence", 0.70),
+        ambiguity_min_margin: parse_f32("routing.ambiguity_min_margin", 0.15),
+        sse_heartbeat_max_silence_secs: parse_u64("routing.sse_heartbeat_max_silence_secs", 120),
         loaded_at: Instant::now(),
     })
 }

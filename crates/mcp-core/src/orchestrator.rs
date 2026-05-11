@@ -219,10 +219,53 @@ fn is_agentic_request(message: &str) -> bool {
     AGENTIC_VERBS.iter().any(|kw| lc.contains(*kw))
 }
 
+/// Detecta se il messaggio descrive **risoluzione di test falliti** (non
+/// semplice creazione/esecuzione di test): "esegui i test e risolvi i fail",
+/// "lancia Playwright e correggi gli errori", "fai funzionare i test che
+/// falliscono", ecc.
+///
+/// Senza questo detector tali richieste con `intent=test` cadrebbero sulla
+/// routing matrix `test|bilanciata` che usa modelli LEGGERI (deepseek-chat,
+/// gpt-4.1-mini) — questi non sono in grado di orchestrare multi-file edit,
+/// debug AuthJS, refactor config. Il chiamante riclassifica l'intent a
+/// `fix_complesso` (mappato a claude-haiku/claude-sonnet/mistral-large in
+/// `nexus_routing_matrix`).
+///
+/// Le keyword sono **prefissi laschi** che matchano forme verbali multiple:
+/// (risolv/risolvere/risolto, fix/fixa/fixato, correg/correggere/corretto).
+/// Falsi positivi accettabili (al peggio modello piu' capace di quanto serva).
+fn is_test_failure_resolution(message: &str) -> bool {
+    let lc = message.to_lowercase();
+    // Deve menzionare i test E richiedere un'azione correttiva
+    let mentions_tests = ["test", "playwright", "vitest", "jest", "pytest", "cargo test"]
+        .iter()
+        .any(|kw| lc.contains(*kw));
+    if !mentions_tests {
+        return false;
+    }
+    // Verbi correttivi (prefissi che coprono coniugazioni it/en):
+    const CORRECTIVE_VERBS: &[&str] = &[
+        "risolv", "fix", "correg", "ripar", "ripara",
+        "fai funzionare", "fai passare", "make pass", "make work",
+        "fai partire e", "esegui e", "lancia e",
+        "applica fix", "applica patch", "applica corre",
+        "make them pass", "pass all tests", "tutti i test passino",
+        "fai in modo che", "fai sì che", "fa sì che",
+        "non funziona", "non funzionano", "non passano",
+        "stanno fallendo", "stanno fallendo", "are failing", "is failing",
+        "failure", "fallimento", "fallimenti",
+    ];
+    CORRECTIVE_VERBS.iter().any(|kw| lc.contains(*kw))
+}
+
 /// Variante di `classify_intent_local` che applica la promozione agentic:
 /// se l'intent classificato e' `chat` ma `is_agentic_request` rileva una
 /// richiesta multi-step (es. "imposta un utente admin"), riclassifica come
 /// `system_admin` per dirottare a modelli capable in routing matrix.
+///
+/// Inoltre: se l'intent e' `test` ma `is_test_failure_resolution` rileva
+/// una richiesta di risoluzione fail, riclassifica come `fix_complesso`
+/// per evitare il routing a modelli leggeri (gpt-4.1-mini).
 ///
 /// Usata come **fallback** quando il classifier LLM non e' disponibile.
 /// Path async preferito: `classify_intent_async`.
@@ -232,6 +275,16 @@ fn classify_intent_with_agentic_promotion(message: &str) -> (&'static str, f32) 
         // Confidence ridotta perche' e' una promozione euristica, non una
         // classificazione diretta.
         return ("system_admin", 0.70);
+    }
+    // Promozione → fix_complesso quando il messaggio chiede di RISOLVERE
+    // fail di test (es. "esegui i test e correggi gli errori"). Senza
+    // questa promozione il task finisce su modelli light incapaci di
+    // orchestrare multi-file edit + debug.
+    // Sia `intent="test"` (creazione test interpretata male) sia
+    // `intent="fix"` (intent generico senza tier) vengono promossi:
+    // `fix_complesso` mappa esplicitamente a modelli capable in DB.
+    if (intent == "test" || intent == "fix") && is_test_failure_resolution(message) {
+        return ("fix_complesso", 0.70);
     }
     (intent, confidence)
 }
@@ -252,6 +305,44 @@ struct AgenticIntentResponse {
     cached: bool,
     #[serde(default)]
     fallback_used: bool,
+    /// Top 3 candidati sortati per confidence DESC. Sempre contiene almeno
+    /// `intent` come primo elemento.
+    #[serde(default)]
+    candidates: Vec<IntentCandidate>,
+    /// True se il classifier ritiene la decisione ambigua (confidence < 0.70
+    /// oppure margine sul secondo candidato < 0.15). Quando true il caller
+    /// dovrebbe chiedere disambiguazione all'utente invece di indovinare.
+    #[serde(default)]
+    is_ambiguous: bool,
+    /// Slot canonici per routing slot-based (Livello 4 NLU, mig 0133).
+    /// Se `slots.is_complete()` E `slots.confidence >= soglia`, il caller
+    /// usa `nexus_routing_slots_matrix` come fonte primaria di routing
+    /// (piu' specifica della classica (intent, behavior_mode)).
+    #[serde(default)]
+    slots: crate::routing_slots::ActionSlots,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct IntentCandidate {
+    pub intent: String,
+    pub confidence: f32,
+}
+
+/// Risultato esteso di classificazione: oltre a (intent, confidence) include
+/// candidati alternativi, flag di ambiguita' E slot canonici per supportare
+/// disambiguazione + routing slot-based (best practice NLU: Rasa/Dialogflow/LUIS).
+#[derive(Debug, Clone)]
+pub struct ClassifiedIntent {
+    pub intent: &'static str,
+    pub confidence: f32,
+    pub candidates: Vec<IntentCandidate>,
+    pub is_ambiguous: bool,
+    /// Slot canonici (action_verb, target_type, framework, scope) estratti
+    /// dal classifier LLM. Vuoto se il classifier keyword fallback e' stato
+    /// usato. Quando `slots.is_complete()` E `slots.confidence >= 0.60`, il
+    /// router prova prima la `nexus_routing_slots_matrix` (mig 0133), e
+    /// cade sul routing classico (intent, behavior_mode) se non c'e' match.
+    pub slots: crate::routing_slots::ActionSlots,
 }
 
 /// Soglia di confidence default sotto la quale ignoriamo la classificazione LLM
@@ -442,7 +533,145 @@ async fn classify_intent_async_with_threshold(
         return ("system_admin", parsed.confidence);
     }
 
+    // Promozione → fix_complesso quando il messaggio chiede di risolvere
+    // fail di test. La routing matrix `test|*` ha modelli light
+    // (deepseek-chat, gpt-4.1-mini) inadeguati per orchestrare multi-file
+    // edit + debug. `fix_complesso` mappa a modelli capable.
+    // Sia `test` sia `fix` vengono promossi (entrambi sono target sub-tier).
+    if (intent_static == "test" || intent_static == "fix")
+        && is_test_failure_resolution(message)
+    {
+        tracing::info!(
+            "intent: promozione {} → fix_complesso (test failure resolution detected)",
+            intent_static
+        );
+        return ("fix_complesso", parsed.confidence);
+    }
+
     (intent_static, parsed.confidence)
+}
+
+/// Variante "full" che ritorna `ClassifiedIntent` (con candidati e flag
+/// ambiguita') invece del solo `(intent, confidence)`.
+///
+/// Best practice NLU: quando `is_ambiguous=true` il caller deve chiedere
+/// disambiguazione all'utente prima di scegliere un provider/modello.
+///
+/// Stesso flusso di `classify_intent_async_with_threshold` ma propaga
+/// i campi aggiuntivi del classifier LLM (`candidates`, `is_ambiguous`).
+async fn classify_intent_async_full_with_threshold(
+    message: &str,
+    min_confidence: f32,
+    timeout_seconds: f32,
+) -> ClassifiedIntent {
+    let llm_enabled = match std::env::var("NEXUS_LLM_CLASSIFIER_ENABLED").as_deref() {
+        Ok(v) => !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => LLM_CLASSIFIER_ENABLED.load(Ordering::Relaxed),
+    };
+
+    // Helper: wrap di un (intent, confidence) keyword-based in ClassifiedIntent.
+    // Il path keyword non ha candidati alternativi: ne sintetizziamo uno solo.
+    // is_ambiguous = (confidence < min_confidence) — best effort: il classifier
+    // keyword non ha visione semantica del task, quindi sotto soglia trattiamo
+    // la decisione come incerta e l'agente chiedera' chiarimenti.
+    let keyword_to_full = |intent: &'static str, conf: f32| -> ClassifiedIntent {
+        ClassifiedIntent {
+            intent,
+            confidence: conf,
+            candidates: vec![IntentCandidate {
+                intent: intent.to_string(),
+                confidence: conf,
+            }],
+            is_ambiguous: conf < min_confidence,
+            // Keyword classifier: nessuno slot semantico estraibile.
+            slots: crate::routing_slots::ActionSlots::default(),
+        }
+    };
+
+    if !llm_enabled || message.trim().is_empty() {
+        let (i, c) = classify_intent_with_agentic_promotion(message);
+        return keyword_to_full(i, c);
+    }
+
+    let brain_url = std::env::var("BRAIN_REST_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+    let url = format!("{}/classify-intent-agentic", brain_url.trim_end_matches('/'));
+
+    let timeout_dur = std::time::Duration::from_millis((timeout_seconds * 1000.0) as u64);
+    let http = match reqwest::Client::builder().timeout(timeout_dur).build() {
+        Ok(c) => c,
+        Err(_) => {
+            let (i, c) = classify_intent_with_agentic_promotion(message);
+            return keyword_to_full(i, c);
+        }
+    };
+
+    let body = serde_json::json!({ "message": message });
+    let resp = match http.post(&url).json(&body).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => {
+            let (i, c) = classify_intent_with_agentic_promotion(message);
+            return keyword_to_full(i, c);
+        }
+    };
+
+    let parsed: AgenticIntentResponse = match resp.json().await {
+        Ok(p) => p,
+        Err(_) => {
+            let (i, c) = classify_intent_with_agentic_promotion(message);
+            return keyword_to_full(i, c);
+        }
+    };
+
+    if parsed.fallback_used || parsed.confidence < min_confidence {
+        let (i, c) = classify_intent_with_agentic_promotion(message);
+        // Conserviamo i candidati LLM se disponibili (utili per audit anche
+        // quando il top intent non passa la soglia di confidence).
+        let candidates = if parsed.candidates.is_empty() {
+            vec![IntentCandidate { intent: i.to_string(), confidence: c }]
+        } else {
+            parsed.candidates
+        };
+        return ClassifiedIntent {
+            intent: i,
+            confidence: c,
+            candidates,
+            is_ambiguous: parsed.is_ambiguous || c < min_confidence,
+            // Anche sotto-soglia conserviamo gli slot per audit/UI: il
+            // routing classico ha priorita' ma il debug rimane visibile.
+            slots: parsed.slots,
+        };
+    }
+
+    let intent_static = match intent_str_to_static(&parsed.intent) {
+        Some(s) => s,
+        None => {
+            let (i, c) = classify_intent_with_agentic_promotion(message);
+            return keyword_to_full(i, c);
+        }
+    };
+
+    // Promozioni euristiche (chat→system_admin, test/fix→fix_complesso).
+    // Una volta promosso, il flag is_ambiguous viene RESETTATO perche' la
+    // promozione e' deterministica (regola hardcoded, non probabilistica).
+    let (final_intent, ambiguous) =
+        if intent_static == "chat" && parsed.agentic_score > 0.70 && parsed.requires_tools {
+            ("system_admin", false)
+        } else if (intent_static == "test" || intent_static == "fix")
+            && is_test_failure_resolution(message)
+        {
+            ("fix_complesso", false)
+        } else {
+            (intent_static, parsed.is_ambiguous)
+        };
+
+    ClassifiedIntent {
+        intent: final_intent,
+        confidence: parsed.confidence,
+        candidates: parsed.candidates,
+        is_ambiguous: ambiguous,
+        slots: parsed.slots,
+    }
 }
 
 /// Wrapper che usa i default hardcoded — solo per call site che non hanno
@@ -1287,6 +1516,11 @@ pub struct Orchestrator {
     pub(crate) routing_thresholds: crate::routing_config::RoutingThresholdsCache,
     /// Cache mapping intent -> tier/capability/preferred_provider — mig 0110.
     pub(crate) intent_capability: crate::routing_config::IntentCapabilityCache,
+    /// Cache della matrice slot-based (mig 0133, Livello 4 NLU).
+    /// Lookup gerarchico (action_verb, target_type, framework, scope) →
+    /// (provider, model). Piu' precisa di (intent, behavior_mode); il
+    /// router la prova per prima e cade su routing classico se no-match.
+    pub(crate) slots_matrix: crate::routing_slots::SlotsRoutingMatrixCache,
 }
 
 impl Orchestrator {
@@ -1296,6 +1530,7 @@ impl Orchestrator {
         routing_matrix: crate::routing_matrix::RoutingMatrixCache,
         routing_thresholds: crate::routing_config::RoutingThresholdsCache,
         intent_capability: crate::routing_config::IntentCapabilityCache,
+        slots_matrix: crate::routing_slots::SlotsRoutingMatrixCache,
     ) -> Self {
         Self {
             neural,
@@ -1304,6 +1539,7 @@ impl Orchestrator {
             routing_matrix,
             routing_thresholds,
             intent_capability,
+            slots_matrix,
         }
     }
 
@@ -1328,6 +1564,85 @@ impl Orchestrator {
             Err(_) => (LLM_CLASSIFIER_MIN_CONFIDENCE_DEFAULT, 5.0),
         };
         classify_intent_async_with_threshold(message, min_conf, timeout_s).await
+    }
+
+    /// Variante "full" che ritorna `ClassifiedIntent` con candidati + flag
+    /// ambiguita'. Usata da `spawn_agent_run` per decidere se chiedere
+    /// disambiguazione all'utente (best practice NLU).
+    pub async fn classify_intent_full(&self, message: &str) -> ClassifiedIntent {
+        let (min_conf, timeout_s) = match self.routing_thresholds.current_async().await {
+            Ok(t) => (t.llm_classifier_min_confidence, t.llm_classifier_timeout_seconds),
+            Err(_) => (LLM_CLASSIFIER_MIN_CONFIDENCE_DEFAULT, 5.0),
+        };
+        classify_intent_async_full_with_threshold(message, min_conf, timeout_s).await
+    }
+
+    /// Routing slot-first (Livello 4 NLU): se il classifier ha estratto slot
+    /// validi con confidence sufficiente, tenta lookup nella `nexus_routing_slots_matrix`
+    /// (mig 0133). In caso di no-match o slot incompleti, ritorna `None` e il
+    /// caller fa fallback al routing classico `(intent, behavior_mode)`.
+    ///
+    /// `min_slot_confidence`: soglia sopra la quale fidarsi degli slot.
+    /// Tipicamente 0.60 — sotto questa soglia il classifier "non e' sicuro"
+    /// di action_verb/scope e meglio cadere sul routing classico testato.
+    ///
+    /// Ritorna `Some((provider, model, rationale))` dove rationale spiega
+    /// la decisione (utile per audit telemetria + UI debug).
+    pub async fn route_by_slots(
+        &self,
+        slots: &crate::routing_slots::ActionSlots,
+        min_slot_confidence: f32,
+    ) -> Option<(String, String, &'static str)> {
+        if !slots.is_complete() {
+            return None;
+        }
+        if !slots.meets_confidence(min_slot_confidence) {
+            tracing::debug!(
+                "route_by_slots: confidence {:.2} < soglia {:.2}, fallback intent classico",
+                slots.confidence, min_slot_confidence
+            );
+            return None;
+        }
+        let matrix = self.slots_matrix.current_async().await?;
+        // Cooldown-awareness: scorri la chain di candidati (priority DESC) e
+        // ritorna il primo provider NON in cooldown. Se tutti i provider della
+        // chain matrice slots sono in cooldown, ritorna None → fallback al
+        // routing classico (che ha la propria cooldown chain).
+        let chain = matrix.lookup_chain(slots);
+        if chain.is_empty() {
+            tracing::debug!(
+                "route_by_slots: nessun match per ({}, {}, {}, {}) in matrix",
+                slots.action_verb, slots.target_type, slots.framework, slots.scope,
+            );
+            return None;
+        }
+        let mut skipped: Vec<String> = Vec::new();
+        for (provider, model) in &chain {
+            if crate::provider_cooldown::is_provider_in_cooldown(provider) {
+                skipped.push(provider.clone());
+                continue;
+            }
+            if !skipped.is_empty() {
+                tracing::info!(
+                    "route_by_slots: skip provider in cooldown [{}], scelto {}/{} (chain pos {}/{})",
+                    skipped.join(","), provider, model,
+                    skipped.len() + 1, chain.len(),
+                );
+            } else {
+                tracing::info!(
+                    "route_by_slots: slots=({}, {}, {}, {}) → {}/{}",
+                    slots.action_verb, slots.target_type, slots.framework, slots.scope,
+                    provider, model,
+                );
+            }
+            return Some((provider.clone(), model.clone(), "slots_matrix"));
+        }
+        // Tutti i provider della chain matrice sono in cooldown.
+        tracing::warn!(
+            "route_by_slots: TUTTI i {} provider della chain in cooldown [{}], fallback intent classico",
+            chain.len(), skipped.join(",")
+        );
+        None
     }
 
     /// Helper unico: estrae preferred_provider per intent (da nexus_intent_capability,
@@ -2587,6 +2902,64 @@ mod tests {
         assert_eq!(intent, "file_ops", "intent specifico non viene riscritto");
     }
 
+    // ─────────────────────────────────────────────────────────────────
+    // Test promozione test → fix_complesso (test failure resolution)
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_test_failure_resolution_positivi() {
+        // Casi paradigmatici osservati in produzione (Redemptor / Playwright)
+        assert!(is_test_failure_resolution("esegui i test playwright e risolvi i fail"));
+        assert!(is_test_failure_resolution("lancia i test e correggi gli errori"));
+        assert!(is_test_failure_resolution("fai funzionare i test Playwright"));
+        assert!(is_test_failure_resolution("fix i test che falliscono"));
+        assert!(is_test_failure_resolution("Run Playwright tests and make them pass"));
+        assert!(is_test_failure_resolution("i test playwright stanno fallendo, ripara"));
+        assert!(is_test_failure_resolution("applica fix ai test pytest"));
+        assert!(is_test_failure_resolution("i test cargo non passano, risolvi"));
+        assert!(is_test_failure_resolution("verifica perche' i test failure"));
+        assert!(is_test_failure_resolution("playwright test failure: indaga e correggi"));
+    }
+
+    #[test]
+    fn test_is_test_failure_resolution_negativi() {
+        // "scrivi un test" non e' una risoluzione di fallimento
+        assert!(!is_test_failure_resolution("scrivi un test unitario per la funzione X"));
+        // "esegui test" senza richiesta di fix non promuove
+        assert!(!is_test_failure_resolution("esegui i test playwright"));
+        // Senza menzione test
+        assert!(!is_test_failure_resolution("risolvi questo errore di compilazione"));
+        // Chat informativa
+        assert!(!is_test_failure_resolution("come si configura playwright?"));
+        // Verb correttivo senza test
+        assert!(!is_test_failure_resolution("fix questo bug nel server"));
+    }
+
+    #[test]
+    fn test_promotion_test_a_fix_complesso() {
+        // Caso paradigmatico Redemptor: gpt-4.1-mini diagnosticava invece di
+        // applicare fix perche' intent=test mappava a modelli light.
+        let (intent, _) = classify_intent_with_agentic_promotion(
+            "Esegui i test Playwright e risolvi i fallimenti rilevati"
+        );
+        assert_eq!(intent, "fix_complesso",
+            "test + verbo correttivo deve essere promosso a fix_complesso");
+
+        let (intent, _) = classify_intent_with_agentic_promotion(
+            "fai funzionare i test Playwright"
+        );
+        assert_eq!(intent, "fix_complesso");
+
+        // Negativo: solo "scrivi test" resta test (no failure resolution)
+        let (intent, _) = classify_intent_with_agentic_promotion(
+            "scrivi i test unitari per il modulo auth"
+        );
+        // Nota: classify_intent_local potrebbe ritornare un altro intent qui;
+        // l'importante e' che NON sia fix_complesso senza failure resolution.
+        assert_ne!(intent, "fix_complesso",
+            "creazione test senza failure resolution non deve essere promossa");
+    }
+
     #[test]
     fn test_classify_intent_local_file_ops() {
         // Verifiche dei nuovi intent introdotti
@@ -2716,6 +3089,54 @@ mod tests {
         let long_a = "x".repeat(1000) + "tail_a";
         let long_b = "x".repeat(1000) + "tail_b";
         assert_eq!(prompt_hash(&long_a), prompt_hash(&long_b));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Test L2: ClassifiedIntent + disambiguation logic
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Helper per creare un ClassifiedIntent di test.
+    fn classified(intent: &'static str, conf: f32, candidates: Vec<(&str, f32)>, ambig: bool) -> ClassifiedIntent {
+        ClassifiedIntent {
+            intent,
+            confidence: conf,
+            candidates: candidates
+                .into_iter()
+                .map(|(i, c)| IntentCandidate {
+                    intent: i.to_string(),
+                    confidence: c,
+                })
+                .collect(),
+            is_ambiguous: ambig,
+            slots: crate::routing_slots::ActionSlots::default(),
+        }
+    }
+
+    #[test]
+    fn classified_intent_struct_e_costruibile_e_serializzabile() {
+        // Smoke test: la struct ClassifiedIntent e i suoi campi sono pubblici
+        // e tipizzati correttamente per essere passati a chat_messages.rs.
+        let c = classified("debug", 0.85, vec![("debug", 0.85), ("fix", 0.40)], false);
+        assert_eq!(c.intent, "debug");
+        assert_eq!(c.candidates.len(), 2);
+        assert_eq!(c.candidates[0].intent, "debug");
+        assert!(!c.is_ambiguous);
+    }
+
+    #[test]
+    fn intent_candidate_e_serializzabile_a_json() {
+        // Serializzabilita' necessaria perche' i candidati vengono persistiti
+        // in chat_messages.metadata per audit + UI.
+        let c = IntentCandidate {
+            intent: "fix".to_string(),
+            confidence: 0.7,
+        };
+        let json_str = serde_json::to_string(&c).expect("serialize ok");
+        assert!(json_str.contains("\"fix\""));
+        assert!(json_str.contains("0.7"));
+        // Round-trip
+        let parsed: IntentCandidate = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed.intent, "fix");
     }
 }
 

@@ -16,6 +16,9 @@ const settingsSubKeys = [
   { key: "embeddings", href: "/admin/settings/embeddings" as Route },
   { key: "quality", href: "/admin/settings/quality" as Route },
   { key: "learning", href: "/admin/settings/learning" as Route },
+  { key: "agent", href: "/admin/settings/agent" as Route, label: "Agenti AI" },
+  { key: "optimizer", href: "/admin/settings/optimizer" as Route, label: "Ottimizzatore" },
+  { key: "reflection", href: "/admin/settings/reflection" as Route, label: "Self-Reflection" },
   { key: "auth", href: "/admin/settings/auth" as Route },
 ];
 

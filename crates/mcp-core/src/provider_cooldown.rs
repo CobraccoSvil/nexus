@@ -243,3 +243,190 @@ pub(crate) fn all_providers_in_cooldown(provider_order: &[String]) -> Option<u64
     }
     min_remaining
 }
+
+// =====================================================================
+// TEST SCALABILITA' COOLDOWN PROVIDER
+// =====================================================================
+// NOTA: provider_cooldown usa stato globale (OnceLock<Mutex<HashMap>>).
+// I test usano nomi provider univoci con prefisso `__test_<funzione>_`
+// per evitare interferenze quando eseguiti in parallelo.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_sconosciuto_non_e_in_cooldown() {
+        // Stato iniziale pulito: un provider mai messo in cooldown
+        // ritorna false. Garanzia base del sistema.
+        assert!(!is_provider_in_cooldown("__test_unknown_xyzzy"));
+    }
+
+    #[test]
+    fn short_cooldown_marca_provider_indisponibile() {
+        let p = "__test_short_cooldown_provider";
+        assert!(!is_provider_in_cooldown(p));
+        put_provider_in_short_cooldown(p, "test rate limit", 60);
+        assert!(
+            is_provider_in_cooldown(p),
+            "dopo short cooldown il provider deve essere in cooldown"
+        );
+    }
+
+    #[test]
+    fn long_cooldown_marca_provider_indisponibile_per_ore() {
+        // Caso billing_error: cooldown deve durare almeno 6h (test sull'effetto,
+        // non sulla durata esatta — verificarla richiederebbe sleep).
+        let p = "__test_long_cooldown_billing";
+        put_provider_in_long_cooldown(p, "credit balance too low");
+        assert!(is_provider_in_cooldown(p));
+        // Snapshot deve contenere il provider con remaining > 0
+        let snap = cooldown_snapshot();
+        let found = snap.iter().find(|(name, _, _)| name == p);
+        assert!(
+            found.is_some(),
+            "long cooldown deve apparire in cooldown_snapshot"
+        );
+        let (_, secs, reason) = found.unwrap();
+        assert!(
+            *secs > 5 * 3600,
+            "long cooldown deve durare >= 5h, trovato {}s",
+            secs
+        );
+        assert_eq!(reason.as_deref(), Some("credit balance too low"));
+    }
+
+    #[test]
+    fn cooldown_e_case_insensitive_sul_nome_provider() {
+        // Defense in depth: put('OpenAI') deve coincidere con is_in_cooldown('openai').
+        // Tutti i call site del codice usano lowercase, ma vogliamo essere robusti.
+        let p_upper = "__TEST_CASE_INSENSITIVE";
+        let p_lower = "__test_case_insensitive";
+        put_provider_in_short_cooldown(p_upper, "test", 60);
+        assert!(is_provider_in_cooldown(p_lower));
+    }
+
+    #[test]
+    fn provider_diversi_hanno_cooldown_indipendenti() {
+        // Caso pratico: openai in cooldown billing non deve impattare anthropic.
+        let p_a = "__test_indep_alpha";
+        let p_b = "__test_indep_beta";
+        put_provider_in_short_cooldown(p_a, "rate limit", 60);
+        assert!(is_provider_in_cooldown(p_a));
+        assert!(!is_provider_in_cooldown(p_b));
+    }
+
+    #[test]
+    fn restore_cooldown_da_redis_ripristina_stato() {
+        // Simula riavvio mcp-core: il cooldown viene letto da Redis e
+        // restore_cooldown lo ricarica in memoria.
+        let p = "__test_restore_provider";
+        assert!(!is_provider_in_cooldown(p));
+        restore_cooldown(p, 3600, "billing_error from redis");
+        assert!(is_provider_in_cooldown(p));
+        let snap = cooldown_snapshot();
+        let entry = snap.iter().find(|(name, _, _)| name == p);
+        assert!(entry.is_some());
+        assert_eq!(
+            entry.unwrap().2.as_deref(),
+            Some("billing_error from redis")
+        );
+    }
+
+    #[test]
+    fn all_providers_in_cooldown_rileva_correttamente() {
+        // Scenario chiave per lo scaling: se TUTTI i provider sono down,
+        // il caller deve sapere per quanto attendere prima di ritentare.
+        let providers = vec![
+            "__test_all_cd_p1".to_string(),
+            "__test_all_cd_p2".to_string(),
+            "__test_all_cd_p3".to_string(),
+        ];
+        for p in &providers {
+            put_provider_in_short_cooldown(p, "rate limit", 120);
+        }
+        let remaining = all_providers_in_cooldown(&providers);
+        assert!(remaining.is_some());
+        let secs = remaining.unwrap();
+        assert!(
+            secs > 0 && secs <= 120,
+            "remaining {}s fuori range [1, 120]",
+            secs
+        );
+    }
+
+    #[test]
+    fn all_providers_in_cooldown_ritorna_none_se_almeno_uno_disponibile() {
+        // Caso frequente: scaling intra-provider deve poter procedere se almeno
+        // un provider della gerarchia e' fuori cooldown.
+        let providers = vec![
+            "__test_partial_cd_p1".to_string(),
+            "__test_partial_cd_p2_AVAILABLE".to_string(),
+        ];
+        put_provider_in_short_cooldown(&providers[0], "rate limit", 60);
+        // providers[1] NON viene messo in cooldown
+        let result = all_providers_in_cooldown(&providers);
+        assert_eq!(
+            result, None,
+            "se almeno un provider e' libero, all_providers_in_cooldown deve essere None"
+        );
+    }
+
+    #[test]
+    fn all_providers_in_cooldown_lista_vuota_ritorna_none() {
+        let result = all_providers_in_cooldown(&[]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn cooldown_snapshot_esclude_provider_non_in_cooldown() {
+        // Nessun provider mai messo in cooldown → snapshot vuoto (al netto di
+        // altri test paralleli). Verifichiamo solo che __test_snap_excluded
+        // NON appaia perche' non e' mai stato messo in cooldown.
+        let p_never = "__test_snap_never_in_cooldown";
+        let snap = cooldown_snapshot();
+        let found = snap.iter().find(|(name, _, _)| name == p_never);
+        assert!(
+            found.is_none(),
+            "provider mai messo in cooldown non deve apparire in snapshot"
+        );
+    }
+
+    #[test]
+    fn cap_retry_after_clampato_dentro_intervallo_valido() {
+        // put_provider_in_cooldown clampa retry_after in [10, 3600].
+        // Test sul comportamento (cooldown attivo) — non sulla durata esatta.
+        let p_lo = "__test_clamp_low";
+        let p_hi = "__test_clamp_high";
+        // 5s sotto il minimo (10s): deve essere clampato a 10s, cooldown attivo
+        put_provider_in_cooldown(p_lo, Some(5));
+        assert!(is_provider_in_cooldown(p_lo));
+        // 99999s sopra il massimo (3600s): clampato a 3600s, cooldown attivo
+        put_provider_in_cooldown(p_hi, Some(99999));
+        assert!(is_provider_in_cooldown(p_hi));
+        // Verifica via snapshot che il cap superiore sia rispettato
+        let snap = cooldown_snapshot();
+        let entry_hi = snap.iter().find(|(name, _, _)| name == p_hi);
+        if let Some((_, secs, _)) = entry_hi {
+            assert!(
+                *secs <= 3600,
+                "cap superiore violato: {}s > 3600s",
+                secs
+            );
+        }
+    }
+
+    #[test]
+    fn reset_provider_failures_pulisce_contatore_circuit_breaker() {
+        let p = "__test_reset_failures_cb";
+        // Triggera il circuit breaker con 3 fallimenti
+        for _ in 0..3 {
+            put_provider_in_cooldown(p, Some(60));
+        }
+        assert!(is_provider_in_cooldown(p));
+        // Reset del contatore: il prossimo put non scatena cooldown esteso
+        reset_provider_failures(p);
+        // Il cooldown attivo rimane finche' non scade naturalmente, ma il
+        // contatore failures e' stato resettato (verifica indiretta: assenza panic)
+    }
+}
