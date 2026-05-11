@@ -850,7 +850,7 @@ export interface AgentRunUsage {
 export interface AgentRunInfo {
   runId: string;
   sessionId: string;
-  status: "running" | "completed" | "awaiting_confirmation" | "failed" | "timed_out" | "cancelled" | "interrupted";
+  status: "running" | "completed" | "awaiting_confirmation" | "failed" | "timed_out" | "cancelled" | "interrupted" | "loop_aborted" | "provider_unavailable";
   automationMode: string;
   provider: string;
   model: string;
@@ -2417,7 +2417,9 @@ export function subscribeAgentStream(
             run.status === "failed" ||
             run.status === "timed_out" ||
             run.status === "cancelled" ||
-            run.status === "interrupted";
+            run.status === "interrupted" ||
+            run.status === "loop_aborted" ||
+            run.status === "provider_unavailable";
           if (isTerminal) {
             onReconnecting?.(false);
             onStep({ runId, step: null, isFinal: true });

@@ -65,6 +65,14 @@ function buildTerminalRunSummary(run: AgentRunInfo): string {
       ? `Elaborazione interrotta dal riavvio del server dopo ${completed} step. Puoi ripetere la richiesta.`
       : "Elaborazione interrotta dal riavvio del server. Puoi ripetere la richiesta.";
   }
+  if (run.status === "loop_aborted") {
+    return completed > 0
+      ? `Operazione interrotta: il modello era entrato in un ciclo ripetitivo dopo ${completed} step. Al prossimo invio verrà usato automaticamente un modello più capace.`
+      : "Operazione interrotta: il modello era entrato in un ciclo ripetitivo. Al prossimo invio verrà usato automaticamente un modello più capace.";
+  }
+  if (run.status === "provider_unavailable") {
+    return "Operazione interrotta: tutti i provider AI configurati sono temporaneamente non disponibili (quota esaurita o rate limit). Riprova tra qualche minuto.";
+  }
   if (run.status === "awaiting_confirmation") {
     return awaiting > 0
       ? `In attesa di conferma per ${awaiting} azion${awaiting === 1 ? "e" : "i"}.`
@@ -309,7 +317,9 @@ export function useChat(
                 finalRun.status === "failed" ||
                 finalRun.status === "timed_out" ||
                 finalRun.status === "cancelled" ||
-                finalRun.status === "interrupted";
+                finalRun.status === "interrupted" ||
+                finalRun.status === "loop_aborted" ||
+                finalRun.status === "provider_unavailable";
               if (isTerminal && sid) {
                 const syntheticMsg = createTerminalMessage(finalRun, projectId, streamingTokenRef.current);
                 setMessages((current) => upsertSyntheticAssistantMessage(current, syntheticMsg));
@@ -586,7 +596,9 @@ export function useChat(
                   finalRun.status === "failed" ||
                   finalRun.status === "timed_out" ||
                   finalRun.status === "cancelled" ||
-                  finalRun.status === "interrupted";
+                  finalRun.status === "interrupted" ||
+                  finalRun.status === "loop_aborted" ||
+                  finalRun.status === "provider_unavailable";
                 if (isTerminal) {
                   const syntheticMsg = createTerminalMessage(finalRun, projectId);
                   setMessages((current) => upsertSyntheticAssistantMessage(current, syntheticMsg));

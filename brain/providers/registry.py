@@ -64,8 +64,11 @@ def _billing_context() -> tuple[str, str]:
     return _BILLING_CTX_CACHE
 
 
-def _lookup_price_any_currency(provider: str, model: str) -> tuple[float, float, str]:
-    """Ritorna (in_cost_per_mtok, out_cost_per_mtok, currency). Fallback 0 se non trovato."""
+def _lookup_price_any_currency(provider: str, model: str) -> tuple[float, float, float, float, str]:
+    """Ritorna (in_cost_per_mtok, out_cost_per_mtok, cache_read_per_mtok, cache_creation_per_mtok, currency).
+
+    Legge anche i prezzi cache (0130_price_cache_columns). Fallback 0 se non trovato.
+    """
     import psycopg2  # type: ignore[import]
     db_url = os.environ.get(
         "DATABASE_URL",
@@ -75,7 +78,10 @@ def _lookup_price_any_currency(provider: str, model: str) -> tuple[float, float,
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT input_cost_per_million_tokens, output_cost_per_million_tokens, currency "
+                    "SELECT input_cost_per_million_tokens, output_cost_per_million_tokens, "
+                    "COALESCE(cache_read_cost_per_million_tokens, 0), "
+                    "COALESCE(cache_creation_cost_per_million_tokens, 0), "
+                    "currency "
                     "FROM ai_price_catalog "
                     "WHERE provider = %s AND model = %s AND is_enabled = TRUE "
                     "ORDER BY effective_from DESC LIMIT 1",
@@ -83,28 +89,74 @@ def _lookup_price_any_currency(provider: str, model: str) -> tuple[float, float,
                 )
                 row = cur.fetchone()
         if row:
-            return (float(row[0]), float(row[1]), str(row[2] or "EUR").strip().upper())
+            return (
+                float(row[0]),
+                float(row[1]),
+                float(row[2]),
+                float(row[3]),
+                str(row[4] or "EUR").strip().upper(),
+            )
     except Exception as e:
         logger.warning("billing price lookup fallito %s/%s: %s", provider, model, e)
-    return (0.0, 0.0, "EUR")
+    return (0.0, 0.0, 0.0, 0.0, "EUR")
+
+
+# UUID sistema usato come placeholder per chiamate senza contesto user/project nel gRPC.
+# Permette di registrare il consumo nel ledger anche quando il context manca,
+# invece di perdere silenziosamente la telemetria.
+_SYSTEM_UUID = "00000000-0000-0000-0000-000000000000"
 
 
 def _record_usage(provider: str, model: str, usage: dict[str, Any] | None, details: dict[str, Any]) -> None:
-    """Scrive su ai_usage_ledger (best-effort)."""
+    """Scrive su ai_usage_ledger (best-effort).
+
+    Registra i token e il costo effettivo incluso il caching Anthropic
+    (cache_read_input_tokens = 0.1x, cache_creation_input_tokens = 1.25x).
+    Se user_id/project_id non disponibili, usa UUID di sistema per non perdere telemetria.
+    """
     if not _brain_billing_enabled():
         return
     if not usage:
         return
+
     user_id, project_id = _billing_context()
-    if not user_id or not project_id:
-        return
+    no_context = not user_id or not project_id
+    if no_context:
+        # Invece di uscire silenziosamente, usa UUID sistema e flagga nei details
+        user_id = _SYSTEM_UUID
+        project_id = _SYSTEM_UUID
+        logger.warning(
+            "billing context mancante per %s/%s: uso UUID sistema per non perdere telemetria",
+            provider, model,
+        )
+
     prompt_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
     completion_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
     total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
-    in_cost_m, out_cost_m, currency = _lookup_price_any_currency(provider, model)
+
+    # Token cache Anthropic (o altri provider con struttura analoga)
+    cache_read_tokens = int(usage.get("cache_read_input_tokens", 0) or 0)
+    cache_creation_tokens = int(usage.get("cache_creation_input_tokens", 0) or 0)
+
+    in_cost_m, out_cost_m, cache_read_m, cache_creation_m, currency = _lookup_price_any_currency(provider, model)
     input_cost = (prompt_tokens / 1_000_000.0) * in_cost_m
     output_cost = (completion_tokens / 1_000_000.0) * out_cost_m
-    total_cost = input_cost + output_cost
+    cache_read_cost = (cache_read_tokens / 1_000_000.0) * cache_read_m
+    cache_creation_cost = (cache_creation_tokens / 1_000_000.0) * cache_creation_m
+    total_cost = input_cost + output_cost + cache_read_cost + cache_creation_cost
+
+    # Arricchisce i details con la rottura del costo per il debug
+    enriched_details: dict[str, Any] = {
+        **details,
+        "no_billing_context": no_context,
+    }
+    if cache_read_tokens or cache_creation_tokens:
+        enriched_details["cache_tokens"] = {
+            "read": cache_read_tokens,
+            "creation": cache_creation_tokens,
+            "read_cost": round(cache_read_cost, 8),
+            "creation_cost": round(cache_creation_cost, 8),
+        }
 
     import psycopg2  # type: ignore[import]
     try:
@@ -115,10 +167,15 @@ def _record_usage(provider: str, model: str, usage: dict[str, Any] | None, detai
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO ai_usage_ledger (user_id, project_id, provider, model, "
+                    "INSERT INTO ai_usage_ledger "
+                    "(user_id, project_id, provider, model, "
                     "prompt_tokens, completion_tokens, total_tokens, "
-                    "input_cost, output_cost, total_cost, currency, status, details) "
-                    "VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'finalized', %s::jsonb)",
+                    "cache_read_tokens, cache_creation_tokens, "
+                    "input_cost, output_cost, total_cost, "
+                    "cache_read_cost, cache_creation_cost, "
+                    "currency, status, details) "
+                    "VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, "
+                    "%s, %s, %s, %s, %s, %s, 'finalized', %s::jsonb)",
                     (
                         user_id,
                         project_id,
@@ -127,14 +184,25 @@ def _record_usage(provider: str, model: str, usage: dict[str, Any] | None, detai
                         prompt_tokens,
                         completion_tokens,
                         total_tokens,
+                        cache_read_tokens,
+                        cache_creation_tokens,
                         input_cost,
                         output_cost,
                         total_cost,
+                        cache_read_cost,
+                        cache_creation_cost,
                         currency,
-                        json.dumps({**details, "missing_user_project_in_grpc": True}),
+                        json.dumps(enriched_details),
                     ),
                 )
             conn.commit()
+        logger.debug(
+            "billing ledger: %s/%s prompt=%d compl=%d cache_read=%d cache_cre=%d cost=%.6f %s",
+            provider, model,
+            prompt_tokens, completion_tokens,
+            cache_read_tokens, cache_creation_tokens,
+            total_cost, currency,
+        )
     except Exception as e:
         logger.warning("billing ledger insert fallito %s/%s: %s", provider, model, e)
 
@@ -150,7 +218,7 @@ def _enforce_quota_estimate(provider: str, model: str, estimated_prompt_tokens: 
     if not user_id or not project_id:
         return (True, "")
     est_total_tokens = max(0, int(estimated_prompt_tokens) + int(estimated_completion_tokens))
-    in_cost_m, out_cost_m, currency = _lookup_price_any_currency(provider, model)
+    in_cost_m, out_cost_m, _cr_m, _cc_m, currency = _lookup_price_any_currency(provider, model)
     est_cost = ((max(0, int(estimated_prompt_tokens)) / 1_000_000.0) * in_cost_m) + (
         (max(0, int(estimated_completion_tokens)) / 1_000_000.0) * out_cost_m
     )

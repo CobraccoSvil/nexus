@@ -400,6 +400,24 @@ async def router_node(state: AgentState) -> dict[str, Any]:
             intent, token_budget, behavior_mode, profile.name,
         )
     else:
+        # Nessun profilo trovato: applica comunque _INTENT_TOOL_SUBSET (BP5 fallback).
+        # Senza profilo il filtro combinato profilo×intent non scatta, ma possiamo
+        # applicare il subset intent-only direttamente: code_read riceve 6 tool
+        # di sola lettura invece di tutti i 31 tool builtin. Riduce il payload
+        # di ogni turno del loop del 70-80%.
+        tools = state.get("tools_json") or []
+        if tools and intent:
+            intent_subset = profile_loader._INTENT_TOOL_SUBSET.get(intent)
+            if intent_subset is not None and intent_subset != ["*"]:
+                _always_on = profile_loader.AgentProfile._ALWAYS_ON_TOOLS
+                allow = set(intent_subset) | _always_on
+                filtered_np = [t for t in tools if t.get("name") in allow]
+                if len(filtered_np) != len(tools):
+                    logger.info(
+                        "router_node: intent=%s filtra tools %d -> %d (no-profile fallback)",
+                        intent, len(tools), len(filtered_np),
+                    )
+                    updates["tools_json"] = filtered_np
         logger.info(
             "router_node: intent=%s token_budget=%d mode=%s profile=<none>",
             intent, token_budget, behavior_mode,
@@ -509,12 +527,20 @@ def _dedup_tool_results(messages: list[Any]) -> list[Any]:
     return new_messages
 
 
-def _compress_old_tool_results(messages: list[Any], keep_recent: int = 6) -> list[Any]:
+def _compress_old_tool_results(
+    messages: list[Any],
+    keep_recent: int = 6,
+    max_content_chars: int = 500,
+) -> list[Any]:
     """Comprime i tool_result dei messaggi piu' vecchi per ridurre il contesto.
 
     Mantiene intatti gli ultimi `keep_recent` messaggi. Per i precedenti,
-    i blocchi tool_result con contenuto > 500 char vengono sostituiti
-    con un riassunto troncato.
+    i blocchi tool_result con contenuto > `max_content_chars` char vengono
+    sostituiti con un riassunto troncato.
+
+    `max_content_chars` e' configurabile: nelle fasi di loop avanzato
+    (iterazioni alte) l'executor passa un valore piu' basso (es. 150)
+    per una compressione piu' aggressiva.
 
     Prima della compressione applica _dedup_tool_results: spesso la stessa
     risorsa viene letta piu' volte e il dedup risparmia tokens senza
@@ -527,10 +553,41 @@ def _compress_old_tool_results(messages: list[Any], keep_recent: int = 6) -> lis
 
     compressed = []
     boundary = len(messages) - keep_recent
+    # La finestra "recente" usa una soglia piu' permissiva: 2× max_content_chars.
+    recent_threshold = max_content_chars * 2
 
     for i, m in enumerate(messages):
         if i >= boundary:
-            compressed.append(m)
+            # Anche i messaggi recenti vengono compressi, ma con soglia piu' alta.
+            extra = getattr(m, "additional_kwargs", {}) or {}
+            blocks = extra.get("anthropic_content")
+            if blocks is None or not isinstance(blocks, list):
+                compressed.append(m)
+                continue
+            changed = False
+            new_blocks = []
+            for block in blocks:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    new_blocks.append(block)
+                    continue
+                content = block.get("content", "")
+                if isinstance(content, str) and len(content) > recent_threshold:
+                    kept = max(recent_threshold // 2, 200)
+                    new_blocks.append({
+                        **block,
+                        "content": content[:kept] + f"\n[... compresso: {len(content)} char originali ...]",
+                    })
+                    changed = True
+                else:
+                    new_blocks.append(block)
+            if changed:
+                new_msg = HumanMessage(
+                    content=getattr(m, "content", ""),
+                    additional_kwargs={"anthropic_content": new_blocks},
+                )
+                compressed.append(new_msg)
+            else:
+                compressed.append(m)
             continue
 
         extra = getattr(m, "additional_kwargs", {}) or {}
@@ -546,10 +603,11 @@ def _compress_old_tool_results(messages: list[Any], keep_recent: int = 6) -> lis
                 new_blocks.append(block)
                 continue
             content = block.get("content", "")
-            if isinstance(content, str) and len(content) > 500:
+            if isinstance(content, str) and len(content) > max_content_chars:
+                kept = max(max_content_chars // 2, 100)
                 new_blocks.append({
                     **block,
-                    "content": content[:200] + f"\n[... compresso: {len(content)} char originali ...]",
+                    "content": content[:kept] + f"\n[... compresso: {len(content)} char originali ...]",
                 })
                 changed = True
             else:
@@ -608,6 +666,29 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     token_budget = state.get("token_budget", 400)
     tools_json = state.get("tools_json") or []
     system_text = state.get("system_text") or ""
+
+    # ── Forced text response (anti-loop tool-only) ────────────────────────
+    # Se il loop ha gia' consumato la maggior parte delle iterazioni concesse
+    # (>= MAX_AGENT_ITERATIONS - 5) e il modello sta ancora facendo tool calls
+    # (stop_reason precedente era "tool_use"), svuotiamo temporaneamente i tool
+    # per forzare una risposta testuale nell'ultima finestra di iterazioni.
+    # Questo previene loop in cui modelli small (es. Mistral) fanno tool calls
+    # continue senza mai produrre testo, consumando tutte le iterazioni senza
+    # lasciare una risposta utile all'utente.
+    _current_iterations = int(state.get("iterations") or 0)
+    _FORCED_TEXT_THRESHOLD = MAX_AGENT_ITERATIONS - 5
+    _prev_stop_reason = state.get("stop_reason")
+    if (
+        tools_json
+        and _current_iterations >= _FORCED_TEXT_THRESHOLD
+        and _prev_stop_reason == "tool_use"
+    ):
+        logger.warning(
+            "executor_node: forced text response — rimozione tool per produrre risposta "
+            "testuale (iterations=%d >= threshold=%d, prev_stop=%s)",
+            _current_iterations, _FORCED_TEXT_THRESHOLD, _prev_stop_reason,
+        )
+        tools_json = []
 
     # Override esplicito batte il routing semantico.
     provider = state.get("provider_override")
@@ -674,7 +755,33 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                     ctx_size = new_size
             except Exception as exc:
                 logger.warning("executor_node: summarizer fallito: %s", exc)
-        if ctx_size > MAX_CONTEXT_CHARS // 2:
+        # ── Compressione escalante (BP4 esteso) ─────────────────────────────
+        # La compressione si attiva se:
+        # a) il contesto supera il 50% di MAX_CONTEXT_CHARS (soglia classica), oppure
+        # b) le iterazioni salgono (loop): keep_recent e max_content_chars decrescono
+        #    progressivamente per limitare l'accumulo di tool_result nella history.
+        #
+        # Calcolo keep_recent escalante:
+        #   iter < 8  → keep_recent=6, max_content_chars=500 (default)
+        #   iter 8-11 → keep_recent=5, max_content_chars=350
+        #   iter 12-15→ keep_recent=4, max_content_chars=250
+        #   iter 16-19→ keep_recent=3, max_content_chars=200
+        #   iter >= 20→ keep_recent=2, max_content_chars=150
+        _compress_iter = _current_iterations  # _current_iterations letto sopra
+        if _compress_iter >= 8:
+            _keep_recent = max(2, 6 - (_compress_iter - 8) // 4)
+            _max_chars = max(150, 500 - (_compress_iter - 8) * 25)
+            messages = _compress_old_tool_results(
+                messages, keep_recent=_keep_recent, max_content_chars=_max_chars,
+            )
+            new_size = _estimate_context_chars(messages)
+            logger.info(
+                "executor_node: compressione escalante iter=%d keep_recent=%d "
+                "max_content_chars=%d: %d -> %d char",
+                _compress_iter, _keep_recent, _max_chars, ctx_size, new_size,
+            )
+            ctx_size = new_size
+        elif ctx_size > MAX_CONTEXT_CHARS // 2:
             messages = _compress_old_tool_results(messages, keep_recent=6)
             new_size = _estimate_context_chars(messages)
             logger.info(
@@ -785,36 +892,66 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             "executor_node: LOOP detected %s/%s ripete tool='%s' (signature=%s) %d+ volte. Abort.",
             provider, model, tool_name, loop_sig, LOOP_THRESHOLD,
         )
-        # Auto-escalation: al primo loop proviamo automaticamente un modello più capace
-        # (evita di chiedere all'utente di cambiare provider/model manualmente).
+        # Auto-escalation: al primo loop proviamo automaticamente un modello più capace.
+        # Priorità:
+        #   1. Catena intra-provider (nexus_model_escalation_chain) — stesso provider, tier superiore
+        #   2. Purpose model DB-driven dal router Rust (loop_fallback_default)
+        #   3. Nessun fallback hardcoded: se nulla disponibile, segna loop_detected
         escalations = int(state.get("auto_escalations") or 0)
         tried_escalation = False
-        if escalations < 1 and _providers is not None and tools_json:
+        if escalations < 3 and _providers is not None and tools_json:
             try:
-                # Purpose model DB-driven: configurabile dal router Rust.
-                fallback_provider = None
-                fallback_model = None
-                try:
-                    from brain.router.service import _routing_client_singleton
-                    decision2 = _routing_client_singleton().purpose_model(purpose="loop_fallback_default")
-                    if decision2.provider not in ("__router_unavailable__", "__no_capable_provider__"):
-                        fallback_provider = decision2.provider
-                        fallback_model = decision2.model
-                except Exception:
-                    pass
+                fallback_provider: str | None = None
+                fallback_model: str | None = None
 
-                # Fallback soft: se purpose non disponibile, prova Anthropic se presente.
-                if not fallback_provider and _providers._providers.get("anthropic"):  # type: ignore[attr-defined]
-                    fallback_provider = "anthropic"
-                    fallback_model = "claude-sonnet-4-6"
+                # === Tier 1: catena intra-provider ===
+                try:
+                    import psycopg2  # type: ignore[import]
+                    import os as _os
+                    _db_url = _os.environ.get(
+                        "DATABASE_URL",
+                        "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
+                    )
+                    with psycopg2.connect(_db_url) as _conn:
+                        with _conn.cursor() as _cur:
+                            _cur.execute(
+                                "SELECT escalation_model FROM nexus_model_escalation_chain "
+                                "WHERE provider = %s AND base_model = %s AND is_active = TRUE "
+                                "ORDER BY escalation_position ASC LIMIT %s",
+                                (provider, model, escalations + 1),
+                            )
+                            _rows = _cur.fetchall()
+                    if _rows and len(_rows) > escalations:
+                        # Prende la posizione corrispondente al numero di escalation già fatte
+                        candidate_model = _rows[escalations][0]
+                        if _providers._providers.get(provider):  # type: ignore[attr-defined]
+                            fallback_provider = provider
+                            fallback_model = candidate_model
+                            logger.info(
+                                "executor_node: LOOP catena intra-provider pos=%d %s/%s => %s/%s",
+                                escalations + 1, provider, model, provider, candidate_model,
+                            )
+                except Exception as _e:
+                    logger.debug("executor_node: catena escalation DB fallita: %s", _e)
+
+                # === Tier 2: purpose model dal router Rust (cross-provider) ===
+                if not fallback_provider:
+                    try:
+                        from brain.router.service import _routing_client_singleton
+                        decision2 = _routing_client_singleton().purpose_model(purpose="loop_fallback_default")
+                        if decision2.provider not in ("__router_unavailable__", "__no_capable_provider__"):
+                            fallback_provider = decision2.provider
+                            fallback_model = decision2.model
+                            logger.info(
+                                "executor_node: LOOP -> purpose_model fallback %s/%s => %s/%s",
+                                provider, model, fallback_provider, fallback_model,
+                            )
+                    except Exception:
+                        pass
 
                 if fallback_provider and fallback_model:
                     p2 = _providers._providers.get(fallback_provider)  # type: ignore[attr-defined]
                     if p2 is not None and hasattr(p2, "generate_agent_turn"):
-                        logger.info(
-                            "executor_node: LOOP -> auto-escalation %s/%s => %s/%s (tool=%s)",
-                            provider, model, fallback_provider, fallback_model, tool_name,
-                        )
                         # Hint anti-loop nel system_text: chiede esplicitamente di NON ripetere il tool.
                         anti_loop_hint = (
                             "\n\n[ANTI-LOOP] Hai appena ripetuto la stessa tool call "
@@ -958,10 +1095,18 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
 
     async def _run(block: dict) -> dict:
         tool_use_id = block.get("id", "")
+        _t_name = block.get("name", "")
+        _t_input = block.get("input", {}) or {}
+        logger.info(
+            "TOOL_CALL tool=%s session=%s input_keys=%s",
+            _t_name,
+            session_id,
+            list(_t_input.keys()) if isinstance(_t_input, dict) else str(_t_input)[:80],
+        )
         try:
             result = await _tool_runner.execute_tool(
-                tool_name=block.get("name", ""),
-                tool_input=block.get("input", {}) or {},
+                tool_name=_t_name,
+                tool_input=_t_input,
                 session_id=session_id,
                 tool_use_id=tool_use_id,
             )

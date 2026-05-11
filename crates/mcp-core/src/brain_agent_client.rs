@@ -472,9 +472,19 @@ pub async fn run_via_brain(
     }
 
     let status = if last_error.is_some() {
-        AgentRunStatus::Failed
+        // Distingui la causa di terminazione con errore
+        match last_stop_reason.as_deref() {
+            Some("no_capable_provider") | Some("provider_unavailable") => {
+                AgentRunStatus::ProviderUnavailable
+            }
+            _ => AgentRunStatus::Failed,
+        }
     } else if ended {
-        AgentRunStatus::Completed
+        // Distingui fine normale da loop abortito
+        match last_stop_reason.as_deref() {
+            Some("loop_detected") | Some("loop_aborted") => AgentRunStatus::LoopAborted,
+            _ => AgentRunStatus::Completed,
+        }
     } else {
         AgentRunStatus::Completed
     };

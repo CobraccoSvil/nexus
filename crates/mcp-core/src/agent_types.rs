@@ -136,6 +136,12 @@ pub enum AgentRunStatus {
     Failed,
     TimedOut,
     Cancelled,
+    /// Il brain ha rilevato un loop (stessa tool call ripetuta >= LOOP_THRESHOLD volte)
+    /// e tutti i tentativi di escalation intra-provider e cross-provider sono esauriti.
+    LoopAborted,
+    /// Nessun provider disponibile: tutti in cooldown (billing_error / rate_limit)
+    /// o non configurati. Il turno non ha potuto essere elaborato.
+    ProviderUnavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,6 +313,8 @@ pub async fn finalize_agent_run(
         AgentRunStatus::AwaitingConfirmation => "awaiting_confirmation",
         AgentRunStatus::Cancelled => "cancelled",
         AgentRunStatus::Running => "running",
+        AgentRunStatus::LoopAborted => "loop_aborted",
+        AgentRunStatus::ProviderUnavailable => "provider_unavailable",
     };
     let _ = sqlx::query("UPDATE agent_runs SET status = $2, final_answer = $3, iteration_count = $4, completed_at = NOW() WHERE id = $1")
     .bind(run_id)

@@ -1591,6 +1591,8 @@ async fn spawn_agent_run(
             AgentRunStatus::TimedOut => "timed_out",
             AgentRunStatus::Cancelled => "cancelled",
             AgentRunStatus::Running => "running",
+            AgentRunStatus::LoopAborted => "loop_aborted",
+            AgentRunStatus::ProviderUnavailable => "provider_unavailable",
         };
         let _ = sqlx::query(
             "UPDATE agent_runs SET status=$2, final_answer=$3, iteration_count=$4, \
