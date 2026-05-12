@@ -2043,7 +2043,7 @@ impl Orchestrator {
                         "SELECT value FROM settings WHERE key = 'provider_hierarchy' LIMIT 1"
                     ).fetch_optional(db).await.ok().flatten()
                 });
-                let hier: Vec<String> = hierarchy_str.as_deref().unwrap_or("openai")
+                let hier: Vec<String> = hierarchy_str.as_deref().unwrap_or(&provider)
                     .split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
                 let alt = hier.iter().find(|p| !is_provider_in_cooldown(p))
                     .cloned()

@@ -512,8 +512,23 @@ pub async fn ai_suggest_handler(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?
     .ok_or((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "template non trovato"}))))?;
 
-    let provider = req.provider.as_deref().unwrap_or("anthropic");
-    let model = req.model.as_deref().unwrap_or("claude-haiku-4-5-20251001");
+    // Provider/model da DB (purpose_model 'admin_fallback_default') se non specificati.
+    // Niente fallback hardcoded: se la tabella non e' configurata, errore esplicito.
+    let (db_provider, db_model) = if req.provider.is_none() || req.model.is_none() {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT provider, model_id FROM nexus_purpose_model WHERE purpose = 'admin_fallback_default' LIMIT 1"
+        )
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("DB error: {e}")}))))?
+        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "error": "nexus_purpose_model: 'admin_fallback_default' non configurato. Applica migrazione 0102."
+        }))))?
+    } else {
+        (String::new(), String::new())
+    };
+    let provider = req.provider.as_deref().unwrap_or(&db_provider);
+    let model = req.model.as_deref().unwrap_or(&db_model);
 
     let usage_ctx = template.usage_context.as_deref().unwrap_or("(nessun contesto d'uso)");
 

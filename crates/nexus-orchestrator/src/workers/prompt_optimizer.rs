@@ -246,9 +246,26 @@ Rispondi con JSON nel formato:
         // meno di costo. Adatto per il prompt_optimizer perche' le varianti
         // non servono in real-time. Manteniamo il flusso sincrono finche'
         // l'admin non attiva esplicitamente il flag.
+        // Modello da DB (nexus_purpose_model, purpose='prompt_optimizer').
+        // Niente fallback hardcoded: se non configurato, errore esplicito.
+        let optimizer_model: Option<(String,)> = sqlx::query_as(
+            "SELECT model_id FROM nexus_purpose_model WHERE purpose = 'prompt_optimizer' LIMIT 1"
+        )
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .ok()
+        .flatten();
+        let model_id = match optimizer_model {
+            Some((m,)) => m,
+            None => {
+                error!("prompt_optimizer: nexus_purpose_model purpose='prompt_optimizer' non configurato");
+                return None;
+            }
+        };
+
         let client = reqwest::Client::new();
         let body = serde_json::json!({
-            "model": "claude-3-5-haiku-20241022",
+            "model": model_id,
             "max_tokens": 4096,
             "temperature": 0.3,
             "messages": [{

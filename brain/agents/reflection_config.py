@@ -44,7 +44,7 @@ _SAFE_DEFAULTS: dict[str, Any] = {
     "reflection_enabled": False,               # fail-safe: disabilitato se DB irraggiungibile
     "reflection_sample_rate": 0.0,
     "reflection_timeout_s": 10.0,
-    "reflection_model": "claude-3-5-haiku-20241022",
+    "reflection_model": "",                    # risolto da DB a runtime; vuoto = reflection disabilitata
     "reflection_reward_weight": 0.3,
     "reflection_reasoning_bank_min_score": 0.85,
 }

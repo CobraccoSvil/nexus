@@ -365,8 +365,8 @@ export function useChat(
                 sessionId: sid,
                 status: "running",
                 automationMode: "automatic",
-                provider: "anthropic",
-                model: "claude-haiku-4-5",
+                provider: "auto",  // placeholder: aggiornato da getAgentRun()
+                model: "auto",     // placeholder: aggiornato da getAgentRun()
                 iterationCount: 0,
                 pendingActions: [],
                 steps: [],

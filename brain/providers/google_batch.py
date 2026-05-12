@@ -3,10 +3,22 @@
 from google import genai
 
 
+def _resolve_google_batch_model() -> str:
+    """Risolve il modello Google batch da nexus_purpose_model (purpose='google_batch')."""
+    try:
+        from brain.router.service import _routing_client_singleton
+        decision = _routing_client_singleton().purpose_model(purpose="google_batch")
+        return decision.model
+    except Exception as e:
+        raise RuntimeError(
+            f"nexus_purpose_model purpose='google_batch' non configurato: {e}"
+        ) from e
+
+
 class GoogleBatchClient:
-    def __init__(self, api_key: str, model: str = "gemini-2.5-flash"):
+    def __init__(self, api_key: str, model: str | None = None):
         self._client = genai.Client(api_key=api_key)
-        self._model = model
+        self._model = model or _resolve_google_batch_model()
 
     async def analyze_files_batch(
         self,

@@ -914,7 +914,7 @@ async def project_analyze(body: ProjectAnalyzeRequest) -> dict[str, object]:
 # ── Batch API (Anthropic Messages Batches) ─────────────────────────────────
 class BatchAnalyzeRequest(BaseModel):
     requests: list[dict]  # [{"custom_id": str, "system": str, "prompt": str}]
-    model: str = "claude-haiku-4-5-20251001"
+    model: str | None = None  # Risolto da nexus_purpose_model 'anthropic_batch' se None
     max_tokens: int = 4096
 
 

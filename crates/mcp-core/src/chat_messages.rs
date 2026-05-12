@@ -2197,7 +2197,14 @@ pub async fn send_chat_message(
     {
         let tier = crate::dlp::classify_sensitivity(content);
         if tier >= crate::dlp::SensitivityTier::Sensitive {
-            let check_provider = effective_provider_override.as_deref().unwrap_or("anthropic");
+            // Provider per il check DLP: usa l'override se presente, altrimenti
+            // il primo default dalla routing matrix (DB-driven, niente hardcoded).
+            let matrix_provider: Option<String> = state.orchestrator.routing_matrix.current()
+                .ok()
+                .and_then(|m| m.default_models.keys().next().cloned());
+            let check_provider = effective_provider_override.as_deref()
+                .or(matrix_provider.as_deref())
+                .unwrap_or("system");
             if let Some(dlp_msg) = crate::dlp::check_dlp_policy_db(check_provider, tier, &state.db).await {
                 if dlp_msg.contains("DLP Block") {
                     // Salva il messaggio di errore come risposta assistant in DB

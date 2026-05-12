@@ -414,9 +414,9 @@ async fn generate_with_admin_fallback(
     .await
     .unwrap_or(None);
 
-    let providers: Vec<String> = hierarchy_str
-        .as_deref()
-        .unwrap_or("deepseek")
+    let providers_csv = hierarchy_str
+        .ok_or_else(|| "Impostazione 'provider_hierarchy' non configurata nella tabella settings".to_string())?;
+    let providers: Vec<String> = providers_csv
         .split(',')
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty() && !broken_providers.contains(s.as_str()))

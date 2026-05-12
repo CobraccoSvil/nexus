@@ -159,11 +159,13 @@ function buildRoutingState(settings: SettingEntry[]): RoutingConfigState {
   return {
     providerHierarchy,
     providerModels: {
-      anthropic: get("provider_model_anthropic") || "claude-sonnet-4-6",
-      openai:    get("provider_model_openai")    || "gpt-4.1-mini",
-      google:    get("provider_model_google")    || "gemini-2.5-flash",
-      deepseek:  get("provider_model_deepseek")  || "deepseek-chat",
-      mistral:   get("provider_model_mistral")   || "mistral-small-4",
+      // Fallback dal catalogo UI (PROVIDER_MODELS[0]), non da nomi hardcoded.
+      // Il valore effettivo viene da nexus_provider_default_model in DB.
+      anthropic: get("provider_model_anthropic") || PROVIDER_MODELS.anthropic[0],
+      openai:    get("provider_model_openai")    || PROVIDER_MODELS.openai[0],
+      google:    get("provider_model_google")    || PROVIDER_MODELS.google[0],
+      deepseek:  get("provider_model_deepseek")  || PROVIDER_MODELS.deepseek[0],
+      mistral:   get("provider_model_mistral")   || PROVIDER_MODELS.mistral[0],
     },
     intentChains: Object.fromEntries(
       ROUTING_INTENTS.map((intent) => [

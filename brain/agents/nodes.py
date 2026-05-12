@@ -703,8 +703,19 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             model = model or decision.model
             logger.info("executor_node routing: %s", decision.rationale)
         else:
-            provider = provider or "openai"
-            model = model or "gpt-4.1-mini"
+            # Router non disponibile: risolvi da DB (nexus_purpose_model).
+            # Niente fallback hardcoded.
+            try:
+                from brain.router.service import _routing_client_singleton
+                decision = _routing_client_singleton().purpose_model(purpose="agent_tier_sonnet")
+                provider = provider or decision.provider
+                model = model or decision.model
+            except Exception as e:
+                logger.error("executor_node: impossibile risolvere modello da DB: %s", e)
+                raise RuntimeError(
+                    "Nessun router disponibile e nexus_purpose_model non raggiungibile. "
+                    "Verifica che mcp-core sia attivo e la migrazione 0102 sia applicata."
+                ) from e
 
     logger.info(
         "executor_node: provider=%s model=%s intent=%s tools=%d",

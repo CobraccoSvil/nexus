@@ -15,8 +15,18 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Modello di default per batch — preferire haiku per costo ridotto
-BATCH_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+def _resolve_batch_model() -> str:
+    """Risolve il modello batch da nexus_purpose_model (purpose='anthropic_batch').
+    Niente fallback hardcoded: errore esplicito se non configurato."""
+    try:
+        from brain.router.service import _routing_client_singleton
+        decision = _routing_client_singleton().purpose_model(purpose="anthropic_batch")
+        return decision.model
+    except Exception as e:
+        raise RuntimeError(
+            "nexus_purpose_model purpose='anthropic_batch' non configurato o mcp-core non raggiungibile. "
+            f"Applica migrazione 0102: {e}"
+        ) from e
 
 
 class AnthropicBatchClient:
@@ -37,12 +47,14 @@ class AnthropicBatchClient:
     async def submit_batch(
         self,
         requests: list[dict],  # [{"custom_id": str, "system": str, "prompt": str}]
-        model: str = BATCH_DEFAULT_MODEL,
+        model: str | None = None,
         max_tokens: int = 4096,
     ) -> str:
         """Invia un batch di richieste. Ritorna il batch_id."""
         if not self._api_key:
             raise ValueError("ANTHROPIC_API_KEY non configurata")
+        if model is None:
+            model = _resolve_batch_model()
 
         client = self._get_client()
 
