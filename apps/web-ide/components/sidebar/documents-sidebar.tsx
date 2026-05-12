@@ -190,7 +190,8 @@ export function DocumentsSidebar({ project, onSendToChat, onOpenInEditor }: Docu
     // Passiamo un hint al pannello chat per forzare un provider adeguato.
     onSendToChat(
       GENERATE_PROMPTS[docType] || `Genera documentazione di tipo ${docType} per il progetto.`,
-      { providerHint: "anthropic", modelHint: "claude-sonnet-4-6" },
+      /* Nessun provider hint: la routing matrix (intent=docs) sceglie il
+         provider migliore disponibile, con fallback automatico se in cooldown. */
     );
     // After sending, stop spinner after a moment and refresh docs
     setTimeout(() => {

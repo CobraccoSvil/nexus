@@ -721,6 +721,29 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
       },
       "required": ["server_id", "tool_name", "arguments"]
     }
+  },
+  {
+    "name": "nexus_doc_generate",
+    "description": "Genera un documento professionale .docx (Analisi Funzionale IEEE 830, Analisi Tecnica, Diagramma ER, Gestione Progetto, Release Notes). Costruisci le sezioni del documento e passale come content_json. Il documento viene registrato nel DB e appare nel pannello DOCUMENTI. DEVI usare questo tool per generare documenti — non usare write_file.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "doc_type": {
+          "type": "string",
+          "enum": ["functional_analysis", "technical_analysis", "er_diagram", "project_management", "release_notes"],
+          "description": "Tipo di documento da generare"
+        },
+        "title": {
+          "type": "string",
+          "description": "Titolo del documento (opzionale, default da template)"
+        },
+        "content_json": {
+          "type": "object",
+          "description": "Contenuto strutturato: { sections: [{ title: string, content: string, subsections?: [...] }] }"
+        }
+      },
+      "required": ["doc_type", "content_json"]
+    }
   }
 ]"#;
 
