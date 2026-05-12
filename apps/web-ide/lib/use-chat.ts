@@ -81,13 +81,86 @@ function buildTerminalRunSummary(run: AgentRunInfo): string {
   return "Operazione conclusa.";
 }
 
+/** Costruisce un riepilogo dettagliato delle azioni eseguite dall'agente (P2). */
+function buildSemanticDetail(run: AgentRunInfo): string {
+  const WRITE_TOOLS = new Set(["write_file", "edit_file", "create_file", "patch_file"]);
+  const CMD_TOOLS = new Set(["run_in_terminal", "run_command"]);
+  const READ_TOOLS = new Set(["read_file", "search_in_files", "search_files"]);
+  const IGNORE_TOOLS = new Set(["supervisor_check"]);
+
+  const modifiedFiles: string[] = [];
+  const commands: string[] = [];
+  let analysisCount = 0;
+  let errorCount = 0;
+
+  for (const step of run.steps) {
+    if (IGNORE_TOOLS.has(step.toolName)) continue;
+    if (step.status === "failed") errorCount++;
+
+    if (WRITE_TOOLS.has(step.toolName)) {
+      const path = (step.toolInput?.path || step.toolInput?.file_path || step.toolInput?.filename) as string | undefined;
+      if (path && !modifiedFiles.includes(path)) {
+        modifiedFiles.push(path);
+      }
+    } else if (CMD_TOOLS.has(step.toolName)) {
+      const cmd = (step.toolInput?.command || step.toolInput?.cmd || step.toolInput?.text) as string | undefined;
+      if (cmd) {
+        // Tronca comandi molto lunghi
+        const short = cmd.length > 80 ? cmd.slice(0, 77) + "..." : cmd;
+        if (!commands.includes(short)) commands.push(short);
+      }
+    } else if (READ_TOOLS.has(step.toolName)) {
+      analysisCount++;
+    }
+  }
+
+  // Se non ci sono azioni significative, non generare dettagli
+  if (modifiedFiles.length === 0 && commands.length === 0 && analysisCount === 0) {
+    return "";
+  }
+
+  const lines: string[] = [];
+  if (modifiedFiles.length > 0) {
+    const MAX_FILES = 5;
+    const shown = modifiedFiles.slice(0, MAX_FILES).map((f) => {
+      // Mostra solo il nome del file (senza path lungo)
+      const parts = f.replace(/\\/g, "/").split("/");
+      return `\`${parts.length > 2 ? ".../" + parts.slice(-2).join("/") : f}\``;
+    });
+    const extra = modifiedFiles.length > MAX_FILES ? ` e altri ${modifiedFiles.length - MAX_FILES} file` : "";
+    lines.push(`- Modificati ${modifiedFiles.length} file: ${shown.join(", ")}${extra}`);
+  }
+  if (commands.length > 0) {
+    const MAX_CMDS = 3;
+    const shown = commands.slice(0, MAX_CMDS).map((c) => `\`${c}\``);
+    const extra = commands.length > MAX_CMDS ? ` e altri ${commands.length - MAX_CMDS}` : "";
+    lines.push(`- Eseguiti ${commands.length} comandi: ${shown.join(", ")}${extra}`);
+  }
+  if (analysisCount > 0) {
+    lines.push(`- Analizzati ${analysisCount} file`);
+  }
+
+  const completed = run.steps.filter((s) => s.status === "completed").length;
+  lines.push(`- Risultato: ${completed} step completati${errorCount > 0 ? `, ${errorCount} errori` : ""}`);
+
+  return `\n\n**Riepilogo:**\n${lines.join("\n")}`;
+}
+
 function createTerminalMessage(run: AgentRunInfo, pid: string, lastStreamingText?: string): ChatMessage {
-  const baseContent =
-    run.finalAnswer?.trim() && run.finalAnswer.trim().length > 0
-      ? run.finalAnswer
-      : lastStreamingText?.trim() && lastStreamingText.trim().length > 0
-        ? lastStreamingText
-        : buildTerminalRunSummary(run);
+  const statusSummary = buildTerminalRunSummary(run);
+  const semanticDetail = buildSemanticDetail(run);
+
+  let baseContent: string;
+  if (run.finalAnswer?.trim() && run.finalAnswer.trim().length > 0) {
+    // La risposta finale del modello e' presente: usala, appendi il dettaglio semantico
+    baseContent = run.finalAnswer + semanticDetail;
+  } else if (lastStreamingText?.trim() && lastStreamingText.trim().length > 0) {
+    // Testo streaming parziale: usalo, appendi il dettaglio semantico
+    baseContent = lastStreamingText + semanticDetail;
+  } else {
+    // Nessuna risposta dal modello: usa status + dettaglio semantico
+    baseContent = statusSummary + semanticDetail;
+  }
 
   // Prependi l'avviso privacy se il provider non e' EU/locale
   const content = run.providerPrivacyNotice

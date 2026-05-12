@@ -164,6 +164,45 @@ export interface AgentStepsPanelProps {
   narrationWarnAfterChars?: number;
 }
 
+/** P5: Blocco collassabile per gli step piu' vecchi */
+function OlderStepsCollapsible({
+  groups,
+  renderGroup,
+  tc,
+}: {
+  groups: { step: AgentStep; count: number; firstIndex: number; lastIndex: number }[];
+  renderGroup: (g: { step: AgentStep; count: number; firstIndex: number; lastIndex: number }) => React.ReactNode;
+  tc: ThemeColors;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const totalStepCount = groups.reduce((sum, g) => sum + g.count, 0);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+      <button
+        type="button"
+        onClick={() => setExpanded((prev) => !prev)}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          background: "none",
+          border: "none",
+          cursor: "pointer",
+          color: tc.textMuted,
+          fontSize: 11,
+          padding: "2px 4px",
+          borderRadius: 4,
+        }}
+      >
+        <span style={{ fontSize: 9 }}>{expanded ? "▼" : "▶"}</span>
+        <span>{expanded ? "Nascondi" : "Mostra"} {totalStepCount} step precedenti</span>
+      </button>
+      {expanded && groups.map(renderGroup)}
+    </div>
+  );
+}
+
 function SingleRunPanel({
   run,
   steps,
@@ -369,7 +408,12 @@ function SingleRunPanel({
               }
             }
 
-            return groups.map(({ step, count, firstIndex, lastIndex }) => {
+            // P5: Separa step vecchi (collassabili) da ultimi 3 (sempre visibili)
+            const VISIBLE_RECENT = 3;
+            const olderGroups = groups.length > VISIBLE_RECENT ? groups.slice(0, groups.length - VISIBLE_RECENT) : [];
+            const recentGroups = groups.length > VISIBLE_RECENT ? groups.slice(groups.length - VISIBLE_RECENT) : groups;
+
+            const renderGroup = ({ step, count, firstIndex, lastIndex }: GroupedStep) => {
               const hasExtendedMetrics = step.usage || step.costUsd || step.latencyMs || step.temperature !== undefined;
               const hasToolDetail = step.toolInput && Object.keys(step.toolInput).length > 0;
               const hasToolResult = Boolean(step.toolResult);
@@ -600,7 +644,22 @@ function SingleRunPanel({
                   )}
                 </div>
               );
-            });
+            };
+
+            return (
+              <>
+                {/* Step vecchi collassabili */}
+                {olderGroups.length > 0 && (
+                  <OlderStepsCollapsible
+                    groups={olderGroups}
+                    renderGroup={renderGroup}
+                    tc={tc}
+                  />
+                )}
+                {/* Ultimi step sempre visibili */}
+                {recentGroups.map(renderGroup)}
+              </>
+            );
           })()}
         </div>
       )}
