@@ -136,11 +136,23 @@ class MistralProvider(BaseProvider):
             }
             if oai_tools:
                 kwargs_call["tools"] = oai_tools
-                # Usa sempre "auto": il modello sceglie liberamente se invocare un tool o
-                # rispondere in testo. "any" forzava la tool call ma causava loop infiniti
-                # di safety-refusal nei modelli small (il modello generava testo invece di
-                # chiamare un tool, riempiendo tutta la finestra di output con ripetizioni).
-                kwargs_call["tool_choice"] = "auto"
+                # tool_choice differenziato per famiglia modello e fase della conversazione:
+                # - Primo turno (nessun tool_result nei messaggi): "required" per modelli
+                #   large/medium/codestral/pixtral — forza almeno una tool call iniziale.
+                #   Senza questo vincolo tendono a narrare ("ora eseguo X...") senza agire.
+                # - Turni successivi (gia' presenti tool_result): "auto" — il modello deve
+                #   poter rispondere in testo quando ha completato il lavoro.
+                # - Modelli small/ministral/nemo: sempre "auto" — "required" causa loop
+                #   infiniti di safety-refusal su questi modelli piu' piccoli.
+                _STRONG_TOOL_MODELS = ("large", "medium", "codestral", "pixtral")
+                is_strong = any(tag in model.lower() for tag in _STRONG_TOOL_MODELS)
+                has_tool_results = any(
+                    m.get("role") == "tool" for m in oai_messages
+                )
+                if is_strong and not has_tool_results:
+                    kwargs_call["tool_choice"] = "required"
+                else:
+                    kwargs_call["tool_choice"] = "auto"
 
             response = await client.chat.completions.create(**kwargs_call)
             choice = response.choices[0]
