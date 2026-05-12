@@ -1963,6 +1963,18 @@ async fn main() -> anyhow::Result<()> {
                 post(environment::gateway_reload_handler)
                     .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
             )
+            // Admin — gestione cooldown provider (lista + reset manuale)
+            // NOTA: la route senza path parameter deve precedere quella con :name
+            .route(
+                "/api/admin/providers/cooldown",
+                get(environment::admin_cooldown_list)
+                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+            )
+            .route(
+                "/api/admin/providers/:name/reset-cooldown",
+                post(environment::admin_reset_provider_cooldown)
+                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+            )
             .route(
                 "/api/models",
                 get(models::list_models).layer(axum_mw::from_fn_with_state(

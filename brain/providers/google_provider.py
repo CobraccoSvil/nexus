@@ -256,8 +256,8 @@ class GoogleProvider(BaseProvider):
             client = self._get_client()
             # Usa models.list() (non fatturata) invece di generate_content per evitare
             # di consumare crediti ad ogni health-check.
-            async for _ in client.aio.models.list():
-                break
+            # google-genai >= 1.x: aio.models.list() e' una coroutine, non un async iterator.
+            await client.aio.models.list()
             return {"provider": self.name, "status": "ready"}
         except Exception as e:
             from .error_handler import classify_error

@@ -241,7 +241,8 @@ fn classify_provider_error(
                 "Rate limit raggiunto",
             ));
         }
-        Some("overloaded") | Some("provider_error") | Some("server_error") => {
+        Some("overloaded") | Some("provider_error") | Some("server_error")
+        | Some("service_unavailable") | Some("bad_gateway") | Some("internal_server_error") => {
             return Some((
                 "provider_error",
                 CooldownKind::Short,
@@ -283,8 +284,11 @@ fn classify_provider_error(
     if lower.contains("overloaded")
         || lower.contains("service unavailable")
         || lower.contains("bad gateway")
+        || lower.contains("internal server error")
+        || lower.contains("gateway timeout")
         || lower.contains("502")
         || lower.contains("503")
+        || lower.contains("504")
     {
         return Some((
             "provider_error",
@@ -708,6 +712,15 @@ fn sanitize_error_for_user(raw: &str) -> String {
     // Errore di autenticazione
     if raw.contains("401") || raw.contains("authentication") || raw.contains("invalid_api_key") {
         return "errore di autenticazione con il provider AI".to_string();
+    }
+    // Errore 5xx del provider (503, 502, 500, 504, ecc.)
+    if raw.contains("Internal server error") || raw.contains("internal server error")
+        || raw.contains("service unavailable") || raw.contains("Service Unavailable")
+        || raw.contains("bad gateway") || raw.contains("Bad Gateway")
+        || raw.contains("Gateway Timeout") || raw.contains("gateway timeout")
+        || raw.contains("503") || raw.contains("502") || raw.contains("504")
+    {
+        return "il provider AI e' temporaneamente non disponibile (errore server). Il sistema sta provando con un altro provider.".to_string();
     }
     // Errore generico: tronca a 200 caratteri e rimuovi stack trace
     let clean = raw.lines().next().unwrap_or(raw);

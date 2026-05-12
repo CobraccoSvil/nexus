@@ -56,6 +56,36 @@ pub(crate) fn reset_provider_failures(provider: &str) {
     }
 }
 
+/// Rimuove completamente il cooldown e il contatore failures per un provider.
+/// Usato dall'endpoint admin per forzare il rientro in servizio di un provider.
+pub fn remove_cooldown(provider: &str) {
+    let key = provider.to_lowercase();
+    // Rimuovi cooldown timer
+    let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut map) = store.lock() {
+        map.remove(&key);
+    }
+    // Rimuovi contatore failures (circuit breaker)
+    reset_provider_failures(provider);
+    // Rimuovi reason
+    let reasons = PROVIDER_COOLDOWN_REASONS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut map) = reasons.lock() {
+        map.remove(&key);
+    }
+    // Rimuovi da Redis (se persistito)
+    if let Some(conn) = REDIS_CLIENT.get() {
+        let mut conn = conn.clone();
+        let redis_key = format!("nexus:billing_cooldown:{}", key);
+        tokio::spawn(async move {
+            let _: Result<(), _> = redis::cmd("DEL")
+                .arg(&redis_key)
+                .query_async(&mut conn)
+                .await;
+        });
+    }
+    tracing::info!("Provider '{}' cooldown rimosso manualmente (admin)", provider);
+}
+
 /// Mette un provider in cooldown. Se `retry_after_seconds` e' fornito dal
 /// provider (header Retry-After), lo usa con un cap a [10s, 3600s]. Altrimenti
 /// default 300s. Se il circuit breaker scatta, cooldown esteso a 600s.

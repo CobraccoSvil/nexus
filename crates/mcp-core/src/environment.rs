@@ -934,3 +934,37 @@ pub async fn embeddings_apply_handler(
         "reindexed": body.reindex
     })))
 }
+
+// ── Admin: gestione cooldown provider ────────────────────────────────────────
+
+/// GET /api/admin/providers/cooldown
+/// Restituisce la lista di tutti i provider attualmente in cooldown.
+pub async fn admin_cooldown_list() -> Json<Value> {
+    let snapshot = crate::provider_cooldown::cooldown_snapshot();
+    let items: Vec<Value> = snapshot
+        .into_iter()
+        .map(|(name, secs, reason)| {
+            json!({
+                "provider": name,
+                "remaining_seconds": secs,
+                "reason": reason,
+            })
+        })
+        .collect();
+    Json(json!({ "cooldowns": items }))
+}
+
+/// POST /api/admin/providers/:name/reset-cooldown
+/// Rimuove il cooldown di un provider, permettendogli di tornare
+/// immediatamente in servizio. Rimuove anche il contatore failures
+/// del circuit breaker e la persistenza Redis.
+pub async fn admin_reset_provider_cooldown(
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Json<Value> {
+    crate::provider_cooldown::remove_cooldown(&name);
+    Json(json!({
+        "ok": true,
+        "provider": name.to_lowercase(),
+        "message": format!("Cooldown rimosso per '{}'", name)
+    }))
+}
