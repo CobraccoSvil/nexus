@@ -145,8 +145,10 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
         Some(s) => s,
         None => return "[Errore: parametro 'path' mancante]".to_string(),
     };
-    if let Some(pattern) = is_protected_path(path_str) {
-        return format!("[Errore: il file '{}' è protetto (pattern: '{}') e non può essere modificato dall'agente. Modifica manualmente se necessario.]", path_str, pattern);
+    if !ctx.is_nexus_operator {
+        if let Some(pattern) = is_protected_path(path_str) {
+            return format!("[Errore: il file '{}' è protetto (pattern: '{}') e non può essere modificato dall'agente. Modifica manualmente se necessario.]", path_str, pattern);
+        }
     }
     let content = match input.get("content").and_then(Value::as_str) {
         Some(s) => s,
@@ -394,8 +396,10 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
         Some(s) => s,
         None => return "[Errore: parametro 'path' mancante]".to_string(),
     };
-    if let Some(pattern) = is_protected_path(path_str) {
-        return format!("[Errore: il file '{}' è protetto (pattern: '{}') e non può essere modificato dall'agente.]", path_str, pattern);
+    if !ctx.is_nexus_operator {
+        if let Some(pattern) = is_protected_path(path_str) {
+            return format!("[Errore: il file '{}' è protetto (pattern: '{}') e non può essere modificato dall'agente.]", path_str, pattern);
+        }
     }
     let old_string = match input.get("old_string").and_then(Value::as_str) {
         Some(s) => s,

@@ -774,6 +774,10 @@ pub struct AgentToolContext {
     pub template_cache: crate::prompt_templates::TemplateCache,
     /// Ruolo utente corrente ("admin" | "editor" | "viewer") — usato dai tool nexus_builtin.
     pub user_role: String,
+    /// Se true, l'agente opera come operatore Nexus con permessi completi
+    /// sui file del progetto gestito. Bypassa `PROTECTED_PATTERNS` ma NON
+    /// la protezione infrastruttura (path-traversal, container ideai-*).
+    pub is_nexus_operator: bool,
     /// Stato atomico dipendenze (Qdrant, embedder). Se down, i tool vettoriali
     /// ritornano subito un messaggio informativo invece di aspettare il timeout.
     pub dependency_status: crate::task_watchdog::DependencyStatusRef,

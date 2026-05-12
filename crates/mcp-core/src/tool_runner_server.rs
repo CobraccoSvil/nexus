@@ -125,7 +125,8 @@ impl ToolRunnerService {
             terminal_consumers: self.deps.terminal_consumers.clone(),
             long_running_patterns,
             template_cache: self.deps.template_cache.clone(),
-            user_role: info.user_role,
+            user_role: info.user_role.clone(),
+            is_nexus_operator: matches!(info.user_role.as_str(), "owner" | "admin"),
             dependency_status: self.deps.dependency_status.clone(),
         })
     }

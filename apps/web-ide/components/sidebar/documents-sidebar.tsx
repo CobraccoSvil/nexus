@@ -229,27 +229,40 @@ export function DocumentsSidebar({ project, onSendToChat, onOpenInEditor }: Docu
   };
 
   /** Apre il documento nell'editor di Nexus.
+   *  File binari (.docx) vengono scaricati. File testo (.md, .txt, .html)
+   *  vengono aperti nell'editor.
    *  Calcola il path relativo al progetto a partire dal file_path assoluto
-   *  registrato nel DB (es. /home/.../projects/<slug>/docs/x.md → docs/x.md). */
+   *  registrato nel DB (es. /home/.../projects/<slug>/docs/x.md -> docs/x.md). */
   const handleOpen = (doc: DocumentItem) => {
+    const fp = doc.file_path;
+    const ext = fp.split(".").pop()?.toLowerCase() ?? "";
+
+    // File binari (.docx, .xlsx, .pdf): scarica invece di aprire nell'editor.
+    if (["docx", "xlsx", "pdf", "odt", "pptx"].includes(ext)) {
+      handleDownload(doc);
+      return;
+    }
+
     if (!onOpenInEditor) return;
-    const abs = doc.file_path;
-    // Prova a estrarre la parte dopo "/projects/<slug>/" o, in fallback,
-    // tutto cio' che segue l'ultima occorrenza di "/<projectName>/".
-    let relative = abs;
+
+    // Estrai il path relativo alla root del progetto.
+    let relative = fp;
+
+    // Caso 1: path assoluto con /projects/<slug>/...
     const projectsMarker = "/projects/";
-    const idx = abs.indexOf(projectsMarker);
+    const idx = fp.indexOf(projectsMarker);
     if (idx >= 0) {
-      const afterProjects = abs.slice(idx + projectsMarker.length);
-      // Salta il segmento dello slug progetto.
+      const afterProjects = fp.slice(idx + projectsMarker.length);
       const firstSlash = afterProjects.indexOf("/");
       if (firstSlash >= 0) {
         relative = afterProjects.slice(firstSlash + 1);
       }
-    } else {
-      // Fallback: prendi solo il nome file.
-      relative = abs.split("/").pop() ?? abs;
+    } else if (fp.startsWith("/")) {
+      // Caso 2: path assoluto generico — prendi solo il nome file.
+      relative = fp.split("/").pop() ?? fp;
     }
+    // Caso 3: path gia' relativo (es. "docs/file.md") — usa cosi' com'e'.
+
     onOpenInEditor(relative);
   };
 
