@@ -256,6 +256,12 @@ pub(super) async fn tool_search_in_files(ctx: &AgentToolContext, input: &Value) 
         .output()
         .await;
 
+    // Limite massimo di output: 500KB. Risultati piu' grandi causano
+    // RESOURCE_EXHAUSTED gRPC (limite 16MB client Python) e consumano
+    // troppi token di contesto per l'LLM. 500KB ~ 10k righe di codice.
+    const MAX_OUTPUT_BYTES: usize = 500 * 1024;
+    const MAX_OUTPUT_LINES: usize = 2000;
+
     match output {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -266,7 +272,7 @@ pub(super) async fn tool_search_in_files(ctx: &AgentToolContext, input: &Value) 
                 format!("Nessun risultato per '{pattern}'.")
             } else {
                 // Rendi i path relativi alla root per leggibilita'
-                stdout
+                let lines: Vec<String> = stdout
                     .lines()
                     .map(|line| {
                         line.replacen(
@@ -277,8 +283,27 @@ pub(super) async fn tool_search_in_files(ctx: &AgentToolContext, input: &Value) 
                         .trim_start_matches(['/', '\\'])
                         .to_string()
                     })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                    .collect();
+                let total_lines = lines.len();
+                // Troncamento: limita per numero righe e per dimensione bytes
+                let mut result = String::new();
+                let mut count = 0;
+                for line in &lines {
+                    if count >= MAX_OUTPUT_LINES || result.len() + line.len() > MAX_OUTPUT_BYTES {
+                        let msg = format!(
+                            "\n\n[Risultato troncato: mostrate {} di {} righe. Usa un pattern piu' specifico o limita il path.]",
+                            count, total_lines
+                        );
+                        result.push_str(&msg);
+                        break;
+                    }
+                    if count > 0 {
+                        result.push('\n');
+                    }
+                    result.push_str(line);
+                    count += 1;
+                }
+                result
             }
         }
         Err(e) => format!("[Impossibile eseguire grep: {}]", e),

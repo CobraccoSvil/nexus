@@ -69,9 +69,9 @@ class ToolRunnerClient:
 
     # Limite massimo per messaggi gRPC ricevuti da mcp-core.
     # Il default gRPC e' 4MB: tool come search_in_files su codebase grandi
-    # possono restituire risultati piu' grandi. 16MB copre la stragrande
-    # maggioranza dei casi senza consumare memoria eccessiva.
-    _GRPC_MAX_MSG_BYTES = 16 * 1024 * 1024  # 16MB
+    # possono restituire risultati piu' grandi. Il ToolRunner Rust tronca
+    # a 500KB, ma per sicurezza il canale accetta fino a 64MB.
+    _GRPC_MAX_MSG_BYTES = 64 * 1024 * 1024  # 64MB
 
     async def _ensure_channel(self) -> tool_runner_pb2_grpc.ToolRunnerStub:
         if self._stub is None:

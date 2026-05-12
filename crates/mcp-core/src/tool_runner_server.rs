@@ -229,8 +229,15 @@ pub async fn spawn_tool_runner_server(
     let svc = ToolRunnerService::new(deps);
     tracing::info!("ToolRunner gRPC server in ascolto su {addr}");
     tokio::spawn(async move {
+        // Limite gRPC esplicito: 64MB encoding/decoding per coerenza col client Python.
+        // Il tool search_in_files tronca a 500KB, ma altri tool (read_file su file grandi)
+        // possono legittimamente produrre risposte da qualche MB.
+        const MAX_MSG: usize = 64 * 1024 * 1024;
+        let tool_runner_svc = ToolRunnerServer::new(svc)
+            .max_decoding_message_size(MAX_MSG)
+            .max_encoding_message_size(MAX_MSG);
         if let Err(e) = Server::builder()
-            .add_service(ToolRunnerServer::new(svc))
+            .add_service(tool_runner_svc)
             .serve(addr)
             .await
         {
