@@ -1398,7 +1398,7 @@ async fn spawn_agent_run(
 
     let db_connections_block = {
         let rows = sqlx::query(
-            "SELECT name, engine, connection_secret, is_primary \
+            "SELECT name, engine, ENCODE(connection_secret, 'escape') AS connection_secret, is_primary \
              FROM project_database_config \
              WHERE project_id = $1 \
              ORDER BY is_primary DESC, LOWER(name)"

@@ -405,9 +405,12 @@ pub mod db_table_size;
 pub mod db_unused_indexes;
 pub mod db_view_list;
 pub mod project_db_apply_migration;
+pub mod project_db_connections;
 pub mod project_db_create_migration;
 pub mod project_db_rollback;
 pub mod project_db_status;
+pub mod project_info;
+pub mod project_run_configs;
 
 use async_trait::async_trait;
 use serde_json::Value;

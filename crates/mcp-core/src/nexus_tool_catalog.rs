@@ -1982,11 +1982,20 @@ impl NexusToolCatalog {
         // ── Project DB tools — gestione DB e migration per progetti utente ──
         {
             use crate::nexus_tools::{
+                project_db_connections::ProjectDbConnectionsTool,
                 project_db_status::ProjectDbStatusTool,
                 project_db_create_migration::ProjectDbCreateMigrationTool,
                 project_db_apply_migration::ProjectDbApplyMigrationTool,
                 project_db_rollback::ProjectDbRollbackTool,
             };
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_db_connections",
+                    NexusToolCategory::Database,
+                    "Restituisce le connessioni DB configurate per il progetto corrente (connection string, engine, ecc.)",
+                ),
+                Arc::new(ProjectDbConnectionsTool),
+            );
             self.register_with_handler(
                 NexusToolSpec::new(
                     "project_db_status",
@@ -2018,6 +2027,30 @@ impl NexusToolCatalog {
                     "Annulla l'ultima migration applicata al DB del progetto utente.",
                 ),
                 Arc::new(ProjectDbRollbackTool),
+            );
+        }
+
+        // ── Project config tools — info progetto, run configs ────────────
+        {
+            use crate::nexus_tools::{
+                project_info::ProjectInfoTool,
+                project_run_configs::ProjectRunConfigsTool,
+            };
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_info",
+                    NexusToolCategory::Utility,
+                    "Info generali del progetto: nome, root path, git branch, stack rilevato, istruzioni custom, sandbox config.",
+                ),
+                Arc::new(ProjectInfoTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_run_configs",
+                    NexusToolCategory::Utility,
+                    "Configurazioni di esecuzione (comandi) disponibili per il progetto: label, tipo, comando, args, cwd, env.",
+                ),
+                Arc::new(ProjectRunConfigsTool),
             );
         }
 
