@@ -111,7 +111,8 @@ impl PromptOptimizerWorker {
         &self,
         min_runs: i64,
     ) -> Result<Vec<PromptMetrics>, sqlx::Error> {
-        // Join tra nexus_prompt_templates, nexus_agent_reflections e prompt_feedback
+        // Join tra nexus_prompt_templates e nexus_agent_reflections
+        // (prompt_feedback droppata in mig 0131, feedback ora in ai_response_feedback con schema diverso)
         let rows = sqlx::query(
             r#"
             SELECT
@@ -119,21 +120,13 @@ impl PromptOptimizerWorker {
                 t.version                                       AS prompt_version,
                 t.content                                       AS prompt_content,
                 COALESCE(AVG(r.score::float8), 0.0)            AS avg_reflection_score,
-                COALESCE(
-                    SUM(CASE WHEN f.user_thumbs = 1 THEN 1 ELSE 0 END)::float8
-                    / NULLIF(COUNT(f.id)::float8, 0),
-                    0.5
-                )                                              AS feedback_positive_rate,
+                0.5::float8                                    AS feedback_positive_rate,
                 COUNT(r.id)                                    AS total_reflection_runs
             FROM nexus_prompt_templates t
             LEFT JOIN nexus_agent_reflections r
                 ON r.prompt_key = t.key
                AND r.prompt_version = t.version
                AND r.created_at >= NOW() - INTERVAL '7 days'
-            LEFT JOIN prompt_feedback f
-                ON f.prompt_key = t.key
-               AND f.prompt_version = t.version
-               AND f.created_at >= NOW() - INTERVAL '7 days'
             WHERE t.is_active = TRUE
               AND t.key LIKE 'agent.%'
             GROUP BY t.key, t.version, t.content

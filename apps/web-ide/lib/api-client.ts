@@ -3283,3 +3283,77 @@ export async function forceDiscardExperiment(id: string): Promise<{ ok: boolean;
 export async function getPromptDashboard(): Promise<PromptDashboardData> {
   return fetchJson(`${adminServiceUrl("/prompt-dashboard")}`);
 }
+
+// ── Direttive condivise agenti ──────────────────────────────────────────
+
+export interface SharedDirective {
+  key: string;
+  content: string;
+  scope: "agent" | "system" | "all";
+  priority: number;
+  isActive: boolean;
+  description: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listSharedDirectives(): Promise<{
+  directives: SharedDirective[];
+  total: number;
+}> {
+  return fetchJson(`${adminServiceUrl("/shared-directives")}`);
+}
+
+export async function getSharedDirective(key: string): Promise<SharedDirective> {
+  return fetchJson(
+    `${adminServiceUrl(`/shared-directives/${encodeURIComponent(key)}`)}`,
+  );
+}
+
+export async function createSharedDirective(data: {
+  key: string;
+  content: string;
+  scope?: string;
+  priority?: number;
+  description?: string;
+}): Promise<SharedDirective> {
+  return fetchJson(`${adminServiceUrl("/shared-directives")}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export async function updateSharedDirective(
+  key: string,
+  data: {
+    content?: string;
+    scope?: string;
+    priority?: number;
+    isActive?: boolean;
+    description?: string;
+  },
+): Promise<SharedDirective> {
+  return fetchJson(
+    `${adminServiceUrl(`/shared-directives/${encodeURIComponent(key)}`)}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    },
+  );
+}
+
+export async function toggleSharedDirective(key: string): Promise<SharedDirective> {
+  return fetchJson(
+    `${adminServiceUrl(`/shared-directives/${encodeURIComponent(key)}/toggle`)}`,
+    { method: "POST" },
+  );
+}
+
+export async function deleteSharedDirective(key: string): Promise<{ ok: boolean }> {
+  return fetchJson(
+    `${adminServiceUrl(`/shared-directives/${encodeURIComponent(key)}`)}`,
+    { method: "DELETE" },
+  );
+}

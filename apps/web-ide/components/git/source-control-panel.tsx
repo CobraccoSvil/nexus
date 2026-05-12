@@ -1369,7 +1369,7 @@ export function SourceControlPanel({
           project={project}
           branches={branches}
           busy={busy}
-          runAction={runAction}
+          runAction={runActionWithGitHubRefresh}
         />
       </div>
 

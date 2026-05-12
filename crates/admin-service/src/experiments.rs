@@ -280,21 +280,13 @@ pub async fn prompt_dashboard(State(state): State<AppState>) -> ApiResult {
             t.experimental,
             COALESCE(AVG(r.score::float8), NULL)               AS avg_reflection_score,
             COUNT(r.id)                                        AS reflection_runs,
-            COALESCE(
-                SUM(CASE WHEN f.user_thumbs = 1 THEN 1 ELSE 0 END)::float8
-                / NULLIF(COUNT(f.id)::float8, 0),
-                NULL
-            )                                                  AS feedback_positive_rate,
-            COUNT(f.id)                                        AS feedback_count
+            NULL::float8                                       AS feedback_positive_rate,
+            0::bigint                                              AS feedback_count
         FROM nexus_prompt_templates t
         LEFT JOIN nexus_agent_reflections r
             ON r.prompt_key = t.key
            AND r.prompt_version = t.version
            AND r.created_at >= NOW() - INTERVAL '7 days'
-        LEFT JOIN prompt_feedback f
-            ON f.prompt_key = t.key
-           AND f.prompt_version = t.version
-           AND f.created_at >= NOW() - INTERVAL '7 days'
         WHERE t.is_active = TRUE
           AND t.key LIKE 'agent.%'
         GROUP BY t.key, t.version, t.schema_type, t.experimental

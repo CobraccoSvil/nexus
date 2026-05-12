@@ -20,6 +20,7 @@ mod experiments;
 mod long_running;
 mod prompt_templates;
 mod settings;
+mod shared_directives;
 
 pub use prompt_templates::TemplateCache;
 
@@ -195,6 +196,22 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/prompt-experiments/:id/discard",
             post(experiments::force_discard),
+        )
+        // Direttive condivise agenti
+        .route(
+            "/shared-directives",
+            get(shared_directives::list_directives)
+                .post(shared_directives::create_directive),
+        )
+        .route(
+            "/shared-directives/:key",
+            get(shared_directives::get_directive)
+                .put(shared_directives::update_directive)
+                .delete(shared_directives::delete_directive),
+        )
+        .route(
+            "/shared-directives/:key/toggle",
+            post(shared_directives::toggle_directive),
         )
         // Dashboard riepilogo metriche prompt
         .route(
