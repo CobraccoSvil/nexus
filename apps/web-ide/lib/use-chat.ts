@@ -384,8 +384,6 @@ export function useChat(
             setAgentRuns((prev) => new Map(prev).set(runId, finalRun));
             setAgentStepsMap((prev) => new Map(prev).set(runId, finalRun.steps));
             if (isPrimary) {
-              setAgentRun(finalRun);
-              setAgentSteps(finalRun.steps);
               const isTerminal =
                 finalRun.status === "completed" ||
                 finalRun.status === "failed" ||
@@ -394,6 +392,11 @@ export function useChat(
                 finalRun.status === "interrupted" ||
                 finalRun.status === "loop_aborted" ||
                 finalRun.status === "provider_unavailable";
+              // Se il run e' terminale, non ri-settare agentRun (cancelRun l'ha gia' pulito)
+              if (!isTerminal) {
+                setAgentRun(finalRun);
+                setAgentSteps(finalRun.steps);
+              }
               if (isTerminal && sid) {
                 const syntheticMsg = createTerminalMessage(finalRun, projectId, streamingTokenRef.current);
                 setMessages((current) => upsertSyntheticAssistantMessage(current, syntheticMsg));
@@ -737,21 +740,19 @@ export function useChat(
     feedbackError,
     confirmAgent,
     cancelRun: useCallback(async (runId: string) => {
+      // Resetta stato UI SUBITO per sbloccare l'input (prima delle chiamate async)
+      setAgentRun(null);
+      setAgentSteps([]);
+      setIsLoading(false);
       try { await cancelAgentRun(runId); } catch { /* ignore */ }
       // Recupera il run finale e mostra il messaggio di interruzione nel chat
       try {
         const finalRun = await getAgentRun(runId);
         if (finalRun) {
-          setAgentRun(finalRun);
-          setAgentSteps(finalRun.steps);
           const syntheticMsg = createTerminalMessage(finalRun, projectId);
           setMessages((current) => upsertSyntheticAssistantMessage(current, syntheticMsg));
         }
       } catch { /* ignore */ }
-      // Resetta stato loading
-      setAgentRun(null);
-      setAgentSteps([]);
-      setIsLoading(false);
     }, [projectId]),
     clear,
     clearTraces: () => setTraces([]),

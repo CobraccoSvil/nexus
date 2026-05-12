@@ -1173,7 +1173,7 @@ export function ChatPanel({
             <AgentProgressInline tc={tc} steps={agentSteps} />
           )}
 
-          {agentRun && (
+          {agentRun && (agentRun.status === "running" || agentRun.status === "awaiting_confirmation") && (
             <AgentStepsPanel
               agentRun={agentRun}
               agentSteps={agentSteps}
