@@ -141,6 +141,52 @@ def compress_tool_list(
     ]
 
 
+def is_first_agent_turn(messages: list[dict]) -> bool:
+    """Determina se siamo al primo turno agente (nessun tool_result nella history).
+
+    La detection si basa sulla presenza di messaggi con role 'tool' (formato
+    OpenAI/Mistral/DeepSeek) o blocchi con type 'tool_result' nel content
+    (formato Anthropic).
+
+    Al primo turno il modello deve essere forzato a usare un tool per evitare
+    il pattern "narrate-without-act" (descrivere azioni senza eseguirle).
+    """
+    for m in messages:
+        role = m.get("role", "")
+        # Formato OpenAI-compat: role=tool
+        if role == "tool":
+            return False
+        # Formato Anthropic: blocchi tool_result nel content
+        content = m.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    return False
+    return True
+
+
+def resolve_tool_choice_openai(
+    model: str,
+    messages: list[dict],
+    *,
+    weak_models: tuple[str, ...] = (),
+) -> str:
+    """Determina il tool_choice per provider con API OpenAI-compatible.
+
+    Ritorna:
+    - "required" al primo turno per modelli non-weak (forza una tool call)
+    - "auto" ai turni successivi o per modelli weak
+
+    I modelli in `weak_models` usano sempre "auto" perche' "required"
+    causa loop di safety-refusal (osservato su mistral-small, ministral).
+    """
+    if weak_models and any(tag in model.lower() for tag in weak_models):
+        return "auto"
+    if is_first_agent_turn(messages):
+        return "required"
+    return "auto"
+
+
 def measure_tools_bytes(tools: list[dict]) -> int:
     """Calcola il peso JSON serializzato di una lista di tool definitions.
 

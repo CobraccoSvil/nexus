@@ -8,7 +8,7 @@ from typing import Any, AsyncIterator
 from .base import BaseProvider, ProviderCatalogEntry, ProviderResult
 from .error_handler import format_error_result
 from .openai_provider import _anthropic_tool_to_openai, _convert_messages_to_openai
-from ._schema_utils import compress_tool_list
+from ._schema_utils import compress_tool_list, resolve_tool_choice_openai
 
 logger = logging.getLogger(__name__)
 
@@ -136,23 +136,13 @@ class MistralProvider(BaseProvider):
             }
             if oai_tools:
                 kwargs_call["tools"] = oai_tools
-                # tool_choice differenziato per famiglia modello e fase della conversazione:
-                # - Primo turno (nessun tool_result nei messaggi): "required" per modelli
-                #   large/medium/codestral/pixtral — forza almeno una tool call iniziale.
-                #   Senza questo vincolo tendono a narrare ("ora eseguo X...") senza agire.
-                # - Turni successivi (gia' presenti tool_result): "auto" — il modello deve
-                #   poter rispondere in testo quando ha completato il lavoro.
-                # - Modelli small/ministral/nemo: sempre "auto" — "required" causa loop
-                #   infiniti di safety-refusal su questi modelli piu' piccoli.
-                _STRONG_TOOL_MODELS = ("large", "medium", "codestral", "pixtral")
-                is_strong = any(tag in model.lower() for tag in _STRONG_TOOL_MODELS)
-                has_tool_results = any(
-                    m.get("role") == "tool" for m in oai_messages
+                # Mistral small/ministral/nemo causano loop con "required" → weak_models.
+                # Per large/medium/codestral/pixtral: "required" al primo turno,
+                # "auto" dopo (helper centralizzato in _schema_utils).
+                kwargs_call["tool_choice"] = resolve_tool_choice_openai(
+                    model, oai_messages,
+                    weak_models=("small", "ministral", "nemo"),
                 )
-                if is_strong and not has_tool_results:
-                    kwargs_call["tool_choice"] = "required"
-                else:
-                    kwargs_call["tool_choice"] = "auto"
 
             response = await client.chat.completions.create(**kwargs_call)
             choice = response.choices[0]

@@ -140,6 +140,11 @@ class DeepSeekProvider(BaseProvider):
             }
             if oai_tools:
                 kwargs_call["tools"] = oai_tools
+                # Anti-narration: forza tool_choice=required al primo turno.
+                from ._schema_utils import resolve_tool_choice_openai
+                kwargs_call["tool_choice"] = resolve_tool_choice_openai(
+                    model, oai_messages,
+                )
 
             response = await client.chat.completions.create(**kwargs_call)
             choice = response.choices[0]

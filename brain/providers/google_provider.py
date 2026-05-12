@@ -163,10 +163,22 @@ class GoogleProvider(BaseProvider):
             # Settiamo None per i thinking model per evitare warning nell'API.
             _is_thinking = "thinking" in model.lower() or "gemini-2.5-pro" in model.lower()
             config_temperature = None if _is_thinking else temperature
+            # Anti-narration: al primo turno (nessun tool_result nella history),
+            # forza il modello a fare almeno una tool call. Google Gemini usa
+            # tool_config con FunctionCallingConfig(mode="ANY").
+            tool_config = None
+            if google_tools:
+                from ._schema_utils import is_first_agent_turn
+                if is_first_agent_turn([m if isinstance(m, dict) else {} for m in messages]):
+                    tool_config = types.ToolConfig(
+                        function_calling_config=types.FunctionCallingConfig(mode="ANY")
+                    )
+
             config = types.GenerateContentConfig(
                 max_output_tokens=max_tokens,
                 temperature=config_temperature,
                 tools=google_tools,
+                tool_config=tool_config,
             )
             if system_text:
                 config.system_instruction = system_text

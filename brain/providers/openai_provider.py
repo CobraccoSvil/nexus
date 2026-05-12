@@ -154,6 +154,14 @@ class OpenAIProvider(BaseProvider):
                 kwargs_call["max_tokens"] = max_tokens
             if oai_tools:
                 kwargs_call["tools"] = oai_tools
+                # Anti-narration: forza tool_choice=required al primo turno
+                # per evitare che il modello narri azioni senza eseguirle.
+                # Modelli o-series (reasoning) non accettano tool_choice.
+                if not _is_o_series(model):
+                    from ._schema_utils import resolve_tool_choice_openai
+                    kwargs_call["tool_choice"] = resolve_tool_choice_openai(
+                        model, oai_messages,
+                    )
 
             response = await client.chat.completions.create(**kwargs_call)
             choice = response.choices[0]

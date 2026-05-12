@@ -337,6 +337,13 @@ class AnthropicProvider(BaseProvider):
                         100 * (1 - bytes_after / max(1, bytes_before)),
                     )
                 kwargs["tools"] = compressed_tools
+                # Anti-narration: al primo turno (nessun tool_result nella history),
+                # forza il modello a fare almeno una tool call. Ai turni successivi
+                # tool_choice resta auto (default) per permettere risposta testuale.
+                # Anthropic usa {"type": "any"} invece di "required".
+                from ._schema_utils import is_first_agent_turn
+                if is_first_agent_turn(effective_messages):
+                    kwargs["tool_choice"] = {"type": "any"}
             if use_thinking:
                 kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
                 kwargs["betas"] = ["interleaved-thinking-2025-05-14"]
