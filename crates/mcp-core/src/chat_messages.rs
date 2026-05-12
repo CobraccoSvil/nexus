@@ -1742,6 +1742,7 @@ async fn spawn_agent_run(
         let _ = sqlx::query(
             "UPDATE agent_runs SET status=$2, final_answer=$3, iteration_count=$4, \
              prompt_tokens=$5, completion_tokens=$6, total_tokens=$7, total_cost=$8, \
+             nexus_override_applied=$9, nexus_agent_type=$10, nexus_task_type=$11, \
              completed_at=NOW() WHERE id=$1",
         )
         .bind(run_id)
@@ -1752,6 +1753,9 @@ async fn spawn_agent_run(
         .bind(result.completion_tokens as i32)
         .bind(result.total_tokens as i32)
         .bind(result.total_cost)
+        .bind(result.nexus_override_applied)
+        .bind(result.nexus_agent_type.as_deref())
+        .bind(result.nexus_task_type.as_deref())
         .execute(&db_clone)
         .await;
 

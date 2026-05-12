@@ -180,6 +180,11 @@ pub struct AgentRunResult {
     /// Stop reason finale: end_turn | tool_use | error | loop_detected | timeout.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// Task type rilevato dal router (es. "fix", "code_read", "architecture").
+    /// Propagato dal brain Python nell'evento SSE end_turn per popolare
+    /// la colonna `nexus_task_type` in agent_runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nexus_task_type: Option<String>,
 }
 
 /// Evento di trace LLM: mostra i messaggi inviati al provider e la risposta ricevuta.

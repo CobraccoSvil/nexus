@@ -382,6 +382,9 @@ pub async fn run_via_brain(
     let mut acc_completion_tokens: u32 = 0;
     let mut acc_total_tokens: u32 = 0;
     let mut acc_total_cost: f64 = 0.0;
+    // B5: metadata routing propagati dal brain Python nell'evento end_turn
+    let mut nexus_task_type: Option<String> = None;
+    let mut nexus_agent_type: Option<String> = None;
 
     // Timeout per-silence: se il brain non emette alcun chunk SSE (inclusi i
     // ping heartbeat ogni ~30s) per `sse_max_silence_secs` secondi, il run
@@ -548,6 +551,13 @@ pub async fn run_via_brain(
                     acc_completion_tokens = evt.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                     acc_total_tokens = evt.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                     acc_total_cost = evt.get("total_cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    // B5: legge metadata routing propagati dal brain Python
+                    if let Some(tt) = evt.get("nexus_task_type").and_then(|v| v.as_str()) {
+                        nexus_task_type = Some(tt.to_string());
+                    }
+                    if let Some(at) = evt.get("nexus_agent_type").and_then(|v| v.as_str()) {
+                        nexus_agent_type = Some(at.to_string());
+                    }
                     if last_stop_reason.is_none() {
                         last_stop_reason = Some(
                             evt.get("stop_reason").and_then(|v| v.as_str()).unwrap_or("end_turn").to_string()
@@ -665,9 +675,10 @@ pub async fn run_via_brain(
         provider,
         model,
         iteration_count: iteration,
-        nexus_override_applied: false,
-        nexus_agent_type: None,
+        nexus_override_applied: nexus_agent_type.is_some(),
+        nexus_agent_type,
         nexus_q_value: None,
+        nexus_task_type,
         provider_privacy_notice: None,
         prompt_tokens: acc_prompt_tokens,
         completion_tokens: acc_completion_tokens,
@@ -782,6 +793,7 @@ fn fail_result(
         nexus_override_applied: false,
         nexus_agent_type: None,
         nexus_q_value: None,
+        nexus_task_type: None,
         provider_privacy_notice: None,
         prompt_tokens: 0,
         completion_tokens: 0,

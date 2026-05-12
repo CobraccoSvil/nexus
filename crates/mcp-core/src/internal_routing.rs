@@ -20,6 +20,70 @@ use serde::Deserialize;
 
 use crate::AppState;
 
+// ---------------------------------------------------------------------------
+// POST /api/internal/provider-error — bridge cooldown brain Python → Rust
+// ---------------------------------------------------------------------------
+
+/// Body della richiesta `POST /api/internal/provider-error`.
+/// Chiamato dal brain Python (cooldown_bridge.py) quando rileva un errore
+/// provider in punti non osservati direttamente da Rust (es. catena
+/// classificatore, fallback chain in registry.py).
+#[derive(Debug, Deserialize)]
+pub struct ProviderErrorPayload {
+    pub provider: String,
+    pub error_class: String,
+    #[serde(default)]
+    pub retry_after_seconds: Option<u64>,
+}
+
+/// Handler `POST /api/internal/provider-error`.
+/// Applica il cooldown appropriato in base alla classe dell'errore:
+///   - `billing_error` → cooldown lungo 6h (persistito in Redis)
+///   - `rate_limit`    → cooldown breve con retry_after o default 60s
+///   - `overloaded` / `provider_error` → cooldown breve 60s
+pub async fn provider_error_handler(
+    Json(body): Json<ProviderErrorPayload>,
+) -> impl IntoResponse {
+    let provider = body.provider.trim().to_lowercase();
+    if provider.is_empty() {
+        return (StatusCode::BAD_REQUEST, "campo `provider` vuoto".to_string()).into_response();
+    }
+    match body.error_class.as_str() {
+        "billing_error" => {
+            crate::provider_cooldown::put_provider_in_long_cooldown(
+                &provider,
+                &format!("brain bridge: {}", body.error_class),
+            );
+            tracing::warn!(
+                "provider-error bridge: '{}' → COOLDOWN LUNGO (billing_error)",
+                provider
+            );
+        }
+        "rate_limit" => {
+            let secs = body.retry_after_seconds.unwrap_or(60);
+            crate::provider_cooldown::put_provider_in_cooldown(&provider, Some(secs));
+            tracing::warn!(
+                "provider-error bridge: '{}' → cooldown breve {}s (rate_limit)",
+                provider, secs
+            );
+        }
+        "overloaded" | "provider_error" => {
+            crate::provider_cooldown::put_provider_in_cooldown(&provider, Some(60));
+            tracing::warn!(
+                "provider-error bridge: '{}' → cooldown breve 60s ({})",
+                provider, body.error_class
+            );
+        }
+        other => {
+            tracing::debug!(
+                "provider-error bridge: '{}' classe non riconosciuta '{}', ignorata",
+                provider, other
+            );
+        }
+    }
+    (StatusCode::OK, "ok".to_string()).into_response()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PurposeQuery {
     pub purpose: String,

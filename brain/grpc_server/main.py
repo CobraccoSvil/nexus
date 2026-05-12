@@ -1244,6 +1244,9 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
         acc_total_tokens = 0
         acc_total_cost = 0.0
         end_turn_emitted = False
+        # Metadata routing (B5): catturati dal nodo router per propagare a Rust
+        nexus_task_type: str | None = None
+        nexus_agent_type: str | None = None
         try:
             # Heartbeat: ogni attesa di evento ha un timeout di 30s.
             # Se il brain e' in elaborazione senza produrre output (tool lento,
@@ -1268,7 +1271,13 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                 for node, delta in event.items():
                     if not isinstance(delta, dict):
                         continue
-                    if node == "executor":
+                    if node == "router":
+                        # Cattura metadata routing (B5 fix: propagazione nexus_task_type/agent_type)
+                        if delta.get("user_intent"):
+                            nexus_task_type = delta["user_intent"]
+                        if delta.get("profile_name"):
+                            nexus_agent_type = delta["profile_name"]
+                    elif node == "executor":
                         # Accumula token/costo da ogni chiamata LLM
                         acc_prompt_tokens += int(delta.get("prompt_tokens") or 0)
                         acc_completion_tokens += int(delta.get("completion_tokens") or 0)
@@ -1298,15 +1307,21 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                             )
                         if delta.get("stop_reason") == "end_turn":
                             end_turn_emitted = True
+                            end_turn_payload = {
+                                "type": "end_turn",
+                                "prompt_tokens": acc_prompt_tokens,
+                                "completion_tokens": acc_completion_tokens,
+                                "total_tokens": acc_total_tokens,
+                                "total_cost": acc_total_cost,
+                            }
+                            # B5: propaga metadata routing a mcp-core Rust
+                            if nexus_task_type:
+                                end_turn_payload["nexus_task_type"] = nexus_task_type
+                            if nexus_agent_type:
+                                end_turn_payload["nexus_agent_type"] = nexus_agent_type
                             yield (
                                 "data: "
-                                + _json.dumps({
-                                    "type": "end_turn",
-                                    "prompt_tokens": acc_prompt_tokens,
-                                    "completion_tokens": acc_completion_tokens,
-                                    "total_tokens": acc_total_tokens,
-                                    "total_cost": acc_total_cost,
-                                })
+                                + _json.dumps(end_turn_payload)
                                 + "\n\n"
                             )
                     elif node == "tool_dispatch":

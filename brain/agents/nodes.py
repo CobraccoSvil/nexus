@@ -830,6 +830,23 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 content=result_text,
                 additional_kwargs={"anthropic_content": assistant_content} if assistant_content else {},
             )
+
+            # Registra l'usage di questo turno nel billing ledger (B1 fix).
+            try:
+                from brain.providers.registry import record_agent_turn_usage
+                record_agent_turn_usage(
+                    provider=provider,
+                    model=model,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_creation_tokens=cache_creation_tokens,
+                    iteration=_current_iterations,
+                    run_id=str(state.get("thread_id") or ""),
+                )
+            except Exception as billing_exc:
+                logger.warning("executor_node: billing ledger fallito iter=%d: %s", _current_iterations, billing_exc)
+
         except Exception as exc:
             logger.error("executor_node: agent_turn %s/%s: %s", provider, model, exc)
             result_text = f"[Errore provider {provider}: {exc}]"
@@ -1469,6 +1486,12 @@ async def learner_node(state: AgentState) -> dict[str, Any]:
             prelim_reward, lcfg["min_confidence"], stop_reason_pre,
         )
 
+    if not result:
+        logger.warning(
+            "learner_node: thread=%s result vuoto (stop=%s), skip Qdrant/SQLite",
+            thread_id, stop_reason_pre,
+        )
+
     # Salva embedding in Qdrant solo se qualita' sufficiente e auto_extract abilitato
     if _retriever is not None and user_input and result and save_to_qdrant:
         interaction_text = f"Input: {user_input}\nOutput: {result}"
@@ -1488,19 +1511,22 @@ async def learner_node(state: AgentState) -> dict[str, Any]:
 
     # Salva in SQLite
     if _storage is not None and user_input:
-        _storage.save_interaction(
-            thread_id=thread_id,
-            task_type=task_type,
-            behavior_mode=behavior_mode,
-            user_input=user_input,
-            agent_output=result or "",
-            provider=provider,
-            model=model,
-            latency_ms=latency_ms,
-            token_usage=token_usage,
-            qdrant_id=qdrant_id,
-            metadata={"iterations": state.get("iterations", 1)},
-        )
+        try:
+            _storage.save_interaction(
+                thread_id=thread_id,
+                task_type=task_type,
+                behavior_mode=behavior_mode,
+                user_input=user_input,
+                agent_output=result or "",
+                provider=provider,
+                model=model,
+                latency_ms=latency_ms,
+                token_usage=token_usage,
+                qdrant_id=qdrant_id,
+                metadata={"iterations": state.get("iterations", 1)},
+            )
+        except Exception as exc:
+            logger.warning("learner_node: salvataggio SQLite fallito thread=%s: %s", thread_id, exc)
 
     # ── Feedback al router Q-Learning ──────────────────────────────────────
     # Reward: usa final_reward dal reflection_node se disponibile,
@@ -1552,7 +1578,7 @@ async def learner_node(state: AgentState) -> dict[str, Any]:
                 profile_name, reward, new_q,
             )
         except Exception as exc:
-            logger.debug("learner_node: feedback Q-learning fallito: %s", exc)
+            logger.warning("learner_node: feedback Q-learning fallito thread=%s: %s", thread_id, exc)
 
     logger.info(
         "learner_node: thread=%s task=%s latency=%.0fms qdrant_id=%s",

@@ -35,7 +35,7 @@ stupefied-*/
 # con il loro proprio remote git: NON vanno tracciati nel repo Nexus.
 /projects/
 
-# Backup DB locali (pg_dump)
-backups/
+# Backup DB locali (pg_dump pesanti)
+backups/postgres/*.dump
 db/backups/
 

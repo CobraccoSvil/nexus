@@ -107,6 +107,8 @@ class AnthropicProvider(BaseProvider):
                 messages=[{"role": "user", "content": prompt}],
             )
             content = response.content[0].text if response.content else ""
+            cache_read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+            cache_created = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
             return ProviderResult(
                 provider=self.name,
                 model=model,
@@ -115,6 +117,8 @@ class AnthropicProvider(BaseProvider):
                     "usage": {
                         "input_tokens": response.usage.input_tokens,
                         "output_tokens": response.usage.output_tokens,
+                        "cache_read_input_tokens": cache_read,
+                        "cache_creation_input_tokens": cache_created,
                     },
                     "stop_reason": response.stop_reason,
                 },

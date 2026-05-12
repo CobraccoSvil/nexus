@@ -101,6 +101,7 @@ function createTerminalMessage(run: AgentRunInfo, pid: string, lastStreamingText
     role: "assistant",
     content,
     runId: run.runId,
+    automationMode: "agent" as const,
     provider: run.provider,
     model: run.model,
     promptTokens: run.usage?.totalPromptTokens,

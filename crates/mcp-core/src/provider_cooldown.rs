@@ -134,6 +134,10 @@ pub fn put_provider_in_long_cooldown(provider: &str, reason: &str) {
         let provider = provider.to_lowercase();
         let reason = reason.to_string();
         let mut conn = conn.clone();
+        tracing::info!(
+            "put_provider_in_long_cooldown: avvio persistenza Redis per '{}'",
+            provider,
+        );
         tokio::spawn(async move {
             let now_ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -149,13 +153,22 @@ pub fn put_provider_in_long_cooldown(provider: &str, reason: &str) {
                 .arg(PROVIDER_COOLDOWN_LONG_SECS + 60)
                 .query_async(&mut conn)
                 .await;
-            if let Err(e) = res {
-                tracing::warn!(
+            match &res {
+                Ok(()) => tracing::info!(
+                    "put_provider_in_long_cooldown: Redis SET ok per '{}' (chiave={})",
+                    provider, key,
+                ),
+                Err(e) => tracing::warn!(
                     "put_provider_in_long_cooldown: persistenza Redis fallita per '{}': {}",
-                    provider, e
-                );
+                    provider, e,
+                ),
             }
         });
+    } else {
+        tracing::warn!(
+            "put_provider_in_long_cooldown: REDIS_CLIENT non inizializzato, cooldown solo in-memory per '{}'",
+            provider,
+        );
     }
 }
 

@@ -705,6 +705,14 @@ async fn main() -> anyhow::Result<()> {
                 "/api/internal/learning/feedback",
                 post(internal_learning::submit_feedback),
             )
+            // /api/internal/provider-error — bridge cooldown: il brain Python
+            // notifica errori provider non osservati da Rust (es. catena
+            // classificatore). Applica cooldown appropriato (lungo per billing,
+            // breve per rate_limit/overloaded).
+            .route(
+                "/api/internal/provider-error",
+                post(internal_routing::provider_error_handler),
+            )
             .route(
                 "/api/internal/prompt-templates/batch-assign-tools",
                 post(prompt_templates::internal_batch_assign_tools_handler),

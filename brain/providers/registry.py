@@ -135,8 +135,8 @@ def _record_usage(provider: str, model: str, usage: dict[str, Any] | None, detai
     total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
 
     # Token cache Anthropic (o altri provider con struttura analoga)
-    cache_read_tokens = int(usage.get("cache_read_input_tokens", 0) or 0)
-    cache_creation_tokens = int(usage.get("cache_creation_input_tokens", 0) or 0)
+    cache_read_tokens = int(usage.get("cache_read_input_tokens", 0) or usage.get("cache_read_tokens", 0) or 0)
+    cache_creation_tokens = int(usage.get("cache_creation_input_tokens", 0) or usage.get("cache_created_tokens", 0) or usage.get("cache_creation_tokens", 0) or 0)
 
     in_cost_m, out_cost_m, cache_read_m, cache_creation_m, currency = _lookup_price_any_currency(provider, model)
     input_cost = (prompt_tokens / 1_000_000.0) * in_cost_m
@@ -205,6 +205,42 @@ def _record_usage(provider: str, model: str, usage: dict[str, Any] | None, detai
         )
     except Exception as e:
         logger.warning("billing ledger insert fallito %s/%s: %s", provider, model, e)
+
+
+def record_agent_turn_usage(
+    provider: str,
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+    iteration: int = 0,
+    run_id: str = "",
+) -> None:
+    """Registra l'usage di un turno dell'executor nel ledger.
+
+    Chiamata da ``executor_node`` in ``nodes.py`` dopo ogni turno agente,
+    poiche' il percorso ``generate_agent_turn`` non transita per
+    ``registry.generate`` e quindi ``_record_usage`` non viene invocata
+    automaticamente.
+    """
+    usage = {
+        "input_tokens": prompt_tokens,
+        "output_tokens": completion_tokens,
+        "cache_read_input_tokens": cache_read_tokens,
+        "cache_creation_input_tokens": cache_creation_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+    _record_usage(
+        provider,
+        model,
+        usage,
+        {
+            "feature": "agent.executor_turn",
+            "iteration": iteration,
+            "run_id": run_id,
+        },
+    )
 
 
 def _enforce_quota_estimate(provider: str, model: str, estimated_prompt_tokens: int, estimated_completion_tokens: int) -> tuple[bool, str]:
