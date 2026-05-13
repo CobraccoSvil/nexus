@@ -1634,7 +1634,8 @@ async fn spawn_agent_run(
             //   - provider in cooldown (lungo o breve, gia' marcato dal brain_agent_client)
             //   - error_class in {billing_error, rate_limit, provider_error}
             //   - il run e' fallito con stop_reason=error (anche senza classify, ritenta una volta)
-            let should_retry = matches!(result.status, AgentRunStatus::Failed) && {
+            //   - hollow_completion: il modello ha risposto senza usare tool (0 step)
+            let failed_retry = matches!(result.status, AgentRunStatus::Failed) && {
                 let in_cooldown = crate::provider_cooldown::is_provider_in_cooldown(&current_provider);
                 let retriable_class = matches!(
                     result.error_class.as_deref(),
@@ -1642,8 +1643,19 @@ async fn spawn_agent_run(
                 );
                 in_cooldown || retriable_class
             };
+            let hollow_retry = result.hollow_completion;
+            let should_retry = failed_retry || hollow_retry;
+
             if !should_retry || fallback_attempt + 1 >= MAX_PROVIDER_FALLBACKS {
                 break;
+            }
+
+            if hollow_retry {
+                tracing::warn!(
+                    "agent_run {}: hollow completion da {}/{} — il modello ha risposto \
+                     senza usare tool, ritento con un modello piu capace",
+                    run_id, current_provider, current_model
+                );
             }
 
             // Cerca il prossimo provider nella gerarchia, non già provato e non in cooldown
@@ -1651,7 +1663,7 @@ async fn spawn_agent_run(
                 !tried.contains(*p) && !crate::provider_cooldown::is_provider_in_cooldown(p)
             });
             let Some(next_provider) = next else {
-                tracing::warn!("agent_run {}: nessun provider alternativo disponibile, mantengo errore", run_id);
+                tracing::warn!("agent_run {}: nessun provider alternativo disponibile, mantengo risultato", run_id);
                 break;
             };
             current_provider = next_provider.clone();
@@ -1679,8 +1691,9 @@ async fn spawn_agent_run(
             };
             fallback_attempt += 1;
             tracing::warn!(
-                "agent_run {}: provider precedente in cooldown — fallback automatico a {}/{}",
-                run_id, current_provider, current_model
+                "agent_run {}: fallback automatico a {}/{} (motivo: {})",
+                run_id, current_provider, current_model,
+                if hollow_retry { "hollow completion" } else { "provider error/cooldown" }
             );
         }
         channels_clone.remove(&run_id);
