@@ -185,6 +185,11 @@ pub struct AgentRunResult {
     /// la colonna `nexus_task_type` in agent_runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nexus_task_type: Option<String>,
+    /// `true` se l'agente ha dichiarato di aver completato senza invocare
+    /// alcun tool nonostante avesse tool disponibili (0 step, iteration <= 1).
+    /// Tipico di modelli piccoli che "allucinano il completamento".
+    #[serde(default)]
+    pub hollow_completion: bool,
 }
 
 /// Evento di trace LLM: mostra i messaggi inviati al provider e la risposta ricevuta.

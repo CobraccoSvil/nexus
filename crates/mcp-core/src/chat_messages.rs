@@ -1695,8 +1695,30 @@ async fn spawn_agent_run(
             clear_session_preferred_provider_after_privacy(&db_clone, session_id_cp).await;
         }
 
+        // ── Hollow completion: il modello ha dichiarato di aver completato
+        // senza invocare alcun tool. Aggiungiamo un avviso per l'utente.
+        if result.hollow_completion {
+            tracing::warn!(
+                "agent_run {}: hollow completion rilevato — il modello {}/{} \
+                 non ha eseguito alcun tool. La risposta potrebbe essere incompleta.",
+                run_id, result.provider, result.model
+            );
+        }
+
         // Save final answer as assistant message
         if let Some(ref answer) = result.final_answer {
+            // Se hollow completion, annota la risposta con un avviso visibile
+            let effective_answer = if result.hollow_completion {
+                format!(
+                    "{answer}\n\n---\n*Avviso: l'agente ({}/{}) ha risposto senza \
+                     eseguire alcun tool (0 step). La risposta potrebbe essere \
+                     incompleta o generica. Riprova con un modello piu' capace \
+                     o riformula la richiesta.*",
+                    result.provider, result.model
+                )
+            } else {
+                answer.clone()
+            };
             let meta = json!({
                 "provider": &result.provider,
                 "model": &result.model,
@@ -1704,6 +1726,7 @@ async fn spawn_agent_run(
                 "iterationCount": result.iteration_count,
                 "automationMode": "agent",
                 "privacyRerouted": privacy_rerouted,
+                "hollowCompletion": result.hollow_completion,
             });
             let _ = sqlx::query(
                 r#"INSERT INTO chat_messages
@@ -1712,7 +1735,7 @@ async fn spawn_agent_run(
             )
             .bind(session_id_cp)
             .bind(project_id_cp)
-            .bind(answer)
+            .bind(&effective_answer)
             .bind(meta)
             .bind(user_message_id)
             .execute(&db_clone)
@@ -1724,7 +1747,7 @@ async fn spawn_agent_run(
                 session_id_cp,
                 Uuid::new_v4(),
                 "assistant".to_string(),
-                answer.clone(),
+                effective_answer.clone(),
             );
         }
 

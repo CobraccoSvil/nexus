@@ -642,6 +642,32 @@ pub async fn run_via_brain(
         AgentRunStatus::Completed
     };
 
+    // ── Hollow completion detection ─────────────────────────────────────────
+    // Se il task aveva tool disponibili, l'agente non ne ha usato nessuno, e
+    // la risposta e' sospettosamente breve/generica, il modello ha "allucinato
+    // il completamento" (tipico di modelli piccoli). Loggiamo un warning e
+    // annotiamo il risultato per il caller.
+    let had_tools = tools_json
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    let hollow_completion = status == AgentRunStatus::Completed
+        && had_tools
+        && steps.is_empty()
+        && iteration <= 1;
+    if hollow_completion {
+        tracing::warn!(
+            "agent_run {}: HOLLOW COMPLETION — il modello {}/{} ha dichiarato \
+             di aver completato senza invocare alcun tool (0 step, iteration={}). \
+             Risposta: {:?}",
+            run_id_str,
+            provider,
+            model,
+            iteration,
+            final_answer.chars().take(120).collect::<String>(),
+        );
+    }
+
     // Evento finale sul broadcast.
     let _ = step_tx.send(AgentStepEvent {
         run_id: run_id_str.clone(),
@@ -690,6 +716,7 @@ pub async fn run_via_brain(
         total_cost: acc_total_cost,
         error_class: last_error_class,
         stop_reason: last_stop_reason,
+        hollow_completion,
     }
 }
 
@@ -814,6 +841,7 @@ fn fail_result(
         total_cost: 0.0,
         error_class: None,
         stop_reason: Some("error".to_string()),
+        hollow_completion: false,
     }
 }
 
