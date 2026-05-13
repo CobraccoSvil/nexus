@@ -28,6 +28,11 @@ pub struct ComponentHealth {
     /// Embedder (gRPC al brain Python): se giù, nessuna vettorializzazione.
     #[serde(default)]
     pub embedder: bool,
+    /// Brain REST (porta 8001): se giù, gli agent run non possono partire.
+    /// `neural_core` verifica solo gRPC 50051; questo campo verifica il server
+    /// HTTP che serve `/agent/run/stream`.
+    #[serde(default)]
+    pub brain_rest: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -91,8 +91,10 @@ export interface HealthResponse {
     database: boolean;
     redis: boolean;
     neural_core: boolean;
-    /** gRPC ToolRunner :50071 — se false, l'AI non può eseguire tool MCP */
+    /** gRPC ToolRunner :50071 — se false, l'AI non puo' eseguire tool MCP */
     tools_grpc?: boolean;
+    /** Brain REST :8001 — se false, gli agent run non funzioneranno */
+    brain_rest?: boolean;
   };
 }
 

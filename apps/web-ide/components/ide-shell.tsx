@@ -405,8 +405,8 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   // Polling client-side dello health: il prop `dashboard` è uno snapshot SSR
   // e non si aggiorna mai. Senza questo, i LED DB/Redis/Brain restano congelati
   // sullo stato del primo render della pagina /ide.
-  const [liveHealth, setLiveHealth] = useState<{ database: boolean; redis: boolean; neural_core: boolean; tools_grpc?: boolean }>(
-    dashboard.health ?? { database: false, redis: false, neural_core: false, tools_grpc: false }
+  const [liveHealth, setLiveHealth] = useState<{ database: boolean; redis: boolean; neural_core: boolean; tools_grpc?: boolean; brain_rest?: boolean }>(
+    dashboard.health ?? { database: false, redis: false, neural_core: false, tools_grpc: false, brain_rest: false }
   );
   useEffect(() => {
     let cancelled = false;
@@ -415,7 +415,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
         const h = await getHealth();
         if (!cancelled) setLiveHealth(h.components);
       } catch {
-        if (!cancelled) setLiveHealth({ database: false, redis: false, neural_core: false, tools_grpc: false });
+        if (!cancelled) setLiveHealth({ database: false, redis: false, neural_core: false, tools_grpc: false, brain_rest: false });
       }
     };
     refresh();
@@ -2197,8 +2197,16 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
             <StatusDot ok={liveHealth.redis} />
             Redis
           </span>
-          <span title={liveHealth.neural_core ? "Brain (Python LangGraph) online" : "Brain offline — la chat non potrà rispondere"} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-            <StatusDot ok={liveHealth.neural_core} />
+          <span title={
+            liveHealth.neural_core && liveHealth.brain_rest
+              ? "Brain (Python LangGraph) online — gRPC + REST ok"
+              : !liveHealth.neural_core && !liveHealth.brain_rest
+                ? "Brain offline — gRPC e REST irraggiungibili"
+                : !liveHealth.brain_rest
+                  ? "Brain REST (:8001) offline — gli agent run non funzioneranno"
+                  : "Brain gRPC (:50051) offline — la chat potrebbe non rispondere"
+          } style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+            <StatusDot ok={liveHealth.neural_core && !!liveHealth.brain_rest} />
             Brain
           </span>
           <span title={liveHealth.tools_grpc ? "MCP Tools (gRPC :50071) online" : "MCP Tools offline — l'AI non potrà eseguire tool (read_file, str_replace, ecc.)"} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
@@ -2244,6 +2252,36 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           }}
         >
           {projectError}
+        </div>
+      )}
+
+      {/* Banner Brain offline — visibile e prominente */}
+      {(!liveHealth.neural_core || !liveHealth.brain_rest) && (
+        <div
+          style={{
+            position: "fixed",
+            top: 38,
+            left: "50%",
+            transform: "translateX(-50%)",
+            padding: "8px 20px",
+            borderRadius: 8,
+            background: "#dc2626",
+            color: "#fff",
+            fontSize: 13,
+            fontWeight: 600,
+            zIndex: 9999,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            boxShadow: "0 4px 12px rgba(220,38,38,0.4)",
+          }}
+        >
+          <span style={{ fontSize: 16 }}>!</span>
+          {!liveHealth.neural_core && !liveHealth.brain_rest
+            ? "Brain offline — la chat e gli agent run non funzioneranno"
+            : !liveHealth.brain_rest
+              ? "Brain REST offline — gli agent run non funzioneranno"
+              : "Brain gRPC offline — la chat potrebbe non rispondere"}
         </div>
       )}
     </main>

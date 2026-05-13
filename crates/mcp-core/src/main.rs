@@ -2146,7 +2146,21 @@ async fn health(State(state): State<AppState>) -> Json<HealthSummary> {
         .unwrap_or(false)
     };
 
-    let status = if db_ok && redis_ok && tools_grpc_ok { "ok" } else { "degraded" };
+    // Verifica TCP connect rapido al Brain REST (porta 8001): gli agent run
+    // usano POST /agent/run/stream su questa porta. neural_core (gRPC 50051)
+    // può essere online mentre il server REST è giù.
+    let brain_rest_ok = {
+        let addr = std::env::var("BRAIN_REST_ADDR").unwrap_or_else(|_| "127.0.0.1:8001".into());
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+    };
+
+    let status = if db_ok && redis_ok && tools_grpc_ok && brain_rest_ok { "ok" } else { "degraded" };
 
     Json(HealthSummary {
         service: "mcp-core".to_string(),
@@ -2161,6 +2175,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthSummary> {
             tools_grpc: tools_grpc_ok,
             qdrant: state.dependency_status.qdrant.load(std::sync::atomic::Ordering::Relaxed),
             embedder: state.dependency_status.embedder.load(std::sync::atomic::Ordering::Relaxed),
+            brain_rest: brain_rest_ok,
         },
     })
 }
