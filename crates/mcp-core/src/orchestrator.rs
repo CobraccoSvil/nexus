@@ -2802,15 +2802,20 @@ pub fn default_model_for_provider(
 }
 
 fn completion_has_error(completion: &Value) -> bool {
-    if completion
+    // metadata.error presente e non-null → errore
+    if let Some(err) = completion
         .get("metadata")
         .and_then(|metadata| metadata.get("error"))
-        .is_some()
     {
-        return true;
+        if !err.is_null() {
+            return true;
+        }
     }
-    if completion.get("error").is_some() {
-        return true;
+    // campo error a root presente e non-null → errore
+    if let Some(err) = completion.get("error") {
+        if !err.is_null() {
+            return true;
+        }
     }
     completion
         .get("content")
