@@ -877,8 +877,12 @@ pub(crate) async fn load_project_context(
         }
     }
 
-    assert_allowed_workspace(db, &root_path).await?;
-    assert_allowed_workspace(db, &repository_root_path).await?;
+    // Fix M20: la verifica root e' un constraint di CREATE (register/clone), non di LOAD.
+    // Se il record esiste in DB significa che a suo tempo e' passato dalla verifica.
+    // Bloccare LOAD/DELETE per progetti registrati prima di un cambio di
+    // `projects_base_root` (es. Fix M5) rende impossibile la cancellazione legittima
+    // dei progetti pre-esistenti dalla UI di Nexus. Le scritture sul filesystem
+    // restano protette dai path_within sulla project root, non dalla root globale.
 
     let details = UserProjectDetails {
         id: row.get::<Uuid, _>("id").to_string(),
