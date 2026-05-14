@@ -705,12 +705,40 @@ pub async fn run_via_brain(
         pending_actions: Vec::new(),
         final_answer: if final_answer.is_empty() {
             last_error.as_ref().map(|e| {
-                format!(
-                    "Si e' verificato un errore durante l'elaborazione della richiesta. \
-                     Riprova tra qualche secondo oppure cambia modello.\n\n\
-                     *Dettaglio tecnico: {}*",
-                    sanitize_error_for_user(e)
-                )
+                // Fix M23: distingue le due cause piu comuni di interruzione SSE
+                // dal brain Python (chunk decode error, silenzio prolungato) dal
+                // generico errore di elaborazione, dando indicazioni utili.
+                // Lo stato del progetto e gli step gia eseguiti sono persistiti
+                // su disco/DB: l'utente puo riprendere senza perdere il lavoro.
+                let lower = e.to_ascii_lowercase();
+                if lower.starts_with("sse chunk:")
+                    || lower.contains("error decoding response body")
+                    || lower.contains("connection reset")
+                    || lower.contains("connection closed")
+                {
+                    format!(
+                        "Il flusso dal brain si e' interrotto prima del completamento. \
+                         Gli step gia eseguiti e i file generati sono salvati. \
+                         Premi Invio (o scrivi \"continua\") per riprendere da dove eri.\n\n\
+                         *Dettaglio tecnico: {}*",
+                        sanitize_error_for_user(e)
+                    )
+                } else if lower.contains("silenzioso") || lower.contains("timeout") {
+                    format!(
+                        "Il brain non ha risposto entro il timeout configurato. \
+                         Verifica che sia attivo (`curl http://localhost:8001/health`) \
+                         e premi Invio per riprendere.\n\n\
+                         *Dettaglio tecnico: {}*",
+                        sanitize_error_for_user(e)
+                    )
+                } else {
+                    format!(
+                        "Si e' verificato un errore durante l'elaborazione della richiesta. \
+                         Riprova tra qualche secondo oppure cambia modello.\n\n\
+                         *Dettaglio tecnico: {}*",
+                        sanitize_error_for_user(e)
+                    )
+                }
             })
         } else {
             // Se ci sono stati tool_use, salva solo l'ultimo segmento di testo
