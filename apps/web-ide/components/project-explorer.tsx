@@ -3,6 +3,7 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { getProjectTree, type UserProjectDetails, type WorkspaceTreeNode } from "../lib/api-client";
 import { useThemeColors } from "../lib/theme";
+import { shortenAbsolutePath } from "../lib/format";
 
 type TreeMap = Record<string, WorkspaceTreeNode[]>;
 
@@ -110,8 +111,13 @@ export function ProjectExplorer({
   return (
     <div style={{ fontSize: 13 }}>
       {project?.rootPath && (
-        <div style={{ color: tc.textMuted, marginBottom: 10, wordBreak: "break-all" }}>
-          {project.rootPath}
+        <div
+          style={{ color: tc.textMuted, marginBottom: 10, wordBreak: "break-all" }}
+          title={project.rootPath}
+        >
+          {/* Fix M8: mostra path accorciato (es. ~/projects/myslug) invece di
+             leakare /home/administrator/ideai/projects/... — full path nel title */}
+          {shortenAbsolutePath(project.rootPath, project.rootPath)}
         </div>
       )}
       {(nodesByPath[""]?.length ?? 0) === 0 ? (

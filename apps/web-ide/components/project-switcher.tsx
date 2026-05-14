@@ -10,6 +10,7 @@ import {
   type UserProjectSummary,
 } from "../lib/api-client";
 import { useThemeColors } from "../lib/theme";
+import { shortenAbsolutePath } from "../lib/format";
 import { ProjectImportWizard } from "./project-import-wizard";
 
 function iconButtonStyle(
@@ -557,8 +558,12 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
             {ds.phase === "dirty" && (
               <div style={{ fontSize: 13, color: tc.textSecondary, lineHeight: 1.5 }}>
                 Ci sono <strong>{ds.dirtyCount} file non committati</strong> in{" "}
-                <code style={{ fontSize: 11, background: tc.bgInput, padding: "1px 4px", borderRadius: 4 }}>
-                  {ds.rootPath}
+                <code
+                  style={{ fontSize: 11, background: tc.bgInput, padding: "1px 4px", borderRadius: 4 }}
+                  title={ds.rootPath}
+                >
+                  {/* Fix M8: path accorciato (full path nel tooltip) */}
+                  {shortenAbsolutePath(ds.rootPath)}
                 </code>
                 .<br /><br />
                 Vuoi procedere ugualmente? Le modifiche andranno <strong>perse definitivamente</strong>.
