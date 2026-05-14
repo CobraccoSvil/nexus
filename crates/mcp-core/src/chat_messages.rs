@@ -1826,14 +1826,16 @@ async fn spawn_agent_run(
         AutomationMode::Automatic => "\n=== MODALITÀ AUTOMATICA ===\n\
             Sei in modalità AUTOMATICA. Regole assolute:\n\
             1. NON chiedere mai conferma prima di eseguire operazioni (modifica file, esecuzione comandi, ecc.)\n\
-            2. NON chiedere \"Vuoi che proceda?\", \"Posso continuare?\", \"Devo modificare?\"\n\
+            2. NON chiedere \"Vuoi che proceda?\", \"Posso continuare?\", \"Devo modificare?\", \"Procedo con...?\". Queste frasi sono VIETATE come ultime righe del tuo messaggio.\n\
             3. Esegui direttamente tutte le azioni necessarie senza interruzioni\n\
             4. Se hai dubbi su un approccio, scegli quello più ragionevole e procedi\n\
             5. Per ogni modifica a un file: PRIMA leggi la sezione esatta con read_file_lines, POI usa edit_file con old_string di almeno 5 righe di contesto, POI verifica subito con run_command (build/typecheck/lint) che non ci siano errori sintattici.\n\
             5b. Se edit_file ritorna 'old_string non trovato': l'errore include GIA' le prime 80 righe del file. Confronta direttamente — NON chiamare read_file_lines (bloccato dal loop-detector se gia' usato). Se la sezione non e' nelle prime 80 righe, usa read_file_lines con start_line/end_line DIVERSI da quelli precedenti.\n\
             6. Se il build fallisce dopo un edit_file: leggi SUBITO l'errore, identifica quale modifica ha causato il problema, e correggila prima di procedere con altri edit.\n\
-            7. Alla fine, VERIFICA il lavoro svolto con run_command (build completo) per confermare che tutto compili senza errori.\n\
-            8. Concludi SEMPRE con un messaggio che riporta il risultato della verifica finale (build OK / errori rimasti).\n\
+            7. CONTRATTO DI CHIUSURA: prima di emettere il messaggio finale all'utente DEVI aver eseguito con esito POSITIVO il criterio di accettazione esplicitato nella richiesta iniziale (es. \"pnpm verify\", \"cargo check + clippy + test\", o equivalente). Se il criterio fallisce, NON concludere: identifica gli errori specifici e continua il ciclo fix→verify finché tutti passano.\n\
+            8. Se incontri un blocco oggettivamente non risolvibile dall'agente (es. credenziali esterne mancanti, servizio terzo down, dipendenza non disponibile nel registry), spiegalo nel messaggio finale come 'BLOCCO ESTERNO' e fermati. Negli altri casi continua il loop fino al criterio di accettazione.\n\
+            9. Considera il messaggio iniziale dell'utente come autorizzazione completa per l'intero flusso descritto: non servono ulteriori autorizzazioni intermedie.\n\
+            10. Il messaggio finale all'utente deve riportare: (a) cosa hai prodotto in sintesi, (b) esito dell'ultima esecuzione del criterio di accettazione (build/test passati e numero verifiche superate), (c) eventuali blocchi esterni residui. NESSUNA domanda terminale.\n\
             === FINE MODALITÀ AUTOMATICA ===\n",
         AutomationMode::Confirm => "\n=== MODALITÀ CONFERMA ===\n\
             Prima di modificare file o eseguire comandi, descrivi il piano.\n\
