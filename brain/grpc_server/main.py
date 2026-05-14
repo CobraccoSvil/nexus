@@ -1244,6 +1244,7 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
         acc_total_tokens = 0
         acc_total_cost = 0.0
         end_turn_emitted = False
+        done_emitted = False
         # Metadata routing (B5): catturati dal nodo router per propagare a Rust
         nexus_task_type: str | None = None
         nexus_agent_type: str | None = None
@@ -1268,7 +1269,14 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                 except StopAsyncIteration:
                     break
                 # event = {"<node_name>": <delta_dict>}
+                # Flag per rilevare se questo evento e' il `learner_node`
+                # (terminale del graph). In tal caso, dopo aver processato
+                # tutti i delta emettiamo immediatamente `done` invece di
+                # affidarci a StopAsyncIteration che a volte tarda.
+                _learner_seen = False
                 for node, delta in event.items():
+                    if node == "learner":
+                        _learner_seen = True
                     if not isinstance(delta, dict):
                         continue
                     if node == "router":
@@ -1340,6 +1348,28 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                                         })
                                         + "\n\n"
                                     )
+                # Se questo era l'evento del learner_node (ultimo del graph),
+                # emettiamo subito `end_turn` (se non gia' emesso) e `done`.
+                # Risolve il caso in cui astream() non emette StopAsyncIteration
+                # tempestivamente dopo aver consumato l'ultimo nodo del graph.
+                if _learner_seen:
+                    if not end_turn_emitted and acc_total_tokens > 0:
+                        end_turn_emitted = True
+                        _final_payload = {
+                            "type": "end_turn",
+                            "prompt_tokens": acc_prompt_tokens,
+                            "completion_tokens": acc_completion_tokens,
+                            "total_tokens": acc_total_tokens,
+                            "total_cost": acc_total_cost,
+                        }
+                        if nexus_task_type:
+                            _final_payload["nexus_task_type"] = nexus_task_type
+                        if nexus_agent_type:
+                            _final_payload["nexus_agent_type"] = nexus_agent_type
+                        yield "data: " + _json.dumps(_final_payload) + "\n\n"
+                    yield 'data: {"type":"done"}\n\n'
+                    done_emitted = True
+                    break
         except Exception as exc:
             import traceback as _tb
             logger.error("agent_run_stream error: %s\n%s", exc, _tb.format_exc())
@@ -1376,6 +1406,13 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                 })
                 + "\n\n"
             )
+
+        # Segnale terminale esplicito: mcp-core lo intercetta e chiude lo
+        # stream immediatamente invece di attendere il timeout di silenzio
+        # SSE (120s). Emesso solo se non gia' inviato in-loop quando il
+        # learner_node ha prodotto evento (caso flusso normale piu' rapido).
+        if not done_emitted:
+            yield 'data: {"type":"done"}\n\n'
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 

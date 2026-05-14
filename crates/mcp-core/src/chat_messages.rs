@@ -689,6 +689,261 @@ async fn build_recent_conversation_context(
     }
 }
 
+/// Arricchisce il messaggio da classificare con un piccolo contesto dei
+/// turni precedenti. Risolve il problema "messaggio troppo generico" per
+/// follow-up contestuali come "riepiloga animali", "applica tutte le ultime",
+/// "continua", "riprendi", che da soli sono ambigui ma in contesto chiari.
+///
+/// Strategia: prependiamo gli ultimi 2 turni (max 4 messaggi) in formato
+/// compatto, poi delimitiamo chiaramente il messaggio da classificare.
+/// Limite totale 800 char per non saturare il classifier.
+async fn build_message_with_recent_context_for_classifier(
+    db: &PgPool,
+    session_id: Uuid,
+    current_message: &str,
+) -> String {
+    let msgs = build_recent_conversation_history(db, session_id, 4).await;
+    if msgs.is_empty() {
+        return current_message.to_string();
+    }
+    let mut ctx_parts: Vec<String> = Vec::new();
+    for m in &msgs {
+        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+        let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let compact = content
+            .replace('\n', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let clipped: String = if compact.chars().count() > 140 {
+            format!("{}...", compact.chars().take(140).collect::<String>())
+        } else {
+            compact
+        };
+        if !clipped.is_empty() {
+            ctx_parts.push(format!("{}: {}", role, clipped));
+        }
+    }
+    if ctx_parts.is_empty() {
+        return current_message.to_string();
+    }
+    let mut ctx = ctx_parts.join("\n");
+    if ctx.len() > 600 {
+        ctx.truncate(600);
+        ctx.push_str("...");
+    }
+    format!(
+        "[Cronologia recente della conversazione]\n{}\n\n[Messaggio attuale da classificare]\n{}",
+        ctx, current_message
+    )
+}
+
+/// Tipo di query meta auto-referenziale rilevato. Determina quale
+/// messaggio precedente significativo va citato nell'hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelfRefIntent {
+    /// Riferito al messaggio piu' recente (precedente alla query stessa).
+    Last,
+    /// Riferito al primo messaggio significativo della sessione.
+    First,
+}
+
+/// Rileva se il messaggio utente e' una domanda meta auto-referenziale
+/// e ritorna il tipo (Last/First). Esempi:
+/// - "qual era l'ultima richiesta?", "ripeti l'ultimo", "e l'ultima" → Last
+/// - "qual era la prima richiesta?", "e la prima" → First
+///
+/// In questi casi il LLM deve sapere che il messaggio corrente NON conta
+/// come "ultima/prima richiesta" e va riferito al precedente messaggio
+/// significativo nella cronologia.
+fn detect_self_referential_intent(message: &str) -> Option<SelfRefIntent> {
+    let m = message.trim().to_lowercase();
+    if m.is_empty() {
+        return None;
+    }
+
+    // Token "richiesta-target": il messaggio sembra parlare DI un'altra
+    // richiesta (vs. essere una richiesta concreta). Sia "richiesta" che
+    // "domanda" che "messaggio" qualificano.
+    let target_tokens = [
+        "richiesta",
+        "domanda",
+        "messaggio",
+        "cosa ho chiesto",
+        "cosa ti ho chiesto",
+        "cosa avevo chiesto",
+        "cosa ti avevo chiesto",
+    ];
+    let has_target = target_tokens.iter().any(|t| m.contains(t));
+
+    // Token "precedente": frasi che esprimono precedenza temporale.
+    let prev_tokens = [
+        "ripeti",
+        "precedente",
+        "prima di",
+        "appena chiesto",
+        "appena fatto",
+    ];
+    let has_prev = prev_tokens.iter().any(|t| m.contains(t));
+
+    // Match per "First": qualunque combinazione di "prima" o "iniziale"
+    // con target o riferimento alla chat.
+    let first_phrases = [
+        "prima richiesta",
+        "prima domanda",
+        "primo messaggio",
+        "prima cosa",
+        "all'inizio",
+        "all'avvio",
+        "iniziale",
+        "inizio della chat",
+        "inizio conversazione",
+        "inizio della conversazione",
+    ];
+    if first_phrases.iter().any(|p| m.contains(p)) {
+        return Some(SelfRefIntent::First);
+    }
+    // Forme abbreviate tipo "e la prima", "qual era la prima"
+    if (m.contains("la prima") || m.starts_with("prima ") || m == "la prima" || m == "prima")
+        && (has_target || m.len() < 30)
+    {
+        return Some(SelfRefIntent::First);
+    }
+
+    // Match per "Last": pattern espliciti
+    let last_phrases = [
+        "ultima richiesta",
+        "ultima domanda",
+        "ultimo messaggio",
+        "ultima cosa",
+        "qual era la richiesta",
+        "qual era la domanda",
+        "ripeti l'ultim",
+        "ripeti ultim",
+        "ripeti la richiesta",
+        "ripeti la domanda",
+    ];
+    if last_phrases.iter().any(|p| m.contains(p)) {
+        return Some(SelfRefIntent::Last);
+    }
+    // Forme abbreviate tipo "e l'ultima", "l'ultima", "qual era l'ultima"
+    if m.contains("l'ultima")
+        || m.contains("l ultima")
+        || (m == "ultima" || m.starts_with("ultima "))
+    {
+        return Some(SelfRefIntent::Last);
+    }
+    // "richiesta/domanda/messaggio precedente"
+    if has_target && has_prev {
+        return Some(SelfRefIntent::Last);
+    }
+
+    None
+}
+
+/// Backward-compatible wrapper: ritorna true se il messaggio e' una qualsiasi
+/// variante di query meta auto-referenziale.
+fn detect_self_referential_query(message: &str) -> bool {
+    detect_self_referential_intent(message).is_some()
+}
+
+/// Cerca un messaggio utente significativo nella sessione, scartando saluti,
+/// conferme brevi e meta-domande auto-referenziali. La direzione di scansione
+/// dipende dall'intent:
+/// - `Last`: dal piu' recente al piu' vecchio (precedente alla query corrente)
+/// - `First`: dal piu' vecchio al piu' recente (primo messaggio della chat)
+async fn find_target_user_message(
+    db: &PgPool,
+    session_id: Uuid,
+    intent: SelfRefIntent,
+) -> Option<String> {
+    let order = match intent {
+        SelfRefIntent::Last => "DESC",
+        SelfRefIntent::First => "ASC",
+    };
+    let query = format!(
+        r#"
+        SELECT content FROM chat_messages
+        WHERE session_id = $1 AND deleted_at IS NULL AND role = 'user'
+        ORDER BY created_at {order}
+        LIMIT 20
+        "#,
+        order = order,
+    );
+    let rows = sqlx::query(&query)
+        .bind(session_id)
+        .fetch_all(db)
+        .await
+        .ok()?;
+
+    let trivial_patterns: &[&str] = &["ok", "si", "sì", "no", "grazie", "ciao", "ok grazie"];
+    for row in rows.iter() {
+        let content: String = row.try_get("content").ok()?;
+        let trimmed = content.trim();
+        let lower = trimmed.to_lowercase();
+        if trimmed.is_empty() || trimmed.len() < 5 {
+            continue;
+        }
+        if trivial_patterns.iter().any(|p| lower == *p) {
+            continue;
+        }
+        if detect_self_referential_query(trimmed) {
+            continue;
+        }
+        let compact = trimmed
+            .replace('\n', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if compact.chars().count() > 120 {
+            return Some(format!("{}...", compact.chars().take(120).collect::<String>()));
+        }
+        return Some(compact);
+    }
+    None
+}
+
+/// Costruisce l'istruzione contestuale "precedente significativo" con un
+/// few-shot example *reale* tratto dalla cronologia attuale. Differenzia
+/// tra richiesta "Last" (precedente) e "First" (prima della chat). Se la
+/// cronologia non contiene messaggi significativi (o non c'e' match),
+/// ritorna `None`: il prompt non subisce iniezione spuria.
+async fn build_self_referential_hint(
+    db: &PgPool,
+    session_id: Uuid,
+    current_message: &str,
+) -> Option<String> {
+    let intent = detect_self_referential_intent(current_message)?;
+    let target = find_target_user_message(db, session_id, intent).await;
+    let (label_role, label_example) = match intent {
+        SelfRefIntent::Last => ("precedente", "La tua precedente richiesta era"),
+        SelfRefIntent::First => ("prima", "La tua prima richiesta in questa chat e' stata"),
+    };
+    let core_rule = format!(
+        "Istruzione contestuale: l'utente sta chiedendo informazioni sulla sua \
+         richiesta {label_role}. Il messaggio attuale e' la domanda meta — \
+         NON considerarlo come 'ultima/prima richiesta'. Riferisciti al \
+         corretto messaggio utente significativo nella cronologia (saltando \
+         saluti, conferme brevi tipo 'ok'/'si'/'no'/'grazie' e altre \
+         meta-domande auto-referenziali ricorsive)."
+    );
+    let current_short: String = current_message
+        .replace('\n', " ")
+        .chars()
+        .take(80)
+        .collect();
+    match target {
+        Some(example) => Some(format!(
+            "\n\n{core_rule}\n\nEsempio tratto da questa conversazione: \
+             il messaggio utente da citare e' \"{example}\". \
+             Per una domanda come '{current_short}' la risposta corretta inizia con: \
+             \"{label_example}: ...\" citando quel testo, NON il messaggio \
+             attuale.",
+        )),
+        None => Some(format!("\n\n{core_rule}")),
+    }
+}
+
 /// Salva l'embedding di un turno conversazionale in Qdrant (fire-and-forget).
 fn spawn_embed_conversation_turn(
     neural: crate::orchestrator::NeuralCoreClient,
@@ -709,9 +964,15 @@ fn spawn_embed_conversation_turn(
             content.clone()
         };
         let vector = match neural.embed_text("", &embed_input).await {
-            Ok(v) => v,
+            Ok(v) => {
+                tracing::info!(
+                    "conversation_embed: OK dim={} session={} role={} msg_id={}",
+                    v.len(), session_id, role, message_id
+                );
+                v
+            }
             Err(e) => {
-                tracing::debug!("conversation embed fallito (non bloccante): {e}");
+                tracing::warn!("conversation_embed: FALLITO session={} role={} msg_id={}: {e}", session_id, role, message_id);
                 return;
             }
         };
@@ -720,7 +981,9 @@ fn spawn_embed_conversation_turn(
         if let Err(e) = vector_memory::upsert_conversation_turn(
             &db, &point_id, &vector, session_id, &role, &content, &now,
         ).await {
-            tracing::debug!("conversation turn upsert fallito (non bloccante): {e}");
+            tracing::warn!("conversation_upsert: FALLITO point={} session={}: {e}", point_id, session_id);
+        } else {
+            tracing::info!("conversation_upsert: OK point={} session={}", point_id, session_id);
         }
     });
 }
@@ -737,33 +1000,74 @@ async fn build_vectorized_conversation_history(
     recent_count: i64,
     semantic_top_k: u64,
 ) -> Vec<serde_json::Value> {
+    const RAW_FALLBACK: i64 = 8;
+
     let recent = build_recent_conversation_history(db, session_id, recent_count).await;
 
-    let embed_input = if current_message.len() > 1000 {
-        &current_message[..1000]
-    } else {
-        current_message
-    };
-    let vector = match neural.embed_text("", embed_input).await {
-        Ok(v) => v,
+    // Costruzione dell'input di embedding: includiamo l'ULTIMA iterazione
+    // (user+assistant) prima del messaggio corrente. Questo aggancia la
+    // ricerca semantica al tema della conversazione, non solo al testo letterale
+    // del turno corrente. Esempio: "si elenca" da solo matcha qualsiasi "elenca
+    // X" passato; con il turno precedente ("quanti utenti / 4 utenti") il
+    // vettore si concentra sul tema utenti.
+    let mut embed_input = String::new();
+    if let Some(last_turn) = recent.iter().rev().take(2).collect::<Vec<_>>().iter().rev().fold(
+        Some(String::new()),
+        |acc, msg| {
+            let mut s = acc?;
+            let role = msg.get("role")?.as_str()?;
+            let content = msg.get("content")?.as_str()?;
+            if !s.is_empty() { s.push('\n'); }
+            s.push_str(role);
+            s.push_str(": ");
+            s.push_str(content);
+            Some(s)
+        },
+    ) {
+        if !last_turn.is_empty() {
+            embed_input.push_str(&last_turn);
+            embed_input.push('\n');
+        }
+    }
+    embed_input.push_str("user: ");
+    embed_input.push_str(current_message);
+    if embed_input.len() > 1500 {
+        embed_input.truncate(1500);
+    }
+    let vector = match neural.embed_text("", &embed_input).await {
+        Ok(v) => {
+            tracing::warn!(
+                "vectorized history: embed OK (con ultimo turno), dim={}, session={}, input_len={}",
+                v.len(), session_id, embed_input.len()
+            );
+            v
+        }
         Err(e) => {
-            tracing::debug!("vectorized history: embedding fallito, uso solo recenti: {e}");
-            return recent;
+            tracing::warn!("vectorized history: embedding fallito, fallback a {RAW_FALLBACK} raw: {e}");
+            return build_recent_conversation_history(db, session_id, RAW_FALLBACK).await;
         }
     };
 
     let semantic_hits = match vector_memory::search_conversation_context(
-        db, &vector, session_id, semantic_top_k, 0.65,
+        db, &vector, session_id, semantic_top_k, 0.40,
     ).await {
-        Ok(hits) => hits,
+        Ok(hits) => {
+            let scores: Vec<f64> = hits.iter().map(|h| h.score).collect();
+            tracing::warn!(
+                "vectorized history: ricerca Qdrant OK, {} hit(s) per session={}, scores={:?}",
+                hits.len(), session_id, scores
+            );
+            hits
+        }
         Err(e) => {
-            tracing::debug!("vectorized history: ricerca Qdrant fallita, uso solo recenti: {e}");
-            return recent;
+            tracing::warn!("vectorized history: ricerca Qdrant fallita, fallback a {RAW_FALLBACK} raw: {e}");
+            return build_recent_conversation_history(db, session_id, RAW_FALLBACK).await;
         }
     };
 
     if semantic_hits.is_empty() {
-        return recent;
+        tracing::warn!("vectorized history: 0 hit semantici per session={}, fallback a {RAW_FALLBACK} raw", session_id);
+        return build_recent_conversation_history(db, session_id, RAW_FALLBACK).await;
     }
 
     // Raccogli i contenuti recenti per deduplicazione
@@ -771,8 +1075,27 @@ async fn build_vectorized_conversation_history(
         .filter_map(|m| m.get("content").and_then(|v| v.as_str()).map(String::from))
         .collect();
 
-    // Converti hit semantici in messaggi, escludendo duplicati
-    let mut semantic_msgs: Vec<(String, serde_json::Value)> = Vec::new();
+    // Il timestamp del piu' vecchio dei recenti: tutto cio' che e' >= a questo
+    // e' gia' coperto dai raw, quindi va escluso dai semantici per evitare
+    // doppioni e per preservare l'ordine cronologico finale.
+    let oldest_recent_ts: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+        r#"
+        SELECT created_at FROM chat_messages
+        WHERE session_id = $1 AND deleted_at IS NULL AND role IN ('user','assistant')
+        ORDER BY created_at DESC
+        OFFSET $2 LIMIT 1
+        "#,
+    )
+    .bind(session_id)
+    .bind((recent_count - 1).max(0))
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+
+    // Converti hit semantici in messaggi, escludendo duplicati e quelli che
+    // cadono nella finestra "recente" (gia' coperti dai raw).
+    let mut semantic_msgs: Vec<(String, f64, serde_json::Value)> = Vec::new();
     for hit in &semantic_hits {
         let role = hit.payload.get("role").and_then(|v| v.as_str()).unwrap_or("user");
         let content = hit.payload.get("content").and_then(|v| v.as_str()).unwrap_or("");
@@ -780,22 +1103,43 @@ async fn build_vectorized_conversation_history(
         if content.is_empty() || recent_contents.contains(content) {
             continue;
         }
+        // Filtra messaggi semantici che ricadono nella finestra recente
+        if let Some(min_recent) = oldest_recent_ts {
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(created_at) {
+                if ts.with_timezone(&chrono::Utc) >= min_recent {
+                    continue;
+                }
+            }
+        }
         let llm_role = if role == "assistant" { "assistant" } else { "user" };
         semantic_msgs.push((
             created_at.to_string(),
+            hit.score,
             json!({ "role": llm_role, "content": content }),
         ));
     }
 
     if semantic_msgs.is_empty() {
-        return recent;
+        tracing::warn!("vectorized history: {} hit semantici tutti duplicati o nella finestra recente, fallback a {RAW_FALLBACK} raw", semantic_hits.len());
+        return build_recent_conversation_history(db, session_id, RAW_FALLBACK).await;
     }
 
-    // Ordina semantici per data
+    // Ordina semantici per data ascendente (vecchio → nuovo) per coerenza cronologica.
+    // La rilevanza semantica e' gia' stata applicata via threshold + top_k.
     semantic_msgs.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Combina: semantici prima (contesto storico), poi recenti (contesto immediato)
-    let mut combined: Vec<serde_json::Value> = semantic_msgs.into_iter().map(|(_, m)| m).collect();
+    tracing::warn!(
+        "vectorized history: combinazione finale: {} semantici (storico) + {} recenti (immediato) per session={}",
+        semantic_msgs.len(), recent.len(), session_id
+    );
+
+    // Combina: semantici prima (contesto storico, ordine cronologico),
+    // poi recenti (contesto immediato, ordine cronologico).
+    // L'ULTIMO messaggio della lista e' la risposta assistant dell'ultimo
+    // turno, posizionato direttamente prima del messaggio user corrente
+    // gestito dal caller: questo garantisce che il LLM "veda" il contesto
+    // immediato come elemento dominante per la risposta.
+    let mut combined: Vec<serde_json::Value> = semantic_msgs.into_iter().map(|(_, _, m)| m).collect();
     combined.extend(recent);
     combined
 }
@@ -1109,9 +1453,20 @@ async fn spawn_agent_run(
     //
     // Modalita' automatic salta la disambiguazione: l'utente vuole che il
     // sistema agisca anche con incertezza moderata (top candidato vince).
+    // Arricchiamo il messaggio passato al classifier con un breve contesto
+    // dei turni recenti: il classifier LLM NON ha accesso autonomo alla
+    // cronologia, quindi senza questo prefisso messaggi tipo "riepiloga
+    // animali" o "applica tutte le ultime" verrebbero marcati ambigui
+    // ("messaggio troppo generico"). L'originale resta invariato per il
+    // resto del flusso (`params.content`).
+    let classifier_input = build_message_with_recent_context_for_classifier(
+        &state.db,
+        params.session_id,
+        &params.content,
+    ).await;
     let classified = state
         .orchestrator
-        .classify_intent_full(&params.content)
+        .classify_intent_full(&classifier_input)
         .await;
     if classified.is_ambiguous
         && !matches!(params.automation_mode, AutomationMode::Automatic)
@@ -1316,7 +1671,12 @@ async fn spawn_agent_run(
     // Consumato dal tokio::spawn sotto per non lasciare dangling clone.
     drop(tx);
 
-    // History ibrida: ultimi 2 raw + top-6 semanticamente rilevanti da Qdrant.
+    // History ibrida: ultimi 4 raw (2 turni completi) + top-6 semanticamente
+    // rilevanti da Qdrant. L'embedding di ricerca include l'ULTIMO turno
+    // user+assistant insieme al messaggio corrente, cosi' la ricerca
+    // semantica si aggancia al tema della conversazione e non al solo testo
+    // letterale del turno corrente. I semantici che ricadono nella finestra
+    // recente vengono filtrati per evitare duplicazione.
     // Se Qdrant/embedding non disponibile, fallback a ultimi 8 raw.
     let vec_deps_ok = state.dependency_status.qdrant.load(std::sync::atomic::Ordering::Relaxed)
         && state.dependency_status.embedder.load(std::sync::atomic::Ordering::Relaxed);
@@ -1326,8 +1686,8 @@ async fn spawn_agent_run(
             &state.orchestrator.neural,
             params.session_id,
             &params.content,
-            2,  // ultimi 2 messaggi sempre inclusi
-            6,  // top-6 semantici
+            4,  // ultimi 4 messaggi raw = 2 turni completi user+assistant
+            6,  // top-6 semantici dalla storia piu' vecchia (soglia 0.40)
         ).await
     } else {
         // Dipendenze vettoriali down: usa solo gli ultimi messaggi raw
@@ -1514,10 +1874,22 @@ async fn spawn_agent_run(
         .map(|s| format!("\n{}\n", s))
         .unwrap_or_default();
 
+    // Iniezione istruzione "precedente significativo": quando l'utente fa
+    // una domanda meta auto-referenziale ("qual era l'ultima richiesta?",
+    // "ripeti l'ultimo"), il LLM rischia di interpretare letteralmente
+    // l'ultimo messaggio (la domanda stessa) invece di scalare al precedente
+    // messaggio utente significativo. L'hint e' auto-aggiornato: include un
+    // few-shot example tratto dalla cronologia reale di questa sessione.
+    let self_ref_hint = build_self_referential_hint(
+        &state.db,
+        params.session_id,
+        &params.content,
+    ).await.unwrap_or_default();
+
     let system_text = format!(
-        "{}{}{}{}{}{}", project_header, project_custom_instructions,
+        "{}{}{}{}{}{}{}", project_header, project_custom_instructions,
         automation_instructions, test_instructions,
-        params.profile_prompt_block, params.system_context
+        params.profile_prompt_block, params.system_context, self_ref_hint
     );
     // Il messaggio iniziale è solo il contenuto corrente (senza prefisso testuale)
     // La history recente viene passata come turns strutturati via resume_history
@@ -1554,6 +1926,11 @@ async fn spawn_agent_run(
     let routing_matrix_for_loop = state.orchestrator.routing_matrix.clone();
     let neural_for_embed = state.orchestrator.neural.clone();
     let recent_history_for_brain = recent_history;
+    // L'intent classificato pilota la decisione di retry "hollow completion":
+    // per chat/docs e' normale che il modello risponda senza tool, NON e' un
+    // bug del modello e non giustifica un fallback su un modello piu' costoso.
+    // `classified.intent` e' `&'static str` quindi e' Copy: nessun clone serve.
+    let classified_intent_for_loop: &'static str = classified.intent;
 
     // Calcola il payload tools dinamico (discovery mode vs inline) prima dello spawn.
     // Il filtering per automation_mode avviene dentro build_tools_json_for_agent:
@@ -1625,6 +2002,7 @@ async fn spawn_agent_run(
                 recent_history_for_brain.clone(),
                 tools_json_for_brain.clone(),
                 sse_max_silence_secs,
+                false, // emit_final_event: emesso manualmente dopo il break del retry loop
             )
             .await;
 
@@ -1643,7 +2021,14 @@ async fn spawn_agent_run(
                 );
                 in_cooldown || retriable_class
             };
-            let hollow_retry = result.hollow_completion;
+            // Hollow completion: il modello ha risposto senza usare tool.
+            // Per intent `chat` (chiacchierata, domande conversazionali,
+            // meta-domande) la risposta senza tool e' attesa e corretta —
+            // disabilitiamo il retry. Per altri intent (anche `docs` quando
+            // l'utente chiede di scrivere/leggere documentazione) il retry
+            // serve perche' il modello dovrebbe usare tool.
+            let hollow_retry = result.hollow_completion
+                && classified_intent_for_loop != "chat";
             let should_retry = failed_retry || hollow_retry;
 
             if !should_retry || fallback_attempt + 1 >= MAX_PROVIDER_FALLBACKS {
@@ -1696,6 +2081,16 @@ async fn spawn_agent_run(
                 if hollow_retry { "hollow completion" } else { "provider error/cooldown" }
             );
         }
+        // Emetti is_final solo DOPO la fine del retry loop, cosi' il
+        // frontend non chiude lo stream SSE dopo il primo tentativo fallito
+        // perdendo i successivi tentativi di fallback.
+        let _ = tx_for_brain.send(AgentStepEvent {
+            run_id: run_id.to_string(),
+            step: None,
+            trace: None,
+            is_final: true,
+            token_delta: None,
+        });
         channels_clone.remove(&run_id);
 
         // Se il gateway ha re-instradato su provider locale per privacy
@@ -1709,8 +2104,11 @@ async fn spawn_agent_run(
         }
 
         // ── Hollow completion: il modello ha dichiarato di aver completato
-        // senza invocare alcun tool. Aggiungiamo un avviso per l'utente.
-        if result.hollow_completion {
+        // senza invocare alcun tool. Per intent `chat` questo e' atteso —
+        // non aggiungiamo avvisi spuri.
+        let conversational_intent = classified_intent_for_loop == "chat";
+        let report_hollow = result.hollow_completion && !conversational_intent;
+        if report_hollow {
             tracing::warn!(
                 "agent_run {}: hollow completion rilevato — il modello {}/{} \
                  non ha eseguito alcun tool. La risposta potrebbe essere incompleta.",
@@ -1720,8 +2118,8 @@ async fn spawn_agent_run(
 
         // Save final answer as assistant message
         if let Some(ref answer) = result.final_answer {
-            // Se hollow completion, annota la risposta con un avviso visibile
-            let effective_answer = if result.hollow_completion {
+            // Annota la risposta solo se l'intent richiedeva tool (NON chat/docs)
+            let effective_answer = if report_hollow {
                 format!(
                     "{answer}\n\n---\n*Avviso: l'agente ({}/{}) ha risposto senza \
                      eseguire alcun tool (0 step). La risposta potrebbe essere \
@@ -2176,6 +2574,7 @@ pub async fn send_chat_message(
                             resume_history,
                             tools_for_resume,
                             sse_silence_resume,
+                            true, // emit_final_event: caller singolo-shot, nessun retry loop
                         )
                         .await;
                         channels2.remove(&new_run_id);
@@ -3118,6 +3517,11 @@ pub async fn legacy_chat(
 #[derive(Debug, Deserialize)]
 pub struct PrecheckRequest {
     pub message: String,
+    /// Sessione corrente: se presente, il precheck riceve la cronologia
+    /// recente per valutare il messaggio in contesto. Senza, valuta in
+    /// isolamento (comportamento pre-fix, marca contestuali come generici).
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<Uuid>,
 }
 
 
@@ -3156,8 +3560,19 @@ pub async fn precheck_chat_message(
         "chat.precheck_message",
     ).await;
 
+    // Arricchimento contestuale: se il client passa session_id, il precheck
+    // riceve gli ultimi turni della conversazione. Risolve i falsi-positivi
+    // su follow-up contestuali (es. "riepiloga gli animali" dopo una chat
+    // sugli animali) che in isolamento sembrano "troppo generici" ma in
+    // contesto sono chiarissimi.
+    let effective_message = if let Some(sid) = body.session_id {
+        build_message_with_recent_context_for_classifier(&state.db, sid, message).await
+    } else {
+        message.to_string()
+    };
+
     let messages_json = serde_json::to_string(&json!([
-        { "role": "user", "content": message }
+        { "role": "user", "content": effective_message }
     ])).unwrap_or_default();
 
     // Modello purpose-specific letto da DB (purpose: chat_feedback_generator).

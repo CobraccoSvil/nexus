@@ -8,7 +8,7 @@ import {
   type FormEvent,
 } from "react";
 import { useChat } from "../lib/use-chat";
-import { listProjectMemories, precheckChatMessage, getProjectDbConfig, listAdminSettings, type AITraceEvent, type ChatAttachment, type PrecheckResult, type ProjectDbConfig } from "../lib/api-client";
+import { listProjectMemories, getProjectDbConfig, listAdminSettings, type AITraceEvent, type ChatAttachment, type PrecheckResult, type ProjectDbConfig } from "../lib/api-client";
 import { useThemeColors } from "../lib/theme";
 import { useI18n } from "../lib/i18n";
 import { useGlobalDialog } from "./global-dialog-provider";
@@ -625,45 +625,13 @@ export function ChatPanel({
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    // Blocca doppio invio mentre il precheck è in corso (evita race condition
-    // dove una seconda chiamata precheck con ok=true chiama doSend e svuota l'input
-    // mentre il risultato della prima sta ancora per mostrare l'overlay)
-    if (precheckPending) return;
     if ((!input.trim() && attachments.length === 0) || !hasProject) return;
     const messageText = input.trim() || (attachments.some(a => a.base64Content) ? "[immagine allegata]" : "[allegato]");
-
-    // Se c'è già un risultato precheck pending (widget aperto), invia direttamente
-    if (precheckResult) {
-      doSend(messageText);
-      return;
-    }
-
-    // Precheck solo su testo con almeno 3 parole, senza allegati puri
-    const wordCount = messageText.trim().split(/\s+/).length;
-    if (wordCount < 3 || attachments.some(a => a.base64Content)) {
-      doSend(messageText);
-      return;
-    }
-
-    setPrecheckPending(true);
-    precheckChatMessage(messageText)
-      .then((result) => {
-        // Mostra il suggerimento solo se c'è contenuto reale da mostrare
-        const hasContent =
-          (result.correctedText?.trim().length ?? 0) > 0 ||
-          (result.contextSuggestion?.trim().length ?? 0) > 0 ||
-          (result.issues?.length ?? 0) > 0;
-        if (!result.ok && hasContent) {
-          setPrecheckResult({ ...result, originalText: messageText });
-        } else {
-          doSend(messageText);
-        }
-      })
-      .catch(() => {
-        // In caso di errore del precheck, invia comunque
-        doSend(messageText);
-      })
-      .finally(() => setPrecheckPending(false));
+    // Precheck disabilitato: l'analisi di "messaggio troppo generico" e' ora
+    // gestita dal classifier intent (campo is_ambiguous + candidates) che
+    // gia' fa una chiamata LLM al brain. Evitiamo cosi' una seconda call
+    // LLM per turno (~1-3s di latenza in piu' per ogni messaggio).
+    doSend(messageText);
   };
 
   const copyMessage = async (_messageId: string, content: string): Promise<boolean> => {

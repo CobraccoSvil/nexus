@@ -15,6 +15,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
 use crate::{
+    agent_types::AgentStepEvent,
     auth::Claims,
     chat_learning::{api_error, parse_user_id, ApiError, ApiResult},
     AppState,
@@ -373,6 +374,20 @@ pub async fn cancel_agent_run(
     .execute(&state.db)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Emetti is_final sul broadcast del run: il frontend chiude l'SSE
+    // immediatamente e poll il DB per leggere lo stato 'cancelled'. Senza
+    // questo evento la UI rimarrebbe "in esecuzione" finche' il tokio::spawn
+    // sottostante non termina autonomamente (anche minuti).
+    if let Some(ch) = state.agent_channels.get(&run_id) {
+        let _ = ch.send(AgentStepEvent {
+            run_id: run_id.to_string(),
+            step: None,
+            trace: None,
+            is_final: true,
+            token_delta: None,
+        });
+    }
 
     Ok(Json(json!({ "runId": run_id.to_string(), "status": "cancelled" })))
 }

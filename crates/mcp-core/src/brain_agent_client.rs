@@ -310,6 +310,12 @@ fn classify_provider_error(
 /// `sse_max_silence_secs`: soglia silenzio SSE in secondi. Letta dal caller
 /// via `settings.routing.sse_heartbeat_max_silence_secs` (mig 0132).
 /// Tipico: 120s. Range pratico [60, 600]. Il brain emette ping ogni 30s.
+///
+/// `emit_final_event`: se true, al termine del tentativo emette
+/// `is_final: true` sul broadcast (default per caller singolo-shot tipo
+/// resend). I caller con retry loop (spawn_agent_run) lo passano `false`
+/// per evitare che il frontend chiuda lo stream SSE dopo il primo tentativo
+/// fallito; quei caller emettono is_final manualmente dopo il break.
 pub async fn run_via_brain(
     run_id: Uuid,
     session_id: Uuid,
@@ -321,6 +327,7 @@ pub async fn run_via_brain(
     conversation_history: Vec<serde_json::Value>,
     tools_json: Value,
     sse_max_silence_secs: u64,
+    emit_final_event: bool,
 ) -> AgentRunResult {
     let run_id_str = run_id.to_string();
     let url = format!("{}/agent/run/stream", brain_rest_url().trim_end_matches('/'));
@@ -397,7 +404,7 @@ pub async fn run_via_brain(
     // I ping del brain resettano il timer implicitamente: ogni chunk ricevuto
     // riavvia il wait_for.
     let max_silence = Duration::from_secs(sse_max_silence_secs);
-    loop {
+    'sse_loop: loop {
         let chunk_opt = tokio::time::timeout(max_silence, stream.next()).await;
         let bytes = match chunk_opt {
             Err(_elapsed) => {
@@ -617,6 +624,16 @@ pub async fn run_via_brain(
                     // si riavvia ad ogni Ok). Nessuna azione necessaria.
                     tracing::debug!("brain SSE ping: run attivo");
                 }
+                "done" => {
+                    // Segnale terminale esplicito dal brain: il graph LangGraph
+                    // ha concluso (END node raggiunto). Usciamo subito dal loop
+                    // esterno (label 'sse_loop) senza attendere il timeout di
+                    // silenzio SSE — questo elimina l'attesa di 120s che
+                    // l'utente percepiva come "Agente in esecuzione" anche
+                    // dopo aver ricevuto la risposta finale.
+                    tracing::info!("brain SSE done ricevuto: chiusura stream {run_id_str}");
+                    break 'sse_loop;
+                }
                 _ => {
                     // Eventi sconosciuti: ignoriamo.
                 }
@@ -668,14 +685,18 @@ pub async fn run_via_brain(
         );
     }
 
-    // Evento finale sul broadcast.
-    let _ = step_tx.send(AgentStepEvent {
-        run_id: run_id_str.clone(),
-        step: None,
-        trace: None,
-        is_final: true,
-        token_delta: None,
-    });
+    // Evento finale sul broadcast. Emesso solo se il caller lo richiede:
+    // i caller con retry loop chiamano questa funzione piu' volte e devono
+    // emettere is_final una sola volta a fine retry (vedi doc del parametro).
+    if emit_final_event {
+        let _ = step_tx.send(AgentStepEvent {
+            run_id: run_id_str.clone(),
+            step: None,
+            trace: None,
+            is_final: true,
+            token_delta: None,
+        });
+    }
 
     AgentRunResult {
         run_id: run_id_str,

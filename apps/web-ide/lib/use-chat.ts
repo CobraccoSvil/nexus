@@ -392,8 +392,15 @@ export function useChat(
                 finalRun.status === "interrupted" ||
                 finalRun.status === "loop_aborted" ||
                 finalRun.status === "provider_unavailable";
-              // Se il run e' terminale, non ri-settare agentRun (cancelRun l'ha gia' pulito)
-              if (!isTerminal) {
+              if (isTerminal) {
+                // Run completato: ripulisci lo stato dell'agente attivo
+                // cosi' la UI smette di mostrare "Agente in esecuzione" e
+                // il pulsante "Stop" rosso. Senza questo reset l'utente
+                // vedeva la chat bloccata in "running" anche dopo che il
+                // backend aveva chiuso lo stream SSE (done event).
+                setAgentRun(null);
+                setAgentSteps([]);
+              } else {
                 setAgentRun(finalRun);
                 setAgentSteps(finalRun.steps);
               }

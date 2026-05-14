@@ -904,10 +904,10 @@ export interface PrecheckResult {
   reason: string | null;
 }
 
-export async function precheckChatMessage(message: string): Promise<PrecheckResult> {
+export async function precheckChatMessage(message: string, sessionId?: string): Promise<PrecheckResult> {
   return fetchJson(`${API_BASE}/api/chat/precheck`, {
     method: "POST",
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, sessionId }),
   });
 }
 
