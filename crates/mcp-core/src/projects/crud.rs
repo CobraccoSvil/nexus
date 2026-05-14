@@ -375,6 +375,44 @@ pub async fn delete_project(
 
     let root_path = context.details.root_path.clone().unwrap_or_default();
 
+    // Fix M21: killa i processi figli registrati in agent_processes PRIMA del DELETE.
+    // Senza questo step un dev server attivo (es. `npm run dev`) continua a scrivere
+    // dentro node_modules/.vite e race con il rm_dir_all sotto, lasciando residui
+    // su disco anche dopo che il DB e' stato pulito dal CASCADE.
+    let running_pids: Vec<i32> = sqlx::query_scalar(
+        r#"
+        SELECT pid FROM agent_processes
+        WHERE project_id = $1
+          AND status IN ('running', 'starting')
+          AND pid IS NOT NULL
+        "#,
+    )
+    .bind(project_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    for pid in &running_pids {
+        let _ = tokio::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .output()
+            .await;
+    }
+    if !running_pids.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        for pid in &running_pids {
+            let _ = tokio::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .output()
+                .await;
+        }
+        tracing::info!(
+            "delete_project: terminati {} processi figli del progetto {}",
+            running_pids.len(),
+            project_id
+        );
+    }
+
     // Elimina dal DB (cascade su workspaces, repositories, agent_runs, ecc.)
     sqlx::query("DELETE FROM projects WHERE id = $1 AND owner_user_id = $2")
         .bind(project_id)
