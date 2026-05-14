@@ -1169,9 +1169,16 @@ export function SourceControlPanel({
           }}
         >
           <div style={{ color: tc.textSecondary }}>
-            Repo
+            Repo GitHub
             <div style={{ color: tc.text, marginTop: 4 }}>
-              {githubStatus?.repoFullName ?? githubStatus?.remoteUrl ?? "Non disponibile"}
+              {/* Fix M12: messaggio coerente con reason invece di "Non disponibile" generico */}
+              {githubStatus?.repoFullName
+                ?? githubStatus?.remoteUrl
+                ?? (githubStatus?.reason === "missing_origin_remote"
+                  ? "Nessun remote configurato"
+                  : githubStatus?.reason === "not_git_repo"
+                  ? "Progetto non e' un repo Git"
+                  : "Non disponibile")}
             </div>
           </div>
           <div style={{ color: tc.textSecondary }}>
