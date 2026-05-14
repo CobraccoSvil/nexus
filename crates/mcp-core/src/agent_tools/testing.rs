@@ -496,3 +496,270 @@ struct PlaywrightStats {
     flaky: usize,
     failed_tests: Vec<String>,
 }
+
+// ── Tool Fase 3: test singolo, lint fix, format file ──────────────────
+
+/// Esegue un singolo test (o un filtro per nome) invece dell'intera suite.
+/// Rileva il framework dal progetto: cargo test, pnpm test, pytest.
+pub(super) async fn tool_run_specific_test(ctx: &AgentToolContext, input: &Value) -> String {
+    let test_name = match input.get("test_name").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => s,
+        _ => return "[Errore: parametro 'test_name' obbligatorio]".to_string(),
+    };
+    let working_dir = input
+        .get("working_dir")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let timeout_secs = input
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(120)
+        .min(600);
+
+    let work_path = if working_dir.is_empty() {
+        ctx.root_path.clone()
+    } else {
+        match resolve_relative_path(&ctx.root_path, working_dir) {
+            Ok(p) => p,
+            Err(e) => return format!("[Errore percorso: {}]", e.1["error"].as_str().unwrap_or("path error")),
+        }
+    };
+
+    // Rileva il framework di test
+    let command = if work_path.join("Cargo.toml").is_file() {
+        format!("cargo test {} -- --nocapture 2>&1", test_name)
+    } else if work_path.join("package.json").is_file() {
+        // Node: pnpm/npm test con filtro
+        if work_path.join("vitest.config.ts").is_file()
+            || work_path.join("vitest.config.js").is_file()
+        {
+            format!("npx vitest run -t '{}' 2>&1", test_name)
+        } else if work_path.join("jest.config.ts").is_file()
+            || work_path.join("jest.config.js").is_file()
+        {
+            format!("npx jest -t '{}' 2>&1", test_name)
+        } else {
+            format!("pnpm test -- --grep '{}' 2>&1", test_name)
+        }
+    } else if work_path.join("pytest.ini").is_file()
+        || work_path.join("pyproject.toml").is_file()
+        || work_path.join("setup.py").is_file()
+    {
+        format!("python -m pytest -k '{}' -v 2>&1", test_name)
+    } else if work_path.join("mix.exs").is_file() {
+        format!("mix test --only {} 2>&1", test_name)
+    } else if work_path.join("go.mod").is_file() {
+        format!("go test -run '{}' -v ./... 2>&1", test_name)
+    } else {
+        return format!(
+            "[Errore: framework di test non rilevato in '{}'. \
+             File cercati: Cargo.toml, package.json, pytest.ini, pyproject.toml, mix.exs, go.mod]",
+            work_path.display()
+        );
+    };
+
+    run_test_command(ctx, &command, &work_path, timeout_secs).await
+}
+
+/// Esegue il linter con fix automatico (clippy --fix, eslint --fix, ruff --fix).
+pub(super) async fn tool_run_lint_fix(ctx: &AgentToolContext, input: &Value) -> String {
+    if !ctx.can_write {
+        return "[Errore: permesso di scrittura non concesso]".to_string();
+    }
+    let check_only = input
+        .get("check_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let working_dir = input
+        .get("working_dir")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let timeout_secs = input
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(120)
+        .min(300);
+
+    let work_path = if working_dir.is_empty() {
+        ctx.root_path.clone()
+    } else {
+        match resolve_relative_path(&ctx.root_path, working_dir) {
+            Ok(p) => p,
+            Err(e) => return format!("[Errore percorso: {}]", e.1["error"].as_str().unwrap_or("path error")),
+        }
+    };
+
+    let command = if work_path.join("Cargo.toml").is_file() {
+        if check_only {
+            "cargo clippy --all-targets -- -D warnings 2>&1".to_string()
+        } else {
+            "cargo clippy --fix --allow-dirty --allow-staged --all-targets 2>&1".to_string()
+        }
+    } else if work_path.join("package.json").is_file() {
+        if check_only {
+            "npx eslint . 2>&1".to_string()
+        } else {
+            "npx eslint . --fix 2>&1".to_string()
+        }
+    } else if work_path.join("pyproject.toml").is_file()
+        || work_path.join("setup.py").is_file()
+        || work_path.join("ruff.toml").is_file()
+    {
+        if check_only {
+            "ruff check . 2>&1".to_string()
+        } else {
+            "ruff check . --fix 2>&1".to_string()
+        }
+    } else {
+        return format!(
+            "[Errore: linter non rilevato in '{}'. \
+             Supportati: cargo clippy (Rust), eslint (Node), ruff (Python)]",
+            work_path.display()
+        );
+    };
+
+    run_test_command(ctx, &command, &work_path, timeout_secs).await
+}
+
+/// Formatta un singolo file (rustfmt, prettier, black) in base all'estensione.
+pub(super) async fn tool_format_file(ctx: &AgentToolContext, input: &Value) -> String {
+    if !ctx.can_write {
+        return "[Errore: permesso di scrittura non concesso]".to_string();
+    }
+    let path_str = match input.get("path").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => s,
+        _ => return "[Errore: parametro 'path' obbligatorio]".to_string(),
+    };
+    let check_only = input
+        .get("check_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let target = match resolve_relative_path(&ctx.root_path, path_str) {
+        Ok(p) => p,
+        Err(e) => return format!("[Errore percorso: {}]", e.1["error"].as_str().unwrap_or("path error")),
+    };
+    if !target.is_file() {
+        return format!("[Errore: '{}' non e' un file]", path_str);
+    }
+
+    let ext = target
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let command = match ext.as_str() {
+        "rs" => {
+            if check_only {
+                format!("rustfmt --check '{}' 2>&1", target.display())
+            } else {
+                format!("rustfmt '{}' 2>&1", target.display())
+            }
+        }
+        "ts" | "tsx" | "js" | "jsx" | "json" | "css" | "scss" | "html" | "vue" | "svelte"
+        | "yaml" | "yml" | "md" => {
+            if check_only {
+                format!("npx prettier --check '{}' 2>&1", target.display())
+            } else {
+                format!("npx prettier --write '{}' 2>&1", target.display())
+            }
+        }
+        "py" => {
+            if check_only {
+                format!("black --check '{}' 2>&1", target.display())
+            } else {
+                format!("black '{}' 2>&1", target.display())
+            }
+        }
+        "go" => format!("gofmt -w '{}' 2>&1", target.display()),
+        _ => {
+            return format!(
+                "[Errore: formatter non disponibile per estensione '.{}'. \
+                 Supportati: .rs (rustfmt), .ts/.js/.json/.css/.md (prettier), .py (black), .go (gofmt)]",
+                ext
+            );
+        }
+    };
+
+    run_test_command(ctx, &command, &ctx.root_path, 30).await
+}
+
+/// Helper comune: esegue un comando con timeout e cattura output.
+async fn run_test_command(
+    ctx: &AgentToolContext,
+    command: &str,
+    work_dir: &Path,
+    timeout_secs: u64,
+) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let mut child = match tokio::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(work_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env_clear()
+        .envs(crate::sandbox::safe_env_for_direct_spawn())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return format!("[Errore avvio: {}]", e),
+    };
+
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    let timeout_result = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        child.wait(),
+    )
+    .await;
+
+    let exit_code = match timeout_result {
+        Ok(Ok(status)) => status.code().unwrap_or(-1),
+        Ok(Err(e)) => return format!("[Errore attesa processo: {}]", e),
+        Err(_) => {
+            return format!("[Timeout dopo {}s. Comando: {}]", timeout_secs, command);
+        }
+    };
+
+    let stdout = if let Some(mut out) = stdout_handle {
+        let mut buf = Vec::new();
+        let _ = out.read_to_end(&mut buf).await;
+        String::from_utf8_lossy(&buf).to_string()
+    } else {
+        String::new()
+    };
+
+    let stderr = if let Some(mut err) = stderr_handle {
+        let mut buf = Vec::new();
+        let _ = err.read_to_end(&mut buf).await;
+        String::from_utf8_lossy(&buf).to_string()
+    } else {
+        String::new()
+    };
+
+    // Tronca output se troppo lungo
+    let max_out = 6000;
+    let stdout_tail = if stdout.len() > max_out {
+        format!("...(troncato)\n{}", &stdout[stdout.len() - max_out..])
+    } else {
+        stdout
+    };
+    let stderr_tail = if stderr.len() > max_out {
+        format!("...(troncato)\n{}", &stderr[stderr.len() - max_out..])
+    } else {
+        stderr
+    };
+
+    let mut result = format!("Exit code: {}\n", exit_code);
+    if !stdout_tail.is_empty() {
+        result.push_str(&format!("\nOutput:\n{}", stdout_tail));
+    }
+    if !stderr_tail.is_empty() {
+        result.push_str(&format!("\nErrori:\n{}", stderr_tail));
+    }
+    result
+}

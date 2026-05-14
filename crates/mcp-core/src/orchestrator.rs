@@ -1967,22 +1967,31 @@ impl Orchestrator {
         let decision_provider = d.provider.to_string();
         let decision_model = d.model.to_string();
 
-        let provider = routing
-            .candidates(intent, Some(decision_provider.as_str()))
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| decision_provider.clone());
-
-        let model = if let Some(m) = model_override.filter(|v| !v.trim().is_empty()) {
-            m.to_string()
-        } else if let Some(configured) = routing.provider_models.get(&provider) {
-            // L'admin ha configurato un modello specifico per questo provider → priorità
-            configured.clone()
-        } else if provider == decision_provider {
-            // Usa il modello scelto dal routing locale
-            decision_model.clone()
+        // La matrice gestisce già cooldown e fallback internamente.
+        // Usa direttamente provider+model dalla matrice: la decisione
+        // (intent, mode) → (provider, model) è specifica e non deve
+        // essere sovrascritta dai default generici provider_model_*.
+        // Solo se la matrice non ha trovato un provider disponibile
+        // (__no_model__), cade sui candidati + default admin.
+        let (provider, model) = if decision_provider != "__no_model__" {
+            let model = if let Some(m) = model_override.filter(|v| !v.trim().is_empty()) {
+                m.to_string()
+            } else {
+                decision_model.clone()
+            };
+            (decision_provider, model)
         } else {
-            default_model_for_provider(matrix, &provider).to_string()
+            let provider = routing
+                .candidates(intent, Some(decision_provider.as_str()))
+                .into_iter()
+                .find(|p| !is_provider_in_cooldown(p))
+                .unwrap_or_else(|| decision_provider.clone());
+            let model = model_override
+                .filter(|v| !v.trim().is_empty())
+                .map(str::to_string)
+                .or_else(|| routing.provider_models.get(&provider).cloned())
+                .unwrap_or_else(|| default_model_for_provider(matrix, &provider).to_string());
+            (provider, model)
         };
 
         // Se il provider scelto e' in cooldown (rate-limit recente nel processo), trova alternativa.

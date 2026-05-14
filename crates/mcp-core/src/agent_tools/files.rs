@@ -521,3 +521,150 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
         }
     }
 }
+
+/// Crea una directory con semantica `-p` (idempotente, crea genitori).
+pub(super) async fn tool_fs_mkdir(ctx: &AgentToolContext, input: &Value) -> String {
+    if !ctx.can_write {
+        return "[Errore: permesso di scrittura non concesso su questo progetto]".to_string();
+    }
+    let path_str = match input.get("path").and_then(Value::as_str) {
+        Some(s) => s,
+        None => return "[Errore: parametro 'path' mancante]".to_string(),
+    };
+    let target = match resolve_relative_path(&ctx.root_path, path_str) {
+        Ok(p) => p,
+        Err(e) => return format!("[Errore percorso: {}]", e.1["error"].as_str().unwrap_or("path error")),
+    };
+    if target.is_dir() {
+        return format!("Directory '{}' esiste gia'", path_str);
+    }
+    match tokio::fs::create_dir_all(&target).await {
+        Ok(()) => format!("Directory '{}' creata con successo", path_str),
+        Err(e) => format!("[Errore creazione directory '{}': {}]", path_str, e),
+    }
+}
+
+/// Copia un file o una directory (ricorsiva) dentro la root del progetto.
+pub(super) async fn tool_fs_copy(ctx: &AgentToolContext, input: &Value) -> String {
+    if !ctx.can_write {
+        return "[Errore: permesso di scrittura non concesso su questo progetto]".to_string();
+    }
+    let from_str = match input.get("from").and_then(Value::as_str) {
+        Some(s) => s,
+        None => return "[Errore: parametro 'from' mancante]".to_string(),
+    };
+    let to_str = match input.get("to").and_then(Value::as_str) {
+        Some(s) => s,
+        None => return "[Errore: parametro 'to' mancante]".to_string(),
+    };
+    let overwrite = input.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
+
+    let from = match resolve_relative_path(&ctx.root_path, from_str) {
+        Ok(p) => p,
+        Err(e) => return format!("[Errore percorso sorgente: {}]", e.1["error"].as_str().unwrap_or("path error")),
+    };
+    let to = match resolve_relative_path(&ctx.root_path, to_str) {
+        Ok(p) => p,
+        Err(e) => return format!("[Errore percorso destinazione: {}]", e.1["error"].as_str().unwrap_or("path error")),
+    };
+
+    if !from.exists() {
+        return format!("[Errore: sorgente '{}' non esiste]", from_str);
+    }
+
+    if to.exists() && !overwrite {
+        return format!(
+            "[Errore: destinazione '{}' esiste gia'. Usa overwrite:true per sovrascrivere]",
+            to_str
+        );
+    }
+
+    if from.is_file() {
+        // Crea directory genitore se non esiste
+        if let Some(parent) = to.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return format!("[Errore creazione directory destinazione: {}]", e);
+            }
+        }
+        match tokio::fs::copy(&from, &to).await {
+            Ok(bytes) => format!("File copiato '{}' -> '{}' ({} byte)", from_str, to_str, bytes),
+            Err(e) => format!("[Errore copia file: {}]", e),
+        }
+    } else if from.is_dir() {
+        match copy_dir_recursive(&from, &to).await {
+            Ok(count) => format!("Directory copiata '{}' -> '{}' ({} file)", from_str, to_str, count),
+            Err(e) => format!("[Errore copia directory: {}]", e),
+        }
+    } else {
+        format!("[Errore: '{}' non e' un file ne' una directory]", from_str)
+    }
+}
+
+/// Helper ricorsivo per copia directory.
+async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<usize, String> {
+    tokio::fs::create_dir_all(dst)
+        .await
+        .map_err(|e| format!("mkdir {}: {}", dst.display(), e))?;
+
+    let mut entries = tokio::fs::read_dir(src)
+        .await
+        .map_err(|e| format!("readdir {}: {}", src.display(), e))?;
+
+    let mut count = 0;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            count += Box::pin(copy_dir_recursive(&src_path, &dst_path)).await?;
+        } else {
+            tokio::fs::copy(&src_path, &dst_path)
+                .await
+                .map_err(|e| format!("copy {}: {}", src_path.display(), e))?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Sposta (rinomina) un file o una directory. Atomico se sullo stesso filesystem.
+pub(super) async fn tool_fs_move(ctx: &AgentToolContext, input: &Value) -> String {
+    if !ctx.can_write {
+        return "[Errore: permesso di scrittura non concesso su questo progetto]".to_string();
+    }
+    let from_str = match input.get("from").and_then(Value::as_str) {
+        Some(s) => s,
+        None => return "[Errore: parametro 'from' mancante]".to_string(),
+    };
+    let to_str = match input.get("to").and_then(Value::as_str) {
+        Some(s) => s,
+        None => return "[Errore: parametro 'to' mancante]".to_string(),
+    };
+
+    let from = match resolve_relative_path(&ctx.root_path, from_str) {
+        Ok(p) => p,
+        Err(e) => return format!("[Errore percorso sorgente: {}]", e.1["error"].as_str().unwrap_or("path error")),
+    };
+    let to = match resolve_relative_path(&ctx.root_path, to_str) {
+        Ok(p) => p,
+        Err(e) => return format!("[Errore percorso destinazione: {}]", e.1["error"].as_str().unwrap_or("path error")),
+    };
+
+    if !from.exists() {
+        return format!("[Errore: sorgente '{}' non esiste]", from_str);
+    }
+    if to.exists() {
+        return format!("[Errore: destinazione '{}' esiste gia']", to_str);
+    }
+
+    // Crea directory genitore se non esiste
+    if let Some(parent) = to.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return format!("[Errore creazione directory destinazione: {}]", e);
+        }
+    }
+
+    match tokio::fs::rename(&from, &to).await {
+        Ok(()) => format!("Spostato '{}' -> '{}'", from_str, to_str),
+        Err(e) => format!("[Errore spostamento: {}]", e),
+    }
+}

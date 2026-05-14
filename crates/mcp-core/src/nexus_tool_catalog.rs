@@ -1987,6 +1987,10 @@ impl NexusToolCatalog {
                 project_db_create_migration::ProjectDbCreateMigrationTool,
                 project_db_apply_migration::ProjectDbApplyMigrationTool,
                 project_db_rollback::ProjectDbRollbackTool,
+                project_db_query::ProjectDbQueryTool,
+                project_db_schema::ProjectDbSchemaTool,
+                project_db_tables::ProjectDbTablesTool,
+                project_db_set_connection::ProjectDbSetConnectionTool,
             };
             self.register_with_handler(
                 NexusToolSpec::new(
@@ -2027,6 +2031,269 @@ impl NexusToolCatalog {
                     "Annulla l'ultima migration applicata al DB del progetto utente.",
                 ),
                 Arc::new(ProjectDbRollbackTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_db_set_connection",
+                    NexusToolCategory::Database,
+                    "Configura la connessione al DB del progetto. Parametri: connection_string (DSN PostgreSQL), engine (postgres), hosting_mode (internal/external).",
+                ),
+                Arc::new(ProjectDbSetConnectionTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_db_query",
+                    NexusToolCategory::Database,
+                    "Esegue una query read-only (SELECT/WITH/EXPLAIN/SHOW) sul DB del progetto corrente. NON usare psql. DDL/DML scrittura sono rifiutati. Limit 100 righe.",
+                ),
+                Arc::new(ProjectDbQueryTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_db_schema",
+                    NexusToolCategory::Database,
+                    "Ispeziona lo schema del DB del progetto corrente: tabelle, colonne, tipi, nullable, default. Filtra per schema (default 'public') o singola tabella.",
+                ),
+                Arc::new(ProjectDbSchemaTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_db_tables",
+                    NexusToolCategory::Database,
+                    "Lista sintetica delle tabelle del DB del progetto corrente: nome, stima righe, dimensione. Piu' veloce di project_db_schema.",
+                ),
+                Arc::new(ProjectDbTablesTool),
+            );
+        }
+
+        // ── HTTP + Healthcheck tools ─────────────────────────────────────
+        {
+            use crate::nexus_tools::{
+                http_request::HttpRequestTool,
+                service_healthcheck::ServiceHealthcheckTool,
+            };
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "http_request",
+                    NexusToolCategory::Utility,
+                    "Esegue una richiesta HTTP strutturata (GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS). Restituisce status, headers, body (JSON o testo), latenza. Ideale per testare endpoint del progetto.",
+                ),
+                Arc::new(HttpRequestTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "service_healthcheck",
+                    NexusToolCategory::Utility,
+                    "Verifica che un servizio sia raggiungibile tramite probe HTTP o TCP (tcp://host:port). Retry con backoff esponenziale. Restituisce ok, status, latenza.",
+                ),
+                Arc::new(ServiceHealthcheckTool),
+            );
+        }
+
+        // ── Fase 4: Bootstrap progetto ──────────────────────────────────
+        {
+            use crate::nexus_tools::{
+                project_delete::ProjectDeleteTool,
+                project_register_existing_dir::ProjectRegisterExistingDirTool,
+                project_register_from_git::ProjectRegisterFromGitTool,
+                project_set_default_branch::ProjectSetDefaultBranchTool,
+                project_workspace_init::ProjectWorkspaceInitTool,
+            };
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_register_from_git",
+                    NexusToolCategory::Utility,
+                    "Clona un repository Git e lo registra come progetto Nexus. Esegue git clone --depth=1, inserisce in projects/workspaces/repositories con transazione atomica.",
+                ),
+                Arc::new(ProjectRegisterFromGitTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_register_existing_dir",
+                    NexusToolCategory::Utility,
+                    "Registra una directory gia' presente sul filesystem come progetto Nexus. Non esegue clone, rileva info Git, inserisce in DB con transazione.",
+                ),
+                Arc::new(ProjectRegisterExistingDirTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_delete",
+                    NexusToolCategory::Utility,
+                    "Soft-delete di un progetto dal DB. Rimuove righe da projects e tabelle dipendenti (CASCADE). Non cancella file dal disco. Richiede confirm:true.",
+                ),
+                Arc::new(ProjectDeleteTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_set_default_branch",
+                    NexusToolCategory::Utility,
+                    "Aggiorna il branch predefinito di un progetto (es. da develop a main).",
+                ),
+                Arc::new(ProjectSetDefaultBranchTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_workspace_init",
+                    NexusToolCategory::Utility,
+                    "Inizializza la riga workspaces per un progetto. Utile dopo clone manuale o registrazione incompleta. Idempotente: se il workspace esiste gia', ritorna l'ID esistente.",
+                ),
+                Arc::new(ProjectWorkspaceInitTool),
+            );
+        }
+
+        // ── Fase 5: Docker / Container ──────────────────────────────────
+        {
+            use crate::nexus_tools::{
+                docker_build::DockerBuildTool,
+                docker_compose_down::DockerComposeDownTool,
+                docker_compose_up::DockerComposeUpTool,
+                docker_logs::DockerLogsTool,
+                docker_ps::DockerPsTool,
+                docker_rm::DockerRmTool,
+                docker_run::DockerRunTool,
+                docker_stop::DockerStopTool,
+            };
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "docker_build",
+                    NexusToolCategory::Deployment,
+                    "Costruisce un'immagine Docker dal progetto con auto-label. Il Dockerfile deve trovarsi dentro la project_root.",
+                ),
+                Arc::new(DockerBuildTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "docker_run",
+                    NexusToolCategory::Deployment,
+                    "Esegue un container Docker con label progetto. Vieta nomi 'ideai-*' (infrastruttura Nexus). Supporta porte, env, volumi.",
+                ),
+                Arc::new(DockerRunTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "docker_ps",
+                    NexusToolCategory::Deployment,
+                    "Lista container del progetto corrente (filtro per label). Non espone container ideai-* ne' di altri progetti.",
+                ),
+                Arc::new(DockerPsTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "docker_logs",
+                    NexusToolCategory::Deployment,
+                    "Legge i log di un container del progetto. Verifica label prima dell'accesso. Supporta tail e timestamps.",
+                ),
+                Arc::new(DockerLogsTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "docker_stop",
+                    NexusToolCategory::Deployment,
+                    "Ferma un singolo container del progetto. Verifica label progetto PRIMA dello stop. Container ideai-* sempre rifiutati.",
+                ),
+                Arc::new(DockerStopTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "docker_rm",
+                    NexusToolCategory::Deployment,
+                    "Rimuove un container fermo del progetto. Verifica label progetto. Container ideai-* sempre rifiutati.",
+                ),
+                Arc::new(DockerRmTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "docker_compose_up",
+                    NexusToolCategory::Deployment,
+                    "Avvia servizi con docker compose. OBBLIGATORIO specificare il file compose (mai compose globali). Supporta build e servizi specifici.",
+                ),
+                Arc::new(DockerComposeUpTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "docker_compose_down",
+                    NexusToolCategory::Deployment,
+                    "Ferma e rimuove servizi compose del progetto. OBBLIGATORIO il file compose. Opzione per rimuovere volumi e immagini.",
+                ),
+                Arc::new(DockerComposeDownTool),
+            );
+        }
+
+        // ── Fase 6: Operazioni DB avanzate ──────────────────────────────
+        {
+            use crate::nexus_tools::{
+                project_db_analyze::ProjectDbAnalyzeTool,
+                project_db_backup::ProjectDbBackupTool,
+                project_db_diff_schema::ProjectDbDiffSchemaTool,
+                project_db_dump_schema::ProjectDbDumpSchemaTool,
+                project_db_kill_query::ProjectDbKillQueryTool,
+                project_db_reindex::ProjectDbReindexTool,
+                project_db_restore::ProjectDbRestoreTool,
+                project_db_vacuum::ProjectDbVacuumTool,
+            };
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_db_backup",
+                    NexusToolCategory::Database,
+                    "Esegue pg_dump sul DB del progetto. Salva in .nexus/backups/. Supporta formato plain/custom, schema-only.",
+                ),
+                Arc::new(ProjectDbBackupTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_db_restore",
+                    NexusToolCategory::Database,
+                    "Ripristina un backup nel DB del progetto. Richiede confirm:true. Supporta plain SQL e formato custom.",
+                ),
+                Arc::new(ProjectDbRestoreTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_db_vacuum",
+                    NexusToolCategory::Database,
+                    "Esegue VACUUM sul DB del progetto. Supporta ANALYZE e FULL. Opera su tabella singola o intero database.",
+                ),
+                Arc::new(ProjectDbVacuumTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_db_analyze",
+                    NexusToolCategory::Database,
+                    "Esegue ANALYZE sul DB del progetto. Aggiorna le statistiche del query planner.",
+                ),
+                Arc::new(ProjectDbAnalyzeTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_db_reindex",
+                    NexusToolCategory::Database,
+                    "Esegue REINDEX su tabella/indice del DB progetto. Operazione bloccante.",
+                ),
+                Arc::new(ProjectDbReindexTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_db_dump_schema",
+                    NexusToolCategory::Database,
+                    "Esporta solo lo schema del DB progetto (pg_dump --schema-only). Snapshot pre-migration.",
+                ),
+                Arc::new(ProjectDbDumpSchemaTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_db_diff_schema",
+                    NexusToolCategory::Database,
+                    "Confronta lo schema DB attuale con un file SQL di riferimento. Utile per verifica post-migration.",
+                ),
+                Arc::new(ProjectDbDiffSchemaTool),
+            );
+            self.register_with_handler(
+                NexusToolSpec::new(
+                    "project_db_kill_query",
+                    NexusToolCategory::Database,
+                    "Termina una query bloccante sul DB progetto. Usa pg_cancel_backend (graceful) o pg_terminate_backend (force).",
+                ),
+                Arc::new(ProjectDbKillQueryTool),
             );
         }
 

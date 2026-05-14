@@ -1,4 +1,15 @@
-.PHONY: help dev dev-wsl dev-cloud dev-hybrid dev-onprem down stop status logs-wsl lint test build clean docker-up docker-down deploy
+.PHONY: help dev dev-wsl dev-cloud dev-hybrid dev-onprem down stop status logs-wsl lint test build clean docker-up docker-down deploy deploy-local \
+        bootstrap deploy-all deploy-rust deploy-web deploy-brain deploy-gateway proxy-reload health logs-prod cleanup-old
+
+# === Configurazione deploy produzione ========================================
+# Override possibile: make deploy PROD_HOST=192.168.1.99
+PROD_HOST  ?= 192.168.0.6
+PROXY_HOST ?= 192.168.0.3
+SSH_USER   ?= administrator
+DEPLOY_DIR ?= /opt/ideai
+PUBLIC_URL ?= https://nexus.cobracco.it
+
+export PROD_HOST PROXY_HOST SSH_USER DEPLOY_DIR PUBLIC_URL
 
 help:
 	@echo "IDEAI — comandi disponibili"
@@ -23,8 +34,20 @@ help:
 	@echo "  make build            - Build tutti i package"
 	@echo "  make clean            - Pulisce dist/ e node_modules"
 	@echo ""
-	@echo "Deploy:"
-	@echo "  make deploy           - Build + restart tutti i servizi in locale"
+	@echo "Deploy locale (WSL):"
+	@echo "  make deploy-local     - Build + restart tutti i servizi in locale"
+	@echo ""
+	@echo "Deploy produzione ($(PROD_HOST) <- $(PROXY_HOST), $(PUBLIC_URL)):"
+	@echo "  make bootstrap        - Setup one-shot di $(PROD_HOST) da zero"
+	@echo "  make deploy           - Rebuild + restart TUTTO su $(PROD_HOST) (alias di deploy-all)"
+	@echo "  make deploy-rust      - Solo binari Rust (mcp-core + microservizi)"
+	@echo "  make deploy-web       - Solo web-ide (Next.js)"
+	@echo "  make deploy-brain     - Solo Python brain"
+	@echo "  make deploy-gateway   - Solo nexus-gateway (Node)"
+	@echo "  make proxy-reload     - Aggiorna nginx su $(PROXY_HOST)"
+	@echo "  make health           - Smoke test post-deploy"
+	@echo "  make logs-prod        - Tail journalctl dei servizi su $(PROD_HOST)"
+	@echo "  make cleanup-old      - DISMETTE il vecchio Nexus su $(PROXY_HOST) (irreversibile)"
 	@echo ""
 	@echo "Docker locale:"
 	@echo "  make docker-up-local  - Avvia solo i Docker locali (redis, qdrant, monitoring)"
@@ -51,8 +74,43 @@ docker-up-local:
 docker-down-local:
 	@docker compose -f docker-compose.local.yml down
 
-deploy:
+# Deploy locale (rinominato: era 'deploy' prima dei target produzione)
+deploy-local:
 	@bash deploy/deploy-local.sh
+
+# === Deploy produzione =======================================================
+
+bootstrap:
+	@bash deploy/bootstrap-prod.sh
+
+deploy: deploy-all
+
+deploy-all:
+	@bash deploy/deploy-prod.sh --all
+
+deploy-rust:
+	@bash deploy/deploy-prod.sh --rust
+
+deploy-web:
+	@bash deploy/deploy-prod.sh --web
+
+deploy-brain:
+	@bash deploy/deploy-prod.sh --brain
+
+deploy-gateway:
+	@bash deploy/deploy-prod.sh --gateway
+
+proxy-reload:
+	@bash deploy/reload-proxy.sh
+
+health:
+	@bash deploy/health-check.sh
+
+logs-prod:
+	@ssh $(SSH_USER)@$(PROD_HOST) 'sudo journalctl -fu nexus-core -u nexus-webide -u nexus-neural'
+
+cleanup-old:
+	@bash deploy/cleanup-old-host.sh
 
 dev: docker-up-cloud
 	@pnpm dev

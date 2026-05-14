@@ -290,6 +290,166 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     }
   },
   {
+    "name": "service_restart",
+    "description": "Riavvia un servizio per label: ferma tutti i processi con la stessa label, poi riavvia con lo stesso comando originale. Utile dopo modifiche al codice per applicare le modifiche senza dover ricordare il comando di avvio.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string",
+          "description": "Label del servizio da riavviare (es. 'Backend .NET', 'Frontend React')"
+        }
+      },
+      "required": [
+        "label"
+      ]
+    }
+  },
+  {
+    "name": "tail_service_logs",
+    "description": "Legge l'output di un servizio con opzione follow. Senza follow_seconds, restituisce l'output attuale (ultime righe). Con follow_seconds, monitora l'output per N secondi catturando nuove righe in tempo reale (max 60s). Utile per debugging servizi in esecuzione.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "process_id": {
+          "type": "string",
+          "description": "ID del processo. Se omesso, usa l'ultimo processo del progetto."
+        },
+        "max_chars": {
+          "type": "integer",
+          "description": "Numero massimo di caratteri da restituire. Default: 8000"
+        },
+        "follow_seconds": {
+          "type": "integer",
+          "description": "Secondi di follow in tempo reale (0 = lettura singola, max 60). Default: 0"
+        }
+      }
+    }
+  },
+  {
+    "name": "list_active_services",
+    "description": "Lista tutti i servizi/processi del progetto corrente con stato, PID, exit code, comando e timestamp di avvio. Mostra sia servizi attivi che recentemente fermati (ultimi 20).",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "fs_mkdir",
+    "description": "Crea una directory con semantica -p (idempotente, crea genitori mancanti). Percorso relativo alla root del progetto.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Percorso directory da creare, relativo alla root del progetto (es. 'src/services/auth')"
+        }
+      },
+      "required": ["path"]
+    }
+  },
+  {
+    "name": "fs_copy",
+    "description": "Copia un file o una directory (ricorsiva) dentro la root del progetto. Rifiuta sovrascritture senza flag overwrite:true.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string",
+          "description": "Percorso sorgente relativo alla root"
+        },
+        "to": {
+          "type": "string",
+          "description": "Percorso destinazione relativo alla root"
+        },
+        "overwrite": {
+          "type": "boolean",
+          "description": "Se true, sovrascrive la destinazione se esiste. Default: false"
+        }
+      },
+      "required": ["from", "to"]
+    }
+  },
+  {
+    "name": "fs_move",
+    "description": "Sposta (rinomina) un file o directory. Atomico se sullo stesso filesystem. Rifiuta se la destinazione esiste.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string",
+          "description": "Percorso sorgente relativo alla root"
+        },
+        "to": {
+          "type": "string",
+          "description": "Percorso destinazione relativo alla root"
+        }
+      },
+      "required": ["from", "to"]
+    }
+  },
+  {
+    "name": "run_specific_test",
+    "description": "Esegue un singolo test per nome invece della suite intera. Rileva il framework: cargo test (Rust), vitest/jest/pnpm (Node), pytest (Python), mix (Elixir), go test (Go). Molto piu' veloce di run full suite.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "test_name": {
+          "type": "string",
+          "description": "Nome o pattern del test da eseguire (es. 'test_auth_login', 'describe auth')"
+        },
+        "working_dir": {
+          "type": "string",
+          "description": "Sottodirectory in cui eseguire. Ometti per usare la root del progetto."
+        },
+        "timeout_secs": {
+          "type": "integer",
+          "description": "Timeout in secondi. Default: 120, max: 600"
+        }
+      },
+      "required": ["test_name"]
+    }
+  },
+  {
+    "name": "run_lint_fix",
+    "description": "Esegue il linter con fix automatico. Rileva: clippy --fix (Rust), eslint --fix (Node), ruff --fix (Python). Con check_only:true esegue solo il controllo senza modificare i file.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "check_only": {
+          "type": "boolean",
+          "description": "Se true, esegue solo il controllo senza applicare fix. Default: false"
+        },
+        "working_dir": {
+          "type": "string",
+          "description": "Sottodirectory. Ometti per la root del progetto."
+        },
+        "timeout_secs": {
+          "type": "integer",
+          "description": "Timeout in secondi. Default: 120, max: 300"
+        }
+      }
+    }
+  },
+  {
+    "name": "format_file",
+    "description": "Formatta un singolo file con il formatter appropriato. Supporta: .rs (rustfmt), .ts/.js/.json/.css/.md (prettier), .py (black), .go (gofmt). Con check_only:true verifica senza modificare.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Percorso del file da formattare, relativo alla root"
+        },
+        "check_only": {
+          "type": "boolean",
+          "description": "Se true, verifica senza modificare. Default: false"
+        }
+      },
+      "required": ["path"]
+    }
+  },
+  {
     "name": "delete_file",
     "description": "Usa questo tool per eliminare file/directory nel progetto. Parametri: path, recursive=true per directory non vuote. Usa con attenzione: l'operazione è irreversibile a meno che non sia in git. Non usare per file in staging area: usa git reset prima.",
     "input_schema": {
@@ -1035,6 +1195,15 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "read_terminal_output" => service::tool_read_service_output(ctx, input).await,
         "read_service_output" => service::tool_read_service_output(ctx, input).await,
         "stop_service" => service::tool_stop_service(ctx, input).await,
+        "service_restart" => service::tool_service_restart(ctx, input).await,
+        "tail_service_logs" => service::tool_tail_service_logs(ctx, input).await,
+        "list_active_services" => service::tool_list_active_services(ctx, input).await,
+        "fs_mkdir" => files::tool_fs_mkdir(ctx, input).await,
+        "fs_copy" => files::tool_fs_copy(ctx, input).await,
+        "fs_move" => files::tool_fs_move(ctx, input).await,
+        "run_specific_test" => testing::tool_run_specific_test(ctx, input).await,
+        "run_lint_fix" => testing::tool_run_lint_fix(ctx, input).await,
+        "format_file" => testing::tool_format_file(ctx, input).await,
         "delete_file" => files::tool_delete_file(ctx, input).await,
         "rename_file" => files::tool_rename_file(ctx, input).await,
         "edit_file" => files::tool_edit_file(ctx, input).await,

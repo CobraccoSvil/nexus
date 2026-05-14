@@ -145,7 +145,212 @@ pub(super) async fn tool_build_project_image(ctx: &AgentToolContext) -> String {
     }
 }
 
-// ── Helper terminale legacy (non usati attualmente, mantenuti per compatibilità) ─────
+/// Riavvia un servizio: ferma tutti i processi con la stessa label,
+/// poi li riesegue con lo stesso comando. Attende output iniziale.
+pub(super) async fn tool_service_restart(ctx: &AgentToolContext, input: &Value) -> String {
+    let label = match input.get("label").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return "[Errore: parametro 'label' obbligatorio]".to_string(),
+    };
+
+    // Cerca il processo esistente con questa label per recuperare il comando
+    let existing = match crate::agent_processes::list_processes(&ctx.db, ctx.project_id).await {
+        Ok(r) => r,
+        Err(e) => return format!("[Errore lista processi: {}]", e),
+    };
+
+    let matching: Vec<_> = existing.iter().filter(|p| p.label == label).collect();
+    if matching.is_empty() {
+        return format!(
+            "[Errore: nessun servizio trovato con label '{}'. Usa run_service per avviarlo.]",
+            label
+        );
+    }
+
+    // Recupera il comando originale dal processo piu' recente con questa label
+    let original_command = matching[0].command.clone();
+
+    // Leggi working_dir dal record completo via DB
+    let work_dir_row = sqlx::query(
+        "SELECT working_dir FROM agent_processes WHERE id = $1",
+    )
+    .bind(matching[0].id)
+    .fetch_optional(&*ctx.db)
+    .await;
+
+    let work_dir = match work_dir_row {
+        Ok(Some(row)) => {
+            let wd: String = row.try_get("working_dir").unwrap_or_default();
+            if wd.is_empty() {
+                ctx.root_path.to_string_lossy().to_string()
+            } else {
+                wd
+            }
+        }
+        _ => ctx.root_path.to_string_lossy().to_string(),
+    };
+
+    // Ferma tutti i processi attivi con questa label
+    for proc in matching.iter().filter(|p| p.status == "running" || p.status == "starting") {
+        let _ = crate::agent_processes::stop_process(&ctx.db, proc.id).await;
+    }
+
+    // Breve pausa per garantire che le porte siano liberate
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Riavvia con lo stesso comando
+    let restart_input = serde_json::json!({
+        "command": original_command,
+        "label": label,
+        "working_dir": work_dir,
+    });
+
+    let result = tool_run_service(ctx, &restart_input, "service").await;
+    format!("Servizio '{}' riavviato.\n{}", label, result)
+}
+
+/// Legge le ultime N righe di output di un servizio, con opzione di attesa
+/// per catturare output aggiuntivo (simula follow per X secondi).
+pub(super) async fn tool_tail_service_logs(ctx: &AgentToolContext, input: &Value) -> String {
+    let process_id_str = input.get("process_id").and_then(Value::as_str).unwrap_or("");
+    let max_chars = input
+        .get("max_chars")
+        .and_then(Value::as_u64)
+        .unwrap_or(8000) as usize;
+    let follow_secs = input
+        .get("follow_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(60);
+
+    // Risolvi process_id: specifico oppure ultimo del progetto
+    let process_id = if process_id_str.is_empty() {
+        let rows = match crate::agent_processes::list_processes(&ctx.db, ctx.project_id).await {
+            Ok(r) => r,
+            Err(e) => return format!("[Errore: {}]", e),
+        };
+        if rows.is_empty() {
+            return "Nessun servizio avviato per questo progetto.".to_string();
+        }
+        rows[0].id
+    } else {
+        match Uuid::parse_str(process_id_str) {
+            Ok(id) => id,
+            Err(_) => return "[Errore: process_id non valido]".to_string(),
+        }
+    };
+
+    if follow_secs == 0 {
+        return match crate::agent_processes::read_process_output(&ctx.db, process_id, max_chars)
+            .await
+        {
+            Ok(info) => format_process_output(&info),
+            Err(e) => format!("[Errore lettura output: {}]", e),
+        };
+    }
+
+    // Modalita' follow: polleggia ogni 2 secondi
+    let mut combined_output = String::new();
+    let mut last_stdout_len: usize = 0;
+    let mut last_stderr_len: usize = 0;
+
+    let start = std::time::Instant::now();
+    while start.elapsed().as_secs() < follow_secs {
+        match crate::agent_processes::read_process_output(&ctx.db, process_id, max_chars).await {
+            Ok(info) => {
+                if info.stdout.len() > last_stdout_len {
+                    combined_output.push_str(&info.stdout[last_stdout_len..]);
+                    last_stdout_len = info.stdout.len();
+                }
+                if info.stderr.len() > last_stderr_len {
+                    if !combined_output.is_empty() && !combined_output.ends_with('\n') {
+                        combined_output.push('\n');
+                    }
+                    combined_output
+                        .push_str(&format!("[STDERR] {}", &info.stderr[last_stderr_len..]));
+                    last_stderr_len = info.stderr.len();
+                }
+                if info.status != "running" && info.status != "starting" {
+                    combined_output.push_str(&format!(
+                        "\n--- Processo terminato (status: {}, exit_code: {}) ---",
+                        info.status,
+                        info.exit_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "?".into())
+                    ));
+                    break;
+                }
+            }
+            Err(e) => {
+                combined_output.push_str(&format!("\n[Errore lettura: {}]", e));
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    if combined_output.is_empty() {
+        "(Nessun output durante il periodo di follow)".to_string()
+    } else {
+        combined_output
+    }
+}
+
+/// Lista i servizi/processi attivi per il progetto corrente.
+pub(super) async fn tool_list_active_services(ctx: &AgentToolContext, _input: &Value) -> String {
+    let rows = match crate::agent_processes::list_processes(&ctx.db, ctx.project_id).await {
+        Ok(r) => r,
+        Err(e) => return format!("[Errore: {}]", e),
+    };
+
+    if rows.is_empty() {
+        return "Nessun servizio registrato per questo progetto.".to_string();
+    }
+
+    let mut output = String::new();
+    let mut running_count = 0;
+    let mut stopped_count = 0;
+
+    for proc in &rows {
+        let status_icon = match proc.status.as_str() {
+            "running" | "starting" => {
+                running_count += 1;
+                "[ATTIVO]"
+            }
+            "stopped" | "exited" | "finished" => {
+                stopped_count += 1;
+                "[FERMO]"
+            }
+            _ => {
+                stopped_count += 1;
+                "[?]"
+            }
+        };
+
+        output.push_str(&format!(
+            "{} {} (id: {}, pid: {}, status: {}",
+            status_icon,
+            proc.label,
+            proc.id,
+            proc.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+            proc.status,
+        ));
+
+        if let Some(code) = proc.exit_code {
+            output.push_str(&format!(", exit: {}", code));
+        }
+
+        output.push_str(&format!(", avviato: {})\n", proc.created_at));
+        output.push_str(&format!("  cmd: {}\n\n", proc.command));
+    }
+
+    format!(
+        "Servizi progetto: {} attivi, {} fermi (ultimi 20)\n\n{}",
+        running_count, stopped_count, output
+    )
+}
+
+// ── Helper terminale legacy (non usati attualmente, mantenuti per compatibilita') ─────
 
 /// Fase 1: aspetta che il frontend confermi la ricezione del comando (delivered/failed).
 /// Molto veloce: il frontend risponde quasi subito.

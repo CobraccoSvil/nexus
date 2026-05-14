@@ -407,10 +407,43 @@ pub mod db_view_list;
 pub mod project_db_apply_migration;
 pub mod project_db_connections;
 pub mod project_db_create_migration;
+pub mod project_db_query;
 pub mod project_db_rollback;
+pub mod project_db_schema;
+pub mod project_db_set_connection;
 pub mod project_db_status;
+pub mod project_db_tables;
 pub mod project_info;
 pub mod project_run_configs;
+pub mod http_request;
+pub mod service_healthcheck;
+
+// ── Fase 4: Bootstrap progetto ────────────────────────────────────────────
+pub mod project_delete;
+pub mod project_register_existing_dir;
+pub mod project_register_from_git;
+pub mod project_set_default_branch;
+pub mod project_workspace_init;
+
+// ── Fase 6: Operazioni DB avanzate ─────────────────────────────────────────
+pub mod project_db_analyze;
+pub mod project_db_backup;
+pub mod project_db_diff_schema;
+pub mod project_db_dump_schema;
+pub mod project_db_kill_query;
+pub mod project_db_reindex;
+pub mod project_db_restore;
+pub mod project_db_vacuum;
+
+// ── Fase 5: Docker / Container ────────────────────────────────────────────
+pub mod docker_build;
+pub mod docker_compose_down;
+pub mod docker_compose_up;
+pub mod docker_logs;
+pub mod docker_ps;
+pub mod docker_rm;
+pub mod docker_run;
+pub mod docker_stop;
 
 use async_trait::async_trait;
 use serde_json::Value;
