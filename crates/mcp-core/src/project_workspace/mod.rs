@@ -1,6 +1,7 @@
 // Sotto-moduli per dominio del workspace di progetto
 pub mod changes;
 pub mod logs;
+pub mod playwright_install;
 pub mod processes;
 pub mod run_configs;
 pub mod services;

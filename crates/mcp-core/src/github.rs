@@ -1688,3 +1688,148 @@ pub async fn github_create_pull_request(
         }
     })))
 }
+
+/// Fix M15: POST /api/projects/:id/github/create-repo
+/// Crea un nuovo repository GitHub per l'utente connesso e configura origin remote
+/// nel progetto target. Risolve il flow E2E "create new project on GitHub" che oggi
+/// richiede prompt manuale all'agente.
+///
+/// Body: `{name: string, private?: bool=true, description?: string, auto_init?: bool=false}`
+/// Output: `{ok, html_url, clone_url, full_name, private, origin_configured, default_branch}`
+pub async fn github_create_repo(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let context = load_project_context(&state.db, project_id, user_id).await?;
+
+    if !context.access.can_manage_git {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Non hai permessi Git su questo progetto",
+        ));
+    }
+
+    let authorized = ensure_github_authorized_user(&state.db, user_id)
+        .await
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "Collega GitHub a Nexus prima di creare un repository",
+            )
+        })?;
+
+    let name = body
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'name' obbligatorio"))?;
+
+    // Validazione name: solo alfanumerico/dash/underscore/punto (GitHub allow)
+    if !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Nome repository non valido (solo alfanumerico, '-', '_', '.')",
+        ));
+    }
+
+    let private = body
+        .get("private")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let description = body
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let auto_init = body
+        .get("auto_init")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    // ── Chiamata GitHub API: POST /user/repos ────────────────────────────
+    let client = Client::builder()
+        .user_agent("nexus-mcp-core")
+        .build()
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("http client: {}", e)))?;
+
+    let resp = client
+        .post("https://api.github.com/user/repos")
+        .bearer_auth(&authorized.access_token)
+        .header("Accept", "application/vnd.github+json")
+        .json(&json!({
+            "name": name,
+            "private": private,
+            "description": description,
+            "auto_init": auto_init,
+        }))
+        .send()
+        .await
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, format!("GitHub API call: {}", e)))?;
+
+    let status = resp.status();
+    let resp_body: serde_json::Value = resp.json().await.unwrap_or_else(|_| json!({}));
+
+    if !status.is_success() {
+        let msg = resp_body
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("errore sconosciuto");
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("GitHub API {} — {}", status, msg),
+        ));
+    }
+
+    let clone_url = resp_body
+        .get("clone_url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let html_url = resp_body
+        .get("html_url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let full_name = resp_body
+        .get("full_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let default_branch = resp_body
+        .get("default_branch")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("main")
+        .to_string();
+
+    // ── Configura origin remote sul progetto (idempotente) ──────────────
+    let mut origin_configured = false;
+    if context.is_git_repo && !clone_url.is_empty() {
+        // Rimuovi eventuale origin pre-esistente
+        let _ = run_git_command(&context.root_path, &["remote", "remove", "origin"]).await;
+        match run_git_command(&context.root_path, &["remote", "add", "origin", &clone_url]).await {
+            Ok(_) => origin_configured = true,
+            Err(e) => {
+                tracing::warn!(
+                    "github_create_repo: remote add fallito (repo creato ma origin non configurato): {}",
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "full_name": full_name,
+        "html_url": html_url,
+        "clone_url": clone_url,
+        "private": private,
+        "default_branch": default_branch,
+        "origin_configured": origin_configured,
+    })))
+}

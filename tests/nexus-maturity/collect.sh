@@ -27,33 +27,51 @@ REPO_ROOT="${REPO_ROOT:-/home/administrator/ideai}"
 OUT="$REPO_ROOT/tests/nexus-maturity/$TS/$ITER"
 mkdir -p "$OUT"
 
-PG_HOST="${PG_HOST:-localhost}"
-PG_PORT="${PG_PORT:-5433}"
+PG_CONTAINER="${PG_CONTAINER:-ideai-postgres-nexus-1}"
 PG_USER="${PG_USER:-nexus}"
 PG_DB="${PG_DB:-nexus}"
 PROJ_PATH="${PROJ_PATH:-}"
 
-PSQL="psql -h $PG_HOST -p $PG_PORT -U $PG_USER -d $PG_DB -At"
-
-if [ -z "${PGPASSWORD:-}" ]; then
-  echo "ATTENZIONE: PGPASSWORD non impostato — psql potrebbe richiedere autenticazione interattiva."
-fi
+# Fix M7: usa docker exec invece di psql host (non installato in WSL),
+# e passa PID/T0 come variabili psql -v per evitare problemi di escape SQL.
+# Il quoting `:'name'` di psql sostituisce in modo sicuro la variabile dentro stringhe SQL.
+run_psql_copy() {
+  local sql="$1"
+  local out_file="$2"
+  local err_file="$3"
+  docker exec -i "$PG_CONTAINER" psql \
+    -U "$PG_USER" -d "$PG_DB" -At \
+    -v pid="$PID" -v t0="$T0" \
+    -c "$sql" > "$out_file" 2>"$err_file" || true
+}
 
 echo "[collect] dump tabelle agente -> $OUT"
 
-$PSQL -c "COPY (SELECT * FROM agent_runs WHERE project_id='$PID' AND created_at >= '$T0' ORDER BY created_at) TO STDOUT WITH CSV HEADER" > "$OUT/agent_runs.csv" 2>"$OUT/agent_runs.err" || true
+run_psql_copy \
+  "COPY (SELECT * FROM agent_runs WHERE project_id=:'pid'::uuid AND created_at >= :'t0'::timestamptz ORDER BY created_at) TO STDOUT WITH CSV HEADER" \
+  "$OUT/agent_runs.csv" "$OUT/agent_runs.err"
 
-$PSQL -c "COPY (SELECT s.* FROM agent_steps s JOIN agent_runs r ON r.id = s.run_id WHERE r.project_id='$PID' AND r.created_at >= '$T0' ORDER BY s.run_id, s.step_index) TO STDOUT WITH CSV HEADER" > "$OUT/agent_steps.csv" 2>"$OUT/agent_steps.err" || true
+run_psql_copy \
+  "COPY (SELECT s.* FROM agent_steps s JOIN agent_runs r ON r.id = s.run_id WHERE r.project_id=:'pid'::uuid AND r.created_at >= :'t0'::timestamptz ORDER BY s.run_id, s.step_index) TO STDOUT WITH CSV HEADER" \
+  "$OUT/agent_steps.csv" "$OUT/agent_steps.err"
 
-$PSQL -c "COPY (SELECT * FROM agent_processes WHERE project_id='$PID' ORDER BY id) TO STDOUT WITH CSV HEADER" > "$OUT/agent_processes.csv" 2>"$OUT/agent_processes.err" || true
+run_psql_copy \
+  "COPY (SELECT * FROM agent_processes WHERE project_id=:'pid'::uuid ORDER BY id) TO STDOUT WITH CSV HEADER" \
+  "$OUT/agent_processes.csv" "$OUT/agent_processes.err"
 
-$PSQL -c "COPY (SELECT * FROM ai_usage_ledger WHERE project_id='$PID' AND created_at >= '$T0' ORDER BY created_at) TO STDOUT WITH CSV HEADER" > "$OUT/ai_usage_ledger.csv" 2>"$OUT/ai_usage_ledger.err" || true
+run_psql_copy \
+  "COPY (SELECT * FROM ai_usage_ledger WHERE project_id=:'pid'::uuid AND created_at >= :'t0'::timestamptz ORDER BY created_at) TO STDOUT WITH CSV HEADER" \
+  "$OUT/ai_usage_ledger.csv" "$OUT/ai_usage_ledger.err"
 
 echo "[collect] tool name frequency"
-$PSQL -c "COPY (SELECT s.tool_name, COUNT(*) AS n FROM agent_steps s JOIN agent_runs r ON r.id=s.run_id WHERE r.project_id='$PID' AND r.created_at >= '$T0' GROUP BY 1 ORDER BY 2 DESC) TO STDOUT WITH CSV HEADER" > "$OUT/tool_name_frequency.csv" 2>>"$OUT/agent_steps.err" || true
+run_psql_copy \
+  "COPY (SELECT s.tool_name, COUNT(*) AS n FROM agent_steps s JOIN agent_runs r ON r.id=s.run_id WHERE r.project_id=:'pid'::uuid AND r.created_at >= :'t0'::timestamptz GROUP BY 1 ORDER BY 2 DESC) TO STDOUT WITH CSV HEADER" \
+  "$OUT/tool_name_frequency.csv" "$OUT/tool_name_frequency.err"
 
 echo "[collect] cost summary"
-$PSQL -c "COPY (SELECT provider, model, COUNT(*) AS calls, SUM(prompt_tokens) AS pt, SUM(completion_tokens) AS ct, SUM(total_cost) AS cost_eur FROM ai_usage_ledger WHERE project_id='$PID' AND created_at >= '$T0' GROUP BY 1,2 ORDER BY cost_eur DESC NULLS LAST) TO STDOUT WITH CSV HEADER" > "$OUT/cost_by_model.csv" 2>>"$OUT/ai_usage_ledger.err" || true
+run_psql_copy \
+  "COPY (SELECT provider, model, COUNT(*) AS calls, SUM(prompt_tokens) AS pt, SUM(completion_tokens) AS ct, SUM(total_cost) AS cost_eur FROM ai_usage_ledger WHERE project_id=:'pid'::uuid AND created_at >= :'t0'::timestamptz GROUP BY 1,2 ORDER BY cost_eur DESC NULLS LAST) TO STDOUT WITH CSV HEADER" \
+  "$OUT/cost_by_model.csv" "$OUT/cost_by_model.err"
 
 echo "[collect] docker logs (since $T0)"
 for c in ideai-mcp-core-1 ideai-brain-1 ideai-web-ide-1 ideai-postgres-nexus-1; do

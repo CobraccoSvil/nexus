@@ -109,3 +109,47 @@ pub(super) async fn tool_git_pull(ctx: &AgentToolContext) -> String {
         Err(e) => format!("[git pull error: {}]", e),
     }
 }
+
+/// Fix M16: configura un remote git (es. `origin`) puntando a un URL.
+/// Tool agente che evita all'agente di usare `run_command git remote add ...` shell.
+/// Input: `{name: string, url: string}` (default name = "origin")
+pub(super) async fn tool_git_remote_add(ctx: &AgentToolContext, input: &Value) -> String {
+    if !ctx.is_git_repo {
+        return "Il progetto non e' un repository git.".to_string();
+    }
+    if !ctx.can_write {
+        return "[Errore: permesso di scrittura non concesso]".to_string();
+    }
+    let name = input.get("name").and_then(Value::as_str).unwrap_or("origin").trim();
+    let url = match input.get("url").and_then(Value::as_str) {
+        Some(u) if !u.trim().is_empty() => u.trim(),
+        _ => return "[Errore: parametro 'url' obbligatorio]".to_string(),
+    };
+
+    // Validazione: name puro alfanumerico/underscore/dash, no path traversal
+    if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+        return format!("[Errore: nome remote non valido '{}' (solo alfanumerico/-/_)]", name);
+    }
+
+    // Validazione: url deve essere https:// o git@ (no file:// path locali per evitare leak)
+    if !url.starts_with("https://") && !url.starts_with("git@") && !url.starts_with("ssh://") {
+        return format!(
+            "[Errore: url remote deve iniziare con https://, git@ o ssh:// (rifiutato: '{}')]",
+            url
+        );
+    }
+
+    // Se il remote esiste gia: rimuovilo e ricrealo (idempotente)
+    let _ = run_git_command(&ctx.root_path, &["remote", "remove", name]).await;
+
+    match run_git_command(&ctx.root_path, &["remote", "add", name, url]).await {
+        Ok(_) => {
+            // Verifica con git remote -v
+            match run_git_command(&ctx.root_path, &["remote", "-v"]).await {
+                Ok((stdout, _)) => format!("Remote '{}' configurato verso {}.\n\nStato remote:\n{}", name, url, stdout.trim()),
+                Err(_) => format!("Remote '{}' configurato verso {}.", name, url),
+            }
+        }
+        Err(e) => format!("[git remote add error: {}]", e),
+    }
+}

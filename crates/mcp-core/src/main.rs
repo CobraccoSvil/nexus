@@ -1333,6 +1333,15 @@ async fn main() -> anyhow::Result<()> {
                 )),
             )
             .route(
+                // Fix M19: install Playwright atomicamente via MCP Nexus
+                // (configurazione coerente con port_allocations, no shell agente)
+                "/api/projects/:id/services/install-playwright",
+                post(project_workspace::playwright_install::install_playwright).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
                 "/api/projects/:id/services/restart-all",
                 post(project_workspace::restart_all_project_services).layer(axum_mw::from_fn_with_state(
                     state.clone(),
@@ -1516,6 +1525,14 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/projects/:id/github/clone",
                 post(github::github_clone_repository).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                // Fix M15: crea nuovo repo GitHub + configura origin remote in un solo step
+                "/api/projects/:id/github/create-repo",
+                post(github::github_create_repo).layer(axum_mw::from_fn_with_state(
                     state.clone(),
                     middleware::require_auth,
                 )),

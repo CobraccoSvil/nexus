@@ -10,6 +10,15 @@ function normalizeContent(raw: string): string {
   s = s.replace(/\.([A-ZÀ-Ü])/g, ".\n\n$1");
   // Stessa cosa per "frase.[Link" (markdown link dopo punto senza spazio)
   s = s.replace(/\.(\[)/g, ".\n\n$1");
+  // Fix M13: pattern tipico del flow narrative agente "Sto facendo X:Procedo con Y"
+  // ":Maiuscola" → ":\n\nMaiuscola" (esclude URL https:// e ftp://)
+  // Negative lookbehind: non spezzare se preceduto da http/https/ftp/file/mailto
+  s = s.replace(/(?<!https?|ftp|file|mailto):([A-ZÀ-Ü])/g, ":\n\n$1");
+  // Stessa cosa per ":L'" / ":Un'" (italiano: apostrofo dopo maiuscola)
+  s = s.replace(/(?<!https?|ftp|file|mailto):([A-ZÀ-Ü]['ʼ])/g, ":\n\n$1");
+  // Frasi che indicano transizione: " Now ", " Verifico ", " Creo ", " Aspetto ", " Aggiungo ", " Installo "
+  // Solo se preceduto da `.` o `:` per evitare false positive in frasi normali
+  s = s.replace(/([.:])\s+(Now|Verifico|Creo|Aspetto|Aggiungo|Installo|Sto installando|Sto creando|Sto verificando|Procedo)\s+/g, "$1\n\n$2 ");
   // Evita tripli+ a-capo consecutivi creati dalla normalizzazione
   s = s.replace(/\n{3,}/g, "\n\n");
   return s;
