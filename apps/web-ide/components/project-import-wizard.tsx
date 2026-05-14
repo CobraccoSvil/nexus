@@ -655,8 +655,10 @@ export function ProjectImportWizard({ onComplete, onClose }: ProjectImportWizard
 
   return (
     <div
-      className="fixed inset-0 flex-row"
       style={{
+        position: "fixed",
+        inset: 0,
+        display: "flex",
         background: "rgba(0,0,0,0.5)",
         alignItems: "center",
         justifyContent: "center",
