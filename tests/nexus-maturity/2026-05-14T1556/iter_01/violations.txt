@@ -1,0 +1,7 @@
+# Modelli AI hardcoded
+
+# Emoji nei sorgenti
+
+# unwrap()/expect() fuori test (file *.rs, esclusi tests/)
+
+# Log payload chiaro

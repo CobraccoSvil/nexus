@@ -106,15 +106,41 @@ export function promptFromPlaywrightRun(run: PlaywrightRunSummary): string {
     .join("\n");
 }
 
-/** Porta preferita tra quelle Nexus: dev > app > http > web > minima disponibile */
+/** Fix M17: porta dev preferita per Playwright/UI runner.
+ * Allineamento con pick_dev_port di crates/mcp-core/src/nexus_tools/test_playwright.rs:25.
+ * - Cerca label che CONTIENE uno dei keyword dev (non solo equals)
+ * - ESCLUDE esplicitamente label backend/api/server-api
+ * - Fallback: preferisce porte tipiche dev (>= 5000) rispetto a backend (< 5000)
+ * - Ultimo fallback: 5173 (default Vite) invece di 3000 (che spesso e' Next.js / web-ide stesso)
+ */
 function pickBestPort(ports: PortEntry[]): number {
-  const priority = ["dev", "app", "http", "web"];
-  for (const label of priority) {
-    const entry = ports.find((p) => p.label?.toLowerCase() === label && p.port != null);
+  const dev_keywords = ["dev", "app", "http", "web", "frontend", "serve", "server", "vite", "next", "react"];
+  const backend_keywords = ["backend", "api", "server-api", "dotnet", "fastify", "express", "graphql"];
+
+  const isBackend = (p: PortEntry) => {
+    const l = p.label?.toLowerCase() ?? "";
+    return backend_keywords.some((bk) => l.includes(bk));
+  };
+
+  // 1) Preferenza per label che contiene un dev keyword e NON e' backend
+  for (const kw of dev_keywords) {
+    const entry = ports.find((p) => {
+      const l = p.label?.toLowerCase() ?? "";
+      return l.includes(kw) && !isBackend(p) && p.port != null;
+    });
     if (entry?.port != null) return entry.port;
   }
-  const sorted = ports.filter((p) => p.port != null).sort((a, b) => (a.port ?? 0) - (b.port ?? 0));
-  return sorted[0]?.port ?? 3000;
+
+  // 2) Tra le porte non-backend, preferisci porte tipiche dev (>= 5000)
+  const nonBackend = ports.filter((p) => p.port != null && !isBackend(p));
+  const devTypical = nonBackend
+    .filter((p) => (p.port ?? 0) >= 5000)
+    .sort((a, b) => (a.port ?? 0) - (b.port ?? 0));
+  if (devTypical[0]?.port != null) return devTypical[0].port;
+
+  // 3) Fallback finale: porta minore tra non-backend, oppure 5173 (default Vite)
+  const sorted = nonBackend.sort((a, b) => (a.port ?? 0) - (b.port ?? 0));
+  return sorted[0]?.port ?? 5173;
 }
 
 /**

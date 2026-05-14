@@ -214,6 +214,24 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     }
   },
   {
+    "name": "git_remote_add",
+    "description": "Usa questo tool per configurare un remote git (es. origin) puntando a un URL https://github.com/.../repo.git. Tool atomico Nexus che evita run_command shell. Idempotente: se il remote esiste gia, viene rimosso e ricreato col nuovo URL. Validazione: URL deve iniziare con https://, git@ o ssh:// (file:// rifiutati). Necessario prima di git_push verso un repository appena creato.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Nome del remote (default 'origin'). Solo alfanumerico/dash/underscore."
+        },
+        "url": {
+          "type": "string",
+          "description": "URL del remote (https://, git@, ssh://). Obbligatorio."
+        }
+      },
+      "required": ["url"]
+    }
+  },
+  {
     "name": "dispatch_subtask",
     "description": "Usa questo tool per delegare sottotask a agenti paralleli quando decomponibile in lavoro indipendente (es. refactoring moduli separati, update test+docs insieme). Richiede modalità agenti paralleli abilitata. Non usare per task sequenziali che dipendono l'uno dall'altro.",
     "input_schema": {
@@ -948,7 +966,7 @@ pub fn is_mutating_tool(name: &str) -> bool {
     matches!(
         name,
         "write_file" | "edit_file" | "delete_file" | "rename_file"
-            | "git_stage" | "git_commit" | "git_push" | "git_pull"
+            | "git_stage" | "git_commit" | "git_push" | "git_pull" | "git_remote_add"
     )
     // run_in_terminal è intenzionalmente NON mutante: il comando appare nel terminale
     // ma l'agente non ha visibilità dell'output, quindi non blocca la conferma.
@@ -1190,6 +1208,7 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "git_commit" => git::tool_git_commit(ctx, input).await,
         "git_push" => git::tool_git_push(ctx).await,
         "git_pull" => git::tool_git_pull(ctx).await,
+        "git_remote_add" => git::tool_git_remote_add(ctx, input).await,
         "run_in_terminal" => service::tool_run_service(ctx, input, "task").await,
         "run_service" => service::tool_run_service(ctx, input, "service").await,
         "read_terminal_output" => service::tool_read_service_output(ctx, input).await,

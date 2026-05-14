@@ -1,8 +1,14 @@
 // Sotto-moduli per dominio del workspace di progetto
+pub mod auto_bootstrap;
+pub mod browser_check;
 pub mod changes;
+pub mod fs_events;
 pub mod logs;
+pub mod playwright_install;
 pub mod processes;
 pub mod run_configs;
+pub mod runtime_issues;
+pub mod scan_ports;
 pub mod services;
 pub mod wizard;
 pub mod workbench;

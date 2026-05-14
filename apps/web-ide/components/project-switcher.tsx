@@ -10,6 +10,8 @@ import {
   type UserProjectSummary,
 } from "../lib/api-client";
 import { useThemeColors } from "../lib/theme";
+import { shortenAbsolutePath } from "../lib/format";
+import { ProjectImportWizard } from "./project-import-wizard";
 
 function iconButtonStyle(
   tc: ReturnType<typeof useThemeColors>,
@@ -60,6 +62,7 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
   const [cloneError, setCloneError] = useState<string | null>(null);
   const [deleteState, setDeleteState] = useState<DeleteState>({ phase: "idle" });
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [importWizardOpen, setImportWizardOpen] = useState(false);
 
   // GitHub repo picker
   const [githubConnected, setGithubConnected] = useState(false);
@@ -310,6 +313,36 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
               </div>
             )}
 
+            {/* Importa cartella locale (registra una directory gia esistente sul filesystem) */}
+            <div style={{ borderTop: `1px solid ${tc.border}`, paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ color: tc.textSecondary, fontSize: 12, fontWeight: 600 }}>
+                Importa cartella locale
+              </div>
+              <div style={{ fontSize: 11, color: tc.textMuted }}>
+                Registra una directory esistente sul server come progetto Nexus (apre il wizard di import con browser file, analisi e config DB).
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsModalOpen(false);
+                  setImportWizardOpen(true);
+                }}
+                style={{
+                  alignSelf: "flex-start",
+                  padding: "8px 16px",
+                  borderRadius: 8,
+                  border: `1px solid ${tc.border}`,
+                  background: tc.bgInput,
+                  color: tc.text,
+                  cursor: "pointer",
+                  fontSize: 13,
+                  fontWeight: 600,
+                }}
+              >
+                Importa cartella locale...
+              </button>
+            </div>
+
             {/* Clone from GitHub */}
             <div style={{ borderTop: `1px solid ${tc.border}`, paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
               <div style={{ color: tc.textSecondary, fontSize: 12, fontWeight: 600 }}>
@@ -460,6 +493,18 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
         </div>
       )}
 
+      {/* Import wizard (registrazione directory locale) */}
+      {importWizardOpen && (
+        <ProjectImportWizard
+          onComplete={(projectId) => {
+            setImportWizardOpen(false);
+            onRefreshProjects?.();
+            void onSelect(projectId);
+          }}
+          onClose={() => setImportWizardOpen(false)}
+        />
+      )}
+
       {/* Delete confirm dialog */}
       {(ds.phase === "confirm" || ds.phase === "dirty") && (
         <div
@@ -513,8 +558,12 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
             {ds.phase === "dirty" && (
               <div style={{ fontSize: 13, color: tc.textSecondary, lineHeight: 1.5 }}>
                 Ci sono <strong>{ds.dirtyCount} file non committati</strong> in{" "}
-                <code style={{ fontSize: 11, background: tc.bgInput, padding: "1px 4px", borderRadius: 4 }}>
-                  {ds.rootPath}
+                <code
+                  style={{ fontSize: 11, background: tc.bgInput, padding: "1px 4px", borderRadius: 4 }}
+                  title={ds.rootPath}
+                >
+                  {/* Fix M8: path accorciato (full path nel tooltip) */}
+                  {shortenAbsolutePath(ds.rootPath)}
                 </code>
                 .<br /><br />
                 Vuoi procedere ugualmente? Le modifiche andranno <strong>perse definitivamente</strong>.

@@ -1333,6 +1333,59 @@ async fn main() -> anyhow::Result<()> {
                 )),
             )
             .route(
+                // Fix M19: install Playwright atomicamente via MCP Nexus
+                // (configurazione coerente con port_allocations, no shell agente)
+                "/api/projects/:id/services/install-playwright",
+                post(project_workspace::playwright_install::install_playwright).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                // Fix M14: browser-check (Playwright smoke con cattura console errors)
+                "/api/projects/:id/services/browser-check",
+                post(project_workspace::browser_check::browser_check).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                // Fix M10: runtime issues (errori catturati dai tool agente)
+                "/api/projects/:id/runtime-issues",
+                get(project_workspace::runtime_issues::list_runtime_issues)
+                  .post(project_workspace::runtime_issues::create_runtime_issue)
+                  .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_auth)),
+            )
+            .route(
+                "/api/projects/:id/runtime-issues/:issue_id",
+                axum::routing::patch(project_workspace::runtime_issues::update_runtime_issue)
+                  .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_auth)),
+            )
+            .route(
+                // Fix M1: auto-detect porte da package.json/Procfile/docker-compose
+                "/api/projects/:id/services/scan-ports",
+                post(project_workspace::scan_ports::scan_ports).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                // Fix M11: SSE stream eventi filesystem (auto-refresh EXPLORER)
+                "/api/projects/:id/fs-events",
+                get(project_workspace::fs_events::fs_events).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                // Fix M18: auto-bootstrap dev tools al register/clone
+                "/api/projects/:id/services/auto-bootstrap",
+                post(project_workspace::auto_bootstrap::auto_bootstrap).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
                 "/api/projects/:id/services/restart-all",
                 post(project_workspace::restart_all_project_services).layer(axum_mw::from_fn_with_state(
                     state.clone(),
@@ -1516,6 +1569,14 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/projects/:id/github/clone",
                 post(github::github_clone_repository).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                // Fix M15: crea nuovo repo GitHub + configura origin remote in un solo step
+                "/api/projects/:id/github/create-repo",
+                post(github::github_create_repo).layer(axum_mw::from_fn_with_state(
                     state.clone(),
                     middleware::require_auth,
                 )),

@@ -185,14 +185,90 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
             let project_id_bg = ctx.project_id;
             let root_bg = ctx.root_path.clone();
             let target_bg = target.clone();
+            let path_str_bg = path_str.to_string();
+            let content_bg = content.to_string();
             tokio::spawn(async move {
                 let _ = crate::projects::reindex_single_file(&db_bg, &neural_bg, project_id_bg, &root_bg, &target_bg).await;
                 crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &target_bg).await;
+                // Hook M2: se il file e' un .md di documentazione, registra in project_documents
+                let _ = upsert_project_document_if_doc(&db_bg, project_id_bg, &path_str_bg, &content_bg).await;
             });
             format!("File '{}' scritto con successo ({} byte)", path_str, content.len())
         }
         Err(e) => format!("[Errore scrittura '{}': {}]", path_str, e),
     }
+}
+
+/// Hook M2: rileva se un file appena scritto e' documentazione del progetto e lo registra in `project_documents`.
+/// Tipi rilevati: PRD, README, ARCHITECTURE, CHANGELOG, CONTRIBUTING, SPEC, generic markdown sotto specs/ o docs/.
+/// Idempotente: se esiste gia una riga con stesso (project_id, file_path), aggiorna updated_at e version increment patch.
+async fn upsert_project_document_if_doc(
+    db: &sqlx::PgPool,
+    project_id: uuid::Uuid,
+    rel_path: &str,
+    content: &str,
+) -> Result<(), sqlx::Error> {
+    let lower = rel_path.to_lowercase();
+    if !lower.ends_with(".md") && !lower.ends_with(".markdown") {
+        return Ok(());
+    }
+    // Mappa al check constraint del DB (project_documents_doc_type_check):
+    //   functional_analysis, technical_analysis, er_diagram, project_management, release_notes
+    let doc_type = if lower.contains("prd")
+        || lower.starts_with("specs/")
+        || lower.contains("/specs/")
+        || lower.contains("functional")
+    {
+        "functional_analysis"
+    } else if lower.ends_with("readme.md")
+        || lower.contains("architecture")
+        || lower.starts_with("docs/")
+        || lower.contains("/docs/")
+        || lower.contains("technical")
+    {
+        "technical_analysis"
+    } else if lower.contains("erd") || lower.contains("schema_diagram") || lower.contains("er_diagram") {
+        "er_diagram"
+    } else if lower.contains("changelog") || lower.contains("release_notes") {
+        "release_notes"
+    } else if lower.contains("contributing") || lower.contains("project_management") || lower.contains("roadmap") {
+        "project_management"
+    } else {
+        return Ok(());
+    };
+    // Titolo: prima riga "# ..." oppure nome file senza estensione
+    let title = content
+        .lines()
+        .find_map(|l| {
+            let t = l.trim();
+            t.strip_prefix("# ").map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| {
+            std::path::Path::new(rel_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(rel_path)
+                .to_string()
+        });
+    let title = title.chars().take(255).collect::<String>();
+
+    sqlx::query(
+        r#"
+        INSERT INTO project_documents (project_id, doc_type, title, file_path, status, metadata, structure_json)
+        VALUES ($1, $2, $3, $4, 'draft', jsonb_build_object('source', 'agent_write_file'), '{}'::jsonb)
+        ON CONFLICT (project_id, file_path) DO UPDATE
+          SET title = EXCLUDED.title,
+              doc_type = EXCLUDED.doc_type,
+              updated_at = NOW()
+        "#,
+    )
+    .bind(project_id)
+    .bind(doc_type)
+    .bind(&title)
+    .bind(rel_path)
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 pub(super) async fn tool_list_files(ctx: &AgentToolContext, input: &Value) -> String {
