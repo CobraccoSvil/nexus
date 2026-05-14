@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { shortenAbsolutePath } from "../../lib/format";
 import { TruncatedText } from "../truncated-text";
 import { DocumentsSidebar } from "./documents-sidebar";
 import { ProjectExplorer } from "../project-explorer";
@@ -1063,7 +1064,7 @@ export function SidebarManager({
         {renderOpenEditors()}
         <ViewHeader
           title="Explorer"
-          subtitle={project?.rootPath ?? "Apri un progetto"}
+          subtitle={project?.rootPath ? shortenAbsolutePath(project.rootPath) : "Apri un progetto"}
           actions={
             <div style={{ display: "flex", gap: 6 }}>
               <button

@@ -225,6 +225,150 @@ class OpenAIProvider(BaseProvider):
                 metadata=meta,
             )
 
+    async def generate_agent_turn_stream(
+        self,
+        model: str,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int = 4096,
+        system_text: str = "",
+        extended_thinking: bool = False,
+    ):
+        """Fix M3: streaming agent-turn per OpenAI (paritetico con Anthropic).
+
+        Yield: {"type": "token", "delta": str} per ogni delta di testo
+               {"type": "done", "result": dict} al termine (schema generate_agent_turn)
+               {"type": "error", "message": str, "metadata"?: dict} in caso di errore
+
+        Nota: il parametro extended_thinking e' ignorato lato OpenAI (reasoning
+        traces non sono esposte in stream dall'API chat.completions).
+        """
+        if not self._api_key:
+            yield {"type": "error", "message": "OpenAI API key non configurata"}
+            return
+        try:
+            import json as _json
+
+            client = self._get_client()
+            oai_messages = _convert_messages_to_openai(messages)
+            if system_text:
+                oai_messages.insert(0, {"role": "system", "content": system_text})
+            oai_tools = [_anthropic_tool_to_openai(t) for t in tools] if tools else []
+
+            stream_kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": oai_messages,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+            if _is_o_series(model):
+                stream_kwargs["max_completion_tokens"] = max_tokens
+                if oai_messages and oai_messages[0].get("role") == "system":
+                    oai_messages[0] = {"role": "developer", "content": oai_messages[0]["content"]}
+            else:
+                stream_kwargs["max_tokens"] = max_tokens
+            if oai_tools:
+                stream_kwargs["tools"] = oai_tools
+                if not _is_o_series(model):
+                    from ._schema_utils import resolve_tool_choice_openai
+                    stream_kwargs["tool_choice"] = resolve_tool_choice_openai(model, oai_messages)
+
+            text_buf: list[str] = []
+            # Accumulatori per tool_calls (delta arrivano frammentati per index)
+            tool_calls_acc: dict[int, dict[str, Any]] = {}
+            finish_reason: str | None = None
+            usage_obj: Any = None
+
+            stream = await client.chat.completions.create(**stream_kwargs)
+            async for chunk in stream:
+                # Eventuale usage sul chunk finale (stream_options.include_usage)
+                if getattr(chunk, "usage", None):
+                    usage_obj = chunk.usage
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                if getattr(choice, "finish_reason", None):
+                    finish_reason = choice.finish_reason
+                delta = getattr(choice, "delta", None)
+                if delta is None:
+                    continue
+                # Token di testo
+                content_delta = getattr(delta, "content", None)
+                if content_delta:
+                    text_buf.append(content_delta)
+                    yield {"type": "token", "delta": content_delta}
+                # Tool calls (delta frammentati)
+                tc_deltas = getattr(delta, "tool_calls", None)
+                if tc_deltas:
+                    for tc_delta in tc_deltas:
+                        idx = getattr(tc_delta, "index", 0) or 0
+                        slot = tool_calls_acc.setdefault(
+                            idx, {"id": None, "name": None, "arguments": ""}
+                        )
+                        if getattr(tc_delta, "id", None):
+                            slot["id"] = tc_delta.id
+                        fn = getattr(tc_delta, "function", None)
+                        if fn:
+                            if getattr(fn, "name", None):
+                                slot["name"] = fn.name
+                            if getattr(fn, "arguments", None):
+                                slot["arguments"] += fn.arguments
+
+            text_content = "".join(text_buf)
+            tool_use_blocks: list[dict] = []
+            assistant_content: list[dict] = []
+
+            if finish_reason == "tool_calls" and tool_calls_acc:
+                stop_reason = "tool_use"
+                for _idx in sorted(tool_calls_acc.keys()):
+                    slot = tool_calls_acc[_idx]
+                    try:
+                        args = _json.loads(slot.get("arguments") or "{}")
+                    except Exception:
+                        args = {}
+                    block = {
+                        "id": slot.get("id") or f"call_{_idx}",
+                        "name": slot.get("name") or "",
+                        "input": args,
+                    }
+                    tool_use_blocks.append(block)
+                    assistant_content.append({"type": "tool_use", **block})
+            else:
+                stop_reason = "end_turn"
+                if text_content:
+                    assistant_content.append({"type": "text", "text": text_content})
+
+            usage_data: dict[str, Any] = {}
+            if usage_obj is not None:
+                usage_data = {
+                    "input_tokens": getattr(usage_obj, "prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(usage_obj, "completion_tokens", 0) or 0,
+                }
+                cached_tokens = 0
+                ptd = getattr(usage_obj, "prompt_tokens_details", None)
+                if ptd is not None:
+                    cached_tokens = getattr(ptd, "cached_tokens", 0) or 0
+                if cached_tokens > 0:
+                    usage_data["cache_read_input_tokens"] = cached_tokens
+
+            yield {
+                "type": "done",
+                "result": {
+                    "provider": self.name,
+                    "model": model,
+                    "content": text_content,
+                    "metadata": {
+                        "stop_reason": stop_reason,
+                        "tool_use_blocks": tool_use_blocks,
+                        "assistant_content": assistant_content,
+                        "usage": usage_data,
+                    },
+                },
+            }
+        except Exception as e:
+            meta = format_error_result(e, self.name, model)
+            yield {"type": "error", "message": meta.get("error", str(e)), "metadata": meta}
+
     async def generate_stream(self, model: str, prompt: str, **kwargs: Any) -> AsyncIterator[str]:
         if not self._api_key:
             yield "[OpenAI API key not configured]"

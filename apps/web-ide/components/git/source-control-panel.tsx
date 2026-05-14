@@ -211,6 +211,12 @@ export function SourceControlPanel({
   const [prTitle, setPrTitle] = useState("");
   const [prBody, setPrBody] = useState("");
   const [prBaseBranch, setPrBaseBranch] = useState("");
+  // Fix M15: dialog inline "Crea repo GitHub"
+  const [createRepoOpen, setCreateRepoOpen] = useState(false);
+  const [createRepoName, setCreateRepoName] = useState("");
+  const [createRepoPrivate, setCreateRepoPrivate] = useState(true);
+  const [createRepoDesc, setCreateRepoDesc] = useState("");
+  const [createRepoBusy, setCreateRepoBusy] = useState(false);
   const [analyzeBusy, setAnalyzeBusy] = useState(false);
   const [deepAnalysisPhase, setDeepAnalysisPhase] = useState<"idle" | "static" | "deep">("idle");
   const [insights, setInsights] = useState<DeepAnalysisInsights | null>(null);
@@ -486,6 +492,55 @@ export function SourceControlPanel({
       );
     } finally {
       setGitHubBusy(false);
+    }
+  };
+
+  // Fix M15: crea nuovo repo GitHub e configura origin sul progetto
+  const handleCreateGithubRepo = async () => {
+    if (!project?.id) return;
+    const name = createRepoName.trim();
+    if (!name) {
+      setGitHubError("Specifica il nome del repository");
+      return;
+    }
+    try {
+      setCreateRepoBusy(true);
+      setGitHubError(null);
+      setGitHubMessage(null);
+      const res = await fetch(`/api/projects/${project.id}/github/create-repo`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          private: createRepoPrivate,
+          description: createRepoDesc.trim() || undefined,
+        }),
+      });
+      if (!res.ok) {
+        const errBody = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(errBody.error ?? `HTTP ${res.status}`);
+      }
+      const data = (await res.json()) as {
+        html_url?: string;
+        full_name?: string;
+        origin_configured?: boolean;
+      };
+      setGitHubMessage(
+        `Repo ${data.full_name ?? name} creato${data.origin_configured ? " e origin configurato" : ""}`,
+      );
+      setCreateRepoOpen(false);
+      setCreateRepoName("");
+      setCreateRepoDesc("");
+      await loadGitHubState(false);
+      if (data.html_url && typeof window !== "undefined") {
+        window.open(data.html_url, "_blank", "noopener,noreferrer");
+      }
+    } catch (nextError) {
+      setGitHubError(
+        nextError instanceof Error ? nextError.message : "Impossibile creare il repository",
+      );
+    } finally {
+      setCreateRepoBusy(false);
     }
   };
 
@@ -1259,7 +1314,72 @@ export function SourceControlPanel({
               Open PR
             </a>
           ) : null}
+          {githubStatus?.reason === "missing_origin_remote" &&
+          githubAccount?.connected === true &&
+          canManageGit ? (
+            <button
+              disabled={createRepoBusy || githubBusy || busy}
+              onClick={() => {
+                setCreateRepoOpen((v) => !v);
+                if (!createRepoName) setCreateRepoName(project.slug ?? project.name ?? "");
+              }}
+              style={smallButtonStyle(tc, createRepoBusy || githubBusy || busy)}
+              title="Crea un nuovo repository GitHub e collega come origin"
+            >
+              Crea repo su GitHub
+            </button>
+          ) : null}
         </div>
+
+        {createRepoOpen ? (
+          <div
+            style={{
+              borderTop: `1px solid ${tc.border}`,
+              paddingTop: 10,
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <div style={{ color: tc.text, fontWeight: 700 }}>Crea repository GitHub</div>
+            <input
+              value={createRepoName}
+              onChange={(e) => setCreateRepoName(e.target.value)}
+              placeholder="Nome repository (alfanumerico, '-', '_', '.')"
+              style={inputStyle(tc)}
+            />
+            <input
+              value={createRepoDesc}
+              onChange={(e) => setCreateRepoDesc(e.target.value)}
+              placeholder="Descrizione (opzionale)"
+              style={inputStyle(tc)}
+            />
+            <label style={{ display: "flex", alignItems: "center", gap: 8, color: tc.text }}>
+              <input
+                type="checkbox"
+                checked={createRepoPrivate}
+                onChange={(e) => setCreateRepoPrivate(e.target.checked)}
+              />
+              Repository privato
+            </label>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <button
+                disabled={createRepoBusy || !createRepoName.trim()}
+                onClick={() => void handleCreateGithubRepo()}
+                style={smallButtonStyle(tc, createRepoBusy || !createRepoName.trim())}
+              >
+                {createRepoBusy ? "Creazione..." : "Crea repo"}
+              </button>
+              <button
+                disabled={createRepoBusy}
+                onClick={() => setCreateRepoOpen(false)}
+                style={smallButtonStyle(tc, createRepoBusy)}
+              >
+                Annulla
+              </button>
+            </div>
+          </div>
+        ) : null}
 
         {canCreatePr ? (
           <div
