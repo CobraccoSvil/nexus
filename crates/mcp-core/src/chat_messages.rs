@@ -1952,12 +1952,27 @@ async fn spawn_agent_run(
         Err(_) => 120,
     };
 
+    // Cloni dedicati al panic-handler: se il corpo principale del tokio::spawn
+    // panica, dobbiamo comunque emettere is_final e marcare il run come failed
+    // nel DB. Senza questi cloni esterni, il `move` cattura tutto e il branch
+    // di recovery non avrebbe accesso ai canali/DB. (Garanzia anti-blocco UI.)
+    let panic_tx = tx_for_brain.clone();
+    let panic_db = db_clone.clone();
+    let panic_channels = channels_clone.clone();
+    let panic_run_id = run_id;
+    let panic_session_id = session_id_cp;
+    let panic_project_id = project_id_cp;
+    let panic_user_msg_id = user_message_id;
+
     tokio::spawn(async move {
+        use futures::FutureExt;
+
         tracing::info!(
             "spawn_agent_run: delega al brain LangGraph run_id={}",
             run_id
         );
 
+        let agent_body = std::panic::AssertUnwindSafe(async move {
         // ── Loop di retry con fallback automatico tra provider ───────────────
         // Se il run fallisce per "credit too low" / "quota exceeded", il provider
         // viene messo in cooldown lungo (in brain_agent_client). Qui rileviamo
@@ -2218,6 +2233,64 @@ async fn spawn_agent_run(
                 run_id,
                 result.steps.len()
             );
+        }
+        }); // chiude AssertUnwindSafe(async move { ... })
+
+        // Cattura panic dell'intero body: senza questo, un panic dentro lo
+        // spawn lascia il run con status='running' per sempre e l'UI bloccata
+        // (il canale broadcast non riceve mai is_final).
+        if let Err(panic_payload) = agent_body.catch_unwind().await {
+            let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "panic non-stringificato".to_string()
+            };
+            tracing::error!(
+                "agent_run {}: PANIC catturato nel tokio::spawn — emetto is_final di fallback. Payload: {}",
+                panic_run_id, panic_msg
+            );
+
+            // 1. Emetti is_final per sbloccare l'UI
+            let _ = panic_tx.send(AgentStepEvent {
+                run_id: panic_run_id.to_string(),
+                step: None,
+                trace: None,
+                is_final: true,
+                token_delta: None,
+            });
+            panic_channels.remove(&panic_run_id);
+
+            // 2. Aggiorna agent_runs come failed
+            let _ = sqlx::query(
+                "UPDATE agent_runs SET status='failed', completed_at=NOW(), \
+                 final_answer=$2 WHERE id=$1",
+            )
+            .bind(panic_run_id)
+            .bind(format!(
+                "Errore interno: il task agente e' terminato in modo imprevisto ({}). Riprova.",
+                panic_msg
+            ))
+            .execute(&panic_db)
+            .await;
+
+            // 3. Inserisci un messaggio assistant per far vedere l'errore in chat
+            let _ = sqlx::query(
+                r#"INSERT INTO chat_messages
+                   (id, session_id, project_id, role, content, metadata, request_message_id, created_at)
+                   VALUES (gen_random_uuid(),$1,$2,'assistant',$3,$4,$5,NOW())"#,
+            )
+            .bind(panic_session_id)
+            .bind(panic_project_id)
+            .bind(format!(
+                "⚠ Errore interno: il task agente e' terminato in modo imprevisto.\n\n```\n{}\n```\n\nPuoi riprovare la richiesta.",
+                panic_msg
+            ))
+            .bind(json!({"errorClass": "internal_panic", "agentRunId": panic_run_id.to_string()}))
+            .bind(panic_user_msg_id)
+            .execute(&panic_db)
+            .await;
         }
     });
 

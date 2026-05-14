@@ -1370,6 +1370,15 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                     yield 'data: {"type":"done"}\n\n'
                     done_emitted = True
                     break
+        except asyncio.CancelledError:
+            # Il client mcp-core ha chiuso la connessione TCP. NON dobbiamo
+            # mascherare la cancellazione (FastAPI ha bisogno di propagarla
+            # per il cleanup), ma il blocco `finally` sotto garantisce che
+            # `done` venga comunque emesso prima che il generator chiuda —
+            # questo previene il caso di mcp-core in attesa per 120s del
+            # timeout di silenzio quando lo stream e' gia' morto.
+            logger.warning("agent_run_stream cancellato dal client (CancelledError)")
+            raise
         except Exception as exc:
             import traceback as _tb
             logger.error("agent_run_stream error: %s\n%s", exc, _tb.format_exc())
@@ -1393,26 +1402,32 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
             if _retry_after is not None:
                 _payload["retry_after_seconds"] = _retry_after
             yield f"data: {_json.dumps(_payload)}\n\n"
-
-        if not end_turn_emitted and acc_total_tokens > 0:
-            yield (
-                "data: "
-                + _json.dumps({
-                    "type": "end_turn",
-                    "prompt_tokens": acc_prompt_tokens,
-                    "completion_tokens": acc_completion_tokens,
-                    "total_tokens": acc_total_tokens,
-                    "total_cost": acc_total_cost,
-                })
-                + "\n\n"
-            )
-
-        # Segnale terminale esplicito: mcp-core lo intercetta e chiude lo
-        # stream immediatamente invece di attendere il timeout di silenzio
-        # SSE (120s). Emesso solo se non gia' inviato in-loop quando il
-        # learner_node ha prodotto evento (caso flusso normale piu' rapido).
-        if not done_emitted:
-            yield 'data: {"type":"done"}\n\n'
+        finally:
+            # Garanzia di chiusura SSE: `done` deve essere SEMPRE emesso
+            # (anche su CancelledError, eccezione, o uscita normale del loop)
+            # affinche' mcp-core possa chiudere il proprio stream senza
+            # aspettare il timeout di silenzio (120s).
+            if not end_turn_emitted and acc_total_tokens > 0:
+                try:
+                    yield (
+                        "data: "
+                        + _json.dumps({
+                            "type": "end_turn",
+                            "prompt_tokens": acc_prompt_tokens,
+                            "completion_tokens": acc_completion_tokens,
+                            "total_tokens": acc_total_tokens,
+                            "total_cost": acc_total_cost,
+                        })
+                        + "\n\n"
+                    )
+                except (GeneratorExit, asyncio.CancelledError):
+                    # Client gia' chiuso, non possiamo piu' yield
+                    pass
+            if not done_emitted:
+                try:
+                    yield 'data: {"type":"done"}\n\n'
+                except (GeneratorExit, asyncio.CancelledError):
+                    pass
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 

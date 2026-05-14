@@ -3,9 +3,12 @@
 //! Responsabilita':
 //!   1. Probe periodico delle dipendenze infrastrutturali (Qdrant, embedder)
 //!      con persistenza in `nexus_dependency_health`.
-//!   2. Rilevamento e terminazione forzata di task background bloccati
+//!   2. Auto-recovery: se un servizio e' down, tenta il ripristino automatico
+//!      (restart container Docker, restart servizio systemd). Max 1 tentativo
+//!      ogni 5 minuti per evitare loop di restart.
+//!   3. Rilevamento e terminazione forzata di task background bloccati
 //!      (quality scan, vector compaction, agent processes).
-//!   3. Esposizione stato in-memory via `DependencyStatus` (atomico, zero-cost
+//!   4. Esposizione stato in-memory via `DependencyStatus` (atomico, zero-cost
 //!      per i consumer — nessun lock, nessuna query DB nel hot path).
 //!
 //! Il loop principale gira ogni 60s (configurabile via env
@@ -14,6 +17,7 @@
 //!   - Probe embedder (gRPC embed_text "watchdog", timeout 10s)
 //!   - Persiste risultati in DB (fire-and-forget)
 //!   - Aggiorna DependencyStatus atomicamente
+//!   - Se servizio DOWN: auto-recovery (con cooldown 5 min)
 //!   - Query task bloccati e li marca 'failed'
 //!   - Pulizia storico >24h
 //!
@@ -30,7 +34,9 @@ use serde_json::json;
 use sqlx::PgPool;
 use tokio::time::sleep;
 
+use crate::agent_types::AgentStepEvent;
 use crate::orchestrator::Orchestrator;
+use crate::AgentChannels;
 
 // ── Stato in-memory condiviso via Arc ────────────────────────────────────────
 
@@ -43,16 +49,17 @@ pub struct DependencyStatus {
     pub embedder: AtomicBool,
     /// Unix timestamp dell'ultimo check completato.
     pub last_check: AtomicI64,
+    /// Unix timestamp dell'ultimo tentativo di recovery (evita retry troppo frequenti).
+    pub last_recovery_attempt: AtomicI64,
 }
 
 impl DependencyStatus {
     pub fn new() -> Self {
         Self {
-            // Ottimista all'avvio: considera tutto sano fino al primo probe.
-            // Il primo probe avviene dopo 15s dal boot.
             qdrant: AtomicBool::new(true),
             embedder: AtomicBool::new(true),
             last_check: AtomicI64::new(0),
+            last_recovery_attempt: AtomicI64::new(0),
         }
     }
 }
@@ -73,6 +80,11 @@ const STALE_SCAN_MINUTES: i32 = 5;
 /// Soglia per considerare un agent process bloccato (10 minuti).
 const STALE_PROCESS_MINUTES: i32 = 10;
 
+/// Soglia per considerare un agent_run orfano (15 minuti senza completamento).
+/// Coperto da catch_unwind nel tokio::spawn ma serve safety-net per panic
+/// fuori dal body (es. crash mcp-core, DB tx fail post-emit).
+const STALE_AGENT_RUN_MINUTES: i32 = 15;
+
 // ── Spawn ────────────────────────────────────────────────────────────────────
 
 /// Avvia il watchdog in background. Restituisce subito.
@@ -80,6 +92,7 @@ pub fn spawn_task_watchdog(
     db: PgPool,
     orchestrator: Arc<Orchestrator>,
     status: DependencyStatusRef,
+    agent_channels: AgentChannels,
 ) {
     let enabled = std::env::var("NEXUS_TASK_WATCHDOG_ENABLED")
         .map(|v| v != "false" && v != "0")
@@ -100,7 +113,7 @@ pub fn spawn_task_watchdog(
         // Attesa iniziale: lascia tempo agli altri servizi di stabilizzarsi.
         sleep(Duration::from_secs(15)).await;
         loop {
-            run_cycle(&db, &orchestrator, &status).await;
+            run_cycle(&db, &orchestrator, &status, &agent_channels).await;
             sleep(Duration::from_secs(interval_s)).await;
         }
     });
@@ -108,8 +121,16 @@ pub fn spawn_task_watchdog(
 
 // ── Ciclo principale ─────────────────────────────────────────────────────────
 
-async fn run_cycle(db: &PgPool, orchestrator: &Orchestrator, status: &DependencyStatus) {
+async fn run_cycle(
+    db: &PgPool,
+    orchestrator: &Orchestrator,
+    status: &DependencyStatus,
+    agent_channels: &AgentChannels,
+) {
     // 1. Probe dipendenze
+    let was_qdrant_ok = status.qdrant.load(Ordering::Relaxed);
+    let was_embedder_ok = status.embedder.load(Ordering::Relaxed);
+
     let qdrant_result = probe_qdrant().await;
     let embedder_result = probe_embedder(orchestrator).await;
 
@@ -118,28 +139,48 @@ async fn run_cycle(db: &PgPool, orchestrator: &Orchestrator, status: &Dependency
     status.embedder.store(embedder_result.healthy, Ordering::Relaxed);
     status.last_check.store(Utc::now().timestamp(), Ordering::Relaxed);
 
-    // Log solo su cambio stato o errore (evita spam nei log)
-    if !qdrant_result.healthy {
+    // Log su cambio stato (evita spam nei log)
+    if !qdrant_result.healthy && was_qdrant_ok {
         tracing::warn!(
             "task_watchdog: qdrant DOWN — {} ({}ms)",
             qdrant_result.error_message.as_deref().unwrap_or("sconosciuto"),
             qdrant_result.latency_ms.unwrap_or(0),
         );
+    } else if qdrant_result.healthy && !was_qdrant_ok {
+        tracing::info!("task_watchdog: qdrant RIPRISTINATO ({}ms)", qdrant_result.latency_ms.unwrap_or(0));
     }
-    if !embedder_result.healthy {
+
+    if !embedder_result.healthy && was_embedder_ok {
         tracing::warn!(
             "task_watchdog: embedder DOWN — {} ({}ms)",
             embedder_result.error_message.as_deref().unwrap_or("sconosciuto"),
             embedder_result.latency_ms.unwrap_or(0),
         );
+    } else if embedder_result.healthy && !was_embedder_ok {
+        tracing::info!("task_watchdog: embedder RIPRISTINATO ({}ms)", embedder_result.latency_ms.unwrap_or(0));
     }
 
     // Persisti in DB (fire-and-forget)
     persist_probe(db, "qdrant", &qdrant_result).await;
     persist_probe(db, "embedder", &embedder_result).await;
 
+    // ── Auto-recovery servizi down (max 1 tentativo ogni 5 minuti) ────────
+    let now_ts = Utc::now().timestamp();
+    let last_recovery = status.last_recovery_attempt.load(Ordering::Relaxed);
+    let recovery_cooldown_expired = (now_ts - last_recovery) > 300;
+
+    if recovery_cooldown_expired && (!qdrant_result.healthy || !embedder_result.healthy) {
+        status.last_recovery_attempt.store(now_ts, Ordering::Relaxed);
+        if !qdrant_result.healthy {
+            attempt_recovery("qdrant", &qdrant_result).await;
+        }
+        if !embedder_result.healthy {
+            attempt_recovery("embedder", &embedder_result).await;
+        }
+    }
+
     // 2. Detect e termina task bloccati
-    terminate_stale_tasks(db).await;
+    terminate_stale_tasks(db, agent_channels).await;
 
     // 3. Pulizia storico >24h (una query leggera, eseguita ogni ciclo)
     let _ = sqlx::query(
@@ -147,6 +188,109 @@ async fn run_cycle(db: &PgPool, orchestrator: &Orchestrator, status: &Dependency
     )
     .execute(db)
     .await;
+}
+
+// ── Auto-recovery ───────────────────────────────────────────────────────────
+
+async fn attempt_recovery(service: &str, probe: &ProbeResult) {
+    let kind = probe.error_kind.as_deref().unwrap_or("unknown");
+    tracing::info!("task_watchdog: tentativo auto-recovery per {service} (errore: {kind})");
+
+    match (service, kind) {
+        ("qdrant", "connection_refused") => {
+            // Qdrant potrebbe essere un container Docker fermo
+            try_restart_container("qdrant").await;
+        }
+        ("qdrant", "timeout" | "too_many_files") => {
+            // Qdrant sovraccarico — restart del container
+            try_restart_container("qdrant").await;
+        }
+        ("embedder", "timeout") => {
+            // Il brain gRPC potrebbe avere il canale bloccato — restart del processo
+            try_restart_systemd_or_process("brain").await;
+        }
+        ("embedder", "embed_error") => {
+            // Errore nell'embedding — potrebbe essere un crash parziale del modello
+            try_restart_systemd_or_process("brain").await;
+        }
+        _ => {
+            tracing::debug!("task_watchdog: nessuna strategia di recovery per {service}/{kind}");
+        }
+    }
+}
+
+async fn try_restart_container(name_hint: &str) {
+    let output = tokio::process::Command::new("docker")
+        .args(["ps", "-a", "--filter", &format!("name={name_hint}"), "--format", "{{.Names}} {{.Status}}"])
+        .output()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            for line in stdout.lines() {
+                let container_name = line.split_whitespace().next().unwrap_or("");
+                if container_name.is_empty() { continue; }
+                // Non toccare container ideai-* (infrastruttura protetta)
+                if container_name.starts_with("ideai-") {
+                    tracing::info!(
+                        "task_watchdog: recovery {name_hint}: container {container_name} e' infrastruttura protetta, skip restart"
+                    );
+                    continue;
+                }
+                if line.contains("Exited") || line.contains("exited") {
+                    tracing::info!("task_watchdog: recovery {name_hint}: riavvio container {container_name}");
+                    let _ = tokio::process::Command::new("docker")
+                        .args(["start", container_name])
+                        .output()
+                        .await;
+                }
+            }
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::debug!("task_watchdog: recovery {name_hint}: docker ps fallito: {stderr}");
+        }
+        Err(e) => {
+            tracing::debug!("task_watchdog: recovery {name_hint}: docker non disponibile: {e}");
+        }
+    }
+}
+
+async fn try_restart_systemd_or_process(name_hint: &str) {
+    // Tenta restart via systemd (servizio utente)
+    let systemd_result = tokio::process::Command::new("systemctl")
+        .args(["--user", "restart", &format!("nexus-{name_hint}.service")])
+        .output()
+        .await;
+
+    match systemd_result {
+        Ok(o) if o.status.success() => {
+            tracing::info!("task_watchdog: recovery {name_hint}: riavviato via systemctl --user");
+            return;
+        }
+        _ => {}
+    }
+
+    // Fallback: cerca il processo e invia SIGHUP per forzare un reload
+    let pgrep = tokio::process::Command::new("pgrep")
+        .args(["-f", &format!("{name_hint}")])
+        .output()
+        .await;
+
+    if let Ok(o) = pgrep {
+        if o.status.success() {
+            let pids = String::from_utf8_lossy(&o.stdout);
+            let pid_count = pids.lines().count();
+            tracing::info!(
+                "task_watchdog: recovery {name_hint}: processo attivo ({pid_count} pid), il servizio gira ma non risponde al probe"
+            );
+        } else {
+            tracing::warn!(
+                "task_watchdog: recovery {name_hint}: nessun processo trovato, il servizio potrebbe essere completamente fermo"
+            );
+        }
+    }
 }
 
 // ── Probe dipendenze ─────────────────────────────────────────────────────────
@@ -274,7 +418,7 @@ async fn persist_probe(db: &PgPool, dependency: &str, result: &ProbeResult) {
 
 // ── Detect e termina task bloccati ───────────────────────────────────────────
 
-async fn terminate_stale_tasks(db: &PgPool) {
+async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
     // Quality scans bloccate (>5 minuti in "running")
     let stale_scans = sqlx::query_scalar::<_, i64>(
         "UPDATE nexus_quality_scans \
@@ -329,6 +473,64 @@ async fn terminate_stale_tasks(db: &PgPool) {
 
     for id in &stale_processes {
         tracing::warn!("task_watchdog: terminato agent process bloccato id={}", id);
+    }
+
+    // Agent runs orfani (>15 minuti senza completamento). Tipico scenario:
+    // panic NON catturato fuori dal catch_unwind del body, crash mcp-core
+    // prima del UPDATE finale, oppure DB tx fallita post-emit. La query
+    // ritorna anche session_id per emettere un messaggio assistant di errore
+    // in chat (cosi' l'utente vede il fallimento e puo' riprovare).
+    let stale_runs = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, Option<uuid::Uuid>, Option<uuid::Uuid>)>(
+        "UPDATE agent_runs SET \
+             status = 'timed_out', \
+             completed_at = NOW(), \
+             final_answer = COALESCE(final_answer, \
+                 'Watchdog: run terminato per timeout (>15 minuti senza completamento). Riprova.') \
+         WHERE status IN ('running', 'awaiting_confirmation') \
+           AND created_at < NOW() - make_interval(mins => $1) \
+         RETURNING id, session_id, project_id, run_message_id",
+    )
+    .bind(STALE_AGENT_RUN_MINUTES)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    for (run_id, session_id, project_id_opt, request_msg_id) in &stale_runs {
+        tracing::warn!(
+            "task_watchdog: terminato agent_run orfano id={} session={}",
+            run_id, session_id
+        );
+
+        // 1. Emetti is_final sul broadcast (se canale ancora attivo) per
+        //    sbloccare eventuali EventSource ancora in ascolto.
+        if let Some(tx) = agent_channels.get(run_id) {
+            let _ = tx.send(AgentStepEvent {
+                run_id: run_id.to_string(),
+                step: None,
+                trace: None,
+                is_final: true,
+                token_delta: None,
+            });
+        }
+        agent_channels.remove(run_id);
+
+        // 2. Inserisci un assistant_message di errore visibile in chat,
+        //    cosi' l'utente sa che il run e' fallito (anziche' fissare
+        //    una UI vuota).
+        if let Some(project_id) = project_id_opt {
+            let _ = sqlx::query(
+                r#"INSERT INTO chat_messages
+                   (id, session_id, project_id, role, content, metadata, request_message_id, created_at)
+                   VALUES (gen_random_uuid(),$1,$2,'assistant',$3,$4,$5,NOW())"#,
+            )
+            .bind(session_id)
+            .bind(project_id)
+            .bind("⚠ Watchdog: il run agente e' stato terminato per timeout (>15 minuti senza completamento). Puoi riprovare la richiesta.")
+            .bind(json!({"errorClass": "watchdog_timeout", "agentRunId": run_id.to_string()}))
+            .bind(request_msg_id)
+            .execute(db)
+            .await;
+        }
     }
 }
 

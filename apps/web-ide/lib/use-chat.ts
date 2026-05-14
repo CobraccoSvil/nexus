@@ -380,18 +380,58 @@ export function useChat(
         },
         async () => {
           try {
-            const finalRun = await getAgentRun(runId);
+            // Helper per valutare lo stato come terminale
+            const isStatusTerminal = (status: string) =>
+              status === "completed" ||
+              status === "failed" ||
+              status === "timed_out" ||
+              status === "cancelled" ||
+              status === "interrupted" ||
+              status === "loop_aborted" ||
+              status === "provider_unavailable";
+
+            // Polling con retry: se l'evento agent_final SSE e' arrivato MA
+            // il DB risponde ancora "running", potrebbe esserci una race
+            // condition (UPDATE finale in corso) oppure un bug backend
+            // (panic dopo emit ma prima del UPDATE). Riproviamo 3 volte ×
+            // 2s. Se dopo 6 secondi il DB resta non-terminale, FORZIAMO lo
+            // stato terminale lato UI (l'SSE diceva is_final=true,
+            // dobbiamo fidarci e sbloccare l'utente).
+            let finalRun = await getAgentRun(runId);
+            let attempts = 0;
+            const MAX_RETRIES = 3;
+            while (!isStatusTerminal(finalRun.status) && attempts < MAX_RETRIES) {
+              await new Promise((r) => setTimeout(r, 2000));
+              attempts += 1;
+              try {
+                finalRun = await getAgentRun(runId);
+              } catch {
+                break;
+              }
+            }
+            // Sintetizza terminale forzato se il DB non si e' aggiornato:
+            // l'SSE ci ha gia' detto is_final=true, quindi consideriamo
+            // il run concluso (failed) e sblocchiamo la UI. Senza questo
+            // l'utente vede il pulsante Stop rosso indefinitamente.
+            const dbIsTerminal = isStatusTerminal(finalRun.status);
+            if (!dbIsTerminal) {
+              console.warn(
+                `[use-chat] agent_final ricevuto ma DB resta status=${finalRun.status} dopo ${MAX_RETRIES} retry. Forzo terminale (failed) lato UI.`,
+              );
+              finalRun = {
+                ...finalRun,
+                status: "failed",
+                finalAnswer:
+                  finalRun.finalAnswer ||
+                  "⚠ Il backend ha chiuso lo stream ma il database non si e' aggiornato. La risposta potrebbe non essere stata salvata correttamente.",
+              };
+            }
             setAgentRuns((prev) => new Map(prev).set(runId, finalRun));
             setAgentStepsMap((prev) => new Map(prev).set(runId, finalRun.steps));
             if (isPrimary) {
-              const isTerminal =
-                finalRun.status === "completed" ||
-                finalRun.status === "failed" ||
-                finalRun.status === "timed_out" ||
-                finalRun.status === "cancelled" ||
-                finalRun.status === "interrupted" ||
-                finalRun.status === "loop_aborted" ||
-                finalRun.status === "provider_unavailable";
+              // Dopo il retry, il run e' sempre considerato terminale
+              // (vero terminale dal DB, oppure forzato fail dopo timeout)
+              const isTerminal = isStatusTerminal(finalRun.status);
               if (isTerminal) {
                 // Run completato: ripulisci lo stato dell'agente attivo
                 // cosi' la UI smette di mostrare "Agente in esecuzione" e

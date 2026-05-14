@@ -565,6 +565,7 @@ async fn main() -> anyhow::Result<()> {
         state.db.clone(),
         std::sync::Arc::new(state.orchestrator.clone()),
         state.dependency_status.clone(),
+        state.agent_channels.clone(),
     );
 
     // Worker `model_catalog_sync`: ogni 24h aggiorna ai_price_catalog
