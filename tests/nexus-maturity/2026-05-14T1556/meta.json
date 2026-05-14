@@ -41,5 +41,27 @@
   "project_setup_status": "OK — creato via UI col fix #1 (bottone 'Importa cartella locale...')",
   "project_setup_method": "UI ProjectImportWizard cablato dal Fix #1 (cat G)",
   "t0_will_be_recorded_after": "creazione progetto UI + invio primo prompt",
-  "ui_automation_mode_label": "Continuo (UI label) — mapping atteso verso backend "
+  "ui_automation_mode_label": "Continuo (UI label) — mapping atteso verso backend ",
+  "ideai_post_fixes_sha": "61b1e45fb1efd10a356c9f5ac8b61fd5fe1597bf",
+  "ideai_monitor_baseline_sha": "61b1e45fb1efd10a356c9f5ac8b61fd5fe1597bf",
+  "ideai_baseline_after_m4m2": "16fec82f028df87437dde3d486f55d12b4fc34b1",
+  "iter_02_start": "2026-05-14T17:13:30.499965+02:00",
+  "iter_02_baseline_sha_ideai": "16fec82f028df87437dde3d486f55d12b4fc34b1",
+  "iter_02_baseline_sha_target": "c1f573a803204f80fbcc5be11ca169895eeeda80",
+  "fixes_applied_before_iter2": [
+    "Fix #3 (M4) — autonomia MODALITA AUTOMATICA rinforzata in chat_messages.rs",
+    "Fix #4 (M2) — hook write_file -> project_documents in agent_tools/files.rs"
+  ],
+  "iter_02_strategy": "Uso pulsanti 'Risolvi con Nexus' sui pannelli (Problemi/Porte/Console Debug/Run&Debug/Source Control) per ogni errore residuo, invece di re-inviare prompt liberi nella chat.",
+  "ideai_baseline_after_fix5": "cb589f877532c12e912bc8dd66dcf71aae94a803",
+  "iter_03_start": "2026-05-14T18:07:27.860016+02:00",
+  "iter_03_baseline_sha_ideai": "cb589f877532c12e912bc8dd66dcf71aae94a803",
+  "iter_03_strategy": "Continua il lavoro di iter_02 (filesystem MANTENUTO). Obiettivo: avviare backend+frontend e verificare via HTTP. Fix #5 attivo nel system prompt rinforza il criterio di accettazione.",
+  "fixes_active_in_iter3": [
+    "Fix #1 cabling ProjectImportWizard (UI utente)",
+    "Fix #2 backdrop overlay wizard (UI utente)",
+    "Fix #3 (M4) autonomia MODALITA AUTOMATICA",
+    "Fix #4 (M2) hook write_file -> project_documents",
+    "Fix #5 criterio accettazione include avvio HTTP"
+  ]
 }

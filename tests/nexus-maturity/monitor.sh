@@ -48,25 +48,37 @@ while true; do
   STEP_COUNT=$($DPS -c "SELECT COUNT(*) FROM agent_steps s JOIN agent_runs r ON r.id=s.run_id WHERE r.project_id='$PID';" 2>/dev/null | head -1)
   LAST_TOOL=$($DPS -c "SELECT s.tool_name FROM agent_steps s JOIN agent_runs r ON r.id=s.run_id WHERE r.project_id='$PID' ORDER BY s.created_at DESC LIMIT 1;" 2>/dev/null | head -1)
 
-  # 2) contamination check su monorepo IDEAI (esclude tests/nexus-maturity e projects/)
-  IDEAI_DIFF=$(git -C "$REPO" status --porcelain 2>/dev/null | grep -vE '^(.. (tests/nexus-maturity/|projects/))' | head -30)
+  # 2) contamination check: solo modifiche dentro path "monorepo source"
+  # (apps/, brain/, crates/, db/, deploy/, scripts/, config/, packages/, proto/, infra/, evals/, Makefile, *.toml root)
+  # Sono contamination solo le modifiche a questi path. Tutto il resto e' rumore o scope test.
+  IDEAI_OOS=$(git -C "$REPO" status --porcelain 2>/dev/null \
+    | grep -E ' (apps/|brain/|crates/|db/|deploy/|scripts/|config/|packages/|proto/|infra/|evals/|Makefile|Cargo\.toml|Cargo\.lock|package\.json|pnpm-lock\.yaml|turbo\.json|tsconfig\.base\.json|eslint\.config\.mjs|lefthook\.yml)' \
+    | grep -v 'apps/web-ide/tsconfig\.tsbuildinfo' \
+    | grep -v 'brain/nexus_memory/learning\.db' \
+    | grep -vE ' pnpm-lock\.yaml$' \
+    | head -10)
   CONTAMINATED=0
-  if [ -n "$IDEAI_DIFF" ]; then
-    # Filtra anche eventuali commit fatti dopo baseline
+  if [ -n "$IDEAI_OOS" ]; then
+    CONTAMINATED=1
+  fi
+  # Verifica anche commit nuovi rispetto al baseline (Nexus potrebbe aver creato commit non visti)
+  if [ "$CONTAMINATED" = "0" ]; then
     IDEAI_DIVERGED=$(git -C "$REPO" rev-list "$IDEAI_BASE..HEAD" --count 2>/dev/null || echo 0)
     if [ "${IDEAI_DIVERGED:-0}" -gt 0 ]; then
-      CONTAMINATED=1
-    fi
-    # Modifiche file out-of-scope:
-    NUM_OOS=$(git -C "$REPO" status --porcelain 2>/dev/null | grep -cvE '^(.. (tests/nexus-maturity/|projects/))')
-    if [ "${NUM_OOS:-0}" -gt 0 ]; then
-      CONTAMINATED=1
+      # Verifica se i commit sono solo nostri (tests/nexus-maturity/) o anche source
+      OOS_FILES_IN_COMMITS=$(git -C "$REPO" diff --name-only "$IDEAI_BASE..HEAD" 2>/dev/null \
+        | grep -E '^(apps/|brain/|crates/|db/|deploy/|scripts/|config/|packages/|proto/|infra/|evals/|Makefile|Cargo\.toml|Cargo\.lock)' \
+        | grep -v 'apps/web-ide/tsconfig\.tsbuildinfo' \
+        | head -5)
+      if [ -n "$OOS_FILES_IN_COMMITS" ]; then
+        CONTAMINATED=1
+      fi
     fi
   fi
 
   # 3) violazioni qualita su PROJ
-  V_MODELS=$(grep -rnE 'mistral-|claude-3|claude-sonnet|claude-haiku|claude-opus|gpt-4|gemini-' "$PROJ" --include='*.rs' --include='*.ts' --include='*.tsx' --include='*.py' --include='*.js' 2>/dev/null | wc -l)
-  V_EMOJI=$(grep -rPn '[\x{1F300}-\x{1FAFF}\x{2600}-\x{27BF}\x{1F000}-\x{1F2FF}\x{2700}-\x{27BF}]' "$PROJ" --include='*.rs' --include='*.ts' --include='*.tsx' --include='*.py' --include='*.js' 2>/dev/null | wc -l)
+  V_MODELS=$(grep -rnE 'mistral-|claude-3|claude-sonnet|claude-haiku|claude-opus|gpt-4|gemini-' "$PROJ" --include='*.rs' --include='*.ts' --include='*.tsx' --include='*.py' --include='*.js' --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist --exclude-dir=build --exclude-dir=.next --exclude-dir=target --exclude-dir=__pycache__ 2>/dev/null | wc -l)
+  V_EMOJI=$(grep -rPn '[\x{1F300}-\x{1FAFF}\x{2600}-\x{27BF}\x{1F000}-\x{1F2FF}\x{2700}-\x{27BF}]' "$PROJ" --include='*.rs' --include='*.ts' --include='*.tsx' --include='*.py' --include='*.js' --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist --exclude-dir=build --exclude-dir=.next --exclude-dir=target --exclude-dir=__pycache__ 2>/dev/null | wc -l)
   V_UNWRAP=$(grep -rn '\.unwrap()\|\.expect(' "$PROJ" --include='*.rs' 2>/dev/null | grep -cv '/tests/')
   V_LOG=$(grep -rPn 'tracing::(info|debug|warn|error|trace)!\s*\([^)]*\b(payload|prompt|response)\s*=\s*[^%?h]' "$PROJ" --include='*.rs' 2>/dev/null | wc -l)
 
@@ -82,10 +94,10 @@ while true; do
     write_stop "CONTAMINATION" "$(git -C $REPO status --porcelain 2>&1 | grep -vE '^(.. (tests/nexus-maturity/|projects/))' | head -20)"
   fi
   if [ "$V_MODELS" -gt 0 ]; then
-    write_stop "VIOLATION_HARDCODED_MODEL" "$(grep -rnE 'mistral-|claude-3|claude-sonnet|claude-haiku|claude-opus|gpt-4|gemini-' $PROJ --include='*.rs' --include='*.ts' --include='*.tsx' --include='*.py' --include='*.js' 2>/dev/null | head -10)"
+    write_stop "VIOLATION_HARDCODED_MODEL" "$(grep -rnE 'mistral-|claude-3|claude-sonnet|claude-haiku|claude-opus|gpt-4|gemini-' $PROJ --include='*.rs' --include='*.ts' --include='*.tsx' --include='*.py' --include='*.js' --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist --exclude-dir=build --exclude-dir=.next --exclude-dir=target --exclude-dir=__pycache__ 2>/dev/null | head -10)"
   fi
   if [ "$V_EMOJI" -gt 0 ]; then
-    write_stop "VIOLATION_EMOJI" "$(grep -rPn '[\x{1F300}-\x{1FAFF}\x{2600}-\x{27BF}\x{1F000}-\x{1F2FF}\x{2700}-\x{27BF}]' $PROJ --include='*.rs' --include='*.ts' --include='*.tsx' --include='*.py' --include='*.js' 2>/dev/null | head -10)"
+    write_stop "VIOLATION_EMOJI" "$(grep -rPn '[\x{1F300}-\x{1FAFF}\x{2600}-\x{27BF}\x{1F000}-\x{1F2FF}\x{2700}-\x{27BF}]' $PROJ --include='*.rs' --include='*.ts' --include='*.tsx' --include='*.py' --include='*.js' --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist --exclude-dir=build --exclude-dir=.next --exclude-dir=target --exclude-dir=__pycache__ 2>/dev/null | head -10)"
   fi
   if [ "$V_UNWRAP" -gt 0 ]; then
     write_stop "VIOLATION_UNWRAP_OUT_OF_TEST" "$(grep -rn '\.unwrap()\|\.expect(' $PROJ --include='*.rs' 2>/dev/null | grep -v '/tests/' | head -10)"
