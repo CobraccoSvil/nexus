@@ -387,10 +387,33 @@ export function BottomPanelManager({
               Nessun run Playwright disponibile. Premi <strong>Abilita Playwright</strong> per configurare il framework di test, poi <strong>Avvia test</strong> per eseguirli.
             </div>
           ) : (
-            playwrightRuns.map((run) => (
+            playwrightRuns.map((run) => {
+              // Fix M46: distingue setup (install deps/browsers) da test execution.
+              // I jobs in DB hanno tutti kind='playwright_test' ma alcuni sono
+              // chiaramente install (apt-get, pnpm add @playwright/test, playwright
+              // install chromium). Classificazione regex sul label+summary.
+              const s = `${run.label} ${run.summary ?? ""}`.toLowerCase();
+              const isSetup =
+                s.includes("installing dependencies") ||
+                s.includes("switching to root") ||
+                s.includes("failed to install browsers") ||
+                s.includes("@playwright/test") ||
+                s.includes("chromium_headless_shell") ||
+                /\b(ffmpeg|firefox-\d|webkit-\d)\b/.test(s) ||
+                (s.includes("installed") && !s.includes("test"));
+              const category: "setup" | "test" = isSetup ? "setup" : "test";
+              const badgeBg = category === "setup" ? "#6b7280" : "#3b82f6";
+              return (
               <div key={run.id} style={tileStyle(tc)}>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                  <span className="font-semibold" style={{ color: tc.text }}>{run.label}</span>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{
+                      background: badgeBg, color: "#fff", fontSize: 9, fontWeight: 700,
+                      padding: "1px 6px", borderRadius: 3, textTransform: "uppercase",
+                      letterSpacing: 0.5,
+                    }}>{category}</span>
+                    <span className="font-semibold" style={{ color: tc.text }}>{run.label}</span>
+                  </div>
                   <span style={{
                     color: run.status === "passed" ? "#10b981" : run.status === "failed" ? tc.error : tc.textMuted,
                     fontSize: 11, fontWeight: 600,
@@ -424,7 +447,8 @@ export function BottomPanelManager({
                   </div>
                 )}
               </div>
-            ))
+              );
+            })
           )}
         </div>
       </div>
