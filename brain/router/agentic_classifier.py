@@ -430,11 +430,15 @@ CRITICAL:
 - "esegui test e correggi fail" / "fai funzionare i test" → intent=debug, action_verb=resolve.
 - "fix bug at file.py:42" → intent=fix, action_verb=resolve, scope=single.
 - "leggi file.py" → intent=code_read, action_verb=read.
+- "fai/crea/costruisci/realizza una app|applicazione|sistema|sito|servizio|piattaforma per X" → intent=architecture, action_verb=write, scope=system_wide, complexity=high. E' scaffolding completo (PRD + schema DB + backend + frontend + test). NON e' docs.
+- "scaffold/genera progetto" / "boilerplate" / "starter kit" → intent=architecture, scope=system_wide.
 
 Use confidence<0.7 honestly when ambiguous (downstream asks user). NEVER inflate.
 
 Examples:
 - "ciao" → {{"intent":"chat","agentic_score":0.0,"requires_tools":false,"complexity":"low","confidence":0.99,"candidates":[{{"intent":"chat","confidence":0.99}}],"slots":{{"action_verb":"read","target_type":"code","framework":"","scope":"single","confidence":0.10}}}}
+- "Fai una app per la gestione di un autonoleggio" → {{"intent":"architecture","agentic_score":0.95,"requires_tools":true,"complexity":"high","confidence":0.92,"candidates":[{{"intent":"architecture","confidence":0.92}}],"slots":{{"action_verb":"write","target_type":"service","framework":"","scope":"system_wide","confidence":0.90}}}}
+- "Crea un sito ecommerce con catalogo e carrello" → {{"intent":"architecture","agentic_score":0.95,"requires_tools":true,"complexity":"high","confidence":0.92,"candidates":[{{"intent":"architecture","confidence":0.92}}],"slots":{{"action_verb":"write","target_type":"service","framework":"","scope":"system_wide","confidence":0.88}}}}
 - "leggi src/main.py" → {{"intent":"code_read","agentic_score":0.8,"requires_tools":true,"complexity":"low","confidence":0.95,"candidates":[{{"intent":"code_read","confidence":0.95}}],"slots":{{"action_verb":"read","target_type":"code","framework":"","scope":"single","confidence":0.95}}}}
 - "scrivi un test per foo()" → {{"intent":"test","agentic_score":0.7,"requires_tools":true,"complexity":"medium","confidence":0.92,"candidates":[{{"intent":"test","confidence":0.92}}],"slots":{{"action_verb":"write","target_type":"tests","framework":"","scope":"single","confidence":0.90}}}}
 - "esegui i test playwright e risolvi i fail" → {{"intent":"debug","agentic_score":0.95,"requires_tools":true,"complexity":"high","confidence":0.85,"candidates":[{{"intent":"debug","confidence":0.85}},{{"intent":"fix","confidence":0.70}}],"slots":{{"action_verb":"resolve","target_type":"tests","framework":"playwright","scope":"multi_file","confidence":0.92}}}}
