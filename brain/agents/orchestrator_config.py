@@ -1,0 +1,234 @@
+"""Configurazione runtime per il nuovo orchestrator Plan/Act/Verify (PR-1+).
+
+Tutti i parametri vengono letti ESCLUSIVAMENTE dalla tabella `settings` del DB
+(categoria 'orchestrator'). Nessuna variabile d'ambiente viene usata: ogni
+modifica admin e' applicabile a caldo dall'interfaccia admin senza rideploy.
+
+Cache in memoria con TTL 60 secondi: un aggiornamento admin diventa attivo
+entro un minuto senza riavvio del servizio.
+
+Chiavi DB (categoria 'orchestrator', vedi mig 0150):
+    plan_phase_enabled              bool   default: false
+    plan_behavior_modes             csv    default: 'automatico,continuo'
+    plan_intents                    csv    default: 'code,implement,fix,refactor,scaffold_app,architecture'
+    plan_min_token_budget           int    default: 2000
+    planner_prompt_key              str    default: 'agent.planner.base'
+    todo_reminder_every_n_steps     int    default: 5
+    todo_reminder_min_todos         int    default: 3
+    verifier_enabled                bool   default: false
+    max_verify_cycles               int    default: 3
+    max_plan_revisions              int    default: 2
+    verifier_timeout_s              float  default: 30.0
+
+Fail-safe: se DB irraggiungibile al primo avvio o keys mancanti, i default
+conservativi qui sotto DISABILITANO la feature (plan_phase_enabled=False,
+verifier_enabled=False) cosi' il sistema continua a comportarsi come prima
+del PR-1.
+"""
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# TTL della cache locale (secondi). Ogni modifica admin diventa attiva entro questo intervallo.
+_CACHE_TTL_S = 60.0
+
+# Tutte le chiavi attese dal DB. Niente prefisso 'orchestrator.' qui: viene aggiunto
+# in _load_from_db quando si formula la query. Le chiavi locali tengono il nome
+# pulito per uso programmatico.
+_KEY_PREFIX = "orchestrator."
+_KEYS = (
+    "plan_phase_enabled",
+    "plan_behavior_modes",
+    "plan_intents",
+    "plan_min_token_budget",
+    "planner_prompt_key",
+    "todo_reminder_every_n_steps",
+    "todo_reminder_min_todos",
+    "verifier_enabled",
+    "max_verify_cycles",
+    "max_plan_revisions",
+    "verifier_timeout_s",
+)
+
+# Default conservativi: feature OFF se DB irraggiungibile.
+_SAFE_DEFAULTS: dict[str, Any] = {
+    "plan_phase_enabled": False,
+    "plan_behavior_modes": ["automatico", "continuo"],
+    "plan_intents": ["code", "implement", "fix", "refactor", "scaffold_app", "architecture"],
+    "plan_min_token_budget": 2000,
+    "planner_prompt_key": "agent.planner.base",
+    "todo_reminder_every_n_steps": 5,
+    "todo_reminder_min_todos": 3,
+    "verifier_enabled": False,
+    "max_verify_cycles": 3,
+    "max_plan_revisions": 2,
+    "verifier_timeout_s": 30.0,
+}
+
+_lock = threading.RLock()
+_cache: dict[str, Any] = dict(_SAFE_DEFAULTS)
+_cache_loaded_at: float = 0.0
+
+
+def _coerce(value: str, default: Any) -> Any:
+    """Converte una stringa value dal DB nel tipo del default."""
+    if isinstance(default, bool):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    if isinstance(default, float):
+        try:
+            return float(value.strip())
+        except (ValueError, TypeError):
+            return default
+    if isinstance(default, int):
+        try:
+            return int(value.strip())
+        except (ValueError, TypeError):
+            return default
+    if isinstance(default, list):
+        # CSV → list[str], strip + filter empty
+        return [s.strip() for s in value.split(",") if s.strip()]
+    return value.strip()
+
+
+def _load_from_db() -> dict[str, Any]:
+    """Legge i settings orchestrator dalla tabella `settings` via psycopg2."""
+    import os
+    database_url = os.environ.get("DATABASE_URL", "")
+    if not database_url:
+        logger.warning("orchestrator_config: DATABASE_URL non impostato, uso safe_defaults")
+        return dict(_SAFE_DEFAULTS)
+
+    try:
+        import psycopg2  # type: ignore[import-untyped]
+    except ImportError:
+        logger.warning("orchestrator_config: psycopg2 non installato, uso safe_defaults")
+        return dict(_SAFE_DEFAULTS)
+
+    full_keys = [_KEY_PREFIX + k for k in _KEYS]
+    try:
+        conn = psycopg2.connect(database_url)
+        try:
+            with conn.cursor() as cur:
+                keys_placeholder = ",".join(f"'{k}'" for k in full_keys)
+                cur.execute(
+                    f"SELECT key, value FROM settings WHERE key IN ({keys_placeholder})"
+                )
+                rows = {k: v for k, v in cur.fetchall()}
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.error("orchestrator_config: errore lettura DB: %s", exc)
+        return dict(_cache)  # mantiene valori precedenti in caso di errore transitorio
+
+    result: dict[str, Any] = {}
+    for local_key, safe_val in _SAFE_DEFAULTS.items():
+        raw = rows.get(_KEY_PREFIX + local_key, "")
+        if not raw:
+            result[local_key] = safe_val
+            continue
+        result[local_key] = _coerce(raw, safe_val)
+
+    return result
+
+
+def _refresh_if_stale() -> None:
+    """Ricarica la cache dal DB se il TTL e' scaduto."""
+    global _cache, _cache_loaded_at
+    now = time.monotonic()
+    with _lock:
+        if now - _cache_loaded_at < _CACHE_TTL_S:
+            return
+        fresh = _load_from_db()
+        _cache = fresh
+        _cache_loaded_at = now
+        logger.debug(
+            "orchestrator_config: cache aggiornata (plan_enabled=%s verifier_enabled=%s)",
+            fresh.get("plan_phase_enabled"),
+            fresh.get("verifier_enabled"),
+        )
+
+
+def get() -> dict[str, Any]:
+    """Restituisce la configurazione orchestrator corrente (cache TTL 60s)."""
+    _refresh_if_stale()
+    with _lock:
+        return dict(_cache)
+
+
+# ── Accessori tipizzati ────────────────────────────────────────────────────
+
+def plan_phase_enabled() -> bool:
+    return bool(get()["plan_phase_enabled"])
+
+
+def verifier_enabled() -> bool:
+    return bool(get()["verifier_enabled"])
+
+
+def plan_behavior_modes() -> list[str]:
+    return list(get()["plan_behavior_modes"])
+
+
+def plan_intents() -> list[str]:
+    return list(get()["plan_intents"])
+
+
+def plan_min_token_budget() -> int:
+    return int(get()["plan_min_token_budget"])
+
+
+def planner_prompt_key() -> str:
+    return str(get()["planner_prompt_key"])
+
+
+def todo_reminder_every_n_steps() -> int:
+    return int(get()["todo_reminder_every_n_steps"])
+
+
+def todo_reminder_min_todos() -> int:
+    return int(get()["todo_reminder_min_todos"])
+
+
+def max_verify_cycles() -> int:
+    return int(get()["max_verify_cycles"])
+
+
+def max_plan_revisions() -> int:
+    return int(get()["max_plan_revisions"])
+
+
+def verifier_timeout_s() -> float:
+    return float(get()["verifier_timeout_s"])
+
+
+def is_eligible(behavior_mode: str | None, intent: str | None, token_budget: int) -> bool:
+    """Helper booleano: il run corrente puo' attivare il planner?
+
+    Tutti e 4 i check devono passare:
+    1. plan_phase_enabled = True
+    2. behavior_mode in plan_behavior_modes
+    3. intent in plan_intents
+    4. token_budget >= plan_min_token_budget
+    """
+    cfg = get()
+    if not cfg["plan_phase_enabled"]:
+        return False
+    if behavior_mode and behavior_mode.lower() not in [m.lower() for m in cfg["plan_behavior_modes"]]:
+        return False
+    if intent and intent.lower() not in [i.lower() for i in cfg["plan_intents"]]:
+        return False
+    if int(token_budget or 0) < int(cfg["plan_min_token_budget"]):
+        return False
+    return True
+
+
+def force_reload() -> None:
+    """Invalida la cache e forza una rilettura immediata dal DB (utile nei test)."""
+    global _cache_loaded_at
+    with _lock:
+        _cache_loaded_at = 0.0
