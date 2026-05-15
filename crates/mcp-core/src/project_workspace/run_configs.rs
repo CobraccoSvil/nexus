@@ -278,6 +278,23 @@ pub async fn auto_populate_run_configs(
         return;
     }
 
+    // Fix M40: pre-carica le allocazioni dal DB per propagarle nell'env del
+    // run_config. Map label -> port. Senza questo le porte allocate in
+    // nexus_port_allocations restavano "fantasma": il run_config aveva
+    // PORT=5000 hardcoded e il sistema port_allocation non veniva mai usato.
+    let allocations_map: std::collections::HashMap<String, i32> =
+        sqlx::query_as::<_, (i32, String)>(
+            "SELECT port, COALESCE(label, '') FROM nexus_port_allocations \
+             WHERE project_id = $1",
+        )
+        .bind(project_id)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(port, label)| (label.to_lowercase(), port))
+        .collect();
+
     let mut inserted = 0_usize;
     for s in &suggestions {
         let label = s.get("label").and_then(|v| v.as_str()).unwrap_or("run").to_string();
@@ -296,10 +313,28 @@ pub async fn auto_populate_run_configs(
             })
             .unwrap_or_default();
         let cwd = s.get("cwd").and_then(|v| v.as_str()).map(str::to_string);
-        let env = s.get("env").cloned().unwrap_or(json!({}));
+        let mut env = s.get("env").cloned().unwrap_or(json!({}));
         let role = s.get("role").and_then(|v| v.as_str()).map(str::to_string);
         let essential = s.get("essential").and_then(|v| v.as_bool()).unwrap_or(false);
         let group = s.get("group").and_then(|v| v.as_str()).map(str::to_string);
+
+        // Fix M40: se il run_config ha role=backend/frontend e c'e una
+        // allocation per "<role>-dev" o "<role>", sostituisci env.PORT con
+        // quella porta. Il backend Fastify (legge process.env.PORT) ascoltera
+        // sulla porta allocata; il frontend Vite no ma il valore appare nel
+        // pannello UI per coerenza visiva.
+        if let Some(role_str) = &role {
+            let role_lc = role_str.to_lowercase();
+            let alloc_port = allocations_map
+                .get(&format!("{}-dev", role_lc))
+                .or_else(|| allocations_map.get(&role_lc))
+                .copied();
+            if let Some(p) = alloc_port {
+                if let Some(env_obj) = env.as_object_mut() {
+                    env_obj.insert("PORT".to_string(), json!(p.to_string()));
+                }
+            }
+        }
 
         let res = sqlx::query(
             "INSERT INTO run_configurations \
