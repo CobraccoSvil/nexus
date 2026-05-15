@@ -391,10 +391,20 @@ async fn build_composed_system_context(
                         })
                 })
                 .unwrap_or(false);
+            // Fix M54: include infrastruttura Nexus disponibile (DB Postgres,
+            // Redis, range porte) cosi l'agente sa che puo creare DB applicativi
+            // e allocare porte autonomamente, senza chiedere all'utente.
+            let infra_block = "INFRASTRUTTURA NEXUS DISPONIBILE (usa autonomamente, no domande utente):\n  \
+                 Postgres applicativi: localhost:5433 user=nexus pass=nexus (container ideai-postgres-nexus-1).\n    \
+                   Per il DB del progetto: CREATE DATABASE <slug>; (psql -h localhost -p 5433 -U nexus -d postgres).\n    \
+                   Connection string standard: postgresql://nexus:nexus@localhost:5433/<slug>\n  \
+                 Redis: localhost:6379 (cache opzionale).\n  \
+                 Tool MCP request_port(label): alloca porte dinamiche (range 20000-39999) — usa al posto di hardcodare 3000/5173.";
             if let Some(summary) = analysis_summary {
                 format!(
                     "=== CONTESTO PROGETTO (non chiedere queste informazioni: sono gia' qui) ===\n\
                      Progetto: {} | ProjectId: {} | Root: {} | Git: {}\n\
+                     {}\n\
                      Endpoint REST disponibili (auth via cookie sessione, chiamabili via run_command + curl):\n\
                        POST /api/projects/{}/services/allocate-port  body {{label:\"backend-dev\"}}\n\
                        POST /api/projects/{}/services/install-playwright\n\
@@ -406,6 +416,7 @@ async fn build_composed_system_context(
                     project_id,
                     root_path.display(),
                     if proj.is_git_repo { "si" } else { "no" },
+                    infra_block,
                     project_id, project_id, project_id, project_id,
                     summary
                 )
@@ -415,6 +426,7 @@ async fn build_composed_system_context(
                      Progetto: {} | ProjectId: {} | Root: {} | Git: {}\n\
                      REPOSITORY VUOTO (solo {}). NON chiamare list_files: SAI gia' che e' vuoto.\n\
                      Inizia direttamente con write_file dei file richiesti dall'utente.\n\
+                     {}\n\
                      Endpoint REST disponibili (chiamabili via run_command + curl):\n\
                        POST /api/projects/{}/services/allocate-port  body {{label:\"backend-dev\"}}\n\
                        POST /api/projects/{}/services/install-playwright\n\
@@ -425,6 +437,7 @@ async fn build_composed_system_context(
                     root_path.display(),
                     if proj.is_git_repo { "si" } else { "no" },
                     if proj.is_git_repo { ".git/" } else { "vuoto" },
+                    infra_block,
                     project_id, project_id, project_id,
                 )
             } else {
@@ -432,6 +445,7 @@ async fn build_composed_system_context(
                     "=== CONTESTO PROGETTO ===\n\
                      Progetto: {} | ProjectId: {} | Root: {} | Git: {}\n\
                      (Nessuna analisi disponibile: usa list_files solo per la prima esplorazione, poi memorizza)\n\
+                     {}\n\
                      Endpoint REST disponibili (chiamabili via run_command + curl):\n\
                        POST /api/projects/{}/services/allocate-port  body {{label:\"backend-dev\"}}\n\
                        POST /api/projects/{}/services/install-playwright\n\
@@ -440,6 +454,7 @@ async fn build_composed_system_context(
                     project_id,
                     root_path.display(),
                     if proj.is_git_repo { "si" } else { "no" },
+                    infra_block,
                     project_id, project_id,
                 )
             }
