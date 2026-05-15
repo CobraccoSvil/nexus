@@ -35,7 +35,11 @@ stupefied-*/
 # con il loro proprio remote git: NON vanno tracciati nel repo Nexus.
 /projects/
 
-# Backup DB locali (pg_dump pesanti)
+# Backup DB locali (pg_dump pesanti). Versionati solo su filesystem
+# WSL + D:\Backups\Nexus\ tramite deploy/backup-db-to-d.sh, mai in git.
+backups/*.dump
+backups/*.sql.gz
 backups/postgres/*.dump
+backups/postgres/*.sql.gz
 db/backups/
 
