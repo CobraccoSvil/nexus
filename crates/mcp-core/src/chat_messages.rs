@@ -369,26 +369,78 @@ async fn build_composed_system_context(
 
     let project_header = match load_project_context(db, project_id, user_id).await {
         Ok(proj) => {
+            // Fix M52: includi SEMPRE ProjectId nel context, anche quando i
+            // dettagli progetto sono disponibili. L'agente lo usa per
+            // chiamare endpoint REST /api/projects/:id/services/*
+            // (allocate-port, install-playwright, browser-check, ecc.).
+            // Senza, l'agente chiedeva l'UUID all'utente — violazione M22.
+            //
+            // Fix M50: rileva dir vuota e indica esplicitamente di non
+            // ri-chiamare list_files. Quando il repo e' nuovo (no commit
+            // significativi, no file), suggerisci di iniziare direttamente
+            // con write_file. Evita il loop patologico (visto su o3 con 18+
+            // chiamate list_files consecutive su dir vuota).
+            let root_path = proj.repository_root_path.clone();
+            let is_empty_repo = std::fs::read_dir(&root_path)
+                .map(|d| {
+                    d.filter_map(|e| e.ok())
+                        .all(|e| {
+                            let name = e.file_name();
+                            let n = name.to_string_lossy();
+                            n == ".git" || n.starts_with('.')
+                        })
+                })
+                .unwrap_or(false);
             if let Some(summary) = analysis_summary {
                 format!(
                     "=== CONTESTO PROGETTO (non chiedere queste informazioni: sono gia' qui) ===\n\
-                     Progetto: {} | Root: {} | Git: {}\n\
+                     Progetto: {} | ProjectId: {} | Root: {} | Git: {}\n\
+                     Endpoint REST disponibili (auth via cookie sessione, chiamabili via run_command + curl):\n\
+                       POST /api/projects/{}/services/allocate-port  body {{label:\"backend-dev\"}}\n\
+                       POST /api/projects/{}/services/install-playwright\n\
+                       POST /api/projects/{}/services/browser-check\n\
+                       POST /api/projects/{}/services/sync-ports-to-files\n\
                      {}\n\
                      === FINE CONTESTO PROGETTO ===\n\n",
                     proj.details.name,
-                    proj.repository_root_path.display(),
+                    project_id,
+                    root_path.display(),
                     if proj.is_git_repo { "si" } else { "no" },
+                    project_id, project_id, project_id, project_id,
                     summary
+                )
+            } else if is_empty_repo {
+                format!(
+                    "=== CONTESTO PROGETTO ===\n\
+                     Progetto: {} | ProjectId: {} | Root: {} | Git: {}\n\
+                     REPOSITORY VUOTO (solo {}). NON chiamare list_files: SAI gia' che e' vuoto.\n\
+                     Inizia direttamente con write_file dei file richiesti dall'utente.\n\
+                     Endpoint REST disponibili (chiamabili via run_command + curl):\n\
+                       POST /api/projects/{}/services/allocate-port  body {{label:\"backend-dev\"}}\n\
+                       POST /api/projects/{}/services/install-playwright\n\
+                       POST /api/projects/{}/services/browser-check\n\
+                     === FINE CONTESTO PROGETTO ===\n\n",
+                    proj.details.name,
+                    project_id,
+                    root_path.display(),
+                    if proj.is_git_repo { "si" } else { "no" },
+                    if proj.is_git_repo { ".git/" } else { "vuoto" },
+                    project_id, project_id, project_id,
                 )
             } else {
                 format!(
                     "=== CONTESTO PROGETTO ===\n\
-                     Progetto: {} | Root: {} | Git: {}\n\
-                     (Nessuna analisi disponibile: usa list_files per esplorare la struttura)\n\
+                     Progetto: {} | ProjectId: {} | Root: {} | Git: {}\n\
+                     (Nessuna analisi disponibile: usa list_files solo per la prima esplorazione, poi memorizza)\n\
+                     Endpoint REST disponibili (chiamabili via run_command + curl):\n\
+                       POST /api/projects/{}/services/allocate-port  body {{label:\"backend-dev\"}}\n\
+                       POST /api/projects/{}/services/install-playwright\n\
                      === FINE CONTESTO PROGETTO ===\n\n",
                     proj.details.name,
-                    proj.repository_root_path.display(),
-                    if proj.is_git_repo { "si" } else { "no" }
+                    project_id,
+                    root_path.display(),
+                    if proj.is_git_repo { "si" } else { "no" },
+                    project_id, project_id,
                 )
             }
         }
