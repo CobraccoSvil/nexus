@@ -74,22 +74,30 @@ async def run_subagent(
     # 1. Carica definition
     definition = subagent_store.fetch_definition(kind)
     if not definition:
+        summary = f"[kind '{kind}' non trovato in nexus_subagent_definitions]"
+        subagent_store.update_run_completion(
+            subagent_run_id, status="failed", final_summary=summary,
+            artifacts=[], iterations=0,
+            tokens_prompt=0, tokens_completion=0, cost_usd=0.0,
+        )
         return {
-            "status": "failed",
-            "summary": f"[kind '{kind}' non trovato in nexus_subagent_definitions]",
-            "iterations": 0, "cost_usd": 0, "tokens": {},
-            "artifacts": [],
+            "status": "failed", "summary": summary,
+            "iterations": 0, "cost_usd": 0, "tokens": {}, "artifacts": [],
         }
 
     # 2. Carica prompt
     prompt_key = definition["prompt_key"]
     system_text = prompt_registry.get_prompt(prompt_key) or ""
     if not system_text:
+        summary = f"[prompt '{prompt_key}' non trovato]"
+        subagent_store.update_run_completion(
+            subagent_run_id, status="failed", final_summary=summary,
+            artifacts=[], iterations=0,
+            tokens_prompt=0, tokens_completion=0, cost_usd=0.0,
+        )
         return {
-            "status": "failed",
-            "summary": f"[prompt '{prompt_key}' non trovato]",
-            "iterations": 0, "cost_usd": 0, "tokens": {},
-            "artifacts": [],
+            "status": "failed", "summary": summary,
+            "iterations": 0, "cost_usd": 0, "tokens": {}, "artifacts": [],
         }
 
     # 3. Build messages iniziali. Embed il context come parte del task per il sub-agent.
