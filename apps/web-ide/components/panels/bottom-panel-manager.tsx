@@ -327,6 +327,10 @@ export function BottomPanelManager({
     // playwright
     const handleRunPlaywright = () => {
       if (!onSendToChat) return;
+      // Fix M43: pulisce la lista delle run precedenti prima di lanciare i
+      // nuovi test. Senza questo, le run vecchie restavano visibili sotto
+      // le nuove confondendo l'utente sullo stato attuale.
+      onClearPanel?.("playwright");
       onSendToChat(promptRunPlaywrightTests());
     };
     const handleEnablePlaywright = () => {
