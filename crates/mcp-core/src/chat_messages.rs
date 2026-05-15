@@ -2223,10 +2223,37 @@ async fn spawn_agent_run(
         .await;
 
         // Fix M27: auto-commit locale a fine run completato. Idempotente, no push.
+        // Fix M30 + M31 estesi: ri-scansiona run_configurations e port_allocations
+        // a fine run cosi' i pannelli Run & Debug e Porte si popolano con quanto
+        // l'agente ha generato (al register_project la dir era vuota).
         if matches!(result.status, AgentRunStatus::Completed) {
-            let db_for_commit = db_clone.clone();
+            let db_for_hooks = db_clone.clone();
+            let project_id_hook = project_id_cp;
             tokio::spawn(async move {
-                crate::agent_types::auto_commit_project_changes(&db_for_commit, run_id).await;
+                crate::agent_types::auto_commit_project_changes(&db_for_hooks, run_id).await;
+                // Carica project_root via workspaces e ri-scansiona
+                if let Ok(Some((root_str,))) = sqlx::query_as::<_, (Option<String>,)>(
+                    "SELECT absolute_path FROM workspaces \
+                     WHERE project_id = $1 AND is_primary = true LIMIT 1",
+                )
+                .bind(project_id_hook)
+                .fetch_optional(&db_for_hooks)
+                .await
+                {
+                    if let Some(root) = root_str {
+                        let root_path = std::path::PathBuf::from(&root);
+                        if root_path.is_dir() {
+                            crate::project_workspace::run_configs::auto_populate_run_configs(
+                                &db_for_hooks, project_id_hook, &root_path,
+                            )
+                            .await;
+                            crate::project_workspace::scan_ports::auto_populate_port_allocations(
+                                &db_for_hooks, project_id_hook, &root_path,
+                            )
+                            .await;
+                        }
+                    }
+                }
             });
         }
 
