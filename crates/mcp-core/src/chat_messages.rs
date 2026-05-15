@@ -2222,6 +2222,14 @@ async fn spawn_agent_run(
         .execute(&db_clone)
         .await;
 
+        // Fix M27: auto-commit locale a fine run completato. Idempotente, no push.
+        if matches!(result.status, AgentRunStatus::Completed) {
+            let db_for_commit = db_clone.clone();
+            tokio::spawn(async move {
+                crate::agent_types::auto_commit_project_changes(&db_for_commit, run_id).await;
+            });
+        }
+
         // Persisti gli step del run su agent_steps (fix bug: la tabella veniva letta
         // da chat_agent.rs:121,195 ma non scritta — dashboard "AI Workspace" mostrava
         // sempre storia vuota, reflection non poteva correlare step con outcome).

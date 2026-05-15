@@ -333,4 +333,120 @@ pub async fn finalize_agent_run(
     .bind(iteration_count as i32)
     .execute(db)
     .await;
+
+    // Fix M27 (auto-commit locale): a fine run completato con successo, fa
+    // git add -A + commit nel project_root se ci sono cambiamenti.
+    // Idempotente (skip se git status pulito), best-effort (errori solo loggati),
+    // NO push automatico. L'utente decide se/quando pushare via UI.
+    if matches!(status, AgentRunStatus::Completed) {
+        let db_clone = db.clone();
+        tokio::spawn(async move {
+            auto_commit_project_changes(&db_clone, run_id).await;
+        });
+    }
+}
+
+/// Esegue `git add -A && git commit -m ...` nel project_root del run.
+/// Idempotente: se non ci sono modifiche staged, non commit niente.
+/// Best-effort: errori loggati ma non propagati.
+pub async fn auto_commit_project_changes(db: &PgPool, run_id: Uuid) {
+    // 1. Recupera project_id e project_root
+    let row = match sqlx::query_as::<_, (Uuid, Option<String>)>(
+        r#"
+        SELECT r.project_id, w.absolute_path
+        FROM agent_runs r
+        LEFT JOIN workspaces w ON w.project_id = r.project_id AND w.is_primary = true
+        WHERE r.id = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(run_id)
+    .fetch_optional(db)
+    .await
+    {
+        Ok(Some(r)) => r,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("auto_commit: lookup run fallito: {}", e);
+            return;
+        }
+    };
+    let (_project_id, root_opt) = row;
+    let root = match root_opt {
+        Some(p) if !p.is_empty() => p,
+        _ => return,
+    };
+    let root_path = std::path::PathBuf::from(&root);
+    if !root_path.is_dir() {
+        return;
+    }
+    // 2. Verifica che sia un repo git
+    let is_git = tokio::process::Command::new("git")
+        .args(["-C", &root, "rev-parse", "--is-inside-work-tree"])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !is_git {
+        return;
+    }
+    // 3. Stage all changes
+    let _ = tokio::process::Command::new("git")
+        .args(["-C", &root, "add", "-A"])
+        .output()
+        .await;
+    // 4. Skip se niente staged (idempotente)
+    let any_staged = tokio::process::Command::new("git")
+        .args(["-C", &root, "diff", "--cached", "--quiet"])
+        .output()
+        .await
+        .map(|o| !o.status.success()) // exit code != 0 => changes staged
+        .unwrap_or(false);
+    if !any_staged {
+        return;
+    }
+    // 5. Conta i file staged per il messaggio
+    let count = tokio::process::Command::new("git")
+        .args(["-C", &root, "diff", "--cached", "--name-only"])
+        .output()
+        .await
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count()
+        })
+        .unwrap_or(0);
+    let msg = format!(
+        "feat: modifiche da Nexus run {} ({} file)\n\n\
+         Auto-commit generato da Nexus al completamento del run agente.\n\
+         Per pubblicare su GitHub usa il pannello Source Control (Crea repo / Push).\n",
+        run_id, count
+    );
+    // 6. Commit con user.email/name fallback per evitare fail se git config vuota
+    let output = tokio::process::Command::new("git")
+        .args([
+            "-C", &root,
+            "-c", "user.email=nexus@local",
+            "-c", "user.name=Nexus Agent",
+            "commit", "-m", &msg,
+        ])
+        .output()
+        .await;
+    match output {
+        Ok(o) if o.status.success() => {
+            tracing::info!(
+                "auto_commit: {} file committati nel run {} (root={})",
+                count, run_id, root
+            );
+        }
+        Ok(o) => {
+            tracing::warn!(
+                "auto_commit: git commit fallito (exit {}): stderr={}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+        Err(e) => tracing::warn!("auto_commit: spawn git commit fallito: {}", e),
+    }
 }
