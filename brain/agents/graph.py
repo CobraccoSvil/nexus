@@ -16,9 +16,30 @@ from .nodes import (
     router_node,
     tool_dispatch_node,
 )
+from .planner_node import planner_node, configure as _configure_planner
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
+
+
+def route_after_router(state: AgentState) -> str:
+    """PR-1: after router, decide se passare dal planner_node o direttamente
+    all'executor (legacy path).
+
+    Il planner_node ha il suo guard interno (orchestrator_config.is_eligible)
+    e si auto-skippa se non eligibile, ma l'edge condizionale evita anche
+    di chiamare la funzione quando il routing intent ha gia' fatto fallback
+    a chat o quando il behavior_mode esclude il flusso. Il vantaggio principale
+    e' che lo state non viene mutato (plan_phase_active resta unset) cosi'
+    il loop legacy ha overhead zero.
+    """
+    from . import orchestrator_config
+    behavior_mode = state.get("behavior_mode")
+    intent = state.get("user_intent")
+    token_budget = int(state.get("token_budget") or 0)
+    if orchestrator_config.is_eligible(behavior_mode, intent, token_budget):
+        return "planner"
+    return "executor"
 
 
 def create_agent_graph(
@@ -62,11 +83,23 @@ def create_agent_graph(
         agent_router=agent_router,
     )
 
+    # PR-1: inject anche nel planner_node. routing_client deriva dal router
+    # se ha la stessa interfaccia (purpose_model), altrimenti il planner si
+    # skippa al primo run.
+    try:
+        from brain.router.service import _routing_client_singleton
+        _routing_client = _routing_client_singleton()
+    except Exception as exc:
+        logger.warning("create_agent_graph: routing_client non disponibile (planner sara' inattivo): %s", exc)
+        _routing_client = None
+    _configure_planner(providers=providers, tool_runner=tool_runner, routing_client=_routing_client)
+
     # Crea il grafo con lo schema di stato
     workflow: StateGraph = StateGraph(AgentState)
 
     # Aggiunge nodi
     workflow.add_node("router", router_node)  # type: ignore[arg-type]
+    workflow.add_node("planner", planner_node)  # type: ignore[arg-type]
     workflow.add_node("executor", executor_node)  # type: ignore[arg-type]
     workflow.add_node("tool_dispatch", tool_dispatch_node)  # type: ignore[arg-type]
     workflow.add_node("reflection", reflection_node)  # type: ignore[arg-type]
@@ -75,12 +108,16 @@ def create_agent_graph(
     # Imposta entry point
     workflow.set_entry_point("router")
 
-    # Routing condizionale da router a executor
+    # PR-1: Routing condizionale da router a planner OPPURE executor direttamente.
+    # Default OFF: orchestrator_config.is_eligible ritorna False finche'
+    # plan_phase_enabled = false in settings → comportamento legacy invariato.
     workflow.add_conditional_edges(
         "router",
-        route_by_task_type,
-        {"executor": "executor"},
+        route_after_router,
+        {"planner": "planner", "executor": "executor"},
     )
+    # Il planner emette il piano e poi passa il controllo all'executor.
+    workflow.add_edge("planner", "executor")
 
     # Dopo executor: loop su tool_dispatch o passo a reflection.
     # Nota: route_after_executor ora manda a "reflection" invece di "learner"

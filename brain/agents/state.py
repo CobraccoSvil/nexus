@@ -76,3 +76,32 @@ class AgentState(TypedDict, total=False):
     reflection_suggestions: list | None
     # Reward finale fuso: 0.7 * heuristic + 0.3 * reflection_score
     final_reward: float | None
+
+    # ── Plan/Act/Verify (PR-1+, opt-in via orchestrator.plan_phase_enabled) ─
+    # Flag: True quando il planner_node ha prodotto un piano per questo run.
+    plan_phase_active: bool
+    # Motivo dello skip del planner (per logging/debug). None se attivo.
+    plan_phase_skip_reason: str | None
+    # UUID del plan corrente (= run_id Nexus = thread_id LangGraph).
+    current_plan_id: str | None
+    # Snapshot del plan letto dal DB al termine del planner_node.
+    current_todos: list[dict]
+    # Acceptance criteria globali del plan (popolato in PR-1; usato in PR-2 dal verifier).
+    acceptance_criteria: list[dict]
+    # ID del todo "attivo" (in_progress o primo pending). Aggiornato dal verifier in PR-2.
+    active_todo_id: str | None
+    # Contatore per il reminder injection: incrementato in tool_dispatch_node,
+    # reset post-injection. Soglia in orchestrator.todo_reminder_every_n_steps.
+    since_last_todo_reminder: int
+    # PR-2: ciclo verifier corrente per active_todo (reset a 0 ad ogni todo).
+    verify_cycle: int
+    # PR-2: ultimo risultato del verifier (criteria_results).
+    verifier_last_result: dict | None
+    # PR-2: contatore revisioni strutturali del plan (cap max_plan_revisions).
+    plan_revisions: int
+    # PR-3 (sub-agents): popolati quando lo state e' di una sub-run.
+    parent_run_id: str | None
+    subagent_depth: int
+    subagent_results: list[dict]
+    active_subagent_runs: list[str]
+    subagent_cost_cumulative_usd: float
