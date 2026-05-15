@@ -30,6 +30,7 @@ pub(crate) mod command;
 pub(crate) mod testing;
 pub(crate) mod ports;
 pub(crate) mod todos;
+pub(crate) mod subagent;
 
 // Re-export per uso interno crate (tool_run_tests è chiamato da agent_loop, in teoria).
 pub(crate) use command::tool_run_tests;
@@ -290,6 +291,32 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         }
       },
       "required": ["action", "run_id", "todos"]
+    }
+  },
+  {
+    "name": "dispatch_subagent",
+    "description": "PR-3 sub-agents pattern (Claude Code/Cursor style): delega un sotto-task a un sub-agent isolato con context window pulito, tool whitelist propria e modello dedicato. Il sub-agent ritorna SOLO un summary compatto al main (no bloat). Usa quando: (a) esplori grossi codebase senza riempire context, (b) deleghi task indipendenti in parallelo (puoi emettere piu' dispatch_subagent nello stesso turno), (c) vuoi isolare blast radius (kind con tool whitelist ristretta). Kinds pre-definiti: 'plan', 'explore', 'implement', 'verify', 'review'. La task_description deve essere AUTONOMA: il sub-agent non vede la tua conversazione.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "description": "Tipo di sub-agent. Pre-definiti: plan, explore, implement, verify, review. L'admin puo' aggiungere custom kinds in nexus_subagent_definitions."
+        },
+        "task": {
+          "type": "string",
+          "description": "Descrizione COMPLETA e AUTONOMA del sotto-task. Il sub-agent non vede la conversation del main."
+        },
+        "context": {
+          "type": "string",
+          "description": "Contesto aggiuntivo opzionale: file rilevanti, vincoli, decisioni precedenti."
+        },
+        "expected_output_format": {
+          "type": "string",
+          "description": "Forma del summary atteso, es. 'lista file modificati', 'paragrafo 300 char con file:linea', 'json {passed, results}'."
+        }
+      },
+      "required": ["kind", "task"]
     }
   },
   {
@@ -1254,6 +1281,8 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "request_port" => ports::tool_request_port(ctx, input).await,
         // PR-1 Plan/Act/Verify: emette/aggiorna la TODO list del planner.
         "nexus_todo_write" => todos::tool_nexus_todo_write(ctx, input).await,
+        // PR-3 sub-agents: delega a un sub-agent isolato (riabilita ex M55).
+        "dispatch_subagent" => subagent::tool_dispatch_subagent(ctx, input).await,
         "run_in_terminal" => service::tool_run_service(ctx, input, "task").await,
         "run_service" => service::tool_run_service(ctx, input, "service").await,
         "read_terminal_output" => service::tool_read_service_output(ctx, input).await,

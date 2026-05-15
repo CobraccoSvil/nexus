@@ -677,6 +677,49 @@ def reload_settings(body: ReloadSettingsRequest) -> dict[str, object]:
     return _load_keys_from_db()
 
 
+# ── PR-3 sub-agents: endpoint per dispatch_subagent (chiamato da mcp-core) ──
+
+class SubagentRunRequest(BaseModel):
+    subagent_run_id: str
+    parent_run_id: str
+    project_id: str
+    user_id: str
+    session_id: str
+    kind: str
+    task: str
+    context: str = ""
+    expected_format: str = ""
+    depth: int = 1
+    is_background: bool = False
+
+
+@app.post("/agent/subagent-run")
+async def subagent_run_endpoint(body: SubagentRunRequest) -> dict[str, object]:
+    """PR-3: spawn di un sub-agent isolato.
+
+    Chiamato dal handler Rust tool_dispatch_subagent dopo aver inserito
+    la row in nexus_subagent_runs con status='pending'.
+    Riusa l'agent_graph esistente con state fresco e thread_id figlio.
+    """
+    from brain.agents import subagent_dispatch_node
+    graph = _get_agent_graph()
+    result = await subagent_dispatch_node.run_subagent(
+        subagent_run_id=body.subagent_run_id,
+        parent_run_id=body.parent_run_id,
+        project_id=body.project_id,
+        user_id=body.user_id,
+        session_id=body.session_id,
+        kind=body.kind,
+        task=body.task,
+        context=body.context,
+        expected_format=body.expected_format,
+        depth=body.depth,
+        is_background=body.is_background,
+        agent_graph=graph,
+    )
+    return result
+
+
 # ── Project Analyzer Agent ──────────────────────────────────────────────────
 # Endpoint dedicato all'agente agent.project.analyzer (vedi migrazione 0094):
 # carica il prompt dal DB, sostituisce i placeholder col payload del progetto,
