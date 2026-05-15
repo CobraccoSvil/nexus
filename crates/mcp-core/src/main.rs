@@ -1934,6 +1934,13 @@ async fn main() -> anyhow::Result<()> {
                 post(models::sync_model_catalog)
                     .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
             )
+            .route(
+                // Fix M53-auto: trigger manuale per auto-promotion modelli.
+                // Esegue lo stesso codice del post-sync ma on-demand.
+                "/api/admin/auto-upgrade-models",
+                post(models::auto_upgrade_models_endpoint)
+                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+            )
             // Admin users management
             .route(
                 "/api/admin/users",

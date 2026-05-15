@@ -248,7 +248,216 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
     .execute(db).await;
 
     tracing::info!("run_catalog_sync: added={} updated={} skipped={}", added, updated, skipped);
+
+    // Fix M53-auto: post-sync auto-promotion. Identifica per ogni "famiglia"
+    // di modelli (es. gpt-5-mini, claude-opus-4-7, mistral-large-3) il piu
+    // recente nel catalog, lo abilita e lo propaga in nexus_routing_matrix
+    // + nexus_provider_default_model. Idempotente: se la famiglia e gia al
+    // top, no-op.
+    if let Err(e) = auto_upgrade_models_and_routing(db).await {
+        tracing::warn!("auto_upgrade_models_and_routing fallito: {e}");
+    }
+
     Ok((added, updated, skipped))
+}
+
+/// Fix M53-auto: regole "famiglia modello" per auto-promotion. La regex
+/// matcha tutti i modelli appartenenti alla stessa categoria funzionale
+/// (es. mini, nano, opus, ecc.). L'ordinamento semantico individua il piu
+/// recente: vengono confrontate le parti numeriche separate da "-" o ".".
+const FAMILY_RULES: &[(&str /* provider */, &str /* regex */, &str /* label */)] = &[
+    // OpenAI
+    ("openai",    r"^gpt-\d+(\.\d+)?$",                       "gpt-frontier"),
+    ("openai",    r"^gpt-\d+(\.\d+)?-pro$",                   "gpt-pro"),
+    ("openai",    r"^gpt-\d+(\.\d+)?-mini$",                  "gpt-mini"),
+    ("openai",    r"^gpt-\d+(\.\d+)?-nano$",                  "gpt-nano"),
+    ("openai",    r"^gpt-\d+(\.\d+)?-codex$",                 "gpt-codex"),
+    ("openai",    r"^gpt-\d+(\.\d+)?-codex-mini$",            "gpt-codex-mini"),
+    // Anthropic
+    ("anthropic", r"^claude-opus-\d+-\d+$",                   "claude-opus"),
+    ("anthropic", r"^claude-sonnet-\d+-\d+$",                 "claude-sonnet"),
+    ("anthropic", r"^claude-haiku-\d+-\d+$",                  "claude-haiku"),
+    // Google
+    ("google",    r"^gemini-\d+(\.\d+)?-flash$",              "gemini-flash"),
+    ("google",    r"^gemini-\d+(\.\d+)?-flash-lite$",         "gemini-flash-lite"),
+    ("google",    r"^gemini-\d+(\.\d+)?-pro$",                "gemini-pro"),
+    // Mistral: matcha sia il formato data abbreviata (large-2411) sia
+    // la nuova nomenclatura semantica (large-3). parse_version skippa
+    // i YYMM date, quindi "large-3" [3] vince su "large-2411" [].
+    ("mistral",   r"^mistral-large-\d+$",                     "mistral-large"),
+    ("mistral",   r"^mistral-medium-\d+(-\d+-\d+)?$",         "mistral-medium"),
+    ("mistral",   r"^mistral-small-\d+(-\d+-\d+)?$",          "mistral-small"),
+    ("mistral",   r"^magistral-medium-\d+(-\d+-\d+)?$",       "magistral-medium"),
+    ("mistral",   r"^codestral-\d+$",                         "codestral"),
+    ("mistral",   r"^devstral-medium-\d+$",                   "devstral-medium"),
+    // DeepSeek
+    ("deepseek",  r"^deepseek-v\d+(\.\d+)?$",                 "deepseek-v"),
+];
+
+/// Parsa una versione embedded in un nome modello in una tupla di interi.
+/// Skippa i suffissi data (YYYYMMDD, 8 cifre) per evitare di confonderli
+/// con sub-versioni semantiche. Es:
+/// - "gpt-5.4-mini"               -> [5, 4]
+/// - "claude-opus-4-7"            -> [4, 7]
+/// - "claude-opus-4-7-20260416"   -> [4, 7]   (skip 20260416)
+/// - "claude-opus-4-20250514"     -> [4]      (skip 20250514)
+/// - "mistral-large-2411"         -> [2411]   (4 cifre, non skippato — e "data abbreviata" mistral pattern)
+/// - "deepseek-v3.2"              -> [3, 2]
+fn parse_version(name: &str) -> Vec<i64> {
+    // Numeri da skippare come "date abbreviate o complete":
+    // - 8 cifre = YYYYMMDD (es. 20260416)
+    // - 6 cifre = YYYYMM   (es. 202604)
+    // - 4 cifre = YYMM     (formato Mistral: es. 2411 = nov 2024)
+    fn looks_like_date(s: &str, n: i64) -> bool {
+        match s.len() {
+            8 => (20200101..=20351231).contains(&n),
+            6 => (202001..=203512).contains(&n),
+            4 => {
+                // YYMM: anno 24-35, mese 01-12. Es. 2411 = nov 2024.
+                let yy = n / 100;
+                let mm = n % 100;
+                (24..=35).contains(&yy) && (1..=12).contains(&mm)
+            }
+            _ => false,
+        }
+    }
+    let mut nums = Vec::new();
+    let mut cur = String::new();
+    for c in name.chars() {
+        if c.is_ascii_digit() {
+            cur.push(c);
+        } else {
+            if !cur.is_empty() {
+                if let Ok(n) = cur.parse::<i64>() {
+                    if !looks_like_date(&cur, n) {
+                        nums.push(n);
+                    }
+                }
+                cur.clear();
+            }
+        }
+    }
+    if !cur.is_empty() {
+        if let Ok(n) = cur.parse::<i64>() {
+            if !looks_like_date(&cur, n) {
+                nums.push(n);
+            }
+        }
+    }
+    nums
+}
+
+/// Auto-promotion modelli: per ogni famiglia trova il modello piu recente,
+/// lo abilita in ai_price_catalog, e aggiorna nexus_routing_matrix +
+/// nexus_provider_default_model dove esiste un modello "vecchio" della stessa
+/// famiglia. Idempotente.
+pub async fn auto_upgrade_models_and_routing(db: &sqlx::PgPool) -> Result<(), String> {
+    use regex::Regex;
+    let mut promotions: Vec<(String, String, String)> = Vec::new(); // (provider, family, top_model)
+    let mut enabled_count = 0_usize;
+
+    for (provider, pattern, family_label) in FAMILY_RULES {
+        let re = match Regex::new(pattern) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("auto_upgrade: regex {pattern} invalida: {e}");
+                continue;
+            }
+        };
+        // Carica tutti i modelli del provider che matchano la famiglia
+        let candidates: Vec<String> = sqlx::query_scalar(
+            "SELECT model FROM ai_price_catalog WHERE provider = $1",
+        )
+        .bind(provider)
+        .fetch_all(db)
+        .await
+        .map_err(|e| format!("query candidates: {e}"))?
+        .into_iter()
+        .filter(|m: &String| re.is_match(m))
+        .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        // Ordina semanticamente per parse_version desc, con tiebreaker
+        // sulla lunghezza: a parita di versione preferisco il nome piu
+        // corto (alias non-dated, es. claude-opus-4-7 < claude-opus-4-7-20260416).
+        let mut sorted = candidates.clone();
+        sorted.sort_by(|a, b| {
+            let va = parse_version(a);
+            let vb = parse_version(b);
+            vb.cmp(&va).then(a.len().cmp(&b.len()))
+        });
+        let top = sorted[0].clone();
+        promotions.push((provider.to_string(), family_label.to_string(), top.clone()));
+
+        // Abilita TUTTI i modelli della famiglia (utente vuole scelta)
+        for m in &candidates {
+            let res = sqlx::query(
+                "UPDATE ai_price_catalog SET is_enabled = true \
+                 WHERE provider = $1 AND model = $2 AND is_enabled = false",
+            )
+            .bind(provider)
+            .bind(m)
+            .execute(db)
+            .await;
+            if let Ok(r) = res {
+                if r.rows_affected() > 0 {
+                    enabled_count += 1;
+                }
+            }
+        }
+
+        // Aggiorna routing_matrix: per ogni record con stesso provider e
+        // model "vecchio" della famiglia (model che matcha la regex ma e
+        // diverso dal top), sostituisci con top.
+        let to_replace: Vec<String> = candidates
+            .iter()
+            .filter(|m| **m != top)
+            .cloned()
+            .collect();
+        if !to_replace.is_empty() {
+            let res = sqlx::query(
+                "UPDATE nexus_routing_matrix \
+                 SET model_id = $1, updated_at = NOW() \
+                 WHERE provider = $2 AND model_id = ANY($3)",
+            )
+            .bind(&top)
+            .bind(provider)
+            .bind(&to_replace)
+            .execute(db)
+            .await;
+            if let Ok(r) = res {
+                if r.rows_affected() > 0 {
+                    tracing::info!(
+                        "auto_upgrade: routing_matrix [{}/{}] {} record -> {}",
+                        provider, family_label, r.rows_affected(), top
+                    );
+                }
+            }
+            // Idem per default_model_for_provider (se il default e vecchio della stessa famiglia)
+            let _ = sqlx::query(
+                "UPDATE nexus_provider_default_model \
+                 SET model_id = $1, updated_at = NOW(), notes = COALESCE(notes,'') || ' | auto-upgrade ' || $2 \
+                 WHERE provider = $3 AND model_id = ANY($4)",
+            )
+            .bind(&top)
+            .bind(family_label.to_string())
+            .bind(provider)
+            .bind(&to_replace)
+            .execute(db)
+            .await;
+        }
+    }
+
+    tracing::info!(
+        "auto_upgrade_models_and_routing: enabled={} promotions={}",
+        enabled_count, promotions.len()
+    );
+    for (p, fam, top) in &promotions {
+        tracing::debug!("  {} / {} -> top = {}", p, fam, top);
+    }
+
+    Ok(())
 }
 
 /// POST /api/admin/sync-model-catalog
@@ -262,6 +471,15 @@ pub async fn sync_model_catalog(State(state): State<AppState>) -> Json<Value> {
         Err(e) => Json(json!({
             "error": e, "added": 0, "updated": 0, "skipped": 0,
         })),
+    }
+}
+
+/// POST /api/admin/auto-upgrade-models
+/// Trigger manuale per la promotion auto (utile per testare senza aspettare cron).
+pub async fn auto_upgrade_models_endpoint(State(state): State<AppState>) -> Json<Value> {
+    match auto_upgrade_models_and_routing(&state.db).await {
+        Ok(()) => Json(json!({ "ok": true })),
+        Err(e) => Json(json!({ "ok": false, "error": e })),
     }
 }
 
