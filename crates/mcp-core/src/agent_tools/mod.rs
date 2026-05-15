@@ -29,6 +29,7 @@ pub(crate) mod sandbox;
 pub(crate) mod command;
 pub(crate) mod testing;
 pub(crate) mod ports;
+pub(crate) mod todos;
 
 // Re-export per uso interno crate (tool_run_tests è chiamato da agent_loop, in teoria).
 pub(crate) use command::tool_run_tests;
@@ -244,6 +245,51 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         }
       },
       "required": ["label"]
+    }
+  },
+  {
+    "name": "nexus_todo_write",
+    "description": "PR-1 Plan/Act/Verify: crea o aggiorna la TODO list strutturata del piano agente. Tool riservato principalmente al planner_node per emettere il plan iniziale (action='create'). L'executor puo' usarlo solo per action='check' (marca completato) o 'update' (cambia status). Persiste in nexus_agent_todos con isolation per project_id. Tipi di azione: 'create' (ricrea l'intera lista, cancellando i todos precedenti del run), 'check' (UPDATE status='completed' su lista di id), 'add' (INSERT nuovi todo in coda con seq incrementale), 'update' (UPDATE status arbitrario su id). Ritorna JSON {ok, action, affected, plan_id?, todo_ids?}.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["create", "check", "add", "update"],
+          "description": "Operazione: create=reset+ricrea piano, check=marca completati, add=appende todos, update=aggiorna status arbitrari."
+        },
+        "run_id": {
+          "type": "string",
+          "description": "UUID dell'agent_run corrente (passato dal brain via state.thread_id). Obbligatorio."
+        },
+        "todos": {
+          "type": "array",
+          "description": "Array di todo. Per create/add: content+status+priority+acceptance_criteria. Per check/update: id obbligatorio.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {"type": "string", "description": "UUID del todo (obbligatorio per check/update)"},
+              "seq": {"type": "integer", "description": "Ordinamento, opzionale (auto per create/add)"},
+              "content": {"type": "string", "description": "Descrizione atomica e verificabile del todo"},
+              "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "blocked", "skipped"]},
+              "priority": {"type": "string", "enum": ["high", "normal", "low"], "description": "Default 'normal'"},
+              "acceptance_criteria": {
+                "type": "array",
+                "description": "Array di check verificabili: [{type:'run_command'|'http'|'file_exists'|'regex_in_output'|'db_query', spec:{...}, expected:{...}}]"
+              }
+            }
+          }
+        },
+        "planner_model": {
+          "type": "string",
+          "description": "Modello LLM usato dal planner (per audit, opzionale)."
+        },
+        "plan_acceptance_criteria": {
+          "type": "array",
+          "description": "Acceptance criteria globali del plan (opzionale, action=create)."
+        }
+      },
+      "required": ["action", "run_id", "todos"]
     }
   },
   {
@@ -1206,6 +1252,8 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "git_remote_add" => git::tool_git_remote_add(ctx, input).await,
         // Fix M51: tool dedicato per allocazione porta (evita curl via run_command).
         "request_port" => ports::tool_request_port(ctx, input).await,
+        // PR-1 Plan/Act/Verify: emette/aggiorna la TODO list del planner.
+        "nexus_todo_write" => todos::tool_nexus_todo_write(ctx, input).await,
         "run_in_terminal" => service::tool_run_service(ctx, input, "task").await,
         "run_service" => service::tool_run_service(ctx, input, "service").await,
         "read_terminal_output" => service::tool_read_service_output(ctx, input).await,
