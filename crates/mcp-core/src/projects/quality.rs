@@ -165,6 +165,88 @@ pub async fn run_quality_scan(
 /// - related_files (file semanticamente simili via code index)
 /// - confidence (validazione falsi positivi via analisi vettoriale)
 /// - duplicati semantici (funzioni simili in file diversi)
+/// Fix M5: wrapper pubblico per scan quality background (no HTTP wrapper).
+/// Chiamato dall'hook chat_messages.rs a fine run completato: inserisce
+/// una riga 'running' in nexus_quality_scans, lancia perform_quality_scan,
+/// aggiorna lo stato a 'completed'/'failed'. Idempotente: skippa se c'e gia
+/// uno scan running per lo stesso progetto (per evitare scan paralleli).
+pub async fn auto_scan_quality(
+    db: &sqlx::PgPool,
+    orchestrator: &crate::orchestrator::Orchestrator,
+    project_id: Uuid,
+    root_path: &str,
+    dep_status: &crate::task_watchdog::DependencyStatusRef,
+) {
+    // Idempotenza: se c'e gia uno scan running per il progetto, skip.
+    let existing: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM nexus_quality_scans \
+         WHERE project_id = $1 AND status = 'running'",
+    )
+    .bind(project_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(0);
+    if existing > 0 {
+        tracing::debug!("auto_scan_quality: skip (gia 1+ scan running per {})", project_id);
+        return;
+    }
+    let scan_id = match sqlx::query_scalar::<_, i64>(
+        "INSERT INTO nexus_quality_scans (project_id, status) \
+         VALUES ($1, 'running') RETURNING id",
+    )
+    .bind(project_id)
+    .fetch_one(db)
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!("auto_scan_quality: insert scan fallito: {}", e);
+            return;
+        }
+    };
+    let started = std::time::Instant::now();
+    match perform_quality_scan(db, orchestrator, project_id, root_path, dep_status).await {
+        Ok((files_scanned, total_findings, by_severity, by_category)) => {
+            let duration_ms = started.elapsed().as_millis() as i32;
+            let by_sev_json = serde_json::to_value(&by_severity).unwrap_or(json!({}));
+            let by_cat_json = serde_json::to_value(&by_category).unwrap_or(json!({}));
+            let _ = sqlx::query(
+                "UPDATE nexus_quality_scans \
+                 SET status = 'completed', files_scanned = $1, total_findings = $2, \
+                     by_severity = $3, by_category = $4, duration_ms = $5, \
+                     completed_at = NOW() \
+                 WHERE id = $6",
+            )
+            .bind(files_scanned as i32)
+            .bind(total_findings as i32)
+            .bind(&by_sev_json)
+            .bind(&by_cat_json)
+            .bind(duration_ms)
+            .bind(scan_id)
+            .execute(db)
+            .await;
+            tracing::info!(
+                "auto_scan_quality: scan_id={} project={} files={} findings={} duration_ms={}",
+                scan_id, project_id, files_scanned, total_findings, duration_ms
+            );
+        }
+        Err(e) => {
+            let duration_ms = started.elapsed().as_millis() as i32;
+            let _ = sqlx::query(
+                "UPDATE nexus_quality_scans \
+                 SET status = 'failed', error_message = $1, duration_ms = $2, completed_at = NOW() \
+                 WHERE id = $3",
+            )
+            .bind(e.to_string())
+            .bind(duration_ms)
+            .bind(scan_id)
+            .execute(db)
+            .await;
+            tracing::warn!("auto_scan_quality: scan fallita: {}", e);
+        }
+    }
+}
+
 async fn perform_quality_scan(
     db: &sqlx::PgPool,
     orchestrator: &crate::orchestrator::Orchestrator,

@@ -940,6 +940,35 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     void loadOutputEvents(activeProject.id, selectedOutputChannel);
   }, [activeProject?.id, selectedOutputChannel, loadOutputEvents]);
 
+  // Fix M45: polling fallback dei pannelli operativi (porte, playwright,
+  // problemi, run_configs) ogni 8s. Senza questo, se l'SSE del run agente
+  // si interrompe a meta' (es. brain restart, chunk decode error), il
+  // pannello Playwright restava bloccato sulla snapshot iniziale e
+  // l'utente non vedeva il risultato del test appena eseguito.
+  useEffect(() => {
+    const projectId = activeProject?.id;
+    if (!projectId) return;
+    const refresh = async () => {
+      try {
+        const [problemsRes, portsRes, playwrightRes, runConfigsRes] =
+          await Promise.all([
+            getProjectProblems(projectId),
+            getProjectPorts(projectId),
+            getPlaywrightRuns(projectId),
+            getRunConfigs(projectId),
+          ]);
+        setProblemItems(problemsRes.items ?? []);
+        setPorts(portsRes.ports ?? []);
+        setPlaywrightRuns(playwrightRes.runs ?? []);
+        setRunConfigs(runConfigsRes.configs ?? []);
+      } catch {
+        // Best-effort: ignora errori transient
+      }
+    };
+    const interval = window.setInterval(refresh, 8_000);
+    return () => window.clearInterval(interval);
+  }, [activeProject?.id]);
+
   useEffect(() => {
     if (!activeProject || !workbenchReady) return;
     const timeout = window.setTimeout(() => {

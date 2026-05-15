@@ -10,6 +10,7 @@ pub mod processes;
 pub mod run_configs;
 pub mod runtime_issues;
 pub mod scan_ports;
+pub mod sync_ports;
 pub mod services;
 pub mod wizard;
 pub mod workbench;

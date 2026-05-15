@@ -1380,6 +1380,15 @@ async fn main() -> anyhow::Result<()> {
                 )),
             )
             .route(
+                // Fix M41: riscrive vite.config / .env / playwright.config esistenti
+                // sostituendo porte hardcoded con quelle allocate in nexus_port_allocations.
+                "/api/projects/:id/services/sync-ports-to-files",
+                post(project_workspace::sync_ports::sync_ports_to_files).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
                 // Fix M11: SSE stream eventi filesystem (auto-refresh EXPLORER)
                 "/api/projects/:id/fs-events",
                 get(project_workspace::fs_events::fs_events).layer(axum_mw::from_fn_with_state(

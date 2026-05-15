@@ -1919,6 +1919,10 @@ async fn spawn_agent_run(
 
     let db_clone = state.db.clone();
     let channels_clone = state.agent_channels.clone();
+    // Fix M5: clone state.orchestrator + dependency_status per il quality
+    // scan automatico a fine run (perform_quality_scan ha bisogno di entrambi).
+    let orchestrator_clone = state.orchestrator.clone();
+    let dep_status_clone = state.dependency_status.clone();
     let session_id_cp = params.session_id;
     let project_id_cp = params.project_id;
     let user_message_id = params.user_message_id;
@@ -2229,6 +2233,8 @@ async fn spawn_agent_run(
         if matches!(result.status, AgentRunStatus::Completed) {
             let db_for_hooks = db_clone.clone();
             let project_id_hook = project_id_cp;
+            let orchestrator_for_hooks = orchestrator_clone.clone();
+            let dep_status_for_hooks = dep_status_clone.clone();
             tokio::spawn(async move {
                 crate::agent_types::auto_commit_project_changes(&db_for_hooks, run_id).await;
                 // Carica project_root via workspaces e ri-scansiona
@@ -2249,6 +2255,16 @@ async fn spawn_agent_run(
                             .await;
                             crate::project_workspace::scan_ports::auto_populate_port_allocations(
                                 &db_for_hooks, project_id_hook, &root_path,
+                            )
+                            .await;
+                            // Fix M5 (originale): auto-scan quality post-run cosi' il
+                            // pannello Problemi non resta sempre vuoto. Best-effort.
+                            crate::projects::quality::auto_scan_quality(
+                                &db_for_hooks,
+                                &orchestrator_for_hooks,
+                                project_id_hook,
+                                &root.clone(),
+                                &dep_status_for_hooks,
                             )
                             .await;
                         }

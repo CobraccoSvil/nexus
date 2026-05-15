@@ -33,7 +33,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Cap iterazioni agent loop (richiesta executor -> tool_dispatch -> executor ...).
-MAX_AGENT_ITERATIONS = 25
+# Fix M26: alzato da 25 -> 60 per allinearsi al cap Rust (AGENT_MAX_ITERATIONS=60
+# in crates/mcp-core/src/agent_types.rs:14). Run di generazione progetto E2E
+# richiedono tipicamente 40-65 iterazioni (vedi test maturity 2026-05-14T2040
+# run 738fc4f4: 62 step). Cap a 25 forzava completamenti prematuri o "forced
+# text mode" a 20 step impedendo task realmente E2E come scaffolding completo
+# di un'app full-stack.
+MAX_AGENT_ITERATIONS = 60
 
 # ── Lookup prezzi modelli da ai_price_catalog ──────────────────────────────
 _PRICE_CACHE: dict[str, tuple[float, float]] = {}
