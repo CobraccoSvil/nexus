@@ -138,10 +138,25 @@ export async function GET() {
         getServiceState(svc.name, svc.readonly === true),
         checkPort(svc.port),
       ]);
+      // Fix M28: in dev WSL i servizi Nexus sono lanciati da deploy-local.sh come
+      // setsid nohup processes, senza una unit systemd corrispondente. systemctl
+      // ritorna ActiveState=unknown/inactive ma la porta risponde. Se non c'è
+      // una unit ma la porta è viva, consideriamo il servizio attivo.
+      // I servizi "readonly" (postgres/redis) restano come sono perché in
+      // setup container hanno port mapping diverso (es. Postgres su :5433).
+      const stateUnknown = state === "unknown" || state === "inactive" || state === "failed";
+      const effectiveState: NexusServiceInfo["state"] =
+        !svc.readonly && stateUnknown && port_alive
+          ? "active"
+          : (state as NexusServiceInfo["state"]);
+      const effectiveSubState =
+        !svc.readonly && stateUnknown && port_alive
+          ? "running"
+          : sub_state;
       return {
         ...svc,
-        state: state as NexusServiceInfo["state"],
-        sub_state,
+        state: effectiveState,
+        sub_state: effectiveSubState,
         port_alive,
       };
     })
