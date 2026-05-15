@@ -1233,11 +1233,14 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
 # ─── Routing condizionale post-executor ──────────────────────────────────────
 
 def route_after_executor(state: AgentState) -> str:
-    """Decide se iterare (tool_dispatch) o chiudere (learner).
+    """Decide se iterare (tool_dispatch), verificare (verifier), o chiudere (learner).
 
     Safety cap: superato MAX_AGENT_ITERATIONS forza learner per evitare
     loop infiniti.
     Loop detection: stop_reason="loop_detected" forza chiusura immediata.
+
+    PR-2: se plan_phase_active + verifier_enabled e end_turn, va al verifier
+    (che poi decide se re-iterare o passare a reflection).
     """
     iterations = int(state.get("iterations") or 0)
     stop_reason = state.get("stop_reason")
@@ -1250,6 +1253,30 @@ def route_after_executor(state: AgentState) -> str:
         return "learner"
     if stop_reason == "tool_use" and pending:
         return "tool_dispatch"
+    # PR-2: end_turn con plan_phase_active → verifier
+    if state.get("plan_phase_active"):
+        cfg = orchestrator_config.get()
+        if cfg.get("verifier_enabled"):
+            return "verifier"
+    return "learner"
+
+
+def route_after_verifier(state: AgentState) -> str:
+    """Decide post-verifier: re-iterare (executor) o chiudere (learner/reflection).
+
+    Logica:
+    - Se stop_reason='end_turn' (verifier ha promosso il prossimo todo o
+      finito tutti): vai a reflection
+    - Se stop_reason='tool_use' (verifier ha iniettato retry o passato al
+      prossimo todo): rientra in executor
+    """
+    iterations = int(state.get("iterations") or 0)
+    if iterations >= MAX_AGENT_ITERATIONS:
+        logger.warning("route_after_verifier: cap iterazioni, chiudo")
+        return "learner"
+    stop_reason = state.get("stop_reason")
+    if stop_reason == "tool_use":
+        return "executor"
     return "learner"
 
 

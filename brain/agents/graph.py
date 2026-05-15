@@ -12,11 +12,13 @@ from .nodes import (
     learner_node,
     reflection_node,
     route_after_executor,
+    route_after_verifier,
     route_by_task_type,
     router_node,
     tool_dispatch_node,
 )
 from .planner_node import planner_node, configure as _configure_planner
+from .verifier_node import verifier_node, configure as _configure_verifier
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -93,6 +95,7 @@ def create_agent_graph(
         logger.warning("create_agent_graph: routing_client non disponibile (planner sara' inattivo): %s", exc)
         _routing_client = None
     _configure_planner(providers=providers, tool_runner=tool_runner, routing_client=_routing_client)
+    _configure_verifier(tool_runner=tool_runner)
 
     # Crea il grafo con lo schema di stato
     workflow: StateGraph = StateGraph(AgentState)
@@ -102,6 +105,7 @@ def create_agent_graph(
     workflow.add_node("planner", planner_node)  # type: ignore[arg-type]
     workflow.add_node("executor", executor_node)  # type: ignore[arg-type]
     workflow.add_node("tool_dispatch", tool_dispatch_node)  # type: ignore[arg-type]
+    workflow.add_node("verifier", verifier_node)  # type: ignore[arg-type]
     workflow.add_node("reflection", reflection_node)  # type: ignore[arg-type]
     workflow.add_node("learner", learner_node)  # type: ignore[arg-type]
 
@@ -119,16 +123,27 @@ def create_agent_graph(
     # Il planner emette il piano e poi passa il controllo all'executor.
     workflow.add_edge("planner", "executor")
 
-    # Dopo executor: loop su tool_dispatch o passo a reflection.
-    # Nota: route_after_executor ora manda a "reflection" invece di "learner"
-    # direttamente. reflection_node poi passa sempre a learner.
+    # Dopo executor: loop su tool_dispatch, verificare (PR-2), o passo a reflection.
+    # PR-2: se plan_phase_active + verifier_enabled e stop_reason=end_turn,
+    # route_after_executor ritorna "verifier" che lancia la verifica DoD.
     workflow.add_conditional_edges(
         "executor",
         route_after_executor,
-        {"tool_dispatch": "tool_dispatch", "learner": "reflection"},
+        {
+            "tool_dispatch": "tool_dispatch",
+            "verifier": "verifier",
+            "learner": "reflection",
+        },
     )
     # tool_dispatch rientra nell'executor per un'altra iterazione.
     workflow.add_edge("tool_dispatch", "executor")
+    # PR-2: dopo verifier, route_after_verifier decide se re-iterare (executor)
+    # o chiudere (reflection -> learner).
+    workflow.add_conditional_edges(
+        "verifier",
+        route_after_verifier,
+        {"executor": "executor", "learner": "reflection"},
+    )
     # reflection passa sempre a learner (fire-and-forget interno).
     workflow.add_edge("reflection", "learner")
     workflow.add_edge("learner", END)
