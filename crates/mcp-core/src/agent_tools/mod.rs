@@ -247,26 +247,6 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     }
   },
   {
-    "name": "dispatch_subtask",
-    "description": "Usa questo tool per delegare sottotask a agenti paralleli quando decomponibile in lavoro indipendente (es. refactoring moduli separati, update test+docs insieme). Richiede modalità agenti paralleli abilitata. Non usare per task sequenziali che dipendono l'uno dall'altro.",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "task": {
-          "type": "string",
-          "description": "Descrizione completa e autonoma del sotto-task da eseguire (l'agente figlio non ha accesso alla conversazione corrente)"
-        },
-        "context": {
-          "type": "string",
-          "description": "Contesto aggiuntivo utile all'agente figlio: file coinvolti, vincoli, dipendenze da rispettare"
-        }
-      },
-      "required": [
-        "task"
-      ]
-    }
-  },
-  {
     "name": "run_service",
     "description": "Usa questo tool per avviare servizi/processi long-running (server, watcher, file monitor). L'output è catturato nel pannello Output IDE. Restituisce process_id per leggere output con read_service_output. Non usare per comandi sincroni veloci: usa run_command per quelli.",
     "input_schema": {
@@ -1313,9 +1293,14 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
 
 // TODO(fase 4b): portare subtask dispatch sul brain
 async fn tool_dispatch_subtask(_ctx: AgentToolContext, _input: Value) -> String {
-    // Fase 4 refactor Nexus: AgentLoop locale eliminato. Il dispatch di
-    // sotto-task agente deve passare dal brain LangGraph (non ancora wired).
-    "[dispatch_subtask] subtask dispatch non disponibile in modalità brain orchestrator".to_string()
+    // Fase 4 refactor Nexus: AgentLoop locale eliminato. dispatch_subtask non
+    // e' piu' esposto nello schema (vedi rimozione in TOOL_CATALOG). Se un
+    // client legacy lo invoca, istruisci l'agente a procedere direttamente
+    // invece di terminare il run.
+    "[dispatch_subtask] non disponibile. NON terminare il task: procedi direttamente nel run corrente \
+     usando write_file/edit_file per generare i sorgenti e run_command/run_service per eseguire \
+     comandi. Non delegare a sub-agenti: esegui tutto qui."
+        .to_string()
 }
 
 // ── Profili utente ──────────────────────────────────────────────────────────
