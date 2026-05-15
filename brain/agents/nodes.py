@@ -17,7 +17,14 @@ from typing import TYPE_CHECKING, Any
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from . import profile_loader, prompt_registry, prompt_renderer, reflection_config
+from . import (
+    profile_loader,
+    prompt_registry,
+    prompt_renderer,
+    reflection_config,
+    orchestrator_config,
+    todo_store,
+)
 from .reflection_rubric import build_reflection_prompt, parse_reflection_response
 from .state import AgentState
 
@@ -1184,14 +1191,42 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
             ctx_chars, new_chars, budget_per_tool,
         )
 
+    # ── PR-1: TODO reminder injection (anti-amnesia) ─────────────────────────
+    # Se il plan e' attivo e siamo a una soglia di N tool use, appende
+    # un blocco <system-reminder> con la checklist corrente al tool_result
+    # HumanMessage. Counter resetta dopo injection.
+    final_blocks = list(results)
+    new_reminder_counter = int(state.get("since_last_todo_reminder", 0) or 0) + len(pending)
+    if state.get("plan_phase_active"):
+        from . import todo_reminder
+        # Check soglia via cfg (cache TTL 60s)
+        cfg_reminder = orchestrator_config.get()
+        every_n = max(1, int(cfg_reminder.get("todo_reminder_every_n_steps", 5)))
+        if new_reminder_counter >= every_n:
+            reminder_run_id = state.get("thread_id") or ""
+            reminder_text = todo_reminder.build_reminder_text(reminder_run_id) if reminder_run_id else None
+            if reminder_text:
+                todo_reminder.append_reminder_block(final_blocks, reminder_text)
+                # Best-effort: traccia che i todos sono stati "visti" in questa iter
+                try:
+                    todo_store.increment_iteration_seen(reminder_run_id)
+                except Exception:
+                    pass
+                new_reminder_counter = 0
+                logger.debug(
+                    "tool_dispatch_node: TODO reminder iniettato per run_id=%s",
+                    reminder_run_id,
+                )
+
     tool_msg = HumanMessage(
-        content="", additional_kwargs={"anthropic_content": list(results)},
+        content="", additional_kwargs={"anthropic_content": final_blocks},
     )
 
     return {
         "messages": [tool_msg],
         "pending_tool_uses": [],
         "stop_reason": "tool_use",
+        "since_last_todo_reminder": new_reminder_counter,
     }
 
 
