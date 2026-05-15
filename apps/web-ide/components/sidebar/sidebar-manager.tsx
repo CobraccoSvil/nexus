@@ -1022,37 +1022,52 @@ export function SidebarManager({
             Nessun editor aperto.
           </div>
         ) : (
-          allOpenTabs.map((tab) => (
-            <button
-              key={`open-${tab.path}`}
-              onClick={() => onOpenFile(tab.path)}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: 8,
-                width: "100%",
-                background: "transparent",
-                border: "none",
-                color: tc.text,
-                cursor: "pointer",
-                padding: "5px 6px",
-                borderRadius: 6,
-                textAlign: "left",
-              }}
-            >
-              <span
+          allOpenTabs.map((tab) => {
+            // Fix open-editors: mostra il path relativo alla root del progetto
+            // attivo, full path solo nel title (hover). Aiuta a vedere subito
+            // il file di interesse senza spazio sprecato dal prefisso assoluto.
+            const isInProject = project?.rootPath
+              ? tab.path.startsWith(project.rootPath)
+              : false;
+            const display = isInProject && project?.rootPath
+              ? tab.path.slice(project.rootPath.length).replace(/^\//, "")
+              : shortenAbsolutePath(tab.path, project?.rootPath ?? undefined);
+            // Segnale visuale se il file appartiene a un altro progetto (raro,
+            // ma capita dopo uno switch progetto se il tab e' rimasto aperto).
+            const outsideProject = !isInProject && project?.rootPath;
+            return (
+              <button
+                key={`open-${tab.path}`}
+                onClick={() => onOpenFile(tab.path)}
+                title={tab.path + (outsideProject ? " (fuori dal progetto attivo)" : "")}
                 style={{
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 8,
+                  width: "100%",
+                  background: "transparent",
+                  border: "none",
+                  color: outsideProject ? tc.warning : tc.text,
+                  cursor: "pointer",
+                  padding: "5px 6px",
+                  borderRadius: 6,
+                  textAlign: "left",
                 }}
               >
-                {tab.path}
-              </span>
-              {tab.dirty && <span style={{ color: tc.warning }}>●</span>}
-            </button>
-          ))
+                <span
+                  style={{
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {display}
+                </span>
+                {tab.dirty && <span style={{ color: tc.warning }}>●</span>}
+              </button>
+            );
+          })
         )}
       </div>
     </div>
