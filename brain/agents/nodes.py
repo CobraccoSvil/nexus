@@ -807,18 +807,27 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             )
         anth_messages = _langchain_to_anthropic_messages(messages)
         try:
-            p = _providers._providers.get(provider)  # type: ignore[attr-defined]
-            if p is None or not hasattr(p, "generate_agent_turn"):
-                raise RuntimeError(f"provider {provider} non supporta agent_turn")
             # max_tokens dinamico: almeno 8192 per turni con tool, capped a 16384.
             # Il token_budget dallo state (stimato dal router_node) viene usato
             # come base, ma per agent turn con tool serve molto piu' spazio
             # (tool_use JSON e' verboso, content_json per documenti puo' essere enorme).
             effective_max_tokens = max(8192, min(token_budget * 4, 16384))
-            prov_result = await p.generate_agent_turn(
-                model, anth_messages, tools_json,
+            # Fix M60: passa dal registry per riusare la cascade fallback esistente
+            # (provider_hierarchy + nexus_provider_default_model + classify_error).
+            # generate_agent_turn_sync e' bloccante, lo runno in thread.
+            prov_result = await asyncio.to_thread(
+                _providers.generate_agent_turn_sync,
+                provider, model, anth_messages, tools_json,
                 max_tokens=effective_max_tokens, system_text=system_text,
             )
+            # Aggiorna provider/model effettivamente usati se la cascade ha fatto fallback.
+            if prov_result.provider and prov_result.provider != provider:
+                logger.info(
+                    "executor_node: cascade fallback %s -> %s/%s",
+                    provider, prov_result.provider, prov_result.model,
+                )
+                provider = prov_result.provider
+                model = prov_result.model
             result_text = prov_result.content or ""
             meta = prov_result.metadata or {}
             stop_reason = meta.get("stop_reason") or "end_turn"
