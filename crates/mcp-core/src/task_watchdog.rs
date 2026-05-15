@@ -47,6 +47,8 @@ use crate::AgentChannels;
 pub struct DependencyStatus {
     pub qdrant: AtomicBool,
     pub embedder: AtomicBool,
+    /// Fix M48: stato del nexus-gateway (Node.js su :4060).
+    pub gateway: AtomicBool,
     /// Unix timestamp dell'ultimo check completato.
     pub last_check: AtomicI64,
     /// Unix timestamp dell'ultimo tentativo di recovery (evita retry troppo frequenti).
@@ -58,6 +60,7 @@ impl DependencyStatus {
         Self {
             qdrant: AtomicBool::new(true),
             embedder: AtomicBool::new(true),
+            gateway: AtomicBool::new(true),
             last_check: AtomicI64::new(0),
             last_recovery_attempt: AtomicI64::new(0),
         }
@@ -130,13 +133,16 @@ async fn run_cycle(
     // 1. Probe dipendenze
     let was_qdrant_ok = status.qdrant.load(Ordering::Relaxed);
     let was_embedder_ok = status.embedder.load(Ordering::Relaxed);
+    let was_gateway_ok = status.gateway.load(Ordering::Relaxed);
 
     let qdrant_result = probe_qdrant().await;
     let embedder_result = probe_embedder(orchestrator).await;
+    let gateway_result = probe_gateway().await;
 
     // Aggiorna stato atomico
     status.qdrant.store(qdrant_result.healthy, Ordering::Relaxed);
     status.embedder.store(embedder_result.healthy, Ordering::Relaxed);
+    status.gateway.store(gateway_result.healthy, Ordering::Relaxed);
     status.last_check.store(Utc::now().timestamp(), Ordering::Relaxed);
 
     // Log su cambio stato (evita spam nei log)
@@ -160,22 +166,36 @@ async fn run_cycle(
         tracing::info!("task_watchdog: embedder RIPRISTINATO ({}ms)", embedder_result.latency_ms.unwrap_or(0));
     }
 
+    if !gateway_result.healthy && was_gateway_ok {
+        tracing::warn!(
+            "task_watchdog: nexus-gateway DOWN — {} ({}ms)",
+            gateway_result.error_message.as_deref().unwrap_or("sconosciuto"),
+            gateway_result.latency_ms.unwrap_or(0),
+        );
+    } else if gateway_result.healthy && !was_gateway_ok {
+        tracing::info!("task_watchdog: nexus-gateway RIPRISTINATO ({}ms)", gateway_result.latency_ms.unwrap_or(0));
+    }
+
     // Persisti in DB (fire-and-forget)
     persist_probe(db, "qdrant", &qdrant_result).await;
     persist_probe(db, "embedder", &embedder_result).await;
+    persist_probe(db, "gateway", &gateway_result).await;
 
     // ── Auto-recovery servizi down (max 1 tentativo ogni 5 minuti) ────────
     let now_ts = Utc::now().timestamp();
     let last_recovery = status.last_recovery_attempt.load(Ordering::Relaxed);
     let recovery_cooldown_expired = (now_ts - last_recovery) > 300;
 
-    if recovery_cooldown_expired && (!qdrant_result.healthy || !embedder_result.healthy) {
+    if recovery_cooldown_expired && (!qdrant_result.healthy || !embedder_result.healthy || !gateway_result.healthy) {
         status.last_recovery_attempt.store(now_ts, Ordering::Relaxed);
         if !qdrant_result.healthy {
             attempt_recovery("qdrant", &qdrant_result).await;
         }
         if !embedder_result.healthy {
             attempt_recovery("embedder", &embedder_result).await;
+        }
+        if !gateway_result.healthy {
+            attempt_recovery("gateway", &gateway_result).await;
         }
     }
 
@@ -213,9 +233,109 @@ async fn attempt_recovery(service: &str, probe: &ProbeResult) {
             // Errore nell'embedding — potrebbe essere un crash parziale del modello
             try_restart_systemd_or_process("brain").await;
         }
+        ("gateway", _) => {
+            // Fix M48: gateway Node.js cade ripetutamente, lo riavvia.
+            try_restart_gateway().await;
+        }
         _ => {
             tracing::debug!("task_watchdog: nessuna strategia di recovery per {service}/{kind}");
         }
+    }
+}
+
+/// Fix M48: probe HTTP del nexus-gateway su :4060/providers.
+async fn probe_gateway() -> ProbeResult {
+    let port = std::env::var("NEXUS_GATEWAY_PORT").unwrap_or_else(|_| "4060".into());
+    let url = format!("http://localhost:{}/providers", port);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(QDRANT_PROBE_TIMEOUT_S))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ProbeResult {
+                healthy: false,
+                latency_ms: None,
+                error_kind: Some("client_error".into()),
+                error_message: Some(e.to_string()),
+            };
+        }
+    };
+    let started = Instant::now();
+    match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => ProbeResult {
+            healthy: true,
+            latency_ms: Some(started.elapsed().as_millis() as i32),
+            error_kind: None,
+            error_message: None,
+        },
+        Ok(r) => ProbeResult {
+            healthy: false,
+            latency_ms: Some(started.elapsed().as_millis() as i32),
+            error_kind: Some("http_error".into()),
+            error_message: Some(format!("HTTP {}", r.status())),
+        },
+        Err(e) => {
+            let msg = e.to_string();
+            let kind = if msg.contains("refused") || msg.contains("Connection refused") {
+                "connection_refused"
+            } else if msg.contains("timed out") || msg.contains("timeout") {
+                "timeout"
+            } else {
+                "connection_error"
+            };
+            ProbeResult {
+                healthy: false,
+                latency_ms: Some(started.elapsed().as_millis() as i32),
+                error_kind: Some(kind.into()),
+                error_message: Some(msg[..msg.len().min(300)].to_string()),
+            }
+        }
+    }
+}
+
+/// Fix M48: riavvia il nexus-gateway (Node.js) se cade. Usa lo stesso comando
+/// di deploy-local.sh (setsid nohup node dist/server.js). Best-effort: errori
+/// solo loggati. Cooldown 5 min gestito dal chiamante.
+async fn try_restart_gateway() {
+    let root = std::env::var("NEXUS_REPO_ROOT")
+        .unwrap_or_else(|_| "/home/administrator/ideai".to_string());
+    let server_js = format!("{}/apps/nexus-gateway/dist/server.js", root);
+    if !std::path::Path::new(&server_js).exists() {
+        tracing::warn!(
+            "task_watchdog: recovery gateway: {} non trovato, skip",
+            server_js
+        );
+        return;
+    }
+    // Verifica che non sia gia stato avviato di recente (gestisce race con stop precedente).
+    let _ = tokio::process::Command::new("pkill")
+        .args(["-f", "apps/nexus-gateway/dist/server.js"])
+        .output()
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // setsid nohup node ... > /tmp/nexus-gateway.log 2>&1 < /dev/null &
+    let shell = format!(
+        "setsid nohup env NODE_ENV=production NEXUS_GATEWAY_PORT={} node '{}' > /tmp/nexus-gateway.log 2>&1 < /dev/null &",
+        std::env::var("NEXUS_GATEWAY_PORT").unwrap_or_else(|_| "4060".into()),
+        server_js
+    );
+    match tokio::process::Command::new("sh")
+        .args(["-c", &shell])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => {
+            tracing::info!("task_watchdog: recovery gateway: spawn node OK");
+        }
+        Ok(o) => {
+            tracing::warn!(
+                "task_watchdog: recovery gateway: spawn fallito ({}): {}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+        Err(e) => tracing::warn!("task_watchdog: recovery gateway: shell exec fallito: {}", e),
     }
 }
 
