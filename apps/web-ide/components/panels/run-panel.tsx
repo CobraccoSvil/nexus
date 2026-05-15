@@ -354,6 +354,19 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
   const [batchBusy, setBatchBusy] = useState(false);
 
   const handleRestartAll = async () => {
+    // Fix M47: se non ci sono servizi systemd installati, il pulsante prima
+    // era solo disabilitato senza spiegare perche. Ora il click avvisa
+    // l'utente con un messaggio attivabile (Configura wizard) invece di
+    // restare silenzioso.
+    if (services.length === 0) {
+      await confirmDialog(
+        "Nessun servizio systemd installato per questo progetto. " +
+        "Usa il pulsante '+ Configura' qui sopra per lanciare il wizard di rilevamento, " +
+        "oppure avvia i Run Configurations dal pannello Run & Debug (npm dev / npm start).",
+      );
+      bumpLastRestart(); // Azzera comunque il contatore "file modificati" se l'utente conferma
+      return;
+    }
     if (!await confirmDialog("Riavviare tutti i servizi del progetto?")) return;
     setBatchBusy(true); setSvcMsg("Riavvio in corso…");
     try {
@@ -608,7 +621,7 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
         <span>Servizi systemd persistenti{slug ? ` — ${slug}` : ""}</span>
         <div style={{ display:"flex", gap:6 }}>
           <button onClick={fetchServices} title="Aggiorna stato" disabled={batchBusy} style={{ background:"none",border:`1px solid ${tc.border}`,borderRadius:3,color:tc.textMuted,cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10 }}>↺</button>
-          <button onClick={handleRestartAll} title="Riavvia tutti i servizi del progetto" disabled={batchBusy || services.length===0} style={{ background:"transparent",border:`1px solid #f59e0b`,borderRadius:3,color:"#f59e0b",cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10,opacity:(batchBusy||services.length===0)?0.5:1 }}>↻ Tutti</button>
+          <button onClick={handleRestartAll} title={services.length===0 ? "Nessun servizio systemd. Clicca per dettagli." : "Riavvia tutti i servizi del progetto"} disabled={batchBusy} style={{ background:"transparent",border:`1px solid #f59e0b`,borderRadius:3,color:"#f59e0b",cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10,opacity:batchBusy?0.5:1 }}>↻ Tutti</button>
           <button onClick={handleCleanupPorts} title="Termina processi su porte conflittuali (esclude i servizi del progetto)" disabled={batchBusy} style={{ background:"transparent",border:`1px solid #ef4444`,borderRadius:3,color:"#ef4444",cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10,opacity:batchBusy?0.5:1 }}>✕ Porte</button>
           <button onClick={runWizard} title="Wizard rilevamento servizi" disabled={batchBusy} style={{ background:tc.accent,border:"none",borderRadius:3,color:"#fff",cursor:batchBusy?"wait":"pointer",padding:"2px 10px",fontSize:10,opacity:batchBusy?0.6:1 }}>+ Configura</button>
         </div>
@@ -631,13 +644,15 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
           </div>
           <button
             onClick={handleRestartAll}
-            disabled={batchBusy || services.length===0}
-            title="Riavvia tutti i servizi per recepire le modifiche"
+            disabled={batchBusy}
+            title={services.length===0
+              ? "Nessun servizio systemd installato. Clicca per istruzioni su come configurarli."
+              : "Riavvia tutti i servizi per recepire le modifiche"}
             style={{
               background:"#f59e0b", color:"#fff", border:"none", borderRadius:3,
               padding:"3px 10px", fontSize:11, cursor:batchBusy?"wait":"pointer",
               flexShrink:0, fontWeight:600,
-              opacity:(batchBusy||services.length===0)?0.5:1,
+              opacity:batchBusy?0.5:1,
             }}
           >
             ↻ Riavvia tutti
