@@ -290,7 +290,11 @@ prompt_service_menu() {
 }
 
 stop_webide() {
-    pkill -f "server\.js" 2>/dev/null || true
+    # Fix M49: il pattern "server\.js" matchava ANCHE il nexus-gateway
+    # (node apps/nexus-gateway/dist/server.js), causando il kill collaterale
+    # del gateway a ogni rebuild --web. Ora il match e' ristretto al solo
+    # binary del web-ide (apps/web-ide/server.js).
+    pkill -f "apps/web-ide/server\.js" 2>/dev/null || true
     pkill -f "next-server" 2>/dev/null || true
     pkill -f "next start"  2>/dev/null || true
     sleep 1
