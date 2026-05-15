@@ -403,7 +403,46 @@ pub async fn get_project_ports(
     let project_root = context.root_path.to_string_lossy().to_string();
     let slug = context.details.name.to_lowercase().replace([' ', '_'], "-");
 
-    let ports = detect_project_ports(&project_root, &slug, project_id, &state.db).await;
+    // Fix M37: il pannello "Porte" mostrava "Nessuna porta rilevata" anche
+    // quando nexus_port_allocations conteneva 2+ porte (backend-dev, frontend-dev)
+    // perche' detect_project_ports cercava solo porte LIVE (processi attivi + ss).
+    // Ora prima leggiamo le allocazioni in DB, poi aggiungiamo le porte live
+    // marcandole con `live=true`. Cosi' l'utente vede TUTTE le porte gestite dal
+    // progetto, anche se backend/frontend non sono attualmente avviati.
+    let mut ports = detect_project_ports(&project_root, &slug, project_id, &state.db).await;
+    let live_ports: std::collections::HashSet<i32> = ports
+        .iter()
+        .filter_map(|p| p.get("port").and_then(|v| v.as_i64()).map(|n| n as i32))
+        .collect();
+
+    // Marca le live come live=true (le esistenti sono live)
+    for p in ports.iter_mut() {
+        if let Some(obj) = p.as_object_mut() {
+            obj.insert("live".to_string(), json!(true));
+        }
+    }
+
+    // Aggiungi le allocazioni in DB non gia presenti come live
+    let allocations: Vec<(i32, String, String)> = sqlx::query_as::<_, (i32, String, String)>(
+        "SELECT port, COALESCE(label, ''), allocation_mode \
+         FROM nexus_port_allocations WHERE project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    for (port, label, mode) in allocations {
+        if !live_ports.contains(&port) {
+            ports.push(json!({
+                "port": port,
+                "label": label,
+                "allocation_mode": mode,
+                "live": false,
+                "source": "db_allocation",
+            }));
+        }
+    }
+
     Ok(Json(json!({ "ports": ports })))
 }
 
