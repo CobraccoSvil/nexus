@@ -37,6 +37,7 @@ pub struct ToolRunnerDeps {
     pub dependency_status: crate::task_watchdog::DependencyStatusRef,
 }
 
+#[derive(Clone)]
 pub struct ToolRunnerService {
     deps: ToolRunnerDeps,
 }
@@ -234,15 +235,45 @@ pub async fn spawn_tool_runner_server(
         // Il tool search_in_files tronca a 500KB, ma altri tool (read_file su file grandi)
         // possono legittimamente produrre risposte da qualche MB.
         const MAX_MSG: usize = 64 * 1024 * 1024;
-        let tool_runner_svc = ToolRunnerServer::new(svc)
-            .max_decoding_message_size(MAX_MSG)
-            .max_encoding_message_size(MAX_MSG);
-        if let Err(e) = Server::builder()
-            .add_service(tool_runner_svc)
-            .serve(addr)
-            .await
-        {
-            tracing::error!("ToolRunner server terminato con errore: {e}");
+        // Fix M33: retry con backoff su transport error.
+        // Sintomo originale: dopo un restart di mcp-core, il bind tcp su :50071
+        // poteva fallire con "transport error" se la porta era in stato TIME_WAIT
+        // o se il processo precedente non l'aveva rilasciata. Senza retry il
+        // ToolRunner restava down e tutti i tool agente fallivano gRPC UNAVAILABLE.
+        const MAX_ATTEMPTS: u32 = 6;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let tool_runner_svc = ToolRunnerServer::new(svc.clone())
+                .max_decoding_message_size(MAX_MSG)
+                .max_encoding_message_size(MAX_MSG);
+            match Server::builder()
+                .add_service(tool_runner_svc)
+                .serve(addr)
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!("ToolRunner server terminato regolarmente");
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "ToolRunner server terminato con errore (tentativo {}/{}): {e}",
+                        attempt, MAX_ATTEMPTS
+                    );
+                    if attempt >= MAX_ATTEMPTS {
+                        tracing::error!(
+                            "ToolRunner: raggiunto limite {} tentativi, arresto definitivo",
+                            MAX_ATTEMPTS
+                        );
+                        return;
+                    }
+                    // Backoff esponenziale capped a 30s: 2, 4, 8, 16, 30s
+                    let secs = std::cmp::min(2u64.pow(attempt), 30);
+                    tracing::warn!("ToolRunner: retry tra {}s", secs);
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                }
+            }
         }
     });
     Ok(())

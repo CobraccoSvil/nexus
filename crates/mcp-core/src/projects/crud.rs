@@ -432,6 +432,50 @@ pub async fn delete_project(
         );
     }
 
+    // Fix M35: scan /proc per processi con CWD dentro project_root non registrati
+    // in agent_processes (es. dev server avviati dall'agente in run precedenti e
+    // sopravvissuti a uno Stop service mal completato). Linux-only via readlink.
+    if !root_path.is_empty() {
+        let mut orphan_pids: Vec<i32> = Vec::new();
+        if let Ok(mut entries) = tokio::fs::read_dir("/proc").await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                let pid: i32 = match name_str.parse() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                let cwd_link = format!("/proc/{}/cwd", pid);
+                if let Ok(cwd) = tokio::fs::read_link(&cwd_link).await {
+                    let cwd_str = cwd.to_string_lossy();
+                    if cwd_str.starts_with(&root_path) && !running_pids.contains(&pid) {
+                        orphan_pids.push(pid);
+                    }
+                }
+            }
+        }
+        for pid in &orphan_pids {
+            let _ = tokio::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .output()
+                .await;
+        }
+        if !orphan_pids.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            for pid in &orphan_pids {
+                let _ = tokio::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .output()
+                    .await;
+            }
+            tracing::info!(
+                "delete_project: terminati {} processi orfani con cwd in {} (M35)",
+                orphan_pids.len(),
+                root_path
+            );
+        }
+    }
+
     // Elimina dal DB (cascade su workspaces, repositories, agent_runs, ecc.)
     sqlx::query("DELETE FROM projects WHERE id = $1 AND owner_user_id = $2")
         .bind(project_id)

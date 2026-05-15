@@ -1370,6 +1370,16 @@ async fn main() -> anyhow::Result<()> {
                 )),
             )
             .route(
+                // Fix M33-B: allocazione dinamica di una porta nel bucket
+                // deterministico del progetto. Usata dall'agente al posto di
+                // hardcodare porte (M33-A vieta hardcode nel prompt).
+                "/api/projects/:id/services/allocate-port",
+                post(project_workspace::allocate_port::allocate_port).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
                 // Fix M11: SSE stream eventi filesystem (auto-refresh EXPLORER)
                 "/api/projects/:id/fs-events",
                 get(project_workspace::fs_events::fs_events).layer(axum_mw::from_fn_with_state(

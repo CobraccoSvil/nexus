@@ -1,4 +1,5 @@
 // Sotto-moduli per dominio del workspace di progetto
+pub mod allocate_port;
 pub mod auto_bootstrap;
 pub mod browser_check;
 pub mod changes;

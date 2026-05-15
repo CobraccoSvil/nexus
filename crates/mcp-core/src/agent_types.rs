@@ -390,6 +390,69 @@ pub async fn auto_commit_project_changes(db: &PgPool, run_id: Uuid) {
     if !is_git {
         return;
     }
+    // Fix M34: se manca .gitignore, scrive un default minimo prima del git add
+    // per evitare di committare node_modules / build artifacts / secrets.
+    // Patterns scelti per coprire i default Node/Python/Rust/Next/Vite generici.
+    let gitignore_path = root_path.join(".gitignore");
+    if !gitignore_path.exists() {
+        let default_gitignore = "\
+# Auto-generato da Nexus al primo commit. Personalizza se serve.
+
+# Dependencies
+node_modules/
+.pnpm-store/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build artifacts
+dist/
+build/
+out/
+.next/
+.nuxt/
+.turbo/
+target/
+*.tsbuildinfo
+
+# Test artifacts
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+";
+        if let Err(e) = tokio::fs::write(&gitignore_path, default_gitignore).await {
+            tracing::warn!(
+                "auto_commit: scrittura .gitignore default fallita: {} (continuo lo stesso)",
+                e
+            );
+        } else {
+            tracing::info!("auto_commit: scritto .gitignore default in {}", root);
+        }
+    }
     // 3. Stage all changes
     let _ = tokio::process::Command::new("git")
         .args(["-C", &root, "add", "-A"])
