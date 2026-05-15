@@ -43,3 +43,16 @@ backups/postgres/*.dump
 backups/postgres/*.sql.gz
 db/backups/
 
+# Artefatti runtime locali (non versionati: prodotti dai build / dai test).
+apps/web-ide/tsconfig.tsbuildinfo
+brain/nexus_memory/
+.claude/projects/
+.cursor/
+check_tables.txt
+devnull
+test-results/
+
+# Run di test maturity Nexus: solo telemetria per debug locale, non utile in git.
+# I template (collect.sh, monitor.sh, report-template.md, rubric.md) restano tracked.
+tests/nexus-maturity/202[5-9]-*/
+
