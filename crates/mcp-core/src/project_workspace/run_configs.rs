@@ -240,6 +240,99 @@ pub fn compute_run_config_suggestions(root: &std::path::Path) -> Vec<Value> {
     suggestions
 }
 
+/// Fix M30: auto-popola la tabella `run_configurations` dai suggerimenti rilevati
+/// nel filesystem. Chiamata da `register_project` come spawn-and-forget post-insert,
+/// cosi' il pannello Run & Debug mostra subito i run config (npm dev, npm test, ecc.)
+/// senza richiedere il click "Configura" manuale.
+/// Idempotente: se esistono gia' run_config per il progetto, skippa.
+pub async fn auto_populate_run_configs(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    project_root: &std::path::Path,
+) {
+    // Idempotenza: se ci sono gia' record, lascia stare (l'utente potrebbe averli editati).
+    let already: i64 = match sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM run_configurations WHERE project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_one(db)
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("auto_populate_run_configs: count fallita: {e}");
+            return;
+        }
+    };
+    if already > 0 {
+        tracing::debug!("auto_populate_run_configs: skip (gia' {} record)", already);
+        return;
+    }
+
+    let suggestions = compute_run_config_suggestions(project_root);
+    if suggestions.is_empty() {
+        tracing::info!(
+            "auto_populate_run_configs: nessun suggerimento rilevato per {}",
+            project_id
+        );
+        return;
+    }
+
+    let mut inserted = 0_usize;
+    for s in &suggestions {
+        let label = s.get("label").and_then(|v| v.as_str()).unwrap_or("run").to_string();
+        let kind = s.get("kind").and_then(|v| v.as_str()).unwrap_or("shell").to_string();
+        let command = s.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if command.is_empty() {
+            continue;
+        }
+        let args: Vec<String> = s
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cwd = s.get("cwd").and_then(|v| v.as_str()).map(str::to_string);
+        let env = s.get("env").cloned().unwrap_or(json!({}));
+        let role = s.get("role").and_then(|v| v.as_str()).map(str::to_string);
+        let essential = s.get("essential").and_then(|v| v.as_bool()).unwrap_or(false);
+        let group = s.get("group").and_then(|v| v.as_str()).map(str::to_string);
+
+        let res = sqlx::query(
+            "INSERT INTO run_configurations \
+             (id, project_id, label, kind, command, args, cwd, env, role, essential, group_label) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(project_id)
+        .bind(&label)
+        .bind(&kind)
+        .bind(&command)
+        .bind(&args)
+        .bind(&cwd)
+        .bind(&env)
+        .bind(&role)
+        .bind(essential)
+        .bind(&group)
+        .execute(db)
+        .await;
+        if res.is_ok() {
+            inserted += 1;
+        }
+    }
+    // Salva anche cache suggerimenti per UI "rigenera"
+    save_suggestions_cache(db, project_id, &suggestions).await;
+    tracing::info!(
+        "auto_populate_run_configs: {}/{} run_config inseriti per progetto {}",
+        inserted,
+        suggestions.len(),
+        project_id
+    );
+}
+
 /// Salva i suggerimenti rilevati nella cache DB del progetto.
 pub async fn save_suggestions_cache(db: &sqlx::PgPool, project_id: Uuid, suggestions: &[Value]) {
     let json_val = serde_json::to_value(suggestions).unwrap_or(Value::Null);

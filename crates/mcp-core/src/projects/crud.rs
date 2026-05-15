@@ -277,6 +277,25 @@ pub async fn register_project(
     )
     .await?;
 
+    // Fix M30 + M31: auto-popola run_configurations e nexus_port_allocations
+    // scansionando il filesystem del progetto registrato. Spawn-and-forget,
+    // best-effort: errori solo loggati. Idempotenti via guardia/ON CONFLICT.
+    {
+        let db_clone = state.db.clone();
+        let root_clone = canonical.clone();
+        let pid = project_id;
+        tokio::spawn(async move {
+            crate::project_workspace::run_configs::auto_populate_run_configs(
+                &db_clone, pid, &root_clone,
+            )
+            .await;
+            crate::project_workspace::scan_ports::auto_populate_port_allocations(
+                &db_clone, pid, &root_clone,
+            )
+            .await;
+        });
+    }
+
     // Avvia analisi automatica in background per popolare la memoria vettoriale
     {
         let state_bg = state.clone();

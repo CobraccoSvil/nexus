@@ -30,6 +30,8 @@ export interface NexusServiceInfo {
    * dall'IDE senza privilegi root. I pulsanti start/stop/restart vengono omessi.
    */
   readonly?: boolean;
+  /** Nome del container Docker (per servizi containerizzati: Postgres/Redis). */
+  dockerContainer?: string;
   state: "active" | "inactive" | "failed" | "activating" | "unknown";
   sub_state?: string;
   /**
@@ -51,9 +53,36 @@ const NEXUS_SERVICES: Omit<NexusServiceInfo, "state" | "sub_state">[] = [
   { name: "nexus-plugin-wsl",     label: "Plugin Service",   port: 4050, description: "Connettori MCP" },
   { name: "nexus-admin-wsl",      label: "Admin Service",    port: 4010, description: "Pannello amministrazione" },
   // Servizi di infrastruttura (system): sola lettura, richiedono root per il controllo.
-  { name: "redis-server",         label: "Redis",            port: 6379, description: "Cache e broker messaggi",                 led: "Redis",    readonly: true },
-  { name: "postgresql@16-main",   label: "PostgreSQL",       port: 5432, description: "Database relazionale principale",         led: "DB",       readonly: true },
+  // In setup container (Nexus dev WSL) il check via systemctl non funziona:
+  // Postgres/Redis girano in container ideai-* e il port mapping non e' 1:1
+  // (es. Postgres host :5433 -> container :5432). Per questi servizi
+  // checkContainer() interroga `docker inspect` come source-of-truth.
+  { name: "redis-server",         label: "Redis",            port: 6379, description: "Cache e broker messaggi",                 led: "Redis",    readonly: true, dockerContainer: "ideai-redis-1" },
+  { name: "postgresql@16-main",   label: "PostgreSQL",       port: 5433, description: "Database relazionale principale",         led: "DB",       readonly: true, dockerContainer: "ideai-postgres-nexus-1" },
 ];
+
+/**
+ * Fix M29: legge stato di un container Docker (running/exited/...).
+ * Usato per Postgres/Redis che girano containerizzati in ideai-*.
+ */
+async function checkDockerContainer(name: string): Promise<{ state: string; sub_state: string }> {
+  try {
+    const { stdout } = await execAsync(
+      `docker inspect ${name} --format "{{.State.Status}}|{{.State.Health.Status}}" 2>/dev/null || echo "missing|"`
+    );
+    const trimmed = stdout.trim();
+    if (trimmed === "missing|" || trimmed === "") {
+      return { state: "unknown", sub_state: "container-not-found" };
+    }
+    const [status, health] = trimmed.split("|");
+    if (status === "running") {
+      return { state: "active", sub_state: health || "running" };
+    }
+    return { state: "inactive", sub_state: status || "dead" };
+  } catch {
+    return { state: "unknown", sub_state: "unknown" };
+  }
+}
 
 /**
  * Verifica se una porta TCP locale risponde entro `timeoutMs` millisecondi.
@@ -134,8 +163,15 @@ async function getServiceState(name: string, systemScope = false): Promise<{ sta
 export async function GET() {
   const services: NexusServiceInfo[] = await Promise.all(
     NEXUS_SERVICES.map(async (svc) => {
+      // Fix M29: per servizi con dockerContainer definito (Postgres, Redis)
+      // interroga lo stato del container Docker invece di systemctl.
+      // In setup non-container il dockerContainer e' undefined e si ricade
+      // sul check systemctl standard.
+      const stateProbe = svc.dockerContainer
+        ? checkDockerContainer(svc.dockerContainer)
+        : getServiceState(svc.name, svc.readonly === true);
       const [{ state, sub_state }, port_alive] = await Promise.all([
-        getServiceState(svc.name, svc.readonly === true),
+        stateProbe,
         checkPort(svc.port),
       ]);
       // Fix M28: in dev WSL i servizi Nexus sono lanciati da deploy-local.sh come
