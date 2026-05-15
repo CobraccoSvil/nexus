@@ -100,16 +100,29 @@ export function OptimizationPanel({ projectId, onSendToChat, onAutoSendToChat, a
   const tc = useThemeColors();
   const storageKey = `nexus:optimization:${projectId}`;
 
-  // Stato dipendenze infrastrutturali (Qdrant/embedder)
+  // Stato dipendenze infrastrutturali (Qdrant/embedder).
+  // Polling ogni 30s: senza questo, dopo un restart di Nexus durante la stessa
+  // sessione browser il banner "non disponibile" rimaneva stale all'infinito
+  // perche l'effetto girava solo on-mount.
   const [depsOk, setDepsOk] = useState(true);
   useEffect(() => {
-    fetch(`${OPT_API_BASE}/api/health`, { credentials: "include" })
-      .then(r => r.json())
-      .then(d => {
-        const comps = d.components as Record<string, boolean> | undefined;
-        setDepsOk(comps?.qdrant !== false && comps?.embedder !== false);
-      })
-      .catch(() => { /* ignora — assume ok */ });
+    let cancelled = false;
+    const checkHealth = () => {
+      fetch(`${OPT_API_BASE}/api/health`, { credentials: "include" })
+        .then(r => r.json())
+        .then(d => {
+          if (cancelled) return;
+          const comps = d.components as Record<string, boolean> | undefined;
+          setDepsOk(comps?.qdrant !== false && comps?.embedder !== false);
+        })
+        .catch(() => { /* ignora — assume ok finche' un check riesce */ });
+    };
+    checkHealth();
+    const interval = window.setInterval(checkHealth, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
   }, []);
 
   const [scanning, setScanning] = useState(false);
