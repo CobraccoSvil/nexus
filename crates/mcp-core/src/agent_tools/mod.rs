@@ -28,6 +28,7 @@ pub(crate) mod service;
 pub(crate) mod sandbox;
 pub(crate) mod command;
 pub(crate) mod testing;
+pub(crate) mod ports;
 
 // Re-export per uso interno crate (tool_run_tests è chiamato da agent_loop, in teoria).
 pub(crate) use command::tool_run_tests;
@@ -229,6 +230,20 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         }
       },
       "required": ["url"]
+    }
+  },
+  {
+    "name": "request_port",
+    "description": "Fix M51: alloca una porta TCP libera per il progetto dal bucket deterministico Nexus (20000-39999). Usa questo tool al posto di hardcodare 3002/5173 o di chiamare curl all'endpoint REST allocate-port. Idempotente: chiamate ripetute con stessa label ritornano la stessa porta. La porta viene registrata in nexus_port_allocations e propagata automaticamente in run_configurations.env.PORT al prossimo run completed (M40). Ritorna JSON {port, label, allocation_mode}.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string",
+          "description": "Etichetta logica del servizio (es. 'backend-dev', 'frontend-dev', 'api', 'web'). Obbligatorio."
+        }
+      },
+      "required": ["label"]
     }
   },
   {
@@ -1209,6 +1224,8 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "git_push" => git::tool_git_push(ctx).await,
         "git_pull" => git::tool_git_pull(ctx).await,
         "git_remote_add" => git::tool_git_remote_add(ctx, input).await,
+        // Fix M51: tool dedicato per allocazione porta (evita curl via run_command).
+        "request_port" => ports::tool_request_port(ctx, input).await,
         "run_in_terminal" => service::tool_run_service(ctx, input, "task").await,
         "run_service" => service::tool_run_service(ctx, input, "service").await,
         "read_terminal_output" => service::tool_read_service_output(ctx, input).await,

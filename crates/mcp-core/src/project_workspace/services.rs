@@ -820,12 +820,12 @@ pub(super) const NEXUS_RESERVED_PORTS: &[u16] = &[
 
 /// Range dedicato ai servizi dei progetti gestiti (deve evitare conflitti con Nexus e con servizi host comuni).
 /// Scelta conservativa: porte alte non privilegiate, fuori dal range Nexus e fuori dai DB.
-pub(super) const PROJECT_PORT_RANGE_START: u16 = 20000;
-pub(super) const PROJECT_PORT_RANGE_END: u16 = 39999;
+pub const PROJECT_PORT_RANGE_START: u16 = 20000;
+pub const PROJECT_PORT_RANGE_END: u16 = 39999;
 /// Numero porte per progetto nel bucket deterministico.
-pub(super) const PROJECT_PORT_BUCKET_SIZE: u16 = 50;
+pub const PROJECT_PORT_BUCKET_SIZE: u16 = 50;
 
-fn project_bucket_start(project_id: &Uuid) -> u16 {
+pub fn project_bucket_start(project_id: &Uuid) -> u16 {
     // Hash stabile: usa i primi 8 byte (big-endian) del UUID.
     let b = project_id.as_bytes();
     let mut v: u64 = 0;
