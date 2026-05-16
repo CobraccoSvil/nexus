@@ -703,15 +703,15 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         )
         tools_json = []
 
-    # Override esplicito batte il routing semantico.
     # Fix M61 (sticky cascade): se il turno precedente ha fatto cascade fallback
     # con successo a un altro provider, "sticky" su quello nelle iter successive
-    # invece di ripartire dal provider primario fallito. Risparmia 1 round-trip
-    # di fallimento per iterazione.
+    # invece di ripartire dal provider primario fallito. Lo sticky ha priorita'
+    # ANCHE sul provider_override (l'utente sceglie un primario ma se quel
+    # primario fallisce, il cascade-fallback diventa la nuova fonte di verita').
     sticky_provider = state.get("sticky_provider")
     sticky_model = state.get("sticky_model")
-    provider = state.get("provider_override") or sticky_provider
-    model = state.get("model_override") or sticky_model
+    provider = sticky_provider or state.get("provider_override")
+    model = sticky_model or state.get("model_override")
     if not provider or not model:
         if _router is not None:
             # Passa anche il message originale: il router lo usa per detection
