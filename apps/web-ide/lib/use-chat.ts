@@ -766,6 +766,47 @@ export function useChat(
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, sessionId]);
 
+  // M65: polling provider/model durante esecuzione.
+  // Quando M61b sticky cascade fa fallback (es. openai/o3 -> deepseek/deepseek-chat),
+  // l'UPDATE su agent_runs.provider/model (M62) avviene server-side, ma il frontend
+  // ha il provider INIZIALE nel state React. Senza polling, l'utente vede
+  // "run: openai/o3" anche se il provider effettivo è deepseek. Polling ogni 5s
+  // mantiene il display sincronizzato. Si auto-disattiva quando il run e' terminale.
+  useEffect(() => {
+    if (!agentRun) return;
+    if (agentRun.status !== "running" && agentRun.status !== "awaiting_confirmation") return;
+    const runId = agentRun.runId;
+    let cancelled = false;
+    const interval = setInterval(async () => {
+      if (cancelled) return;
+      try {
+        const fresh = await getAgentRun(runId);
+        if (cancelled || !fresh) return;
+        // Aggiorna solo se provider/model sono effettivamente cambiati per non triggerare re-render inutili.
+        setAgentRun((prev) => {
+          if (!prev || prev.runId !== runId) return prev;
+          if (prev.provider === fresh.provider && prev.model === fresh.model && prev.status === fresh.status) {
+            return prev;
+          }
+          return { ...prev, provider: fresh.provider, model: fresh.model, status: fresh.status };
+        });
+        setAgentRuns((prev) => {
+          const existing = prev.get(runId);
+          if (!existing || (existing.provider === fresh.provider && existing.model === fresh.model && existing.status === fresh.status)) {
+            return prev;
+          }
+          return new Map(prev).set(runId, { ...existing, provider: fresh.provider, model: fresh.model, status: fresh.status });
+        });
+      } catch {
+        /* polling best-effort: ignora errori transitori */
+      }
+    }, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [agentRun?.runId, agentRun?.status]);
+
   return {
     messages,
     sessionId,

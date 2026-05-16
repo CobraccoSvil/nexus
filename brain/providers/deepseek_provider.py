@@ -166,7 +166,22 @@ class DeepSeekProvider(BaseProvider):
                     tool_use_blocks.append(block)
                     assistant_content.append({"type": "tool_use", **block})
             else:
-                if text_content:
+                # M64: alcuni modelli (deepseek-chat in particolare) talvolta
+                # emettono tool_call come XML inline nel content invece di
+                # usare il campo tool_calls nativo. Esempio:
+                # <invoke name="run_command"><parameter name="command">ls</parameter></invoke>
+                # Se rilevato, parsiamo e convertiamo in tool_use_blocks per
+                # evitare che finisca nel display come testo grezzo (DSML leak).
+                xml_blocks, cleaned_text = _parse_inline_tool_invocations(text_content)
+                if xml_blocks:
+                    stop_reason = "tool_use"
+                    for blk in xml_blocks:
+                        tool_use_blocks.append(blk)
+                        assistant_content.append({"type": "tool_use", **blk})
+                    if cleaned_text.strip():
+                        assistant_content.insert(0, {"type": "text", "text": cleaned_text})
+                    text_content = cleaned_text
+                elif text_content:
                     assistant_content.append({"type": "text", "text": text_content})
 
             usage_data = {}
@@ -229,3 +244,87 @@ class DeepSeekProvider(BaseProvider):
             from .error_handler import classify_error
             info = classify_error(e, self.name)
             return {"provider": self.name, "status": "error", "reason": info["message"], "error_class": info["stop_reason"]}
+
+
+def _parse_inline_tool_invocations(text: str) -> tuple[list[dict], str]:
+    """M64: parser di recupero per tool_call emessi come XML inline.
+
+    Alcuni modelli (deepseek-chat, claude antichi) talvolta producono
+    nel content una struttura tipo:
+
+        <invoke name="run_command">
+          <parameter name="command">ls -la</parameter>
+          <parameter name="timeout_secs">120</parameter>
+        </invoke>
+
+    Quando il finish_reason non e' 'tool_calls', il content arriva nel
+    display come testo grezzo (problema DSML leak visibile in chat).
+    Questo helper estrae le invoke con regex e ritorna:
+      - list di {id, name, input} (formato tool_use Anthropic-compat)
+      - testo "pulito" senza le invoke (eventuale narrazione)
+
+    Ritorna ([], text_originale) se nessun invoke rilevato.
+    """
+    import re
+    import uuid as _uuid
+
+    if not text or "<invoke" not in text:
+        return [], text
+
+    # Regex per match l'intero blocco <invoke name="X">...</invoke>
+    invoke_re = re.compile(
+        r'<invoke\s+name="(?P<name>[^"]+)"\s*>(?P<body>.*?)</invoke>',
+        re.DOTALL,
+    )
+    param_re = re.compile(
+        r'<parameter\s+name="(?P<pname>[^"]+)"(?:\s+string="(?P<is_string>true|false)")?\s*>(?P<value>.*?)</parameter>',
+        re.DOTALL,
+    )
+
+    blocks: list[dict] = []
+    cleaned = text
+    for m in invoke_re.finditer(text):
+        tool_name = m.group("name").strip()
+        body = m.group("body") or ""
+        params: dict = {}
+        for pm in param_re.finditer(body):
+            pname = pm.group("pname").strip()
+            raw_value = (pm.group("value") or "").strip()
+            is_string_attr = pm.group("is_string")
+            # Coercion best-effort: se string="false", prova int/bool/null/float
+            if is_string_attr == "false" and raw_value:
+                lower = raw_value.lower()
+                if lower in ("true", "false"):
+                    params[pname] = (lower == "true")
+                    continue
+                if lower == "null":
+                    params[pname] = None
+                    continue
+                try:
+                    params[pname] = int(raw_value)
+                    continue
+                except ValueError:
+                    pass
+                try:
+                    params[pname] = float(raw_value)
+                    continue
+                except ValueError:
+                    pass
+                # fallthrough: tienilo come stringa
+            params[pname] = raw_value
+        if tool_name:
+            blocks.append({
+                "id": f"toolu_{_uuid.uuid4().hex[:24]}",
+                "name": tool_name,
+                "input": params,
+            })
+        # Rimuovi il blocco dal testo pulito
+        cleaned = cleaned.replace(m.group(0), "")
+
+    # Pulisci anche eventuali wrapper <tool_calls>...</tool_calls> esterni
+    cleaned = re.sub(r"</?tool_calls\s*/?>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</?DSML\s*/?>", "", cleaned, flags=re.IGNORECASE)
+    # Compatta whitespace ridondante
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    return blocks, cleaned
