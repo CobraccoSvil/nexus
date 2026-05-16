@@ -1215,6 +1215,38 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
 
     results = await asyncio.gather(*[_run(b) for b in pending])
 
+    # M68: persisti gli step in agent_steps INCREMENTALMENTE durante il run.
+    # Prima il batch finale era in chat_messages.rs:2350 (Rust) a fine run.
+    # Ora ogni step viene scritto subito cosi' la UI lo vede via polling
+    # (M67) o via refresh, senza dover aspettare la fine del run.
+    try:
+        import os, psycopg2  # type: ignore[import-untyped]
+        from psycopg2.extras import Json as _Json  # type: ignore[import-untyped]
+        _run_id = state.get("thread_id") or ""
+        _dburl = os.environ.get("DATABASE_URL", "")
+        if _run_id and _dburl:
+            _step_base = int(state.get("iterations") or 0) * 1000
+            _conn = psycopg2.connect(_dburl)
+            try:
+                with _conn.cursor() as _cur:
+                    for _idx, (_block, _result) in enumerate(zip(pending, results)):
+                        _t_name = _block.get("name", "")
+                        _t_input = _block.get("input", {}) or {}
+                        _t_result = _result.get("content", "")
+                        _status = "failed" if _result.get("is_error") else "completed"
+                        _cur.execute(
+                            """INSERT INTO agent_steps
+                               (id, run_id, step_index, tool_name, tool_input, tool_result, status, created_at)
+                               VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, NOW())
+                               ON CONFLICT DO NOTHING""",
+                            (_run_id, _step_base + _idx, _t_name, _Json(_t_input), _t_result, _status),
+                        )
+                _conn.commit()
+            finally:
+                _conn.close()
+    except Exception as _persist_exc:
+        logger.warning("tool_dispatch_node: persistenza incrementale agent_steps fallita: %s", _persist_exc)
+
     new_chars = sum(len(r.get("content", "")) for r in results)
     if ctx_chars + new_chars > MAX_CONTEXT_CHARS:
         budget_per_tool = max(1500, (MAX_CONTEXT_CHARS - ctx_chars) // max(len(results), 1))
