@@ -405,9 +405,14 @@ export function ChatPanel({
     const id = setInterval(() => setNowTick(Date.now()), 1000);
     return () => clearInterval(id);
   }, [isAgentRunning]);
+  // M66: se ancora nessun step è arrivato via SSE, usa il timestamp di avvio
+  // del run come riferimento. Altrimenti il contatore "Agente AI in esecuzione 0s"
+  // resta congelato a 0 anche se l'agente sta "pensando" da minuti, perche'
+  // lastStepAt = Date.now() lo fa coincidere con nowTick.
+  const runStartedAt = agentRun?.createdAt ? new Date(agentRun.createdAt).getTime() : Date.now();
   const lastStepAt = agentSteps.length > 0
     ? Math.max(...agentSteps.map((s) => new Date(s.createdAt ?? 0).getTime()))
-    : Date.now();
+    : runStartedAt;
   const secondsSinceLastStep = Math.max(0, Math.floor((nowTick - lastStepAt) / 1000));
   const isAgentStuck = isAgentRunning && secondsSinceLastStep > 60;
 
