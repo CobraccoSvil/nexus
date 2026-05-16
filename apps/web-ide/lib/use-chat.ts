@@ -766,12 +766,14 @@ export function useChat(
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, sessionId]);
 
-  // M65: polling provider/model durante esecuzione.
+  // M65+M67: polling provider/model + steps durante esecuzione.
   // Quando M61b sticky cascade fa fallback (es. openai/o3 -> deepseek/deepseek-chat),
   // l'UPDATE su agent_runs.provider/model (M62) avviene server-side, ma il frontend
   // ha il provider INIZIALE nel state React. Senza polling, l'utente vede
-  // "run: openai/o3" anche se il provider effettivo è deepseek. Polling ogni 5s
-  // mantiene il display sincronizzato. Si auto-disattiva quando il run e' terminale.
+  // "run: openai/o3" anche se il provider effettivo è deepseek.
+  // M67: anche gli step possono essere persi se SSE stream cade o rallenta.
+  // Polling ogni 5s mantiene provider+model+status+steps+iterationCount sincronizzati.
+  // Auto-disattiva quando il run e' terminale.
   useEffect(() => {
     if (!agentRun) return;
     if (agentRun.status !== "running" && agentRun.status !== "awaiting_confirmation") return;
@@ -782,21 +784,64 @@ export function useChat(
       try {
         const fresh = await getAgentRun(runId);
         if (cancelled || !fresh) return;
-        // Aggiorna solo se provider/model sono effettivamente cambiati per non triggerare re-render inutili.
+        // Aggiorna agent_run solo se metadata sono cambiati (evita re-render inutili)
         setAgentRun((prev) => {
           if (!prev || prev.runId !== runId) return prev;
-          if (prev.provider === fresh.provider && prev.model === fresh.model && prev.status === fresh.status) {
-            return prev;
-          }
-          return { ...prev, provider: fresh.provider, model: fresh.model, status: fresh.status };
+          const changed =
+            prev.provider !== fresh.provider ||
+            prev.model !== fresh.model ||
+            prev.status !== fresh.status ||
+            (prev.iterationCount ?? 0) !== (fresh.iterationCount ?? 0);
+          if (!changed) return prev;
+          return {
+            ...prev,
+            provider: fresh.provider,
+            model: fresh.model,
+            status: fresh.status,
+            iterationCount: fresh.iterationCount ?? prev.iterationCount,
+          };
         });
         setAgentRuns((prev) => {
           const existing = prev.get(runId);
-          if (!existing || (existing.provider === fresh.provider && existing.model === fresh.model && existing.status === fresh.status)) {
+          if (!existing) return prev;
+          if (
+            existing.provider === fresh.provider &&
+            existing.model === fresh.model &&
+            existing.status === fresh.status &&
+            (existing.iterationCount ?? 0) === (fresh.iterationCount ?? 0)
+          ) {
             return prev;
           }
-          return new Map(prev).set(runId, { ...existing, provider: fresh.provider, model: fresh.model, status: fresh.status });
+          return new Map(prev).set(runId, {
+            ...existing,
+            provider: fresh.provider,
+            model: fresh.model,
+            status: fresh.status,
+            iterationCount: fresh.iterationCount ?? existing.iterationCount,
+          });
         });
+        // M67: refresh steps. Se il count è cambiato (o c'è uno step pre-esistente
+        // con dati aggiornati, es. status running -> completed), aggiorna lo state.
+        const freshSteps = fresh.steps ?? [];
+        if (freshSteps.length > 0) {
+          setAgentSteps((prev) => {
+            // Confronto rapido: numero diverso o cambio di status sull'ultimo step
+            if (prev.length === freshSteps.length) {
+              const last = freshSteps[freshSteps.length - 1];
+              const prevLast = prev[prev.length - 1];
+              if (
+                prevLast &&
+                prevLast.stepIndex === last.stepIndex &&
+                prevLast.status === last.status &&
+                prevLast.toolName === last.toolName
+              ) {
+                return prev;
+              }
+            }
+            return freshSteps;
+          });
+          setAgentStepsMap((prev) => new Map(prev).set(runId, freshSteps));
+        }
       } catch {
         /* polling best-effort: ignora errori transitori */
       }
