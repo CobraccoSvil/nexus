@@ -845,6 +845,24 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 provider = prov_result.provider
                 model = prov_result.model
                 cascade_did_fallback = True
+                # Fix M62: propaga il provider/model effettivi anche su agent_runs cosi'
+                # la chat UI mostra il fallback invece del primario fallito. Best-effort:
+                # se il DB e' down logghiamo soltanto.
+                try:
+                    import os, psycopg2  # type: ignore[import-untyped]
+                    _run_id = str(state.get("thread_id") or "")
+                    _dburl = os.environ.get("DATABASE_URL", "")
+                    if _run_id and _dburl:
+                        _conn = psycopg2.connect(_dburl)
+                        with _conn.cursor() as _cur:
+                            _cur.execute(
+                                "UPDATE agent_runs SET provider=%s, model=%s WHERE id=%s",
+                                (provider, model, _run_id),
+                            )
+                        _conn.commit()
+                        _conn.close()
+                except Exception as _exc:
+                    logger.warning("executor_node: UPDATE agent_runs cascade fallita: %s", _exc)
             result_text = prov_result.content or ""
             meta = prov_result.metadata or {}
             stop_reason = meta.get("stop_reason") or "end_turn"
