@@ -63,6 +63,22 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
         return "[Errore: comando vuoto]".to_string();
     }
 
+    // ── Livello 0 GUARDRAIL: blocca comandi infrastruttura-distruttivi ──
+    // Difesa in profondita': blacklist server-side che non puo' essere
+    // bypassata dal prompt utente / jailbreak. Vedi safety.rs per la lista
+    // pattern (psql -d nexus, prisma migrate reset, docker exec ideai-*,
+    // DROP/TRUNCATE/DELETE su tabelle Nexus, rm -rf su /home/administrator/ideai).
+    if let Some(reason) = super::safety::check_command(&command) {
+        tracing::warn!(
+            "SECURITY_GUARDRAIL: comando BLOCCATO category={} project_id={} cmd_excerpt={:?}",
+            reason.category,
+            ctx.project_id,
+            command.chars().take(160).collect::<String>(),
+        );
+        let _ = persist_security_audit(ctx, &command, &reason).await;
+        return super::safety::format_blocked_result(&command, &reason);
+    }
+
     if strict_migration_only_project(ctx).await
         && !shell_command_bypasses_migration_policy(&command)
         && shell_looks_like_sql_cli_with_ddl(&command)
@@ -477,4 +493,28 @@ fn extract_test_count(line: &str, keyword: &str) -> Option<u32> {
     let pos = line.find(keyword)?;
     let before = &line[..pos];
     before.rsplit(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+}
+
+/// Persiste l'evento di blocco su `nexus_security_audit` (mig 0154).
+/// Best-effort: se la tabella non esiste o il DB e' down, log warn e prosegue.
+async fn persist_security_audit(
+    ctx: &AgentToolContext,
+    command: &str,
+    reason: &super::safety::BlockReason,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO nexus_security_audit
+           (project_id, user_id, session_id, tool_name, command_excerpt, category, message, blocked)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, true)"#,
+    )
+    .bind(ctx.project_id)
+    .bind(ctx.user_id)
+    .bind(ctx.session_id)
+    .bind("run_command")
+    .bind(command.chars().take(2000).collect::<String>())
+    .bind(reason.category)
+    .bind(reason.message)
+    .execute(&*ctx.db)
+    .await
+    .map(|_| ())
 }

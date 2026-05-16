@@ -31,6 +31,7 @@ pub(crate) mod testing;
 pub(crate) mod ports;
 pub(crate) mod todos;
 pub(crate) mod subagent;
+pub(crate) mod safety;
 
 // Re-export per uso interno crate (tool_run_tests è chiamato da agent_loop, in teoria).
 pub(crate) use command::tool_run_tests;
