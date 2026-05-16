@@ -105,3 +105,9 @@ class AgentState(TypedDict, total=False):
     subagent_results: list[dict]
     active_subagent_runs: list[str]
     subagent_cost_cumulative_usd: float
+
+    # M61 sticky cascade fallback: dopo un cascade riuscito, persisti il
+    # provider/model effettivo cosi' le iter successive partono direttamente
+    # da li' invece di ri-tentare il primario fallito ad ogni round.
+    sticky_provider: str | None
+    sticky_model: str | None

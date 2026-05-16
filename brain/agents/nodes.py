@@ -704,8 +704,14 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         tools_json = []
 
     # Override esplicito batte il routing semantico.
-    provider = state.get("provider_override")
-    model = state.get("model_override")
+    # Fix M61 (sticky cascade): se il turno precedente ha fatto cascade fallback
+    # con successo a un altro provider, "sticky" su quello nelle iter successive
+    # invece di ripartire dal provider primario fallito. Risparmia 1 round-trip
+    # di fallimento per iterazione.
+    sticky_provider = state.get("sticky_provider")
+    sticky_model = state.get("sticky_model")
+    provider = state.get("provider_override") or sticky_provider
+    model = state.get("model_override") or sticky_model
     if not provider or not model:
         if _router is not None:
             # Passa anche il message originale: il router lo usa per detection
@@ -828,13 +834,17 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 max_tokens=effective_max_tokens, system_text=system_text,
             )
             # Aggiorna provider/model effettivamente usati se la cascade ha fatto fallback.
+            # Salva anche come "sticky" per le iter successive (M61): evita di ri-tentare
+            # il provider primario fallito ad ogni round, risparmiando latenza/cost.
+            cascade_did_fallback = False
             if prov_result.provider and prov_result.provider != provider:
                 logger.info(
-                    "executor_node: cascade fallback %s -> %s/%s",
+                    "executor_node: cascade fallback %s -> %s/%s (sticky per iter successive)",
                     provider, prov_result.provider, prov_result.model,
                 )
                 provider = prov_result.provider
                 model = prov_result.model
+                cascade_did_fallback = True
             result_text = prov_result.content or ""
             meta = prov_result.metadata or {}
             stop_reason = meta.get("stop_reason") or "end_turn"
@@ -1064,6 +1074,14 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     total_tokens = prompt_tokens + completion_tokens + cache_creation_tokens + cache_read_tokens
     cache_hit_rate = cache_read_tokens / total_tokens if total_tokens > 0 else 0.0
 
+    # M61 sticky cascade: se nel turno corrente c'è stato fallback, salva i
+    # provider/model effettivi nello state cosi' le iter successive partono
+    # direttamente da li' senza ri-tentare il provider primario fallito.
+    sticky_out = {
+        "sticky_provider": provider if (locals().get("cascade_did_fallback") or state.get("sticky_provider")) else state.get("sticky_provider"),
+        "sticky_model": model if (locals().get("cascade_did_fallback") or state.get("sticky_model")) else state.get("sticky_model"),
+    }
+
     return {
         "messages": [assistant_msg],
         "result": result_text,
@@ -1086,6 +1104,7 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         "temperature": temperature,
         "top_p": top_p,
         "created_at": created_at,
+        **sticky_out,
     }
 
 
