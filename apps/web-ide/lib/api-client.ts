@@ -189,6 +189,13 @@ export interface FeedbackErrorResponse {
   learning: Record<string, unknown>;
 }
 
+export interface FeedbackPositiveResponse {
+  ok: boolean;
+  feedbackId: string;
+  alreadyRecorded: boolean;
+  newQValue: number | null;
+}
+
 export interface UserProjectSummary {
   id: string;
   name: string;
@@ -356,12 +363,32 @@ export interface PortEntry {
   service?: string | null;
 }
 
+export interface PlaywrightProgress {
+  total?: number | null;
+  passed: number;
+  failed: number;
+  skipped: number;
+  flaky: number;
+  current_spec?: string | null;
+  failed_specs?: string[];
+}
+
 export interface PlaywrightRunSummary {
   id: string;
   label: string;
   status: string;
   summary?: string;
   createdAt: string;
+  updatedAt?: string;
+  artifacts?: PlaywrightArtifact[];
+  progress?: PlaywrightProgress;
+  command?: string;
+  exitCode?: number;
+  [k: string]: unknown;
+}
+
+export interface PlaywrightRunDetail extends PlaywrightRunSummary {
+  outputLog: string;
 }
 
 export interface GitFileChange {
@@ -947,6 +974,16 @@ export async function feedbackChatMessageError(
   });
 }
 
+export async function feedbackChatMessagePositive(
+  messageId: string,
+  comment?: string,
+): Promise<FeedbackPositiveResponse> {
+  return fetchJson(`${API_BASE}/api/chat/messages/${messageId}/feedback-positive`, {
+    method: "POST",
+    body: JSON.stringify(comment ? { comment } : {}),
+  });
+}
+
 export async function getMyProjects(): Promise<{ projects: UserProjectSummary[] }> {
   return fetchJson(`${API_BASE}/api/projects/mine`);
 }
@@ -1458,6 +1495,51 @@ export async function getPlaywrightRuns(
   projectId: string,
 ): Promise<{ runs: PlaywrightRunSummary[] }> {
   return fetchJson(`${API_BASE}/api/projects/${projectId}/playwright/runs`);
+}
+
+export async function getPlaywrightRunDetail(
+  projectId: string,
+  runId: string,
+): Promise<PlaywrightRunDetail> {
+  return fetchJson(`${API_BASE}/api/projects/${projectId}/playwright/runs/${runId}`);
+}
+
+/**
+ * Apre uno stream SSE per gli eventi live di un run Playwright.
+ * Eventi emessi: "line" (riga output), "progress" (counter), "final" (esito).
+ * Ritorna l'EventSource per consentire al chiamante di chiudere lo stream.
+ */
+export function subscribePlaywrightRunStream(
+  projectId: string,
+  runId: string,
+  handlers: {
+    onLine?: (data: { job_id: string; line: string }) => void;
+    onProgress?: (data: { job_id: string; progress: PlaywrightProgress }) => void;
+    onFinal?: (data: { job_id: string; status: string; exit_code: number; progress: PlaywrightProgress }) => void;
+    onError?: (err: Event) => void;
+  },
+): EventSource {
+  const url = `${API_BASE}/api/projects/${projectId}/playwright/runs/${runId}/stream`;
+  const es = new EventSource(url, { withCredentials: true });
+  if (handlers.onLine) {
+    es.addEventListener("line", (e: MessageEvent) => {
+      try { handlers.onLine!(JSON.parse(e.data)); } catch { /* ignore */ }
+    });
+  }
+  if (handlers.onProgress) {
+    es.addEventListener("progress", (e: MessageEvent) => {
+      try { handlers.onProgress!(JSON.parse(e.data)); } catch { /* ignore */ }
+    });
+  }
+  if (handlers.onFinal) {
+    es.addEventListener("final", (e: MessageEvent) => {
+      try { handlers.onFinal!(JSON.parse(e.data)); } catch { /* ignore */ }
+    });
+  }
+  if (handlers.onError) {
+    es.addEventListener("error", handlers.onError);
+  }
+  return es;
 }
 
 export type DetectRunConfigsSource = "heuristic" | "ai" | "cached";
@@ -3358,4 +3440,78 @@ export async function deleteSharedDirective(key: string): Promise<{ ok: boolean 
     `${adminServiceUrl(`/shared-directives/${encodeURIComponent(key)}`)}`,
     { method: "DELETE" },
   );
+}
+
+// ---------------------------------------------------------------------------
+// Stubs Orchestrator (PR-4 admin panel) — endpoint non ancora esposti.
+// Mantenuti come placeholder per consentire il build delle pagine admin
+// (OrchestratorPanel, SubagentDefinitionsEditor) finche' i client reali non
+// vengono cablati. Ritornano risposte vuote / mock.
+// ---------------------------------------------------------------------------
+
+export async function listOrchestratorPlans(_args?: { limit?: number; projectId?: string }): Promise<{ plans: OrchestratorPlanSummary[] }> {
+  return { plans: [] };
+}
+
+export async function getOrchestratorPlan(_runId: string): Promise<OrchestratorPlanDetail | null> {
+  return null;
+}
+
+export async function listSubagentDefinitions(): Promise<{ definitions: SubagentDefinition[] }> {
+  return { definitions: [] };
+}
+
+export async function listSubagentRuns(_args?: { parentRunId?: string; kind?: string; projectId?: string; limit?: number }): Promise<{ runs: OrchestratorSubagentRun[] }> {
+  return { runs: [] };
+}
+
+export async function upsertSubagentDefinition(_def: unknown): Promise<{ ok: boolean }> {
+  return { ok: true };
+}
+
+export async function deleteSubagentDefinition(_kind: string): Promise<{ ok: boolean }> {
+  return { ok: true };
+}
+
+export async function clearPlaywrightRuns(_projectId?: string): Promise<{ ok: boolean }> {
+  return { ok: true };
+}
+
+// Tipi stub Orchestrator (corrispondono ai placeholder API sopra).
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type _Any = any;
+export interface OrchestratorPlanSummary {
+  runId: string; projectId: string; createdAt: string;
+  status?: string; intent?: string; provider?: string; model?: string;
+  plannerModel?: string; costUsd?: number;
+  todosTotal?: number; todosDone?: number;
+  verifierRuns?: number; subagentRuns?: number;
+  approvedAt?: string | null; approvedBy?: string | null; score?: number | null;
+}
+export interface OrchestratorPlanDetail {
+  runId: string;
+  todos: _Any[]; verifierRuns: _Any[]; subagentRuns: _Any[];
+  plan?: _Any;
+  [k: string]: _Any;
+}
+export interface OrchestratorSubagentRun {
+  id: string; kind: string; status: string; createdAt: string;
+  costUsd?: number; tokensPrompt?: number; tokensCompletion?: number;
+  iterations?: number; parentRunId?: string;
+  [k: string]: _Any;
+}
+export interface SubagentDefinition {
+  kind: string; description: string; promptKey: string;
+  toolWhitelist: string[]; modelPurpose: string;
+  maxIterations: number; timeoutS: number;
+  isBackground: boolean; isEnabled: boolean;
+  [k: string]: _Any;
+}
+
+export type PlaywrightArtifact = any;
+
+
+export async function resetProviderCooldown(_providerKey: string): Promise<{ ok: boolean }> {
+  return { ok: true };
 }

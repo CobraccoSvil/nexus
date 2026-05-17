@@ -85,7 +85,7 @@ if [ "4" -gt "${SKIP_TO:-0}" ]; then
 fi
 
 # === Step 5: Setup DB ==========================================================
-run_step 5 "Database ai_orchestrator"
+run_step 5 "Database nexus"
 if [ "5" -gt "${SKIP_TO:-0}" ]; then
     DB_PASSWORD="${DB_PASSWORD:-$(openssl rand -hex 16)}"
     remote_exec "$PROD_HOST" "
@@ -100,10 +100,10 @@ BEGIN
     END IF;
 END
 \\\$\\\$;
-SELECT 'CREATE DATABASE ai_orchestrator OWNER postgres_app'
-WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'ai_orchestrator')\\gexec
-SELECT 'CREATE DATABASE ai_orchestrator_shadow OWNER postgres_app'
-WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'ai_orchestrator_shadow')\\gexec
+SELECT 'CREATE DATABASE nexus OWNER postgres_app'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'nexus')\\gexec
+SELECT 'CREATE DATABASE nexus_shadow OWNER postgres_app'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'nexus_shadow')\\gexec
 SQL
     "
     info "  OK  DB pronti (password: $DB_PASSWORD)"
@@ -145,8 +145,8 @@ if [ "6" -gt "${SKIP_TO:-0}" ]; then
 
     remote_exec "$PROD_HOST" "cat > $DEPLOY_DIR/.env << 'ENVEOF'
 # Generato da bootstrap $(date -u +%FT%TZ)
-DATABASE_URL=postgres://postgres_app:${DB_PASSWORD}@localhost:5432/ai_orchestrator
-SHADOW_POSTGRES_URL=postgres://postgres_app:${DB_PASSWORD}@localhost:5432/ai_orchestrator_shadow
+DATABASE_URL=postgres://postgres_app:${DB_PASSWORD}@localhost:5432/nexus
+SHADOW_POSTGRES_URL=postgres://postgres_app:${DB_PASSWORD}@localhost:5432/nexus_shadow
 REDIS_URL=redis://localhost:6379
 QDRANT_URL=http://localhost:6334
 MCP_SERVER_PORT=4000

@@ -1,0 +1,78 @@
+name: nexus-suite
+
+# PR-4 — Test suite Plan/Act/Verify + Sub-agents.
+#
+# Livelli 3 (contract) e 4 (E2E) eseguiti su ogni PR.
+# Livelli 5 (maturity) e 6 (UI Playwright) eseguiti in nightly schedule.
+
+on:
+  pull_request:
+    paths:
+      - "crates/mcp-core/**"
+      - "brain/**"
+      - "apps/web-ide/**"
+      - "tests/**"
+      - "db/migrations/**"
+      - "infra/sql/**"
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"   # 03:00 UTC nightly
+
+jobs:
+  contract-rust:
+    name: "L3 contract test Rust"
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: nexus
+          POSTGRES_PASSWORD: nexus
+          POSTGRES_DB: nexus
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      DATABASE_URL: postgres://nexus:nexus@localhost:5433/nexus
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Apply migrations
+        run: |
+          for f in db/migrations/*.sql; do
+            psql "$DATABASE_URL" -f "$f" || true
+          done
+      - name: cargo test contract
+        run: cargo test -p mcp-core --tests --release -- --nocapture
+
+  e2e-python:
+    name: "L4 E2E pytest"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install deps
+        run: pip install pytest psycopg2-binary requests
+      - name: Run E2E suite (skip se servizi non disponibili)
+        run: python3 tests/e2e/nexus-suite/run_all.py
+        continue-on-error: true
+
+  ui-playwright:
+    name: "L6 UI e2e Playwright"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20", cache: "pnpm" }
+      - uses: pnpm/action-setup@v3
+        with: { version: 10 }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm test:ui-e2e
+        continue-on-error: true
+        env:
+          WEB_IDE_URL: http://localhost:3000

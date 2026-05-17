@@ -12,6 +12,7 @@ import {
   getOutputEvents,
   getMyProjects,
   getPlaywrightRuns,
+  clearPlaywrightRuns,
   getProviderHealth,
   getGatewayProviders,
   getProjectFile,
@@ -56,6 +57,14 @@ import { UserSidebarMenu } from "./user-header";
 import type { SidebarView } from "./sidebar/sidebar-manager";
 import type { PanelTab } from "./panels/bottom-panel-manager";
 import { TruncatedText } from "./truncated-text";
+import {
+  useProjectDispatcher,
+  useProjectStore,
+  selectPlaywrightRuns,
+  selectPorts,
+  selectFilesRecent,
+} from "../lib/project-dispatcher";
+import { ConnectionStatusBadge, ToastStack } from "./dispatcher-status";
 
 // Dynamic imports per componenti pesanti IDE
 const ChatPanel = dynamic(() => import("./chat-panel.lazy"), {
@@ -115,6 +124,7 @@ const panelTabs: Array<{ key: PanelTab; label: string }> = [
   { key: "ports", label: "Porte" },
   { key: "services", label: "Servizi" },
   { key: "playwright", label: "Playwright" },
+  { key: "monitor", label: "Monitor" },
   { key: "optimization", label: "Ottimizzazione" },
 ];
 
@@ -541,6 +551,17 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
 
   const multiChat = useMultiChat(activeProject?.id ?? "default");
 
+  // Dispatcher centrale: connessione SSE unica per progetto, alimenta lo store
+  // Zustand da cui i pannelli leggono in tempo reale (eliminando il polling 4-8s).
+  useProjectDispatcher(activeProject?.id);
+  // Lo store del dispatcher e' la NUOVA fonte di verita' per i pannelli.
+  // Per ora `playwrightRunsFromDispatcher` viene mergeato con `playwrightRuns`
+  // (state legacy) per compatibilita' durante la migrazione. Il polling esistente
+  // (useEffect linee ~898 e ~943) verra' rimosso in una fase successiva.
+  const playwrightRunsFromDispatcher = useProjectStore(selectPlaywrightRuns);
+  const portsFromDispatcher = useProjectStore(selectPorts);
+  const filesRecentFromDispatcher = useProjectStore(selectFilesRecent);
+
   const [chatProvider, setChatProvider] = useState<string>("auto");
   const [chatModel, setChatModel] = useState<string>("auto");
   const [chatAutomationMode, setChatAutomationMode] = useState<"study" | "confirm" | "automatic">("confirm");
@@ -654,6 +675,24 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     },
     [],
   );
+
+  // Quando il dispatcher segnala file modificati (dall'agente), triggera un
+  // refresh dei pannelli operativi (problemi, porte, playwright) per allineare
+  // l'UI in tempo reale senza aspettare il polling.
+  const filesRefreshRef = useRef(0);
+  useEffect(() => {
+    if (!activeProject?.id || filesRecentFromDispatcher.length === 0) return;
+    // Evita il refresh al primo mount (solo sui cambiamenti successivi)
+    const count = filesRecentFromDispatcher.length;
+    if (filesRefreshRef.current === 0) {
+      filesRefreshRef.current = count;
+      return;
+    }
+    if (count !== filesRefreshRef.current) {
+      filesRefreshRef.current = count;
+      void refreshOperationalViews(activeProject.id);
+    }
+  }, [filesRecentFromDispatcher.length, activeProject?.id, refreshOperationalViews]);
 
   const loadOutputEvents = useCallback(
     async (projectId: string, channel: string) => {
@@ -894,27 +933,23 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     } catch { /* ignora */ }
   }, []);
 
-  // Polling canali output + porte: ogni 4s se ci sono processi attivi (●), ogni 8s altrimenti
+  // Polling canali output (non ancora cablato al dispatcher). Le porte sono
+  // ora gestite dal dispatcher: vedi `portsFromDispatcher`. Intervallo: 10s
+  // se nessun processo attivo, 4s con processi attivi (per stream live dei log).
   useEffect(() => {
     if (!activeProject) return;
     const tick = async () => {
       try {
-        const [channelsRes, portsRes] = await Promise.all([
-          getOutputChannels(activeProject.id),
-          getProjectPorts(activeProject.id),
-        ]);
+        const channelsRes = await getOutputChannels(activeProject.id);
         setOutputChannels(channelsRes.channels ?? []);
-        setPorts(portsRes.ports ?? []);
         if (activePanelTabRef.current === "output" && selectedOutputChannelRef.current) {
           void loadOutputEvents(activeProject.id, selectedOutputChannelRef.current);
         }
       } catch { /* ignora */ }
     };
-    // Intervallo adattivo: 4s con processi attivi, 8s altrimenti
     const getInterval = () =>
-      outputChannelsRef.current.some((ch) => ch.label?.startsWith("●")) ? 4000 : 8000;
+      outputChannelsRef.current.some((ch) => ch.label?.startsWith("●")) ? 4000 : 10000;
     let timer = window.setInterval(tick, getInterval());
-    // Ricalcola intervallo ogni volta che i canali cambiano
     const adjustTimer = () => {
       window.clearInterval(timer);
       timer = window.setInterval(tick, getInterval());
@@ -940,32 +975,23 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     void loadOutputEvents(activeProject.id, selectedOutputChannel);
   }, [activeProject?.id, selectedOutputChannel, loadOutputEvents]);
 
-  // Fix M45: polling fallback dei pannelli operativi (porte, playwright,
-  // problemi, run_configs) ogni 8s. Senza questo, se l'SSE del run agente
-  // si interrompe a meta' (es. brain restart, chunk decode error), il
-  // pannello Playwright restava bloccato sulla snapshot iniziale e
-  // l'utente non vedeva il risultato del test appena eseguito.
+  // Polling Fix M45 RIMOSSO: ora i pannelli operativi (porte, playwright,
+  // problemi) si aggiornano in tempo reale via dispatcher SSE — vedi
+  // `useProjectDispatcher(activeProject?.id)` sopra. Resta solo un refresh
+  // periodico molto piu' rilassato (30s) per `runConfigs` che ancora non
+  // emette eventi tramite il dispatcher (verra' migrato in PR successiva).
   useEffect(() => {
     const projectId = activeProject?.id;
     if (!projectId) return;
     const refresh = async () => {
       try {
-        const [problemsRes, portsRes, playwrightRes, runConfigsRes] =
-          await Promise.all([
-            getProjectProblems(projectId),
-            getProjectPorts(projectId),
-            getPlaywrightRuns(projectId),
-            getRunConfigs(projectId),
-          ]);
-        setProblemItems(problemsRes.items ?? []);
-        setPorts(portsRes.ports ?? []);
-        setPlaywrightRuns(playwrightRes.runs ?? []);
+        const runConfigsRes = await getRunConfigs(projectId);
         setRunConfigs(runConfigsRes.configs ?? []);
       } catch {
-        // Best-effort: ignora errori transient
+        /* best-effort */
       }
     };
-    const interval = window.setInterval(refresh, 8_000);
+    const interval = window.setInterval(refresh, 30_000);
     return () => window.clearInterval(interval);
   }, [activeProject?.id]);
 
@@ -1416,6 +1442,8 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
             onClick={() => {
               const currentId = multiChat.activeTabId;
               if (!currentId) return;
+              // Il backend emette ChatSessionCompacted via dispatcher SSE,
+              // use-chat ascolta e riallinea tokenUsage senza re-mount.
               void multiChat.compactSession(currentId);
             }}
             title="Compatta chat"
@@ -1481,6 +1509,12 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
                   .then(() => refreshProviderStatus());
                 // Notifica il pannello ottimizzazione per auto-fix sequenziale
                 setAgentRunEndSignal((n) => n + 1);
+                // Refresh dei Playwright runs: l'agente potrebbe aver eseguito test
+                if (activeProject) {
+                  void getPlaywrightRuns(activeProject.id)
+                    .then((res) => setPlaywrightRuns(res.runs ?? []))
+                    .catch(() => { /* ignora */ });
+                }
               }}
             />
           </div>
@@ -1746,6 +1780,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           }}
           aria-label="Stato provider AI"
         >
+          <ConnectionStatusBadge />
           <span
             title={providerTitle("OpenAI", providerStatus.openai)}
             style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
@@ -2143,8 +2178,10 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
             outputChannels={outputChannels}
             selectedOutputChannel={selectedOutputChannel}
             outputEvents={outputEvents}
-            ports={ports}
-            playwrightRuns={playwrightRuns}
+            ports={portsFromDispatcher.length > 0
+              ? portsFromDispatcher.map((p) => ({ port: p.port, label: p.label, state: "listen" }))
+              : ports}
+            playwrightRuns={playwrightRunsFromDispatcher.length > 0 ? playwrightRunsFromDispatcher : playwrightRuns}
             onOpenFile={(path, line) => void openFileInGroup(path, line)}
             onSelectOutputChannel={setSelectedOutputChannel}
             onRefreshPanel={(tab) => {
@@ -2174,7 +2211,14 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
                   } catch { /* ignora */ }
                   break;  // output = alias legacy
                 case "ports": setPorts([]); break;
-                case "playwright": setPlaywrightRuns([]); break;
+                case "playwright":
+                  setPlaywrightRuns([]);
+                  if (activeProject) {
+                    void clearPlaywrightRuns(activeProject.id).catch((err) => {
+                      console.warn("[playwright] clear runs failed:", err);
+                    });
+                  }
+                  break;
               }
             }}
             onSendToChat={(msg) => {
@@ -2313,6 +2357,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               : "Brain gRPC offline — la chat potrebbe non rispondere"}
         </div>
       )}
+      <ToastStack />
     </main>
   );
 }

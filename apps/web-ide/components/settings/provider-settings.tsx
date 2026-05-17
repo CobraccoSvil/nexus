@@ -372,7 +372,7 @@ export function ProviderSettings({
                         {isError && (
                           <button
                             onClick={() => onReloadProvider(providerName)}
-                            title="Ricarica chiave dal DB e ri-testa il provider"
+                            title="Ricarica chiave dal DB, azzera il cooldown (utile dopo billing recharge) e ri-testa il provider"
                             style={{
                               padding: "3px 8px",
                               borderRadius: 6,

@@ -223,6 +223,44 @@ pub async fn get_agent_run(
     let total_tokens = run.try_get::<i32, _>("total_tokens").unwrap_or(0);
     let total_cost = run.try_get::<f64, _>("total_cost").unwrap_or(0.0);
 
+    // M71: breakdown per coppia provider/model dalla ai_usage_ledger.
+    // Mostriamo una riga per ogni provider/modello effettivamente usato nel run
+    // (cascade fallback puo' aver coinvolto piu' provider).
+    let breakdown_rows = sqlx::query(
+        "SELECT provider, model,
+                SUM(prompt_tokens)::bigint     AS prompt_tokens,
+                SUM(completion_tokens)::bigint AS completion_tokens,
+                SUM(total_tokens)::bigint      AS total_tokens,
+                SUM(total_cost)::float8        AS total_cost,
+                COUNT(*)::int                  AS calls,
+                MIN(created_at)                AS first_call_at,
+                MAX(created_at)                AS last_call_at
+         FROM ai_usage_ledger
+         WHERE run_id = $1 AND status = 'finalized'
+         GROUP BY provider, model
+         ORDER BY MIN(created_at) ASC",
+    )
+    .bind(run_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let usage_breakdown: Vec<Value> = breakdown_rows
+        .iter()
+        .map(|r| {
+            json!({
+                "provider": r.try_get::<String, _>("provider").unwrap_or_default(),
+                "model": r.try_get::<String, _>("model").unwrap_or_default(),
+                "promptTokens": r.try_get::<i64, _>("prompt_tokens").unwrap_or(0),
+                "completionTokens": r.try_get::<i64, _>("completion_tokens").unwrap_or(0),
+                "totalTokens": r.try_get::<i64, _>("total_tokens").unwrap_or(0),
+                "totalCost": r.try_get::<f64, _>("total_cost").unwrap_or(0.0),
+                "calls": r.try_get::<i32, _>("calls").unwrap_or(0),
+                "firstCallAt": r.try_get::<DateTime<Utc>, _>("first_call_at").ok().map(|v| v.to_rfc3339()),
+                "lastCallAt": r.try_get::<DateTime<Utc>, _>("last_call_at").ok().map(|v| v.to_rfc3339()),
+            })
+        })
+        .collect();
+
     Ok(Json(json!({
         "runId": run.try_get::<Uuid, _>("id").ok().map(|v| v.to_string()),
         "sessionId": run.try_get::<Uuid, _>("session_id").ok().map(|v| v.to_string()),
@@ -240,6 +278,7 @@ pub async fn get_agent_run(
             "totalTokens": total_tokens,
         },
         "totalCostUsd": total_cost,
+        "usageBreakdown": usage_breakdown,
         "createdAt": run.try_get::<DateTime<Utc>, _>("created_at").ok().map(|v| v.to_rfc3339()),
         "completedAt": run.try_get::<Option<DateTime<Utc>>, _>("completed_at").unwrap_or(None).map(|v| v.to_rfc3339()),
     })))

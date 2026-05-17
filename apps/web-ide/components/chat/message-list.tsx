@@ -465,6 +465,10 @@ export interface MessageListProps {
   onResend: (messageId: string) => void;
   onDelete: (messageId: string) => void;
   onFeedback: (messageId: string, content: string) => void;
+  /** Feedback positivo: conferma esplicita che la risposta e' corretta (Q-learning reward=1.0). */
+  onFeedbackPositive?: (messageId: string) => void;
+  /** Set di messageId per cui l'utente ha gia' inviato feedback positivo (UI mostra stato confermato). */
+  positiveFeedback?: Set<string>;
   lastUserRef: RefObject<HTMLDivElement | null>;
 }
 
@@ -515,6 +519,8 @@ export function MessageList({
   onResend,
   onDelete,
   onFeedback,
+  onFeedbackPositive,
+  positiveFeedback,
   lastUserRef,
 }: MessageListProps) {
   const [copyFeedback, setCopyFeedback] = useState<CopyFeedbackState>(null);
@@ -656,16 +662,45 @@ export function MessageList({
                     {busyAction === "resend" ? "…" : "↻"}
                   </button>
                 ) : (
-                  <button
-                    type="button"
-                    disabled={Boolean(busyAction)}
-                    onClick={() => onFeedback(message.id, message.content ?? "")}
-                    style={messageActionIconStyle(tc, Boolean(busyAction))}
-                    title="Segnala errore"
-                    aria-label="Segnala errore"
-                  >
-                    {busyAction === "feedback" ? "…" : "⚠"}
-                  </button>
+                  <>
+                    {onFeedbackPositive && (() => {
+                      const alreadyVoted = positiveFeedback?.has(message.id) ?? false;
+                      return (
+                        <button
+                          type="button"
+                          disabled={Boolean(busyAction) || alreadyVoted}
+                          onClick={() => onFeedbackPositive(message.id)}
+                          style={messageActionIconStyle(
+                            tc,
+                            Boolean(busyAction),
+                            alreadyVoted ? "success" : null,
+                          )}
+                          title={
+                            alreadyVoted
+                              ? "Feedback positivo gia' inviato"
+                              : "Risposta corretta (rinforza apprendimento)"
+                          }
+                          aria-label="Feedback positivo"
+                        >
+                          {busyAction === "feedback-positive"
+                            ? "…"
+                            : alreadyVoted
+                              ? "👍"
+                              : "👍🏻"}
+                        </button>
+                      );
+                    })()}
+                    <button
+                      type="button"
+                      disabled={Boolean(busyAction)}
+                      onClick={() => onFeedback(message.id, message.content ?? "")}
+                      style={messageActionIconStyle(tc, Boolean(busyAction))}
+                      title="Segnala errore"
+                      aria-label="Segnala errore"
+                    >
+                      {busyAction === "feedback" ? "…" : "⚠"}
+                    </button>
+                  </>
                 )}
                 <button
                   type="button"

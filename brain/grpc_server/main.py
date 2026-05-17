@@ -720,6 +720,111 @@ async def subagent_run_endpoint(body: SubagentRunRequest) -> dict[str, object]:
     return result
 
 
+# ── PR-3 sub-agent control endpoints ─────────────────────────────────────────
+@app.get("/agent/subagent-run/{run_id}")
+async def subagent_poll_endpoint(run_id: str) -> dict[str, object]:
+    """Poll dello stato di una sub-run. Usato dal main agent quando il
+    sub-agent gira in background (is_background=true): il tool dispatch
+    ritorna subito con status=running, il main poi fa polling.
+    """
+    from brain.agents import subagent_store
+    row = subagent_store.fetch_run(run_id)
+    if not row:
+        return {"error": "not_found", "run_id": run_id}
+    return {
+        "subagent_run_id": row["id"],
+        "status": row["status"],
+        "kind": row["kind"],
+        "summary": row.get("final_summary"),
+        "artifacts": row.get("artifacts") or [],
+        "iterations": row.get("iterations") or 0,
+        "tokens": {
+            "prompt": row.get("tokens_prompt") or 0,
+            "completion": row.get("tokens_completion") or 0,
+        },
+        "cost_usd": float(row.get("cost_usd") or 0.0),
+        "depth": row.get("depth") or 1,
+        "source": row.get("source") or "db",
+    }
+
+
+class SubagentResumeRequest(BaseModel):
+    run_id: str
+
+
+@app.post("/agent/subagent-resume")
+async def subagent_resume_endpoint(body: SubagentResumeRequest) -> dict[str, object]:
+    """Riprende una sub-run paused/background. Marca lo status come running
+    e ritorna subito; il sub-agent viene rilanciato in background dal node.
+    """
+    from brain.agents import subagent_store
+    row = subagent_store.fetch_run(body.run_id)
+    if not row:
+        return {"status": "error", "error": "not_found", "run_id": body.run_id}
+    if row["status"] not in ("paused", "running"):
+        return {"status": "noop", "run_id": body.run_id, "current_status": row["status"]}
+    subagent_store.update_run_start(body.run_id)
+    return {"status": "running", "run_id": body.run_id}
+
+
+# ── PR-3 clarifying questions HITL ───────────────────────────────────────────
+@app.get("/agent/clarifications/{run_id}")
+async def clarifications_get(run_id: str) -> dict[str, object]:
+    """Ritorna le clarifying questions emesse per un run + eventuali risposte."""
+    import os
+    url = os.environ.get("DATABASE_URL", "")
+    if not url:
+        return {"error": "db_unavailable"}
+    try:
+        import psycopg2  # type: ignore[import-untyped]
+        from psycopg2.extras import RealDictCursor  # type: ignore[import-untyped]
+        with psycopg2.connect(url, cursor_factory=RealDictCursor) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id::text, run_id::text, questions, user_answers, applied_defaults,
+                              created_at, answered_at
+                       FROM nexus_agent_clarifications WHERE run_id = %s
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (run_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {"run_id": run_id, "clarification": None}
+                return {"run_id": run_id, "clarification": dict(row)}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+class ClarificationsAnswerRequest(BaseModel):
+    answers: dict[str, str]
+
+
+@app.post("/agent/clarifications/{run_id}/answer")
+async def clarifications_answer(run_id: str, body: ClarificationsAnswerRequest) -> dict[str, object]:
+    """Riceve le risposte dell'utente alle clarifying questions (HITL Confirm).
+    Il loop dell'agente puo' poi riprendere il planner con queste risposte
+    iniettate come default applicati.
+    """
+    import os, json as _json
+    url = os.environ.get("DATABASE_URL", "")
+    if not url:
+        return {"error": "db_unavailable"}
+    try:
+        import psycopg2  # type: ignore[import-untyped]
+        with psycopg2.connect(url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE nexus_agent_clarifications
+                       SET user_answers = %s::jsonb, answered_at = NOW()
+                       WHERE run_id = %s AND user_answers IS NULL""",
+                    (_json.dumps(body.answers), run_id),
+                )
+            conn.commit()
+        return {"status": "ok", "run_id": run_id, "applied": len(body.answers)}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 # ── Project Analyzer Agent ──────────────────────────────────────────────────
 # Endpoint dedicato all'agente agent.project.analyzer (vedi migrazione 0094):
 # carica il prompt dal DB, sostituisce i placeholder col payload del progetto,

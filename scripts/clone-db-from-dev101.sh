@@ -13,7 +13,6 @@ SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMo
 
 # "nome_db:container_locale:porta_locale:utente_locale:porta_remota:esiste_su_server-remoto"
 declare -a DBS=(
-  "ai_orchestrator:ideai-postgres-1:5432:postgres:5432:yes"
   "nexus:ideai-postgres-nexus-1:5433:nexus:5432:yes"
 )
 

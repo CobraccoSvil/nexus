@@ -460,6 +460,49 @@ pub async fn compact_chat_session(
     .await
     .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Calcola totali token freschi (sommando dai metadata dei messaggi rimasti)
+    // per permettere al frontend `use-chat` di riallineare immediatamente la
+    // TokenUsageBar senza bisogno di refresh browser. I messaggi non vengono
+    // cancellati al compact (rimangono in DB), quindi il totale e' stabile,
+    // ma inviarlo nell'evento rimuove qualsiasi desync col cliente.
+    let totals: Option<(i64, f64)> = sqlx::query_as::<_, (i64, f64)>(
+        r#"SELECT
+            COALESCE(SUM((metadata->>'totalTokens')::bigint), 0)::bigint AS total_tokens,
+            COALESCE(SUM((metadata->>'totalCost')::float8), 0.0)::float8 AS total_cost
+           FROM chat_messages
+           WHERE session_id = $1
+             AND role = 'assistant'
+             AND deleted_at IS NULL
+             AND metadata->>'totalTokens' IS NOT NULL"#,
+    )
+    .bind(ctx.session_id)
+    .fetch_one(&state.db)
+    .await
+    .ok();
+    let (total_tokens, total_cost_usd) = totals.unwrap_or((0, 0.0));
+
+    // Emette eventi dispatcher: il frontend ascolta via SSE e ricalcola UI.
+    // - ChatSessionCompacted → use-chat aggiorna tokenUsage
+    // - ChatSessionStatusChanged → tab della sessione mostra icona "compactata"
+    nexus_events::dispatcher::emit(
+        &state.project_channels,
+        ctx.project_id,
+        nexus_events::ProjectEvent::ChatSessionCompacted {
+            session_id: ctx.session_id,
+            summary_point_id: Some(point_id.clone()),
+            total_tokens,
+            total_cost_usd,
+        },
+    );
+    nexus_events::dispatcher::emit(
+        &state.project_channels,
+        ctx.project_id,
+        nexus_events::ProjectEvent::ChatSessionStatusChanged {
+            session_id: ctx.session_id,
+            status: "compacted".into(),
+        },
+    );
+
     Ok(Json(json!({
         "ok": true,
         "summary": summary_text,

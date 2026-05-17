@@ -55,8 +55,10 @@ export function ProjectDbPanel({ project }: Props) {
     connection_string: "",
   });
   // Campi separati per costruire la connection string (piu' intuitivo)
+  // Default sensati per il setup locale (host=localhost, porta postgres standard)
+  // così il pulsante "Testa connessione" non esplode su placeholder letterali.
   const [connFields, setConnFields] = useState({
-    host: "",
+    host: "localhost",
     port: "5432",
     database: "",
     username: "",
@@ -381,6 +383,24 @@ export function ProjectDbPanel({ project }: Props) {
 
   const handleTestConnection = async () => {
     if (!projectId) return;
+    // Validazione client: evitiamo che placeholder/empty arrivino al backend
+    // generando un errore criptico "failed to lookup address information".
+    if (useConnFields && initForm.engine !== "sqlite") {
+      const { host, database, username } = connFields;
+      const missing: string[] = [];
+      if (!host.trim()) missing.push("Host");
+      if (!database.trim()) missing.push("Database");
+      if (!username.trim()) missing.push("Utente");
+      if (missing.length > 0) {
+        setTestResult({ ok: false, error: `Campi obbligatori vuoti: ${missing.join(", ")}` });
+        return;
+      }
+    } else if (!useConnFields) {
+      if (!(initForm.connection_string ?? "").trim()) {
+        setTestResult({ ok: false, error: "Connection string vuota." });
+        return;
+      }
+    }
     setBusy(true);
     setError(null);
     setTestResult(null);
@@ -621,7 +641,7 @@ export function ProjectDbPanel({ project }: Props) {
                     <label style={{ fontSize: 9, color: tc.textMuted }}>Host</label>
                     <input
                       type="text"
-                      placeholder="192.168.0.6 o localhost"
+                      placeholder="localhost"
                       value={connFields.host}
                       onChange={(e) => setConnFields((f) => ({ ...f, host: e.target.value }))}
                       style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
@@ -641,7 +661,7 @@ export function ProjectDbPanel({ project }: Props) {
                     <label style={{ fontSize: 9, color: tc.textMuted }}>Database</label>
                     <input
                       type="text"
-                      placeholder="nome_database"
+                      placeholder="nome del DB applicativo (es. myapp_dev)"
                       value={connFields.database}
                       onChange={(e) => setConnFields((f) => ({ ...f, database: e.target.value }))}
                       style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}

@@ -218,6 +218,86 @@ fn err(msg: &str) -> String {
     format!("\u{274C} [dispatch_subagent] {msg}")
 }
 
+/// PR-3: tool `nexus_subagent_poll` — leggi lo stato di un sub-agent run.
+/// Usato dal main quando ha invocato un sub-agent background.
+pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> String {
+    let run_id = match input.get("subagent_run_id").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return format!("\u{274C} [nexus_subagent_poll] parametro 'subagent_run_id' obbligatorio"),
+    };
+    let row = sqlx::query(
+        "SELECT id::text, status, kind, final_summary, artifacts, iterations,
+                tokens_prompt, tokens_completion, cost_usd, depth, source, is_background
+         FROM nexus_subagent_runs WHERE id::text = $1",
+    )
+    .bind(&run_id)
+    .fetch_optional(&*ctx.db)
+    .await;
+    match row {
+        Ok(Some(r)) => {
+            let summary = json!({
+                "subagent_run_id": r.try_get::<String, _>("id").unwrap_or_default(),
+                "status": r.try_get::<String, _>("status").unwrap_or_default(),
+                "kind": r.try_get::<String, _>("kind").unwrap_or_default(),
+                "summary": r.try_get::<Option<String>, _>("final_summary").unwrap_or(None),
+                "artifacts": r.try_get::<Option<Vec<String>>, _>("artifacts").unwrap_or(None).unwrap_or_default(),
+                "iterations": r.try_get::<i32, _>("iterations").unwrap_or(0),
+                "tokens": {
+                    "prompt": r.try_get::<i32, _>("tokens_prompt").unwrap_or(0),
+                    "completion": r.try_get::<i32, _>("tokens_completion").unwrap_or(0),
+                },
+                "cost_usd": r.try_get::<f64, _>("cost_usd").unwrap_or(0.0),
+                "depth": r.try_get::<i32, _>("depth").unwrap_or(1),
+                "source": r.try_get::<String, _>("source").unwrap_or_else(|_| "db".into()),
+                "is_background": r.try_get::<bool, _>("is_background").unwrap_or(false),
+            });
+            summary.to_string()
+        }
+        Ok(None) => format!("\u{274C} [nexus_subagent_poll] sub-agent run '{run_id}' non trovato"),
+        Err(e) => format!("\u{274C} [nexus_subagent_poll] query fallita: {e}"),
+    }
+}
+
+/// PR-3: tool `nexus_subagent_resume` — riprendi un sub-agent paused/background.
+pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -> String {
+    let run_id = match input.get("subagent_run_id").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return format!("\u{274C} [nexus_subagent_resume] parametro 'subagent_run_id' obbligatorio"),
+    };
+    // Best-effort: aggiorna lo stato a 'running' e chiama l'endpoint brain
+    // /agent/subagent-resume per re-dispatcharne l'esecuzione.
+    let upd = sqlx::query(
+        "UPDATE nexus_subagent_runs SET status='running' WHERE id::text = $1 AND status IN ('paused','running','timeout')"
+    )
+    .bind(&run_id)
+    .execute(&*ctx.db)
+    .await;
+    if let Err(e) = upd {
+        return format!("\u{274C} [nexus_subagent_resume] update fallito: {e}");
+    }
+    // Notifica al brain (best-effort).
+    let brain_url = std::env::var("NEURAL_REST_URL").unwrap_or_else(|_| "http://localhost:8001".into());
+    let resp = reqwest::Client::new()
+        .post(format!("{brain_url}/agent/subagent-resume"))
+        .json(&json!({"run_id": run_id}))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            format!("{{\"status\":\"resumed\",\"subagent_run_id\":\"{run_id}\"}}")
+        }
+        Ok(r) => format!(
+            "{{\"status\":\"partial\",\"subagent_run_id\":\"{run_id}\",\"brain_status\":{}}}",
+            r.status().as_u16()
+        ),
+        Err(e) => format!(
+            "{{\"status\":\"db_updated_brain_unreachable\",\"subagent_run_id\":\"{run_id}\",\"error\":\"{}\"}}",
+            e.to_string().replace('"', "'")
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::err;

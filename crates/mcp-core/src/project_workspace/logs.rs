@@ -595,7 +595,7 @@ pub async fn get_playwright_runs(
 
     let rows = sqlx::query(
         r#"
-        SELECT id, kind, status, input, created_at
+        SELECT id, kind, status, input, created_at, updated_at, progress
         FROM jobs
         WHERE project_id = $1 AND kind ILIKE '%playwright%'
         ORDER BY created_at DESC
@@ -611,15 +611,273 @@ pub async fn get_playwright_runs(
         .into_iter()
         .map(|row| {
             let input = row.get::<Value, _>("input");
+            let progress = row.try_get::<Value, _>("progress").unwrap_or_else(|_| json!({}));
             json!({
                 "id": row.get::<Uuid, _>("id").to_string(),
                 "label": input.get("label").and_then(Value::as_str).unwrap_or("Playwright run"),
                 "status": row.get::<String, _>("status"),
                 "summary": input.get("message").and_then(Value::as_str),
+                "artifacts": input.get("artifacts").cloned().unwrap_or_else(|| json!([])),
+                "command": input.get("command").and_then(Value::as_str),
+                "exitCode": input.get("exit_code").and_then(Value::as_i64),
+                "progress": progress,
                 "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
+                "updatedAt": row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+                    .map(|d| d.to_rfc3339())
+                    .unwrap_or_default(),
             })
         })
         .collect::<Vec<_>>();
 
     Ok(Json(json!({ "runs": runs })))
+}
+
+/// GET /api/projects/:id/playwright/runs/:run_id  — dettaglio singolo run con output_log.
+pub async fn get_playwright_run_detail(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath((project_id_str, run_id_str)): AxumPath<(String, String)>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&project_id_str)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let run_id = Uuid::parse_str(&run_id_str)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Run id non valido"))?;
+    let _context = load_project_context(&state.db, project_id, user_id).await?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT id, status, input, created_at, updated_at, progress, output_log
+        FROM jobs
+        WHERE id = $1 AND project_id = $2 AND kind = 'playwright_test'
+        "#,
+    )
+    .bind(run_id)
+    .bind(project_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Run non trovato"))?;
+
+    let input = row.get::<Value, _>("input");
+    let progress = row.try_get::<Value, _>("progress").unwrap_or_else(|_| json!({}));
+    let output_log = row
+        .try_get::<Option<String>, _>("output_log")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    Ok(Json(json!({
+        "id": row.get::<Uuid, _>("id").to_string(),
+        "status": row.get::<String, _>("status"),
+        "label": input.get("label").and_then(Value::as_str).unwrap_or("Playwright run"),
+        "command": input.get("command").and_then(Value::as_str),
+        "summary": input.get("message").and_then(Value::as_str),
+        "artifacts": input.get("artifacts").cloned().unwrap_or_else(|| json!([])),
+        "exitCode": input.get("exit_code").and_then(Value::as_i64),
+        "progress": progress,
+        "outputLog": output_log,
+        "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
+        "updatedAt": row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+            .map(|d| d.to_rfc3339())
+            .unwrap_or_default(),
+    })))
+}
+
+/// GET /api/projects/:id/playwright/runs/:run_id/stream  — SSE stream eventi live.
+///
+/// Eventi emessi (SSE event types):
+/// - `line`: una riga di output Playwright
+/// - `progress`: counter aggiornati (passed/failed/skipped/current_spec)
+/// - `final`: status terminale (passed/failed/timeout)
+///
+/// Quando il run e' gia' terminato (no channel attivo), ritorna subito un
+/// evento `final` con lo stato dal DB e chiude.
+pub async fn stream_playwright_run(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath((project_id_str, run_id_str)): AxumPath<(String, String)>,
+) -> Result<axum::response::Sse<std::pin::Pin<Box<dyn futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> + Send>>>, (StatusCode, Json<Value>)> {
+    use axum::response::sse::{Event, Sse};
+    use futures::StreamExt;
+
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&project_id_str)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let run_id = Uuid::parse_str(&run_id_str)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Run id non valido"))?;
+    let _ = load_project_context(&state.db, project_id, user_id).await?;
+
+    // Verifica che il job appartenga al progetto
+    let job_exists: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM jobs WHERE id = $1 AND project_id = $2 AND kind = 'playwright_test'"
+    )
+    .bind(run_id)
+    .bind(project_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if job_exists.is_none() {
+        return Err(api_error(StatusCode::NOT_FOUND, "Run non trovato"));
+    }
+
+    // Si aggancia al channel se attivo
+    let rx_opt = state.playwright_channels.get(&run_id).map(|tx| tx.subscribe());
+
+    let stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send>> = match rx_opt {
+        Some(rx) => {
+            // Run live: stream gli eventi finche' il sender e' aperto
+            Box::pin(
+                tokio_stream::wrappers::BroadcastStream::new(rx)
+                    .map(|res| match res {
+                        Ok(ev) => {
+                            let event_type = match &ev {
+                                crate::playwright_live::PlaywrightEvent::Line { .. } => "line",
+                                crate::playwright_live::PlaywrightEvent::Progress { .. } => "progress",
+                                crate::playwright_live::PlaywrightEvent::Final { .. } => "final",
+                            };
+                            let data = serde_json::to_string(&ev).unwrap_or_default();
+                            Ok::<_, std::convert::Infallible>(
+                                Event::default().event(event_type).data(data)
+                            )
+                        }
+                        Err(_) => Ok(Event::default().event("error").data("lag")),
+                    })
+            )
+        }
+        None => {
+            // Run gia' chiuso: emette singolo evento "final" con stato DB e termina.
+            // Costruisce sincrono lo state finale e lo wrappa in tokio_stream::once.
+            let row_opt = sqlx::query(
+                "SELECT status, progress, input FROM jobs WHERE id = $1"
+            )
+            .bind(run_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+            let payload = if let Some(row) = row_opt {
+                let status: String = row.try_get("status").unwrap_or_else(|_| "unknown".into());
+                let progress: Value = row.try_get("progress").unwrap_or_else(|_| json!({}));
+                let input: Value = row.try_get("input").unwrap_or_else(|_| json!({}));
+                let exit_code = input.get("exit_code").and_then(Value::as_i64).unwrap_or(-1);
+                json!({
+                    "kind": "final",
+                    "job_id": run_id.to_string(),
+                    "status": status,
+                    "exit_code": exit_code,
+                    "progress": progress,
+                })
+            } else {
+                json!({ "kind": "final", "job_id": run_id.to_string(), "status": "unknown" })
+            };
+            let ev = Event::default().event("final").data(payload.to_string());
+            Box::pin(tokio_stream::once(Ok::<_, std::convert::Infallible>(ev)))
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keep-alive")
+    ))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ArtifactQuery {
+    pub path: String,
+}
+
+pub async fn serve_playwright_artifact(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(id): AxumPath<String>,
+    axum::extract::Query(q): axum::extract::Query<ArtifactQuery>,
+) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let context = load_project_context(&state.db, project_id, user_id).await?;
+
+    // Path traversal guard: il path richiesto deve essere relativo e risolversi
+    // dentro la project root; deve inoltre puntare a test-results/ o playwright-report/.
+    let rel = std::path::Path::new(&q.path);
+    if rel.is_absolute() || q.path.contains("..") {
+        return Err(api_error(StatusCode::BAD_REQUEST, "path non valido"));
+    }
+    let allowed = q.path.contains("test-results/")
+        || q.path.contains("playwright-report/")
+        || q.path.contains("test-results\\")
+        || q.path.contains("playwright-report\\");
+    if !allowed {
+        return Err(api_error(StatusCode::FORBIDDEN, "solo artifact Playwright sono accessibili"));
+    }
+    let full = context.root_path.join(rel);
+    let canonical = full
+        .canonicalize()
+        .map_err(|_| api_error(StatusCode::NOT_FOUND, "file non trovato"))?;
+    let root_canonical = context
+        .root_path
+        .canonicalize()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "project root non risolvibile"))?;
+    if !canonical.starts_with(&root_canonical) {
+        return Err(api_error(StatusCode::FORBIDDEN, "path fuori dal progetto"));
+    }
+
+    let bytes = tokio::fs::read(&canonical)
+        .await
+        .map_err(|e| api_error(StatusCode::NOT_FOUND, format!("lettura file: {}", e)))?;
+
+    let ext = canonical
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "webm" => "video/webm",
+        "mp4" => "video/mp4",
+        "zip" => "application/zip",
+        "html" => "text/html; charset=utf-8",
+        _ => "application/octet-stream",
+    };
+
+    Ok(([(header::CONTENT_TYPE, mime)], bytes).into_response())
+}
+
+pub async fn clear_playwright_runs(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let _context = load_project_context(&state.db, project_id, user_id).await?;
+
+    let result = sqlx::query(
+        r#"DELETE FROM jobs WHERE project_id = $1 AND kind ILIKE '%playwright%'"#,
+    )
+    .bind(project_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let deleted = result.rows_affected();
+    // Dispatcher: notifica al frontend di svuotare il pannello Playwright in tempo reale
+    nexus_events::dispatcher::emit(
+        &state.project_channels,
+        project_id,
+        nexus_events::event::ProjectEvent::JobsCleared {
+            job_kind: "playwright_test".to_string(),
+            deleted,
+        },
+    );
+
+    Ok(Json(json!({ "deleted": deleted })))
 }

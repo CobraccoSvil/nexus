@@ -111,3 +111,10 @@ class AgentState(TypedDict, total=False):
     # da li' invece di ri-tentare il primario fallito ad ogni round.
     sticky_provider: str | None
     sticky_model: str | None
+
+    # M69 sticky cascade specifico per planner_node: dopo un cascade riuscito
+    # nel planner, memorizza il provider/model effettivo cosi' i replan
+    # successivi (o riusi del planner) partono direttamente da li' senza
+    # ri-tentare la chain completa (anthropic -> openai -> google -> deepseek).
+    planner_sticky_provider: str | None
+    planner_sticky_model: str | None

@@ -68,6 +68,10 @@ pub use logs::{
     get_output_channels,
     get_output_events,
     get_playwright_runs,
+    get_playwright_run_detail,
+    stream_playwright_run,
+    clear_playwright_runs,
+    serve_playwright_artifact,
 };
 
 pub use wizard::{

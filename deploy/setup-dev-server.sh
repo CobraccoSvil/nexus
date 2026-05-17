@@ -71,12 +71,12 @@ fi
 echo "[5/9] Configurazione PostgreSQL..."
 if command -v psql &>/dev/null; then
   # Crea database e utente se non esistono
-  sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = 'ai_orchestrator'" \
-    | grep -q 1 || sudo -u postgres psql -c "CREATE DATABASE ai_orchestrator;"
+  sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = 'nexus'" \
+    | grep -q 1 || sudo -u postgres psql -c "CREATE DATABASE nexus;"
   sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname = 'orchestrator'" \
     | grep -q 1 || sudo -u postgres psql -c "CREATE USER orchestrator WITH PASSWORD 'orchestrator_dev_2024';"
-  sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ai_orchestrator TO orchestrator;"
-  sudo -u postgres psql -d ai_orchestrator -c "GRANT ALL ON SCHEMA public TO orchestrator;"
+  sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE nexus TO orchestrator;"
+  sudo -u postgres psql -d nexus -c "GRANT ALL ON SCHEMA public TO orchestrator;"
 
   # Abilita connessioni dalla rete locale
   PG_CONF=$(find /etc/postgresql -name postgresql.conf 2>/dev/null | head -1)
@@ -94,7 +94,7 @@ if command -v psql &>/dev/null; then
     }
   fi
   systemctl restart postgresql
-  echo "  PostgreSQL configurato (db: ai_orchestrator, user: orchestrator)"
+  echo "  PostgreSQL configurato (db: nexus, user: orchestrator)"
 else
   echo "  ATTENZIONE: psql non trovato, PostgreSQL potrebbe non essere installato"
 fi
@@ -151,7 +151,7 @@ mkdir -p "$PROJECT_DIR"
 
 cat > "$PROJECT_DIR/.env" << 'ENVEOF'
 # AI-Orchestrator v2 — Environment
-DATABASE_URL=postgres://orchestrator:orchestrator_dev_2024@localhost:5432/ai_orchestrator
+DATABASE_URL=postgres://orchestrator:orchestrator_dev_2024@localhost:5432/nexus
 REDIS_URL=redis://localhost:6379
 NEURAL_CORE_URL=http://localhost:50051
 QDRANT_URL=http://localhost:6333
@@ -233,7 +233,7 @@ echo " 8. Avvia Claude Code:"
 echo "    cd $PROJECT_DIR && claude"
 echo ""
 echo " Servizi disponibili:"
-echo "   PostgreSQL:  localhost:5432 (db: ai_orchestrator, user: orchestrator)"
+echo "   PostgreSQL:  localhost:5432 (db: nexus, user: orchestrator)"
 echo "   Redis:       localhost:6379"
 echo "   Qdrant:      localhost:6333"
 echo "============================================"

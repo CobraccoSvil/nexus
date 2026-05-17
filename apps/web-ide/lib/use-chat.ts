@@ -7,6 +7,7 @@ import {
   createChatSession,
   deleteChatMessage,
   feedbackChatMessageError,
+  feedbackChatMessagePositive,
   getActiveRunForSession,
   getAgentRun,
   getChatMessages,
@@ -21,10 +22,15 @@ import {
   type SendChatMessageOptions,
   type ChatMessage,
 } from "./api-client";
+import {
+  selectChatLastCompact,
+  selectChatLastMessage,
+  useProjectStore,
+} from "./project-dispatcher";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-type BusyAction = "resend" | "delete" | "feedback";
+type BusyAction = "resend" | "delete" | "feedback" | "feedback-positive";
 
 function upsertSyntheticAssistantMessage(current: ChatMessage[], message: ChatMessage): ChatMessage[] {
   const index = current.findIndex((item) => item.id === message.id);
@@ -244,6 +250,17 @@ export function useChat(
   const [isReady, setIsReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busyByMessage, setBusyByMessage] = useState<Record<string, BusyAction | undefined>>({});
+  // Set di messageId per cui l'utente ha gia' votato positivamente in questa sessione.
+  // Persistito in sessionStorage per sopravvivere a reload pagina.
+  const [positiveFeedback, setPositiveFeedback] = useState<Set<string>>(() => {
+    if (typeof window === "undefined") return new Set();
+    try {
+      const raw = window.sessionStorage.getItem("nexus-positive-feedback");
+      return raw ? new Set(JSON.parse(raw)) : new Set();
+    } catch {
+      return new Set();
+    }
+  });
   const [agentRun, setAgentRun] = useState<AgentRunInfo | null>(null);
   const [agentSteps, setAgentSteps] = useState<AgentStep[]>([]);
   const [isReconnecting, setIsReconnecting] = useState(false);
@@ -254,6 +271,36 @@ export function useChat(
   const [traces, setTraces] = useState<AITraceEvent[]>([]);
   const [streamingToken, setStreamingToken] = useState<string>("");
   const streamingTokenRef = useRef<string>("");
+
+  // ── Binding dispatcher: TokenUsageBar e tokenUsage si aggiornano in
+  // ── real-time SENZA refresh browser quando il backend emette eventi chat.
+  //
+  // - ChatSessionCompacted: il backend invia totali freschi dopo compact;
+  //   riallineiamo subito la barra (caso bug "percentuale solo dopo F5").
+  // - ChatMessageAdded: il backend invia totali assoluti aggiornati ad ogni
+  //   INSERT messaggio (TODO: cablare emit lato chat_messages.rs); per ora
+  //   resta inattivo finche' il cablaggio backend e' completo.
+  const lastCompact = useProjectStore(selectChatLastCompact(sessionId ?? null));
+  const lastMessage = useProjectStore(selectChatLastMessage(sessionId ?? null));
+
+  useEffect(() => {
+    if (!lastCompact || !sessionId) return;
+    setTokenUsage({
+      totalTokens: lastCompact.totalTokens,
+      totalCostUsd: lastCompact.totalCostUsd,
+    });
+  }, [lastCompact?.ts, sessionId]);
+
+  useEffect(() => {
+    if (!lastMessage || !sessionId) return;
+    // Totali assoluti dal backend (idempotente, non incrementale)
+    if (lastMessage.totalTokens !== undefined && lastMessage.totalCostUsd !== undefined) {
+      setTokenUsage({
+        totalTokens: lastMessage.totalTokens,
+        totalCostUsd: lastMessage.totalCostUsd,
+      });
+    }
+  }, [lastMessage?.messageId, sessionId]);
 
   // Persist traces to sessionStorage when they change
   useEffect(() => {
@@ -664,6 +711,37 @@ export function useChat(
     }
   }, []);
 
+  const feedbackPositive = useCallback(async (messageId: string, comment?: string) => {
+    if (!messageId) return;
+    if (positiveFeedback.has(messageId)) return; // idempotente lato client
+    setBusyByMessage((current) => ({ ...current, [messageId]: "feedback-positive" }));
+    setError(null);
+    try {
+      await feedbackChatMessagePositive(messageId, comment?.trim() || undefined);
+      setPositiveFeedback((prev) => {
+        const next = new Set(prev);
+        next.add(messageId);
+        if (typeof window !== "undefined") {
+          try {
+            window.sessionStorage.setItem(
+              "nexus-positive-feedback",
+              JSON.stringify(Array.from(next)),
+            );
+          } catch { /* quota / disabled — ignora */ }
+        }
+        return next;
+      });
+    } catch (e) {
+      setError(formatChatError(e, "Invio feedback positivo fallito."));
+    } finally {
+      setBusyByMessage((current) => {
+        const next = { ...current };
+        delete next[messageId];
+        return next;
+      });
+    }
+  }, [positiveFeedback]);
+
   const clear = useCallback(() => {
     setMessages([]);
     setError(null);
@@ -766,92 +844,6 @@ export function useChat(
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, sessionId]);
 
-  // M65+M67: polling provider/model + steps durante esecuzione.
-  // Quando M61b sticky cascade fa fallback (es. openai/o3 -> deepseek/deepseek-chat),
-  // l'UPDATE su agent_runs.provider/model (M62) avviene server-side, ma il frontend
-  // ha il provider INIZIALE nel state React. Senza polling, l'utente vede
-  // "run: openai/o3" anche se il provider effettivo è deepseek.
-  // M67: anche gli step possono essere persi se SSE stream cade o rallenta.
-  // Polling ogni 5s mantiene provider+model+status+steps+iterationCount sincronizzati.
-  // Auto-disattiva quando il run e' terminale.
-  useEffect(() => {
-    if (!agentRun) return;
-    if (agentRun.status !== "running" && agentRun.status !== "awaiting_confirmation") return;
-    const runId = agentRun.runId;
-    let cancelled = false;
-    const interval = setInterval(async () => {
-      if (cancelled) return;
-      try {
-        const fresh = await getAgentRun(runId);
-        if (cancelled || !fresh) return;
-        // Aggiorna agent_run solo se metadata sono cambiati (evita re-render inutili)
-        setAgentRun((prev) => {
-          if (!prev || prev.runId !== runId) return prev;
-          const changed =
-            prev.provider !== fresh.provider ||
-            prev.model !== fresh.model ||
-            prev.status !== fresh.status ||
-            (prev.iterationCount ?? 0) !== (fresh.iterationCount ?? 0);
-          if (!changed) return prev;
-          return {
-            ...prev,
-            provider: fresh.provider,
-            model: fresh.model,
-            status: fresh.status,
-            iterationCount: fresh.iterationCount ?? prev.iterationCount,
-          };
-        });
-        setAgentRuns((prev) => {
-          const existing = prev.get(runId);
-          if (!existing) return prev;
-          if (
-            existing.provider === fresh.provider &&
-            existing.model === fresh.model &&
-            existing.status === fresh.status &&
-            (existing.iterationCount ?? 0) === (fresh.iterationCount ?? 0)
-          ) {
-            return prev;
-          }
-          return new Map(prev).set(runId, {
-            ...existing,
-            provider: fresh.provider,
-            model: fresh.model,
-            status: fresh.status,
-            iterationCount: fresh.iterationCount ?? existing.iterationCount,
-          });
-        });
-        // M67: refresh steps. Se il count è cambiato (o c'è uno step pre-esistente
-        // con dati aggiornati, es. status running -> completed), aggiorna lo state.
-        const freshSteps = fresh.steps ?? [];
-        if (freshSteps.length > 0) {
-          setAgentSteps((prev) => {
-            // Confronto rapido: numero diverso o cambio di status sull'ultimo step
-            if (prev.length === freshSteps.length) {
-              const last = freshSteps[freshSteps.length - 1];
-              const prevLast = prev[prev.length - 1];
-              if (
-                prevLast &&
-                prevLast.stepIndex === last.stepIndex &&
-                prevLast.status === last.status &&
-                prevLast.toolName === last.toolName
-              ) {
-                return prev;
-              }
-            }
-            return freshSteps;
-          });
-          setAgentStepsMap((prev) => new Map(prev).set(runId, freshSteps));
-        }
-      } catch {
-        /* polling best-effort: ignora errori transitori */
-      }
-    }, 5000);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [agentRun?.runId, agentRun?.status]);
-
   return {
     messages,
     sessionId,
@@ -871,6 +863,8 @@ export function useChat(
     resend,
     remove,
     feedbackError,
+    feedbackPositive,
+    positiveFeedback,
     confirmAgent,
     cancelRun: useCallback(async (runId: string) => {
       // Resetta stato UI SUBITO per sbloccare l'input (prima delle chiamate async)

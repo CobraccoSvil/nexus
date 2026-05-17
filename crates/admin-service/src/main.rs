@@ -18,6 +18,7 @@ mod browser_bridge;
 mod environment;
 mod experiments;
 mod long_running;
+mod orchestrator_panel;
 mod prompt_templates;
 mod settings;
 mod shared_directives;
@@ -217,6 +218,29 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/prompt-dashboard",
             get(experiments::prompt_dashboard),
+        )
+        // PR-4 Orchestrator panel (Plan/Act/Verify + Sub-agents)
+        .route(
+            "/orchestrator/plans",
+            get(orchestrator_panel::list_plans),
+        )
+        .route(
+            "/orchestrator/plans/:run_id",
+            get(orchestrator_panel::get_plan),
+        )
+        .route(
+            "/orchestrator/subagents/definitions",
+            get(orchestrator_panel::list_subagent_definitions)
+                .post(orchestrator_panel::upsert_subagent_definition),
+        )
+        .route(
+            "/orchestrator/subagents/definitions/:kind",
+            axum::routing::patch(orchestrator_panel::upsert_subagent_definition)
+                .delete(orchestrator_panel::delete_subagent_definition),
+        )
+        .route(
+            "/orchestrator/subagents/runs",
+            get(orchestrator_panel::list_subagent_runs),
         )
         .layer(axum_mw::from_fn_with_state(state.clone(), require_admin))
         .with_state(state.clone());

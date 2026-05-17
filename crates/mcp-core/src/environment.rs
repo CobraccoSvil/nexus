@@ -294,7 +294,7 @@ pub async fn get_environment_status(
     State(state): State<AppState>,
 ) -> ApiResult {
     let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/ai_orchestrator".to_string());
+        .unwrap_or_else(|_| "postgres://nexus:nexus@localhost:5433/nexus".to_string());
 
     let (
         db_check,
@@ -375,7 +375,7 @@ pub async fn fix_environment(
 
         "run_migrations" => {
             let db_url = std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/ai_orchestrator".to_string());
+                .unwrap_or_else(|_| "postgres://nexus:nexus@localhost:5433/nexus".to_string());
             let result = timeout(
                 Duration::from_secs(60),
                 Command::new("/home/administrator/.cargo/bin/sqlx")

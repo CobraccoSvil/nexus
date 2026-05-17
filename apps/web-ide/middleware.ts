@@ -20,8 +20,14 @@ export function middleware(request: NextRequest) {
     return NextResponse.next();
   }
 
-  // Allow login page and static assets
-  if (pathname === "/login" || pathname.startsWith("/_next") || pathname.startsWith("/favicon")) {
+  // Allow login page, static assets, and public screenshots
+  if (
+    pathname === "/login" ||
+    pathname.startsWith("/_next") ||
+    pathname.startsWith("/favicon") ||
+    pathname.startsWith("/screenshots/") ||
+    pathname === "/pricing"
+  ) {
     return NextResponse.next();
   }
 
@@ -44,5 +50,5 @@ export function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico|api/).*)"],
+  matcher: ["/((?!_next/static|_next/image|favicon.ico|api/|screenshots/).*)"],
 };

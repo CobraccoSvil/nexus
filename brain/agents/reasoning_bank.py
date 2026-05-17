@@ -199,3 +199,110 @@ async def _insert_example(
         json.dumps(context),
         float(reflection.get("score", 0.0)),
     )
+
+
+
+
+# PR-4: planner few-shot integration.
+# Persiste plan completati con successo (verifier passed + final_reward >= soglia)
+# come esempi few-shot per planner_node nelle invocazioni future con intent
+# scaffold_app / architecture.
+
+_PLAN_PATTERN_TYPE = "plan_template"
+_PLAN_REWARD_THRESHOLD = 0.85
+
+
+async def maybe_store_successful_plan(
+    run_id: str,
+    intent: str,
+    user_task: str,
+    plan_summary: str,
+    final_reward: float,
+) -> bool:
+    """Persiste un plan vincente come esempio pattern_type=plan_template.
+
+    Soglia configurabile via setting orchestrator.reasoning_bank_plan_min_score
+    (fallback 0.85). Filtra per intent in {scaffold_app, architecture, code, implement}.
+    """
+    if intent not in ("scaffold_app", "architecture", "code", "implement"):
+        return False
+    pool = _get_db_pool()
+    if pool is None:
+        return False
+    try:
+        async with pool.acquire() as conn:  # type: ignore[union-attr]
+            threshold_row = await conn.fetchrow(
+                "SELECT value FROM settings WHERE key='orchestrator.reasoning_bank_plan_min_score' LIMIT 1"
+            )
+            threshold = _PLAN_REWARD_THRESHOLD
+            if threshold_row and threshold_row["value"]:
+                try:
+                    threshold = float(threshold_row["value"])
+                except Exception:
+                    pass
+            if final_reward < threshold:
+                return False
+            pattern_id = await conn.fetchval(
+                """INSERT INTO reasoning_patterns
+                   (pattern_type, name, description, source_agent)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT DO NOTHING
+                   RETURNING id""",
+                _PLAN_PATTERN_TYPE,
+                f"plan:{intent}",
+                f"Plan riuscito per intent={intent}",
+                "planner_node",
+            )
+            if pattern_id is None:
+                pattern_id = await conn.fetchval(
+                    "SELECT id FROM reasoning_patterns WHERE pattern_type=$1 AND name=$2 LIMIT 1",
+                    _PLAN_PATTERN_TYPE, f"plan:{intent}",
+                )
+            import json as _json
+            await conn.execute(
+                """INSERT INTO reasoning_examples
+                   (pattern_id, input_summary, output_summary, context, quality_score, validated)
+                   VALUES ($1, $2, $3, $4::jsonb, $5, FALSE)""",
+                pattern_id,
+                (user_task or "")[:500],
+                (plan_summary or "")[:1500],
+                _json.dumps({"run_id": run_id, "intent": intent}),
+                float(final_reward),
+            )
+        logger.info(
+            "reasoning_bank: plan run_id=%s intent=%s reward=%.3f salvato come few-shot",
+            run_id, intent, final_reward,
+        )
+        return True
+    except Exception as exc:
+        logger.debug("maybe_store_successful_plan fallita: %s", exc)
+        return False
+
+
+async def retrieve_similar_plans(
+    user_task: str,
+    intent: str | None = None,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    """Ritorna fino a `limit` plan riusciti per few-shot (ordinati per score)."""
+    pool = _get_db_pool()
+    if pool is None:
+        return []
+    try:
+        async with pool.acquire() as conn:  # type: ignore[union-attr]
+            rows = await conn.fetch(
+                """SELECT e.input_summary, e.output_summary, e.quality_score
+                   FROM reasoning_examples e
+                   JOIN reasoning_patterns p ON p.id = e.pattern_id
+                   WHERE p.pattern_type = $1
+                     AND ($2::text IS NULL OR p.name = 'plan:' || $2)
+                   ORDER BY e.quality_score DESC, e.created_at DESC
+                   LIMIT $3""",
+                _PLAN_PATTERN_TYPE,
+                intent,
+                int(limit),
+            )
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.debug("retrieve_similar_plans fallita: %s", exc)
+        return []

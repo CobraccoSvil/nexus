@@ -6,12 +6,12 @@ import {
   deleteProject,
   getGitHubAccount,
   listUserGitHubRepositories,
+  registerProject,
   type GitHubRepositorySummary,
   type UserProjectSummary,
 } from "../lib/api-client";
 import { useThemeColors } from "../lib/theme";
 import { shortenAbsolutePath } from "../lib/format";
-import { ProjectImportWizard } from "./project-import-wizard";
 
 function iconButtonStyle(
   tc: ReturnType<typeof useThemeColors>,
@@ -62,7 +62,9 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
   const [cloneError, setCloneError] = useState<string | null>(null);
   const [deleteState, setDeleteState] = useState<DeleteState>({ phase: "idle" });
   const [deleteError, setDeleteError] = useState<string | null>(null);
-  const [importWizardOpen, setImportWizardOpen] = useState(false);
+  const [importFolder, setImportFolder] = useState("");
+  const [importBusy, setImportBusy] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
 
   // GitHub repo picker
   const [githubConnected, setGithubConnected] = useState(false);
@@ -103,6 +105,24 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
       setCloneError(err instanceof Error ? err.message : "Errore durante il clone.");
     } finally {
       setCloneBusy(false);
+    }
+  }
+
+  async function handleImport() {
+    const folder = importFolder.trim();
+    if (!folder) return;
+    setImportBusy(true);
+    setImportError(null);
+    try {
+      const result = await registerProject(folder);
+      setImportFolder("");
+      setIsModalOpen(false);
+      onRefreshProjects?.();
+      startTransition(() => { void onSelect(result.project.id); });
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : "Errore durante l'import.");
+    } finally {
+      setImportBusy(false);
     }
   }
 
@@ -313,34 +333,57 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
               </div>
             )}
 
-            {/* Importa cartella locale (registra una directory gia esistente sul filesystem) */}
+            {/* Nuovo progetto locale: solo nome cartella (risolto contro projects_base_root). */}
             <div style={{ borderTop: `1px solid ${tc.border}`, paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
               <div style={{ color: tc.textSecondary, fontSize: 12, fontWeight: 600 }}>
-                Importa cartella locale
+                Nuovo progetto locale
               </div>
               <div style={{ fontSize: 11, color: tc.textMuted }}>
-                Registra una directory esistente sul server come progetto Nexus (apre il wizard di import con browser file, analisi e config DB).
+                Indica il nome della cartella. Verra&apos; creata (se non esiste) dentro la directory progetti configurata e registrata come progetto Nexus.
               </div>
-              <button
-                type="button"
-                onClick={() => {
-                  setIsModalOpen(false);
-                  setImportWizardOpen(true);
-                }}
-                style={{
-                  alignSelf: "flex-start",
-                  padding: "8px 16px",
-                  borderRadius: 8,
-                  border: `1px solid ${tc.border}`,
-                  background: tc.bgInput,
-                  color: tc.text,
-                  cursor: "pointer",
-                  fontSize: 13,
-                  fontWeight: 600,
-                }}
-              >
-                Importa cartella locale...
-              </button>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input
+                  type="text"
+                  value={importFolder}
+                  onChange={(e) => setImportFolder(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter" && !importBusy) void handleImport(); }}
+                  placeholder="mio-progetto"
+                  disabled={importBusy}
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    padding: "8px 10px",
+                    borderRadius: 8,
+                    border: `1px solid ${importFolder ? tc.accent : tc.border}`,
+                    background: tc.bgInput,
+                    color: tc.text,
+                    fontSize: 13,
+                    fontFamily: "monospace",
+                    boxSizing: "border-box",
+                  }}
+                />
+                <button
+                  type="button"
+                  disabled={!importFolder.trim() || importBusy}
+                  onClick={() => { void handleImport(); }}
+                  style={{
+                    padding: "8px 16px",
+                    borderRadius: 8,
+                    border: "none",
+                    background: !importFolder.trim() || importBusy ? tc.bgInput : tc.accent,
+                    color: !importFolder.trim() || importBusy ? tc.textMuted : "#fff",
+                    cursor: !importFolder.trim() || importBusy ? "not-allowed" : "pointer",
+                    fontSize: 13,
+                    fontWeight: 600,
+                    whiteSpace: "nowrap",
+                    flexShrink: 0,
+                  }}
+                >
+                  {importBusy ? "Creazione…" : "Crea"}
+                </button>
+              </div>
+              {importError && <div style={{ fontSize: 12, color: tc.error }}>{importError}</div>}
+              {importBusy && <div style={{ fontSize: 12, color: tc.textMuted, fontStyle: "italic" }}>Registrazione progetto in corso…</div>}
             </div>
 
             {/* Clone from GitHub */}
@@ -491,18 +534,6 @@ export function ProjectSwitcher({ projects, activeProjectId, onSelect, onRefresh
             </div>
           </div>
         </div>
-      )}
-
-      {/* Import wizard (registrazione directory locale) */}
-      {importWizardOpen && (
-        <ProjectImportWizard
-          onComplete={(projectId) => {
-            setImportWizardOpen(false);
-            onRefreshProjects?.();
-            void onSelect(projectId);
-          }}
-          onClose={() => setImportWizardOpen(false)}
-        />
       )}
 
       {/* Delete confirm dialog */}

@@ -57,6 +57,26 @@ pub(super) async fn tool_git_commit(ctx: &AgentToolContext, input: &Value) -> St
     };
     match run_git_command(&ctx.root_path, &["commit", "-m", message]).await {
         Ok((stdout, _)) => {
+            // Dispatcher: notifica GitStatusChanged → pannello Git aggiorna branch + counts
+            if let Ok((status_out, _)) = run_git_command(&ctx.root_path, &["status", "--porcelain=v1", "-b"]).await {
+                let branch = status_out
+                    .lines()
+                    .next()
+                    .and_then(|l| l.strip_prefix("## "))
+                    .map(|s| s.split("...").next().unwrap_or(s).to_string())
+                    .unwrap_or_default();
+                let modified_count = status_out.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
+                nexus_events::dispatcher::emit(
+                    &ctx.project_channels,
+                    ctx.project_id,
+                    nexus_events::event::ProjectEvent::GitStatusChanged {
+                        branch,
+                        ahead: 0,
+                        behind: 0,
+                        modified_count: modified_count as i32,
+                    },
+                );
+            }
             // Re-indicizza i file modificati nel commit in background
             let db_bg = ctx.db.clone();
             let neural_bg = ctx.neural.clone();

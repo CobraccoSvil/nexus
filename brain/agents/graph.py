@@ -39,9 +39,14 @@ def route_after_router(state: AgentState) -> str:
     behavior_mode = state.get("behavior_mode")
     intent = state.get("user_intent")
     token_budget = int(state.get("token_budget") or 0)
-    if orchestrator_config.is_eligible(behavior_mode, intent, token_budget):
-        return "planner"
-    return "executor"
+    cfg = orchestrator_config.get()
+    eligible = orchestrator_config.is_eligible(behavior_mode, intent, token_budget)
+    logger.info(
+        "route_after_router: eligible=%s plan_enabled=%s mode=%r intent=%r budget=%d -> %s",
+        eligible, cfg.get("plan_phase_enabled"), behavior_mode, intent, token_budget,
+        "planner" if eligible else "executor",
+    )
+    return "planner" if eligible else "executor"
 
 
 def create_agent_graph(

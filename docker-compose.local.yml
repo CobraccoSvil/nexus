@@ -21,6 +21,32 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # M74 — Container Postgres SEPARATO per i DB applicativi generati dall'agente.
+  # Isolato fisicamente dal container postgres-nexus: anche se l'agente riesce
+  # a connettersi non puo' MAI raggiungere il DB Nexus (sono cluster diversi).
+  # Il role applicativo `nexus_app` viene creato dal bootstrap SQL con permessi
+  # minimali (NOSUPERUSER, NOCREATEROLE) — vedi infra/sql/init-postgres-app.sql.
+  postgres-app:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: nexus_admin
+      POSTGRES_PASSWORD: nexus_admin_secret
+      POSTGRES_DB: postgres
+      # Password del role applicativo letta dal bootstrap script. In dev usiamo
+      # un valore fisso; in prod sovrascrivere via env del compose.
+      NEXUS_APP_DB_PASSWORD: nexus_app_dev_secret
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres-app-data:/var/lib/postgresql/data
+      - ./infra/sql/init-postgres-app.sh:/docker-entrypoint-initdb.d/01-bootstrap-app-role.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus_admin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
 
   redis:
     image: redis:7-alpine
@@ -91,5 +117,6 @@ services:
 
 volumes:
   postgres-nexus-data:
+  postgres-app-data:
   qdrant-data:
   grafana-data:

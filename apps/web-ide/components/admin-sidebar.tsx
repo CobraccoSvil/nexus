@@ -42,6 +42,8 @@ export function AdminSidebar({
         { label: "Template Prompt", href: "/admin/prompts" as Route, icon: "PT" },
         { label: "Dashboard Prompt", href: "/admin/prompts/dashboard" as Route, icon: "DP" },
         { label: "Direttive Condivise", href: "/admin/prompts/directives" as Route, icon: "DC" },
+        { label: "Orchestrator", href: "/admin/orchestrator" as Route, icon: "OR" },
+        { label: "Sub-agents kinds", href: "/admin/orchestrator/subagents" as Route, icon: "SA" },
         { label: "Feedback AI", href: "/admin/ai-feedback" as Route, icon: "F" },
         { label: "Apprendimento Progetto", href: "/admin/project-learning" as Route, icon: "AP" },
       ],

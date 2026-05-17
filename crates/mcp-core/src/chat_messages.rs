@@ -63,6 +63,14 @@ pub struct FeedbackErrorRequest {
     pub comment: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackPositiveRequest {
+    /// Commento opzionale (es. "perfetto", "soluzione elegante"). Salvato per audit ma non genera correzioni.
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LegacyChatRequest {
@@ -369,93 +377,26 @@ async fn build_composed_system_context(
 
     let project_header = match load_project_context(db, project_id, user_id).await {
         Ok(proj) => {
-            // Fix M52: includi SEMPRE ProjectId nel context, anche quando i
-            // dettagli progetto sono disponibili. L'agente lo usa per
-            // chiamare endpoint REST /api/projects/:id/services/*
-            // (allocate-port, install-playwright, browser-check, ecc.).
-            // Senza, l'agente chiedeva l'UUID all'utente — violazione M22.
-            //
-            // Fix M50: rileva dir vuota e indica esplicitamente di non
-            // ri-chiamare list_files. Quando il repo e' nuovo (no commit
-            // significativi, no file), suggerisci di iniziare direttamente
-            // con write_file. Evita il loop patologico (visto su o3 con 18+
-            // chiamate list_files consecutive su dir vuota).
-            let root_path = proj.repository_root_path.clone();
-            let is_empty_repo = std::fs::read_dir(&root_path)
-                .map(|d| {
-                    d.filter_map(|e| e.ok())
-                        .all(|e| {
-                            let name = e.file_name();
-                            let n = name.to_string_lossy();
-                            n == ".git" || n.starts_with('.')
-                        })
-                })
-                .unwrap_or(false);
-            // Fix M54: include infrastruttura Nexus disponibile (DB Postgres,
-            // Redis, range porte) cosi l'agente sa che puo creare DB applicativi
-            // e allocare porte autonomamente, senza chiedere all'utente.
-            let infra_block = "INFRASTRUTTURA NEXUS DISPONIBILE (usa autonomamente, no domande utente):\n  \
-                 Postgres applicativi: localhost:5433 user=nexus pass=nexus (container ideai-postgres-nexus-1).\n    \
-                   Per il DB del progetto: CREATE DATABASE <slug>; (psql -h localhost -p 5433 -U nexus -d postgres).\n    \
-                   Connection string standard: postgresql://nexus:nexus@localhost:5433/<slug>\n  \
-                 Redis: localhost:6379 (cache opzionale).\n  \
-                 Tool MCP request_port(label): alloca porte dinamiche (range 20000-39999) — usa al posto di hardcodare 3000/5173.";
             if let Some(summary) = analysis_summary {
                 format!(
                     "=== CONTESTO PROGETTO (non chiedere queste informazioni: sono gia' qui) ===\n\
-                     Progetto: {} | ProjectId: {} | Root: {} | Git: {}\n\
-                     {}\n\
-                     Endpoint REST disponibili (auth via cookie sessione, chiamabili via run_command + curl):\n\
-                       POST /api/projects/{}/services/allocate-port  body {{label:\"backend-dev\"}}\n\
-                       POST /api/projects/{}/services/install-playwright\n\
-                       POST /api/projects/{}/services/browser-check\n\
-                       POST /api/projects/{}/services/sync-ports-to-files\n\
+                     Progetto: {} | Root: {} | Git: {}\n\
                      {}\n\
                      === FINE CONTESTO PROGETTO ===\n\n",
                     proj.details.name,
-                    project_id,
-                    root_path.display(),
+                    proj.repository_root_path.display(),
                     if proj.is_git_repo { "si" } else { "no" },
-                    infra_block,
-                    project_id, project_id, project_id, project_id,
                     summary
-                )
-            } else if is_empty_repo {
-                format!(
-                    "=== CONTESTO PROGETTO ===\n\
-                     Progetto: {} | ProjectId: {} | Root: {} | Git: {}\n\
-                     REPOSITORY VUOTO (solo {}). NON chiamare list_files: SAI gia' che e' vuoto.\n\
-                     Inizia direttamente con write_file dei file richiesti dall'utente.\n\
-                     {}\n\
-                     Endpoint REST disponibili (chiamabili via run_command + curl):\n\
-                       POST /api/projects/{}/services/allocate-port  body {{label:\"backend-dev\"}}\n\
-                       POST /api/projects/{}/services/install-playwright\n\
-                       POST /api/projects/{}/services/browser-check\n\
-                     === FINE CONTESTO PROGETTO ===\n\n",
-                    proj.details.name,
-                    project_id,
-                    root_path.display(),
-                    if proj.is_git_repo { "si" } else { "no" },
-                    if proj.is_git_repo { ".git/" } else { "vuoto" },
-                    infra_block,
-                    project_id, project_id, project_id,
                 )
             } else {
                 format!(
                     "=== CONTESTO PROGETTO ===\n\
-                     Progetto: {} | ProjectId: {} | Root: {} | Git: {}\n\
-                     (Nessuna analisi disponibile: usa list_files solo per la prima esplorazione, poi memorizza)\n\
-                     {}\n\
-                     Endpoint REST disponibili (chiamabili via run_command + curl):\n\
-                       POST /api/projects/{}/services/allocate-port  body {{label:\"backend-dev\"}}\n\
-                       POST /api/projects/{}/services/install-playwright\n\
+                     Progetto: {} | Root: {} | Git: {}\n\
+                     (Nessuna analisi disponibile: usa list_files per esplorare la struttura)\n\
                      === FINE CONTESTO PROGETTO ===\n\n",
                     proj.details.name,
-                    project_id,
-                    root_path.display(),
-                    if proj.is_git_repo { "si" } else { "no" },
-                    infra_block,
-                    project_id, project_id,
+                    proj.repository_root_path.display(),
+                    if proj.is_git_repo { "si" } else { "no" }
                 )
             }
         }
@@ -1413,6 +1354,18 @@ async fn run_turn(
     )
     .await?;
 
+    nexus_events::dispatcher::emit(
+        &state.project_channels,
+        project_id,
+        nexus_events::ProjectEvent::ChatMessageAdded {
+            session_id,
+            message_id: assistant_id,
+            role: "assistant".into(),
+            total_tokens: payload["total_tokens"].as_i64(),
+            total_cost_usd: payload["total_cost"].as_f64(),
+        },
+    );
+
     sqlx::query(
         r#"
         UPDATE chat_sessions
@@ -1893,28 +1846,14 @@ async fn spawn_agent_run(
         AutomationMode::Automatic => "\n=== MODALITÀ AUTOMATICA ===\n\
             Sei in modalità AUTOMATICA. Regole assolute:\n\
             1. NON chiedere mai conferma prima di eseguire operazioni (modifica file, esecuzione comandi, ecc.)\n\
-            2. NON chiedere \"Vuoi che proceda?\", \"Posso continuare?\", \"Devo modificare?\", \"Procedo con...?\". Queste frasi sono VIETATE come ultime righe del tuo messaggio.\n\
+            2. NON chiedere \"Vuoi che proceda?\", \"Posso continuare?\", \"Devo modificare?\"\n\
             3. Esegui direttamente tutte le azioni necessarie senza interruzioni\n\
             4. Se hai dubbi su un approccio, scegli quello più ragionevole e procedi\n\
             5. Per ogni modifica a un file: PRIMA leggi la sezione esatta con read_file_lines, POI usa edit_file con old_string di almeno 5 righe di contesto, POI verifica subito con run_command (build/typecheck/lint) che non ci siano errori sintattici.\n\
             5b. Se edit_file ritorna 'old_string non trovato': l'errore include GIA' le prime 80 righe del file. Confronta direttamente — NON chiamare read_file_lines (bloccato dal loop-detector se gia' usato). Se la sezione non e' nelle prime 80 righe, usa read_file_lines con start_line/end_line DIVERSI da quelli precedenti.\n\
             6. Se il build fallisce dopo un edit_file: leggi SUBITO l'errore, identifica quale modifica ha causato il problema, e correggila prima di procedere con altri edit.\n\
-            7. CONTRATTO DI CHIUSURA: prima di emettere il messaggio finale all'utente DEVI aver eseguito con esito POSITIVO il criterio di accettazione esplicitato nella richiesta iniziale (es. \"pnpm verify\", \"cargo check + clippy + test\", o equivalente). Se il criterio fallisce, NON concludere: identifica gli errori specifici e continua il ciclo fix→verify finché tutti passano.\n\
-            8. Se incontri un blocco oggettivamente non risolvibile dall'agente (es. credenziali esterne mancanti, servizio terzo down, dipendenza non disponibile nel registry), spiegalo nel messaggio finale come 'BLOCCO ESTERNO' e fermati. Negli altri casi continua il loop fino al criterio di accettazione.\n\
-            9. Considera il messaggio iniziale dell'utente come autorizzazione completa per l'intero flusso descritto: non servono ulteriori autorizzazioni intermedie.\n\
-            10. Il messaggio finale all'utente deve riportare: (a) cosa hai prodotto in sintesi, (b) esito dell'ultima esecuzione del criterio di accettazione (build/test passati e numero verifiche superate), (c) eventuali blocchi esterni residui. NESSUNA domanda terminale.\n\
-            11. CRITERIO DI ACCETTAZIONE DEFAULT — quando l'utente richiede di costruire un'applicazione web/servizio funzionante e non specifica un criterio diverso, il criterio implicito include sempre: (a) il codice compila/passa typecheck/lint senza errori; (b) i test esistenti passano; (c) il backend si avvia e risponde a una richiesta HTTP di health/index (es. `curl http://localhost:PORT/` o endpoint /api/health ritorna 2xx); (d) se c'e' un frontend, anche il frontend dev server si avvia e serve l'HTML root su una porta diversa. NON puoi considerare il criterio soddisfatto se l'app non e' stata effettivamente avviata e raggiunta via HTTP almeno una volta nel run.\n\
-            12. Per avviare servizi long-running (npm start, vite dev, ecc.) usa `run_command` con `background: true` quando il tool lo supporta, poi attendi qualche secondo con `read_service_output` o `sleep`, quindi verifica con un secondo `run_command` `curl -sS -o /dev/null -w '%{http_code}\\n' http://localhost:PORT/`. Documenta nel messaggio finale le porte effettive utilizzate (es. backend :3001, frontend :5173).\n\
-            13. GIT — VIETATO eseguire `git ...` o `gh ...` via `run_command`. Per qualsiasi operazione git usa i tool agente dedicati:\n\
-               - lettura: `git_status`, `git_log`, `git_diff`, `git_diff_stat`, `git_branch_list`, `git_remote_list`, `git_show`, `git_log_graph`, `git_blame`, `git_ls_files`, `git_rev_parse`, `git_tag_list`, `git_stash_list`, `git_for_each_ref`, `git_describe`, `git_grep`, `git_config_list`, `git_merge_base`, `git_reflog`, `git_show_branch`, `git_count_objects`, `git_fsck` (read-only)\n\
-               - scrittura locale: `git_stage` (paths), `git_commit` (message), `git_push`, `git_pull`\n\
-               - GitHub read: `gh_repo_view`, `gh_pr_view`, `gh_pr_list`, `gh_issue_list/view`, `gh_release_list/view`, `gh_workflow_list/view`, `gh_run_list/view/logs`, `gh_repo_clone_url`, `gh_repo_fork_list`\n\
-               - GitHub write (issue/PR): `gh_issue_create/comment/close`, `gh_pr_create/review/merge/close`, `gh_release_create`, `gh_workflow_run`, `gh_run_cancel`\n\
-               Se l'operazione che ti serve NON esiste come tool dedicato (es. `git remote add`, `git checkout -b`, `gh repo create`, `git reset`, `git merge`), USA gli endpoint REST di Nexus chiamandoli via `http_request`:\n\
-               - POST `http://localhost:4000/api/projects/{project_id}/github/clone` body `{clone_url}` per clonare\n\
-               - POST `http://localhost:4000/api/projects/{project_id}/github/publish-branch` per publish iniziale (richiede origin gia configurato)\n\
-               - POST `http://localhost:4000/api/projects/{project_id}/github/pull-request` per creare PR\n\
-               Se NEMMENO l'endpoint REST copre l'operazione (es. `gh repo create` per creare un nuovo repository da zero, `git remote add` per impostare origin), segnalalo nel messaggio finale come BLOCCO ESTERNO indicando esattamente quale operazione manca (es. \"manca tool/endpoint per `git remote add`, serve aggiungerlo a nexus_tools o esporre l'endpoint REST `/api/projects/:id/github/create-repo`\"). NON aggirare il blocco con `run_command git/gh` shell — preserva la tracciabilita delle operazioni git nei pannelli Nexus.\n\
+            7. Alla fine, VERIFICA il lavoro svolto con run_command (build completo) per confermare che tutto compili senza errori.\n\
+            8. Concludi SEMPRE con un messaggio che riporta il risultato della verifica finale (build OK / errori rimasti).\n\
             === FINE MODALITÀ AUTOMATICA ===\n",
         AutomationMode::Confirm => "\n=== MODALITÀ CONFERMA ===\n\
             Prima di modificare file o eseguire comandi, descrivi il piano.\n\
@@ -1986,10 +1925,6 @@ async fn spawn_agent_run(
 
     let db_clone = state.db.clone();
     let channels_clone = state.agent_channels.clone();
-    // Fix M5: clone state.orchestrator + dependency_status per il quality
-    // scan automatico a fine run (perform_quality_scan ha bisogno di entrambi).
-    let orchestrator_clone = state.orchestrator.clone();
-    let dep_status_clone = state.dependency_status.clone();
     let session_id_cp = params.session_id;
     let project_id_cp = params.project_id;
     let user_message_id = params.user_message_id;
@@ -2292,53 +2227,6 @@ async fn spawn_agent_run(
         .bind(result.nexus_task_type.as_deref())
         .execute(&db_clone)
         .await;
-
-        // Fix M27: auto-commit locale a fine run completato. Idempotente, no push.
-        // Fix M30 + M31 estesi: ri-scansiona run_configurations e port_allocations
-        // a fine run cosi' i pannelli Run & Debug e Porte si popolano con quanto
-        // l'agente ha generato (al register_project la dir era vuota).
-        if matches!(result.status, AgentRunStatus::Completed) {
-            let db_for_hooks = db_clone.clone();
-            let project_id_hook = project_id_cp;
-            let orchestrator_for_hooks = orchestrator_clone.clone();
-            let dep_status_for_hooks = dep_status_clone.clone();
-            tokio::spawn(async move {
-                crate::agent_types::auto_commit_project_changes(&db_for_hooks, run_id).await;
-                // Carica project_root via workspaces e ri-scansiona
-                if let Ok(Some((root_str,))) = sqlx::query_as::<_, (Option<String>,)>(
-                    "SELECT absolute_path FROM workspaces \
-                     WHERE project_id = $1 AND is_primary = true LIMIT 1",
-                )
-                .bind(project_id_hook)
-                .fetch_optional(&db_for_hooks)
-                .await
-                {
-                    if let Some(root) = root_str {
-                        let root_path = std::path::PathBuf::from(&root);
-                        if root_path.is_dir() {
-                            crate::project_workspace::run_configs::auto_populate_run_configs(
-                                &db_for_hooks, project_id_hook, &root_path,
-                            )
-                            .await;
-                            crate::project_workspace::scan_ports::auto_populate_port_allocations(
-                                &db_for_hooks, project_id_hook, &root_path,
-                            )
-                            .await;
-                            // Fix M5 (originale): auto-scan quality post-run cosi' il
-                            // pannello Problemi non resta sempre vuoto. Best-effort.
-                            crate::projects::quality::auto_scan_quality(
-                                &db_for_hooks,
-                                &orchestrator_for_hooks,
-                                project_id_hook,
-                                &root.clone(),
-                                &dep_status_for_hooks,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            });
-        }
 
         // Persisti gli step del run su agent_steps (fix bug: la tabella veniva letta
         // da chat_agent.rs:121,195 ma non scritta — dashboard "AI Workspace" mostrava
@@ -3619,6 +3507,186 @@ pub async fn feedback_error(
         "correctionId": correction_id.to_string(),
         "deduplicatedCount": dedup_count,
         "learning": learning_action
+    })))
+}
+
+/// Handler feedback positivo (pollice su): conferma esplicita che la risposta AI e' corretta.
+///
+/// A differenza di `feedback_error`:
+/// - registra in `ai_response_feedback` con `feedback_type='positive'`
+/// - NON genera `prompt_corrections` ne' embedding Qdrant (positivo = "lascia tutto com'e'")
+/// - rinforza il Q-value con reward=1.0 sul `NexusBridge` se il messaggio ha run_id + intent
+pub async fn feedback_positive(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(message_id): AxumPath<String>,
+    Json(body): Json<FeedbackPositiveRequest>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let message_id = Uuid::parse_str(&message_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Message id non valido"))?;
+    let comment = body
+        .comment
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+
+    let row = sqlx::query(
+        r#"
+        SELECT
+            m.id,
+            m.session_id,
+            m.project_id,
+            m.role,
+            m.metadata,
+            s.user_id
+        FROM chat_messages m
+        JOIN chat_sessions s ON s.id = m.session_id
+        WHERE m.id = $1
+        "#,
+    )
+    .bind(message_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let Some(row) = row else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Messaggio non trovato"));
+    };
+
+    let owner: Option<Uuid> = row.try_get("user_id").unwrap_or(None);
+    if owner != Some(user_id) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Messaggio non accessibile",
+        ));
+    }
+
+    let role: String = row.try_get("role").unwrap_or_default();
+    if role != "assistant" {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Il feedback positivo e' consentito solo sui messaggi AI",
+        ));
+    }
+
+    let session_id: Uuid = row
+        .try_get("session_id")
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let project_id: Uuid = row
+        .try_get("project_id")
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    let metadata: Value = row.try_get("metadata").unwrap_or_else(|_| json!({}));
+    let intent = metadata
+        .get("intent")
+        .and_then(Value::as_str)
+        .unwrap_or("chat")
+        .to_lowercase();
+    let provider = metadata
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let model = metadata
+        .get("model")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let run_id = metadata
+        .get("runId")
+        .or_else(|| metadata.get("agentRunId"))
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let agent_type_hint = metadata
+        .get("agentType")
+        .or_else(|| metadata.get("profile"))
+        .and_then(Value::as_str)
+        .unwrap_or("chat_default")
+        .to_string();
+
+    // Idempotenza: se gia' esiste un feedback positivo per questo messaggio, ritorna quello.
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT id FROM ai_response_feedback
+        WHERE message_id = $1 AND user_id = $2 AND feedback_type = 'positive'
+        LIMIT 1
+        "#,
+    )
+    .bind(message_id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    if let Some(existing_id) = existing {
+        return Ok(Json(json!({
+            "ok": true,
+            "feedbackId": existing_id.to_string(),
+            "alreadyRecorded": true,
+            "newQValue": null,
+        })));
+    }
+
+    let feedback_id = Uuid::new_v4();
+    // `error_comment` e' NOT NULL nello schema: salva commento utente o sentinel.
+    let comment_to_store = if comment.is_empty() {
+        "[positive feedback senza commento]".to_string()
+    } else {
+        comment.to_string()
+    };
+    sqlx::query(
+        r#"
+        INSERT INTO ai_response_feedback (
+            id, project_id, session_id, message_id, orchestrator_run_id, user_id,
+            feedback_type, intent, provider, model, error_comment, status, created_at, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, 'positive', $7, $8, $9, $10, 'resolved', NOW(), NOW())
+        "#,
+    )
+    .bind(feedback_id)
+    .bind(project_id)
+    .bind(session_id)
+    .bind(message_id)
+    .bind(run_id)
+    .bind(user_id)
+    .bind(&intent)
+    .bind(&provider)
+    .bind(&model)
+    .bind(&comment_to_store)
+    .execute(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Rinforza Q-learning: reward=1.0 (successo confermato dall'utente).
+    let mut new_q_value: Option<f32> = None;
+    if let Some(bridge) = crate::nexus_bridge::NexusBridge::global() {
+        let task_id = run_id
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| message_id.to_string());
+        let pascal = crate::internal_learning::snake_to_pascal(&agent_type_hint);
+        let agent_type = nexus_orchestrator::AgentType::from_name(&pascal);
+        let q = bridge.record_outcome(
+            &task_id,
+            &intent,
+            agent_type,
+            true,   // success
+            1.0,    // reward massimo
+            0,      // duration_ms non disponibile qui
+            None,
+        );
+        new_q_value = Some(q);
+        tracing::info!(
+            "feedback_positive: Q-update task={} intent={} agent={} new_q={}",
+            task_id, intent, pascal, q,
+        );
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "feedbackId": feedback_id.to_string(),
+        "alreadyRecorded": false,
+        "newQValue": new_q_value,
     })))
 }
 

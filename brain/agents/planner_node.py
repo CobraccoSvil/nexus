@@ -100,14 +100,67 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
         logger.warning("planner_node: session_id assente — skip")
         return {"plan_phase_active": False, "plan_phase_skip_reason": "no_session_id"}
 
+    # ── PR-3 Codex pattern: clarifying questions pre-flight ─────────────────
+    # In modalita' Confirm il planner emette `requires_clarification` con N
+    # domande → loop si interrompe per HITL.
+    # In Automatico/Continuo il planner applica default sensati e li annota
+    # nel PRD/plan (trasparenza).
+    pending_clar = state.get("pending_clarifications")
+    if cfg.get("clarifying_questions_enabled", True) and pending_clar is None:
+        try:
+            clar_outcome = await _detect_clarifications(state, cfg)
+        except Exception as exc:
+            logger.debug("planner_node: clarifying detect skipped (%s)", exc)
+            clar_outcome = None
+        if clar_outcome and clar_outcome.get("questions"):
+            # Solo Confirm si ferma per HITL; le altre modalita' applicano
+            # i default e proseguono.
+            is_confirm = behavior_mode in (None, "confirm", "study")
+            if is_confirm:
+                logger.info(
+                    "planner_node: pending_clarifications emesse run_id=%s n=%d (HITL Confirm)",
+                    run_id, len(clar_outcome["questions"]),
+                )
+                _persist_clarifications(run_id, state.get("project_id") or "", clar_outcome["questions"], applied=None)
+                return {
+                    "plan_phase_active": False,
+                    "plan_phase_skip_reason": "awaiting_clarifications",
+                    "pending_clarifications": clar_outcome["questions"],
+                }
+            else:
+                # Applica default e prosegui.
+                applied = {q["id"]: q.get("suggested_default", "") for q in clar_outcome["questions"]}
+                _persist_clarifications(
+                    run_id, state.get("project_id") or "",
+                    clar_outcome["questions"], applied=applied,
+                )
+                state["applied_default_assumptions"] = list(clar_outcome["questions"])
+                logger.info(
+                    "planner_node: applied %d clarifying defaults run_id=%s (mode=%s)",
+                    len(applied), run_id, behavior_mode,
+                )
+
     # ── Risolvi provider/model via nexus_purpose_model.planner ───────────────
-    try:
-        decision = _routing_client.purpose_model(purpose="planner")
-        planner_provider = decision.provider
-        planner_model = decision.model
-    except Exception as exc:
-        logger.error("planner_node: purpose_model(planner) fallito: %s — skip", exc)
-        return {"plan_phase_active": False, "plan_phase_skip_reason": f"purpose_model_error:{exc}"}
+    # M69: se in un'iterazione precedente di questo run il cascade ha gia'
+    # eletto un provider vincente per il planner, partiamo direttamente da
+    # quello (sticky) invece di ri-tentare la chain completa.
+    sticky_p = state.get("planner_sticky_provider")
+    sticky_m = state.get("planner_sticky_model")
+    if sticky_p and sticky_m:
+        planner_provider = sticky_p
+        planner_model = sticky_m
+        logger.info(
+            "planner_node: M69 sticky cascade attivo provider=%s model=%s",
+            planner_provider, planner_model,
+        )
+    else:
+        try:
+            decision = _routing_client.purpose_model(purpose="planner")
+            planner_provider = decision.provider
+            planner_model = decision.model
+        except Exception as exc:
+            logger.error("planner_node: purpose_model(planner) fallito: %s — skip", exc)
+            return {"plan_phase_active": False, "plan_phase_skip_reason": f"purpose_model_error:{exc}"}
 
     # ── Carica prompt dal registry DB (cache TTL 60s) ────────────────────────
     prompt_key = orchestrator_config.planner_prompt_key()
@@ -136,7 +189,19 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
                                 "content": {"type": "string"},
                                 "status": {"type": "string", "enum": ["pending"]},
                                 "priority": {"type": "string", "enum": ["high", "normal", "low"]},
-                                "acceptance_criteria": {"type": "array"},
+                                "acceptance_criteria": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "type": {"type": "string"},
+                                            "command": {"type": "string"},
+                                            "expected": {"type": "string"},
+                                            "url": {"type": "string"},
+                                            "path": {"type": "string"},
+                                        },
+                                    },
+                                },
                             },
                             "required": ["content"],
                         },
@@ -255,7 +320,119 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
         "messages": [assistant_msg, tool_result_msg],
         "provider_used": used_provider,
         "model_used": used_model,
+        # M69: persisti il provider/model effettivamente vincente del cascade
+        # cosi' eventuali replan futuri di questo run lo riusano direttamente.
+        "planner_sticky_provider": used_provider,
+        "planner_sticky_model": used_model,
     }
+
+
+async def _detect_clarifications(state: AgentState, cfg: dict) -> dict[str, Any] | None:
+    """PR-3 Codex pattern: chiede al LLM se il task utente e' ambiguo.
+
+    Ritorna `{"questions": [{id,question,suggested_default}, ...]}` se ambiguo,
+    altrimenti None. Best-effort: in caso di errore non blocca il run.
+    """
+    max_q = int(cfg.get("clarifying_questions_max", 3))
+    # Recupera l'ultimo messaggio user (il task vero e proprio).
+    user_msg = ""
+    for m in reversed(state.get("messages", []) or []):
+        if getattr(m, "type", None) in ("human", "user"):
+            content = getattr(m, "content", "") or ""
+            user_msg = content if isinstance(content, str) else str(content)
+            break
+    if not user_msg.strip():
+        return None
+    template = prompt_registry.get_prompt("agent.clarifying.detect") or ""
+    if not template:
+        return None
+    # Render template con max_q.
+    from . import prompt_renderer
+    system_text = prompt_renderer.render(template, {"max_questions": max_q})
+    # Usa lo stesso routing del planner (deepseek o sticky).
+    try:
+        decision = _routing_client.purpose_model(purpose="planner")
+        provider, model = decision.provider, decision.model
+    except Exception:
+        return None
+    # Tool semplice per la struttura della risposta.
+    tools_json = [{
+        "name": "request_clarification",
+        "description": "Emetti questa lista di domande se e SOLO se il task utente e' ambiguo.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "question": {"type": "string"},
+                            "suggested_default": {"type": "string"},
+                        },
+                        "required": ["id", "question"],
+                    },
+                }
+            },
+            "required": ["questions"],
+        },
+    }]
+    import asyncio as _aio
+    try:
+        anth_messages = _langchain_to_anthropic_messages_local([
+            type("M", (), {"type": "human", "content": user_msg, "additional_kwargs": {}})(),
+        ])
+        result = await _aio.to_thread(
+            _providers.generate_agent_turn_sync,
+            provider, model, anth_messages, tools_json,
+            max_tokens=512, system_text=system_text,
+        )
+    except Exception as exc:
+        logger.debug("_detect_clarifications: LLM call fallita: %s", exc)
+        return None
+    meta = result.metadata or {}
+    blocks = meta.get("tool_use_blocks") or []
+    for b in blocks:
+        if b.get("name") == "request_clarification":
+            inp = b.get("input") or {}
+            qs = inp.get("questions") or []
+            qs = [q for q in qs if isinstance(q, dict) and q.get("id") and q.get("question")][:max_q]
+            if qs:
+                return {"questions": qs}
+    return None
+
+
+def _persist_clarifications(
+    run_id: str,
+    project_id: str,
+    questions: list[dict],
+    applied: dict | None,
+) -> None:
+    """Persisti la riga in nexus_agent_clarifications (best-effort)."""
+    import os
+    url = os.environ.get("DATABASE_URL", "")
+    if not url:
+        return
+    try:
+        import psycopg2  # type: ignore[import-untyped]
+        import json as _json
+        with psycopg2.connect(url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO nexus_agent_clarifications
+                       (run_id, project_id, questions, applied_defaults, answered_at)
+                       VALUES (%s, %s, %s::jsonb, %s::jsonb, %s)""",
+                    (
+                        run_id, project_id,
+                        _json.dumps(questions),
+                        _json.dumps(applied) if applied is not None else None,
+                        "NOW()" if applied is not None else None,
+                    ),
+                )
+            conn.commit()
+    except Exception as exc:
+        logger.debug("_persist_clarifications fallita: %s", exc)
 
 
 def _langchain_to_anthropic_messages_local(messages: list) -> list[dict]:

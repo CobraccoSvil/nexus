@@ -32,9 +32,12 @@ pub struct ToolRunnerDeps {
     pub db: PgPool,
     pub neural: NeuralCoreClient,
     pub agent_channels: AgentChannels,
+    pub playwright_channels: crate::playwright_live::PlaywrightChannels,
     pub terminal_consumers: TerminalConsumers,
     pub template_cache: TemplateCache,
     pub dependency_status: crate::task_watchdog::DependencyStatusRef,
+    pub project_channels: nexus_events::ProjectChannels,
+    pub monitor_registry: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, serde_json::Value>>>>,
 }
 
 #[derive(Clone)]
@@ -121,6 +124,7 @@ impl ToolRunnerService {
             db: Arc::new(self.deps.db.clone()),
             parent_run_id: None,
             agent_channels: self.deps.agent_channels.clone(),
+            playwright_channels: self.deps.playwright_channels.clone(),
             neural: self.deps.neural.clone(),
             automation_mode: AutomationMode::Automatic,
             terminal_consumers: self.deps.terminal_consumers.clone(),
@@ -129,6 +133,8 @@ impl ToolRunnerService {
             user_role: info.user_role.clone(),
             is_nexus_operator: matches!(info.user_role.as_str(), "owner" | "admin"),
             dependency_status: self.deps.dependency_status.clone(),
+            project_channels: self.deps.project_channels.clone(),
+            monitor_registry: self.deps.monitor_registry.clone(),
         })
     }
 }

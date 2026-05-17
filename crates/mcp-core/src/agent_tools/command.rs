@@ -123,11 +123,29 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
         ctx.root_path.clone()
     };
 
-    // Spawn come Child (non .output()) così possiamo killarlo se necessario
-    let child = Command::new("/bin/sh")
+    // M72: auto-provisioning del DB applicativo dedicato del progetto e
+    // injection di NEXUS_PROJECT_DB_URL + DATABASE_URL nell'env del processo.
+    // L'agente NON deve mai usare il DB 'nexus' (infrastruttura). Il DB
+    // applicativo si chiama <slug>_app (con `-` → `_` per validita' Postgres).
+    // Idempotente: CREATE DATABASE solo se non esiste.
+    let (project_db_url, project_db_name) = ensure_project_db_url(ctx).await;
+
+    // Bash invece di /bin/sh per garantire brace-expansion (mkdir -p a/{b,c})
+    // e altre feature attese dagli agenti che generano comandi shell ricchi.
+    // Fallback a /bin/sh se bash non esiste.
+    let shell_path = if std::path::Path::new("/bin/bash").exists() {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    };
+
+    let child = Command::new(shell_path)
         .arg("-c")
         .arg(&command)
         .current_dir(&work_dir)
+        .env("NEXUS_PROJECT_DB_URL", &project_db_url)
+        .env("NEXUS_PROJECT_DB_NAME", &project_db_name)
+        .env("DATABASE_URL", &project_db_url)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn();
@@ -136,6 +154,27 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
         Ok(c) => c,
         Err(e) => return format!("[Errore avvio comando '{}': {}]", command, e),
     };
+
+    // Drain stdout/stderr IN PARALLELO con child.wait() per evitare deadlock
+    // del buffer pipe Linux (~64 KB). Senza questo, comandi che producono >64KB
+    // di output (es. playwright test, npm install verbose) bloccano la pipe
+    // e child.wait() non ritorna mai.
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut out) = stdout_handle {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await;
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut err) = stderr_handle {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await;
+        }
+        buf
+    });
 
     // Probe: aspetta 10 secondi. Se finisce, ritorna output. Se no, killa e re-route.
     let probe = tokio::time::timeout(
@@ -146,22 +185,12 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
 
     match probe {
         Ok(Ok(exit_status)) => {
-            // Il processo è terminato entro il probe — leggi l'output normalmente
+            // Il processo è terminato entro il probe — leggi l'output drainato dai task paralleli
             let exit_code = exit_status.code().unwrap_or(-1);
-            let stdout = if let Some(mut out) = child.stdout.take() {
-                let mut buf = Vec::new();
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await;
-                String::from_utf8_lossy(&buf).to_string()
-            } else {
-                String::new()
-            };
-            let stderr = if let Some(mut err) = child.stderr.take() {
-                let mut buf = Vec::new();
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await;
-                String::from_utf8_lossy(&buf).to_string()
-            } else {
-                String::new()
-            };
+            let stdout_bytes = stdout_task.await.unwrap_or_default();
+            let stderr_bytes = stderr_task.await.unwrap_or_default();
+            let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+            let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
             // Hint semantici: per exit != 0 classifica l'errore con suggerimento diagnostico
             let hint = if exit_code != 0 {
                 let diag = classify_command_error(exit_code, &stderr, &stdout);
@@ -277,6 +306,24 @@ pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value, test_r
         Err(e) => return format!("[Errore avvio test '{}': {}]", command, e),
     };
 
+    // Drain stdout/stderr in parallelo con child.wait() per evitare deadlock pipe (~64KB).
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut out) = stdout_handle {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await;
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut err) = stderr_handle {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await;
+        }
+        buf
+    });
+
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(timeout),
         child.wait(),
@@ -286,20 +333,10 @@ pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value, test_r
     match result {
         Ok(Ok(exit_status)) => {
             let exit_code = exit_status.code().unwrap_or(-1);
-            let stdout = if let Some(mut out) = child.stdout.take() {
-                let mut buf = Vec::new();
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut out, &mut buf).await;
-                String::from_utf8_lossy(&buf).to_string()
-            } else {
-                String::new()
-            };
-            let stderr = if let Some(mut err) = child.stderr.take() {
-                let mut buf = Vec::new();
-                let _ = tokio::io::AsyncReadExt::read_to_end(&mut err, &mut buf).await;
-                String::from_utf8_lossy(&buf).to_string()
-            } else {
-                String::new()
-            };
+            let stdout_bytes = stdout_task.await.unwrap_or_default();
+            let stderr_bytes = stderr_task.await.unwrap_or_default();
+            let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+            let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
 
             // Troncamento intelligente: preserva errori (in fondo)
             let truncated_stdout = smart_truncate_test_output(&stdout, 6000);
@@ -517,4 +554,122 @@ async fn persist_security_audit(
     .execute(&*ctx.db)
     .await
     .map(|_| ())
+}
+
+/// M72+M74+M75 — garantisce che esista un DB applicativo dedicato per il progetto
+/// e ritorna `(connection_url, db_name)`. Idempotente.
+///
+/// **Architettura di isolamento (Livello 6 + Livello 2):**
+/// - Il DB applicativo vive in un container Postgres SEPARATO (`postgres-app`)
+///   dal container infrastruttura (`postgres-nexus`). Cluster distinti: non c'e'
+///   modo che l'agente raggiunga il DB Nexus anche con escalation di privilegi.
+/// - L'URL ritornato usa il role `nexus_app` (NOSUPERUSER, NOCREATEROLE,
+///   NOREPLICATION, NOBYPASSRLS, CREATEDB) — vedi infra/sql/init-postgres-app.sh.
+///
+/// Settings DB-driven (cache nei caller via sqlx pool, refresh 60s lato app):
+///   - nexus_app_db_host / nexus_app_db_port (default: localhost:5434)
+///   - nexus_app_db_user / nexus_app_db_password (default: nexus_app/<dev>)
+///   - nexus_app_admin_user / nexus_app_admin_password (per CREATE DATABASE)
+///
+/// Strategia:
+/// 1. Legge `projects.slug`, sanifica → nome DB `<slug>_app`
+/// 2. Connessione admin (al container postgres-app, NON al nexus) per
+///    CREATE DATABASE idempotente con OWNER = nexus_app
+/// 3. Ritorna URL `postgresql://nexus_app:<pwd>@<host>:<port>/<db>`
+///
+/// Se il container postgres-app non risponde, ritorna comunque un URL valido
+/// così l'env injection avviene — l'agente vedra' un errore di connessione
+/// che NON contaminera' il DB Nexus.
+async fn ensure_project_db_url(ctx: &AgentToolContext) -> (String, String) {
+    let slug: Option<String> = sqlx::query_scalar(
+        "SELECT slug FROM projects WHERE id = $1 LIMIT 1",
+    )
+    .bind(ctx.project_id)
+    .fetch_optional(&*ctx.db)
+    .await
+    .ok()
+    .flatten();
+
+    let base = slug.unwrap_or_else(|| ctx.project_id.simple().to_string());
+    let mut sanitized: String = base
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | '0'..='9' | '_' => c,
+            'A'..='Z' => c.to_ascii_lowercase(),
+            _ => '_',
+        })
+        .collect();
+    if sanitized.is_empty() {
+        sanitized = ctx.project_id.simple().to_string();
+    }
+    if sanitized.chars().next().map_or(true, |c| c.is_ascii_digit()) {
+        sanitized.insert(0, 'p');
+    }
+    if sanitized.len() > 56 {
+        sanitized.truncate(56);
+    }
+    let db_name = format!("{sanitized}_app");
+
+    // Lettura settings DB-driven (single batch, default conservativi).
+    let host = load_setting_or(&ctx.db, "nexus_app_db_host", "localhost").await;
+    let port = load_setting_or(&ctx.db, "nexus_app_db_port", "5434").await;
+    let user = load_setting_or(&ctx.db, "nexus_app_db_user", "nexus_app").await;
+    let pwd  = load_setting_or(&ctx.db, "nexus_app_db_password", "nexus_app_dev_secret").await;
+    let admin_user = load_setting_or(&ctx.db, "nexus_app_admin_user", "nexus_admin").await;
+    let admin_pwd  = load_setting_or(&ctx.db, "nexus_app_admin_password", "nexus_admin_secret").await;
+
+    // CREATE DATABASE idempotente sul container postgres-app via admin role.
+    let admin_url = format!("postgresql://{admin_user}:{admin_pwd}@{host}:{port}/postgres");
+    match sqlx::PgPool::connect(&admin_url).await {
+        Ok(admin_pool) => {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
+            )
+            .bind(&db_name)
+            .fetch_one(&admin_pool)
+            .await
+            .unwrap_or(false);
+            if !exists {
+                // OWNER = nexus_app cosi' il role applicativo ha pieni poteri
+                // sul SUO DB (e solo quello).
+                let create_sql = format!(
+                    "CREATE DATABASE \"{}\" OWNER \"{}\" TEMPLATE template0",
+                    db_name, user
+                );
+                if let Err(e) = sqlx::query(&create_sql).execute(&admin_pool).await {
+                    tracing::warn!(
+                        "ensure_project_db_url: CREATE DATABASE \"{}\" fallita: {} (procedo, URL comunque iniettato)",
+                        db_name, e
+                    );
+                } else {
+                    tracing::info!(
+                        "ensure_project_db_url: provisioned db=\"{}\" owner=\"{}\" project_id={}",
+                        db_name, user, ctx.project_id
+                    );
+                }
+            }
+            admin_pool.close().await;
+        }
+        Err(e) => {
+            tracing::warn!(
+                "ensure_project_db_url: admin pool fallito su {}: {}. URL iniettato comunque (agente vedra' connection error, NON contaminera' nexus).",
+                admin_url.replacen(&admin_pwd, "***", 1), e
+            );
+        }
+    }
+
+    let url = format!("postgresql://{user}:{pwd}@{host}:{port}/{db_name}");
+    (url, db_name)
+}
+
+/// Helper: legge una setting da DB con fallback hardcoded conservativo.
+/// Niente cache (chiamato max 6 volte per run_command, costo trascurabile vs LLM).
+async fn load_setting_or(db: &sqlx::PgPool, key: &str, default: &str) -> String {
+    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1 LIMIT 1")
+        .bind(key)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| default.to_string())
 }

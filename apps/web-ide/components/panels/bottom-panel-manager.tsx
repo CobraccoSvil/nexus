@@ -5,17 +5,22 @@ import { TerminalPanel } from "../terminal-panel";
 import { DebugPanel } from "./debug-panel";
 import { OutputPanel } from "./output-panel";
 import { OptimizationPanel } from "./optimization-panel";
+import { MonitorPanel } from "./monitor-panel";
 import { RunPanel } from "./run-panel";
 import { promptFromPlaywrightRun, promptFromPort, promptFromProblem, promptEnablePlaywright, promptRunPlaywrightTests } from "../../lib/chat-prompts";
 import type {
   AITraceEvent,
   OutputChannel,
   OutputEvent,
+  PlaywrightArtifact,
+  PlaywrightProgress,
   PlaywrightRunSummary,
   PortEntry,
   ProblemItem,
   UserProjectDetails,
 } from "../../lib/api-client";
+import { subscribePlaywrightRunStream } from "../../lib/api-client";
+import { useState, useEffect, useRef } from "react";
 
 export type PanelTab =
   | "problems"
@@ -26,7 +31,8 @@ export type PanelTab =
   | "services"
   | "ports"
   | "playwright"
-  | "optimization";
+  | "optimization"
+  | "monitor";
 
 export interface BottomPanelManagerProps {
   activePanelTab: PanelTab;
@@ -152,6 +158,8 @@ export function BottomPanelManager({
   // Pannello corrente (tutti gli altri tab usano conditional rendering normale)
   const otherPanel = () => {
     if (!project) return null;
+
+    if (activePanelTab === "monitor") return <MonitorPanel onSendToChat={onSendToChat} />;
 
     if (activePanelTab === "problems") return (
       <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
@@ -420,6 +428,12 @@ export function BottomPanelManager({
                   }}>{run.status}</span>
                 </div>
                 {run.summary && <div style={{ color: tc.textSecondary, fontSize: 12, marginTop: 6 }}>{run.summary}</div>}
+                {project && category === "test" && (
+                  <PlaywrightLiveProgress run={run} projectId={project.id} tc={tc} />
+                )}
+                {run.artifacts && run.artifacts.length > 0 && project && (
+                  <PlaywrightArtifacts artifacts={run.artifacts} projectId={project.id} tc={tc} />
+                )}
                 <div style={{ color: tc.textMuted, fontSize: 11, marginTop: 6 }}>{new Date(run.createdAt).toLocaleString()}</div>
                 {onSendToChat && run.status === "failed" && (
                   <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
@@ -483,5 +497,235 @@ export function BottomPanelManager({
         </div>
       )}
     </>
+  );
+}
+
+/**
+ * Componente live: si aggancia all'SSE stream del run per mostrare progress
+ * incrementale (counter passed/failed/skipped, spec corrente) + ultime ~30
+ * righe di output. Si disconnette automaticamente sul Final.
+ */
+function PlaywrightLiveProgress({
+  run,
+  projectId,
+  tc,
+}: {
+  run: PlaywrightRunSummary;
+  projectId: string;
+  tc: ReturnType<typeof useThemeColors>;
+}) {
+  const [progress, setProgress] = useState<PlaywrightProgress>(
+    (run.progress as PlaywrightProgress) || {
+      passed: 0, failed: 0, skipped: 0, flaky: 0,
+    }
+  );
+  const [tail, setTail] = useState<string[]>([]);
+  const esRef = useRef<EventSource | null>(null);
+
+  useEffect(() => {
+    if (run.status !== "running") return;
+    const es = subscribePlaywrightRunStream(projectId, run.id, {
+      onProgress: (data) => setProgress(data.progress),
+      onLine: (data) => {
+        setTail((prev) => {
+          const next = [...prev, data.line];
+          return next.length > 30 ? next.slice(-30) : next;
+        });
+      },
+      onFinal: (data) => {
+        setProgress(data.progress);
+        es.close();
+      },
+      onError: () => { /* il browser auto-reconnect; ignora */ },
+    });
+    esRef.current = es;
+    return () => { es.close(); esRef.current = null; };
+  }, [run.id, run.status, projectId]);
+
+  const total = progress.total ?? (progress.passed + progress.failed + progress.skipped);
+  const done = progress.passed + progress.failed + progress.skipped;
+  const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  const isRunning = run.status === "running";
+
+  return (
+    <div style={{ marginTop: 8, fontSize: 11 }}>
+      {/* Counter compatti */}
+      <div style={{ display: "flex", gap: 12, alignItems: "center", color: tc.textSecondary }}>
+        <span>
+          <span style={{ color: "#10b981", fontWeight: 600 }}>{progress.passed} ✓</span>
+          {progress.failed > 0 && (
+            <> · <span style={{ color: tc.error, fontWeight: 600 }}>{progress.failed} ✗</span></>
+          )}
+          {progress.skipped > 0 && (
+            <> · <span style={{ color: tc.textMuted }}>{progress.skipped} skip</span></>
+          )}
+          {progress.flaky > 0 && (
+            <> · <span style={{ color: "#f59e0b" }}>{progress.flaky} flaky</span></>
+          )}
+        </span>
+        <span style={{ color: tc.textMuted }}>
+          {done}{total > 0 ? `/${total}` : ""} {isRunning ? "in corso" : ""}
+        </span>
+      </div>
+
+      {/* Barra di progress (solo per run live o con progress popolato) */}
+      {(isRunning || total > 0) && (
+        <div style={{
+          marginTop: 4, height: 4, background: tc.border, borderRadius: 2,
+          overflow: "hidden", position: "relative",
+        }}>
+          <div style={{
+            width: `${pct}%`, height: "100%",
+            background: progress.failed > 0 ? tc.error : "#10b981",
+            transition: "width 0.3s ease",
+          }} />
+        </div>
+      )}
+
+      {/* Spec attualmente in esecuzione */}
+      {isRunning && progress.current_spec && (
+        <div style={{ marginTop: 4, color: tc.textMuted, fontFamily: "monospace", fontSize: 10 }}>
+          ▸ {progress.current_spec}
+        </div>
+      )}
+
+      {/* Tail output live (solo per run in corso) */}
+      {isRunning && tail.length > 0 && (
+        <div style={{
+          marginTop: 6, padding: 6, background: "rgba(0,0,0,0.2)",
+          borderRadius: 3, fontFamily: "monospace", fontSize: 10, lineHeight: 1.4,
+          color: tc.textMuted, maxHeight: 120, overflow: "auto",
+          whiteSpace: "pre-wrap",
+        }}>
+          {tail.map((line, i) => (
+            <div key={i} style={{
+              color: line.includes("✗") || line.includes("Error") ? tc.error
+                : line.includes("✓") ? "#10b981"
+                : undefined,
+            }}>{line}</div>
+          ))}
+        </div>
+      )}
+
+      {/* Lista specifica dei failed */}
+      {!isRunning && progress.failed_specs && progress.failed_specs.length > 0 && (
+        <div style={{ marginTop: 4, color: tc.error, fontFamily: "monospace", fontSize: 10 }}>
+          {progress.failed_specs.slice(0, 5).map((s, i) => (
+            <div key={i}>✗ {s}</div>
+          ))}
+          {progress.failed_specs.length > 5 && (
+            <div style={{ color: tc.textMuted }}>
+              ...e altri {progress.failed_specs.length - 5}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PlaywrightArtifacts({
+  artifacts,
+  projectId,
+  tc,
+}: {
+  artifacts: PlaywrightArtifact[];
+  projectId: string;
+  tc: ReturnType<typeof useThemeColors>;
+}) {
+  const [lightbox, setLightbox] = useState<string | null>(null);
+  const images = artifacts.filter((a) => a.kind === "image");
+  const videos = artifacts.filter((a) => a.kind === "video");
+  const others = artifacts.filter((a) => a.kind !== "image" && a.kind !== "video");
+
+  const urlFor = (path: string) =>
+    `/api/projects/${projectId}/playwright/artifact?path=${encodeURIComponent(path)}`;
+
+  return (
+    <div style={{ marginTop: 8 }}>
+      {images.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {images.slice(0, 12).map((img) => (
+            <button
+              key={img.path}
+              onClick={() => setLightbox(urlFor(img.path))}
+              title={img.name}
+              style={{
+                padding: 0,
+                border: `1px solid ${tc.border}`,
+                borderRadius: 4,
+                cursor: "pointer",
+                background: tc.bgCard,
+                overflow: "hidden",
+              }}
+            >
+              <img
+                src={urlFor(img.path)}
+                alt={img.name}
+                loading="lazy"
+                style={{ width: 120, height: 80, objectFit: "cover", display: "block" }}
+              />
+            </button>
+          ))}
+          {images.length > 12 && (
+            <span style={{ alignSelf: "center", fontSize: 11, color: tc.textMuted }}>
+              +{images.length - 12} altre immagini
+            </span>
+          )}
+        </div>
+      )}
+      {videos.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
+          {videos.map((v) => (
+            <video
+              key={v.path}
+              src={urlFor(v.path)}
+              controls
+              style={{ width: 200, height: 120, border: `1px solid ${tc.border}`, borderRadius: 4 }}
+            />
+          ))}
+        </div>
+      )}
+      {others.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
+          {others.map((o) => (
+            <a
+              key={o.path}
+              href={urlFor(o.path)}
+              target="_blank"
+              rel="noreferrer"
+              style={{
+                fontSize: 11,
+                padding: "2px 6px",
+                borderRadius: 3,
+                background: tc.bgCard,
+                color: tc.textSecondary,
+                textDecoration: "none",
+                border: `1px solid ${tc.border}`,
+              }}
+            >
+              {o.kind === "trace" ? "trace.zip" : o.kind === "report" ? "HTML report" : o.name}
+            </a>
+          ))}
+        </div>
+      )}
+      {lightbox && (
+        <div
+          onClick={() => setLightbox(null)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.85)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 9999,
+            cursor: "zoom-out",
+          }}
+        >
+          <img src={lightbox} alt="Screenshot" style={{ maxWidth: "92vw", maxHeight: "92vh", boxShadow: "0 0 40px rgba(0,0,0,0.5)" }} />
+        </div>
+      )}
+    </div>
   );
 }

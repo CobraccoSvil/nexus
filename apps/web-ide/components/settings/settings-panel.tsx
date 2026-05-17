@@ -56,7 +56,8 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
     }
   }, []);
 
-  // Ricarica le chiavi nel brain poi ri-testa il provider
+  // Ricarica le chiavi nel brain, AZZERA il cooldown lato mcp-core (utile
+  // dopo billing recharge/rate_limit risolto), poi ri-testa il provider.
   const handleReloadProvider = useCallback(async (provider: string) => {
     try {
       await fetch(`${NEURAL_BASE}/reload-settings`, {
@@ -65,7 +66,16 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
         body: "{}",
       });
     } catch {
-      // ignora errori di reload, prova comunque il test
+      // ignora errori di reload, prova comunque il reset cooldown e il test
+    }
+    // Best-effort: il reset-cooldown e' no-op se non c'e' cooldown attivo
+    // (idempotente lato Rust). Cosi' dopo billing recharge l'utente puo'
+    // riattivare il provider senza passare dall'API.
+    try {
+      const { resetProviderCooldown } = await import("../../lib/api-client");
+      await resetProviderCooldown(provider);
+    } catch {
+      // ignora: il provider potrebbe non essere registrato nei cooldown
     }
     await handleTestProvider(provider);
   }, [handleTestProvider]);

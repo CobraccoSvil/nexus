@@ -177,8 +177,19 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
             return format!("[Errore creazione directory: {}]", e);
         }
     }
+    let existed_before = target.exists();
     match tokio::fs::write(&target, content).await {
         Ok(()) => {
+            // Dispatcher: notifica Explorer/Editor in tempo reale
+            nexus_events::dispatcher::emit(
+                &ctx.project_channels,
+                ctx.project_id,
+                nexus_events::event::ProjectEvent::FileChanged {
+                    path: path_str.to_string(),
+                    op: if existed_before { "modified".to_string() } else { "created".to_string() },
+                },
+            );
+
             // Re-indicizza il file nel code index + eventuale auto-scan qualità (in background)
             let db_bg = ctx.db.clone();
             let neural_bg = ctx.neural.clone();
@@ -417,7 +428,17 @@ pub(super) async fn tool_delete_file(ctx: &AgentToolContext, input: &Value) -> S
         }
     } else {
         match tokio::fs::remove_file(&target).await {
-            Ok(()) => format!("File '{}' eliminato con successo", path_str),
+            Ok(()) => {
+                nexus_events::dispatcher::emit(
+                    &ctx.project_channels,
+                    ctx.project_id,
+                    nexus_events::event::ProjectEvent::FileChanged {
+                        path: path_str.to_string(),
+                        op: "deleted".to_string(),
+                    },
+                );
+                format!("File '{}' eliminato con successo", path_str)
+            }
             Err(e) => format!("[Errore eliminazione '{}': {}]", path_str, e),
         }
     }
@@ -575,6 +596,14 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
             };
             match tokio::fs::write(&target, &new_content).await {
                 Ok(()) => {
+                    nexus_events::dispatcher::emit(
+                        &ctx.project_channels,
+                        ctx.project_id,
+                        nexus_events::event::ProjectEvent::FileChanged {
+                            path: path_str.to_string(),
+                            op: "modified".to_string(),
+                        },
+                    );
                     // Re-indicizza il file nel code index + eventuale auto-scan qualità (in background)
                     let db_bg = ctx.db.clone();
                     let neural_bg = ctx.neural.clone();

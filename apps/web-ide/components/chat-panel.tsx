@@ -8,7 +8,8 @@ import {
   type FormEvent,
 } from "react";
 import { useChat } from "../lib/use-chat";
-import { listProjectMemories, getProjectDbConfig, listAdminSettings, type AITraceEvent, type ChatAttachment, type PrecheckResult, type ProjectDbConfig } from "../lib/api-client";
+import { listProjectMemories, getProjectDbConfig, listAdminSettings, getModels, type AITraceEvent, type ChatAttachment, type ModelCatalogEntry, type PrecheckResult, type ProjectDbConfig } from "../lib/api-client";
+import { fallbackContextWindow } from "../lib/context-window";
 import { useThemeColors } from "../lib/theme";
 import { useI18n } from "../lib/i18n";
 import { useGlobalDialog } from "./global-dialog-provider";
@@ -322,7 +323,12 @@ export function ChatPanel({
       if (chars?.has_value) setNarrationWarnAfterChars(Number(chars.value));
     }).catch(() => {});
   }, []);
-  const { messages, isLoading, isReady, isReconnecting, error, busyByMessage, agentRun, agentSteps, agentRuns, agentStepsMap, tokenUsage, traces, streamingToken, send, resend, remove, feedbackError, confirmAgent, cancelRun } =
+  // Catalogo modelli per risolvere context window del modello attivo
+  const [modelCatalog, setModelCatalog] = useState<ModelCatalogEntry[]>([]);
+  useEffect(() => {
+    getModels().then(({ models }) => setModelCatalog(models)).catch(() => {});
+  }, []);
+  const { messages, isLoading, isReady, isReconnecting, error, busyByMessage, agentRun, agentSteps, agentRuns, agentStepsMap, tokenUsage, traces, streamingToken, send, resend, remove, feedbackError, feedbackPositive, positiveFeedback, confirmAgent, cancelRun } =
     useChat(projectId, profileId, { sessionId });
   const prevAgentActiveRef = useRef(false);
   useEffect(() => {
@@ -405,14 +411,9 @@ export function ChatPanel({
     const id = setInterval(() => setNowTick(Date.now()), 1000);
     return () => clearInterval(id);
   }, [isAgentRunning]);
-  // M66: se ancora nessun step è arrivato via SSE, usa il timestamp di avvio
-  // del run come riferimento. Altrimenti il contatore "Agente AI in esecuzione 0s"
-  // resta congelato a 0 anche se l'agente sta "pensando" da minuti, perche'
-  // lastStepAt = Date.now() lo fa coincidere con nowTick.
-  const runStartedAt = agentRun?.createdAt ? new Date(agentRun.createdAt).getTime() : Date.now();
   const lastStepAt = agentSteps.length > 0
     ? Math.max(...agentSteps.map((s) => new Date(s.createdAt ?? 0).getTime()))
-    : runStartedAt;
+    : Date.now();
   const secondsSinceLastStep = Math.max(0, Math.floor((nowTick - lastStepAt) / 1000));
   const isAgentStuck = isAgentRunning && secondsSinceLastStep > 60;
 
@@ -1104,6 +1105,8 @@ export function ChatPanel({
             onResend={handleResend}
             onDelete={handleDelete}
             onFeedback={handleFeedback}
+            onFeedbackPositive={feedbackPositive}
+            positiveFeedback={positiveFeedback}
             lastUserRef={lastUserRef}
           />
 
@@ -1377,10 +1380,34 @@ export function ChatPanel({
       )}
 
       {/* Token usage bar */}
-      <TokenUsageBar
-        totalTokens={tokenUsage.totalTokens}
-        totalCostUsd={tokenUsage.totalCostUsd}
-      />
+      {(() => {
+        // Ultimo messaggio assistant con metriche (copre sia chat normale che agent run)
+        const lastAssistantWithTokens = [...messages]
+          .reverse()
+          .find((m) => m.role === "assistant" && (m.promptTokens ?? 0) > 0);
+        const activeModel =
+          agentRun?.model ||
+          lastAssistantWithTokens?.model ||
+          (selectedModel !== "auto" ? selectedModel : null);
+        const catalogEntry = activeModel
+          ? modelCatalog.find((m) => m.model === activeModel)
+          : null;
+        const ctxWindow =
+          catalogEntry?.contextWindow ?? fallbackContextWindow(activeModel);
+        const lastInputTokens =
+          agentRun?.usage?.totalPromptTokens ??
+          lastAssistantWithTokens?.promptTokens ??
+          null;
+        return (
+          <TokenUsageBar
+            totalTokens={tokenUsage.totalTokens}
+            totalCostUsd={tokenUsage.totalCostUsd}
+            contextWindow={ctxWindow}
+            lastInputTokens={lastInputTokens}
+            modelLabel={activeModel}
+          />
+        );
+      })()}
 
       {/* Precheck widget */}
       {precheckPending && (

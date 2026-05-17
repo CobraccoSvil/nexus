@@ -47,6 +47,13 @@ const nextConfig: NextConfig = {
         source: "/api/admin/embeddings/:path*",
         destination: `${backend}/api/admin/embeddings/:path*`,
       },
+      // Provider cooldown management → mcp-core (porta 4000): il cooldown vive
+      // in memoria di mcp-core + Redis, non in admin-service. Vedi
+      // environment::admin_reset_provider_cooldown e provider_cooldown.rs.
+      {
+        source: "/api/admin/providers/:path*",
+        destination: `${backend}/api/admin/providers/:path*`,
+      },
       {
         source: "/api/admin/:path*",
         destination: `${adminService}/api/admin/:path*`,

@@ -63,6 +63,16 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
             // Read initial output
             match crate::agent_processes::read_process_output(&ctx.db, process_id, 4000).await {
                 Ok(info) => {
+                    // Dispatcher: notifica avvio servizio → pannello Servizi aggiorna LED
+                    nexus_events::dispatcher::emit(
+                        &ctx.project_channels,
+                        ctx.project_id,
+                        nexus_events::event::ProjectEvent::ServiceStarted {
+                            name: label.clone(),
+                            port: None,
+                            pid: info.pid,
+                        },
+                    );
                     let mut msg = format!(
                         "Servizio '{}' avviato (process_id: {}, pid: {}, status: {})\n",
                         label,
@@ -132,7 +142,16 @@ pub(super) async fn tool_stop_service(ctx: &AgentToolContext, input: &Value) -> 
         Err(_) => return "[Errore: process_id non valido]".to_string(),
     };
     match crate::agent_processes::stop_process(&ctx.db, process_id).await {
-        Ok(msg) => msg,
+        Ok(msg) => {
+            nexus_events::dispatcher::emit(
+                &ctx.project_channels,
+                ctx.project_id,
+                nexus_events::event::ProjectEvent::ServiceStopped {
+                    name: format!("process:{}", process_id),
+                },
+            );
+            msg
+        }
         Err(e) => format!("[Errore stop servizio: {}]", e),
     }
 }

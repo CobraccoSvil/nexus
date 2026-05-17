@@ -60,10 +60,11 @@ pub fn spawn_file_watcher(state: &AppState, project_id: Uuid, root: PathBuf) {
 
     let db = state.db.clone();
     let neural = state.orchestrator.neural.clone();
+    let channels = state.project_channels.clone();
     let watching_projects = Arc::clone(&state.watching_projects);
 
     tokio::spawn(async move {
-        let result = run_watcher(db, neural, project_id, root).await;
+        let result = run_watcher(db, neural, project_id, root, channels).await;
         // Rimuove il progetto dal set cosi' si puo' riavviare se necessario.
         watching_projects.remove(&project_id);
         if let Err(e) = result {
@@ -80,6 +81,7 @@ async fn run_watcher(
     neural: crate::orchestrator::NeuralCoreClient,
     project_id: Uuid,
     root: PathBuf,
+    channels: nexus_events::ProjectChannels,
 ) -> anyhow::Result<()> {
     // Canale tokio per ricevere gli eventi `notify` dal thread OS.
     let (tx, mut rx) = mpsc::channel::<notify::Result<Event>>(512);
@@ -130,7 +132,7 @@ async fn run_watcher(
                 }
                 _ = tokio::time::sleep(timeout_dur) => {
                     // Debounce scaduto: re-indicizza i file accumulati.
-                    flush_pending(&db, &neural, project_id, &root, &mut pending).await;
+                    flush_pending(&db, &neural, project_id, &root, &mut pending, &channels).await;
                     deadline = None;
                 }
             }
@@ -180,6 +182,7 @@ async fn flush_pending(
     project_id: Uuid,
     root: &Path,
     pending: &mut Vec<PathBuf>,
+    channels: &nexus_events::ProjectChannels,
 ) {
     if pending.is_empty() {
         return;
@@ -206,6 +209,16 @@ async fn flush_pending(
                 );
             }
         }
+    }
+    for path in &files {
+        nexus_events::dispatcher::emit(
+            channels,
+            project_id,
+            nexus_events::ProjectEvent::FileChanged {
+                path: path.display().to_string(),
+                op: "write".into(),
+            },
+        );
     }
 }
 

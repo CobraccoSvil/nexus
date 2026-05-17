@@ -115,7 +115,7 @@ pub async fn submit_feedback(
 /// `agent_router_server.rs::snake_to_pascal` perche' quello e' privato al
 /// modulo gRPC. Manteniamo la logica identica per coerenza tra i due path
 /// (gRPC legacy + REST nuovo).
-fn snake_to_pascal(name: &str) -> String {
+pub(crate) fn snake_to_pascal(name: &str) -> String {
     if name.chars().next().map(char::is_uppercase).unwrap_or(false) && !name.contains('_') {
         return name.to_string();
     }

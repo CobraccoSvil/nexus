@@ -17,7 +17,7 @@ def get_postgres_connection_string() -> str:
     """
     return os.environ.get(
         "DATABASE_URL",
-        "postgresql://postgres:postgres@localhost:5432/ai_orchestrator",
+        "postgresql://nexus:nexus@localhost:5433/nexus",
     )
 
 

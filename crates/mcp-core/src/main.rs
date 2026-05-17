@@ -27,6 +27,7 @@ mod nexus_tool_catalog;
 mod nexus_tools;
 mod middleware;
 mod orchestrator;
+pub mod playwright_live;
 mod routing_config;
 mod routing_matrix;
 mod routing_slots;
@@ -53,6 +54,7 @@ mod internal_routing;
 mod internal_learning;
 mod port_registry;
 mod provider_health_probe;
+mod dispatcher_routes;
 mod task_watchdog;
 
 use std::net::SocketAddr;
@@ -93,6 +95,9 @@ struct AppState {
     redis: redis::aio::MultiplexedConnection,
     orchestrator: Orchestrator,
     agent_channels: AgentChannels,
+    /// Channel per stream live degli eventi Playwright (run live monitoring).
+    /// Chiave: job_id (UUID di una riga `jobs` con kind='playwright_test').
+    playwright_channels: playwright_live::PlaywrightChannels,
     terminal_consumers: TerminalConsumers,
     template_cache: prompt_templates::TemplateCache,
     /// `true` se l'immagine `nexus-sandbox:latest` è disponibile nel daemon Docker.
@@ -121,6 +126,15 @@ struct AppState {
     /// Set dei project_id per cui il file watcher inotify e' gia' attivo.
     /// Evita di avviare watcher duplicati sullo stesso progetto.
     pub(crate) watching_projects: Arc<DashSet<Uuid>>,
+    /// Dispatcher centrale di eventi cross-pannello.
+    /// Un canale broadcast per project_id, riceve tutti gli eventi rilevanti
+    /// (jobs, ports, problems, services, files, git, flags, monitor).
+    /// Vedi `crates/nexus-events/`.
+    pub(crate) project_channels: nexus_events::ProjectChannels,
+    /// Mappa monitor in-memory per project_id. Aggiornata dal tool agente
+    /// `dispatcher_update_monitor` ed esposta nel snapshot bootstrap.
+    /// `monitor_id -> { value, label }`.
+    pub(crate) monitor_registry: Arc<parking_lot::RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, serde_json::Value>>>>,
 }
 
 #[tokio::main]
@@ -486,6 +500,7 @@ async fn main() -> anyhow::Result<()> {
         redis,
         orchestrator,
         agent_channels: Arc::new(DashMap::new()),
+        playwright_channels: playwright_live::new_channels(),
         terminal_consumers: Arc::new(DashMap::new()),
         template_cache,
         sandbox_available,
@@ -496,6 +511,8 @@ async fn main() -> anyhow::Result<()> {
         dependency_status: std::sync::Arc::new(task_watchdog::DependencyStatus::new()),
         indexing_projects: Arc::new(DashSet::new()),
         watching_projects: Arc::new(DashSet::new()),
+        project_channels: nexus_events::dispatcher::new_registry(),
+        monitor_registry: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
     };
     chat_learning::spawn_vector_compaction_scheduler(state.clone());
     nexus_builtin::seed_tools_and_server(&state.db).await;
@@ -607,9 +624,12 @@ async fn main() -> anyhow::Result<()> {
                 db: state.db.clone(),
                 neural: state.orchestrator.neural.clone(),
                 agent_channels: state.agent_channels.clone(),
+                playwright_channels: state.playwright_channels.clone(),
                 terminal_consumers: state.terminal_consumers.clone(),
                 template_cache: state.template_cache.clone(),
                 dependency_status: state.dependency_status.clone(),
+                project_channels: state.project_channels.clone(),
+                monitor_registry: state.monitor_registry.clone(),
             };
             if let Err(e) = tool_runner_server::spawn_tool_runner_server(deps, addr).await {
                 tracing::error!("ToolRunner server: avvio fallito: {e}");
@@ -822,6 +842,13 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/chat/messages/:id/feedback-error",
                 post(chat_messages::feedback_error).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/chat/messages/:id/feedback-positive",
+                post(chat_messages::feedback_positive).layer(axum_mw::from_fn_with_state(
                     state.clone(),
                     middleware::require_auth,
                 )),
@@ -1333,78 +1360,6 @@ async fn main() -> anyhow::Result<()> {
                 )),
             )
             .route(
-                // Fix M19: install Playwright atomicamente via MCP Nexus
-                // (configurazione coerente con port_allocations, no shell agente)
-                "/api/projects/:id/services/install-playwright",
-                post(project_workspace::playwright_install::install_playwright).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
-            )
-            .route(
-                // Fix M14: browser-check (Playwright smoke con cattura console errors)
-                "/api/projects/:id/services/browser-check",
-                post(project_workspace::browser_check::browser_check).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
-            )
-            .route(
-                // Fix M10: runtime issues (errori catturati dai tool agente)
-                "/api/projects/:id/runtime-issues",
-                get(project_workspace::runtime_issues::list_runtime_issues)
-                  .post(project_workspace::runtime_issues::create_runtime_issue)
-                  .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_auth)),
-            )
-            .route(
-                "/api/projects/:id/runtime-issues/:issue_id",
-                axum::routing::patch(project_workspace::runtime_issues::update_runtime_issue)
-                  .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_auth)),
-            )
-            .route(
-                // Fix M1: auto-detect porte da package.json/Procfile/docker-compose
-                "/api/projects/:id/services/scan-ports",
-                post(project_workspace::scan_ports::scan_ports).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
-            )
-            .route(
-                // Fix M33-B: allocazione dinamica di una porta nel bucket
-                // deterministico del progetto. Usata dall'agente al posto di
-                // hardcodare porte (M33-A vieta hardcode nel prompt).
-                "/api/projects/:id/services/allocate-port",
-                post(project_workspace::allocate_port::allocate_port).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
-            )
-            .route(
-                // Fix M41: riscrive vite.config / .env / playwright.config esistenti
-                // sostituendo porte hardcoded con quelle allocate in nexus_port_allocations.
-                "/api/projects/:id/services/sync-ports-to-files",
-                post(project_workspace::sync_ports::sync_ports_to_files).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
-            )
-            .route(
-                // Fix M11: SSE stream eventi filesystem (auto-refresh EXPLORER)
-                "/api/projects/:id/fs-events",
-                get(project_workspace::fs_events::fs_events).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
-            )
-            .route(
-                // Fix M18: auto-bootstrap dev tools al register/clone
-                "/api/projects/:id/services/auto-bootstrap",
-                post(project_workspace::auto_bootstrap::auto_bootstrap).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
-            )
-            .route(
                 "/api/projects/:id/services/restart-all",
                 post(project_workspace::restart_all_project_services).layer(axum_mw::from_fn_with_state(
                     state.clone(),
@@ -1457,7 +1412,51 @@ async fn main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/projects/:id/playwright/runs",
-                get(project_workspace::get_playwright_runs).layer(axum_mw::from_fn_with_state(
+                get(project_workspace::get_playwright_runs)
+                    .delete(project_workspace::clear_playwright_runs)
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_auth,
+                    )),
+            )
+            .route(
+                "/api/projects/:id/playwright/artifact",
+                get(project_workspace::serve_playwright_artifact).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
+            )
+            .route(
+                "/api/projects/:id/playwright/runs/:run_id",
+                get(project_workspace::get_playwright_run_detail).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/projects/:id/playwright/runs/:run_id/stream",
+                get(project_workspace::stream_playwright_run).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            // ── Dispatcher centrale: SSE stream + snapshot ──
+            .route(
+                "/api/projects/:id/event-stream",
+                get(dispatcher_routes::event_stream).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/projects/:id/snapshot",
+                get(dispatcher_routes::project_snapshot).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/projects/:id/dispatcher/test",
+                post(dispatcher_routes::dispatcher_test).layer(axum_mw::from_fn_with_state(
                     state.clone(),
                     middleware::require_auth,
                 )),
@@ -1588,14 +1587,6 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/projects/:id/github/clone",
                 post(github::github_clone_repository).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
-            )
-            .route(
-                // Fix M15: crea nuovo repo GitHub + configura origin remote in un solo step
-                "/api/projects/:id/github/create-repo",
-                post(github::github_create_repo).layer(axum_mw::from_fn_with_state(
                     state.clone(),
                     middleware::require_auth,
                 )),
@@ -1934,13 +1925,6 @@ async fn main() -> anyhow::Result<()> {
                 post(models::sync_model_catalog)
                     .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
             )
-            .route(
-                // Fix M53-auto: trigger manuale per auto-promotion modelli.
-                // Esegue lo stesso codice del post-sync ma on-demand.
-                "/api/admin/auto-upgrade-models",
-                post(models::auto_upgrade_models_endpoint)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
-            )
             // Admin users management
             .route(
                 "/api/admin/users",
@@ -2170,6 +2154,10 @@ async fn main() -> anyhow::Result<()> {
                     middleware::require_auth,
                 )),
             )
+            .layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::event_capture_middleware,
+            ))
             .with_state(state)
             .layer(cors);
 

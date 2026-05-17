@@ -279,7 +279,15 @@ fn check_injection_patterns(sql: &str) -> Vec<DbFinding> {
     let format_re = Regex::new(r#"f['"].*\{.*\}.*['"]|format!\s*\("#).unwrap();
     let interp_re = Regex::new(r#"\$\{?\w+\}?"#).unwrap();
 
-    if concat_re.is_match(sql) || format_re.is_match(sql) || interp_re.is_match(sql) {
+    // Rimuovi blocchi PL/pgSQL ($$...$$) e commenti SQL prima del check.
+    // Questi contengono legittimamente $variabili, format('%I', ...), quote_ident()
+    // che sono pattern sicuri in PostgreSQL ma matchano le regex sopra.
+    let plpgsql_block_re = Regex::new(r#"\$\$[\s\S]*?\$\$"#).unwrap();
+    let comment_re = Regex::new(r#"--[^\n]*"#).unwrap();
+    let no_plpgsql = plpgsql_block_re.replace_all(sql, " ");
+    let cleaned = comment_re.replace_all(&no_plpgsql, " ");
+
+    if concat_re.is_match(&cleaned) || format_re.is_match(&cleaned) || interp_re.is_match(&cleaned) {
         findings.push(DbFinding {
             category: "security".into(),
             severity: "high".into(),

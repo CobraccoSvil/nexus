@@ -6,7 +6,7 @@
 #   2. Sync repo da workstation
 #   3. prod-setup-dev101.sh: pacchetti, Rust, Node, Python venv, nginx, systemd, logrotate
 #   4. Postgres 16 + Redis 7 (apt) + Qdrant (Docker singolo container)
-#   5. Setup DB ai_orchestrator + ai_orchestrator_shadow
+#   5. Setup DB nexus + nexus_shadow
 #   6. Genera /opt/ideai/.env (JWT_SECRET random + prompt API keys)
 #   7. Build iniziale Rust + Node + Python (delegato a deploy-prod.sh --all --first-build)
 #   8. Patch nginx-microservices.conf con set_real_ip_from $PROXY_HOST
@@ -105,7 +105,7 @@ remote_exec "$PROD_HOST" '
 info "  OK  Postgres + Redis + Qdrant attivi"
 
 # === Step 5: Setup DB ==========================================================
-step 5 10 "Database ai_orchestrator + ai_orchestrator_shadow"
+step 5 10 "Database nexus + nexus_shadow"
 
 DB_PASSWORD="${DB_PASSWORD:-$(openssl rand -hex 16)}"
 remote_exec "$PROD_HOST" "
@@ -120,10 +120,10 @@ BEGIN
     END IF;
 END
 \$\$;
-SELECT 'CREATE DATABASE ai_orchestrator OWNER postgres_app'
-WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'ai_orchestrator')\\gexec
-SELECT 'CREATE DATABASE ai_orchestrator_shadow OWNER postgres_app'
-WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'ai_orchestrator_shadow')\\gexec
+SELECT 'CREATE DATABASE nexus OWNER postgres_app'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'nexus')\\gexec
+SELECT 'CREATE DATABASE nexus_shadow OWNER postgres_app'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'nexus_shadow')\\gexec
 SQL
 "
 info "  OK  DB pronti (password salvata in /opt/ideai/.env)"
@@ -151,8 +151,8 @@ else
     remote_exec "$PROD_HOST" "
         sudo tee $DEPLOY_DIR/.env >/dev/null <<ENV
 # Generato da bootstrap-prod.sh il \$(date -u +%FT%TZ)
-DATABASE_URL=postgres://postgres_app:$DB_PASSWORD@localhost:5432/ai_orchestrator
-SHADOW_POSTGRES_URL=postgres://postgres_app:$DB_PASSWORD@localhost:5432/ai_orchestrator_shadow
+DATABASE_URL=postgres://postgres_app:$DB_PASSWORD@localhost:5432/nexus
+SHADOW_POSTGRES_URL=postgres://postgres_app:$DB_PASSWORD@localhost:5432/nexus_shadow
 REDIS_URL=redis://localhost:6379
 QDRANT_URL=http://localhost:6334
 MCP_SERVER_PORT=4000

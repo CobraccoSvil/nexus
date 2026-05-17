@@ -149,6 +149,16 @@ static FORBIDDEN_PATTERNS: &[(&str, &str, &str, &str)] = &[
         "Modifica routing/servizi systemd vietata",
         "Operazioni sysadmin fuori scope progetto.",
     ),
+    // ── 6b. DATABASE_URL puntato al DB nexus (M70) ─────────────────────────
+    // L'agente NON deve mai usare il DB 'nexus' come target applicativo:
+    // pattern match su DATABASE_URL=...@.../nexus o postgres:// senza dbname
+    // o DATABASE_URL=...@.../postgres (cluster admin DB).
+    (
+        "database_url_nexus",
+        r"(?i)\bDATABASE_URL\s*=\s*[^\s;|&]*@[^/\s]+(?::\d+)?/(?:nexus|postgres)\b",
+        "DATABASE_URL puntato al DB nexus o postgres (infrastruttura): vietato",
+        "Usa il DB applicativo dedicato al progetto. La variabile NEXUS_PROJECT_DB_URL viene iniettata automaticamente da Nexus e punta al DB dedicato del progetto attivo.",
+    ),
     // ── 7. Secrets exfiltration ────────────────────────────────────────────
     (
         "cat_env_nexus",

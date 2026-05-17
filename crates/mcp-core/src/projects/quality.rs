@@ -104,6 +104,7 @@ pub async fn run_quality_scan(
     let db = state.db.clone();
     let orchestrator = state.orchestrator.clone();
     let dep_status = state.dependency_status.clone();
+    let channels = state.project_channels.clone();
     tokio::spawn(async move {
         let started = std::time::Instant::now();
         match perform_quality_scan(&db, &orchestrator, project_id, &root_path, &dep_status).await {
@@ -126,6 +127,17 @@ pub async fn run_quality_scan(
                 .bind(scan_id)
                 .execute(&db)
                 .await;
+                nexus_events::dispatcher::emit(
+                    &channels,
+                    project_id,
+                    nexus_events::ProjectEvent::FindingsUpdated {
+                        scan_id: None,
+                        total: total_findings as i64,
+                        critical: *by_severity.get("critical").unwrap_or(&0) as i64,
+                        warnings: *by_severity.get("warning").unwrap_or(&0) as i64,
+                        resolved_ids: vec![],
+                    },
+                );
                 tracing::info!(
                     "quality_scan background: scan_id={} project_id={} files={} findings={} duration_ms={}",
                     scan_id, project_id, files_scanned, total_findings, duration_ms

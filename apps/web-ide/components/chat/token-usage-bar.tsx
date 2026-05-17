@@ -8,12 +8,21 @@ export interface TokenUsageBarProps {
   totalTokens: number;
   totalCostUsd: number;
   budgetUsd?: number;
+  /** Context window in token del modello corrente. Se presente, attiva l'indicatore di riempimento. */
+  contextWindow?: number | null;
+  /** Token di input usati nell'ultimo turno (stima del riempimento context window). */
+  lastInputTokens?: number | null;
+  /** Modello corrente, mostrato nel tooltip dettagliato. */
+  modelLabel?: string | null;
 }
 
 export function TokenUsageBar({
   totalTokens,
   totalCostUsd,
   budgetUsd,
+  contextWindow,
+  lastInputTokens,
+  modelLabel,
 }: TokenUsageBarProps) {
   const tc = useThemeColors();
   const [expanded, setExpanded] = useState(false);
@@ -21,16 +30,25 @@ export function TokenUsageBar({
   if (totalTokens === 0 && totalCostUsd === 0) return null;
 
   const hasBudget = budgetUsd != null && budgetUsd > 0;
-  const ratio = hasBudget ? totalCostUsd / budgetUsd! : null;
+  const hasContext =
+    contextWindow != null &&
+    contextWindow > 0 &&
+    lastInputTokens != null &&
+    lastInputTokens > 0;
+  const ratio = hasBudget
+    ? totalCostUsd / budgetUsd!
+    : hasContext
+      ? lastInputTokens! / contextWindow!
+      : null;
 
   let barColor = tc.textMuted;
-  if (hasBudget && ratio != null) {
+  if (ratio != null) {
     if (ratio < 0.5) barColor = tc.success;
     else if (ratio < 0.8) barColor = tc.warning;
     else barColor = tc.error;
   }
 
-  const fillPct = hasBudget && ratio != null ? Math.min(ratio * 100, 100) : null;
+  const fillPct = ratio != null ? Math.min(ratio * 100, 100) : null;
 
   const label =
     totalTokens >= 1_000_000
@@ -51,7 +69,13 @@ export function TokenUsageBar({
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
-        title={hasBudget ? `Budget: $${budgetUsd!.toFixed(2)}` : "Token consumati nella sessione"}
+        title={
+          hasBudget
+            ? `Budget: $${budgetUsd!.toFixed(2)}`
+            : hasContext
+              ? `Context window: ${lastInputTokens!.toLocaleString()} / ${contextWindow!.toLocaleString()} token`
+              : "Token consumati nella sessione"
+        }
         style={{
           display: "flex",
           alignItems: "center",
@@ -62,7 +86,7 @@ export function TokenUsageBar({
           border: `1px solid ${tc.border}`,
           background: tc.bgCard,
           cursor: "pointer",
-          color: hasBudget ? barColor : tc.textMuted,
+          color: ratio != null ? barColor : tc.textMuted,
           fontSize: 11,
           fontFamily: "inherit",
           whiteSpace: "nowrap",
@@ -87,9 +111,9 @@ export function TokenUsageBar({
         )}
         <span style={{ position: "relative", zIndex: 1 }}>
           {label} &bull; {costLabel}
-          {hasBudget && ratio != null && (
+          {ratio != null && (
             <span style={{ marginLeft: 4, opacity: 0.8 }}>
-              ({Math.round(ratio * 100)}%)
+              ({Math.round(ratio * 100)}% {hasBudget ? "budget" : "ctx"})
             </span>
           )}
         </span>
@@ -139,6 +163,36 @@ export function TokenUsageBar({
               <span>Budget</span>
               <span>${budgetUsd!.toFixed(2)}</span>
             </div>
+          )}
+          {hasContext && (
+            <>
+              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
+                <span>Ultimo input</span>
+                <span style={{ color: barColor }}>
+                  {lastInputTokens!.toLocaleString()} token
+                </span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span>Context window{modelLabel ? ` (${modelLabel})` : ""}</span>
+                <span>{contextWindow!.toLocaleString()} token</span>
+              </div>
+              {ratio != null && ratio >= 0.7 && !hasBudget && (
+                <div
+                  style={{
+                    marginTop: 6,
+                    paddingTop: 6,
+                    borderTop: `1px solid ${tc.border}`,
+                    color: ratio >= 0.8 ? tc.error : tc.warning,
+                    fontSize: 10,
+                    lineHeight: 1.4,
+                  }}
+                >
+                  {ratio >= 0.8
+                    ? "Context quasi pieno: compatta la chat (icona ⌁) per evitare perdita di informazioni."
+                    : "Context sopra il 70%: valuta di compattare la chat a breve."}
+                </div>
+              )}
+            </>
           )}
         </div>
       )}

@@ -146,6 +146,20 @@ pub async fn control_project_service(
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     let ok = out.status.success();
 
+    if ok {
+        let evt = match systemctl_action {
+            "start" => nexus_events::event::ProjectEvent::ServiceStarted {
+                name: svc_name.clone(),
+                port: None,
+                pid: None,
+            },
+            "stop" => nexus_events::event::ProjectEvent::ServiceStopped { name: svc_name.clone() },
+            "restart" => nexus_events::event::ProjectEvent::ServiceRestarted { name: svc_name.clone() },
+            _ => unreachable!("validated above"),
+        };
+        nexus_events::dispatcher::emit(&state.project_channels, project_id, evt);
+    }
+
     Ok(Json(json!({
         "ok":     ok,
         "unit":   svc_name,

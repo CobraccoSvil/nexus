@@ -103,7 +103,31 @@ pub async fn register_project(
     Json(body): Json<RegisterProjectRequest>,
 ) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
-    let raw_path = PathBuf::from(body.absolute_path.trim());
+    let raw_input = body.absolute_path.trim();
+    if raw_input.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Nome cartella mancante",
+        ));
+    }
+    let raw_path = if raw_input.starts_with('/') {
+        PathBuf::from(raw_input)
+    } else {
+        // Path relativo: lo risolviamo dentro projects_base_root e creiamo
+        // la cartella se non esiste, cosi' l'utente puo' creare un nuovo
+        // progetto indicando solo il nome.
+        let base_root = load_projects_base_root(&state.db).await?;
+        let candidate = base_root.join(raw_input);
+        if !candidate.exists() {
+            fs::create_dir_all(&candidate).await.map_err(|e| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Impossibile creare la cartella: {e}"),
+                )
+            })?;
+        }
+        candidate
+    };
     let canonical = raw_path.canonicalize().map_err(|_| {
         api_error(
             StatusCode::BAD_REQUEST,

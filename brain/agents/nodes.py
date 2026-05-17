@@ -395,6 +395,14 @@ async def router_node(state: AgentState) -> dict[str, Any]:
                 rag_block = _build_rag_context(intent, str(text))
                 if rag_block:
                     rendered = rag_block + "\n\n" + rendered
+                # PR-3 Codex pattern: project_instructions.md injection nel system_text.
+                # PR-3 Cursor pattern: <available_subagents> block per auto-delegation.
+                try:
+                    extra_blocks = _build_pr3_system_blocks(state)
+                    if extra_blocks:
+                        rendered = rendered + "\n\n" + extra_blocks
+                except Exception as _exc:
+                    logger.debug("pr3 injection skip: %s", _exc)
                 updates["system_text"] = rendered
         # Filtriamo tools_json combinando whitelist profilo + intent (BP5).
         # Il doppio filtraggio: per chat/analyze/review viene rimosso anche
@@ -1745,6 +1753,90 @@ async def learner_node(state: AgentState) -> dict[str, Any]:
     return {
         "completed_at": completed_at,
     }
+
+
+# ─── PR-3 Codex + Cursor: project_instructions + available_subagents blocks ─
+
+def _build_pr3_system_blocks(state: AgentState) -> str:
+    """Compone i blocchi extra da appendere al system_text:
+      - <project_instructions>: contenuto di .nexus/project-instructions.md
+      - <available_subagents>: catalogo kind disponibili per auto-delegation
+    Best-effort: ritorna stringa vuota se nulla da iniettare.
+    """
+    blocks: list[str] = []
+    project_id = state.get("project_id") or ""
+    # 1. Project instructions (AGENTS.md / CLAUDE.md style).
+    try:
+        from . import orchestrator_config, project_instructions_loader
+        import os as _os
+        cfg = orchestrator_config.get()
+        if cfg.get("plan_phase_enabled", False) and project_id:
+            url = _os.environ.get("DATABASE_URL", "")
+            if url:
+                import psycopg2  # type: ignore[import-untyped]
+                with psycopg2.connect(url) as conn:
+                    proj_root = None
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT absolute_path FROM workspaces WHERE project_id=%s AND is_primary=true LIMIT 1",
+                                (project_id,),
+                            )
+                            row = cur.fetchone()
+                            proj_root = row[0] if row else None
+                    except Exception:
+                        proj_root = None
+                    instr = project_instructions_loader.load_project_instructions(
+                        conn, project_id, proj_root,
+                    )
+                    if instr:
+                        blocks.append(instr)
+    except Exception:
+        pass
+    # 2. Available subagents (Cursor pattern auto-delegation).
+    try:
+        from . import orchestrator_config, subagent_store, prompt_registry, prompt_renderer
+        cfg = orchestrator_config.get()
+        if cfg.get("subagents_enabled", False) and cfg.get("auto_delegation_enabled", True):
+            proj_root = None
+            url = __import__("os").environ.get("DATABASE_URL", "")
+            if url and project_id:
+                try:
+                    import psycopg2  # type: ignore[import-untyped]
+                    with psycopg2.connect(url) as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT absolute_path FROM workspaces WHERE project_id=%s AND is_primary=true LIMIT 1",
+                                (project_id,),
+                            )
+                            row = cur.fetchone()
+                            proj_root = row[0] if row else None
+                except Exception:
+                    pass
+            kinds = subagent_store.list_enabled_kinds(proj_root)
+            if kinds:
+                wl = (cfg.get("subagent_kinds_whitelist") or "").split(",")
+                wl = [w.strip() for w in wl if w.strip()]
+                if wl:
+                    kinds = [k for k in kinds if k.get("kind") in wl]
+            if kinds:
+                lines = []
+                for k in kinds:
+                    bg = " (background)" if k.get("is_background") else ""
+                    lines.append(f"- {k['kind']}{bg}: {k.get('description','')}")
+                subagents_block = "\n".join(lines)
+                tpl = prompt_registry.get_prompt("system.available_subagents_block") or ""
+                if tpl:
+                    rendered = prompt_renderer.render(tpl, {
+                        "subagents_block": subagents_block,
+                        "max_parallel": cfg.get("max_parallel_subagents", 3),
+                    })
+                    blocks.append(rendered)
+                else:
+                    blocks.append(f"<available_subagents>\n{subagents_block}\n</available_subagents>")
+    except Exception:
+        pass
+    return "\n\n".join(b for b in blocks if b)
 
 
 # ─── Funzione di routing condizionale ────────────────────────────────────────

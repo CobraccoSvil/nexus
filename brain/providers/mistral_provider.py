@@ -210,7 +210,18 @@ class MistralProvider(BaseProvider):
                     tool_use_blocks.append(block)
                     assistant_content.append({"type": "tool_use", **block})
             else:
-                if text_content:
+                tool_names = {t.get("name", "") for t in tools if t.get("name")}
+                from ._schema_utils import parse_inline_tool_invocations
+                xml_blocks, cleaned_text = parse_inline_tool_invocations(text_content, tool_names)
+                if xml_blocks:
+                    stop_reason = "tool_use"
+                    for blk in xml_blocks:
+                        tool_use_blocks.append(blk)
+                        assistant_content.append({"type": "tool_use", **blk})
+                    if cleaned_text.strip():
+                        assistant_content.insert(0, {"type": "text", "text": cleaned_text})
+                    text_content = cleaned_text
+                elif text_content:
                     assistant_content.append({"type": "text", "text": text_content})
 
             usage_data = {}

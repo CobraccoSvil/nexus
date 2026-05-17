@@ -32,6 +32,7 @@ pub(crate) mod ports;
 pub(crate) mod todos;
 pub(crate) mod subagent;
 pub(crate) mod safety;
+pub(crate) mod dispatcher;
 
 // Re-export per uso interno crate (tool_run_tests è chiamato da agent_loop, in teoria).
 pub(crate) use command::tool_run_tests;
@@ -318,6 +319,34 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         }
       },
       "required": ["kind", "task"]
+    }
+  },
+  {
+    "name": "nexus_subagent_poll",
+    "description": "PR-3: poll dello stato di un sub-agent in background. Usa con il subagent_run_id ritornato da dispatch_subagent quando il kind ha is_background=true (il main riceve subito status=running, poi fa polling). Ritorna lo stato corrente + summary se completed.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "subagent_run_id": {
+          "type": "string",
+          "description": "UUID del sub-agent run (ritornato da dispatch_subagent)."
+        }
+      },
+      "required": ["subagent_run_id"]
+    }
+  },
+  {
+    "name": "nexus_subagent_resume",
+    "description": "PR-3: riprende un sub-agent paused o timeout-ato. Marca lo status come running e re-invia al brain per ri-esecuzione. Usa solo con sub-agent precedentemente pausati.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "subagent_run_id": {
+          "type": "string",
+          "description": "UUID del sub-agent run da riprendere."
+        }
+      },
+      "required": ["subagent_run_id"]
     }
   },
   {
@@ -689,8 +718,80 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         "auto_start_server": {
           "type": "boolean",
           "description": "Se true e il dev server non è raggiungibile, lo avvia automaticamente con run_service prima dei test (default: false)"
+        },
+        "config_path": {
+          "type": "string",
+          "description": "Directory relativa alla root del progetto contenente playwright.config.ts (es. 'app'). Se omesso, Nexus sceglie automaticamente la directory con piu' test spec tra radice e sottodirectory comuni."
+        },
+        "cleanup_stale_configs": {
+          "type": "boolean",
+          "description": "Se true (default), rimuove automaticamente config wrapper stale alla radice quando la suite reale e' in una sottodirectory (es. playwright.config.ts alla radice con 0 test mentre i veri test sono in app/e2e/)."
         }
       }
+    }
+  },
+  {
+    "name": "dispatcher_emit_event",
+    "description": "Emette un evento custom sul dispatcher centrale del progetto. Usalo quando hai un'informazione semantica che non rientra negli eventi automatici (es. 'analisi statica completata', 'modello AI cambiato'). I pannelli sottoscritti al dispatcher la ricevono in tempo reale.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "kind": { "type": "string", "description": "Nome logico dell'evento (es. 'analysis_done', 'config_reloaded')" },
+        "resource": { "type": "string", "description": "Categoria della risorsa (es. 'quality', 'deploy', 'custom')" },
+        "payload": { "type": "object", "description": "Dati liberi associati all'evento (verranno serializzati come JSON)" }
+      },
+      "required": ["kind"]
+    }
+  },
+  {
+    "name": "dispatcher_post_notification",
+    "description": "Invia una notifica (toast) all'utente nell'IDE. Usalo per comunicare eventi importanti che meritano l'attenzione immediata dell'utente. Rate-limited a 10/min per run.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "severity": { "type": "string", "enum": ["info", "success", "warning", "error"], "description": "Severita' del toast" },
+        "message": { "type": "string", "description": "Testo del messaggio (in italiano)" },
+        "panel": { "type": "string", "description": "Pannello opzionale da evidenziare (playwright|ports|problems|services|database|...)" },
+        "ttl_ms": { "type": "integer", "description": "Durata visibilita' in ms (default frontend: 5000)" }
+      },
+      "required": ["severity", "message"]
+    }
+  },
+  {
+    "name": "dispatcher_set_flag",
+    "description": "Imposta o aggiorna un flag globale del progetto, persistito in DB. I pannelli interessati ricevono FlagChanged e possono mostrare badge/banner. Le chiavi devono iniziare con uno dei prefissi consentiti: build_, test_, deploy_, custom_, feature_.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "key": { "type": "string", "description": "Nome del flag (es. 'build_in_progress', 'test_suite_running')" },
+        "value": { "description": "Valore JSON (boolean, number, string o null per cancellare il flag)" }
+      },
+      "required": ["key"]
+    }
+  },
+  {
+    "name": "dispatcher_update_monitor",
+    "description": "Aggiorna un widget monitor custom nel pannello Monitor. Usalo per esporre metriche real-time (progresso build, contatori, KPI). Valori in memoria, persistono solo finche' mcp-core e' vivo.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "monitor_id": { "type": "string", "description": "ID univoco del widget (es. 'build_progress', 'http_qps')" },
+        "value": { "description": "Valore corrente (number, string o object)" },
+        "label": { "type": "string", "description": "Etichetta human-readable opzionale" }
+      },
+      "required": ["monitor_id", "value"]
+    }
+  },
+  {
+    "name": "dispatcher_highlight_panel",
+    "description": "Forza un flash animation su un pannello dell'IDE per attirare l'attenzione dell'utente (es. dopo aver completato una migrazione Database, evidenzia il pannello Database).",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "panel": { "type": "string", "description": "Nome del pannello (playwright|ports|problems|services|database|monitor|files|git)" },
+        "duration_ms": { "type": "integer", "description": "Durata del flash in ms (default 800, max 5000)" }
+      },
+      "required": ["panel"]
     }
   },
   {
@@ -1009,6 +1110,8 @@ pub struct AgentToolContext {
     pub parent_run_id: Option<Uuid>,
     /// Canali agente (DashMap) per registrare i run figlio.
     pub agent_channels: crate::AgentChannels,
+    /// Channel per stream live eventi Playwright (run live monitoring).
+    pub playwright_channels: crate::playwright_live::PlaywrightChannels,
     /// Client Neural Core per i run figlio.
     pub neural: crate::orchestrator::NeuralCoreClient,
     /// Automation mode corrente (ereditata dai run figlio).
@@ -1028,6 +1131,12 @@ pub struct AgentToolContext {
     /// Stato atomico dipendenze (Qdrant, embedder). Se down, i tool vettoriali
     /// ritornano subito un messaggio informativo invece di aspettare il timeout.
     pub dependency_status: crate::task_watchdog::DependencyStatusRef,
+    /// Dispatcher centrale di eventi cross-pannello.
+    /// Tool che mutano risorse chiamano `nexus_events::dispatcher::emit` per
+    /// notificare i pannelli frontend in tempo reale.
+    pub project_channels: nexus_events::ProjectChannels,
+    /// Registro monitor in-memory (per `dispatcher_update_monitor` tool).
+    pub monitor_registry: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, serde_json::Value>>>>,
 }
 
 /// Ritorna true se il tool modifica lo stato del filesystem o del repository.
@@ -1284,6 +1393,9 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "nexus_todo_write" => todos::tool_nexus_todo_write(ctx, input).await,
         // PR-3 sub-agents: delega a un sub-agent isolato (riabilita ex M55).
         "dispatch_subagent" => subagent::tool_dispatch_subagent(ctx, input).await,
+        // PR-3 sub-agents: poll + resume per background runs.
+        "nexus_subagent_poll" => subagent::tool_nexus_subagent_poll(ctx, input).await,
+        "nexus_subagent_resume" => subagent::tool_nexus_subagent_resume(ctx, input).await,
         "run_in_terminal" => service::tool_run_service(ctx, input, "task").await,
         "run_service" => service::tool_run_service(ctx, input, "service").await,
         "read_terminal_output" => service::tool_read_service_output(ctx, input).await,
@@ -1329,6 +1441,12 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         }
         "run_playwright_tests" => testing::tool_run_playwright_tests(ctx, input).await,
         "batch_analyze_code" => tool_batch_analyze_code(ctx, input).await,
+        // ── Dispatcher centrale (pilotaggio pannelli) ──────────────────────
+        "dispatcher_emit_event" => dispatcher::tool_dispatcher_emit_event(ctx, input).await,
+        "dispatcher_post_notification" => dispatcher::tool_dispatcher_post_notification(ctx, input).await,
+        "dispatcher_set_flag" => dispatcher::tool_dispatcher_set_flag(ctx, input).await,
+        "dispatcher_update_monitor" => dispatcher::tool_dispatcher_update_monitor(ctx, input).await,
+        "dispatcher_highlight_panel" => dispatcher::tool_dispatcher_highlight_panel(ctx, input).await,
         // ── Nexus Builtin tool (prefisso nexus_*) ──────────────────────────
         // Dispatch verso nexus_builtin::execute_with_neural per usare
         // la ricerca semantica quando neural è disponibile (Qdrant).

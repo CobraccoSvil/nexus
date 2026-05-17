@@ -129,7 +129,7 @@ curl -X POST http://localhost:8001/agent/run \
 DATABASE_URL=postgresql://nexus:nexus@localhost:5433/nexus?sslmode=disable
 ```
 
-Default se non impostato: `postgresql://postgres:postgres@localhost:5432/ai_orchestrator`
+Default se non impostato: `postgresql://nexus:nexus@localhost:5433/nexus`
 
 ### Integrazione con Nexus:
 - Usa lo stesso `DATABASE_URL` del mcp-core

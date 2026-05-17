@@ -552,11 +552,26 @@ class ProviderRegistry:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                     return pool.submit(_run).result(timeout=90)
             except Exception as exc:
-                logger.error("Agent turn failed for %s/%s: %s", prov_name, prov_model, exc)
+                # M73: alcune eccezioni (es. TimeoutError, CancelledError) hanno
+                # str(exc) vuoto: usiamo repr(exc) per garantire un messaggio
+                # informativo e exc_info=True per il traceback completo.
+                exc_msg = repr(exc) if not str(exc).strip() else str(exc)
+                logger.error(
+                    "Agent turn failed for %s/%s: %s",
+                    prov_name, prov_model, exc_msg,
+                    exc_info=True,
+                )
+                # Classifica timeout in modo distinto cosi' il cascade fallback
+                # capisce il motivo del fallimento.
+                import concurrent.futures as _cf
+                if isinstance(exc, (_cf.TimeoutError, asyncio.TimeoutError)):
+                    stop = "timeout"
+                else:
+                    stop = "error"
                 return ProviderResult(
                     provider=prov_name, model=prov_model,
-                    content=f"[Error: {exc}]",
-                    metadata={"error": str(exc), "stop_reason": "error"},
+                    content=f"[Error: {exc_msg}]",
+                    metadata={"error": exc_msg, "stop_reason": stop},
                 )
 
         result = _run_agent_turn(effective_provider, effective_model)
@@ -570,7 +585,7 @@ class ProviderRegistry:
 
         # Fallback a cascata: se il provider fallisce per errori retriable (billing/quota/errore),
         # proviamo i provider successivi nella chain dinamica (DB-driven, niente hardcoded).
-        _RETRIABLE_STOPS = {"billing_error", "rate_limit", "overloaded", "provider_error", "error"}
+        _RETRIABLE_STOPS = {"billing_error", "rate_limit", "overloaded", "provider_error", "error", "timeout"}
         if result.metadata.get("stop_reason") in _RETRIABLE_STOPS or result.content.startswith("[Error:"):
             for fb_prov in self._provider_fallback_chain(exclude=effective_provider):
                 fb_model = self._default_model_or_none(fb_prov)

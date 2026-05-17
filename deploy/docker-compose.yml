@@ -2,7 +2,7 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_DB: ai_orchestrator
+      POSTGRES_DB: nexus
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
@@ -14,7 +14,7 @@ services:
   shadow-db:
     image: postgres:16
     environment:
-      POSTGRES_DB: ai_orchestrator_shadow
+      POSTGRES_DB: nexus_shadow
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:

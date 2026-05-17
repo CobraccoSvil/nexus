@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useEffect, useRef } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { useProjectStore, selectFilesRecent, useEventOfKind } from "../../lib/project-dispatcher/hooks";
 import { TruncatedText } from "../truncated-text";
 import {
   runQualityScan,
@@ -132,6 +133,10 @@ export function OptimizationPanel({ projectId, onSendToChat, onAutoSendToChat, a
   const [findings, setFindings] = useState<QualityFinding[]>(() => {
     try { const s = sessionStorage.getItem(storageKey); return s ? JSON.parse(s).findings ?? [] : []; } catch { return []; }
   });
+  // Ref stabile ai findings correnti: usata negli useEffect per evitare stale closures
+  // senza dover mettere `findings` nelle dipendenze (causerebbe loop infiniti).
+  const findingsRef = useRef(findings);
+  findingsRef.current = findings;
   const [activeCategory, setActiveCategory] = useState("all");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -383,6 +388,55 @@ export function OptimizationPanel({ projectId, onSendToChat, onAutoSendToChat, a
         }
       }
 
+      // Ri-scansione attiva: dopo ogni run agente, verifica se i findings HIGH
+      // ancora aperti sono stati risolti dal lavoro dell'agente. Raggruppa per file
+      // per minimizzare le chiamate, poi marca come fixed quelli scomparsi.
+      // Questo copre il caso in cui l'agente modifica un file con findings attivi
+      // senza che l'utente abbia cliccato "Fix" esplicitamente su quel finding.
+      try {
+        const activeHighFindings = findingsRef.current.filter(
+          f => !f.fixedAt && (f.severity === "high" || f.severity === "medium")
+        );
+        if (activeHighFindings.length > 0) {
+          const byFile = new Map<string, QualityFinding[]>();
+          for (const f of activeHighFindings) {
+            const arr = byFile.get(f.filePath) ?? [];
+            arr.push(f);
+            byFile.set(f.filePath, arr);
+          }
+          const autoResolved: string[] = [];
+          for (const [filePath, fileFindings] of byFile.entries()) {
+            try {
+              const result = await scanProjectFile(projectId, filePath);
+              const freshFindings = result.findings;
+              for (const f of fileFindings) {
+                const stillExists = freshFindings.find(
+                  r =>
+                    r.title === f.title &&
+                    r.category === f.category &&
+                    (r.lineNumber === null ||
+                      f.lineNumber === null ||
+                      Math.abs((r.lineNumber ?? 0) - (f.lineNumber ?? 0)) <= 10)
+                );
+                if (!stillExists) {
+                  autoResolved.push(f.id);
+                  fixRetryCountRef.current.delete(f.id);
+                }
+              }
+            } catch {
+              // Se la scansione del singolo file fallisce, salta — non bloccare gli altri
+            }
+          }
+          if (autoResolved.length > 0) {
+            await markBatchFixedRef.current(autoResolved);
+          }
+        }
+      } catch {
+        // Fallback: se la ri-scansione fallisce del tutto, refresh dal DB
+      }
+      // Refresh finale dal DB per sincronizzare eventuali cambiamenti non catturati
+      setTimeout(() => { fetchFindingsRef.current(); }, 2000);
+
       // 2. Se l'auto-fix non è attivo, non proseguire con la coda
       if (!autoFixEnabledRef.current || (!onSendToChat && !onAutoSendToChat)) return;
 
@@ -425,6 +479,119 @@ export function OptimizationPanel({ projectId, onSendToChat, onAutoSendToChat, a
   // dipendenze escluse intenzionalmente: onSendToChat/onAutoSendToChat/sendFileToFix sono callback da props lette in closure; storageKey/projectId derivano da projectId prop stabile
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentRunEndSignal]);
+
+  // Dispatcher: ascolta FileChanged dal dispatcher SSE per aggiornare il pannello
+  // quando l'agente (o qualunque tool) modifica un file che ha findings attivi.
+  // Questo complementa agentRunEndSignal: funziona anche quando il fix avviene
+  // tramite un agente che non passa per onRunEnd della chat principale.
+  const filesRecentChanged = useProjectStore(selectFilesRecent);
+  const filesChangedCountRef = useRef(filesRecentChanged.length);
+  useEffect(() => {
+    if (filesRecentChanged.length === 0) return;
+    if (filesChangedCountRef.current === filesRecentChanged.length) return;
+    filesChangedCountRef.current = filesRecentChanged.length;
+
+    // Verifica se il file cambiato ha findings pendenti
+    const pendingFiles = new Set(pendingMarkOnNextRunRef.current.map(f => f.filePath));
+    const changedPaths = filesRecentChanged.map(f => f.path);
+    const hasRelevantChange = changedPaths.some(p => pendingFiles.has(p));
+
+    if (hasRelevantChange && pendingMarkOnNextRunRef.current.length > 0) {
+      // Delay per dare tempo al backend di scrivere il file
+      const timer = setTimeout(async () => {
+        const pending = [...pendingMarkOnNextRunRef.current];
+        pendingMarkOnNextRunRef.current = [];
+
+        const resolved: QualityFinding[] = [];
+        const byFile = new Map<string, QualityFinding[]>();
+        for (const f of pending) {
+          const arr = byFile.get(f.filePath) ?? [];
+          arr.push(f);
+          byFile.set(f.filePath, arr);
+        }
+
+        for (const [filePath, fileFindings] of byFile.entries()) {
+          try {
+            const result = await scanProjectFile(projectId, filePath);
+            for (const f of fileFindings) {
+              const freshMatch = result.findings.find(
+                r => r.title === f.title && r.category === f.category &&
+                  (r.lineNumber === null || f.lineNumber === null ||
+                    Math.abs((r.lineNumber ?? 0) - (f.lineNumber ?? 0)) <= 10)
+              );
+              if (!freshMatch) resolved.push(f);
+            }
+          } catch {
+            resolved.push(...fileFindings);
+          }
+        }
+
+        if (resolved.length > 0) {
+          for (const f of resolved) fixRetryCountRef.current.delete(f.id);
+          await markBatchFixedRef.current(resolved.map(f => f.id));
+        }
+      }, 2000);
+      return () => clearTimeout(timer);
+    }
+
+    // Se non ci sono findings pendenti ma un file con findings attivi e' cambiato,
+    // ri-scansiona quei file specifici per verificare se i findings sono stati risolti.
+    const activeByFile = new Map<string, QualityFinding[]>();
+    for (const f of findingsRef.current.filter(f => !f.fixedAt)) {
+      const arr = activeByFile.get(f.filePath) ?? [];
+      arr.push(f);
+      activeByFile.set(f.filePath, arr);
+    }
+    const changedActiveFiles = changedPaths.filter(p => activeByFile.has(p));
+    if (changedActiveFiles.length > 0) {
+      const timer = setTimeout(async () => {
+        const autoResolved: string[] = [];
+        for (const filePath of changedActiveFiles) {
+          const fileFindings = activeByFile.get(filePath) ?? [];
+          try {
+            const result = await scanProjectFile(projectId, filePath);
+            for (const f of fileFindings) {
+              const stillExists = result.findings.find(
+                r =>
+                  r.title === f.title &&
+                  r.category === f.category &&
+                  (r.lineNumber === null ||
+                    f.lineNumber === null ||
+                    Math.abs((r.lineNumber ?? 0) - (f.lineNumber ?? 0)) <= 10)
+              );
+              if (!stillExists) {
+                autoResolved.push(f.id);
+                fixRetryCountRef.current.delete(f.id);
+              }
+            }
+          } catch {
+            // Scansione fallita per questo file — salta
+          }
+        }
+        if (autoResolved.length > 0) {
+          await markBatchFixedRef.current(autoResolved);
+        }
+        // Refresh finale per sincronizzare
+        setTimeout(() => { fetchFindingsRef.current(); }, 2000);
+      }, 2000);
+      return () => clearTimeout(timer);
+    }
+  }, [filesRecentChanged, projectId]);
+
+  // Binding evento dispatcher `FindingsUpdated`: il backend emette dopo ogni
+  // scan di quality (auto o on-demand) con il delta `resolved_ids` (lista
+  // findings risolti rispetto allo stato precedente). Marchiamo in-place
+  // SENZA ri-scansionare lato client, evitando flash banner e duplicate API.
+  //
+  // Sostituisce il vecchio setInterval(15000) che faceva polling locale dei
+  // file con findings HIGH attivi — rumoroso e causa di flash banner periodici.
+  useEventOfKind("FindingsUpdated", (env) => {
+    const ids = env.payload.resolved_ids ?? [];
+    if (ids.length === 0) return;
+    void markBatchFixedRef.current(ids);
+    // Refresh leggero per allineare anche eventuali findings nuovi non risolti
+    setTimeout(() => { fetchFindingsRef.current(); }, 1000);
+  }, [projectId]);
 
   // Auto-reset della coda dopo che tutti i file sono stati inviati (con delay per mostrare il messaggio)
   useEffect(() => {

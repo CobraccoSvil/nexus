@@ -1,0 +1,523 @@
+// Zustand store centrale per i dati operativi del progetto attivo.
+// Tutti i pannelli (Playwright, Ports, Problems, Services, Files, Git, Database,
+// Flags, Monitor) leggono da qui. L'unica fonte di verita' e' il dispatcher
+// backend via SSE — niente piu' polling indipendente per pannello.
+
+import { create } from "zustand";
+import type {
+  ConnectionStatus,
+  EnvelopedEvent,
+  MonitorState,
+  PlaywrightRunSummary,
+  ToastItem,
+} from "./types";
+
+export interface PortEntry {
+  port: number;
+  label: string;
+  pid?: number;
+}
+
+export interface ProblemItem {
+  id: string;
+  severity: string;
+  source: string;
+  message: string;
+  filePath?: string | null;
+  line?: number | null;
+  column?: number | null;
+  createdAt: string;
+}
+
+export interface ChatSessionUsage {
+  totalTokens: number;
+  totalCostUsd: number;
+  ts: number;
+}
+
+export interface ChatMessageDelta {
+  messageId: string;
+  role: string;
+  totalTokens?: number;
+  totalCostUsd?: number;
+  ts: number;
+}
+
+export interface MutationRecord {
+  method: string;
+  path: string;
+  statusCode: number;
+  sessionId?: string;
+  summary?: string;
+  actorUserId?: string;
+  ts: number;
+}
+
+export interface EventEnrichment {
+  uiHint?: import("./types").UiHint;
+  semanticTags: string[];
+  severityInferred?: string;
+  panelTarget?: string;
+  ts: number;
+}
+
+export interface ProjectStoreState {
+  projectId: string | null;
+  connectionStatus: ConnectionStatus;
+  lastSeq: number;
+  lastEventTs: number | null;
+  reconnectAttempts: number;
+
+  // Slices per topic
+  playwright: { runs: PlaywrightRunSummary[] };
+  ports: { entries: PortEntry[] };
+  problems: { items: ProblemItem[]; badge: number };
+  services: { byName: Record<string, { name: string; port?: number; pid?: number; status: "running" | "stopped" }> };
+  files: { recentChanged: Array<{ path: string; op: string; ts: number }> };
+  git: { branch: string; ahead: number; behind: number; modified: number };
+  database: { recentQueries: Array<{ duration_ms: number; rows: number; kind: string; ts: number }> };
+  flags: Record<string, unknown>;
+  monitors: Record<string, MonitorState>;
+  chat: {
+    lastCompactBySession: Record<string, ChatSessionUsage>;
+    lastMessageBySession: Record<string, ChatMessageDelta>;
+    statusBySession: Record<string, string>;
+  };
+  mutations: { recent: MutationRecord[] };
+  enrichments: { byEventId: Record<string, EventEnrichment> };
+  // Findings updates: ultimo evento FindingsUpdated ricevuto (con resolved_ids).
+  // I componenti come optimization-panel ascoltano per applicare delta in-place
+  // senza ri-scansionare.
+  findingsUpdate: {
+    scanId?: string;
+    total: number;
+    critical: number;
+    warnings: number;
+    resolvedIds: string[];
+    ts: number;
+  } | null;
+
+  // UI ephemera
+  toasts: ToastItem[];
+  panelHighlights: Record<string, number>; // panel -> expiresAt ts
+
+  // Actions
+  setConnectionStatus: (s: ConnectionStatus) => void;
+  setProject: (projectId: string | null) => void;
+  applySnapshot: (snapshot: any) => void;
+  applyEvent: (env: EnvelopedEvent) => void;
+  dismissToast: (id: string) => void;
+  bumpReconnect: () => void;
+  resetReconnect: () => void;
+  /**
+   * Sottoscrive un listener che riceve OGNI evento applicato (post-dedup).
+   * Restituisce una funzione per disiscriversi. Usato da `useProjectEvents`
+   * e `useEventOfKind` per consentire a qualsiasi componente di reagire ad
+   * eventi specifici senza dover passare per i selettori tipizzati.
+   */
+  subscribeAll: (listener: (env: EnvelopedEvent) => void) => () => void;
+}
+
+// Listener set out-of-store (Zustand `set` non funziona bene su Set).
+// Modulo-level: condiviso tra tutte le istanze (in pratica una sola — Next App Router).
+const eventListeners = new Set<(env: EnvelopedEvent) => void>();
+
+const TOAST_DEFAULT_TTL = 5000;
+
+export const useProjectStore = create<ProjectStoreState>((set, get) => ({
+  projectId: null,
+  connectionStatus: "idle",
+  lastSeq: 0,
+  lastEventTs: null,
+  reconnectAttempts: 0,
+
+  playwright: { runs: [] },
+  ports: { entries: [] },
+  problems: { items: [], badge: 0 },
+  services: { byName: {} },
+  files: { recentChanged: [] },
+  git: { branch: "", ahead: 0, behind: 0, modified: 0 },
+  database: { recentQueries: [] },
+  flags: {},
+  monitors: {},
+  chat: { lastCompactBySession: {}, lastMessageBySession: {}, statusBySession: {} },
+  mutations: { recent: [] },
+  enrichments: { byEventId: {} },
+  findingsUpdate: null,
+
+  toasts: [],
+  panelHighlights: {},
+
+  setConnectionStatus: (s) => set({ connectionStatus: s }),
+
+  setProject: (projectId) => set({
+    projectId,
+    lastSeq: 0,
+    lastEventTs: null,
+    reconnectAttempts: 0,
+    connectionStatus: projectId ? "connecting" : "idle",
+    // Reset stato per evitare contaminazione tra progetti diversi
+    playwright: { runs: [] },
+    ports: { entries: [] },
+    problems: { items: [], badge: 0 },
+    services: { byName: {} },
+    files: { recentChanged: [] },
+    git: { branch: "", ahead: 0, behind: 0, modified: 0 },
+    database: { recentQueries: [] },
+    flags: {},
+    monitors: {},
+    chat: { lastCompactBySession: {}, lastMessageBySession: {}, statusBySession: {} },
+    mutations: { recent: [] },
+    enrichments: { byEventId: {} },
+    findingsUpdate: null,
+    toasts: [],
+    panelHighlights: {},
+  }),
+
+  subscribeAll: (listener) => {
+    eventListeners.add(listener);
+    return () => { eventListeners.delete(listener); };
+  },
+
+  applySnapshot: (snapshot) => set((state) => {
+    const next: Partial<ProjectStoreState> = { lastSeq: snapshot.seq ?? 0 };
+    if (snapshot.playwright?.runs) {
+      next.playwright = { runs: snapshot.playwright.runs };
+    }
+    if (snapshot.flags) {
+      next.flags = snapshot.flags;
+    }
+    if (snapshot.monitors) {
+      next.monitors = snapshot.monitors;
+    }
+    return { ...state, ...next };
+  }),
+
+  applyEvent: (env) => set((state) => {
+    if (env.seq <= state.lastSeq && env.seq !== 0) return state; // dedup
+
+    const next: ProjectStoreState = {
+      ...state,
+      lastSeq: Math.max(state.lastSeq, env.seq),
+      lastEventTs: env.ts,
+    };
+
+    // Apply payload
+    const p = env.payload;
+    switch (p.kind) {
+      case "JobCreated": {
+        if (p.job_kind === "playwright_test") {
+          const newRun: PlaywrightRunSummary = {
+            id: p.id,
+            label: p.label,
+            status: p.status,
+            summary: p.summary,
+            artifacts: Array.isArray(p.artifacts) ? (p.artifacts as unknown[]) : [],
+            createdAt: new Date(env.ts).toISOString(),
+          };
+          const without = next.playwright.runs.filter((r) => r.id !== p.id);
+          next.playwright = { runs: [newRun, ...without].slice(0, 50) };
+        }
+        break;
+      }
+      case "JobUpdated": {
+        next.playwright = {
+          runs: next.playwright.runs.map((r) =>
+            r.id === p.id
+              ? { ...r, status: p.status, label: p.label ?? r.label, summary: p.summary ?? r.summary }
+              : r,
+          ),
+        };
+        break;
+      }
+      case "JobsCleared": {
+        if (p.job_kind === "playwright_test") {
+          next.playwright = { runs: [] };
+        }
+        break;
+      }
+      case "PortAllocated": {
+        const without = next.ports.entries.filter((e) => e.port !== p.port);
+        next.ports = { entries: [...without, { port: p.port, label: p.label, pid: p.pid }] };
+        break;
+      }
+      case "PortReleased": {
+        next.ports = { entries: next.ports.entries.filter((e) => e.port !== p.port) };
+        break;
+      }
+      case "FindingsUpdated": {
+        next.problems = { ...next.problems, badge: p.total };
+        // Esponi resolved_ids in slot dedicato: optimization-panel ascolta
+        // questo per marcare i findings in-place senza scan extra.
+        next.findingsUpdate = {
+          scanId: p.scan_id,
+          total: p.total,
+          critical: p.critical,
+          warnings: p.warnings,
+          resolvedIds: p.resolved_ids ?? [],
+          ts: env.ts,
+        };
+        break;
+      }
+      case "ServiceStarted": {
+        next.services = {
+          byName: {
+            ...next.services.byName,
+            [p.name]: { name: p.name, port: p.port, pid: p.pid, status: "running" },
+          },
+        };
+        break;
+      }
+      case "ServiceStopped":
+      case "ServiceRestarted": {
+        const existing = next.services.byName[p.name];
+        next.services = {
+          byName: {
+            ...next.services.byName,
+            [p.name]: existing ? { ...existing, status: "running" } : { name: p.name, status: "running" },
+          },
+        };
+        break;
+      }
+      case "FileChanged": {
+        next.files = {
+          recentChanged: [
+            { path: p.path, op: p.op, ts: env.ts },
+            ...next.files.recentChanged.filter((f) => f.path !== p.path),
+          ].slice(0, 50),
+        };
+        break;
+      }
+      case "GitStatusChanged": {
+        next.git = { branch: p.branch, ahead: p.ahead, behind: p.behind, modified: p.modified_count };
+        break;
+      }
+      case "DbQueryRun": {
+        next.database = {
+          recentQueries: [
+            { duration_ms: p.duration_ms, rows: p.rows, kind: p.statement_kind, ts: env.ts },
+            ...next.database.recentQueries,
+          ].slice(0, 100),
+        };
+        break;
+      }
+      case "FlagChanged": {
+        next.flags = { ...next.flags, [p.key]: p.value };
+        break;
+      }
+      case "MonitorUpdated": {
+        next.monitors = {
+          ...next.monitors,
+          [p.monitor_id]: {
+            value: p.value,
+            label: p.label,
+            updated_at: new Date(env.ts).toISOString(),
+          },
+        };
+        break;
+      }
+      case "ChatSessionCompacted": {
+        next.chat = {
+          ...next.chat,
+          lastCompactBySession: {
+            ...next.chat.lastCompactBySession,
+            [p.session_id]: {
+              totalTokens: p.total_tokens,
+              totalCostUsd: p.total_cost_usd,
+              ts: env.ts,
+            },
+          },
+          statusBySession: { ...next.chat.statusBySession, [p.session_id]: "compacted" },
+        };
+        break;
+      }
+      case "ChatMessageAdded": {
+        next.chat = {
+          ...next.chat,
+          lastMessageBySession: {
+            ...next.chat.lastMessageBySession,
+            [p.session_id]: {
+              messageId: p.message_id,
+              role: p.role,
+              totalTokens: p.total_tokens,
+              totalCostUsd: p.total_cost_usd,
+              ts: env.ts,
+            },
+          },
+        };
+        break;
+      }
+      case "ChatSessionStatusChanged": {
+        next.chat = {
+          ...next.chat,
+          statusBySession: { ...next.chat.statusBySession, [p.session_id]: p.status },
+        };
+        break;
+      }
+      case "MutationRecorded": {
+        next.mutations = {
+          recent: [
+            {
+              method: p.method,
+              path: p.path,
+              statusCode: p.status_code,
+              sessionId: p.session_id,
+              summary: p.summary,
+              actorUserId: p.actor_user_id,
+              ts: env.ts,
+            },
+            ...next.mutations.recent,
+          ].slice(0, 200),
+        };
+        break;
+      }
+      case "EventEnriched": {
+        next.enrichments = {
+          byEventId: {
+            ...next.enrichments.byEventId,
+            [p.event_id]: {
+              uiHint: p.ui_hint,
+              semanticTags: p.semantic_tags ?? [],
+              severityInferred: p.severity_inferred,
+              panelTarget: p.panel_target,
+              ts: env.ts,
+            },
+          },
+        };
+        // Cap LRU a 500 per evitare crescita illimitata in sessioni lunghe
+        const entries = Object.entries(next.enrichments.byEventId);
+        if (entries.length > 500) {
+          const sorted = entries.sort((a, b) => b[1].ts - a[1].ts).slice(0, 500);
+          next.enrichments = { byEventId: Object.fromEntries(sorted) };
+        }
+        // Se l'enrichment include ui_hint, applicalo come se fosse arrivato
+        // con l'evento originale (toast + highlight). Idempotente: il toast
+        // ha id = event_id, dedupliato dallo store toast manager.
+        if (p.ui_hint) {
+          // Riusa la stessa logica del blocco "Apply UI hint" sotto:
+          // facciamo merge inline per evitare ricorsione
+          const h = p.ui_hint;
+          if (h.toast_msg && h.toast_severity) {
+            const toastId = `enriched_${p.event_id}`;
+            if (!next.toasts.find((t) => t.id === toastId)) {
+              const toast: ToastItem = {
+                id: toastId,
+                severity: h.toast_severity,
+                message: h.toast_msg,
+                ttl_ms: TOAST_DEFAULT_TTL,
+                panel: h.highlight_panel,
+                createdAt: env.ts,
+              };
+              next.toasts = [...next.toasts, toast].slice(-20);
+              if (typeof window !== "undefined") {
+                window.setTimeout(() => get().dismissToast(toast.id), TOAST_DEFAULT_TTL);
+              }
+            }
+          }
+          if (h.highlight_panel && h.flash_duration_ms) {
+            next.panelHighlights = {
+              ...next.panelHighlights,
+              [h.highlight_panel]: Date.now() + h.flash_duration_ms,
+            };
+          }
+        }
+        break;
+      }
+      case "Notification":
+      case "HighlightPanel":
+      case "AgentToolUsed":
+      case "Custom":
+      case "SnapshotRequired":
+        break;
+    }
+
+    // Apply UI hint (toast + highlight)
+    const hint = env.ui_hint;
+    if (hint) {
+      if (hint.toast_msg && hint.toast_severity) {
+        const toast: ToastItem = {
+          id: env.event_id,
+          severity: hint.toast_severity,
+          message: hint.toast_msg,
+          ttl_ms: TOAST_DEFAULT_TTL,
+          panel: hint.highlight_panel,
+          createdAt: env.ts,
+        };
+        next.toasts = [...next.toasts, toast].slice(-20);
+        // Auto-dismiss
+        if (typeof window !== "undefined") {
+          window.setTimeout(() => get().dismissToast(toast.id), TOAST_DEFAULT_TTL);
+        }
+      }
+      if (hint.highlight_panel && hint.flash_duration_ms) {
+        next.panelHighlights = {
+          ...next.panelHighlights,
+          [hint.highlight_panel]: Date.now() + hint.flash_duration_ms,
+        };
+      }
+      if (hint.badge_increment) {
+        const [panel, inc] = hint.badge_increment;
+        if (panel === "problems") {
+          next.problems = { ...next.problems, badge: next.problems.badge + inc };
+        }
+      }
+    }
+
+    // Notifica tutti i listener `subscribeAll` (hook universali useProjectEvents).
+    // Fatto qui AL FONDO dopo che lo state e' aggiornato, ma usando una
+    // microtask per non bloccare il set di Zustand (i listener possono fare
+    // setState a loro volta).
+    if (eventListeners.size > 0) {
+      Promise.resolve().then(() => {
+        for (const listener of eventListeners) {
+          try {
+            listener(env);
+          } catch (e) {
+            console.error("[dispatcher] listener error:", e);
+          }
+        }
+      });
+    }
+
+    return next;
+  }),
+
+  dismissToast: (id) => set((state) => ({
+    toasts: state.toasts.filter((t) => t.id !== id),
+  })),
+
+  bumpReconnect: () => set((state) => ({ reconnectAttempts: state.reconnectAttempts + 1 })),
+  resetReconnect: () => set({ reconnectAttempts: 0 }),
+}));
+
+// Selectors esportati per ergonomia
+export const selectConnection = (s: ProjectStoreState) => s.connectionStatus;
+export const selectPlaywrightRuns = (s: ProjectStoreState) => s.playwright.runs;
+export const selectPorts = (s: ProjectStoreState) => s.ports.entries;
+export const selectProblemsBadge = (s: ProjectStoreState) => s.problems.badge;
+export const selectServicesMap = (s: ProjectStoreState) => s.services.byName;
+export const selectFilesRecent = (s: ProjectStoreState) => s.files.recentChanged;
+export const selectGitStatus = (s: ProjectStoreState) => s.git;
+export const selectDatabaseQueries = (s: ProjectStoreState) => s.database.recentQueries;
+export const selectToasts = (s: ProjectStoreState) => s.toasts;
+export const selectFlags = (s: ProjectStoreState) => s.flags;
+export const selectMonitors = (s: ProjectStoreState) => s.monitors;
+export const selectHighlight = (panel: string) => (s: ProjectStoreState) => {
+  const exp = s.panelHighlights[panel];
+  return exp && exp > Date.now() ? exp : null;
+};
+
+// ── Chat / mutation / enrichment / findings ─────────────────────────────────
+export const selectChatLastCompact = (sessionId: string | null) => (s: ProjectStoreState) =>
+  sessionId ? s.chat.lastCompactBySession[sessionId] ?? null : null;
+export const selectChatLastMessage = (sessionId: string | null) => (s: ProjectStoreState) =>
+  sessionId ? s.chat.lastMessageBySession[sessionId] ?? null : null;
+export const selectChatStatus = (sessionId: string | null) => (s: ProjectStoreState) =>
+  sessionId ? s.chat.statusBySession[sessionId] ?? null : null;
+export const selectMutationsRecent = (s: ProjectStoreState) => s.mutations.recent;
+export const selectEnrichmentByEventId = (eventId: string) => (s: ProjectStoreState) =>
+  s.enrichments.byEventId[eventId] ?? null;
+export const selectFindingsUpdate = (s: ProjectStoreState) => s.findingsUpdate;
+export const subscribeAll = (
+  listener: (env: EnvelopedEvent) => void,
+) => useProjectStore.getState().subscribeAll(listener);

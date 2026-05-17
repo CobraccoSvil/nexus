@@ -102,7 +102,7 @@ done
 # === 6. Routing matrix popolata (direttiva G di CLAUDE.md) ===================
 log "Registry modelli (nexus_routing_matrix)"
 matrix_count=$(remote_exec "$PROD_HOST" \
-    "sudo -u postgres psql -tAc \"SELECT COUNT(*) FROM nexus_routing_matrix;\" ai_orchestrator 2>/dev/null || echo 0")
+    "sudo -u postgres psql -tAc \"SELECT COUNT(*) FROM nexus_routing_matrix;\" nexus 2>/dev/null || echo 0")
 if [ "${matrix_count:-0}" -gt 0 ]; then
     printf '  %bOK%b  nexus_routing_matrix: %s righe\n' "$C_GREEN" "$C_NC" "$matrix_count"
     CHECKS_PASSED=$((CHECKS_PASSED + 1))

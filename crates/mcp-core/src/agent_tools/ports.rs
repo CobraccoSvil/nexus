@@ -124,6 +124,16 @@ pub async fn tool_request_port(ctx: &AgentToolContext, input: &Value) -> String 
         return format!("[Errore: INSERT fallito ({})]", e);
     }
 
+    nexus_events::dispatcher::emit(
+        &ctx.project_channels,
+        ctx.project_id,
+        nexus_events::event::ProjectEvent::PortAllocated {
+            port,
+            label: label.clone(),
+            pid: None,
+        },
+    );
+
     json!({
         "port": port,
         "label": label,

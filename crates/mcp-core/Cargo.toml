@@ -37,6 +37,8 @@ mcp-proto = { path = "../mcp-proto" }
 nexus-auth = { path = "../nexus-auth" }
 nexus-types = { path = "../nexus-types" }
 nexus-orchestrator = { path = "../nexus-orchestrator" }
+nexus-events = { path = "../nexus-events" }
+parking_lot = "0.12"
 ruvector = { path = "../ruvector" }
 dashmap.workspace = true
 futures.workspace = true

@@ -195,3 +195,141 @@ def measure_tools_bytes(tools: list[dict]) -> int:
     import json
 
     return len(json.dumps(tools, ensure_ascii=False, separators=(",", ":")))
+
+
+def _coerce_value(raw: str):
+    """Best-effort: stringa -> int/float/bool/None se possibile."""
+    lower = raw.lower()
+    if lower in ("true", "false"):
+        return lower == "true"
+    if lower == "null":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    return raw
+
+
+def parse_inline_tool_invocations(
+    text: str,
+    known_tool_names: set[str] | None = None,
+) -> tuple[list[dict], str]:
+    """Parser di recupero per tool_call emessi come XML inline nel content.
+
+    Riconosce tre formati:
+      1. <invoke name="X"><parameter name="Y">V</parameter></invoke>
+      2. <tool_name><param>value</param></tool_name>  (formato semplificato)
+      3. <functions><function><name>X</name><params><k>v</k></params></function></functions>
+         (formato DeepSeek/ChatGPT-style)
+
+    Il formato 2 richiede `known_tool_names` per distinguere tag tool
+    da tag XML arbitrari nel testo. Se non fornito, solo i formati 1 e 3 vengono usati.
+
+    Ritorna ([], text_originale) se nessuna invocazione rilevata.
+    """
+    import re
+    import uuid as _uuid
+
+    if not text:
+        return [], text
+
+    blocks: list[dict] = []
+    cleaned = text
+
+    # --- Formato 1: <invoke name="X">...</invoke> ---
+    if "<invoke" in text:
+        invoke_re = re.compile(
+            r'<invoke\s+name="(?P<name>[^"]+)"\s*>(?P<body>.*?)</invoke>',
+            re.DOTALL,
+        )
+        param_re = re.compile(
+            r'<parameter\s+name="(?P<pname>[^"]+)"(?:\s+string="(?P<is_string>true|false)")?\s*>(?P<value>.*?)</parameter>',
+            re.DOTALL,
+        )
+        for m in invoke_re.finditer(text):
+            tool_name = m.group("name").strip()
+            body = m.group("body") or ""
+            params: dict = {}
+            for pm in param_re.finditer(body):
+                pname = pm.group("pname").strip()
+                raw_value = (pm.group("value") or "").strip()
+                is_string_attr = pm.group("is_string")
+                if is_string_attr == "false" and raw_value:
+                    params[pname] = _coerce_value(raw_value)
+                else:
+                    params[pname] = raw_value
+            if tool_name:
+                blocks.append({
+                    "id": f"toolu_{_uuid.uuid4().hex[:24]}",
+                    "name": tool_name,
+                    "input": params,
+                })
+            cleaned = cleaned.replace(m.group(0), "")
+
+    # --- Formato 3: <functions><function><name>X</name><params>...</params></function></functions> ---
+    if "<function>" in cleaned or "<functions>" in cleaned:
+        func_re = re.compile(
+            r"<function>\s*<name>(?P<name>[^<]+)</name>\s*<params?>(?P<body>.*?)</params?>\s*</function>",
+            re.DOTALL,
+        )
+        child_re = re.compile(
+            r"<(?P<key>[a-z_][a-z0-9_]*)>(?P<val>.*?)</(?P=key)>",
+            re.DOTALL,
+        )
+        for m in func_re.finditer(cleaned):
+            tool_name = m.group("name").strip()
+            body = m.group("body") or ""
+            params = {}
+            for cm in child_re.finditer(body):
+                params[cm.group("key")] = _coerce_value(cm.group("val").strip())
+            if tool_name:
+                blocks.append({
+                    "id": f"toolu_{_uuid.uuid4().hex[:24]}",
+                    "name": tool_name,
+                    "input": params,
+                })
+        cleaned = re.sub(
+            r"<functions>\s*(?:<function>.*?</function>\s*)+</functions>",
+            "", cleaned, flags=re.DOTALL,
+        )
+        cleaned = re.sub(r"<function>.*?</function>", "", cleaned, flags=re.DOTALL)
+
+    # --- Formato 2: <tool_name><child_param>value</child_param></tool_name> ---
+    if known_tool_names:
+        escaped_names = "|".join(re.escape(n) for n in sorted(known_tool_names, key=len, reverse=True))
+        tool_tag_re = re.compile(
+            rf"<(?P<tname>{escaped_names})\s*>(?P<body>.*?)</(?P=tname)>",
+            re.DOTALL,
+        )
+        child_re = re.compile(
+            r"<(?P<key>[a-z_][a-z0-9_]*)>(?P<val>.*?)</(?P=key)>",
+            re.DOTALL,
+        )
+        for m in tool_tag_re.finditer(cleaned):
+            tool_name = m.group("tname")
+            body = m.group("body") or ""
+            params = {}
+            for cm in child_re.finditer(body):
+                params[cm.group("key")] = _coerce_value(cm.group("val").strip())
+            blocks.append({
+                "id": f"toolu_{_uuid.uuid4().hex[:24]}",
+                "name": tool_name,
+                "input": params,
+            })
+            cleaned = cleaned.replace(m.group(0), "")
+
+    if not blocks:
+        return [], text
+
+    # Pulisci wrapper residui
+    cleaned = re.sub(r"</?tool_calls\s*/?>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</?functions\s*/?>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</?DSML\s*/?>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    return blocks, cleaned
