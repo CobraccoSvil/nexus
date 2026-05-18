@@ -66,6 +66,7 @@ import {
   selectPorts,
   selectFilesRecent,
   selectGitStatus,
+  selectProblemsBadge,
 } from "../lib/project-dispatcher";
 import { ConnectionStatusBadge, ToastStack } from "./dispatcher-status";
 
@@ -580,6 +581,19 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     }
   }, [playwrightConfigChangedAt, activeProject]);
 
+  // Auto-refresh problemItems quando arriva FindingsUpdated dal dispatcher.
+  // Il badge usa il valore "live" dal dispatcher (selectProblemsBadge), ma per
+  // la lista completa serve refetch via API perche' l'evento non contiene items.
+  const problemsBadgeFromDispatcher = useProjectStore(selectProblemsBadge);
+  useEffect(() => {
+    if (!activeProject) return;
+    if (problemsBadgeFromDispatcher === 0) return; // skip stato iniziale
+    void getProjectProblems(activeProject.id)
+      .then((res) => setProblemItems(res.items ?? []))
+      .catch(() => { /* ignora */ });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [problemsBadgeFromDispatcher]);
+
   // Auto-refresh gitState quando arriva GitStatusChanged dal dispatcher.
   // Il payload e' magro (branch, ahead, behind, modified_count) ma noi
   // serviamo GitRepositoryState completo (staged/unstaged/untracked file list),
@@ -660,7 +674,12 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     editorGroups.find((group) => group.id === activeEditorGroupId) ?? editorGroups[0];
   const activeEditorTab =
     activeGroup?.tabs.find((tab) => tab.path === activeGroup.activePath) ?? null;
-  const problemCount = problemItems.length;
+  // Preferiamo il badge dal dispatcher (zero-latency, aggiornato live da
+  // FindingsUpdated) rispetto a problemItems.length che si aggiorna solo
+  // dopo che il refresh API completa.
+  const problemCount = problemsBadgeFromDispatcher > 0
+    ? problemsBadgeFromDispatcher
+    : problemItems.length;
 
   const cycleLayoutMode = useCallback(() => {
     setLayoutMode((current) => {
