@@ -174,6 +174,15 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
         }
     };
 
+    // Notifica tutti i client connessi (event-driven, no polling nel pannello provider).
+    nexus_events::dispatcher::broadcast_all_global(
+        nexus_events::ProjectEvent::ProviderHealthChanged {
+            provider: provider.to_string(),
+            status: if healthy { "up".to_string() } else { "down".to_string() },
+            latency_ms: Some(latency_ms as i64),
+        },
+    );
+
     // Persistenza fire-and-forget. Errori del DB non interrompono il loop.
     let row_result = sqlx::query(
         r#"INSERT INTO nexus_provider_health_history

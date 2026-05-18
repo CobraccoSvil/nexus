@@ -244,8 +244,26 @@ impl LearningScheduler {
             // Catch panics via std::panic::AssertUnwindSafe + catch_unwind is complex in async.
             // Un worker che panica causerà un errore gestito da tokio.
             // Per ora: chiamata diretta. Un wrapper di safety può essere aggiunto.
+            // Notifica inizio worker (system-wide, broadcast a tutti i client)
+            nexus_events::dispatcher::broadcast_all_global(
+                nexus_events::ProjectEvent::SubagentRunChanged {
+                    run_id: name.clone(),
+                    status: "started".to_string(),
+                    parent_run_id: None,
+                },
+            );
+
             let outcome = worker.run(context).await;
             let duration = start.elapsed().as_millis() as u64;
+
+            // Notifica completamento/fallimento worker
+            nexus_events::dispatcher::broadcast_all_global(
+                nexus_events::ProjectEvent::SubagentRunChanged {
+                    run_id: name.clone(),
+                    status: if outcome.success { "completed".to_string() } else { "failed".to_string() },
+                    parent_run_id: None,
+                },
+            );
 
             if !outcome.success {
                 warn!(

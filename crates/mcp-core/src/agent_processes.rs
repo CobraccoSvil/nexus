@@ -66,6 +66,15 @@ pub async fn spawn_agent_process(
     .await
     .map_err(|e| format!("DB insert error: {e}"))?;
 
+    // Notifica frontend: nuovo canale output disponibile per questo processo
+    nexus_events::dispatcher::emit_global(
+        project_id,
+        nexus_events::ProjectEvent::OutputChannelCreated {
+            channel_id: format!("agent:{}", process_id),
+            label: label.to_string(),
+        },
+    );
+
     // ── Scelta della strategia di spawn ──────────────────────────────────────
     //
     // A) Docker immagine progetto: servizi con Dockerfile proprio (isolamento completo,

@@ -465,6 +465,15 @@ pub async fn update_setting(
         Err(e) => return Json(serde_json::json!({ "status": "error", "error": e.to_string() })),
     };
 
+    // Notifica tutti i client connessi (evento system-wide)
+    let ns = key.split('_').next().unwrap_or("admin").to_string();
+    nexus_events::dispatcher::broadcast_all_global(
+        nexus_events::ProjectEvent::SettingChanged {
+            namespace: ns,
+            key: key.clone(),
+        },
+    );
+
     // Invalida cache DLP se è cambiata una chiave di configurazione DLP
     if matches!(key.as_str(), "dlp_enabled" | "dlp_allow_cloud_tier2" | "dlp_allow_cloud_tier3") {
         crate::dlp::invalidate_dlp_cache();
@@ -523,7 +532,17 @@ pub async fn bulk_update(
         .execute(&state.db)
         .await
         {
-            Ok(_) => updated += 1,
+            Ok(_) => {
+                updated += 1;
+                // Notifica per ogni setting aggiornato
+                let ns = entry.key.split('_').next().unwrap_or("admin").to_string();
+                nexus_events::dispatcher::broadcast_all_global(
+                    nexus_events::ProjectEvent::SettingChanged {
+                        namespace: ns,
+                        key: entry.key.clone(),
+                    },
+                );
+            }
             Err(e) => errors.push(format!("{}: {}", entry.key, e)),
         }
     }

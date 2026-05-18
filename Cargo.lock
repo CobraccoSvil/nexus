@@ -2144,6 +2144,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "futures",
+ "nexus-events",
  "nexus-types",
  "ort",
  "parking_lot",

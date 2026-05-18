@@ -177,6 +177,31 @@ pub fn emit_global(project_id: Uuid, event: ProjectEvent) -> Option<EnvelopedEve
     global_channels().map(|ch| emit(ch, project_id, event))
 }
 
+/// Broadcast di un evento system-wide a TUTTI i canali progetto attivi.
+/// Usato per eventi che non appartengono a un progetto specifico
+/// (es. ProviderHealthChanged, SettingChanged).
+/// Clona l'evento per ogni canale. No-op se nessun canale registrato.
+pub fn broadcast_all(channels: &ProjectChannels, event: ProjectEvent)
+where
+    ProjectEvent: Clone,
+{
+    let classifier = Classifier::rules_only();
+    for entry in channels.iter() {
+        let pid = *entry.key();
+        emit_with_classifier(channels, pid, event.clone(), &classifier);
+    }
+}
+
+/// Come [`broadcast_all`] ma usa il registry globale.
+pub fn broadcast_all_global(event: ProjectEvent)
+where
+    ProjectEvent: Clone,
+{
+    if let Some(ch) = global_channels() {
+        broadcast_all(ch, event);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

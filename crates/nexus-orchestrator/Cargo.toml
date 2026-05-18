@@ -21,6 +21,7 @@ chrono.workspace = true
 # Local crates
 ruvector = { path = "../ruvector" }
 nexus-types = { path = "../nexus-types" }
+nexus-events = { path = "../nexus-events" }
 
 # Orchestrator specific
 parking_lot = "0.12"
