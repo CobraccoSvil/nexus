@@ -42,6 +42,7 @@ export {
   selectMonitors,
   selectMutationsRecent,
   selectPlaywrightRuns,
+  selectPlaywrightConfigChangedAt,
   selectPorts,
   selectProblemsBadge,
   selectServicesMap,

@@ -244,6 +244,18 @@ pub async fn install_plugin(
     )
     .await;
 
+    // Emetti evento plugin installato (solo per plugin con scope progetto)
+    if let Some(pid) = project_id {
+        nexus_events::dispatcher::emit_global(
+            pid,
+            nexus_events::ProjectEvent::PluginChanged {
+                plugin_id: plugin_instance_id.to_string(),
+                slug: catalog.slug.clone(),
+                action: "installed".to_string(),
+            },
+        );
+    }
+
     Ok(Json(json!({
         "ok": true,
         "pluginInstanceId": plugin_instance_id.to_string(),
@@ -444,6 +456,17 @@ pub async fn uninstall_plugin(
     )
     .await;
 
+    if let Some(pid) = project_id {
+        nexus_events::dispatcher::emit_global(
+            pid,
+            nexus_events::ProjectEvent::PluginChanged {
+                plugin_id: plugin_instance_id.to_string(),
+                slug: plugin_slug.clone(),
+                action: "uninstalled".to_string(),
+            },
+        );
+    }
+
     Ok(Json(json!({
         "ok": true,
         "pluginInstanceId": plugin_instance_id.to_string(),
@@ -497,6 +520,19 @@ pub async fn toggle_plugin(
         json!({ "enabled": body.enabled }),
     )
     .await;
+
+    let project_id: Option<Uuid> = existing.try_get("project_id").unwrap_or(None);
+    let slug: String = existing.try_get("slug").unwrap_or_else(|_| "unknown".into());
+    if let Some(pid) = project_id {
+        nexus_events::dispatcher::emit_global(
+            pid,
+            nexus_events::ProjectEvent::PluginChanged {
+                plugin_id: plugin_instance_id.to_string(),
+                slug,
+                action: if body.enabled { "enabled".to_string() } else { "disabled".to_string() },
+            },
+        );
+    }
 
     Ok(Json(json!({ "ok": true, "enabled": body.enabled })))
 }

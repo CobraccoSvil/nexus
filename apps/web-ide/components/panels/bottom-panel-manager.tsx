@@ -45,6 +45,7 @@ export interface BottomPanelManagerProps {
   outputEvents: OutputEvent[];
   ports: PortEntry[];
   playwrightRuns: PlaywrightRunSummary[];
+  playwrightConfigured?: boolean;
   traces?: AITraceEvent[];
   onOpenFile: (path: string, line?: number) => void;
   onSelectOutputChannel: (id: string) => void;
@@ -99,6 +100,7 @@ export function BottomPanelManager({
   outputEvents,
   ports,
   playwrightRuns,
+  playwrightConfigured,
   traces = [],
   onOpenFile,
   onSelectOutputChannel,
@@ -359,10 +361,12 @@ export function BottomPanelManager({
           gap: 8,
         }}>
           <span style={{ fontSize: 11, color: tc.textMuted }}>
-            {playwrightRuns.length > 0 ? `${playwrightRuns.length} run` : "Nessun run"}
+            {playwrightRuns.length > 0
+              ? `${playwrightRuns.length} run`
+              : playwrightConfigured ? "Configurato" : "Nessun run"}
           </span>
           <div style={{ display: "flex", gap: 6 }}>
-            {onSendToChat && (
+            {onSendToChat && !playwrightConfigured && (
               <button
                 onClick={handleEnablePlaywright}
                 title="Configura Playwright nel progetto tramite Nexus"
@@ -398,7 +402,11 @@ export function BottomPanelManager({
         <div style={{ padding: 12, overflow: "auto", flex: 1, minHeight: 0 }}>
           {playwrightRuns.length === 0 ? (
             <div style={{ color: tc.textMuted, fontSize: 12 }}>
-              Nessun run Playwright disponibile. Premi <strong>Abilita Playwright</strong> per configurare il framework di test, poi <strong>Avvia test</strong> per eseguirli.
+              {playwrightConfigured ? (
+                <>Playwright configurato. Premi <strong>Avvia test</strong> per eseguire i test e2e.</>
+              ) : (
+                <>Nessun run Playwright disponibile. Premi <strong>Abilita Playwright</strong> per configurare il framework di test, poi <strong>Avvia test</strong> per eseguirli.</>
+              )}
             </div>
           ) : (
             playwrightRuns.map((run) => {

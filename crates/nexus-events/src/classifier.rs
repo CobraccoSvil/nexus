@@ -145,6 +145,22 @@ impl Classifier {
                 })
             }
             ProjectEvent::DbQueryRun { .. } => None, // query veloci non emettono hint
+            ProjectEvent::DbConfigUpdated { name, action, .. } => Some(UiHint {
+                highlight_panel: Some("database".into()),
+                toast_severity: Some("success".into()),
+                toast_msg: Some(format!(
+                    "Connessione DB '{}' {}",
+                    name,
+                    match action.as_str() {
+                        "created" => "configurata",
+                        "updated" => "aggiornata",
+                        "deleted" => "rimossa",
+                        _ => "modificata",
+                    }
+                )),
+                flash_duration_ms: Some(600),
+                ..Default::default()
+            }),
 
             // ── Notifiche dall'agente (gia' decise dal modello) ───────
             ProjectEvent::Notification {
@@ -197,6 +213,129 @@ impl Classifier {
             // mutazione HTTP). I pannelli interessati ascoltano via
             // `useEventOfKind("mutation_recorded", ...)` se serve.
             ProjectEvent::MutationRecorded { .. } => None,
+
+            // ── Project lifecycle ─────────────────────────────────────
+            ProjectEvent::ProjectCreated { name, .. } => Some(UiHint {
+                toast_severity: Some("success".into()),
+                toast_msg: Some(format!("Progetto '{}' creato", name)),
+                flash_duration_ms: Some(600),
+                ..Default::default()
+            }),
+            ProjectEvent::ProjectDeleted { name } => Some(UiHint {
+                toast_severity: Some("info".into()),
+                toast_msg: Some(format!("Progetto '{}' eliminato", name)),
+                flash_duration_ms: Some(600),
+                ..Default::default()
+            }),
+
+            // ── Database migrations ──────────────────────────────────
+            ProjectEvent::MigrationApplied { migration_name, version } => Some(UiHint {
+                highlight_panel: Some("database".into()),
+                toast_severity: Some("success".into()),
+                toast_msg: Some(format!("Migrazione '{}' (v{}) applicata", migration_name, version)),
+                flash_duration_ms: Some(600),
+                ..Default::default()
+            }),
+            ProjectEvent::MigrationRolledBack { migration_name, version } => Some(UiHint {
+                highlight_panel: Some("database".into()),
+                toast_severity: Some("warning".into()),
+                toast_msg: Some(format!("Migrazione '{}' (v{}) annullata", migration_name, version)),
+                flash_duration_ms: Some(600),
+                ..Default::default()
+            }),
+
+            // ── Run configurations ───────────────────────────────────
+            ProjectEvent::RunConfigChanged { label, action, .. } => Some(UiHint {
+                highlight_panel: Some("services".into()),
+                toast_severity: Some("info".into()),
+                toast_msg: Some(format!(
+                    "Config run '{}' {}",
+                    label,
+                    match action.as_str() {
+                        "created" => "creata",
+                        "updated" => "aggiornata",
+                        "deleted" => "eliminata",
+                        _ => "modificata",
+                    }
+                )),
+                flash_duration_ms: Some(400),
+                ..Default::default()
+            }),
+
+            // ── Memory ───────────────────────────────────────────────
+            ProjectEvent::MemoryUpdated { category, count_delta } => {
+                let action = if *count_delta > 0 { "aggiunto" } else { "rimosso" };
+                Some(UiHint {
+                    toast_severity: Some("info".into()),
+                    toast_msg: Some(format!("Memoria {}: elemento {}", category, action)),
+                    flash_duration_ms: Some(300),
+                    ..Default::default()
+                })
+            }
+
+            // ── Provider health ───────────────────────────────────────
+            ProjectEvent::ProviderHealthChanged { provider, status, .. } => {
+                let (sev, msg) = match status.as_str() {
+                    "down" => ("error", format!("Provider {} non raggiungibile", provider)),
+                    "degraded" => ("warning", format!("Provider {} degradato", provider)),
+                    _ => ("success", format!("Provider {} operativo", provider)),
+                };
+                Some(UiHint {
+                    toast_severity: Some(sev.into()),
+                    toast_msg: Some(msg),
+                    flash_duration_ms: Some(400),
+                    ..Default::default()
+                })
+            }
+
+            // ── Plugin lifecycle ─────────────────────────────────────
+            ProjectEvent::PluginChanged { slug, action, .. } => Some(UiHint {
+                toast_severity: Some("info".into()),
+                toast_msg: Some(format!(
+                    "Plugin '{}' {}",
+                    slug,
+                    match action.as_str() {
+                        "installed" => "installato",
+                        "uninstalled" => "disinstallato",
+                        "enabled" => "abilitato",
+                        "disabled" => "disabilitato",
+                        _ => "modificato",
+                    }
+                )),
+                flash_duration_ms: Some(400),
+                ..Default::default()
+            }),
+
+            // ── Settings ─────────────────────────────────────────────
+            ProjectEvent::SettingChanged { .. } => None, // silente, i pannelli reagiscono
+            // ── Subagent runs ────────────────────────────────────────
+            ProjectEvent::SubagentRunChanged { .. } => None, // silente, pannello orchestratore reagisce
+            // ── Quality scan progress ────────────────────────────────
+            ProjectEvent::QualityScanProgress { phase, percent, .. } => {
+                if phase == "started" {
+                    Some(UiHint {
+                        highlight_panel: Some("problems".into()),
+                        toast_severity: Some("info".into()),
+                        toast_msg: Some("Scansione qualita' avviata".into()),
+                        flash_duration_ms: Some(300),
+                        ..Default::default()
+                    })
+                } else if phase == "completed" {
+                    Some(UiHint {
+                        highlight_panel: Some("problems".into()),
+                        toast_severity: Some("success".into()),
+                        toast_msg: Some("Scansione qualita' completata".into()),
+                        flash_duration_ms: Some(600),
+                        ..Default::default()
+                    })
+                } else {
+                    // progress: silente, aggiorna solo la barra
+                    let _ = percent; // evita warning unused
+                    None
+                }
+            }
+            // ── Output channels ──────────────────────────────────────
+            ProjectEvent::OutputChannelCreated { .. } => None, // silente
 
             // ── Eventi di arricchimento ───────────────────────────────
             // EventEnriched e' il VEICOLO di hint, non un evento da

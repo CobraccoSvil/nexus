@@ -101,7 +101,18 @@ pub async fn get_pool_for_project(
     let dsn = String::from_utf8(secret_bytes)
         .map_err(|_| "connection_secret non e' UTF-8 valido".to_string())?;
 
-    get_pool_for_dsn(dsn.trim()).await
+    // Applica max_db_pool_size dalla quota del progetto (cache 60s, no round-trip
+    // aggiuntivo in hot path). Se la quota non esiste usa emergency_default (10).
+    let quota = crate::security::quotas::load_quota(nexus_pool, project_id).await;
+    let max_conn = (quota.max_db_pool_size.max(1) as u32).min(50); // cap ragionevole
+
+    let normalized = normalize_dsn(dsn.trim())?;
+    PgPoolOptions::new()
+        .max_connections(max_conn)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&normalized)
+        .await
+        .map_err(|e| format!("connect failed: {}", e))
 }
 
 /// Wrapper pubblico di `normalize_dsn` per uso da altri moduli.

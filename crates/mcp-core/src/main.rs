@@ -515,6 +515,9 @@ async fn main() -> anyhow::Result<()> {
         project_channels: nexus_events::dispatcher::new_registry(),
         monitor_registry: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
     };
+    // Singleton globale per emit da contesti senza &ProjectChannels (NexusToolHandler).
+    nexus_events::dispatcher::init_global(state.project_channels.clone());
+
     chat_learning::spawn_vector_compaction_scheduler(state.clone());
     nexus_builtin::seed_tools_and_server(&state.db).await;
     // Reindex semantico Qdrant dei tool MCP (fire-and-forget, +30s delay).

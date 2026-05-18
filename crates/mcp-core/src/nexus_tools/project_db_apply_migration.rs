@@ -93,6 +93,13 @@ impl NexusToolHandler for ProjectDbApplyMigrationTool {
                         "UPDATE project_migration_history SET status='applied', applied_at=NOW(), applied_by_agent='nexus-agent' WHERE id=$1"
                     ).bind(id).execute(&nexus_pool).await.ok();
                     applied.push(json!({"filename": &filename, "status": "applied"}));
+                    nexus_events::dispatcher::emit_global(
+                        ctx.project_id,
+                        nexus_events::ProjectEvent::MigrationApplied {
+                            migration_name: filename.clone(),
+                            version: id.to_string(),
+                        },
+                    );
                 }
                 Err(e) => {
                     sqlx::query(

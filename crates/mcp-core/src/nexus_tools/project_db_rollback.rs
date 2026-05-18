@@ -81,6 +81,13 @@ impl NexusToolHandler for ProjectDbRollbackTool {
                 sqlx::query(
                     "UPDATE project_migration_history SET status='rolled_back', rolled_back_at=NOW() WHERE id=$1"
                 ).bind(migration_id).execute(&nexus_pool).await.ok();
+                nexus_events::dispatcher::emit_global(
+                    ctx.project_id,
+                    nexus_events::ProjectEvent::MigrationRolledBack {
+                        migration_name: filename.clone(),
+                        version: migration_id.to_string(),
+                    },
+                );
                 nexus_pool.close().await;
                 Ok(json!({"ok": true, "rolled_back": filename}))
             }

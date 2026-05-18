@@ -43,6 +43,7 @@ export type ProjectEvent =
   | { kind: "FileChanged"; path: string; op: "created" | "modified" | "deleted" }
   | { kind: "GitStatusChanged"; branch: string; ahead: number; behind: number; modified_count: number }
   | { kind: "DbQueryRun"; query_id?: string; duration_ms: number; rows: number; statement_kind: string }
+  | { kind: "DbConfigUpdated"; name: string; engine?: string; action: string }
   | { kind: "AgentToolUsed"; run_id: string; tool: string; target_resource?: string }
   | { kind: "Notification"; severity: string; message: string; panel?: string; ttl_ms?: number; run_id?: string }
   | { kind: "FlagChanged"; key: string; value: unknown }
@@ -54,6 +55,18 @@ export type ProjectEvent =
   | { kind: "ChatSessionStatusChanged"; session_id: string; status: string }
   | { kind: "MutationRecorded"; method: string; path: string; status_code: number; session_id?: string; summary?: string; actor_user_id?: string }
   | { kind: "EventEnriched"; event_id: string; ui_hint?: UiHint; semantic_tags?: string[]; severity_inferred?: string; panel_target?: string }
+  | { kind: "ProjectCreated"; name: string; slug: string }
+  | { kind: "ProjectDeleted"; name: string }
+  | { kind: "MigrationApplied"; migration_name: string; version: string }
+  | { kind: "MigrationRolledBack"; migration_name: string; version: string }
+  | { kind: "RunConfigChanged"; config_id: string; label: string; action: string }
+  | { kind: "MemoryUpdated"; category: string; count_delta: number }
+  | { kind: "ProviderHealthChanged"; provider: string; status: string; latency_ms?: number }
+  | { kind: "PluginChanged"; plugin_id: string; slug: string; action: string }
+  | { kind: "SettingChanged"; namespace: string; key: string }
+  | { kind: "SubagentRunChanged"; run_id: string; status: string; parent_run_id?: string }
+  | { kind: "QualityScanProgress"; scan_id: string; phase: string; percent?: number }
+  | { kind: "OutputChannelCreated"; channel_id: string; label: string }
   | { kind: "SnapshotRequired"; reason: string; last_known_seq: number };
 
 export interface EnvelopedEvent {

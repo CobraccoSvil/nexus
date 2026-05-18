@@ -313,18 +313,13 @@ pub async fn register_project(
     )
     .await?;
 
-    // Emetti evento di creazione progetto sul dispatcher. Permette ai pannelli
-    // frontend di aggiornarsi in tempo reale senza polling.
+    // Emetti evento tipizzato di creazione progetto sul dispatcher.
     let _ = nexus_events::dispatcher::emit(
         &state.project_channels,
         project_id,
-        nexus_events::ProjectEvent::MutationRecorded {
-            method: "POST".to_string(),
-            path: "/api/projects/register".to_string(),
-            status_code: 200,
-            session_id: None,
-            summary: Some(format!("Progetto '{}' creato", project_name)),
-            actor_user_id: Some(user_id),
+        nexus_events::ProjectEvent::ProjectCreated {
+            name: project_name.clone(),
+            slug: slug.clone(),
         },
     );
 
@@ -527,6 +522,8 @@ pub async fn delete_project(
         }
     }
 
+    let project_name = context.details.name.clone();
+
     // Elimina dal DB (cascade su workspaces, repositories, agent_runs, ecc.)
     sqlx::query("DELETE FROM projects WHERE id = $1 AND owner_user_id = $2")
         .bind(project_id)
@@ -534,6 +531,15 @@ pub async fn delete_project(
         .execute(&state.db)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Emetti evento tipizzato di eliminazione progetto sul dispatcher.
+    let _ = nexus_events::dispatcher::emit(
+        &state.project_channels,
+        project_id,
+        nexus_events::ProjectEvent::ProjectDeleted {
+            name: project_name.clone(),
+        },
+    );
 
     // Elimina la directory locale.
     // Tentativo preliminare di chmod -R u+rwX per recuperare file readonly

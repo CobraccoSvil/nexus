@@ -12,7 +12,7 @@
 //! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -153,6 +153,28 @@ pub fn cleanup_idle(channels: &ProjectChannels) -> usize {
         }
     });
     removed
+}
+
+// ── Singleton globale per emit da contesti senza &ProjectChannels ────────
+
+static GLOBAL_CHANNELS: OnceLock<ProjectChannels> = OnceLock::new();
+
+/// Inizializza il registry globale. Chiamare una sola volta in `main()`.
+/// Chiamate successive sono no-op (il primo vince).
+pub fn init_global(channels: ProjectChannels) {
+    let _ = GLOBAL_CHANNELS.set(channels);
+}
+
+/// Ritorna il registry globale se inizializzato.
+pub fn global_channels() -> Option<&'static ProjectChannels> {
+    GLOBAL_CHANNELS.get()
+}
+
+/// Emette un evento usando il registry globale. No-op silenzioso se non
+/// inizializzato (pre-main o in test senza setup). Utile per tool che non
+/// hanno accesso diretto a `&ProjectChannels` (es. NexusToolHandler).
+pub fn emit_global(project_id: Uuid, event: ProjectEvent) -> Option<EnvelopedEvent> {
+    global_channels().map(|ch| emit(ch, project_id, event))
 }
 
 #[cfg(test)]

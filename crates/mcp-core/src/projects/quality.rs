@@ -107,6 +107,15 @@ pub async fn run_quality_scan(
     let channels = state.project_channels.clone();
     tokio::spawn(async move {
         let started = std::time::Instant::now();
+        nexus_events::dispatcher::emit(
+            &channels,
+            project_id,
+            nexus_events::ProjectEvent::QualityScanProgress {
+                scan_id: scan_id.to_string(),
+                phase: "started".to_string(),
+                percent: Some(0),
+            },
+        );
         match perform_quality_scan(&db, &orchestrator, project_id, &root_path, &dep_status).await {
             Ok((files_scanned, total_findings, by_severity, by_category)) => {
                 let duration_ms = started.elapsed().as_millis() as i32;
@@ -127,6 +136,15 @@ pub async fn run_quality_scan(
                 .bind(scan_id)
                 .execute(&db)
                 .await;
+                nexus_events::dispatcher::emit(
+                    &channels,
+                    project_id,
+                    nexus_events::ProjectEvent::QualityScanProgress {
+                        scan_id: scan_id.to_string(),
+                        phase: "completed".to_string(),
+                        percent: Some(100),
+                    },
+                );
                 nexus_events::dispatcher::emit(
                     &channels,
                     project_id,

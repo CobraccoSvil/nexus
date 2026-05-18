@@ -182,10 +182,21 @@ impl NexusToolHandler for ProjectDbSetConnectionTool {
                 let saved_name: String = r.try_get("name").unwrap_or_default();
                 let saved_engine: Option<String> = r.try_get("engine").unwrap_or(None);
                 let saved_dsn: Option<String> = r.try_get("connection_string").unwrap_or(None);
+                let action_str = if existing_id.is_some() { "updated" } else { "created" };
+
+                // Notifica il pannello DB frontend via dispatcher SSE
+                nexus_events::dispatcher::emit_global(
+                    project_id,
+                    nexus_events::event::ProjectEvent::DbConfigUpdated {
+                        name: saved_name.clone(),
+                        engine: saved_engine.clone(),
+                        action: action_str.to_string(),
+                    },
+                );
 
                 Ok(json!({
                     "ok": true,
-                    "action": if existing_id.is_some() { "updated" } else { "created" },
+                    "action": action_str,
                     "name": saved_name,
                     "engine": saved_engine,
                     "connection_string": saved_dsn,

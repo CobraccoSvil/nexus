@@ -120,6 +120,14 @@ pub enum ProjectEvent {
         rows: i64,
         statement_kind: String, // "select" | "insert" | "update" | "ddl" | ...
     },
+    /// Configurazione DB del progetto creata/aggiornata/rimossa.
+    /// Emesso da `project_db_set_connection` tool — il pannello DB frontend
+    /// ascolta questo evento per ricaricare automaticamente i dati.
+    DbConfigUpdated {
+        name: String,
+        engine: Option<String>,
+        action: String, // "created" | "updated" | "deleted"
+    },
 
     // ── Agent meta (osservabilita') ────────────────────────────────────
     AgentToolUsed {
@@ -223,7 +231,92 @@ pub enum ProjectEvent {
         panel_target: Option<String>,
     },
 
-    // ── Eventi di servizio del dispatcher ──────────────────────────────
+    // ── Project lifecycle ──────────────────────────────────────────────
+    /// Progetto registrato (creato). Emesso da `register_project`.
+    /// La sidebar progetti ascolta per aggiornare la lista in tempo reale.
+    ProjectCreated {
+        name: String,
+        slug: String,
+    },
+    /// Progetto eliminato. Emesso da `delete_project`.
+    ProjectDeleted {
+        name: String,
+    },
+
+    // ── Database migrations ─────────────────────────────────────────────
+    /// Migrazione applicata con successo.
+    MigrationApplied {
+        migration_name: String,
+        version: String,
+    },
+    /// Migrazione annullata (rollback).
+    MigrationRolledBack {
+        migration_name: String,
+        version: String,
+    },
+
+    // ── Run configurations ──────────────────────────────────────────────
+    /// Configurazione run creata/aggiornata/eliminata.
+    RunConfigChanged {
+        config_id: String,
+        label: String,
+        action: String, // "created" | "updated" | "deleted"
+    },
+
+    // ── Memory / reasoning bank ─────────────────────────────────────────
+    /// Elemento di memoria inserito/aggiornato/eliminato.
+    MemoryUpdated {
+        category: String, // "pattern" | "fact" | "decision" | ...
+        count_delta: i32,
+    },
+
+    // ── Provider health ───────────────────────────────────────────────────
+    /// Cambio stato salute di un provider AI.
+    ProviderHealthChanged {
+        provider: String,
+        status: String, // "up" | "down" | "degraded"
+        latency_ms: Option<i64>,
+    },
+
+    // ── Plugin lifecycle ─────────────────────────────────────────────────
+    /// Plugin installato/disinstallato/abilitato/disabilitato.
+    PluginChanged {
+        plugin_id: String,
+        slug: String,
+        action: String, // "installed" | "uninstalled" | "enabled" | "disabled"
+    },
+
+    // ── Settings ─────────────────────────────────────────────────────────
+    /// Impostazione di sistema modificata.
+    SettingChanged {
+        namespace: String,
+        key: String,
+    },
+
+    // ── Subagent lifecycle ───────────────────────────────────────────────
+    /// Ciclo di vita di un sub-agente orchestrato.
+    SubagentRunChanged {
+        run_id: String,
+        status: String, // "started" | "completed" | "failed"
+        parent_run_id: Option<String>,
+    },
+
+    // ── Quality scan progress ────────────────────────────────────────────
+    /// Progresso dello scan qualita' (oltre il FindingsUpdated finale).
+    QualityScanProgress {
+        scan_id: String,
+        phase: String, // "started" | "progress" | "completed"
+        percent: Option<u8>,
+    },
+
+    // ── Output channels ──────────────────────────────────────────────────
+    /// Nuovo canale di output registrato (es. agent:xxx).
+    OutputChannelCreated {
+        channel_id: String,
+        label: String,
+    },
+
+    // ── Eventi di servizio del dispatcher ──────────────────────────────────
     /// Inviato quando il consumer e' rimasto indietro oltre la capacita'
     /// del ring buffer. Il client deve ricaricare lo snapshot REST.
     SnapshotRequired {
@@ -246,7 +339,7 @@ impl ProjectEvent {
             | Self::ServiceRestarted { .. } => TOPIC_SERVICES,
             Self::FileChanged { .. } => TOPIC_FILES,
             Self::GitStatusChanged { .. } => TOPIC_GIT,
-            Self::DbQueryRun { .. } => TOPIC_DATABASE,
+            Self::DbQueryRun { .. } | Self::DbConfigUpdated { .. } => TOPIC_DATABASE,
             Self::AgentToolUsed { .. } => TOPIC_AGENT,
             Self::Notification { .. } => TOPIC_NOTIFICATION,
             Self::FlagChanged { .. } => TOPIC_FLAGS,
@@ -257,6 +350,16 @@ impl ProjectEvent {
             | Self::ChatSessionStatusChanged { .. } => TOPIC_CHAT,
             Self::MutationRecorded { .. } => TOPIC_MUTATION,
             Self::EventEnriched { .. } => TOPIC_META,
+            Self::ProjectCreated { .. } | Self::ProjectDeleted { .. } => TOPIC_SYSTEM,
+            Self::MigrationApplied { .. } | Self::MigrationRolledBack { .. } => TOPIC_DATABASE,
+            Self::RunConfigChanged { .. } => TOPIC_SERVICES,
+            Self::MemoryUpdated { .. } => TOPIC_AGENT,
+            Self::ProviderHealthChanged { .. } => TOPIC_SYSTEM,
+            Self::PluginChanged { .. } => TOPIC_SYSTEM,
+            Self::SettingChanged { .. } => TOPIC_FLAGS,
+            Self::SubagentRunChanged { .. } => TOPIC_AGENT,
+            Self::QualityScanProgress { .. } => TOPIC_PROBLEMS,
+            Self::OutputChannelCreated { .. } => TOPIC_SERVICES,
             Self::SnapshotRequired { .. } => TOPIC_SYSTEM,
         }
     }
@@ -276,6 +379,7 @@ impl ProjectEvent {
             Self::FileChanged { .. } => "FileChanged",
             Self::GitStatusChanged { .. } => "GitStatusChanged",
             Self::DbQueryRun { .. } => "DbQueryRun",
+            Self::DbConfigUpdated { .. } => "DbConfigUpdated",
             Self::AgentToolUsed { .. } => "AgentToolUsed",
             Self::Notification { .. } => "Notification",
             Self::FlagChanged { .. } => "FlagChanged",
@@ -287,6 +391,18 @@ impl ProjectEvent {
             Self::ChatSessionStatusChanged { .. } => "ChatSessionStatusChanged",
             Self::MutationRecorded { .. } => "MutationRecorded",
             Self::EventEnriched { .. } => "EventEnriched",
+            Self::ProjectCreated { .. } => "ProjectCreated",
+            Self::ProjectDeleted { .. } => "ProjectDeleted",
+            Self::MigrationApplied { .. } => "MigrationApplied",
+            Self::MigrationRolledBack { .. } => "MigrationRolledBack",
+            Self::RunConfigChanged { .. } => "RunConfigChanged",
+            Self::MemoryUpdated { .. } => "MemoryUpdated",
+            Self::ProviderHealthChanged { .. } => "ProviderHealthChanged",
+            Self::PluginChanged { .. } => "PluginChanged",
+            Self::SettingChanged { .. } => "SettingChanged",
+            Self::SubagentRunChanged { .. } => "SubagentRunChanged",
+            Self::QualityScanProgress { .. } => "QualityScanProgress",
+            Self::OutputChannelCreated { .. } => "OutputChannelCreated",
             Self::SnapshotRequired { .. } => "SnapshotRequired",
         }
     }

@@ -629,7 +629,26 @@ pub async fn get_playwright_runs(
         })
         .collect::<Vec<_>>();
 
-    Ok(Json(json!({ "runs": runs })))
+    // Verifica se Playwright e' configurato (config file nella project root)
+    let project_root: Option<String> = sqlx::query_scalar(
+        "SELECT project_root FROM projects WHERE id = $1",
+    )
+    .bind(project_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    let configured = if let Some(root) = &project_root {
+        let root_path = std::path::Path::new(root);
+        root_path.join("playwright.config.ts").exists()
+            || root_path.join("playwright.config.js").exists()
+            || root_path.join("playwright.config.mjs").exists()
+    } else {
+        false
+    };
+
+    Ok(Json(json!({ "runs": runs, "configured": configured })))
 }
 
 /// GET /api/projects/:id/playwright/runs/:run_id  — dettaglio singolo run con output_log.

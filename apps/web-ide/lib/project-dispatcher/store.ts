@@ -85,6 +85,26 @@ export interface ProjectStoreState {
   };
   mutations: { recent: MutationRecord[] };
   enrichments: { byEventId: Record<string, EventEnrichment> };
+  // Project lifecycle: timestamp dell'ultimo evento per trigger refresh lista progetti
+  projectLifecycle: { lastChangeAt: number };
+  // Database migrations: timestamp dell'ultimo evento per trigger refresh lista migrazioni
+  migrations: { lastChangeAt: number };
+  // Run configurations: timestamp dell'ultimo evento per trigger refresh lista config
+  runConfigs: { lastChangeAt: number };
+  // Memory: timestamp dell'ultimo aggiornamento per trigger refresh pannello memoria
+  memory: { lastChangeAt: number };
+  // Provider health: ultimo stato per provider
+  providerHealth: { lastChangeAt: number };
+  // Plugin: timestamp dell'ultimo evento per trigger refresh
+  plugins: { lastChangeAt: number };
+  // Settings: timestamp dell'ultimo evento per trigger refresh
+  settings: { lastChangeAt: number };
+  // Subagent runs: ultimo stato
+  subagentRuns: { lastChangeAt: number };
+  // Quality scan progress
+  qualityScan: { scanId?: string; phase: string; percent: number; ts: number } | null;
+  // Output channels
+  outputChannels: { lastChangeAt: number };
   // Findings updates: ultimo evento FindingsUpdated ricevuto (con resolved_ids).
   // I componenti come optimization-panel ascoltano per applicare delta in-place
   // senza ri-scansionare.
@@ -143,6 +163,16 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
   chat: { lastCompactBySession: {}, lastMessageBySession: {}, statusBySession: {} },
   mutations: { recent: [] },
   enrichments: { byEventId: {} },
+  projectLifecycle: { lastChangeAt: 0 },
+  migrations: { lastChangeAt: 0 },
+  runConfigs: { lastChangeAt: 0 },
+  memory: { lastChangeAt: 0 },
+  providerHealth: { lastChangeAt: 0 },
+  plugins: { lastChangeAt: 0 },
+  settings: { lastChangeAt: 0 },
+  subagentRuns: { lastChangeAt: 0 },
+  qualityScan: null,
+  outputChannels: { lastChangeAt: 0 },
   findingsUpdate: null,
 
   toasts: [],
@@ -442,6 +472,65 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
         }
         break;
       }
+      // ── Project lifecycle ──────────────────────────────────────────
+      case "ProjectCreated":
+      case "ProjectDeleted": {
+        next.projectLifecycle = { lastChangeAt: env.ts };
+        break;
+      }
+      // ── Database migrations ─────────────────────────────────────────
+      case "MigrationApplied":
+      case "MigrationRolledBack": {
+        next.migrations = { lastChangeAt: env.ts };
+        // Aggiorna anche il timestamp DB config per triggerare refresh pannello DB
+        next.database = { ...next.database, configUpdatedAt: env.ts };
+        break;
+      }
+      // ── Run configurations ──────────────────────────────────────────
+      case "RunConfigChanged": {
+        next.runConfigs = { lastChangeAt: env.ts };
+        break;
+      }
+      // ── Memory ──────────────────────────────────────────────────────
+      case "MemoryUpdated": {
+        next.memory = { lastChangeAt: env.ts };
+        break;
+      }
+      // ── Provider health ───────────────────────────────────────────
+      case "ProviderHealthChanged": {
+        next.providerHealth = { lastChangeAt: env.ts };
+        break;
+      }
+      // ── Plugin lifecycle ──────────────────────────────────────────
+      case "PluginChanged": {
+        next.plugins = { lastChangeAt: env.ts };
+        break;
+      }
+      // ── Settings ──────────────────────────────────────────────────
+      case "SettingChanged": {
+        next.settings = { lastChangeAt: env.ts };
+        break;
+      }
+      // ── Subagent runs ─────────────────────────────────────────────
+      case "SubagentRunChanged": {
+        next.subagentRuns = { lastChangeAt: env.ts };
+        break;
+      }
+      // ── Quality scan progress ─────────────────────────────────────
+      case "QualityScanProgress": {
+        next.qualityScan = {
+          scanId: p.scan_id,
+          phase: p.phase,
+          percent: p.percent ?? 0,
+          ts: env.ts,
+        };
+        break;
+      }
+      // ── Output channels ───────────────────────────────────────────
+      case "OutputChannelCreated": {
+        next.outputChannels = { lastChangeAt: env.ts };
+        break;
+      }
       case "Notification":
       case "HighlightPanel":
       case "AgentToolUsed":
@@ -539,6 +628,16 @@ export const selectMutationsRecent = (s: ProjectStoreState) => s.mutations.recen
 export const selectEnrichmentByEventId = (eventId: string) => (s: ProjectStoreState) =>
   s.enrichments.byEventId[eventId] ?? null;
 export const selectFindingsUpdate = (s: ProjectStoreState) => s.findingsUpdate;
+export const selectProjectLifecycleAt = (s: ProjectStoreState) => s.projectLifecycle.lastChangeAt;
+export const selectMigrationsChangedAt = (s: ProjectStoreState) => s.migrations.lastChangeAt;
+export const selectRunConfigsChangedAt = (s: ProjectStoreState) => s.runConfigs.lastChangeAt;
+export const selectMemoryChangedAt = (s: ProjectStoreState) => s.memory.lastChangeAt;
+export const selectProviderHealthChangedAt = (s: ProjectStoreState) => s.providerHealth.lastChangeAt;
+export const selectPluginsChangedAt = (s: ProjectStoreState) => s.plugins.lastChangeAt;
+export const selectSettingsChangedAt = (s: ProjectStoreState) => s.settings.lastChangeAt;
+export const selectSubagentRunsChangedAt = (s: ProjectStoreState) => s.subagentRuns.lastChangeAt;
+export const selectQualityScan = (s: ProjectStoreState) => s.qualityScan;
+export const selectOutputChannelsChangedAt = (s: ProjectStoreState) => s.outputChannels.lastChangeAt;
 export const subscribeAll = (
   listener: (env: EnvelopedEvent) => void,
 ) => useProjectStore.getState().subscribeAll(listener);

@@ -102,11 +102,41 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         ctx.root_path.clone()
     };
 
-    // Kill processi precedenti con la stessa label per evitare duplicati
+    // ── Deduplicazione servizi: kill processi simili + cleanup orfani ────────
+    // L'agente AI spesso usa label leggermente diverse per lo stesso servizio
+    // ("Backend Taskboard", "Backend API", "Taskboard Backend"). Per evitare
+    // duplicati, confrontiamo con similarita' normalizzata oltre che esatta.
     if let Ok(existing) = crate::agent_processes::list_processes(&ctx.db, ctx.project_id).await {
-        for proc in existing.iter().filter(|p| p.label == label && (p.status == "running" || p.status == "starting")) {
-            let _ = crate::agent_processes::stop_process(&ctx.db, proc.id).await;
+        let label_lower = label.to_lowercase();
+        let label_words: std::collections::HashSet<&str> = label_lower.split_whitespace().collect();
+
+        for proc in existing.iter().filter(|p| p.status == "running" || p.status == "starting") {
+            let proc_lower = proc.label.to_lowercase();
+            let proc_words: std::collections::HashSet<&str> = proc_lower.split_whitespace().collect();
+
+            // Match esatto o similarita': almeno una parola significativa in comune
+            // (escludiamo parole generiche come "service", "server", "run")
+            let dominated = proc.label == label || {
+                const GENERIC: &[&str] = &["service", "server", "run", "dev", "start"];
+                let meaningful_common = label_words.intersection(&proc_words)
+                    .filter(|w| !GENERIC.contains(w) && w.len() > 2)
+                    .count();
+                meaningful_common > 0
+            };
+
+            if dominated {
+                tracing::info!(
+                    old_label = %proc.label,
+                    new_label = %label,
+                    proc_id = %proc.id,
+                    "run_service: kill processo simile prima di riavvio"
+                );
+                let _ = crate::agent_processes::stop_process(&ctx.db, proc.id).await;
+            }
         }
+
+        // Cleanup porte allocate per processi morti di questo progetto
+        cleanup_dead_process_ports(&ctx.db, ctx.project_id, &existing).await;
     }
 
     // ── Quota container (PR hardening) ────────────────────────────────────
@@ -240,6 +270,57 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
             }
         }
         Err(e) => format!("[Errore avvio servizio '{}': {}]", label, e),
+    }
+}
+
+/// Rilascia porte allocate (dynamic) il cui processo e' morto.
+/// Controlla `agent_processes` per processi non-running di questo progetto
+/// e rimuove le porte allocate che non hanno piu' un processo attivo.
+async fn cleanup_dead_process_ports(
+    db: &sqlx::PgPool,
+    project_id: uuid::Uuid,
+    processes: &[crate::agent_processes::ProcessSummary],
+) {
+    // Raccogli le label dei processi ancora attivi
+    let active_labels: std::collections::HashSet<String> = processes
+        .iter()
+        .filter(|p| p.status == "running" || p.status == "starting")
+        .map(|p| p.label.clone())
+        .collect();
+
+    // Prendi le porte allocate dinamicamente per questo progetto
+    let rows = sqlx::query_as::<_, (i32, String)>(
+        "SELECT port, label FROM nexus_port_allocations \
+         WHERE project_id = $1 AND allocation_mode = 'dynamic'"
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await;
+
+    if let Ok(allocations) = rows {
+        for (port, alloc_label) in allocations {
+            // Se nessun processo attivo corrisponde a questa allocazione, rilasciala
+            if !active_labels.contains(&alloc_label) {
+                // Verifica anche che la porta non sia effettivamente in uso (bind test)
+                let port_in_use = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+                    .await
+                    .is_err();
+                if !port_in_use {
+                    let _ = sqlx::query(
+                        "DELETE FROM nexus_port_allocations WHERE project_id = $1 AND port = $2"
+                    )
+                    .bind(project_id)
+                    .bind(port)
+                    .execute(db)
+                    .await;
+                    tracing::info!(
+                        port = port,
+                        label = %alloc_label,
+                        "cleanup: porta dinamica rilasciata (processo morto)"
+                    );
+                }
+            }
+        }
     }
 }
 

@@ -977,6 +977,8 @@ fn read_text(path: &std::path::Path, max_bytes: usize) -> Option<String> {
 }
 
 fn detect_from_env_content(content: &str) -> Option<(String, String)> {
+    // Prima cerca URL completi (DATABASE_URL, POSTGRES_URL, ecc.)
+    let mut env_vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
@@ -984,6 +986,8 @@ fn detect_from_env_content(content: &str) -> Option<(String, String)> {
         let k = k.trim();
         let v = v.trim().trim_matches('"').trim_matches('\'');
         if v.is_empty() { continue; }
+        env_vars.insert(k.to_ascii_uppercase(), v.to_string());
+
         let engine = if v.starts_with("postgres://") || v.starts_with("postgresql://") {
             "postgres"
         } else if v.starts_with("mysql://") || v.starts_with("mariadb://") {
@@ -1003,6 +1007,79 @@ fn detect_from_env_content(content: &str) -> Option<(String, String)> {
             return Some((engine.to_string(), v.to_string()));
         }
     }
+
+    // Fallback: costruisci connection string da variabili separate (POSTGRES_*, DB_*, ecc.)
+    if let Some(conn) = build_connection_from_env_vars(&env_vars) {
+        return Some(conn);
+    }
+
+    None
+}
+
+/// Costruisce una connection string da variabili d'ambiente separate
+/// come POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
+/// o varianti come DB_HOST, PGHOST, MYSQL_HOST, ecc.
+fn build_connection_from_env_vars(vars: &std::collections::HashMap<String, String>) -> Option<(String, String)> {
+    // Pattern di variabili per engine noti
+    struct EnvPattern {
+        engine: &'static str,
+        host_keys: &'static [&'static str],
+        port_keys: &'static [&'static str],
+        db_keys: &'static [&'static str],
+        user_keys: &'static [&'static str],
+        pass_keys: &'static [&'static str],
+        default_port: &'static str,
+    }
+
+    let patterns = [
+        EnvPattern {
+            engine: "postgres",
+            host_keys: &["POSTGRES_HOST", "PGHOST", "DB_HOST", "DATABASE_HOST"],
+            port_keys: &["POSTGRES_PORT", "PGPORT", "DB_PORT", "DATABASE_PORT"],
+            db_keys: &["POSTGRES_DB", "PGDATABASE", "DB_NAME", "DATABASE_NAME", "POSTGRES_DATABASE"],
+            user_keys: &["POSTGRES_USER", "PGUSER", "DB_USER", "DATABASE_USER", "POSTGRES_USERNAME"],
+            pass_keys: &["POSTGRES_PASSWORD", "PGPASSWORD", "DB_PASSWORD", "DATABASE_PASSWORD", "POSTGRES_PASS"],
+            default_port: "5432",
+        },
+        EnvPattern {
+            engine: "mysql",
+            host_keys: &["MYSQL_HOST", "DB_HOST", "DATABASE_HOST"],
+            port_keys: &["MYSQL_PORT", "DB_PORT", "DATABASE_PORT"],
+            db_keys: &["MYSQL_DATABASE", "MYSQL_DB", "DB_NAME", "DATABASE_NAME"],
+            user_keys: &["MYSQL_USER", "MYSQL_USERNAME", "DB_USER"],
+            pass_keys: &["MYSQL_PASSWORD", "MYSQL_PASS", "DB_PASSWORD"],
+            default_port: "3306",
+        },
+    ];
+
+    for pat in &patterns {
+        let host = pat.host_keys.iter().find_map(|k| vars.get(*k));
+        let db = pat.db_keys.iter().find_map(|k| vars.get(*k));
+
+        // Serve almeno host + database per costruire una connection string utile
+        if let (Some(host), Some(db)) = (host, db) {
+            let port = pat.port_keys.iter().find_map(|k| vars.get(*k))
+                .map(|s| s.as_str())
+                .unwrap_or(pat.default_port);
+            let user = pat.user_keys.iter().find_map(|k| vars.get(*k))
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let pass = pat.pass_keys.iter().find_map(|k| vars.get(*k))
+                .map(|s| s.as_str())
+                .unwrap_or("");
+
+            let conn_str = if !user.is_empty() && !pass.is_empty() {
+                format!("{}://{}:{}@{}:{}/{}", pat.engine, user, pass, host, port, db)
+            } else if !user.is_empty() {
+                format!("{}://{}@{}:{}/{}", pat.engine, user, host, port, db)
+            } else {
+                format!("{}://{}:{}/{}", pat.engine, host, port, db)
+            };
+
+            return Some((pat.engine.to_string(), conn_str));
+        }
+    }
+
     None
 }
 

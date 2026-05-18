@@ -553,6 +553,15 @@ pub async fn create_run_config(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    nexus_events::dispatcher::emit_global(
+        project_id,
+        nexus_events::ProjectEvent::RunConfigChanged {
+            config_id: config_id.to_string(),
+            label: body.label.clone(),
+            action: "created".to_string(),
+        },
+    );
+
     Ok(Json(json!({
         "id": config_id.to_string(),
         "label": body.label,
@@ -602,6 +611,15 @@ pub async fn update_run_config(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    nexus_events::dispatcher::emit_global(
+        project_id,
+        nexus_events::ProjectEvent::RunConfigChanged {
+            config_id: config_id.to_string(),
+            label: body.label.clone(),
+            action: "updated".to_string(),
+        },
+    );
+
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -617,12 +635,30 @@ pub async fn delete_run_config(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Config id non valido"))?;
     let _context = load_project_context(&state.db, project_id, user_id).await?;
 
+    let label: String = sqlx::query_scalar("SELECT label FROM run_configurations WHERE id=$1 AND project_id=$2")
+        .bind(config_id)
+        .bind(project_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
     sqlx::query("DELETE FROM run_configurations WHERE id=$1 AND project_id=$2")
         .bind(config_id)
         .bind(project_id)
         .execute(&state.db)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    nexus_events::dispatcher::emit_global(
+        project_id,
+        nexus_events::ProjectEvent::RunConfigChanged {
+            config_id: config_id.to_string(),
+            label,
+            action: "deleted".to_string(),
+        },
+    );
 
     Ok(Json(json!({ "ok": true })))
 }

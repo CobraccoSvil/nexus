@@ -91,6 +91,19 @@ function openStream(projectId: string): void {
     // ── Catch-all HTTP mutations + meta enrichment ─────────────────────────
     "MutationRecorded",
     "EventEnriched",
+    // ── Project lifecycle + DB migrations + run configs + memory ──────────
+    "ProjectCreated",
+    "ProjectDeleted",
+    "MigrationApplied",
+    "MigrationRolledBack",
+    "RunConfigChanged",
+    "MemoryUpdated",
+    "ProviderHealthChanged",
+    "PluginChanged",
+    "SettingChanged",
+    "SubagentRunChanged",
+    "QualityScanProgress",
+    "OutputChannelCreated",
   ];
   KINDS.forEach((k) => es.addEventListener(k, handleEvent));
   es.addEventListener("message", handleEvent);

@@ -1493,7 +1493,7 @@ export async function cleanupProjectPorts(
 
 export async function getPlaywrightRuns(
   projectId: string,
-): Promise<{ runs: PlaywrightRunSummary[] }> {
+): Promise<{ runs: PlaywrightRunSummary[]; configured?: boolean }> {
   return fetchJson(`${API_BASE}/api/projects/${projectId}/playwright/runs`);
 }
 

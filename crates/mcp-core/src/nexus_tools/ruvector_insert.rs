@@ -84,6 +84,13 @@ impl NexusToolHandler for RuVectorInsertTool {
         match bridge.ruvector().insert_with_persist(id.clone(), vector, Some(metadata), confidence) {
             Ok(node_id) => {
                 let stats = bridge.ruvector().stats();
+                nexus_events::dispatcher::emit_global(
+                    _ctx.project_id,
+                    nexus_events::ProjectEvent::MemoryUpdated {
+                        category: namespace.clone(),
+                        count_delta: 1,
+                    },
+                );
                 Ok(json!({
                     "ok": true,
                     "id": id,
