@@ -701,7 +701,7 @@ pub(super) async fn detect_project_ports(
 }
 
 /// Legge porte TCP in ascolto via `ss -tlnp` → Vec<(port, pid, program)>
-pub(super) async fn read_listening_ports_ss() -> anyhow::Result<Vec<(u16, u32, String)>> {
+pub async fn read_listening_ports_ss() -> anyhow::Result<Vec<(u16, u32, String)>> {
     let output = tokio::process::Command::new("ss")
         .args(["-tlnp"])
         .output()
@@ -736,7 +736,7 @@ pub(super) async fn read_listening_ports_ss() -> anyhow::Result<Vec<(u16, u32, S
 }
 
 /// Fallback: legge /proc/net/tcp e /proc/net/tcp6 → Vec<(port, pid, program)>
-pub(super) fn read_listening_ports_proc() -> Vec<(u16, u32, String)> {
+pub fn read_listening_ports_proc() -> Vec<(u16, u32, String)> {
     let mut inode_to_port: std::collections::HashMap<u64, u16> = std::collections::HashMap::new();
 
     for path in &["/proc/net/tcp", "/proc/net/tcp6"] {
@@ -792,7 +792,7 @@ pub(super) fn read_listening_ports_proc() -> Vec<(u16, u32, String)> {
 /// Range riservato gRPC:  4100–4139  (canali gRPC interni, target migrazione)
 /// Porte gRPC attuali:    50051–50072 (in uso finché non migrati)
 /// Progetti utente:       5000+ (assegnate da find_free_port)
-pub(super) const NEXUS_RESERVED_PORTS: &[u16] = &[
+pub const NEXUS_RESERVED_PORTS: &[u16] = &[
     // Porte di sistema
     80, 443,
     // ── HTTP Nexus (4000-4079) ─────────────────────────────────────────────
@@ -1392,4 +1392,121 @@ pub async fn delete_port_allocation(
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(json!({ "ok": true })))
+}
+
+// ── Port binding globale per port_enforcer ──────────────────────────────────
+
+/// Un binding di rete rilevato: porta TCP in LISTEN con PID e (opzionalmente)
+/// il `project_id` associato via `agent_processes`.
+#[derive(Debug, Clone)]
+pub struct PortBinding {
+    pub port: u16,
+    pub pid: u32,
+    pub program: String,
+    pub project_id: Option<uuid::Uuid>,
+}
+
+/// Scansiona tutte le porte TCP in ascolto (`ss -tlnp` o fallback `/proc/net/tcp`)
+/// e associa ogni PID al `project_id` corrispondente consultando `agent_processes`.
+///
+/// Usata dal `port_enforcer` per individuare violazioni: processi di progetto
+/// che bindano porte fuori dal bucket assegnato.
+pub async fn detect_all_port_bindings(db: &sqlx::PgPool) -> Result<Vec<PortBinding>, String> {
+    // 1. Ottieni tutte le porte in ascolto con PID
+    let listening = read_listening_ports_ss()
+        .await
+        .unwrap_or_else(|_| read_listening_ports_proc());
+
+    if listening.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 2. Costruisci mappa pid → project_id da agent_processes
+    let pid_rows: Vec<(Option<i32>, uuid::Uuid)> = sqlx::query_as(
+        "SELECT pid, project_id FROM agent_processes \
+         WHERE pid IS NOT NULL AND status IN ('running', 'starting')",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("query agent_processes: {}", e))?;
+
+    let mut pid_to_project: std::collections::HashMap<u32, uuid::Uuid> =
+        std::collections::HashMap::new();
+    for (pid_opt, proj_id) in &pid_rows {
+        if let Some(pid) = pid_opt {
+            if *pid > 0 {
+                pid_to_project.insert(*pid as u32, *proj_id);
+            }
+        }
+    }
+
+    // 3. Espandi con discendenti: se il PID noto ha figli, eredita il project_id
+    let mut children: std::collections::HashMap<u32, Vec<u32>> =
+        std::collections::HashMap::new();
+    if let Ok(proc_entries) = std::fs::read_dir("/proc") {
+        for entry in proc_entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if let Ok(pid) = name_str.parse::<u32>() {
+                let status_path = format!("/proc/{}/status", pid);
+                if let Ok(content) = std::fs::read_to_string(&status_path) {
+                    for line in content.lines() {
+                        if let Some(rest) = line.strip_prefix("PPid:") {
+                            if let Ok(ppid) = rest.trim().parse::<u32>() {
+                                children.entry(ppid).or_default().push(pid);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // BFS: propaga project_id dai PID noti ai discendenti
+    let known_pids: Vec<u32> = pid_to_project.keys().copied().collect();
+    let mut queue: std::collections::VecDeque<u32> = known_pids.into_iter().collect();
+    while let Some(pid) = queue.pop_front() {
+        let proj = match pid_to_project.get(&pid).copied() {
+            Some(p) => p,
+            None => continue,
+        };
+        if let Some(kids) = children.get(&pid) {
+            for &child in kids {
+                if !pid_to_project.contains_key(&child) {
+                    pid_to_project.insert(child, proj);
+                    queue.push_back(child);
+                }
+            }
+        }
+    }
+
+    // 4. Costruisci i PortBinding
+    let bindings: Vec<PortBinding> = listening
+        .into_iter()
+        .map(|(port, pid, program)| PortBinding {
+            port,
+            pid,
+            program,
+            project_id: pid_to_project.get(&pid).copied(),
+        })
+        .collect();
+
+    Ok(bindings)
+}
+
+/// Verifica se una porta e' allocata ad un progetto specifico in `nexus_port_allocations`.
+pub async fn port_allocated_to_project(
+    db: &sqlx::PgPool,
+    port: u16,
+    project_id: uuid::Uuid,
+) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM nexus_port_allocations WHERE port = $1 AND project_id = $2)",
+    )
+    .bind(port as i32)
+    .bind(project_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(false)
 }

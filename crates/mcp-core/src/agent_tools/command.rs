@@ -76,6 +76,15 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
             command.chars().take(160).collect::<String>(),
         );
         let _ = persist_security_audit(ctx, &command, &reason).await;
+        // PR hardening: audit trail centralizzato (oltre al log security_audit esistente)
+        crate::security::record_audit(
+            crate::security::AuditEntry::blocked(ctx.project_id, "command_blocked", "command")
+                .with_resource(reason.category.to_string())
+                .with_details(serde_json::json!({
+                    "command_excerpt": command.chars().take(200).collect::<String>(),
+                    "reason": reason.message,
+                })),
+        );
         return super::safety::format_blocked_result(&command, &reason);
     }
 

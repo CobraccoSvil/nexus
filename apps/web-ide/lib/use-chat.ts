@@ -272,6 +272,13 @@ export function useChat(
   const [streamingToken, setStreamingToken] = useState<string>("");
   const streamingTokenRef = useRef<string>("");
 
+  // ── Auto-continuazione per modalita' "Automatico" ──
+  // Quando un run primario completa con status "completed" e automationMode "automatic",
+  // invia automaticamente "Continua" per far proseguire l'agente senza intervento utente.
+  // Limite: max 10 continuazioni automatiche consecutive per evitare loop infiniti.
+  const autoContinueCountRef = useRef(0);
+  const [autoContinuePending, setAutoContinuePending] = useState(false);
+
   // ── Binding dispatcher: TokenUsageBar e tokenUsage si aggiornano in
   // ── real-time SENZA refresh browser quando il backend emette eventi chat.
   //
@@ -301,6 +308,60 @@ export function useChat(
       });
     }
   }, [lastMessage?.messageId, sessionId]);
+
+  // ── Auto-continuazione: quando il run completa in modalita' "automatic" e
+  // autoContinuePending e' true, invia "Continua" dopo 2s (attende che isLoading
+  // sia false). Il contatore limita a max 10 continuazioni consecutive.
+  // Reset del contatore: ogni messaggio manuale dell'utente lo azzera.
+  const autoContinueSendRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!autoContinuePending || isLoading || !sessionId) return;
+    // Piccolo delay per dare tempo alla UI di aggiornarsi (mostra il messaggio sintetico)
+    autoContinueSendRef.current = setTimeout(() => {
+      setAutoContinuePending(false);
+      // Usa sendChatMessage direttamente per evitare dipendenze circolari con send()
+      void (async () => {
+        try {
+          setIsLoading(true);
+          const response = await sendChatMessage(sessionId, "Continua", {
+            automationMode: "automatic",
+          });
+          if (response.agentRun) {
+            setMessages((current) => [
+              ...current,
+              ...(response.userMessage ? [response.userMessage] : []),
+            ]);
+            setAgentSteps([]);
+            const initialRun: AgentRunInfo = {
+              runId: response.agentRun.runId,
+              sessionId: sessionId,
+              status: "running",
+              automationMode: "automatic",
+              provider: response.agentRun.provider,
+              model: response.agentRun.model,
+              iterationCount: 0,
+              pendingActions: [],
+              steps: [],
+              createdAt: new Date().toISOString(),
+            };
+            setAgentRun(initialRun);
+            setAgentRuns((prev) => new Map(prev).set(initialRun.runId, initialRun));
+            setAgentStepsMap((prev) => new Map(prev).set(initialRun.runId, []));
+            subscribeToRun(sessionId, response.agentRun.runId, true);
+          } else {
+            setIsLoading(false);
+          }
+        } catch {
+          setIsLoading(false);
+          setAutoContinuePending(false);
+        }
+      })();
+    }, 2000);
+    return () => {
+      if (autoContinueSendRef.current) clearTimeout(autoContinueSendRef.current);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoContinuePending, isLoading, sessionId]);
 
   // Persist traces to sessionStorage when they change
   useEffect(() => {
@@ -507,6 +568,16 @@ export function useChat(
                     );
                   }
                 } catch {}
+                // Auto-continuazione: se il run e' completato (non failed/cancelled)
+                // e la modalita' era "automatic", segnala al effect di inviare "Continua".
+                if (
+                  finalRun.status === "completed" &&
+                  finalRun.automationMode === "automatic" &&
+                  autoContinueCountRef.current < 10
+                ) {
+                  autoContinueCountRef.current += 1;
+                  setAutoContinuePending(true);
+                }
               }
             }
             // Rimuove i run completati dalla map dopo 30s
@@ -549,6 +620,10 @@ export function useChat(
       if (!hasProject || !isReady || !sessionId || !content.trim() || isLoading) {
         return;
       }
+      // Reset contatore auto-continuazione: ogni messaggio manuale dell'utente
+      // azzera il conteggio per permettere nuove sequenze di auto-continuazione.
+      autoContinueCountRef.current = 0;
+      setAutoContinuePending(false);
 
       setIsLoading(true);
       setError(null);

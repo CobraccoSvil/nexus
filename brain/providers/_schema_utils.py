@@ -238,6 +238,21 @@ def parse_inline_tool_invocations(
     if not text:
         return [], text
 
+    # --- Normalizzazione tag DSML Unicode (DeepSeek) ---
+    # DeepSeek emette tag con prefisso U+FF5C: <｜｜DSML｜｜invoke ...>
+    # Li normalizziamo a tag XML standard per permettere il parsing.
+    import re as _re_dsml
+    _DSML_PREFIX = "｜｜DSML｜｜"
+    if _DSML_PREFIX in text:
+        text = text.replace(f"<{_DSML_PREFIX}invoke", "<invoke")
+        text = text.replace(f"</{_DSML_PREFIX}invoke>", "</invoke>")
+        text = text.replace(f"<{_DSML_PREFIX}parameter", "<parameter")
+        text = text.replace(f"</{_DSML_PREFIX}parameter>", "</parameter>")
+        text = _re_dsml.sub(
+            rf"</?{_re_dsml.escape(_DSML_PREFIX)}tool_calls\s*/?>", "", text
+        )
+        text = _re_dsml.sub(r"\n{3,}", "\n\n", text).strip()
+
     blocks: list[dict] = []
     cleaned = text
 

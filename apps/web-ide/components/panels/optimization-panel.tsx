@@ -637,6 +637,34 @@ export function OptimizationPanel({ projectId, onSendToChat, onAutoSendToChat, a
     }
   }, [projectId]);
 
+  // Reset completo quando cambia progetto: evita di mostrare findings/stato
+  // del progetto precedente. Il componente non si rimonta (stesso layout),
+  // quindi gli inizializzatori useState non rieseguono — serve un effect esplicito.
+  const prevProjectIdRef = useRef(projectId);
+  useEffect(() => {
+    if (prevProjectIdRef.current === projectId) return;
+    prevProjectIdRef.current = projectId;
+    // Reset di tutto lo stato in-memory
+    setFindings([]);
+    setScanResult(null);
+    setFixQueue([]);
+    setFixQueueIndex(0);
+    setActiveCategory("all");
+    setSelectedFindingIds(new Set());
+    setAutoFixEnabled(false);
+    fixedInSessionRef.current = new Set();
+    pendingMarkOnNextRunRef.current = [];
+    fixRetryCountRef.current = new Map();
+    setDeepReviewJobId(null);
+    setDeepReviewState(null);
+    setDeepReviewError(null);
+    stopDeepReviewPoll();
+    mountRecoveredRef.current = false;
+    // Carica i findings del nuovo progetto dal backend
+    void fetchFindings();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId]);
+
   const handleScan = async () => {
     setScanning(true);
     setError(null);

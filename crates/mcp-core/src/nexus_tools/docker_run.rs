@@ -46,6 +46,22 @@ impl NexusToolHandler for DockerRunTool {
             validate_container_name(n)?;
         }
 
+        // ── PR hardening: quota container per progetto ─────────────────────
+        // get_pool ritorna un pool short-lived verso Nexus (riusa env DATABASE_URL).
+        // Best-effort: se il pool fallisce, salta il check (degrado graceful).
+        if let Ok(nexus_pool) = super::db_helper::get_pool().await {
+            if let Err(reason) = crate::security::quotas::check_can_start_container(&nexus_pool, ctx.project_id).await {
+                crate::security::record_audit(
+                    crate::security::AuditEntry::blocked(ctx.project_id, "container_create", "container")
+                        .with_resource(image.clone())
+                        .with_details(json!({"reason": reason, "name": name})),
+                );
+                nexus_pool.close().await;
+                return Err(NexusToolError::BadInput(format!("Quota container raggiunta: {}", reason)));
+            }
+            nexus_pool.close().await;
+        }
+
         let detach = args.get("detach").and_then(Value::as_bool).unwrap_or(true);
 
         // Slug progetto per label
@@ -65,6 +81,11 @@ impl NexusToolHandler for DockerRunTool {
 
         cmd_args.push("--label".to_string());
         cmd_args.push(label.clone());
+
+        // PR hardening: label aggiuntiva nexus.project_id permette al port_enforcer
+        // di associare in modo univoco container al progetto.
+        cmd_args.push("--label".to_string());
+        cmd_args.push(format!("nexus.project_id={}", ctx.project_id));
 
         if let Some(ref n) = name {
             cmd_args.push("--name".to_string());
@@ -114,6 +135,11 @@ impl NexusToolHandler for DockerRunTool {
 
         if out.success() {
             let container_id = out.stdout.trim().to_string();
+            crate::security::record_audit(
+                crate::security::AuditEntry::allowed(ctx.project_id, "container_create", "container")
+                    .with_resource(container_id.clone())
+                    .with_details(json!({"image": image, "name": name, "detach": detach})),
+            );
             Ok(json!({
                 "ok": true,
                 "container_id": container_id,

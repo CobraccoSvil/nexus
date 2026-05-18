@@ -203,6 +203,12 @@ fn build_static_system_context(github_username: Option<&str>) -> String {
          - \"quality\": scan_code_quality (analisi qualità: complessità, typing, SQL, commenti, dead code)\n\
          - \"semantic\": search_codebase_semantic (ricerca semantica nel codebase), recall_context (recupera contesto conversazionale/progetto precedente)\n\
          Puoi richiedere piu' categorie insieme: request_tools(\"git,service\").\n\
+         Tool Dispatcher (sempre disponibili, NON serve request_tools, sono FUNCTION CALL non comandi shell):\n\
+         dispatcher_set_flag(key, value) — flag progetto nel pannello Monitor (prefissi: build_, test_, deploy_, custom_, feature_).\n\
+         dispatcher_update_monitor(monitor_id, value, label) — widget numerico nel pannello Monitor.\n\
+         dispatcher_post_notification(severity, message) — toast utente (info/success/warning/error).\n\
+         dispatcher_emit_event(kind, resource, payload) — evento custom sul bus eventi.\n\
+         dispatcher_highlight_panel(panel) — flash su un pannello IDE.\n\
          Generazione documenti — SEMPRE DISPONIBILI (non serve request_tools):\n\
          Quando l'utente chiede di generare documentazione, analisi, diagrammi ER, release notes o documenti di progetto, DEVI usare il tool nexus_doc_generate.\n\
          NON rispondere con testo in chat — genera SEMPRE un documento .docx reale.\n\
@@ -1906,9 +1912,27 @@ async fn spawn_agent_run(
         &params.content,
     ).await.unwrap_or_default();
 
+    // Istruzioni specifiche per modelli o-series (o1/o3/o4-mini): forzano
+    // l'uso esplicito dei tool instead of narrare le azioni come testo.
+    let o_series_instructions = if crate::brain_agent_client::is_o_series_model_pub(&model_str) {
+        "\n=== ISTRUZIONI TOOL (MODELLO REASONING) ===\n\
+            REGOLA CRITICA: Devi SEMPRE usare i tool per eseguire azioni. Non narrare mai le azioni come testo.\n\
+            - Per creare/modificare file: usa write_file o edit_file (NON scrivere il contenuto come testo nella risposta)\n\
+            - Per eseguire comandi: usa run_command (NON descrivere cosa faresti)\n\
+            - Per leggere file: usa read_file o read_file_lines (NON immaginare il contenuto)\n\
+            - Per cercare: usa search_in_files o search_codebase_semantic\n\
+            Hai un set essenziale di tool disponibili. Se hai bisogno di un tool non presente (es. git_push, \
+            run_playwright_tests, service-related), usa nexus_mcp_tool_search per cercarlo e nexus_mcp_tool_call \
+            per eseguirlo.\n\
+            VIETATO: rispondere con codice inline senza tool call. Ogni riga di codice DEVE passare da write_file/edit_file.\n\
+            === FINE ISTRUZIONI TOOL ===\n"
+    } else {
+        ""
+    };
+
     let system_text = format!(
-        "{}{}{}{}{}{}{}", project_header, project_custom_instructions,
-        automation_instructions, test_instructions,
+        "{}{}{}{}{}{}{}{}", project_header, project_custom_instructions,
+        automation_instructions, o_series_instructions, test_instructions,
         params.profile_prompt_block, params.system_context, self_ref_hint
     );
     // Il messaggio iniziale è solo il contenuto corrente (senza prefisso testuale)
@@ -1961,6 +1985,8 @@ async fn spawn_agent_run(
         params.user_id,
         params.project_id,
         &params.automation_mode,
+        &provider,
+        &model_str,
     )
     .await;
 
@@ -2644,6 +2670,8 @@ pub async fn send_chat_message(
                             user_id,
                             project_id_r,
                             &automation_r,
+                            &provider_r,
+                            &model_r,
                         )
                         .await;
 

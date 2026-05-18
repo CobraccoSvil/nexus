@@ -154,14 +154,25 @@ pub struct SandboxConfig {
 }
 
 impl SandboxConfig {
+    /// Default sicuro: `network_mode = "none"` → isolamento totale di rete.
+    /// Per i processi `kind = "service"` che devono accettare connessioni esterne,
+    /// chiamare `with_service_network()` PRIMA di passare al builder Docker.
+    ///
+    /// Rollback temporaneo: bandiera ENV `NEXUS_SANDBOX_LEGACY_NETWORK=1` ripristina
+    /// il vecchio default (Docker bridge). Rimuovere dopo 1 settimana di rollout.
     pub fn new(project_root: PathBuf, process_id: Uuid) -> Self {
+        let default_network = if std::env::var("NEXUS_SANDBOX_LEGACY_NETWORK").ok().as_deref() == Some("1") {
+            None
+        } else {
+            Some("none".to_string())
+        };
         Self {
             project_root,
             process_id,
             memory_mb: DEFAULT_MEMORY_MB,
             cpus: DEFAULT_CPUS,
             project_image: None,
-            network_mode: None,
+            network_mode: default_network,
             extra_env: HashMap::new(),
         }
     }
@@ -179,6 +190,15 @@ impl SandboxConfig {
         if let Some(env) = &cfg.extra_env {
             self.extra_env.extend(env.clone());
         }
+        self
+    }
+
+    /// Abilita la rete bridge per i processi `kind = "service"` che espongono
+    /// porte. La porta dichiarata in `env_vars["PORT"]` viene gia' published
+    /// dal builder Docker (cfr. riga ~395). Senza questa chiamata, il servizio
+    /// gira con `--network=none` e non riceve connessioni.
+    pub fn with_service_network(mut self) -> Self {
+        self.network_mode = Some("bridge".to_string());
         self
     }
 
@@ -549,3 +569,117 @@ pub fn safe_env_for_direct_spawn() -> HashMap<String, String> {
         .filter(|(k, _)| !is_blocked_env(k))
         .collect()
 }
+
+// ─── Validation override env passate dall'agente ──────────────────────────────
+
+/// Valida le `env_overrides` che l'agente vuole iniettare in un processo del
+/// progetto. Difende il path critico spawn dai tentativi di puntare a risorse
+/// Nexus (DB, Redis) o di bindare porte fuori dal bucket assegnato al progetto.
+///
+/// Regole hardcoded (in ordine di applicazione):
+/// 1. Nessuna variabile nella `BLOCKED_ENV` di Nexus (`is_blocked_env`)
+/// 2. `PORT` deve essere nel bucket del progetto OPPURE gia' allocata a questo
+///    progetto in `nexus_port_allocations` (per run_config legacy)
+/// 3. `DATABASE_URL` / `POSTGRES_URL` non puo' puntare al DB `nexus` o `postgres`
+/// 4. `REDIS_URL` non puo' puntare al Redis Nexus (`:6379` su localhost o `ideai-redis`)
+///
+/// Ritorna `Err(messaggio)` al primo violation, `Ok(())` se tutto e' lecito.
+pub async fn validate_env_overrides(
+    db: &sqlx::PgPool,
+    project_id: uuid::Uuid,
+    env: &HashMap<String, String>,
+) -> Result<(), String> {
+    for (k, v) in env {
+        // 1. Blocked env (riusa is_blocked_env esistente)
+        if is_blocked_env(k) {
+            return Err(format!(
+                "variabile '{k}' bloccata (BLOCKED_ENV Nexus). \
+                 Non e' permesso ereditare credenziali di sistema verso processi del progetto."
+            ));
+        }
+        // 2. PORT deve essere nel bucket del progetto
+        if k.eq_ignore_ascii_case("PORT") {
+            let port: u16 = v.parse().map_err(|_| format!("PORT='{v}' non valido (atteso u16)"))?;
+            validate_port_for_project(db, project_id, port).await?;
+        }
+        // 3. DATABASE_URL non deve puntare a DB Nexus
+        if k.eq_ignore_ascii_case("DATABASE_URL") || k.eq_ignore_ascii_case("POSTGRES_URL") {
+            let low = v.to_lowercase();
+            // pattern: ...@<host>[:port]/nexus oppure /postgres oppure :5432
+            let bad_db = low.contains("/nexus") || low.ends_with("/postgres") || low.contains("/postgres?");
+            let bad_port = low.contains(":5432");
+            if bad_db || bad_port {
+                return Err(format!(
+                    "{k} punta a infrastruttura Nexus (DB nexus o porta 5432). \
+                     Usa il DB dedicato del progetto (project_database_config)."
+                ));
+            }
+        }
+        // 4. REDIS_URL non deve puntare a Redis Nexus
+        if k.eq_ignore_ascii_case("REDIS_URL") {
+            let low = v.to_lowercase();
+            if low.contains(":6379") || low.contains("ideai-redis") {
+                return Err(format!(
+                    "REDIS_URL punta al Redis Nexus (:6379 o ideai-redis). \
+                     I progetti devono usare il proprio Redis allocato via wizard."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verifica che una porta sia nel bucket del progetto o gia' allocata ad esso.
+/// Errore esplicativo se la porta e' riservata Nexus o appartiene a un altro progetto.
+async fn validate_port_for_project(
+    db: &sqlx::PgPool,
+    project_id: uuid::Uuid,
+    port: u16,
+) -> Result<(), String> {
+    use crate::project_workspace::services::{
+        project_bucket_start, NEXUS_RESERVED_PORTS, PROJECT_PORT_BUCKET_SIZE,
+    };
+    if NEXUS_RESERVED_PORTS.contains(&port) {
+        return Err(format!(
+            "porta {port} riservata Nexus (web-ide/microservizi/DB infrastruttura). \
+             Usa request_port per allocarne una nel bucket del progetto."
+        ));
+    }
+    let bucket_start = project_bucket_start(&project_id);
+    let bucket_end = bucket_start + PROJECT_PORT_BUCKET_SIZE;
+    let in_bucket = port >= bucket_start && port < bucket_end;
+    if !in_bucket {
+        // Tollerata SOLO se gia' allocata a questo progetto (caso run_config legacy)
+        let owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM nexus_port_allocations WHERE port = $1 AND project_id = $2)",
+        )
+        .bind(port as i32)
+        .bind(project_id)
+        .fetch_one(db)
+        .await
+        .unwrap_or(false);
+        if !owned {
+            return Err(format!(
+                "porta {port} fuori dal bucket del progetto [{bucket_start}, {bucket_end}). \
+                 Chiama request_port per ottenere una porta valida."
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests_validate_env {
+    use super::*;
+
+    #[test]
+    fn blocked_env_rejected() {
+        // is_blocked_env e' sync; verifichiamo la sua logica direttamente
+        assert!(is_blocked_env("DATABASE_URL"));
+        assert!(is_blocked_env("JWT_SECRET"));
+        assert!(is_blocked_env("ANTHROPIC_API_KEY"));
+        assert!(!is_blocked_env("PORT"));
+        assert!(!is_blocked_env("HOST"));
+    }
+}
+

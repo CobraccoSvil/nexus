@@ -42,7 +42,19 @@ class AgentProfile:
     temperature: float | None = None
     description: str = ""
 
-    _ALWAYS_ON_TOOLS = {"recall_context"}
+    # Tool sempre disponibili indipendentemente da profilo/intent.
+    # recall_context: infrastruttura contesto (sempre necessario).
+    # write_file, edit_file: tool di scrittura essenziali — senza questi l'agente
+    # perde la capacita' di creare/modificare file quando il classifier intent
+    # sceglie un subset restrittivo (es. "analyze", "review"). Il costo token
+    # delle definizioni e' trascurabile (~200 token) rispetto al rischio di
+    # bloccare l'agente.
+    # run_command, run_service: tool di esecuzione essenziali — senza questi
+    # l'agente non puo' buildare, installare dipendenze, avviare server di
+    # sviluppo ne' verificare il proprio lavoro. Il gating difensivo per
+    # automation_mode study avviene a monte (Rust, build_tools_json_for_agent)
+    # quindi questi tool NON bypassano il filtro study-mode.
+    _ALWAYS_ON_TOOLS = {"recall_context", "write_file", "edit_file", "run_command", "run_service"}
 
     def filter_tools(self, tools_json: list[dict]) -> list[dict]:
         """Restituisce solo i tool ammessi per il profilo.

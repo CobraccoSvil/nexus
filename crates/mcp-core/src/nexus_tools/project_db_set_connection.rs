@@ -77,7 +77,28 @@ impl NexusToolHandler for ProjectDbSetConnectionTool {
             )));
         }
 
-        let secret_bytes = connection_string.as_bytes().to_vec();
+        // ── PR hardening: DB isolation per hosting_mode='internal' ────────────
+        // Se il DSN punta allo stesso cluster PostgreSQL di Nexus, creiamo un
+        // ruolo e database dedicato per il progetto con REVOKE sui DB infrastruttura.
+        let effective_dsn = if hosting_mode == "internal" && engine == "postgres" {
+            match super::db_helper::ensure_project_db_isolation(
+                &pool, project_id, connection_string,
+            ).await {
+                Ok(isolated) => isolated,
+                Err(e) => {
+                    tracing::warn!(
+                        project_id = %project_id,
+                        error = %e,
+                        "DB isolation fallita: uso DSN originale (degradazione graceful)"
+                    );
+                    connection_string.to_string()
+                }
+            }
+        } else {
+            connection_string.to_string()
+        };
+
+        let secret_bytes = effective_dsn.as_bytes().to_vec();
 
         // Se is_primary, azzera il flag sulle altre connessioni
         if is_primary {

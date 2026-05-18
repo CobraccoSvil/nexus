@@ -111,6 +111,12 @@ pub struct PortRegistryCache {
     db: PgPool,
 }
 
+impl std::fmt::Debug for PortRegistryCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PortRegistryCache").finish_non_exhaustive()
+    }
+}
+
 impl PortRegistryCache {
     /// Inizializza la cache. Retry 5x5s per dare tempo a Postgres di salire.
     /// A differenza di RoutingMatrixCache, NON panica se la tabella e' vuota

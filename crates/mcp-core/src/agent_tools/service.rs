@@ -2,6 +2,74 @@
 //! Include anche helper terminali legacy (attualmente non in uso, dead_code).
 
 use super::*;
+use std::collections::HashMap;
+
+/// Heuristica: il comando avvia un server web/long-running che ha bisogno di
+/// una porta TCP? Riconosce:
+/// - script comuni: `next dev|start`, `vite`, `webpack-dev-server`, `astro dev`
+/// - framework Python: `gunicorn`, `uvicorn`, `flask run`, `django runserver`
+/// - Node generici: `node server.js`, `npm run dev|start|serve`
+/// - Rust/Go/.NET dev server: `cargo run`, `go run`, `dotnet run`, `dotnet watch`
+///
+/// In caso di dubbio (es. `make foo`), NON inietta PORT: l'agente puo' chiamare
+/// `request_port` esplicitamente e includere la porta nel comando.
+fn looks_like_web_service(command: &str) -> bool {
+    let lc = command.to_lowercase();
+    // Lista di token che indicano "sto avviando un server web"
+    const WEB_TOKENS: &[&str] = &[
+        "next dev", "next start",
+        "vite", "vite dev", "vite preview",
+        "webpack-dev-server", "webpack serve",
+        "astro dev", "astro start", "astro preview",
+        "nuxt dev", "nuxt start",
+        "svelte-kit dev",
+        "ng serve",            // Angular
+        "react-scripts start", // CRA
+        "expo start",          // React Native web
+        "remix dev",
+        "gunicorn", "uvicorn", "hypercorn", "daphne",
+        "flask run",
+        "django runserver", "manage.py runserver",
+        "rails server", "rails s ",
+        "sinatra",
+        "node server", "node app", "node index", "node main",
+        "ts-node server", "tsx server",
+        "deno serve",
+        "bun --hot", "bun run dev", "bun run start",
+        "cargo run", "cargo watch",
+        "go run",
+        "dotnet run", "dotnet watch",
+        "php -S",
+        "ruby -run",
+        "live-server", "http-server", "browser-sync",
+        // Make/script wrapper noti
+        "npm run dev", "npm run start", "npm run serve",
+        "pnpm dev", "pnpm start", "pnpm serve",
+        "yarn dev", "yarn start", "yarn serve",
+    ];
+    WEB_TOKENS.iter().any(|t| lc.contains(t))
+}
+
+/// Cerca nella combinazione stdout+stderr un pattern di porta TCP in ascolto.
+/// Riconosce output di Next.js, Vite, Express, Flask, Django, ecc.
+/// Ritorna la prima porta trovata (4-5 cifre, range 1024-65535).
+fn detect_port_from_output(stdout: &str, stderr: &str) -> Option<i32> {
+    let combined = format!("{}\n{}", stdout, stderr);
+    // Pattern frequenti: "localhost:3002", "0.0.0.0:3000", "port 5173",
+    // "Local: http://localhost:3002", "listening on :8080"
+    let re = regex::Regex::new(
+        r"(?i)(?:localhost|127\.0\.0\.1|0\.0\.0\.0|::)[:\s]+(\d{4,5})|(?:port|porta)\s+(\d{4,5})|Local:\s+https?://[^:]+:(\d{4,5})"
+    ).ok()?;
+    for cap in re.captures_iter(&combined) {
+        let port_str = cap.get(1).or(cap.get(2)).or(cap.get(3))?;
+        if let Ok(p) = port_str.as_str().parse::<i32>() {
+            if (1024..=65535).contains(&p) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
 
 /// Avvia un servizio/processo long-running direttamente sul server.
 /// L'output viene catturato nel DB e mostrato nel pannello Output dell'IDE.
@@ -41,6 +109,56 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         }
     }
 
+    // ── Quota container (PR hardening) ────────────────────────────────────
+    // Solo per kind="service": i tool agente short-lived non contano contro
+    // la quota container del progetto.
+    if kind == "service" {
+        if let Err(reason) = crate::security::quotas::check_can_start_container(&ctx.db, ctx.project_id).await {
+            crate::security::record_audit(
+                crate::security::AuditEntry::blocked(ctx.project_id, "container_create", "container")
+                    .with_resource(label.clone())
+                    .with_details(serde_json::json!({"reason": reason, "command": command})),
+            );
+            return format!("[Quota raggiunta: {}]", reason);
+        }
+    }
+
+    // ── Strato 1 hardening: auto-inject PORT per servizi web ────────────────
+    // Se il comando avvia un server (next dev, vite, gunicorn, ecc.) Nexus
+    // alloca automaticamente una porta nel bucket del progetto e la inietta
+    // come PORT env. Cosi' il servizio non bindera' sulla porta hardcoded
+    // (es. next dev → 3000 → conflitto con web-ide Nexus).
+    let mut env_overrides: Option<HashMap<String, String>> = None;
+    if looks_like_web_service(&command) {
+        match crate::project_workspace::find_or_allocate_port(
+            &ctx.db,
+            &ctx.port_registry,
+            ctx.project_id,
+            &label,
+        )
+        .await
+        {
+            Ok(alloc) => {
+                let mut env = HashMap::new();
+                env.insert("PORT".to_string(), alloc.port.to_string());
+                env.insert("HOST".to_string(), "0.0.0.0".to_string());
+                env_overrides = Some(env);
+                tracing::info!(
+                    port = alloc.port,
+                    label = %label,
+                    mode = alloc.mode,
+                    "run_service: PORT auto-allocato per servizio web"
+                );
+            }
+            Err(e) => {
+                return format!(
+                    "[Errore allocazione porta per servizio '{}': {}]",
+                    label, e
+                );
+            }
+        }
+    }
+
     match crate::agent_processes::spawn_agent_process(
         &ctx.db,
         ctx.project_id,
@@ -49,7 +167,7 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         &command,
         &work_dir.to_string_lossy(),
         Some(ctx.root_path.clone()),
-        None,
+        env_overrides,
         crate::sandbox::sandbox_enabled(),
         kind,
         None,
@@ -63,13 +181,37 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
             // Read initial output
             match crate::agent_processes::read_process_output(&ctx.db, process_id, 4000).await {
                 Ok(info) => {
+                    // Auto-detect porta dall'output del servizio e registra
+                    // in nexus_port_allocations per il pannello Porte.
+                    let detected_port = detect_port_from_output(&info.stdout, &info.stderr);
+                    if let Some(port) = detected_port {
+                        let _ = sqlx::query(
+                            "INSERT INTO nexus_port_allocations (project_id, port, label, allocation_mode) \
+                             VALUES ($1, $2, $3, 'auto') ON CONFLICT (port) DO UPDATE SET \
+                             project_id = $1, label = $3, updated_at = NOW()"
+                        )
+                        .bind(ctx.project_id)
+                        .bind(port)
+                        .bind(&label)
+                        .execute(&*ctx.db)
+                        .await;
+                        nexus_events::dispatcher::emit(
+                            &ctx.project_channels,
+                            ctx.project_id,
+                            nexus_events::event::ProjectEvent::PortAllocated {
+                                port,
+                                label: label.clone(),
+                                pid: info.pid,
+                            },
+                        );
+                    }
                     // Dispatcher: notifica avvio servizio → pannello Servizi aggiorna LED
                     nexus_events::dispatcher::emit(
                         &ctx.project_channels,
                         ctx.project_id,
                         nexus_events::event::ProjectEvent::ServiceStarted {
                             name: label.clone(),
-                            port: None,
+                            port: detected_port,
                             pid: info.pid,
                         },
                     );

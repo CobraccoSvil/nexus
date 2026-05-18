@@ -37,6 +37,105 @@ fn brain_rest_url() -> String {
 /// - Se count >= soglia: invia solo AGENT_TOOLS_JSON (che contiene già
 ///   `nexus_mcp_tool_search` + `nexus_mcp_tool_call`). Il brain usa la
 ///   ricerca semantica per scoprire i tool a runtime — discovery mode.
+/// Fallback hardcoded dei tool essenziali per modelli o-series (o1/o3/o4-mini).
+/// Questi modelli non supportano `tool_choice` e con 40+ tool tendono a
+/// "narrare" invece di fare tool call. La soluzione e' passare solo i tool
+/// fondamentali + `nexus_mcp_tool_search`/`nexus_mcp_tool_call` per la
+/// discovery on-demand dei tool non inclusi.
+///
+/// La sorgente autoritativa e' `settings.automation.o_series_essential_tools`
+/// (CSV). Letta da `load_o_series_essential_tools()`. Questo fallback copre
+/// il caso DB down.
+const O_SERIES_ESSENTIAL_TOOLS_FALLBACK: &[&str] = &[
+    // Core lettura
+    "read_file",
+    "read_file_lines",
+    "list_files",
+    "search_in_files",
+    // Core scrittura
+    "write_file",
+    "edit_file",
+    "run_command",
+    "fs_mkdir",
+    "delete_file",
+    // Git essenziale
+    "git_status",
+    "git_commit",
+    // Test
+    "run_tests",
+    // Discovery (il modello scopre tool aggiuntivi a runtime)
+    "nexus_mcp_tool_search",
+    "nexus_mcp_tool_call",
+    // Ricerca semantica
+    "search_codebase_semantic",
+];
+
+/// Ritorna `true` se il modello e' della serie reasoning OpenAI (o1/o3/o4-mini).
+/// Questi modelli non supportano il parametro `tool_choice` e hanno bisogno
+/// di un set ridotto di tool + istruzioni esplicite nel system prompt.
+///
+/// Esposta come `is_o_series_model_pub` per uso in `chat_messages.rs`.
+fn is_o_series_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    ["o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini"]
+        .iter()
+        .any(|prefix| m == *prefix || m.starts_with(&format!("{}-", prefix)))
+}
+
+/// Wrapper pubblico di `is_o_series_model` per uso in altri moduli (es. chat_messages).
+pub fn is_o_series_model_pub(model: &str) -> bool {
+    is_o_series_model(model)
+}
+
+/// Legge la whitelist tool essenziali per o-series da `settings`.
+/// Ritorna sempre una lista non vuota: in caso di DB down o chiave assente,
+/// usa il fallback hardcoded `O_SERIES_ESSENTIAL_TOOLS_FALLBACK`.
+async fn load_o_series_essential_tools(db: &PgPool) -> Vec<String> {
+    let csv: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM settings WHERE key = 'automation.o_series_essential_tools'"
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    match csv {
+        Some(s) if !s.trim().is_empty() => s
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
+        _ => {
+            O_SERIES_ESSENTIAL_TOOLS_FALLBACK
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        }
+    }
+}
+
+/// Filtra il JSON tools lasciando solo quelli il cui `name` e' nella whitelist.
+fn filter_tools_by_whitelist(tools: Value, whitelist: &[String]) -> Value {
+    let arr = match tools.as_array() {
+        Some(a) => a,
+        None => return Value::Array(Vec::new()),
+    };
+    let filtered: Vec<Value> = arr
+        .iter()
+        .filter(|t| {
+            let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            whitelist.iter().any(|w| w == name)
+        })
+        .cloned()
+        .collect();
+    tracing::info!(
+        "filter_tools_by_whitelist: {} tool totali -> {} filtrati (whitelist={} voci)",
+        arr.len(),
+        filtered.len(),
+        whitelist.len(),
+    );
+    Value::Array(filtered)
+}
+
 /// Fallback hardcoded della whitelist read-only per modalita' `study`.
 /// USATA SOLO se `settings.automation.study_mode_readonly_tools` non e'
 /// leggibile dal DB (DB down all'avvio). Mantenuta minima: l'admin deve
@@ -133,6 +232,8 @@ pub async fn build_tools_json_for_agent(
     user_id: Uuid,
     project_id: Uuid,
     automation_mode: &crate::orchestrator::AutomationMode,
+    provider: &str,
+    model: &str,
 ) -> Value {
     // Legge soglia dal DB
     let hard_limit: i64 = sqlx::query_scalar::<_, String>(
@@ -198,7 +299,22 @@ pub async fn build_tools_json_for_agent(
     // La whitelist e' letta da `settings.automation.study_mode_readonly_tools`
     // (mig 0132) — niente lista hardcoded nel codice (regola G CLAUDE.md).
     let readonly_whitelist = load_study_mode_readonly_tools(db).await;
-    filter_tools_by_automation_mode(full_tools, automation_mode, &readonly_whitelist)
+    let after_mode = filter_tools_by_automation_mode(full_tools, automation_mode, &readonly_whitelist);
+
+    // Riduzione tool per modelli o-series (o1/o3/o4-mini): questi modelli non
+    // supportano `tool_choice` e con 40+ tool tendono a narrare senza fare
+    // tool call. Passiamo solo i tool essenziali + nexus_mcp_tool_search per
+    // la discovery on-demand dei tool rimanenti.
+    if is_o_series_model(model) {
+        let essential = load_o_series_essential_tools(db).await;
+        tracing::info!(
+            "build_tools_json: modello o-series '{}' rilevato — riduzione a {} tool essenziali + discovery",
+            model, essential.len()
+        );
+        filter_tools_by_whitelist(after_mode, &essential)
+    } else {
+        after_mode
+    }
 }
 
 /// Riconosce gli errori del provider AI che indicano "credito esaurito" / "quota
@@ -1080,5 +1196,64 @@ mod tests {
                 tool
             );
         }
+    }
+
+    #[test]
+    fn is_o_series_rileva_modelli_reasoning() {
+        assert!(is_o_series_model("o3"));
+        assert!(is_o_series_model("o3-mini"));
+        assert!(is_o_series_model("O3"));
+        assert!(is_o_series_model("o1"));
+        assert!(is_o_series_model("o1-preview"));
+        assert!(is_o_series_model("o4-mini"));
+        assert!(is_o_series_model("o4-mini-2025-04-16"));
+        // NON o-series
+        assert!(!is_o_series_model("gpt-4o"));
+        assert!(!is_o_series_model("gpt-4o-mini"));
+        assert!(!is_o_series_model("claude-sonnet-4-6"));
+        assert!(!is_o_series_model("gemini-2.5-flash"));
+    }
+
+    #[test]
+    fn o_series_essential_contiene_discovery_e_write() {
+        // I tool essenziali per o-series devono includere sia tool di
+        // scrittura (per operare) sia tool di discovery (per scoprire
+        // tool aggiuntivi a runtime).
+        let must_have = [
+            "write_file", "edit_file", "run_command",     // scrittura
+            "nexus_mcp_tool_search", "nexus_mcp_tool_call", // discovery
+            "read_file", "list_files",                     // lettura
+        ];
+        for tool in &must_have {
+            assert!(
+                O_SERIES_ESSENTIAL_TOOLS_FALLBACK.contains(tool),
+                "tool essenziale '{}' mancante dal fallback o-series",
+                tool
+            );
+        }
+    }
+
+    #[test]
+    fn filter_tools_by_whitelist_filtra_correttamente() {
+        let tools = make_test_tools();
+        let whitelist = vec![
+            "read_file".to_string(),
+            "write_file".to_string(),
+            "nexus_mcp_tool_search".to_string(),
+        ];
+        let filtered = filter_tools_by_whitelist(tools, &whitelist);
+        let names: Vec<&str> = filtered
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"nexus_mcp_tool_search"));
+        // Non devono esserci tool non in whitelist
+        assert!(!names.contains(&"edit_file"));
+        assert!(!names.contains(&"run_command"));
     }
 }

@@ -52,6 +52,9 @@ pub use workbench::{
 
 pub use changes::get_project_changes;
 
+pub use allocate_port::allocate_port as allocate_project_port;
+pub use allocate_port::find_or_allocate as find_or_allocate_port;
+
 pub use services::{
     get_project_services_status,
     control_project_service,

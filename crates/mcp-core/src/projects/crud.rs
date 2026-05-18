@@ -206,8 +206,8 @@ pub async fn register_project(
 
     sqlx::query(
         r#"
-        INSERT INTO projects (id, team_id, owner_user_id, name, slug, default_branch, visibility, last_opened_by_user_id)
-        VALUES ($1, $2, $3, $4, $5, $6, 'private', $3)
+        INSERT INTO projects (id, team_id, owner_user_id, name, slug, default_branch, visibility, last_opened_by_user_id, repository_root_path)
+        VALUES ($1, $2, $3, $4, $5, $6, 'private', $3, $7)
         "#,
     )
     .bind(project_id)
@@ -216,6 +216,7 @@ pub async fn register_project(
     .bind(&project_name)
     .bind(&slug)
     .bind(&default_branch)
+    .bind(canonical.to_string_lossy().to_string())
     .execute(&mut *tx)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -287,6 +288,17 @@ pub async fn register_project(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // ── Auto-provisioning quote risorse (PR hardening) ─────────────────────
+    // Ogni nuovo progetto riceve una riga in nexus_resource_quotas con i default
+    // globali. Se la tabella non esiste ancora (migrazione non applicata), skip
+    // silenzioso per non bloccare la creazione del progetto.
+    let _ = sqlx::query(
+        "INSERT INTO nexus_resource_quotas (project_id) VALUES ($1) ON CONFLICT (project_id) DO NOTHING",
+    )
+    .bind(project_id)
+    .execute(&mut *tx)
+    .await;
+
     tx.commit()
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -300,6 +312,21 @@ pub async fn register_project(
         context.details.root_path.as_deref(),
     )
     .await?;
+
+    // Emetti evento di creazione progetto sul dispatcher. Permette ai pannelli
+    // frontend di aggiornarsi in tempo reale senza polling.
+    let _ = nexus_events::dispatcher::emit(
+        &state.project_channels,
+        project_id,
+        nexus_events::ProjectEvent::MutationRecorded {
+            method: "POST".to_string(),
+            path: "/api/projects/register".to_string(),
+            status_code: 200,
+            session_id: None,
+            summary: Some(format!("Progetto '{}' creato", project_name)),
+            actor_user_id: Some(user_id),
+        },
+    );
 
     // Fix M30 + M31: auto-popola run_configurations e nexus_port_allocations
     // scansionando il filesystem del progetto registrato. Spawn-and-forget,

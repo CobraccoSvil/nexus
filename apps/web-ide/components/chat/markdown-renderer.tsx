@@ -6,6 +6,13 @@ import { useThemeColors } from "../../lib/theme";
 
 function normalizeContent(raw: string): string {
   let s = raw;
+  // react-markdown 10.x: delimitatori inline (**bold**, *italic*, __bold__, _italic_)
+  // non vengono interpretati se attaccati direttamente al testo precedente senza spazio.
+  // Inseriamo spazio solo dopo punteggiatura (conservativo: non tocca "Bold**resto"
+  // che potrebbe essere una chiusura, ma corregge "fatto.**Ora**" e "risultato:**Bold**").
+  // Il \s* cattura spazi gia' presenti e il replacement normalizza a esattamente uno.
+  s = s.replace(/([.,:;!?)\]])\s*(\*{1,2})([A-Za-zÀ-ü0-9])/g, "$1 $2$3");
+  s = s.replace(/([.,:;!?)\]])\s*(_{1,2})([A-Za-zÀ-ü0-9])/g, "$1 $2$3");
   // "frase.Frase" o "frase.Il" senza spazio → aggiunge doppio a-capo
   s = s.replace(/\.([A-ZÀ-Ü])/g, ".\n\n$1");
   // Stessa cosa per "frase.[Link" (markdown link dopo punto senza spazio)

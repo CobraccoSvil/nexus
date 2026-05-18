@@ -36,6 +36,19 @@ pub async fn spawn_agent_process(
 
     let will_use_docker = sandbox_available && project_root.is_some();
 
+    // ── Strato 2 hardening: valida env_overrides PRIMA di insert DB ─────────────
+    // Rifiuta PORT fuori bucket, DATABASE_URL su DB nexus, REDIS_URL su :6379, ecc.
+    // Audit della rejection scritto qui sotto se l'errore arriva.
+    let env_vars = env_overrides.unwrap_or_default();
+    if let Err(e) = sandbox::validate_env_overrides(db, project_id, &env_vars).await {
+        crate::security::record_audit(
+            crate::security::AuditEntry::blocked(project_id, "env_rejected", "env")
+                .with_resource(label.to_string())
+                .with_details(serde_json::json!({"reason": e, "command": command})),
+        );
+        return Err(format!("env override rifiutato: {e}"));
+    }
+
     // Insert initial DB row
     sqlx::query(
         r#"INSERT INTO agent_processes (id, project_id, session_id, label, command, working_dir, status, sandboxed, kind)
@@ -52,8 +65,6 @@ pub async fn spawn_agent_process(
     .execute(db)
     .await
     .map_err(|e| format!("DB insert error: {e}"))?;
-
-    let env_vars = env_overrides.unwrap_or_default();
 
     // ── Scelta della strategia di spawn ──────────────────────────────────────
     //
@@ -77,6 +88,12 @@ pub async fn spawn_agent_process(
             .with_project_config(&project_cfg);
         if let Some(img) = service_image {
             config = config.with_image(img);
+        }
+        // I servizi (kind=service) devono ricevere connessioni esterne sulla
+        // porta dichiarata: abilita bridge network. I tool agente (kind!=service)
+        // restano isolati (network_mode = "none" di default in SandboxConfig::new).
+        if kind == "service" && project_cfg.network_mode.is_none() {
+            config = config.with_service_network();
         }
         let mut docker_cmd = sandbox::build_sandboxed_command(command, &cwd, &env_vars, &config);
 

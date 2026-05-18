@@ -166,6 +166,33 @@ static FORBIDDEN_PATTERNS: &[(&str, &str, &str, &str)] = &[
         "Lettura secrets/ssh/env Nexus vietata",
         "I file .env del workspace Nexus e le chiavi SSH sono off-limits.",
     ),
+    // ── 8. Bypass del broker di rete Nexus ─────────────────────────────────
+    // Aggiunti in PR hardening: chiusura delle vie laterali per raggiungere
+    // i servizi infrastruttura Nexus dai processi del progetto.
+    (
+        "nc_to_nexus_db",
+        r"(?i)\bnc\b[^|;&]*\b(?:127\.0\.0\.1|localhost|host\.docker\.internal)\b[^|;&]*\b(?:5432|6379|6333|4000|50051|50052|50071|50072)\b",
+        "Connessione netcat a porta infrastruttura Nexus",
+        "Usa solo porte allocate via request_port per i tuoi servizi.",
+    ),
+    (
+        "curl_to_internal",
+        r"(?i)\bcurl\b[^|;&]*\bhttps?://(?:127\.0\.0\.1|localhost|host\.docker\.internal):(?:4000|4010|4020|4030|4040|4050|4055|4060|4070|50051|50052|50071|50072|8001)\b",
+        "curl verso microservizi Nexus interni vietato",
+        "Gli endpoint pubblici Nexus sono accessibili via http://localhost:3000/api/* (web-ide proxy).",
+    ),
+    (
+        "ssh_outbound",
+        r"(?i)\bssh\s+(?:-[a-zA-Z]+\s+\S+\s+)*\S+@\S+",
+        "SSH outbound dal sandbox progetto vietato",
+        "Le connessioni SSH non sono permesse. Per git push usa HTTPS+token o git_push tool.",
+    ),
+    (
+        "setcap_chmod_suid",
+        r"(?i)\b(?:setcap\s+\S+|chmod\s+(?:[ug]\+s|\d?[2-7][0-7]{3}))\b",
+        "Escalation privilegi via setcap o chmod SUID/SGID vietata",
+        "Il container sandbox e' non-privileged (cap-drop ALL); le escalation non avrebbero effetto comunque.",
+    ),
 ];
 
 /// RegexSet compilato una sola volta (lazy).
@@ -374,5 +401,74 @@ mod tests {
         assert!(msg.contains("db_access_nexus"));
         assert!(msg.contains("COMANDO BLOCCATO"));
         assert!(msg.contains("Rimediazione"));
+    }
+
+    // ── Test pattern PR hardening (nc, curl interno, ssh, setcap) ─────────
+
+    #[test]
+    fn blocca_nc_a_porta_postgres_nexus() {
+        let r = check_command("nc -zv 127.0.0.1 5432");
+        assert!(r.is_some(), "nc verso :5432 deve essere bloccato");
+        assert_eq!(r.unwrap().category, "nc_to_nexus_db");
+    }
+
+    #[test]
+    fn blocca_nc_a_redis_nexus() {
+        let r = check_command("nc localhost 6379");
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().category, "nc_to_nexus_db");
+    }
+
+    #[test]
+    fn permette_nc_a_porta_progetto() {
+        // 30050 e' nel range progetti, non e' Nexus reserved
+        assert!(check_command("nc -zv 127.0.0.1 30050").is_none());
+    }
+
+    #[test]
+    fn blocca_curl_a_mcp_core() {
+        let r = check_command("curl http://127.0.0.1:4000/api/health");
+        assert!(r.is_some(), "curl verso mcp-core :4000 deve essere bloccato");
+        assert_eq!(r.unwrap().category, "curl_to_internal");
+    }
+
+    #[test]
+    fn blocca_curl_a_admin_service() {
+        let r = check_command("curl -s http://localhost:4010/admin/users");
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().category, "curl_to_internal");
+    }
+
+    #[test]
+    fn permette_curl_a_web_ide_proxy() {
+        // web-ide :3000 e' il proxy pubblico, non e' nella regex curl_to_internal
+        assert!(check_command("curl http://localhost:3000/api/projects").is_none());
+    }
+
+    #[test]
+    fn blocca_ssh_outbound() {
+        let r = check_command("ssh user@example.com");
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().category, "ssh_outbound");
+    }
+
+    #[test]
+    fn blocca_ssh_con_flags() {
+        let r = check_command("ssh -i ~/.ssh/id_rsa root@server.example.com");
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().category, "ssh_outbound");
+    }
+
+    #[test]
+    fn blocca_setcap_e_chmod_suid() {
+        assert!(check_command("setcap cap_net_bind_service+ep /usr/bin/foo").is_some());
+        assert!(check_command("chmod u+s /usr/bin/myprog").is_some());
+        assert!(check_command("chmod 4755 /usr/bin/myprog").is_some());
+    }
+
+    #[test]
+    fn permette_chmod_normale() {
+        assert!(check_command("chmod 755 ./build.sh").is_none());
+        assert!(check_command("chmod +x ./run.sh").is_none());
     }
 }

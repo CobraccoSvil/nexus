@@ -1137,6 +1137,9 @@ pub struct AgentToolContext {
     pub project_channels: nexus_events::ProjectChannels,
     /// Registro monitor in-memory (per `dispatcher_update_monitor` tool).
     pub monitor_registry: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, serde_json::Value>>>>,
+    /// Cache port_registry (PR hardening): usata da `tool_run_service` per
+    /// auto-allocare PORT nel bucket del progetto via `find_or_allocate_port`.
+    pub port_registry: crate::port_registry::PortRegistryCache,
 }
 
 /// Ritorna true se il tool modifica lo stato del filesystem o del repository.

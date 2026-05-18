@@ -38,6 +38,7 @@ pub struct ToolRunnerDeps {
     pub dependency_status: crate::task_watchdog::DependencyStatusRef,
     pub project_channels: nexus_events::ProjectChannels,
     pub monitor_registry: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, serde_json::Value>>>>,
+    pub port_registry: crate::port_registry::PortRegistryCache,
 }
 
 #[derive(Clone)]
@@ -135,6 +136,7 @@ impl ToolRunnerService {
             dependency_status: self.deps.dependency_status.clone(),
             project_channels: self.deps.project_channels.clone(),
             monitor_registry: self.deps.monitor_registry.clone(),
+            port_registry: self.deps.port_registry.clone(),
         })
     }
 }

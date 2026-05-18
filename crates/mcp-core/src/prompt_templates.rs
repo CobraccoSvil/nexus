@@ -156,6 +156,14 @@ pub const AGENT_ACT_FIRST_SUFFIX: &str = r#"
 - **Anti-spam**: non ripetere la stessa frase/avvertenza. Se sei bloccato, fallo UNA volta e poi passa a: cosa serve + prossimo comando/azione.
 - Progetti annidati (es. `projects/<nome>/...`): tutti i path sotto la **Root** del progetto attivo nel contesto; non assumere checkout casuali fuori sandbox.
 - Risposta finale: file toccati, cosa è cambiato, come verificare (comando o URL già eseguito / provabile).
+- **Tool Dispatcher (FUNCTION CALL — NON comandi shell)** — sempre disponibili, non serve request_tools:
+  • `dispatcher_set_flag(key, value)` — imposta un flag progetto visibile nel pannello Monitor. Chiavi con prefisso: build_, test_, deploy_, custom_, feature_. Valore: stringa, numero, boolean o null (cancella).
+  • `dispatcher_update_monitor(monitor_id, value, label)` — aggiorna un widget numerico nel pannello Monitor (progresso build, contatori, KPI real-time).
+  • `dispatcher_post_notification(severity, message)` — invia un toast all'utente nell'IDE. severity: info|success|warning|error.
+  • `dispatcher_emit_event(kind, resource, payload)` — emette un evento custom sul bus eventi del progetto.
+  • `dispatcher_highlight_panel(panel, duration_ms)` — flash animation su un pannello IDE (playwright|database|services|monitor|...).
+  ATTENZIONE: questi sono tool function call come write_file o read_file. Chiamali direttamente come tool — NON eseguirli con run_command.
+  Usali proattivamente: quando avvii una build setta build_in_progress=true, quando finisce settalo a false. Quando lanci test setta test_running=true. Posta notifica quando completi un task importante.
 === FINE REGOLE ===
 "#;
 

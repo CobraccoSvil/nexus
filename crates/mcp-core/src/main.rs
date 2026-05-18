@@ -5,6 +5,7 @@ mod dlp;
 mod provider_cooldown;
 mod models;
 mod sandbox;
+mod security;
 mod agent_tools;
 mod admin;
 mod auth;
@@ -520,6 +521,17 @@ async fn main() -> anyhow::Result<()> {
     // Indicizza solo i tool con embedding mancante o hash cambiato.
     nexus_builtin::spawn_tool_reindex(state.db.clone(), state.orchestrator.neural.clone());
 
+    // ── PR hardening: avvio writer audit centralizzato + port enforcer ───
+    // Audit writer: consuma il canale `record_audit(...)` e fa batch INSERT
+    // in `nexus_resource_audit` ogni 100 eventi o 5s.
+    security::audit::start_writer(state.db.clone());
+    // Port enforcer: scansiona porte TCP in LISTEN ogni 5s, killa processi
+    // di progetto che bindano porte fuori dal bucket assegnato.
+    tokio::spawn(security::port_enforcer::port_enforcer_loop(
+        state.db.clone(),
+        state.project_channels.clone(),
+    ));
+
     // ── Lettura batch settings DB ────────────────────────────────────────────
     // Leggiamo in parallelo tutti i flag comportamentali dalla tabella settings.
     // I valori sono usati nei blocchi successivi. Le env var restano come
@@ -630,6 +642,7 @@ async fn main() -> anyhow::Result<()> {
                 dependency_status: state.dependency_status.clone(),
                 project_channels: state.project_channels.clone(),
                 monitor_registry: state.monitor_registry.clone(),
+                port_registry: state.port_registry.clone(),
             };
             if let Err(e) = tool_runner_server::spawn_tool_runner_server(deps, addr).await {
                 tracing::error!("ToolRunner server: avvio fallito: {e}");
@@ -1374,6 +1387,13 @@ async fn main() -> anyhow::Result<()> {
                 )),
             )
             .route(
+                "/api/projects/:id/services/allocate-port",
+                post(project_workspace::allocate_project_port).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
                 "/api/projects/:id/services/:service",
                 axum::routing::delete(project_workspace::uninstall_project_service).layer(axum_mw::from_fn_with_state(
                     state.clone(),
@@ -1406,6 +1426,21 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/projects/:id/port-allocations/:port",
                 axum::routing::delete(project_workspace::delete_port_allocation).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            // ── PR hardening: endpoint sicurezza/quote ────────────────────────
+            .route(
+                "/api/projects/:id/security/audit",
+                get(security::api::get_project_audit).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/projects/:id/security/quota",
+                get(security::api::get_project_quota).layer(axum_mw::from_fn_with_state(
                     state.clone(),
                     middleware::require_auth,
                 )),

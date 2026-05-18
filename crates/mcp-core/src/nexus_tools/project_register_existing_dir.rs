@@ -164,6 +164,14 @@ impl NexusToolHandler for ProjectRegisterExistingDirTool {
         .await
         .map_err(|e| NexusToolError::BadInput(format!("insert repositories: {}", e)))?;
 
+        // Auto-provisioning quote risorse (PR hardening)
+        let _ = sqlx::query(
+            "INSERT INTO nexus_resource_quotas (project_id) VALUES ($1) ON CONFLICT (project_id) DO NOTHING",
+        )
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await;
+
         tx.commit()
             .await
             .map_err(|e| NexusToolError::BadInput(format!("commit: {}", e)))?;

@@ -7,6 +7,7 @@ import { OutputPanel } from "./output-panel";
 import { OptimizationPanel } from "./optimization-panel";
 import { MonitorPanel } from "./monitor-panel";
 import { RunPanel } from "./run-panel";
+import { SecurityPanel } from "./security-panel";
 import { promptFromPlaywrightRun, promptFromPort, promptFromProblem, promptEnablePlaywright, promptRunPlaywrightTests } from "../../lib/chat-prompts";
 import type {
   AITraceEvent,
@@ -32,7 +33,8 @@ export type PanelTab =
   | "ports"
   | "playwright"
   | "optimization"
-  | "monitor";
+  | "monitor"
+  | "security";
 
 export interface BottomPanelManagerProps {
   activePanelTab: PanelTab;
@@ -330,6 +332,10 @@ export function BottomPanelManager({
           )}
         </div>
       </div>
+    );
+
+    if (activePanelTab === "security") return (
+      <SecurityPanel projectId={project.id} onSendToChat={onSendToChat} />
     );
 
     // playwright

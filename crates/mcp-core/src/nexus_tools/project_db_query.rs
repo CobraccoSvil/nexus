@@ -60,6 +60,14 @@ impl NexusToolHandler for ProjectDbQueryTool {
         }
 
         if !is_read_only_query(&sql) {
+            // PR hardening: audit anche del blocco syntax-level
+            crate::security::record_audit(
+                crate::security::AuditEntry::blocked(ctx.project_id, "db_query_blocked", "db")
+                    .with_details(json!({
+                        "reason": "non read-only",
+                        "first_keyword": first_keyword(&sql).unwrap_or_default(),
+                    })),
+            );
             return Err(NexusToolError::BadInput(format!(
                 "Solo query read-only consentite (SELECT/WITH/EXPLAIN/SHOW/VALUES/TABLE). Prima keyword: '{}'",
                 first_keyword(&sql).unwrap_or_else(|| "<vuota>".to_string())
@@ -67,6 +75,10 @@ impl NexusToolHandler for ProjectDbQueryTool {
         }
 
         if db_helper::contains_ddl_statement(&sql) {
+            crate::security::record_audit(
+                crate::security::AuditEntry::blocked(ctx.project_id, "db_query_blocked", "db")
+                    .with_details(json!({"reason": "contiene DDL"})),
+            );
             return Err(NexusToolError::BadInput(
                 "La query contiene istruzioni DDL. Usa project_db_create_migration per modifiche schema.".into(),
             ));
@@ -120,6 +132,15 @@ impl NexusToolHandler for ProjectDbQueryTool {
         }
 
         project_pool.close().await;
+
+        // PR hardening: audit query autorizzata
+        crate::security::record_audit(
+            crate::security::AuditEntry::allowed(ctx.project_id, "db_query", "db")
+                .with_details(json!({
+                    "rows_returned": out_rows.len(),
+                    "truncated": truncated,
+                })),
+        );
 
         Ok(json!({
             "ok": true,

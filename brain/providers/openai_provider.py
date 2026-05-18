@@ -9,6 +9,34 @@ from typing import Any, AsyncIterator
 # e usano max_completion_tokens invece di max_tokens.
 _O_SERIES_MODELS = frozenset({"o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini"})
 
+# Soglia: se un modello o-series riceve piu' di N tool, applichiamo il filtro
+# safety net lato Python (il filtro principale avviene lato Rust in
+# build_tools_json_for_agent, ma il safety net copre il caso di provider
+# fallback dove il modello cambia dopo che i tool sono stati costruiti).
+_O_SERIES_MAX_TOOLS = 20
+
+# Tool essenziali per modelli o-series (sincronizzati con
+# O_SERIES_ESSENTIAL_TOOLS_FALLBACK in brain_agent_client.rs)
+_O_SERIES_ESSENTIAL_TOOL_NAMES = frozenset({
+    "read_file", "read_file_lines", "list_files", "search_in_files",
+    "write_file", "edit_file", "run_command", "fs_mkdir", "delete_file",
+    "git_status", "git_commit", "run_tests",
+    "nexus_mcp_tool_search", "nexus_mcp_tool_call",
+    "search_codebase_semantic",
+})
+
+
+def _filter_essential_tools_o_series(tools: list[dict]) -> list[dict]:
+    """Filtra una lista di tool OpenAI-format lasciando solo quelli essenziali.
+
+    Usato come safety net quando il backend Rust non ha potuto filtrare
+    (es. dopo provider fallback da Anthropic a OpenAI o-series).
+    """
+    return [
+        t for t in tools
+        if t.get("function", {}).get("name", "") in _O_SERIES_ESSENTIAL_TOOL_NAMES
+    ]
+
 
 def _is_o_series(model: str) -> bool:
     """Restituisce True se il modello e' della serie reasoning (o1/o3/o4-mini)."""
@@ -136,6 +164,14 @@ class OpenAIProvider(BaseProvider):
                 oai_messages.insert(0, {"role": "system", "content": system_text})
             # Converte Anthropic tool definitions → OpenAI function format
             oai_tools = [_anthropic_tool_to_openai(t) for t in tools] if tools else []
+
+            # Safety net per modelli o-series (vedi anche generate_agent_turn_stream)
+            if _is_o_series(model) and len(oai_tools) > _O_SERIES_MAX_TOOLS:
+                oai_tools = _filter_essential_tools_o_series(oai_tools)
+                logger.info(
+                    "o-series safety net (non-stream): tool ridotti a %d per modello %s",
+                    len(oai_tools), model,
+                )
 
             kwargs_call: dict[str, Any] = {
                 "model": model,
@@ -265,6 +301,16 @@ class OpenAIProvider(BaseProvider):
             if system_text:
                 oai_messages.insert(0, {"role": "system", "content": system_text})
             oai_tools = [_anthropic_tool_to_openai(t) for t in tools] if tools else []
+
+            # Safety net per modelli o-series: se il backend Rust non ha
+            # gia' ridotto i tool (es. dopo provider fallback), li filtriamo
+            # qui. Iniezione istruzioni esplicite sull'uso dei tool.
+            if _is_o_series(model) and len(oai_tools) > _O_SERIES_MAX_TOOLS:
+                oai_tools = _filter_essential_tools_o_series(oai_tools)
+                logger.info(
+                    "o-series safety net: tool ridotti a %d per modello %s",
+                    len(oai_tools), model,
+                )
 
             stream_kwargs: dict[str, Any] = {
                 "model": model,

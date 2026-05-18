@@ -54,6 +54,7 @@ import { useMultiChat } from "../lib/use-multi-chat";
 import { useProfiles, DEFAULT_PROFILE_ID } from "../lib/use-profiles";
 import { ProjectSwitcher } from "./project-switcher";
 import { UserSidebarMenu } from "./user-header";
+import { QuotaBadge } from "./panels/quota-badge";
 import type { SidebarView } from "./sidebar/sidebar-manager";
 import type { PanelTab } from "./panels/bottom-panel-manager";
 import { TruncatedText } from "./truncated-text";
@@ -126,6 +127,7 @@ const panelTabs: Array<{ key: PanelTab; label: string }> = [
   { key: "playwright", label: "Playwright" },
   { key: "monitor", label: "Monitor" },
   { key: "optimization", label: "Ottimizzazione" },
+  { key: "security", label: "Sicurezza" },
 ];
 
 const EMPTY_GROUPS: EditorGroupState[] = [
@@ -2158,7 +2160,8 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               {tab.label}
             </button>
           ))}
-          <div style={{ marginLeft: "auto", paddingRight: 12 }}>
+          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8, paddingRight: 12 }}>
+            {activeProject && <QuotaBadge projectId={activeProject.id} />}
             <button
               type="button"
               onClick={() => setBottomPanelVisible(false)}
