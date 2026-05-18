@@ -470,9 +470,10 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
     } catch { /* ignora — il backend potrebbe essere down */ }
   }, []);
 
+  // Polling rilassato (30s) — i servizi Nexus cambiano stato raramente.
   useEffect(() => {
     fetchNexusServices();
-    const t = setInterval(fetchNexusServices, 8000);
+    const t = setInterval(fetchNexusServices, 30_000);
     return () => clearInterval(t);
   }, [fetchNexusServices]);
 

@@ -5,6 +5,10 @@ import { getHealth, getNeuralHealth, getProviderHealth } from "../lib/api-client
 import { useThemeColors } from "../lib/theme";
 import { useI18n } from "../lib/i18n";
 import { PanelCard } from "./panel-card";
+import {
+  useProjectStore,
+  selectProviderHealthChangedAt,
+} from "../lib/project-dispatcher/store";
 
 interface ServiceStatus {
   name: string;
@@ -81,11 +85,18 @@ export function MonitoringPanel() {
     }
   }, [t]);
 
+  // Fetch iniziale + fallback polling rilassato (120s)
   useEffect(() => {
     refresh();
-    const interval = setInterval(refresh, 30000);
+    const interval = setInterval(refresh, 120_000);
     return () => clearInterval(interval);
   }, [refresh]);
+
+  // Event-driven: refresh immediato quando ProviderHealthChanged arriva via SSE
+  const providerHealthAt = useProjectStore(selectProviderHealthChangedAt);
+  useEffect(() => {
+    if (providerHealthAt > 0) void refresh();
+  }, [providerHealthAt, refresh]);
 
   const statusLabel = (status: "ok" | "error" | "warning" | "loading") =>
     status === "ok" ? t("mon.online") : status === "warning" ? t("mon.quota") : status === "error" ? t("mon.offline") : t("mon.checking");

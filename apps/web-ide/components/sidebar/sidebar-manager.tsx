@@ -9,6 +9,11 @@ import { SourceControlPanel } from "../git/source-control-panel";
 import { ServerMonitorPanel } from "./server-monitor-panel";
 import { ProjectDbPanel } from "../project-db/project-db-panel";
 import {
+  useProjectStore,
+  selectServicesMap,
+  selectPorts as selectDispatcherPorts,
+} from "../../lib/project-dispatcher/store";
+import {
   createRunConfig,
   updateRunConfig,
   deleteRunConfig,
@@ -259,8 +264,12 @@ function RunDebugView({
 
   const projectId = project?.id ?? "";
 
-  // Polling lieve dei servizi systemd del progetto: serve solo a sapere quali
-  // run config nascondere perché coperti da un servizio persistente.
+  // ── Event-driven: refresh servizi via dispatcher SSE ──
+  const servicesFromDispatcher = useProjectStore(selectServicesMap);
+  const portsFromDispatcher = useProjectStore(selectDispatcherPorts);
+
+  // Polling rilassato (30s) dei servizi systemd — fallback di sicurezza.
+  // I refresh reali sono triggerati da ServiceStarted/Stopped/Restarted sotto.
   useEffect(() => {
     if (!projectId) { setSystemdShorts(new Set()); return; }
     let cancelled = false;
@@ -274,11 +283,28 @@ function RunDebugView({
       } catch { /* ignora */ }
     };
     refresh();
-    const t = window.setInterval(refresh, 8000);
+    const t = window.setInterval(refresh, 30_000);
     return () => { cancelled = true; window.clearInterval(t); };
   }, [projectId]);
 
-  // Polling porte rilevate per link "Apri" (molto leggero).
+  // Refresh immediato servizi quando il dispatcher notifica un cambio di stato
+  useEffect(() => {
+    if (!projectId || Object.keys(servicesFromDispatcher).length === 0) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await getProjectServicesStatus(projectId);
+        if (cancelled) return;
+        const svcs = r.services ?? [];
+        setSystemdShorts(new Set(svcs.map(s => s.short)));
+        setSystemdSvcs(svcs);
+      } catch { /* ignora */ }
+    })();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [servicesFromDispatcher]);
+
+  // Polling rilassato (30s) porte — fallback di sicurezza.
   useEffect(() => {
     if (!projectId) { setPorts([]); return; }
     let cancelled = false;
@@ -289,9 +315,23 @@ function RunDebugView({
       } catch { /* ignora */ }
     };
     refresh();
-    const t = window.setInterval(refresh, 10000);
+    const t = window.setInterval(refresh, 30_000);
     return () => { cancelled = true; window.clearInterval(t); };
   }, [projectId]);
+
+  // Refresh immediato porte quando il dispatcher notifica PortAllocated/Released
+  useEffect(() => {
+    if (!projectId || portsFromDispatcher.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await getProjectPorts(projectId);
+        if (!cancelled) setPorts(r.ports ?? []);
+      } catch { /* ignora */ }
+    })();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [portsFromDispatcher]);
 
   const svcUrlFor = (svc: ProjectServiceEntry): string | null => {
     const p =
