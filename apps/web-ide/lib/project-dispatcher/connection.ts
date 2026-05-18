@@ -76,6 +76,7 @@ function openStream(projectId: string): void {
     "FileChanged",
     "GitStatusChanged",
     "DbQueryRun",
+    "DbConfigUpdated",
     "AgentToolUsed",
     "Notification",
     "FlagChanged",
@@ -83,6 +84,13 @@ function openStream(projectId: string): void {
     "HighlightPanel",
     "Custom",
     "SnapshotRequired",
+    // ── Chat session lifecycle (handler nello store, prima non sottoscritti) ──
+    "ChatSessionCompacted",
+    "ChatMessageAdded",
+    "ChatSessionStatusChanged",
+    // ── Catch-all HTTP mutations + meta enrichment ─────────────────────────
+    "MutationRecorded",
+    "EventEnriched",
   ];
   KINDS.forEach((k) => es.addEventListener(k, handleEvent));
   es.addEventListener("message", handleEvent);
