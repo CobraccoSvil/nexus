@@ -743,6 +743,11 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     if (count !== filesRefreshRef.current) {
       filesRefreshRef.current = count;
       void refreshOperationalViews(activeProject.id);
+      // Anche il file tree va rinfrescato: openProject ritorna tree fresh.
+      // Senza questo, la sidebar non mostra file nuovi creati dall'agente.
+      void openProject(activeProject.id)
+        .then((opened) => setTreeNodes(opened.tree))
+        .catch(() => { /* ignora */ });
     }
   }, [filesRecentFromDispatcher.length, activeProject?.id, refreshOperationalViews]);
 
