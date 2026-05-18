@@ -62,8 +62,10 @@ import {
   useProjectDispatcher,
   useProjectStore,
   selectPlaywrightRuns,
+  selectPlaywrightConfigChangedAt,
   selectPorts,
   selectFilesRecent,
+  selectGitStatus,
 } from "../lib/project-dispatcher";
 import { ConnectionStatusBadge, ToastStack } from "./dispatcher-status";
 
@@ -473,6 +475,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   const [outputEvents, setOutputEvents] = useState<OutputEvent[]>([]);
   const [ports, setPorts] = useState<PortEntry[]>([]);
   const [playwrightRuns, setPlaywrightRuns] = useState<PlaywrightRunSummary[]>([]);
+  const [playwrightConfigured, setPlaywrightConfigured] = useState(false);
   const [runConfigs, setRunConfigs] = useState<RunConfigItem[]>([]);
   const [providerStatus, setProviderStatus] = useState<Record<ProviderKey, ProviderHealthState>>({
     openai: { ok: null },
@@ -561,8 +564,35 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   // (state legacy) per compatibilita' durante la migrazione. Il polling esistente
   // (useEffect linee ~898 e ~943) verra' rimosso in una fase successiva.
   const playwrightRunsFromDispatcher = useProjectStore(selectPlaywrightRuns);
+  const playwrightConfigChangedAt = useProjectStore(selectPlaywrightConfigChangedAt);
   const portsFromDispatcher = useProjectStore(selectPorts);
   const filesRecentFromDispatcher = useProjectStore(selectFilesRecent);
+
+  // Auto-refresh pannello Playwright quando il dispatcher rileva playwright.config.*
+  useEffect(() => {
+    if (playwrightConfigChangedAt > 0 && activeProject) {
+      void getPlaywrightRuns(activeProject.id)
+        .then((res) => {
+          setPlaywrightRuns(res.runs ?? []);
+          setPlaywrightConfigured(res.configured ?? false);
+        })
+        .catch(() => { /* ignora */ });
+    }
+  }, [playwrightConfigChangedAt, activeProject]);
+
+  // Auto-refresh gitState quando arriva GitStatusChanged dal dispatcher.
+  // Il payload e' magro (branch, ahead, behind, modified_count) ma noi
+  // serviamo GitRepositoryState completo (staged/unstaged/untracked file list),
+  // quindi usiamo l'evento come trigger di refresh full via API.
+  const gitStatusFromDispatcher = useProjectStore(selectGitStatus);
+  useEffect(() => {
+    if (!activeProject) return;
+    if (!gitStatusFromDispatcher.branch) return; // skip stato iniziale
+    void getGitStatus(activeProject.id)
+      .then((res) => setGitState(res.git))
+      .catch(() => { /* ignora */ });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gitStatusFromDispatcher]);
 
   const [chatProvider, setChatProvider] = useState<string>("auto");
   const [chatModel, setChatModel] = useState<string>("auto");
@@ -668,6 +698,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
         setOutputChannels(channelsRes.channels ?? []);
         setPorts(portsRes.ports ?? []);
         setPlaywrightRuns(playwrightRes.runs ?? []);
+        setPlaywrightConfigured(playwrightRes.configured ?? false);
         setRunConfigs(runConfigsRes.configs ?? []);
         const firstChannel = channelsRes.channels?.[0]?.id ?? "System";
         setSelectedOutputChannel((current) => current || firstChannel);
@@ -1514,7 +1545,10 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
                 // Refresh dei Playwright runs: l'agente potrebbe aver eseguito test
                 if (activeProject) {
                   void getPlaywrightRuns(activeProject.id)
-                    .then((res) => setPlaywrightRuns(res.runs ?? []))
+                    .then((res) => {
+                      setPlaywrightRuns(res.runs ?? []);
+                      setPlaywrightConfigured(res.configured ?? false);
+                    })
                     .catch(() => { /* ignora */ });
                 }
               }}
@@ -2185,6 +2219,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               ? portsFromDispatcher.map((p) => ({ port: p.port, label: p.label, state: "listen" }))
               : ports}
             playwrightRuns={playwrightRunsFromDispatcher.length > 0 ? playwrightRunsFromDispatcher : playwrightRuns}
+            playwrightConfigured={playwrightConfigured}
             onOpenFile={(path, line) => void openFileInGroup(path, line)}
             onSelectOutputChannel={setSelectedOutputChannel}
             onRefreshPanel={(tab) => {
