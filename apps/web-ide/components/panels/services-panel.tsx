@@ -3,6 +3,11 @@
 import { useState, useEffect, useCallback, } from "react";
 import { useThemeColors } from "../../lib/theme";
 import { getOutputChannels, getOutputEvents, stopAgentProcess, clearFinishedProcesses, type OutputChannel, type OutputEvent } from "../../lib/api-client";
+import {
+  useProjectStore,
+  selectOutputChannelsChangedAt,
+  selectServicesMap,
+} from "../../lib/project-dispatcher/store";
 
 interface ServicesPanelProps {
   projectId: string;
@@ -80,10 +85,22 @@ export function ServicesPanel({ projectId, projectName, onSendToChat }: Services
     }
   }, [projectId, activeTab]);
 
-  // Poll every 5s
+  // Event-driven: ricarica canali quando OutputChannelCreated arriva via SSE
+  const outputChannelsChangedAt = useProjectStore(selectOutputChannelsChangedAt);
+  useEffect(() => {
+    if (outputChannelsChangedAt > 0) void fetchProcesses();
+  }, [outputChannelsChangedAt, fetchProcesses]);
+
+  // Event-driven: ricarica canali quando lo stato di un servizio cambia (start/stop/restart)
+  const servicesMap = useProjectStore(selectServicesMap);
+  useEffect(() => {
+    if (servicesMap && Object.keys(servicesMap).length > 0) void fetchProcesses();
+  }, [servicesMap, fetchProcesses]);
+
+  // Fetch iniziale + fallback polling rilassato (30s)
   useEffect(() => {
     fetchProcesses();
-    const interval = setInterval(fetchProcesses, 5000);
+    const interval = setInterval(fetchProcesses, 30_000);
     return () => clearInterval(interval);
   }, [fetchProcesses]);
 

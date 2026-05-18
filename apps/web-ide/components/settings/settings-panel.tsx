@@ -3,6 +3,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { useTheme, useThemeColors } from "../../lib/theme";
 import { useI18n } from "../../lib/i18n";
+import {
+  useProjectStore,
+  selectProviderHealthChangedAt,
+  selectSettingsChangedAt,
+} from "../../lib/project-dispatcher/store";
 import { ProviderSettings, type BrowseDirectoriesResponse, type GatewayProvider, type SettingEntry } from "./provider-settings";
 import { RoutingConfig } from "./routing-config";
 import { PluginManager } from "./plugin-manager";
@@ -93,9 +98,16 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
   useEffect(() => {
     if (category !== "providers") return;
     void loadGatewayProviders();
-    const gwInterval = setInterval(() => void loadGatewayProviders(), 10_000);
+    // Fallback polling rilassato (120s) — la fonte primaria e' il dispatcher SSE
+    const gwInterval = setInterval(() => void loadGatewayProviders(), 120_000);
     return () => clearInterval(gwInterval);
   }, [category, loadGatewayProviders]);
+
+  // Event-driven: ricarica gateway providers quando il health probe emette ProviderHealthChanged
+  const providerHealthAt = useProjectStore(selectProviderHealthChangedAt);
+  useEffect(() => {
+    if (providerHealthAt > 0) void loadGatewayProviders();
+  }, [providerHealthAt, loadGatewayProviders]);
 
   const fetchSettings = useCallback(async () => {
     try {
@@ -114,6 +126,12 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
   useEffect(() => {
     fetchSettings();
   }, [fetchSettings]);
+
+  // Event-driven: ricarica settings quando SettingChanged arriva via SSE
+  const settingsChangedAt = useProjectStore(selectSettingsChangedAt);
+  useEffect(() => {
+    if (settingsChangedAt > 0) void fetchSettings();
+  }, [settingsChangedAt, fetchSettings]);
 
 
   const handleSave = async (key: string) => {
