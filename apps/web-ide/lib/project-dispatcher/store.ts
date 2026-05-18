@@ -69,13 +69,13 @@ export interface ProjectStoreState {
   reconnectAttempts: number;
 
   // Slices per topic
-  playwright: { runs: PlaywrightRunSummary[] };
+  playwright: { runs: PlaywrightRunSummary[]; configChangedAt: number };
   ports: { entries: PortEntry[] };
   problems: { items: ProblemItem[]; badge: number };
   services: { byName: Record<string, { name: string; port?: number; pid?: number; status: "running" | "stopped" }> };
   files: { recentChanged: Array<{ path: string; op: string; ts: number }> };
   git: { branch: string; ahead: number; behind: number; modified: number };
-  database: { recentQueries: Array<{ duration_ms: number; rows: number; kind: string; ts: number }> };
+  database: { recentQueries: Array<{ duration_ms: number; rows: number; kind: string; ts: number }>; configUpdatedAt: number };
   flags: Record<string, unknown>;
   monitors: Record<string, MonitorState>;
   chat: {
@@ -131,13 +131,13 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
   lastEventTs: null,
   reconnectAttempts: 0,
 
-  playwright: { runs: [] },
+  playwright: { runs: [], configChangedAt: 0 },
   ports: { entries: [] },
   problems: { items: [], badge: 0 },
   services: { byName: {} },
   files: { recentChanged: [] },
   git: { branch: "", ahead: 0, behind: 0, modified: 0 },
-  database: { recentQueries: [] },
+  database: { recentQueries: [], configUpdatedAt: 0 },
   flags: {},
   monitors: {},
   chat: { lastCompactBySession: {}, lastMessageBySession: {}, statusBySession: {} },
@@ -157,13 +157,13 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
     reconnectAttempts: 0,
     connectionStatus: projectId ? "connecting" : "idle",
     // Reset stato per evitare contaminazione tra progetti diversi
-    playwright: { runs: [] },
+    playwright: { runs: [], configChangedAt: 0 },
     ports: { entries: [] },
     problems: { items: [], badge: 0 },
     services: { byName: {} },
     files: { recentChanged: [] },
     git: { branch: "", ahead: 0, behind: 0, modified: 0 },
-    database: { recentQueries: [] },
+    database: { recentQueries: [], configUpdatedAt: 0 },
     flags: {},
     monitors: {},
     chat: { lastCompactBySession: {}, lastMessageBySession: {}, statusBySession: {} },
@@ -182,7 +182,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
   applySnapshot: (snapshot) => set((state) => {
     const next: Partial<ProjectStoreState> = { lastSeq: snapshot.seq ?? 0 };
     if (snapshot.playwright?.runs) {
-      next.playwright = { runs: snapshot.playwright.runs };
+      next.playwright = { runs: snapshot.playwright.runs, configChangedAt: 0 };
     }
     if (snapshot.flags) {
       next.flags = snapshot.flags;
@@ -216,12 +216,13 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
             createdAt: new Date(env.ts).toISOString(),
           };
           const without = next.playwright.runs.filter((r) => r.id !== p.id);
-          next.playwright = { runs: [newRun, ...without].slice(0, 50) };
+          next.playwright = { ...next.playwright, runs: [newRun, ...without].slice(0, 50) };
         }
         break;
       }
       case "JobUpdated": {
         next.playwright = {
+          ...next.playwright,
           runs: next.playwright.runs.map((r) =>
             r.id === p.id
               ? { ...r, status: p.status, label: p.label ?? r.label, summary: p.summary ?? r.summary }
@@ -232,7 +233,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
       }
       case "JobsCleared": {
         if (p.job_kind === "playwright_test") {
-          next.playwright = { runs: [] };
+          next.playwright = { ...next.playwright, runs: [] };
         }
         break;
       }
@@ -268,7 +269,16 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
         };
         break;
       }
-      case "ServiceStopped":
+      case "ServiceStopped": {
+        const existing = next.services.byName[p.name];
+        next.services = {
+          byName: {
+            ...next.services.byName,
+            [p.name]: existing ? { ...existing, status: "stopped" } : { name: p.name, status: "stopped" },
+          },
+        };
+        break;
+      }
       case "ServiceRestarted": {
         const existing = next.services.byName[p.name];
         next.services = {
@@ -286,6 +296,10 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
             ...next.files.recentChanged.filter((f) => f.path !== p.path),
           ].slice(0, 50),
         };
+        // Rileva creazione/modifica playwright.config.* per aggiornare pannello Playwright
+        if (/playwright\.config\.(ts|js|mjs)$/.test(p.path)) {
+          next.playwright = { ...next.playwright, configChangedAt: env.ts };
+        }
         break;
       }
       case "GitStatusChanged": {
@@ -294,11 +308,16 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
       }
       case "DbQueryRun": {
         next.database = {
+          ...next.database,
           recentQueries: [
             { duration_ms: p.duration_ms, rows: p.rows, kind: p.statement_kind, ts: env.ts },
             ...next.database.recentQueries,
           ].slice(0, 100),
         };
+        break;
+      }
+      case "DbConfigUpdated": {
+        next.database = { ...next.database, configUpdatedAt: env.ts };
         break;
       }
       case "FlagChanged": {
@@ -493,12 +512,14 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
 // Selectors esportati per ergonomia
 export const selectConnection = (s: ProjectStoreState) => s.connectionStatus;
 export const selectPlaywrightRuns = (s: ProjectStoreState) => s.playwright.runs;
+export const selectPlaywrightConfigChangedAt = (s: ProjectStoreState) => s.playwright.configChangedAt;
 export const selectPorts = (s: ProjectStoreState) => s.ports.entries;
 export const selectProblemsBadge = (s: ProjectStoreState) => s.problems.badge;
 export const selectServicesMap = (s: ProjectStoreState) => s.services.byName;
 export const selectFilesRecent = (s: ProjectStoreState) => s.files.recentChanged;
 export const selectGitStatus = (s: ProjectStoreState) => s.git;
 export const selectDatabaseQueries = (s: ProjectStoreState) => s.database.recentQueries;
+export const selectDbConfigUpdatedAt = (s: ProjectStoreState) => s.database.configUpdatedAt;
 export const selectToasts = (s: ProjectStoreState) => s.toasts;
 export const selectFlags = (s: ProjectStoreState) => s.flags;
 export const selectMonitors = (s: ProjectStoreState) => s.monitors;
