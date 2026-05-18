@@ -20,6 +20,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
 import { useGlobalDialog } from "../global-dialog-provider";
 import {
+  useProjectStore,
+  selectServicesMap,
+  selectPorts as selectDispatcherPorts,
+} from "../../lib/project-dispatcher/store";
+import {
   getProjectServicesStatus,
   controlProjectService,
   getProjectPorts,
@@ -264,12 +269,32 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
     fetchPorts();
     fetchPortAllocations();
     fetchChanges();
-    const t1 = setInterval(fetchServices, 5000);
-    const t2 = setInterval(fetchPorts, 6000);
-    const t3 = setInterval(fetchChanges, 4000);
-    const t4 = setInterval(fetchPortAllocations, 30000);
+    // Polling drop da 5s/6s a 30s: fallback di sicurezza (eventi mancanti, riconnessione SSE).
+    // I refresh "veri" sono triggerati dagli eventi dispatcher sotto.
+    const t1 = setInterval(fetchServices, 30000);
+    const t2 = setInterval(fetchPorts, 30000);
+    const t3 = setInterval(fetchChanges, 4000); // file changes mantengono cadenza fitta (no evento dedicato)
+    const t4 = setInterval(fetchPortAllocations, 60000);
     return () => { clearInterval(t1); clearInterval(t2); clearInterval(t3); clearInterval(t4); };
   }, [fetchServices, fetchPorts, fetchPortAllocations, fetchChanges]);
+
+  // ── Refresh event-driven via dispatcher SSE ─────────────────────────────
+  // L'evento dispatcher non contiene tutti i campi del RunPanel (unit, state,
+  // crash_loop): lo usiamo come trigger di refresh, non come sorgente dati.
+  const servicesFromDispatcher = useProjectStore(selectServicesMap);
+  const portsFromDispatcher = useProjectStore(selectDispatcherPorts);
+  useEffect(() => {
+    // skip mount iniziale (gia' coperto da useEffect precedente)
+    if (Object.keys(servicesFromDispatcher).length === 0) return;
+    void fetchServices();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [servicesFromDispatcher]);
+  useEffect(() => {
+    if (portsFromDispatcher.length === 0) return;
+    void fetchPorts();
+    void fetchPortAllocations();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [portsFromDispatcher]);
 
   // Quando l'agente completa un run, ri-verifica immediatamente i servizi
   // e aggiorna il feedback diagnostico (risolto / persiste)
