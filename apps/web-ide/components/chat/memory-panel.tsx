@@ -3,6 +3,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
 import {
+  useProjectStore,
+  selectMemoryChangedAt,
+} from "../../lib/project-dispatcher/store";
+import {
   listProjectMemories,
   toggleProjectMemory,
   type ProjectMemory,
@@ -30,6 +34,12 @@ export function MemoryPanel({ projectId, onClose }: MemoryPanelProps) {
   }, [projectId]);
 
   useEffect(() => { void load(); }, [load]);
+
+  // Auto-refresh quando l'agente inserisce/aggiorna memorie via dispatcher SSE
+  const memoryChangedAt = useProjectStore(selectMemoryChangedAt);
+  useEffect(() => {
+    if (memoryChangedAt > 0) void load();
+  }, [memoryChangedAt, load]);
 
   const handleToggle = async (id: string) => {
     setToggling(id);

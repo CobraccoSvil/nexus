@@ -3,6 +3,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { useThemeColors } from "../../lib/theme";
 import { useProjectStore, selectFilesRecent, useEventOfKind } from "../../lib/project-dispatcher/hooks";
+import { selectQualityScan } from "../../lib/project-dispatcher/store";
 import { TruncatedText } from "../truncated-text";
 import {
   runQualityScan,
@@ -664,6 +665,18 @@ export function OptimizationPanel({ projectId, onSendToChat, onAutoSendToChat, a
     void fetchFindings();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
+
+  // Reazione a QualityScanProgress via dispatcher SSE: quando il backend
+  // segnala "completed", ricarica i findings senza intervento manuale.
+  const qualityScan = useProjectStore(selectQualityScan);
+  useEffect(() => {
+    if (!qualityScan) return;
+    if (qualityScan.phase === "completed") {
+      void fetchFindings();
+    } else if (qualityScan.phase === "started") {
+      setScanning(true);
+    }
+  }, [qualityScan, fetchFindings]);
 
   const handleScan = async () => {
     setScanning(true);

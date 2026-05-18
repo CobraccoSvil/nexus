@@ -2,6 +2,10 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  useProjectStore,
+  selectPluginsChangedAt,
+} from "../../lib/project-dispatcher/store";
+import {
   createMcpServer,
   deleteMcpServer,
   draftPluginIntegration,
@@ -223,6 +227,12 @@ export function PluginManager() {
       mounted = false;
     };
   }, [loadData]);
+
+  // Auto-refresh quando un plugin viene installato/rimosso/abilitato via dispatcher SSE
+  const pluginsChangedAt = useProjectStore(selectPluginsChangedAt);
+  useEffect(() => {
+    if (pluginsChangedAt > 0) void loadData();
+  }, [pluginsChangedAt, loadData]);
 
   useEffect(() => {
     setPolicyDrafts((prev) => {

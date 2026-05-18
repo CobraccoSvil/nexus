@@ -5,6 +5,7 @@ import { useThemeColors } from "../../lib/theme";
 import {
   useProjectStore,
   selectDbConfigUpdatedAt,
+  selectMigrationsChangedAt,
   selectDatabaseQueries,
 } from "../../lib/project-dispatcher/store";
 import {
@@ -154,6 +155,12 @@ export function ProjectDbPanel({ project }: Props) {
   useEffect(() => {
     if (dbConfigUpdatedAt > 0) void load();
   }, [dbConfigUpdatedAt, load]);
+
+  // Auto-refresh quando una migrazione viene applicata/rollback via dispatcher SSE
+  const migrationsChangedAt = useProjectStore(selectMigrationsChangedAt);
+  useEffect(() => {
+    if (migrationsChangedAt > 0) void load();
+  }, [migrationsChangedAt, load]);
 
   const pending = migrations.filter((m) => m.status === "pending");
   const applied = migrations.filter((m) => m.status === "applied");

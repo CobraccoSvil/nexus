@@ -67,6 +67,7 @@ import {
   selectFilesRecent,
   selectGitStatus,
   selectProblemsBadge,
+  selectRunConfigsChangedAt,
 } from "../lib/project-dispatcher";
 import { ConnectionStatusBadge, ToastStack } from "./dispatcher-status";
 
@@ -1035,8 +1036,23 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   // Polling Fix M45 RIMOSSO: ora i pannelli operativi (porte, playwright,
   // problemi) si aggiornano in tempo reale via dispatcher SSE — vedi
   // `useProjectDispatcher(activeProject?.id)` sopra. Resta solo un refresh
-  // periodico molto piu' rilassato (30s) per `runConfigs` che ancora non
-  // emette eventi tramite il dispatcher (verra' migrato in PR successiva).
+  // Auto-refresh run configs via dispatcher SSE (RunConfigChanged).
+  // Fallback polling 120s per sicurezza (es. modifica diretta DB).
+  const runConfigsChangedAt = useProjectStore(selectRunConfigsChangedAt);
+  useEffect(() => {
+    const projectId = activeProject?.id;
+    if (!projectId || runConfigsChangedAt === 0) return;
+    const refresh = async () => {
+      try {
+        const runConfigsRes = await getRunConfigs(projectId);
+        setRunConfigs(runConfigsRes.configs ?? []);
+      } catch {
+        /* best-effort */
+      }
+    };
+    void refresh();
+  }, [activeProject?.id, runConfigsChangedAt]);
+
   useEffect(() => {
     const projectId = activeProject?.id;
     if (!projectId) return;
@@ -1048,7 +1064,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
         /* best-effort */
       }
     };
-    const interval = window.setInterval(refresh, 30_000);
+    const interval = window.setInterval(refresh, 120_000);
     return () => window.clearInterval(interval);
   }, [activeProject?.id]);
 
