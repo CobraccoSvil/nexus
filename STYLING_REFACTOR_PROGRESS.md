@@ -1,131 +1,68 @@
 # Styling Refactor Progress
 
-## Completion Status
+## Stato corrente (aggiornato 2026-05-19, branch `chore/backlog-closure`)
 
-**Infrastructure (Step 0-2)**: ✅ 100%
-- [x] CSS variables registered in theme-body.tsx
-- [x] 120+ utility classes added to globals.css
-- [x] Helper functions consolidated in lib/styles.ts
-- [x] STYLING_GUIDE.md created
+**Riconteggio reale** (script `scripts/count-inline-styles.sh`):
 
-## 🎉 REFACTORING CSS INLINE STYLES - COMPLETED PHASES
+  Totale inline styles attualmente:  **2884** in **92 file** `.tsx`
+  (vs. baseline storica del piano: 1665 — il codice e' cresciuto)
 
-### ✅ **Fase 1: COMPLETE (5/5 componenti)**
-- admin-sidebar.tsx (79 → 40, -49%) 
-- session-tab-bar.tsx (55 → 30, -45%)
-- routing-config.tsx (87 → 45, -48%)
-- plugin-manager.tsx (79 → 48, -39%)
-- prompts/page.tsx (75 → 38, -49%)
-**Riduzione**: 162 stili
+I numeri precedenti ("446/1665 ridotti, 27%") non riflettono lo stato attuale del
+codice: alcuni file dichiarati come completati nelle fasi 1-2 (es. `routing-config.tsx`,
+`plugin-manager.tsx`, `chat-panel.tsx`, `ide-shell.tsx`) sono cresciuti ben oltre il
+post-refactor a causa di feature aggiunte successivamente.
 
-### ✅ **Fase 2: COMPLETE (3/3 componenti core)**
-- project-import-wizard.tsx (70 → ~45, -35%)
-- chat-panel.tsx (57 → ~35, -39%)
-- ide-shell.tsx (58 → ~38, -34%)
-**Riduzione**: ~55 stili
+### Infrastruttura — disponibile e in uso
 
-### ✅ **Fase 3: IN PROGRESS (1/6 settings)**
-- infrastructure-settings.tsx (74 → ~45, -40%) ✅ COMPLETE
-- gateway-config.tsx (15 stili) — pending
-- security-settings.tsx (31 stili) — pending
-- Altre settings pages — pending
-**Riduzione finora**: ~29 stili
+- CSS variables: `apps/web-ide/components/theme-body.tsx`
+- Utility classes (120+): `apps/web-ide/app/globals.css`
+- Helper functions: `apps/web-ide/lib/styles.ts`
+- Theme switching dark/light: funzionante
+- Build verification: `pnpm verify` chiude EXIT 0 al commit corrente
 
-### 📊 **STATISTICHE FINALI**
-- **Totale stili ridotti**: ~446/1.665 (~27% riduzione)
-- **Componenti refactorizzati**: 9/75 (~12%)
-- **Prossimo target**: ~300 stili (per raggiungere 55% riduzione totale)
-- **Commits**: 5 major commits completati
+## Top 15 file per concentrazione inline styles
 
-### 🚀 **INFRASTRUTTURA CONSOLIDATA**
-- ✅ CSS variables system (theme-body.tsx)
-- ✅ 120+ utility classes (globals.css)
-- ✅ Helper functions (lib/styles.ts)
-- ✅ Development server active on localhost:3000
-- ✅ All builds passing, zero regressions
+| count | file |
+|---|---|
+| 118 | `apps/web-ide/components/project-db/project-db-panel.tsx` |
+| 117 | `apps/web-ide/app/admin/prompts/page.tsx` |
+| 101 | `apps/web-ide/components/panels/run-panel.tsx` |
+| 99  | `apps/web-ide/components/git/source-control-panel.tsx` |
+| 94  | `apps/web-ide/components/sidebar/sidebar-manager.tsx` |
+| 91  | `apps/web-ide/components/settings/routing-config.tsx` |
+| 88  | `apps/web-ide/app/admin/profiles/page.tsx` |
+| 84  | `apps/web-ide/components/settings/plugin-manager.tsx` |
+| 81  | `apps/web-ide/components/chat/agent-steps-panel.tsx` |
+| 80  | `apps/web-ide/components/chat-panel.tsx` |
+| 79  | `apps/web-ide/components/settings/infrastructure-settings.tsx` |
+| 70  | `apps/web-ide/components/ide-shell.tsx` |
+| 67  | `apps/web-ide/components/panels/bottom-panel-manager.tsx` |
+| 63  | `apps/web-ide/components/settings/provider-settings.tsx` |
+| 63  | `apps/web-ide/app/page.tsx` |
 
-### 📈 **PROSSIMI STEP**
-1. Completare Fase 3: Remaining 5 settings pages
-2. Fase 4: Landing page (app/page.tsx, 124 stili)
-3. Fase 5: Refactoring progressivo componenti minori (~65 file)
-**Target Finale**: ~750 stili (-55% riduzione)
-**Overall Progress**: ~387 styles removed (infrastructure + Fase 1 + partial Fase 2)
-**Phase 1 Reduction**: 162 styles removed (from 375 to 213)
-**Overall Progress**: ~222 styles removed (infrastructure + Fase 1)
+Il top 15 concentra ~1300 inline styles (45% del totale).
 
-## Refactor Log
+## Strategia operativa rivista
 
-### Session 2025-04-20 (Final) - Fase 1 COMPLETO ✅
-- **admin-sidebar.tsx**: 79 → 40 styles (-49%) ✅ COMPLETO
-  - Extracted: `flex-col`, `flex-row-gap-10`, `text-xs`, `font-bold`, `text-sm`, `text-base`, `transition-all`
-  - Kept inline: responsive props, border/background colors
+Il refactor styling e' un **lavoro visivo**: cambiare stile inline → utility class
+non e' una pura sostituzione testuale, perche':
+- la specificita' CSS puo' creare regressioni invisibili al typecheck/build,
+- l'ordine `style={{...}} + className` o solo `className` cambia il merge,
+- alcune utility (es. `.flex-row`) hanno `align-items: center` implicito che
+  puo' non corrispondere alle inline,
+- regressioni di layout (overflow, gap, padding) sono visibili solo a browser.
 
-- **session-tab-bar.tsx**: 55 → 30 styles (-45%) ✅ COMPLETO
-  - Extracted: `flex-row`, `flex-1`, `flex-row-gap-5`, `cursor-pointer`, `flex-shrink-0`, `whitespace-nowrap`, `text-xs`, `text-base`, `text-muted`
-  - Kept inline: dynamic colors, animation, opacity, responsive values
+Il piano `competent-wu-2db7bc` ha esplicitamente classificato Fase 5 come
+"richiede preview server attivo per verifica" — ma CLAUDE.md vieta `preview_start`
+("Tutto gira in locale su WSL"). Senza preview, refactor "alla cieca" sono
+rischiosi e a bassissimo ROI per file.
 
-- **routing-config.tsx**: 87 → 45 styles (-48%) ✅ COMPLETO
-  - Extracted: `flex-col-gap-20`, `card`, `flex-row`, `flex-col`, `text-xl`, `text-base`, `text-sm`, `font-bold`, `text-muted`
-  - Removed: 42 stili inline da card sections, flex containers, text elements
-  - Pattern: `className="card"` → removed padding/border/border-radius, kept dynamic backgrounds
-  - Pattern: `className="flex-row"` → removed display/alignItems, kept dynamic gaps
+**Conseguenza operativa**: la Fase 5 va affrontata in una sessione dedicata
+con accesso a un browser di sviluppo locale (Next.js dev server avviato
+manualmente dall'utente), batch da 5-10 file per commit, con verifica visiva
+su tutte le rotte chiave (chat, ide-shell, admin/*, settings/*).
 
-- **plugin-manager.tsx**: 79 → 48 styles (-39%) ✅ COMPLETO
-  - Extracted: `text-base`, `text-sm`, `text-lg`, `text-muted`, `text-xs`, `text-semibold`, `card-sm`, `flex-row-gap-8`, `flex-col-gap-8`, `flex-row`, `btn`
-  - Removed: 31 stili inline da card sections, button styles, flex layouts
-  - Consolidated: helper functions `actionButtonStyle`, `inputStyle`, `selectStyle` already present
-
-- **prompts/page.tsx**: 75 → 38 styles (-49%) ✅ COMPLETO
-  - Extracted: `text-3xl`, `text-base`, `text-lg`, `text-xs`, `text-muted`, `font-bold`, `font-semibold`, `flex-row`, `flex-col`, `card`, `card-sm`
-  - Removed: 37 stili inline from header, layout, details sections
-  - Consolidated: category headers now use `text-xs font-semibold text-muted`
-
-## Summary Fase 1 - FINAL
-**Total Styles Removed**: ~162 stili (5/5 file completi)
-**Starting Total**: 375 stili (5 priority files)
-**Ending Total**: ~213 stili
-**Overall Reduction**: -43% (162/375)
-**Average per file**: -43%
-  - routing-config: -48%
-  - plugin-manager: -39%
-  - prompts/page: -49%
-  - admin-sidebar: -49%
-  - session-tab-bar: -45%
-**Quality**: ✓ Build clean, nessuna regressione visuale
-
----
-
-## Refactor Queue (Priority Order)
-
-### Phase 1: Admin Components (Easy)
-Estimated: 2-3 days
-- routing-config.tsx (87 styles) — has helper functions already
-- plugin-manager.tsx (79 styles) — has helper functions already
-- admin-sidebar.tsx (79 styles) — mostly static flex/padding
-
-### Phase 2: Settings Pages (Medium)
-Estimated: 3-4 days
-- infrastructure-settings.tsx (74 styles)
-- embeddings-settings.tsx
-- quality-settings.tsx
-- learning-settings.tsx
-
-### Phase 3: Core Components (Complex)
-Estimated: 3-4 days
-- project-import-wizard.tsx (70 styles, 96 tc refs)
-- chat-panel.tsx (57 styles)
-- ide-shell.tsx (56 styles)
-- source-control-panel.tsx (55 styles)
-
-### Phase 4: Landing Page (Heavy Refactor)
-Estimated: 2 days
-- app/page.tsx (124 styles) — many dynamic flex layouts
-
----
-
-## Refactor Template
-
-When refactoring a component:
+## Refactor Template (immutato)
 
 ```tsx
 // BEFORE: All inline
@@ -157,30 +94,40 @@ When refactoring a component:
 </div>
 ```
 
----
-
 ## Build Verification
 
-Each refactored component must pass:
-- `npm run build` — no errors/warnings
-- Visual regression test — screenshot comparison before/after
-- Theme switching — dark/light mode works
-- Responsive — all viewport sizes
+Ogni file refactorizzato deve passare:
+- `pnpm verify` exit 0 (CI=1 o senza)
+- Visual regression test su tutte le viewport
+- Theme switching (dark/light)
 
----
+## Note
 
-## Notes
+- CSS variables sono live: theme changes update automatici.
+- Utility classes: ~2KB compressed, aggiunte una volta via globals.css.
+- Refactor incrementale: non blocca altro lavoro.
+- Stima risparmio: ~40-60KB minified JS bundle dopo refactor completo dei top 30 file.
 
-- CSS variables are live: theme changes update automatically
-- Utility classes are ~2KB compressed, added once via globals.css
-- Refactor can be done incrementally without blocking other work
-- Estimated total savings: ~40KB minified JS bundle (inline styles removed)
+## Raccomandazione per evitare regressione del progresso
 
----
+Refactor sostenibile richiede:
+- regola di review che imponga utility classes per pattern ripetuti (es.
+  >3 occorrenze identiche di `display:flex; gap:N`),
+- lint custom o `eslint-plugin-jsx-style` per bloccare nuove inline su
+  patterns gia' coperti da utility,
+- script `scripts/count-inline-styles.sh` come check periodico in CI.
 
-## Timeline
+## Tracker storico (sessioni precedenti)
 
-- **Current**: Infrastructure ready (Step 0-2 ✅)
-- **Next 2 weeks**: Phase 1 + Phase 2 refactors
-- **Following 2 weeks**: Phase 3 + Phase 4
-- **By end of month**: 100% migrated (all 75 components)
+Refactor parziali documentati:
+
+- Fase 1 dichiarata complete su 5 file (admin-sidebar, session-tab-bar,
+  routing-config, plugin-manager, prompts/page) — di questi `routing-config` e
+  `plugin-manager` hanno oggi 91 e 84 styles, quindi sono ricresciuti dopo il
+  refactor.
+- Fase 2 dichiarata complete su 3 file (project-import-wizard, chat-panel,
+  ide-shell) — `chat-panel` ha oggi 80, `ide-shell` ha 70.
+- Fase 3 dichiarata in progress su `infrastructure-settings` — ora a 79 styles.
+
+Il pattern (utility + theme variables) e' applicato in modo selettivo nei file
+"completati" ma il tetto del codice e' cresciuto.
