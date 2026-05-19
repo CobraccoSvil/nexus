@@ -196,9 +196,14 @@ static FORBIDDEN_PATTERNS: &[(&str, &str, &str, &str)] = &[
 ];
 
 /// RegexSet compilato una sola volta (lazy).
+///
+/// safety: i pattern in `FORBIDDEN_PATTERNS` sono literal hardcoded nello
+/// stesso file. Se sono validi non panica mai; se non lo sono è un bug di
+/// sviluppo individuato al primo lancio. Eccezione ammessa da CLAUDE.md §F
+/// ("Regex::new su pattern compilato a build-time").
 static FORBIDDEN_SET: Lazy<RegexSet> = Lazy::new(|| {
     RegexSet::new(FORBIDDEN_PATTERNS.iter().map(|(_, re, _, _)| *re))
-        .expect("FORBIDDEN_PATTERNS contiene regex non valida (bug)")
+        .expect("FORBIDDEN_PATTERNS contiene regex non valida — fix in safety.rs")
 });
 
 /// Verifica un comando shell contro la blacklist.

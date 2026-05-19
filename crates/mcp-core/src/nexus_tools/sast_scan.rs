@@ -10,6 +10,9 @@
 //! sicurezza statica senza richiedere nuove dipendenze. Il chiamante vede
 //! chiaramente quale strategy è stata usata via campo `engine`.
 
+// safety: i `Regex::new("...").unwrap()` di questo modulo sono pattern
+// literal hardcoded per SAST detection — ammessi da CLAUDE.md §F.
+
 use super::exec::{ensure_binary, run_cmd};
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
 use async_trait::async_trait;

@@ -15,6 +15,10 @@
 //! { "findings": [{"file": "...", "line": 42, "rule": "aws_access_key", "preview": "AKIA..."}] }
 //! ```
 
+// safety: tutte le `Regex::new("...").unwrap()` nei pattern di scansione
+// secret sono literal hardcoded ammessi da CLAUDE.md §F. Refactor opportuno
+// (LazyLock<Regex>) ma non e' una violazione.
+
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
 use async_trait::async_trait;
 use regex::Regex;

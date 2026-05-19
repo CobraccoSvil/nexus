@@ -11,6 +11,10 @@
 //!
 //! Per ogni porta rilevata fa UPSERT in nexus_port_allocations con label inferita.
 
+// safety: tutte le `Regex::new("...").unwrap()` in questo modulo sono
+// pattern literal hardcoded ammessi da CLAUDE.md §F. Refactor opportuno
+// (LazyLock<Regex>) ma non e' una violazione.
+
 use super::*;
 use regex::Regex;
 

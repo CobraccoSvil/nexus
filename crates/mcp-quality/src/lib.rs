@@ -1,3 +1,11 @@
+// safety: tutte le `Regex::new("...").unwrap()` in questo modulo sono
+// applicate a pattern literal hardcoded in-line. Sono ammesse da CLAUDE.md
+// §F (clausola "Conversioni da static literals dove l'impossibilita' e'
+// dimostrata"); se uno dei pattern fosse malformato verrebbe scoperto al
+// primo lancio del modulo, mai a runtime su dati utente. Refactor opportuno:
+// migrare a `std::sync::LazyLock<Regex>` per evitare ricompilazione ad ogni
+// chiamata, ma non e' una violazione di §F.
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 

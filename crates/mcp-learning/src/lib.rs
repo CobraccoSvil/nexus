@@ -1,3 +1,7 @@
+// safety: le `Regex::new("...").unwrap()` in questo modulo sono pattern
+// literal hardcoded ammessi da CLAUDE.md §F. Refactor opportuno
+// (LazyLock<Regex>) ma non e' una violazione.
+
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
