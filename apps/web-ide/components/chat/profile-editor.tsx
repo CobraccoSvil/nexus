@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { CreateProfilePayload, UpdateProfilePayload, UserProfile } from "../../lib/api-client";
 import { generateSystemPrompt } from "../../lib/api-client";
 import { useThemeColors } from "../../lib/theme";
+import { PROVIDER_MODELS } from "../../lib/model-catalog";
 
 interface ProfileEditorProps {
   profile?: UserProfile;
@@ -31,15 +32,8 @@ const PROVIDER_OPTIONS = [
   { value: "mistral",  label: "Mistral" },
 ];
 
-const PROVIDER_MODELS: Record<string, string[]> = {
-  anthropic: ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001", "claude-3-haiku-20240307"],
-  openai:    ["gpt-4.1-mini", "gpt-4.1", "gpt-4.1-nano", "o4-mini", "o3", "gpt-4o-mini"],
-  google:    ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-1.5-flash"],
-  deepseek:  ["deepseek-chat", "deepseek-reasoner", "deepseek-coder"],
-  mistral:   ["mistral-small-4", "mistral-large-2411", "codestral-latest", "open-mistral-nemo"],
-  auto: [],
-  "": [],
-};
+// PROVIDER_MODELS migrato in lib/model-catalog.ts (single source frontend;
+// TODO: rimpiazzare con fetch da nexus_routing_matrix/ai_price_catalog).
 
 export function ProfileEditor({
   profile,
