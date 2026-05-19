@@ -54,8 +54,10 @@ pub struct RoutingThresholds {
 }
 
 impl RoutingThresholds {
-    /// Crea con i default del seed migrazione 0111. Usato SOLO per test e per
-    /// chiavi singole mancanti nel DB (ricovero parziale, non fallback totale).
+    /// Crea con i default del seed migrazione 0111. **Test-only**: in produzione
+    /// `fetch_thresholds_from_db` solleva errore se le chiavi mancano (no magic
+    /// fallback — CLAUDE.md §G). Mantenuto per asserzioni "default == seed".
+    #[cfg(test)]
     fn defaults() -> Self {
         Self {
             llm_classifier_min_confidence: 0.60,
@@ -124,23 +126,28 @@ async fn fetch_thresholds_from_db(db: &PgPool) -> Result<RoutingThresholds, Stri
             }
         }
     };
-    let parse_str = |key: &str, default: &str| -> String {
-        match map.get(key).filter(|v| !v.is_empty()) {
-            Some(v) => v.clone(),
-            None => {
-                warn!("settings: chiave {} mancante o vuota, uso default '{}'", key, default);
-                default.to_string()
-            }
-        }
-    };
+    // Provider/modello del classifier: niente fallback hardcoded (CLAUDE.md §G).
+    // Se mancano, errore esplicito che propaga al chiamante (HTTP 503 a runtime).
+    let classifier_provider = map.get("routing.classifier_provider")
+        .filter(|v| !v.is_empty())
+        .cloned()
+        .ok_or_else(|| {
+            "settings 'routing.classifier_provider' mancante (richiede mig 0111)".to_string()
+        })?;
+    let classifier_model = map.get("routing.classifier_model")
+        .filter(|v| !v.is_empty())
+        .cloned()
+        .ok_or_else(|| {
+            "settings 'routing.classifier_model' mancante (richiede mig 0111)".to_string()
+        })?;
 
     Ok(RoutingThresholds {
         llm_classifier_min_confidence: parse_f32("routing.llm_classifier_min_confidence", 0.60),
         llm_classifier_timeout_seconds: parse_f32("routing.llm_classifier_timeout_seconds", 5.0),
         classifier_cache_ttl_seconds: parse_u64("routing.classifier_cache_ttl_seconds", 86_400),
         classifier_cache_max_entries: parse_u32("routing.classifier_cache_max_entries", 10_000),
-        classifier_provider: parse_str("routing.classifier_provider", "google"),
-        classifier_model: parse_str("routing.classifier_model", "gemini-2.5-flash"),
+        classifier_provider,
+        classifier_model,
         token_threshold_chat_breve: parse_u32("routing.token_threshold_chat_breve", 400),
         token_threshold_chat_media: parse_u32("routing.token_threshold_chat_media", 1_500),
         token_threshold_complex_fix: parse_u32("routing.token_threshold_complex_fix", 3_000),
