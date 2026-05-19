@@ -311,6 +311,11 @@ start_webide() {
 build_webide() {
     log "Build web-ide (Next.js)..."
     cd "${ROOT}/apps/web-ide"
+    # Pulizia cache build prima del rebuild. Senza questo, una `.next/` cached
+    # con stato inconsistente (es. dopo merge/stash) puo' includere chunks
+    # vecchi che escludono moduli per tree-shaking errato. Esempio osservato:
+    # dispatcher SSE non incluso nel bundle nonostante presente nei sorgenti.
+    rm -rf .next .turbo
     NODE_ENV=production node_modules/.bin/next build
     cd "$ROOT"
 }
