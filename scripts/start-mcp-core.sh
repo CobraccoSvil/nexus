@@ -10,9 +10,13 @@ if [ -f .env ]; then
   set -a; source .env 2>/dev/null || true; set +a
 fi
 
-# Kill istanze esistenti
+# Kill istanze esistenti — include processi in setsid/orphan.
+# Senza il cleanup esplicito di :50071, una seconda istanza fallisce
+# silenziosamente il bind del ToolRunner gRPC con "transport error".
 pkill -9 -f "target/release/mcp-core" 2>/dev/null || true
-sleep 1
+fuser -k -9 50071/tcp 2>/dev/null || true
+fuser -k -9 4000/tcp  2>/dev/null || true
+sleep 2
 
 LOG=/tmp/nexus-mcp-core.log
 : > "$LOG"
