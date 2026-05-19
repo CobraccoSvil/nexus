@@ -119,7 +119,32 @@ preview server attivo (CLAUDE.md vieta `preview_start` nella sessione corrente).
 
 Nuovo tool: `scripts/count-inline-styles.sh` per misurazione progresso.
 
-## Fasi in backlog (non affrontate in questa sessione)
+## Aggiornamento turno 2 — chiusura backlog residuo (14 commit totali)
+
+Le fasi 1.5, 4.5, 6, 7, 8 — documentate come "rinviate" alla fine della
+prima parte — sono state affrontate nella seconda parte della sessione:
+
+| Fase | Stato | Commit |
+|---|---|---|
+| 1.5 TS price tables | chiusa: `lib/model-catalog.ts` unificato | `927d8b1` |
+| 4.5 dead code | chiusa: 5 file orfani rimossi, Rust 0 warn | `9b58541` |
+| 6 hybrid LLM 3-7 | parz.: `brain/redaction/` + roadmap residua | `97bba08` |
+| 7 on-prem | preflight tool + dry-run report | `d56aee9` |
+| 8 go/no-go | audit statico: 27 OK / 14 deploy / 4 human / 0 miss | `958b64b` |
+
+Restano fuori scope sessione:
+
+- **Fase 5 styling** (66 file, 2884 inline styles): refactor visuale che
+  richiede preview server attivo. CLAUDE.md vieta `preview_start` in WSL.
+- **Fase 6 wiring finale** (~17-24h): integrazione cross-layer
+  embeddings/RAG/audit/redaction con il gateway. Vedi
+  `docs/hybrid-llm-phase6-status.md` per roadmap dettagliata.
+- **Fase 7 esecuzione reale**: richiede target con GPU NVIDIA 40GB+, 64GB
+  RAM, ~60GB download Qwen-32B. Vedi `docs/onprem-dry-run-2026-05-19.md`.
+- **Fase 8 finalizzazione**: 14 item richiedono deploy live + 4 firma
+  legal/CISO/DPO. Vedi `docs/go-nogo-audit-2026-05-19.md`.
+
+## (sezione storica) Fasi in backlog prima del turno 2
 
 - **Fase 1.5**: TS hardcoding price tables (4 file con tabelle prezzi/modelli
   hardcoded → refactor con API che leggono `ai_price_catalog`/`nexus_routing_matrix`).
