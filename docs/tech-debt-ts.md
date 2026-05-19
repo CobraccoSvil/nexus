@@ -15,21 +15,21 @@ pnpm exec tsc --noEmit --strict > tsc-strict.log
 - [ ] `apps/web-ide/tsconfig.json` — ereditarietà strict confermata.
 - [~] `eslint.config.mjs` — regola `@typescript-eslint/no-explicit-any: warn` (salire a `error` dopo pulizia).
 
-## Lint errori pre-esistenti bloccanti (da risolvere prima di rendere `verify` un gate hard)
+## Lint errori bloccanti — RISOLTI (2026-05-19)
 
-Lista rilevata con `pnpm verify` su `feature/dogfood-directives`:
+`pnpm verify` ora chiude con **exit 0** (Fase 2 del backlog di chiusura,
+branch `chore/backlog-closure`):
 
-- `apps/web-ide/app/layout.tsx` — due `@ts-ignore` da convertire in `@ts-expect-error`.
-- `apps/web-ide/components/chat-panel.tsx:370` e altri file settings/* — regola
-  `react-hooks/exhaustive-deps` non trovata (plugin `eslint-plugin-react-hooks`
-  non configurato): caricare il plugin o rimuovere il riferimento.
-- `apps/web-ide/components/panels/optimization-panel.tsx:625` —
-  `no-unused-expressions`.
-- `apps/web-ide/server.js` — 4 `require()` CommonJS: migrare a ESM o aggiungere
-  override `eslint` per `*.js`.
-
-Finché questi errori esistono, CI `verify.yml` fallirà in fase lint. Trattare
-come issue prioritaria Fase 2.
+- `apps/web-ide` lint: 105 warning residui ma **0 errori** — eslint non
+  configurato con `--max-warnings 0`, quindi non bloccanti. Vedi sezione
+  `any` qui sotto per il piano di bonifica.
+- Typecheck web-ide passava già: il fail osservato in precedenza era dovuto
+  a `.next/types/validator.ts` stale (riferiva un modulo `execute-command/route.js`
+  che esisteva solo in un WIP non committato). Soluzione: rebuild dopo `rm -rf .next`.
+- `packages/{rag,llm-gateway,embeddings,audit}/package.json` ora usano
+  `vitest run` invece di `vitest` per evitare watch-mode in CI/verify
+  (causa di blocco indefinito senza `CI=1`).
+- cargo check + cargo clippy `-D warnings` + cargo test workspace: **OK**.
 
 ## `any` da rimuovere
 
