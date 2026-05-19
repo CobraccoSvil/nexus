@@ -940,6 +940,16 @@ async fn run_batch_assign_tools_job(
     const BASE_MAX: usize = 3;
     const HARD_MAX: usize = 8;
 
+    // Provider/model per la selezione tool: letti da nexus_purpose_model
+    // purpose='admin.tool_selection' (mig 0171). CLAUDE.md §G: niente hardcode.
+    let (admin_provider, admin_model) = sqlx::query_as::<_, (String, String)>(
+        "SELECT provider, model_id FROM nexus_purpose_model WHERE purpose = 'admin.tool_selection' LIMIT 1"
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| format!("DB error caricando admin.tool_selection: {e}"))?
+    .ok_or_else(|| "nexus_purpose_model: 'admin.tool_selection' non configurato. Applica migrazione 0171.".to_string())?;
+
     let mut results: Vec<serde_json::Value> = Vec::new();
     let mut assigned = 0usize;
     let mut skipped = 0usize;
@@ -972,8 +982,8 @@ Rispondi con SOLO un array JSON valido, nessun testo aggiuntivo:
         match client
             .post(format!("{brain_url}/generate"))
             .json(&serde_json::json!({
-                "provider": "anthropic",
-                "model": "claude-haiku-4-5-20251001",
+                "provider": admin_provider,
+                "model": admin_model,
                 "prompt": prompt,
             }))
             .send()

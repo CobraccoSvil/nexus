@@ -38,6 +38,91 @@ def _load_system_cache_ttl() -> str:
 _SYSTEM_CACHE_TTL = _load_system_cache_ttl()
 
 
+# Cache 60s del set di modelli che supportano extended thinking, letti da
+# ai_price_catalog.capabilities -> 'thinking' = true (mig 0170). CLAUDE.md
+# §G impone DB come unica fonte: niente set hardcoded.
+import time as _time
+import threading as _threading
+
+_THINKING_MODELS_CACHE: dict[str, Any] = {"value": None, "expires_at": 0.0}
+_THINKING_MODELS_LOCK = _threading.Lock()
+_THINKING_MODELS_TTL_S = 60.0
+
+
+class ThinkingModelsUnavailable(Exception):
+    """Sollevata se ai_price_catalog non e' raggiungibile o non popolato.
+
+    Coerente con il pattern §G (no magic fallback): l'errore propaga al chiamante
+    che decide se disabilitare thinking o restituire 503.
+    """
+
+
+def _load_thinking_models() -> frozenset[str]:
+    """Ritorna il set di modelli che supportano extended thinking.
+
+    Letto da `ai_price_catalog.capabilities ->> 'thinking' = 'true'` (mig 0170).
+    Cache 60s, thread-safe. Solleva `ThinkingModelsUnavailable` se DB down o
+    tabella vuota (no fallback nascosto).
+    """
+    now = _time.monotonic()
+    cached = _THINKING_MODELS_CACHE.get("value")
+    if cached is not None and now < _THINKING_MODELS_CACHE["expires_at"]:
+        return cached
+    with _THINKING_MODELS_LOCK:
+        cached = _THINKING_MODELS_CACHE.get("value")
+        if cached is not None and now < _THINKING_MODELS_CACHE["expires_at"]:
+            return cached
+        try:
+            import psycopg2  # type: ignore[import-untyped]
+            db_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL", "")
+            if not db_url:
+                raise ThinkingModelsUnavailable("DATABASE_URL/POSTGRES_URL non configurato")
+            conn = psycopg2.connect(db_url)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT model FROM ai_price_catalog "
+                        "WHERE provider = 'anthropic' "
+                        "  AND is_enabled = TRUE "
+                        "  AND (capabilities ->> 'thinking')::boolean IS TRUE"
+                    )
+                    rows = cur.fetchall()
+            finally:
+                conn.close()
+        except ThinkingModelsUnavailable:
+            raise
+        except Exception as exc:
+            raise ThinkingModelsUnavailable(
+                f"ai_price_catalog non raggiungibile: {exc}"
+            ) from exc
+        if not rows:
+            raise ThinkingModelsUnavailable(
+                "ai_price_catalog non contiene modelli anthropic con capability 'thinking'. "
+                "Applicare migrazione 0170_model_capabilities.sql."
+            )
+        models = frozenset(r[0] for r in rows)
+        _THINKING_MODELS_CACHE["value"] = models
+        _THINKING_MODELS_CACHE["expires_at"] = now + _THINKING_MODELS_TTL_S
+        return models
+
+
+def _resolve_test_connection_model() -> str:
+    """Risolve il modello per il ping di test_connection() da nexus_purpose_model
+    (purpose='provider_test_connection.anthropic', mig 0171). CLAUDE.md §G.
+    """
+    try:
+        from brain.router.service import _routing_client_singleton
+        decision = _routing_client_singleton().purpose_model(
+            purpose="provider_test_connection.anthropic"
+        )
+        return decision.model
+    except Exception as exc:
+        raise RuntimeError(
+            "nexus_purpose_model purpose='provider_test_connection.anthropic' "
+            f"non configurato: {exc}"
+        ) from exc
+
+
 def _system_cache_control() -> dict:
     """Cache control block per il system prompt.
 
@@ -307,14 +392,17 @@ class AnthropicProvider(BaseProvider):
                                 effective_messages, mid_idx
                             )
 
-            THINKING_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7",
-                                "claude-sonnet-4-5", "claude-opus-4-5"}
-            # Budget e abilitazione letti dal DB via thinking_config (categoria 'agent').
-            # Modificabili dall'admin senza rideploy — TTL cache 60s.
+            # Set di modelli "thinking-capable" letto da ai_price_catalog.capabilities
+            # (mig 0170). Cache 60s. Modificabili dall'admin senza rideploy.
             # Il parametro extended_thinking (legacy) viene IGNORATO: la sorgente
             # di verita' e' esclusivamente il DB per evitare costi imprevisti.
+            try:
+                thinking_models = _load_thinking_models()
+            except ThinkingModelsUnavailable as _tm_err:
+                logger.warning("thinking capability lookup fallito (%s): disabilito thinking", _tm_err)
+                thinking_models = frozenset()
             thinking_budget = _thinking_config.budget_tokens()
-            use_thinking = _thinking_config.enabled() and model in THINKING_MODELS and max_tokens > thinking_budget
+            use_thinking = _thinking_config.enabled() and model in thinking_models and max_tokens > thinking_budget
 
             kwargs: dict[str, Any] = {
                 "model": model,
@@ -528,12 +616,14 @@ class AnthropicProvider(BaseProvider):
                         if mid_idx != user_indices[-3]:
                             effective_messages = _apply_cache_breakpoint(effective_messages, mid_idx)
 
-            # Budget e abilitazione letti dal DB via thinking_config (categoria 'agent').
-            # Stessa logica del path non-streaming: sorgente di verita' e' il DB.
-            THINKING_MODELS = {"claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-7",
-                                "claude-sonnet-4-5", "claude-opus-4-5"}
+            # Stessa logica del path non-streaming: thinking-capable da DB (mig 0170).
+            try:
+                thinking_models = _load_thinking_models()
+            except ThinkingModelsUnavailable as _tm_err:
+                logger.warning("thinking capability lookup fallito (%s): disabilito thinking", _tm_err)
+                thinking_models = frozenset()
             thinking_budget = _thinking_config.budget_tokens()
-            use_thinking = _thinking_config.enabled() and model in THINKING_MODELS and max_tokens > thinking_budget
+            use_thinking = _thinking_config.enabled() and model in thinking_models and max_tokens > thinking_budget
 
             stream_kwargs: dict[str, Any] = {
                 "model": model,
@@ -642,8 +732,9 @@ class AnthropicProvider(BaseProvider):
             return {"provider": self.name, "status": "not_configured", "reason": "API key non configurata"}
         try:
             client = self._get_client()
+            test_model = _resolve_test_connection_model()
             await client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model=test_model,
                 max_tokens=10,
                 messages=[{"role": "user", "content": "ping"}],
             )

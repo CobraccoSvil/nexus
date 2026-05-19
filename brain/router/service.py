@@ -473,9 +473,12 @@ class SemanticRouter:
         e' `POST /api/internal/routing/decide` esposto da mcp-core (vedi
         `crates/mcp-core/src/internal_routing.rs`).
 
-        Fallback in caso di fallimento HTTP: usa `(openai, gpt-4.1-mini)` come
-        scelta safe. Logga warning ma non solleva eccezione (il router e'
-        tipicamente in un percorso critico, no ricarico errori).
+        Niente fallback hardcoded (CLAUDE.md §G): se il Rust router e'
+        irraggiungibile o ritorna 503 / payload malformato, viene restituita
+        una sentinella visibile `provider="__router_unavailable__"` (o
+        `"__no_capable_provider__"` per 503) che il chiamante DEVE intercettare
+        per fermare il flusso, non degradare silenziosamente a un modello
+        arbitrario.
 
         Cache locale: i risultati vengono cached per 30s in base al messaggio
         + behavior_mode, per evitare RTT su decisioni ripetute durante un
