@@ -102,6 +102,104 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         ctx.root_path.clone()
     };
 
+    // ── Anti-duplicato systemd: se esiste un servizio systemd attivo del
+    //    progetto (taskboard-backend-dev.service, ecc.) con scopo simile,
+    //    REFUSE invece di lanciare un duplicato. L'agente AI deve usare
+    //    quello esistente, non bruciare risorse.
+    //    Tipologia: deriva dal command (vite/express/etc) o dal label.
+    let label_lower_top = label.to_lowercase();
+    let command_lower_top = command.to_lowercase();
+    let kind_hint = if command_lower_top.contains("vite") || command_lower_top.contains("svelte")
+        || label_lower_top.contains("frontend") || label_lower_top.contains("vite")
+        || label_lower_top.contains("react") || label_lower_top.contains("svelte")
+        || label_lower_top.contains("nuxt") || label_lower_top.contains("astro")
+    {
+        Some("frontend")
+    } else if command_lower_top.contains("express") || command_lower_top.contains("fastify")
+        || command_lower_top.contains("uvicorn") || command_lower_top.contains("gunicorn")
+        || command_lower_top.contains("rails") || command_lower_top.contains("django")
+        || command_lower_top.contains(" run ") && command_lower_top.contains("backend")
+        || label_lower_top.contains("backend") || label_lower_top.contains("api")
+    {
+        Some("backend")
+    } else {
+        None
+    };
+    if let Some(kind) = kind_hint {
+        // ── A. Cerca tra le allocazioni del progetto label compatibili ──
+        let rows = sqlx::query_as::<_, (i32, String)>(
+            "SELECT port, label FROM nexus_port_allocations WHERE project_id = $1",
+        )
+        .bind(ctx.project_id)
+        .fetch_all(&*ctx.db)
+        .await
+        .unwrap_or_default();
+        for (port, alloc_label) in &rows {
+            let al = alloc_label.to_lowercase();
+            let matches = match kind {
+                "frontend" => al.contains("frontend") || al.contains("vite") || al.contains("react") || al.contains("svelte") || al.contains("ui") || al.contains("nuxt") || al.contains("astro") || al.contains("web") || al.contains("client") || al.contains("dev server"),
+                "backend" => al.contains("backend") || al.contains("api") || (al.contains("server") && !al.contains("frontend") && !al.contains("dev")),
+                _ => false,
+            };
+            if matches {
+                return format!(
+                    "[Errore: servizio '{}' di tipo {} gia' attivo sulla porta {}. \
+                     Riusalo invece di crearne uno nuovo (puoi accedere a http://localhost:{}). \
+                     Se vuoi davvero riavviarlo usa `service_restart` con label='{}'.]",
+                    alloc_label, kind, port, port, alloc_label
+                );
+            }
+        }
+
+        // ── B. Cerca tra i servizi systemd persistenti del progetto ──
+        // I servizi systemd hanno label come "backend-dev"/"frontend-dev"
+        // ma l'allocazione di porta puo' avere label generica ("Service").
+        // Query diretta systemctl: list-units --user --state=active per
+        // unit con prefisso slug del progetto.
+        let project_slug_q = sqlx::query_scalar::<_, String>(
+            "SELECT slug FROM projects WHERE id = $1",
+        )
+        .bind(ctx.project_id)
+        .fetch_optional(&*ctx.db)
+        .await
+        .ok()
+        .flatten();
+        if let Some(slug) = project_slug_q {
+            let slug_norm = slug.to_lowercase().replace([' ', '_'], "-");
+            let systemd_output = tokio::process::Command::new("systemctl")
+                .args(["--user", "list-units", "--type=service", "--state=active",
+                       "--no-legend", "--no-pager"])
+                .output()
+                .await;
+            if let Ok(out) = systemd_output {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let prefix = format!("{}-", slug_norm);
+                for line in stdout.lines() {
+                    let unit = line.split_whitespace().next().unwrap_or("").trim_start_matches('●').trim();
+                    if !unit.starts_with(&prefix) || !unit.ends_with(".service") { continue; }
+                    let short = unit
+                        .strip_prefix(&prefix).unwrap_or(unit)
+                        .strip_suffix(".service").unwrap_or(unit)
+                        .to_lowercase();
+                    let matches = match kind {
+                        "frontend" => short.contains("frontend") || short.contains("vite") || short.contains("ui") || short.contains("web") || short.contains("client"),
+                        "backend" => short.contains("backend") || short.contains("api") || short.contains("server"),
+                        _ => false,
+                    };
+                    if matches {
+                        return format!(
+                            "[Errore: servizio systemd '{}' di tipo {} gia' attivo per questo progetto. \
+                             Usalo invece di lanciarne uno nuovo. Per riavviarlo usa il pulsante 'restart' \
+                             nel pannello Run & Debug, oppure systemctl --user restart {}. \
+                             Se hai bisogno di vedere lo stato del servizio, prima usa list_active_services.]",
+                            unit, kind, unit
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // ── Deduplicazione servizi: kill processi simili + cleanup orfani ────────
     // L'agente AI spesso usa label leggermente diverse per lo stesso servizio
     // ("Backend Taskboard", "Backend API", "Taskboard Backend"). Per evitare

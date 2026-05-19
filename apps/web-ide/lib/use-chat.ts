@@ -267,6 +267,19 @@ export function useChat(
   // Mappa run_id → info per agenti paralleli (include anche il run primario)
   const [agentRuns, setAgentRuns] = useState<Map<string, AgentRunInfo>>(new Map());
   const [agentStepsMap, setAgentStepsMap] = useState<Map<string, AgentStep[]>>(new Map());
+  // Meta-step pubblicati in chat (plan/routing/clarify/fallback/reflection).
+  // Per ogni runId conserviamo la timeline ordinata di entry semantiche che
+  // il backend emette via SSE `agent_meta_step`. Sono rese visibili come
+  // card collassabili sopra/dentro il messaggio assistant del run.
+  const [metaStepsMap, setMetaStepsMap] = useState<
+    Map<string, Array<{
+      kind: string;
+      title: string;
+      payload: Record<string, unknown>;
+      correlationId?: string | null;
+      createdAt: string;
+    }>>
+  >(new Map());
   const [tokenUsage, setTokenUsage] = useState({ totalTokens: 0, totalCostUsd: 0 });
   const [traces, setTraces] = useState<AITraceEvent[]>([]);
   const [streamingToken, setStreamingToken] = useState<string>("");
@@ -330,6 +343,9 @@ export function useChat(
           setIsLoading(true);
           const response = await sendChatMessage(sessionId, "Continua", {
             automationMode: "automatic",
+            // synthetic: messaggio auto-generato dal sistema, la UI lo nasconde
+            // (l'utente non lo ha digitato; vedere chat_messages.rs::synthetic).
+            synthetic: true,
           });
           if (response.agentRun) {
             setMessages((current) => [
@@ -573,15 +589,72 @@ export function useChat(
                     );
                   }
                 } catch {}
-                // Auto-continuazione: se il run e' completato (non failed/cancelled)
-                // e la modalita' era "automatic", segnala al effect di inviare "Continua".
+                // Refresh dei messaggi dal DB con RETRY: il backend salva il
+                // messaggio assistant ASYNC dopo l'emissione di `agent_final`,
+                // quindi al primo getChatMessages potrebbe non essere ancora
+                // presente (race condition tra SSE done e DB INSERT). Riproviamo
+                // fino a 5 volte con backoff: 0ms → 500ms → 1s → 1.5s → 2s.
+                // Stop appena troviamo un assistant message creato DOPO l'inizio
+                // del run corrente (= il vero messaggio appena persistito).
+                const runStartedTs = finalRun.createdAt
+                  ? new Date(finalRun.createdAt).getTime()
+                  : 0;
+                const tryRefresh = async (attempt: number): Promise<boolean> => {
+                  try {
+                    const history = await getChatMessages(sid);
+                    if (!history.messages || history.messages.length === 0) return false;
+                    // Cerca un assistant message persistito DOPO l'inizio del run
+                    const hasRealAssistant = history.messages.some((m) =>
+                      m.role === "assistant" &&
+                      new Date(m.createdAt).getTime() >= runStartedTs - 1000,
+                    );
+                    if (!hasRealAssistant && attempt < 5) return false;
+                    setMessages((current) => {
+                      const syntheticIdForThisRun = `agent-${runId}`;
+                      const dbAssistantIds = new Set(
+                        history.messages.filter((m) => m.role === "assistant").map((m) => m.id),
+                      );
+                      const otherSynthetics = current.filter(
+                        (m) =>
+                          m.id.startsWith("agent-") &&
+                          m.id !== syntheticIdForThisRun &&
+                          !dbAssistantIds.has(m.id),
+                      );
+                      return [...history.messages, ...otherSynthetics];
+                    });
+                    return hasRealAssistant;
+                  } catch {
+                    return false;
+                  }
+                };
+                // Sequenza di retry: 0ms, 500ms, 1000ms, 1500ms, 2000ms
+                void (async () => {
+                  for (let i = 0; i < 5; i++) {
+                    if (i > 0) await new Promise((r) => setTimeout(r, 500));
+                    const found = await tryRefresh(i);
+                    if (found) return; // assistant message vero trovato → stop
+                  }
+                })();
+                // Auto-continuazione: DISATTIVATA per default in modalita'
+                // "automatic". L'utente sceglie "Automatico" per evitare conferme,
+                // NON per far girare l'agente in loop dopo aver completato il task.
+                // Il loop precedente bruciava 1.8M+ token per task gia' completati
+                // (vedi issue utente: "nexus ha risolto ma poi la chat e' ripartita
+                // da sola"). Auto-continue resta possibile SOLO se il run e' in
+                // stato `awaiting_confirmation`, cioe' l'agente sta esplicitamente
+                // aspettando un input — caso in cui "automatic" significa
+                // "rispondi automaticamente per confermare".
                 if (
-                  finalRun.status === "completed" &&
+                  finalRun.status === "awaiting_confirmation" &&
                   finalRun.automationMode === "automatic" &&
-                  autoContinueCountRef.current < 10
+                  autoContinueCountRef.current < 3
                 ) {
                   autoContinueCountRef.current += 1;
                   setAutoContinuePending(true);
+                } else {
+                  // Run completato/failed/cancelled: STOP. L'utente puo' digitare
+                  // "Continua" manualmente se vuole proseguire.
+                  autoContinueCountRef.current = 0;
                 }
               }
             }
@@ -615,6 +688,19 @@ export function useChat(
             return next;
           });
         } : undefined,
+        (meta) => {
+          // Accoda il meta_step alla timeline del run. Dedup per
+          // (kind, createdAt) per resistere a duplicati SSE (replay).
+          setMetaStepsMap((prev) => {
+            const current = prev.get(runId) ?? [];
+            const isDup = current.some(
+              (m) => m.kind === meta.metaStep.kind && m.createdAt === meta.metaStep.createdAt,
+            );
+            if (isDup) return prev;
+            const next = [...current, meta.metaStep];
+            return new Map(prev).set(runId, next);
+          });
+        },
       );
     },
     [projectId],
@@ -831,6 +917,7 @@ export function useChat(
     setAgentSteps([]);
     setAgentRuns(new Map());
     setAgentStepsMap(new Map());
+    setMetaStepsMap(new Map());
     setTokenUsage({ totalTokens: 0, totalCostUsd: 0 });
     setTraces([]);
   }, []);
@@ -892,6 +979,16 @@ export function useChat(
             undefined,
             setIsReconnecting,
             (delta: string) => setStreamingToken((prev) => prev + delta),
+            (meta) => {
+              setMetaStepsMap((prev) => {
+                const current = prev.get(runId) ?? [];
+                const isDup = current.some(
+                  (m) => m.kind === meta.metaStep.kind && m.createdAt === meta.metaStep.createdAt,
+                );
+                if (isDup) return prev;
+                return new Map(prev).set(runId, [...current, meta.metaStep]);
+              });
+            },
           );
         }
       } catch (e) {
@@ -936,6 +1033,7 @@ export function useChat(
     agentSteps,
     agentRuns,
     agentStepsMap,
+    metaStepsMap,
     tokenUsage,
     traces,
     streamingToken,

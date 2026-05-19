@@ -15,7 +15,23 @@ class AgentState(TypedDict, total=False):
     """
 
     messages: Annotated[Sequence[BaseMessage], add]
+    # Meta-step semantici pubblicati al frontend chat (plan/routing/clarify/
+    # fallback/reflection). Ogni nodo che vuole emettere uno step semantico
+    # aggiunge un dict {kind,title,payload,correlation_id?,created_at} a questa
+    # lista; il generator SSE in grpc_server li converte in eventi
+    # `{"type":"meta_step", ...}` al volo. L'annotazione `add` ne consente
+    # l'accumulo cross-nodo senza conflitti di reducer.
+    meta_steps: Annotated[list[dict], add]
     user_intent: str
+    # Confidence della classificazione intent (0..1). Popolato da router_node.
+    # Consumato da clarify_or_expand_node per decidere se attivarsi.
+    intent_confidence: float
+    # Query arricchita prodotta dal clarify_or_expand_node (mode=expand).
+    # USATA solo dal retrieve RAG, NON sostituisce il prompt utente al modello.
+    expanded_query: str | None
+    # True quando clarify_or_expand_node ha emesso una richiesta di chiarimento
+    # e il turno deve fermarsi in attesa di risposta utente.
+    pending_clarify: bool
     task_type: str
     behavior_mode: str
     token_budget: int

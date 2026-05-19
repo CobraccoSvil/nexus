@@ -17,6 +17,7 @@ import { FeedbackErrorDialog } from "./feedback-error-dialog";
 import { IconButton } from "./icon-button";
 import { MessageList } from "./chat/message-list";
 import { AgentStepsPanel } from "./chat/agent-steps-panel";
+import { AgentMetaStepCard as AgentMetaStepCardLazy } from "./chat/agent-meta-step-card";
 import { InlineTracePanel } from "./chat/inline-trace-panel";
 import { Composer } from "./chat/composer";
 import { MemoryPanel } from "./chat/memory-panel";
@@ -127,17 +128,15 @@ function AgentProgressInline({
   tc: Record<string, string>;
   steps: import("../lib/api-client").AgentStep[];
 }) {
+  // Tempo dall'inizio del run (mount del componente). NON resettiamo ad ogni
+  // step nuovo: con agenti che fanno step rapidi (<1s ognuno), il counter
+  // restava bloccato a 0s confondendo l'utente. Ora avanza monotonicamente
+  // per tutta la durata del run.
   const [elapsed, setElapsed] = useState(0);
   useEffect(() => {
     const id = setInterval(() => setElapsed((s) => s + 1), 1000);
     return () => clearInterval(id);
   }, []);
-
-  // Reset timer quando arriva un nuovo step
-  const stepCount = steps.length;
-  useEffect(() => {
-    setElapsed(0);
-  }, [stepCount]);
 
   const currentStep = steps[steps.length - 1];
   const recentDone = steps.filter((s) => s.status === "completed" || s.status === "failed").slice(-3);
@@ -328,7 +327,7 @@ export function ChatPanel({
   useEffect(() => {
     getModels().then(({ models }) => setModelCatalog(models)).catch(() => {});
   }, []);
-  const { messages, isLoading, isReady, isReconnecting, error, busyByMessage, agentRun, agentSteps, agentRuns, agentStepsMap, tokenUsage, traces, streamingToken, send, resend, remove, feedbackError, feedbackPositive, positiveFeedback, confirmAgent, cancelRun } =
+  const { messages, isLoading, isReady, isReconnecting, error, busyByMessage, agentRun, agentSteps, agentRuns, agentStepsMap, metaStepsMap, tokenUsage, traces, streamingToken, send, resend, remove, feedbackError, feedbackPositive, positiveFeedback, confirmAgent, cancelRun } =
     useChat(projectId, profileId, { sessionId });
   const prevAgentActiveRef = useRef(false);
   useEffect(() => {
@@ -411,11 +410,21 @@ export function ChatPanel({
     const id = setInterval(() => setNowTick(Date.now()), 1000);
     return () => clearInterval(id);
   }, [isAgentRunning]);
+  // Tempo trascorso dall'inizio del run: misura quanto tempo l'agente sta
+  // lavorando in totale. Prima usavamo "secondi dall'ultimo step" come fonte,
+  // ma con agenti che fanno step ogni <1s il counter restava bloccato a 0s.
+  // Il countdown ora avanza monotonicamente.
+  const runStartedAt = agentRun?.createdAt
+    ? new Date(agentRun.createdAt).getTime()
+    : Date.now();
+  const secondsSinceLastStep = Math.max(0, Math.floor((nowTick - runStartedAt) / 1000));
+  // "Stuck" calcolato sul tempo dall'ULTIMO step (non dall'inizio run): se
+  // l'agente non emette step da >60s e' in attesa di qualcosa (LLM lento).
   const lastStepAt = agentSteps.length > 0
     ? Math.max(...agentSteps.map((s) => new Date(s.createdAt ?? 0).getTime()))
-    : Date.now();
-  const secondsSinceLastStep = Math.max(0, Math.floor((nowTick - lastStepAt) / 1000));
-  const isAgentStuck = isAgentRunning && secondsSinceLastStep > 60;
+    : runStartedAt;
+  const secondsSinceLastStepInternal = Math.max(0, Math.floor((nowTick - lastStepAt) / 1000));
+  const isAgentStuck = isAgentRunning && secondsSinceLastStepInternal > 60;
 
   // Auto-abort: se nessun nuovo step parte entro 3 minuti, ferma automaticamente
   const autoAbortRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1108,6 +1117,7 @@ export function ChatPanel({
             onFeedbackPositive={feedbackPositive}
             positiveFeedback={positiveFeedback}
             lastUserRef={lastUserRef}
+            projectId={projectId}
           />
 
           {resendPreview && (
@@ -1155,6 +1165,7 @@ export function ChatPanel({
               agentSteps={agentSteps}
               agentRuns={agentRuns}
               agentStepsMap={agentStepsMap}
+              metaSteps={metaStepsMap.get(agentRun.runId) ?? []}
               tc={tc}
               t={t as (key: string) => string}
               onConfirm={handleConfirmAgent}
@@ -1163,6 +1174,43 @@ export function ChatPanel({
               narrationWarnAfterChars={narrationWarnAfterChars}
             />
           )}
+
+          {/* Meta-step persistenti: dopo che il run termina, agentRun viene
+              resettato a null e l'AgentStepsPanel scompare. Qui rendiamo i
+              meta_step (plan/routing/clarify/fallback/reflection) dell'ultimo
+              run di questa sessione anche post-completamento, cosi' l'utente
+              non li perde di vista quando arriva la risposta.
+              Scelta runId: ultimo assistant message con runId valorizzato
+              (fonte autoritativa = DB). Fallback all'ultima entry della Map
+              quando i messaggi non sono ancora arrivati. */}
+          {!agentRun && metaStepsMap.size > 0 && (() => {
+            const lastAssistantWithRun = [...messages]
+              .reverse()
+              .find((m) => m.role === "assistant" && m.runId);
+            const targetRunId = lastAssistantWithRun?.runId
+              ?? Array.from(metaStepsMap.keys()).pop();
+            const targetMetaSteps = targetRunId ? metaStepsMap.get(targetRunId) : undefined;
+            if (!targetMetaSteps || !targetMetaSteps.length) return null;
+            return (
+              <div
+                style={{
+                  border: `1px solid ${tc.border}`,
+                  borderRadius: 10,
+                  background: tc.bgCard,
+                  padding: "8px 12px",
+                  alignSelf: "stretch",
+                }}
+                data-testid="agent-meta-steps-history"
+              >
+                <div style={{ fontSize: 11, fontWeight: 600, color: tc.textMuted, marginBottom: 4 }}>
+                  Decisioni del turno
+                </div>
+                {targetMetaSteps.map((m, idx) => (
+                  <AgentMetaStepCardLazy key={`hist-${m.kind}-${m.createdAt}-${idx}`} data={m} />
+                ))}
+              </div>
+            );
+          })()}
 
           {traces.length > 0 && <InlineTracePanel traces={traces} />}
 

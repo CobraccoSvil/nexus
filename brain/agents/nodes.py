@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 from langchain_core.messages import AIMessage, HumanMessage
 
 from . import (
+    meta_steps,
     profile_loader,
     prompt_registry,
     prompt_renderer,
@@ -314,8 +315,16 @@ async def router_node(state: AgentState) -> dict[str, Any]:
     if _router is not None:
         classification = _router.classify_intent(str(text))
         intent = classification.get("intent", "chat")
+        # Confidence ritornata come stringa "0.xx" dal semantic router.
+        # Defaults a 1.0 quando il classifier non popola il campo (es. fallback
+        # keyword puro) cosi' clarify_or_expand_node non si attiva spuriamente.
+        try:
+            intent_confidence = float(classification.get("confidence", "1.0"))
+        except (TypeError, ValueError):
+            intent_confidence = 1.0
     else:
         intent = "chat"
+        intent_confidence = 1.0
 
     behavior_mode = state.get("behavior_mode", "bilanciata")
 
@@ -375,6 +384,7 @@ async def router_node(state: AgentState) -> dict[str, Any]:
         "behavior_mode": behavior_mode,
         "token_budget": token_budget,
         "iterations": state.get("iterations", 0) + 1,
+        "intent_confidence": intent_confidence,
     }
 
     if profile is not None:
@@ -443,6 +453,30 @@ async def router_node(state: AgentState) -> dict[str, Any]:
             "router_node: intent=%s token_budget=%d mode=%s profile=<none>",
             intent, token_budget, behavior_mode,
         )
+
+    # ── Meta-step `routing` per pubblicazione in chat ───────────────────────
+    # Emesso solo se la classificazione e' significativa (no chat banale a 0
+    # confidence senza profilo) e se il flag `meta_steps.routing_enabled`
+    # e' attivo. Riduce rumore nelle conversazioni di small-talk.
+    if profile is not None or intent != "chat":
+        profile_name = profile.name if profile is not None else None
+        title = f"Intent: {intent}"
+        if profile_name:
+            title += f" — profilo {profile_name}"
+        routing_meta = meta_steps.make(
+            kind="routing",
+            title=title,
+            payload={
+                "intent": intent,
+                "task_type": intent,
+                "profile_name": profile_name,
+                "behavior_mode": behavior_mode,
+                "token_budget": token_budget,
+            },
+        )
+        if routing_meta:
+            updates["meta_steps"] = [routing_meta]
+            meta_steps.persist_async(state.get("thread_id"), routing_meta)
 
     return updates
 

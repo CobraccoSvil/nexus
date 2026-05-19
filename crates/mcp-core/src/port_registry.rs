@@ -367,12 +367,7 @@ impl PortRegistryCache {
         }
         drop(registry);
 
-        // 2. Scansiona i .service, registra porte mancanti
-        let entries = match std::fs::read_dir(&svc_dir) {
-            Ok(e) => e,
-            Err(_) => return, // Directory non esiste: nessun servizio
-        };
-
+        // 2. Scansiona i .service, registra porte mancanti.
         // Mappa slug -> project_id per associare le porte ai progetti
         let project_map: HashMap<String, Uuid> = match sqlx::query_as::<_, (Uuid, String)>(
             "SELECT id, LOWER(REPLACE(REPLACE(name, ' ', '-'), '_', '-')) FROM projects"
@@ -387,35 +382,44 @@ impl PortRegistryCache {
             }
         };
 
-        for entry in entries.flatten() {
-            let fname = entry.file_name().to_string_lossy().to_string();
-            if !fname.ends_with(".service") { continue; }
-
-            // Il nome ha formato {slug}-{short}.service
-            // Estrai lo slug (tutto prima del primo '-' dopo il match con un progetto)
-            let unit_name = &fname;
-            let mut matched_project: Option<(Uuid, &str)> = None;
-            for (slug, pid) in &project_map {
-                let prefix = format!("{}-", slug);
-                if fname.starts_with(&prefix) {
-                    matched_project = Some((*pid, slug.as_str()));
-                    break;
+        // Lettura filesystem sincrona: spawn_blocking per non bloccare tokio
+        let svc_dir_owned = svc_dir.clone();
+        let project_map_clone = project_map.clone();
+        let discovered: Vec<(String, Uuid, Vec<u16>)> = tokio::task::spawn_blocking(move || {
+            let mut results = Vec::new();
+            let entries = match std::fs::read_dir(&svc_dir_owned) {
+                Ok(e) => e,
+                Err(_) => return results,
+            };
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if !fname.ends_with(".service") { continue; }
+                let mut matched_project: Option<Uuid> = None;
+                for (slug, pid) in &project_map_clone {
+                    let prefix = format!("{}-", slug);
+                    if fname.starts_with(&prefix) {
+                        matched_project = Some(*pid);
+                        break;
+                    }
+                }
+                let project_id = match matched_project {
+                    Some(pid) => pid,
+                    None => continue,
+                };
+                let path = entry.path();
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let ports = extract_ports_from_unit_content(&content);
+                if !ports.is_empty() {
+                    results.push((fname, project_id, ports));
                 }
             }
+            results
+        }).await.unwrap_or_default();
 
-            let project_id = match matched_project {
-                Some((pid, _)) => pid,
-                None => continue, // Non e' un servizio di progetto Nexus
-            };
-
-            // Leggi contenuto ed estrai porte
-            let path = entry.path();
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let ports = extract_ports_from_unit_content(&content);
+        for (unit_name, project_id, ports) in discovered {
             for port in ports {
                 if self.is_port_available(port).await {
                     info!(
@@ -423,7 +427,7 @@ impl PortRegistryCache {
                         port, unit_name, project_id
                     );
                     if let Err(e) = self.allocate(
-                        project_id, port, "", "auto", None, Some(unit_name),
+                        project_id, port, "", "auto", None, Some(&unit_name),
                     ).await {
                         warn!("port_registry recovery: allocazione porta {} fallita: {}", port, e);
                     }

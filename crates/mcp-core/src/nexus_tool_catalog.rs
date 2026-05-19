@@ -421,7 +421,14 @@ impl NexusToolCatalog {
                 }
             }
         };
-        handler.execute(ctx, args).await
+        // Molti handler NexusTool usano std::fs::* bloccante dentro execute().
+        // Eseguiamo su spawn_blocking per non congelare i worker tokio.
+        let ctx = ctx.clone();
+        let args = args.clone();
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || handle.block_on(handler.execute(&ctx, &args)))
+            .await
+            .map_err(|e| NexusToolError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("tool join error: {e}"))))?
     }
 
     /// Lista tool di una specifica categoria

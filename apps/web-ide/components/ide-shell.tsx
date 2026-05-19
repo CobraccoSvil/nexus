@@ -68,7 +68,7 @@ import {
   selectProblemsBadge,
   selectRunConfigsChangedAt,
 } from "../lib/project-dispatcher";
-import { ConnectionStatusBadge, ToastStack } from "./dispatcher-status";
+import { ConnectionStatusBadge, ToastStack, usePanelHighlight } from "./dispatcher-status";
 
 // Dynamic imports per componenti pesanti IDE
 const ChatPanel = dynamic(() => import("./chat-panel.lazy"), {
@@ -668,25 +668,47 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
 
   const refreshOperationalViews = useCallback(
     async (projectId: string) => {
-      try {
-        const [problemsRes, channelsRes, portsRes, playwrightRes, runConfigsRes] =
-          await Promise.all([
-            getProjectProblems(projectId),
-            getOutputChannels(projectId),
-            getProjectPorts(projectId),
-            getPlaywrightRuns(projectId),
-            getRunConfigs(projectId),
-          ]);
-        setProblemItems(problemsRes.items ?? []);
-        setOutputChannels(channelsRes.channels ?? []);
-        setPorts(portsRes.ports ?? []);
-        setPlaywrightRuns(playwrightRes.runs ?? []);
-        setPlaywrightConfigured(playwrightRes.configured ?? false);
-        setRunConfigs(runConfigsRes.configs ?? []);
-        const firstChannel = channelsRes.channels?.[0]?.id ?? "System";
+      // Promise.allSettled: se UNO degli endpoint fallisce (es. backend
+      // momentaneamente non risponde su /run-configs), gli altri 4 si
+      // applicano comunque. Prima invece bastava 1 errore per perdere TUTTE
+      // le viste e mostrare "Impossibile caricare le viste operative"
+      // bloccante anche quando il problema era gia' risolto.
+      const results = await Promise.allSettled([
+        getProjectProblems(projectId),
+        getOutputChannels(projectId),
+        getProjectPorts(projectId),
+        getPlaywrightRuns(projectId),
+        getRunConfigs(projectId),
+      ]);
+      const [problemsR, channelsR, portsR, playwrightR, runConfigsR] = results;
+      if (problemsR.status === "fulfilled") setProblemItems(problemsR.value.items ?? []);
+      if (channelsR.status === "fulfilled") {
+        setOutputChannels(channelsR.value.channels ?? []);
+        const firstChannel = channelsR.value.channels?.[0]?.id ?? "System";
         setSelectedOutputChannel((current) => current || firstChannel);
-      } catch (error) {
-        setProjectError(error instanceof Error ? error.message : "Impossibile caricare le viste operative.");
+      }
+      if (portsR.status === "fulfilled") setPorts(portsR.value.ports ?? []);
+      if (playwrightR.status === "fulfilled") {
+        setPlaywrightRuns(playwrightR.value.runs ?? []);
+        setPlaywrightConfigured(playwrightR.value.configured ?? false);
+      }
+      if (runConfigsR.status === "fulfilled") setRunConfigs(runConfigsR.value.configs ?? []);
+
+      // Se TUTTI hanno fallito: errore reale (backend down).
+      // Se almeno uno ha avuto successo: reset dello stato d'errore (su un
+      // refresh successivo le viste sono di nuovo aggiornate).
+      const allFailed = results.every((r) => r.status === "rejected");
+      if (allFailed) {
+        const firstError = results.find((r) => r.status === "rejected") as PromiseRejectedResult | undefined;
+        const msg = firstError?.reason instanceof Error
+          ? firstError.reason.message
+          : "Impossibile caricare le viste operative.";
+        setProjectError(msg);
+      } else {
+        // Almeno qualcosa funziona: pulisci eventuale errore stale
+        setProjectError((current) =>
+          current === "Impossibile caricare le viste operative." ? null : current,
+        );
       }
     },
     [],
@@ -2185,24 +2207,14 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           }}
         >
           {panelTabs.map((tab) => (
-            <button
+            <PanelTabButton
               key={tab.key}
-              onClick={() => setActivePanelTab(tab.key)}
-              style={{
-                border: "none",
-                borderRight: `1px solid ${tc.border}`,
-                background: activePanelTab === tab.key ? tc.bg : "transparent",
-                color: activePanelTab === tab.key ? tc.text : tc.textMuted,
-                padding: isMobileViewport ? "0 8px" : "0 14px",
-                height: "100%",
-                cursor: "pointer",
-                fontSize: isMobileViewport ? 11 : 12,
-                whiteSpace: "nowrap",
-                flexShrink: 0,
-              }}
-            >
-              {tab.label}
-            </button>
+              tab={tab}
+              active={activePanelTab === tab.key}
+              tc={tc}
+              isMobileViewport={isMobileViewport}
+              onSelect={() => setActivePanelTab(tab.key)}
+            />
           ))}
           <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8, paddingRight: 12 }}>
             {activeProject && <QuotaBadge projectId={activeProject.id} />}
@@ -2407,5 +2419,50 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
       )}
       <ToastStack />
     </main>
+  );
+}
+
+/**
+ * Singolo tab del PanelDock con highlight effect quando dispatcher emette
+ * HighlightPanel per la sua key.
+ */
+function PanelTabButton({
+  tab,
+  active,
+  tc,
+  isMobileViewport,
+  onSelect,
+}: {
+  tab: { key: PanelTab; label: string };
+  active: boolean;
+  tc: ReturnType<typeof useThemeColors>;
+  isMobileViewport: boolean;
+  onSelect: () => void;
+}) {
+  const highlighted = usePanelHighlight(tab.key);
+  return (
+    <button
+      onClick={onSelect}
+      style={{
+        border: "none",
+        borderRight: `1px solid ${tc.border}`,
+        background: highlighted
+          ? "rgba(245,158,11,0.25)"
+          : active
+            ? tc.bg
+            : "transparent",
+        color: active ? tc.text : tc.textMuted,
+        padding: isMobileViewport ? "0 8px" : "0 14px",
+        height: "100%",
+        cursor: "pointer",
+        fontSize: isMobileViewport ? 11 : 12,
+        whiteSpace: "nowrap",
+        flexShrink: 0,
+        transition: "background-color 200ms ease-out",
+        boxShadow: highlighted ? "inset 0 -2px 0 #f59e0b" : "none",
+      }}
+    >
+      {tab.label}
+    </button>
   );
 }

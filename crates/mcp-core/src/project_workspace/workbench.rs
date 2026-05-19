@@ -17,7 +17,16 @@ pub async fn open_project(
         context.details.root_path.as_deref(),
     )
     .await?;
-    let tree = list_directory_nodes(&context.root_path, &context.root_path)?;
+    // list_directory_nodes fa I/O sincrono intensivo (read_dir + metadata per ogni
+    // entry + sub-read_dir per has_children). Va eseguito su spawn_blocking per non
+    // bloccare il runtime tokio (causa di freeze mcp-core su progetti grandi).
+    let root_for_tree = context.root_path.clone();
+    let tree = tokio::task::spawn_blocking(move || {
+        list_directory_nodes(&root_for_tree, &root_for_tree)
+    })
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("spawn_blocking tree: {e}")))?
+    ?;
     let git_state = refresh_git_snapshot(&state.db, &context).await?;
 
     Ok(Json(json!({

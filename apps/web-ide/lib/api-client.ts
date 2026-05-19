@@ -1,4 +1,6 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+const API_BASE = typeof window !== "undefined"
+  ? ""
+  : (process.env.NEXT_PUBLIC_API_URL || "");
 // Proxy tramite Next.js /api/neural/* → brain:8001 (evita CORS e NEXT_PUBLIC_* baked)
 const NEURAL_BASE = "/api/neural";
 
@@ -156,6 +158,11 @@ export interface ChatMessage {
   currency?: string;
   automationMode?: "study" | "confirm" | "automatic" | "agent";
   resendOfMessageId?: string;
+  /** True quando il messaggio e' stato generato automaticamente dal sistema
+      (es. auto-continuazione in modalita' "automatic"). La UI lo nasconde
+      per non confondere l'utente: il backend lo persiste comunque per
+      coerenza del run. Vedere chat_messages.rs::synthetic. */
+  synthetic?: boolean;
 }
 
 export interface ChatAttachment {
@@ -179,6 +186,9 @@ export interface SendChatMessageOptions {
   // dal summarizer (BP4). Default: 30 messaggi -- copre i 6 protetti dal
   // summarizer + 24 messaggi recenti.
   messageWindowSize?: number;
+  /** Se true, marca il messaggio come auto-generato dal sistema (es. auto-continuazione).
+      Il backend lo persiste in metadata.synthetic; la UI lo nasconde. */
+  synthetic?: boolean;
 }
 
 export interface FeedbackErrorResponse {
@@ -919,6 +929,7 @@ export async function sendChatMessage(
       // BP13: dichiara la finestra di messaggi che il client e' disposto a
       // inviare. Il backend usa questo hint per pruning lato suo.
       messageWindowSize: options.messageWindowSize ?? 30,
+      synthetic: options.synthetic ?? false,
     }),
   }, 120000);
 }
@@ -1745,6 +1756,33 @@ export async function publishGitHubBranch(
   });
 }
 
+/** Orchestrazione completa: git init (se serve) + commit + crea repo GitHub + push.
+    Per progetti nuovi NON gia' versionati o gia' git ma senza remote.
+    Vedere github.rs::github_publish_project. */
+export async function publishProjectToGitHub(
+  projectId: string,
+  payload: { name: string; description?: string; private?: boolean; commitMessage?: string },
+): Promise<{
+  ok: boolean;
+  // Backend ritorna snake_case (json! macro su valori non-struct).
+  full_name: string;
+  html_url: string;
+  clone_url: string;
+  private: boolean;
+  default_branch: string;
+  pushed: boolean;
+}> {
+  return fetchJson(`${API_BASE}/api/projects/${projectId}/github/publish`, {
+    method: "POST",
+    body: JSON.stringify({
+      name: payload.name,
+      description: payload.description ?? "",
+      private: payload.private ?? true,
+      commit_message: payload.commitMessage ?? "Initial commit (Nexus)",
+    }),
+  }, 90_000);
+}
+
 export async function createGitHubPullRequest(
   projectId: string,
   payload: { title: string; body?: string; baseBranch?: string },
@@ -2435,6 +2473,17 @@ export async function cancelAgentRun(
   });
 }
 
+export interface AgentMetaStepPayload {
+  runId: string;
+  metaStep: {
+    kind: "plan" | "routing" | "clarify" | "fallback" | "reflection" | string;
+    title: string;
+    payload: Record<string, unknown>;
+    correlationId?: string | null;
+    createdAt: string;
+  };
+}
+
 export function subscribeAgentStream(
   sessionId: string,
   runId: string,
@@ -2443,6 +2492,7 @@ export function subscribeAgentStream(
   onTrace?: (trace: AITraceEvent) => void,
   onReconnecting?: (isReconnecting: boolean) => void,
   onToken?: (delta: string) => void,
+  onMetaStep?: (meta: AgentMetaStepPayload) => void,
 ): () => void {
   const url = `${API_BASE}/api/chat/sessions/${sessionId}/agent-stream?run_id=${runId}`;
   const es = new EventSource(url, { withCredentials: true });
@@ -2466,6 +2516,15 @@ export function subscribeAgentStream(
     try {
       const data = JSON.parse((e as MessageEvent).data);
       onToken?.(data.delta as string);
+    } catch {}
+  });
+
+  es.addEventListener("agent_meta_step", (e) => {
+    try {
+      const data = JSON.parse((e as MessageEvent).data) as AgentMetaStepPayload;
+      if (data?.metaStep?.kind) {
+        onMetaStep?.(data);
+      }
     } catch {}
   });
 
@@ -3519,4 +3578,33 @@ export type PlaywrightArtifact = {
 
 export async function resetProviderCooldown(_providerKey: string): Promise<{ ok: boolean }> {
   return { ok: true };
+}
+
+// ── Esecuzione comandi dalla chat ─────────────────────────────────────
+
+export interface CommandExecResult {
+  exit_code: number;
+  stdout: string;
+  stderr: string;
+  blocked: boolean;
+  blocked_reason?: string;
+  duration_ms: number;
+}
+
+/** Esegue un comando shell nel contesto del progetto.
+ *  Il comando viene validato da safety check prima dell'esecuzione.
+ *  Usa URL relativo per transitare dal proxy Next.js (cookie HttpOnly). */
+export async function executeProjectCommand(
+  projectId: string,
+  command: string,
+  timeoutSecs?: number,
+): Promise<CommandExecResult> {
+  // Timeout backend max 120s — il timeout frontend deve coprirlo con margine.
+  const backendTimeout = timeoutSecs ?? 60;
+  const clientTimeoutMs = (backendTimeout + 10) * 1000;
+  return fetchJson(`/api/projects/${projectId}/execute-command`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ command, timeout_secs: timeoutSecs }),
+  }, clientTimeoutMs);
 }

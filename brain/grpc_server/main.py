@@ -1427,6 +1427,25 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                         _learner_seen = True
                     if not isinstance(delta, dict):
                         continue
+                    # ── Meta-step pubblicati da QUALUNQUE nodo ─────────────
+                    # I nodi (planner, router, executor su fallback, ecc.)
+                    # possono accodare entry strutturate in `delta["meta_steps"]`
+                    # via brain/agents/meta_steps.make(). Il generator le
+                    # converte in eventi SSE `{"type":"meta_step", ...}`
+                    # consumati da mcp-core::brain_agent_client.
+                    for ms in (delta.get("meta_steps") or []):
+                        if not isinstance(ms, dict) or not ms.get("kind"):
+                            continue
+                        ms_payload = {
+                            "type": "meta_step",
+                            "kind": ms["kind"],
+                            "title": ms.get("title", ""),
+                            "payload": ms.get("payload") or {},
+                            "created_at": ms.get("created_at"),
+                        }
+                        if ms.get("correlation_id"):
+                            ms_payload["correlation_id"] = ms["correlation_id"]
+                        yield "data: " + _json.dumps(ms_payload) + "\n\n"
                     if node == "router":
                         # Cattura metadata routing (B5 fix: propagazione nexus_task_type/agent_type)
                         if delta.get("user_intent"):

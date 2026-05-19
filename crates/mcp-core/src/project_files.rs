@@ -32,7 +32,15 @@ pub async fn get_project_tree(
         Some(path) if !path.trim().is_empty() => resolve_relative_path(&context.root_path, path)?,
         _ => context.root_path.clone(),
     };
-    let nodes = list_directory_nodes(&context.root_path, &target)?;
+    // list_directory_nodes fa I/O sincrono intensivo: spawn_blocking
+    // per non bloccare il runtime tokio.
+    let root_for_tree = context.root_path.clone();
+    let nodes = tokio::task::spawn_blocking(move || {
+        list_directory_nodes(&root_for_tree, &target)
+    })
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("spawn_blocking tree: {e}")))?
+    ?;
 
     Ok(Json(json!({
         "path": query.path.unwrap_or_default(),
@@ -311,59 +319,62 @@ pub async fn search_project(
     }
 
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
-    let mut stack = vec![context.root_path.clone()];
-    let mut matches = Vec::new();
-
-    while let Some(path) = stack.pop() {
-        if matches.len() >= limit {
-            break;
-        }
-        let entries = match std::fs::read_dir(&path) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-
-        for entry in entries.filter_map(|entry| entry.ok()) {
+    let root_path = context.root_path.clone();
+    let term_owned = term.to_string();
+    let matches = tokio::task::spawn_blocking(move || {
+        let mut stack = vec![root_path.clone()];
+        let mut matches = Vec::new();
+        while let Some(path) = stack.pop() {
             if matches.len() >= limit {
                 break;
             }
-            let child_path = entry.path();
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
+            let entries = match std::fs::read_dir(&path) {
+                Ok(entries) => entries,
                 Err(_) => continue,
             };
-            let name = entry.file_name().to_string_lossy().to_string();
-            if EXCLUDED_NAMES.contains(&name.as_str()) {
-                continue;
-            }
-            if metadata.is_dir() {
-                stack.push(child_path);
-                continue;
-            }
-            if !metadata.is_file() {
-                continue;
-            }
-
-            let content = match std::fs::read_to_string(&child_path) {
-                Ok(content) => content,
-                Err(_) => continue,
-            };
-
-            for (index, line) in content.lines().enumerate() {
+            for entry in entries.filter_map(|entry| entry.ok()) {
                 if matches.len() >= limit {
                     break;
                 }
-                if let Some(column) = line.find(term) {
-                    matches.push(json!({
-                        "path": to_relative(&context.root_path, &child_path),
-                        "line": index + 1,
-                        "column": column + 1,
-                        "preview": line.trim(),
-                    }));
+                let child_path = entry.path();
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(_) => continue,
+                };
+                let name = entry.file_name().to_string_lossy().to_string();
+                if EXCLUDED_NAMES.contains(&name.as_str()) {
+                    continue;
+                }
+                if metadata.is_dir() {
+                    stack.push(child_path);
+                    continue;
+                }
+                if !metadata.is_file() {
+                    continue;
+                }
+                let content = match std::fs::read_to_string(&child_path) {
+                    Ok(content) => content,
+                    Err(_) => continue,
+                };
+                for (index, line) in content.lines().enumerate() {
+                    if matches.len() >= limit {
+                        break;
+                    }
+                    if let Some(column) = line.find(&*term_owned) {
+                        matches.push(json!({
+                            "path": to_relative(&root_path, &child_path),
+                            "line": index + 1,
+                            "column": column + 1,
+                            "preview": line.trim(),
+                        }));
+                    }
                 }
             }
         }
-    }
+        matches
+    })
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Ricerca fallita: {e}")))?;
 
     Ok(Json(json!({
         "query": term,

@@ -290,6 +290,7 @@ pub async fn set_project_db_config(
 
     // Write-back: aggiorna la connection string nei file di configurazione del progetto
     // (appsettings.*.json, .env, ecc.) se fornita e se il progetto e` su disco locale.
+    // Tutto il filesystem I/O e' spostato in spawn_blocking per non bloccare tokio.
     let mut writeback_error: Option<String> = None;
     if let Some(conn_str) = body.connection_string.as_deref().filter(|s| !s.trim().is_empty()) {
         let project_root: Option<String> = sqlx::query_scalar("SELECT repository_root_path FROM projects WHERE id=$1")
@@ -300,14 +301,12 @@ pub async fn set_project_db_config(
             .flatten()
             .filter(|s: &String| !s.is_empty());
         if let Some(root) = project_root {
-            let root_path = std::path::Path::new(&root);
-            if root_path.exists() {
-                // Cerca appsettings*.json con ConnectionStrings e aggiorna
-                let candidates = [
-                    "appsettings.Development.json",
-                    "appsettings.json",
-                ];
-                // Cerca ricorsivamente nei sottoprogetti (max 4 livelli)
+            let conn_str_owned = conn_str.to_string();
+            let wb_result = tokio::task::spawn_blocking(move || {
+                let root_path = std::path::Path::new(&root);
+                if !root_path.exists() { return None; }
+                let mut wb_error: Option<String> = None;
+                let candidates = ["appsettings.Development.json", "appsettings.json"];
                 let mut config_files: Vec<std::path::PathBuf> = Vec::new();
                 fn find_configs(dir: &std::path::Path, names: &[&str], out: &mut Vec<std::path::PathBuf>, depth: u8) {
                     if depth > 4 { return; }
@@ -324,16 +323,14 @@ pub async fn set_project_db_config(
                     }
                 }
                 find_configs(root_path, &candidates, &mut config_files, 0);
-                // Per ogni file trovato, aggiorna le ConnectionStrings
                 for config_file in &config_files {
                     match std::fs::read_to_string(config_file) {
                         Ok(content) => {
                             if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&content) {
                                 let updated = if let Some(cs) = doc.get_mut("ConnectionStrings") {
                                     if let Some(obj) = cs.as_object_mut() {
-                                        // Aggiorna tutte le chiavi di connessione
                                         for (_key, val) in obj.iter_mut() {
-                                            *val = serde_json::Value::String(conn_str.to_string());
+                                            *val = serde_json::Value::String(conn_str_owned.clone());
                                         }
                                         true
                                     } else { false }
@@ -342,7 +339,7 @@ pub async fn set_project_db_config(
                                     if let Ok(pretty) = serde_json::to_string_pretty(&doc) {
                                         if let Err(e) = std::fs::write(config_file, pretty + "\n") {
                                             tracing::warn!("write-back {} fallito: {}", config_file.display(), e);
-                                            writeback_error = Some(format!("Scrittura {} fallita: {}", config_file.display(), e));
+                                            wb_error = Some(format!("Scrittura {} fallita: {}", config_file.display(), e));
                                         } else {
                                             tracing::info!("write-back connection string in {}", config_file.display());
                                         }
@@ -350,12 +347,9 @@ pub async fn set_project_db_config(
                                 }
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!("lettura {} fallita: {}", config_file.display(), e);
-                        }
+                        Err(e) => { tracing::warn!("lettura {} fallita: {}", config_file.display(), e); }
                     }
                 }
-                // Cerca anche file .env e aggiorna
                 let env_files = ["env", ".env", ".env.local", ".env.development"];
                 for env_name in &env_files {
                     let env_path = root_path.join(env_name);
@@ -369,7 +363,7 @@ pub async fn set_project_db_config(
                                 if let Some((k, _)) = trimmed.split_once('=') {
                                     let kl = k.trim().to_lowercase();
                                     if kl.contains("database_url") || kl.contains("connection") || kl.contains("db_url") {
-                                        *line = format!("{}={}", k.trim(), conn_str);
+                                        *line = format!("{}={}", k.trim(), conn_str_owned);
                                         found = true;
                                     }
                                 }
@@ -381,7 +375,9 @@ pub async fn set_project_db_config(
                         }
                     }
                 }
-            }
+                wb_error
+            }).await.unwrap_or(None);
+            writeback_error = wb_result;
         }
     }
 

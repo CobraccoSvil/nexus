@@ -338,26 +338,30 @@ pub async fn cleanup_project_ports(
         }
     }
 
-    // Espande PID protetti con tutti i discendenti (BFS) per non ucciderli per sbaglio
-    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
-    if let Ok(proc_entries) = std::fs::read_dir("/proc") {
-        for entry in proc_entries.flatten() {
-            let n = entry.file_name();
-            let s = n.to_string_lossy();
-            if let Ok(pid) = s.parse::<u32>() {
-                if let Ok(content) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
-                    for line in content.lines() {
-                        if let Some(rest) = line.strip_prefix("PPid:") {
-                            if let Ok(ppid) = rest.trim().parse::<u32>() {
-                                children.entry(ppid).or_default().push(pid);
+    // Espande PID protetti con tutti i discendenti (BFS) per non ucciderli per sbaglio.
+    // Scan /proc sincrono → spawn_blocking per non bloccare il runtime tokio.
+    let children: std::collections::HashMap<u32, Vec<u32>> = tokio::task::spawn_blocking(|| {
+        let mut map: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+        if let Ok(proc_entries) = std::fs::read_dir("/proc") {
+            for entry in proc_entries.flatten() {
+                let n = entry.file_name();
+                let s = n.to_string_lossy();
+                if let Ok(pid) = s.parse::<u32>() {
+                    if let Ok(content) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
+                        for line in content.lines() {
+                            if let Some(rest) = line.strip_prefix("PPid:") {
+                                if let Ok(ppid) = rest.trim().parse::<u32>() {
+                                    map.entry(ppid).or_default().push(pid);
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
                 }
             }
         }
-    }
+        map
+    }).await.unwrap_or_default();
     let mut queue: std::collections::VecDeque<u32> = protected_pids.iter().copied().collect();
     while let Some(pid) = queue.pop_front() {
         if let Some(kids) = children.get(&pid) {
@@ -368,8 +372,12 @@ pub async fn cleanup_project_ports(
     }
 
     // Trova tutti i processi che ascoltano sulle porte e killa quelli non protetti
-    let listening = read_listening_ports_ss().await
-        .unwrap_or_else(|_| read_listening_ports_proc());
+    let listening = match read_listening_ports_ss().await {
+        Ok(v) => v,
+        Err(_) => tokio::task::spawn_blocking(read_listening_ports_proc)
+            .await
+            .unwrap_or_default(),
+    };
 
     let mut killed = Vec::new();
     let mut skipped = Vec::new();
@@ -546,36 +554,16 @@ pub(super) async fn detect_project_ports(
         .chain(systemd_pids.into_iter())
         .collect();
 
-    // Costruisce mappa ppid → vec<pid> per trovare i processi figli (es. node figlio di pnpm)
-    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
-    if let Ok(proc_entries) = std::fs::read_dir("/proc") {
-        for entry in proc_entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if let Ok(pid) = name_str.parse::<u32>() {
-                // Leggi ppid da /proc/{pid}/status
-                let status_path = format!("/proc/{}/status", pid);
-                if let Ok(content) = std::fs::read_to_string(&status_path) {
-                    for line in content.lines() {
-                        if let Some(rest) = line.strip_prefix("PPid:") {
-                            if let Ok(ppid) = rest.trim().parse::<u32>() {
-                                children.entry(ppid).or_default().push(pid);
-                            }
-                            break;
-                        }
-                    }
-                }
-                // Scansiona cwd per aggiungere qualsiasi processo con cwd nel project_root
-                let cwd_path = format!("/proc/{}/cwd", pid);
-                if let Ok(cwd) = std::fs::read_link(&cwd_path) {
-                    let cwd_str = cwd.to_string_lossy();
-                    if cwd_str.starts_with(project_root) {
-                        all_pids.insert(pid);
-                    }
-                }
-            }
-        }
-    }
+    // Scan /proc per costruire mappa figli e trovare processi con cwd nel project_root.
+    // Tutto sincrono → spawn_blocking per non bloccare il runtime tokio.
+    let project_root_owned = project_root.to_string();
+    let (children, cwd_pids) = tokio::task::spawn_blocking(move || {
+        scan_proc_children_and_cwd(&project_root_owned)
+    })
+    .await
+    .unwrap_or_default();
+
+    all_pids.extend(cwd_pids);
 
     // Espandi all_pids con tutti i discendenti dei PID già noti (BFS).
     let mut queue: std::collections::VecDeque<u32> = all_pids.iter().copied().collect();
@@ -615,9 +603,13 @@ pub(super) async fn detect_project_ports(
         return ports;
     }
 
-    // 3. Leggi le porte TCP in ascolto tramite ss oppure /proc/net/tcp
-    let listening = read_listening_ports_ss().await
-        .unwrap_or_else(|_| read_listening_ports_proc());
+    // 3. Leggi le porte TCP in ascolto tramite ss (async) oppure /proc/net/tcp (sync via spawn_blocking)
+    let listening = match read_listening_ports_ss().await {
+        Ok(v) => v,
+        Err(_) => tokio::task::spawn_blocking(read_listening_ports_proc)
+            .await
+            .unwrap_or_default(),
+    };
 
     for (port_num, pid, program) in listening {
         if all_pids.contains(&pid) {
@@ -993,8 +985,12 @@ async fn free_ports_for_unit(unit_name: &str) -> Vec<serde_json::Value> {
 
     let own_pid = get_service_main_pid(unit_name).await;
 
-    let listening = read_listening_ports_ss().await
-        .unwrap_or_else(|_| read_listening_ports_proc());
+    let listening = match read_listening_ports_ss().await {
+        Ok(v) => v,
+        Err(_) => tokio::task::spawn_blocking(read_listening_ports_proc)
+            .await
+            .unwrap_or_default(),
+    };
 
     let mut freed = Vec::new();
     for target_port in &ports {
@@ -1357,7 +1353,17 @@ pub async fn create_port_allocation(
 }
 
 /// DELETE /api/projects/:id/port-allocations/:port
-/// Rilascia una porta allocata al progetto.
+/// Rilascia una porta allocata al progetto E termina il processo che la usa.
+///
+/// Comportamento:
+/// 1. Verifica ownership (porta allocata a questo progetto)
+/// 2. Trova il PID che binda la porta tramite `ss -tlnp`
+/// 3. Se il PID appartiene a un `agent_processes` del progetto: SIGTERM (2s)
+///    + SIGKILL + marca `status='stopped'` in DB
+/// 4. Rilascia l'allocazione dal registry
+///
+/// Senza il kill, l'utente vede la porta "ricomparire" perche' il processo
+/// e' ancora vivo e il detect la rileva di nuovo.
 pub async fn delete_port_allocation(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -1385,13 +1391,66 @@ pub async fn delete_port_allocation(
     }
     drop(registry);
 
+    // ── Termina il processo che binda la porta (best-effort) ────────────────
+    // Senza questo, il processo continuerebbe a girare e il prossimo detect
+    // ricreerebbe l'allocazione: l'utente vede "la × non pulisce".
+    let mut killed_pid: Option<u32> = None;
+    let mut marked_stopped = false;
+    if let Ok(bindings) = detect_all_port_bindings(&state.db).await {
+        if let Some(binding) = bindings.iter().find(|b| b.port == port) {
+            // Killa solo se il binding e' associato a questo progetto (sicurezza)
+            let pid_owned_by_project = match binding.project_id {
+                Some(pid) => pid == _project_id,
+                None => false,
+            };
+            if pid_owned_by_project {
+                let pid = binding.pid;
+                // SIGTERM grazioso
+                let _ = tokio::process::Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status()
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                // SIGKILL se ancora vivo
+                let still_alive = tokio::task::spawn_blocking(move || {
+                    std::path::Path::new(&format!("/proc/{}", pid)).exists()
+                })
+                .await
+                .unwrap_or(false);
+                if still_alive {
+                    let _ = tokio::process::Command::new("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .status()
+                        .await;
+                }
+                killed_pid = Some(pid);
+                // Marca agent_processes come stopped (riconciliazione)
+                let upd = sqlx::query(
+                    "UPDATE agent_processes SET status='stopped', stopped_at=NOW() \
+                     WHERE pid = $1 AND project_id = $2 AND status IN ('running','starting')",
+                )
+                .bind(pid as i32)
+                .bind(_project_id)
+                .execute(&state.db)
+                .await
+                .map(|r| r.rows_affected())
+                .unwrap_or(0);
+                marked_stopped = upd > 0;
+            }
+        }
+    }
+
     state
         .port_registry
         .release(port)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(json!({
+        "ok": true,
+        "killed_pid": killed_pid,
+        "marked_stopped": marked_stopped,
+    })))
 }
 
 // ── Port binding globale per port_enforcer ──────────────────────────────────
@@ -1412,16 +1471,22 @@ pub struct PortBinding {
 /// Usata dal `port_enforcer` per individuare violazioni: processi di progetto
 /// che bindano porte fuori dal bucket assegnato.
 pub async fn detect_all_port_bindings(db: &sqlx::PgPool) -> Result<Vec<PortBinding>, String> {
-    // 1. Ottieni tutte le porte in ascolto con PID
-    let listening = read_listening_ports_ss()
-        .await
-        .unwrap_or_else(|_| read_listening_ports_proc());
+    // 1. Ottieni tutte le porte in ascolto con PID.
+    //    `ss -tlnp` via tokio::process (async). Fallback: /proc/net/tcp via spawn_blocking.
+    let listening = match read_listening_ports_ss().await {
+        Ok(v) => v,
+        Err(_) => {
+            tokio::task::spawn_blocking(read_listening_ports_proc)
+                .await
+                .unwrap_or_default()
+        }
+    };
 
     if listening.is_empty() {
         return Ok(Vec::new());
     }
 
-    // 2. Costruisci mappa pid → project_id da agent_processes
+    // 2. Costruisci mappa pid -> project_id da agent_processes
     let pid_rows: Vec<(Option<i32>, uuid::Uuid)> = sqlx::query_as(
         "SELECT pid, project_id FROM agent_processes \
          WHERE pid IS NOT NULL AND status IN ('running', 'starting')",
@@ -1440,32 +1505,18 @@ pub async fn detect_all_port_bindings(db: &sqlx::PgPool) -> Result<Vec<PortBindi
         }
     }
 
-    // 3. Espandi con discendenti: se il PID noto ha figli, eredita il project_id
-    let mut children: std::collections::HashMap<u32, Vec<u32>> =
-        std::collections::HashMap::new();
-    if let Ok(proc_entries) = std::fs::read_dir("/proc") {
-        for entry in proc_entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if let Ok(pid) = name_str.parse::<u32>() {
-                let status_path = format!("/proc/{}/status", pid);
-                if let Ok(content) = std::fs::read_to_string(&status_path) {
-                    for line in content.lines() {
-                        if let Some(rest) = line.strip_prefix("PPid:") {
-                            if let Ok(ppid) = rest.trim().parse::<u32>() {
-                                children.entry(ppid).or_default().push(pid);
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // 3. Espandi con discendenti: scan /proc sincrono, spostato su spawn_blocking
+    //    per non bloccare il runtime tokio (fix: freeze mcp-core su molti processi).
+    let known_pids: Vec<u32> = pid_to_project.keys().copied().collect();
+    let children = tokio::task::spawn_blocking(move || {
+        build_children_map(&known_pids)
+    })
+    .await
+    .unwrap_or_default();
 
     // BFS: propaga project_id dai PID noti ai discendenti
-    let known_pids: Vec<u32> = pid_to_project.keys().copied().collect();
-    let mut queue: std::collections::VecDeque<u32> = known_pids.into_iter().collect();
+    let root_pids: Vec<u32> = pid_to_project.keys().copied().collect();
+    let mut queue: std::collections::VecDeque<u32> = root_pids.into_iter().collect();
     while let Some(pid) = queue.pop_front() {
         let proj = match pid_to_project.get(&pid).copied() {
             Some(p) => p,
@@ -1481,7 +1532,45 @@ pub async fn detect_all_port_bindings(db: &sqlx::PgPool) -> Result<Vec<PortBindi
         }
     }
 
-    // 4. Costruisci i PortBinding
+    // 4. Fallback CWD: per i PID in ascolto senza project_id da agent_processes,
+    //    tenta associazione via /proc/<pid>/cwd confrontato con repository_root_path
+    //    dei progetti. Cattura processi avviati fuori dal tool system Nexus.
+    let unmatched_pids: Vec<u32> = listening
+        .iter()
+        .filter(|(_, pid, _)| !pid_to_project.contains_key(pid))
+        .map(|(_, pid, _)| *pid)
+        .collect();
+
+    if !unmatched_pids.is_empty() {
+        // Carica mappa root_path -> project_id
+        let project_roots: Vec<(uuid::Uuid, Option<String>)> = sqlx::query_as(
+            "SELECT id, repository_root_path FROM projects \
+             WHERE repository_root_path IS NOT NULL AND repository_root_path != ''",
+        )
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+
+        if !project_roots.is_empty() {
+            let pids_for_cwd = unmatched_pids;
+            let roots_clone: Vec<(uuid::Uuid, String)> = project_roots
+                .into_iter()
+                .filter_map(|(id, r)| r.map(|p| (id, p)))
+                .collect();
+
+            let cwd_matches = tokio::task::spawn_blocking(move || {
+                resolve_pids_by_cwd(&pids_for_cwd, &roots_clone)
+            })
+            .await
+            .unwrap_or_default();
+
+            for (pid, proj_id) in cwd_matches {
+                pid_to_project.entry(pid).or_insert(proj_id);
+            }
+        }
+    }
+
+    // 5. Costruisci i PortBinding
     let bindings: Vec<PortBinding> = listening
         .into_iter()
         .map(|(port, pid, program)| PortBinding {
@@ -1495,14 +1584,136 @@ pub async fn detect_all_port_bindings(db: &sqlx::PgPool) -> Result<Vec<PortBindi
     Ok(bindings)
 }
 
+/// Risolve PID -> project_id leggendo /proc/<pid>/cwd e confrontando con
+/// i root_path dei progetti. Operazione sincrona: chiamare da `spawn_blocking`.
+fn resolve_pids_by_cwd(
+    pids: &[u32],
+    project_roots: &[(uuid::Uuid, String)],
+) -> Vec<(u32, uuid::Uuid)> {
+    let mut results = Vec::new();
+    for &pid in pids {
+        let cwd_link = format!("/proc/{}/cwd", pid);
+        let cwd = match std::fs::read_link(&cwd_link) {
+            Ok(p) => p.to_string_lossy().to_string(),
+            Err(_) => continue,
+        };
+        // Trova il progetto il cui root_path e' un prefisso del cwd.
+        // Se piu' progetti matchano, prende quello con il path piu' lungo (piu' specifico).
+        let mut best: Option<(uuid::Uuid, usize)> = None;
+        for (proj_id, root) in project_roots {
+            if cwd.starts_with(root.as_str()) || cwd == *root {
+                let len = root.len();
+                if best.map_or(true, |(_, prev_len)| len > prev_len) {
+                    best = Some((*proj_id, len));
+                }
+            }
+        }
+        if let Some((proj_id, _)) = best {
+            results.push((pid, proj_id));
+        }
+    }
+    results
+}
+
+/// Costruisce la mappa padre->figli leggendo /proc/*/status.
+/// Operazione puramente sincrona: va chiamata da `spawn_blocking`.
+/// Scansiona /proc per costruire: (a) mappa parent→children, (b) insieme di PID
+/// il cui cwd e' dentro il project_root dato.
+/// Operazione sincrona: chiamare da `spawn_blocking`.
+fn scan_proc_children_and_cwd(
+    project_root: &str,
+) -> (
+    std::collections::HashMap<u32, Vec<u32>>,
+    std::collections::HashSet<u32>,
+) {
+    let mut children: std::collections::HashMap<u32, Vec<u32>> =
+        std::collections::HashMap::new();
+    let mut cwd_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let proc_dir = match std::fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return (children, cwd_pids),
+    };
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let pid = match name_str.parse::<u32>() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Leggi PPid da /proc/{pid}/status
+        let status_path = format!("/proc/{}/status", pid);
+        if let Ok(content) = std::fs::read_to_string(&status_path) {
+            for line in content.lines() {
+                if let Some(rest) = line.strip_prefix("PPid:") {
+                    if let Ok(ppid) = rest.trim().parse::<u32>() {
+                        children.entry(ppid).or_default().push(pid);
+                    }
+                    break;
+                }
+            }
+        }
+        // Controlla cwd per associazione al progetto
+        let cwd_path = format!("/proc/{}/cwd", pid);
+        if let Ok(cwd) = std::fs::read_link(&cwd_path) {
+            let cwd_str = cwd.to_string_lossy();
+            if cwd_str.starts_with(project_root) {
+                cwd_pids.insert(pid);
+            }
+        }
+    }
+    (children, cwd_pids)
+}
+
+/// Filtra solo i PID che sono discendenti dei `known_pids` per ridurre
+/// le letture inutili.
+fn build_children_map(
+    _known_pids: &[u32],
+) -> std::collections::HashMap<u32, Vec<u32>> {
+    let mut children: std::collections::HashMap<u32, Vec<u32>> =
+        std::collections::HashMap::new();
+    let proc_dir = match std::fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return children,
+    };
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let pid = match name_str.parse::<u32>() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Leggi solo la riga PPid: da /proc/<pid>/status (pochi byte)
+        let status_path = format!("/proc/{}/status", pid);
+        let content = match std::fs::read_to_string(&status_path) {
+            Ok(c) => c,
+            Err(_) => continue, // processo scomparso, zombie, ecc.
+        };
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("PPid:") {
+                if let Ok(ppid) = rest.trim().parse::<u32>() {
+                    children.entry(ppid).or_default().push(pid);
+                }
+                break;
+            }
+        }
+    }
+    children
+}
+
 /// Verifica se una porta e' allocata ad un progetto specifico in `nexus_port_allocations`.
 pub async fn port_allocated_to_project(
     db: &sqlx::PgPool,
     port: u16,
     project_id: uuid::Uuid,
 ) -> bool {
+    // Solo allocazioni MANUAL giustificano una porta fuori dal bucket: le
+    // allocazioni auto/dynamic create da agenti AI per processi che hanno
+    // bindato porte arbitrarie (es. Vite default 5173) NON devono salvare
+    // il processo dal port_enforcer. Altrimenti l'agente puo' aggirare
+    // l'isolamento creando un'allocazione dynamic per qualsiasi porta.
     sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM nexus_port_allocations WHERE port = $1 AND project_id = $2)",
+        "SELECT EXISTS(SELECT 1 FROM nexus_port_allocations \
+         WHERE port = $1 AND project_id = $2 AND allocation_mode = 'manual')",
     )
     .bind(port as i32)
     .bind(project_id)

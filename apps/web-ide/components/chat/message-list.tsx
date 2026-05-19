@@ -15,6 +15,91 @@ function parseThinking(content: string): { thinking: string | null; text: string
   return { thinking: match[1].trim(), text: content.slice(match[0].length) };
 }
 
+/** Estrae blocchi `tool_use` serializzati come JSON dal content di un
+ * messaggio assistant. Pattern atteso: array JSON top-level con elementi
+ * `{name, arguments?, input?}` — alcune codifiche brain mettono
+ * `arguments`, altre `input`. Se l'intera content e' un array di tool_use,
+ * `cleanText` resta vuoto e la UI mostra solo le pillole. Quando il content
+ * mescola testo e tool_use, restituiamo cleanText senza il blocco JSON. */
+type ToolUseBlock = { name: string; input: unknown };
+function extractToolUseBlocks(content: string): { toolUses: ToolUseBlock[]; cleanText: string } {
+  const trimmed = content.trim();
+  if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) {
+    return { toolUses: [], cleanText: content };
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (!Array.isArray(parsed)) return { toolUses: [], cleanText: content };
+    const toolUses: ToolUseBlock[] = [];
+    for (const b of parsed) {
+      if (b && typeof b === "object" && typeof (b as Record<string, unknown>).name === "string") {
+        toolUses.push({
+          name: (b as Record<string, unknown>).name as string,
+          input: (b as Record<string, unknown>).arguments ?? (b as Record<string, unknown>).input ?? {},
+        });
+      } else {
+        // Array non omogeneo: non lo trattiamo come tool_use.
+        return { toolUses: [], cleanText: content };
+      }
+    }
+    return { toolUses, cleanText: "" };
+  } catch {
+    return { toolUses: [], cleanText: content };
+  }
+}
+
+function summarizeToolInput(input: unknown): string {
+  if (input == null || typeof input !== "object") return "";
+  const entries = Object.entries(input as Record<string, unknown>);
+  if (entries.length === 0) return "";
+  const parts = entries.slice(0, 3).map(([k, v]) => {
+    let val: string;
+    if (typeof v === "string") val = v.length > 40 ? `"${v.slice(0, 40)}…"` : `"${v}"`;
+    else if (typeof v === "number" || typeof v === "boolean") val = String(v);
+    else if (v == null) val = "null";
+    else val = "{…}";
+    return `${k}=${val}`;
+  });
+  const extra = entries.length > 3 ? `, +${entries.length - 3}` : "";
+  return parts.join(", ") + extra;
+}
+
+function ToolUseBadges({ toolUses, tc }: { toolUses: ToolUseBlock[]; tc: ThemeColors }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 4 }}>
+      {toolUses.map((tu, i) => {
+        const summary = summarizeToolInput(tu.input);
+        return (
+          <div
+            key={`tu-${i}`}
+            style={{
+              display: "inline-flex",
+              alignItems: "baseline",
+              gap: 6,
+              padding: "3px 8px",
+              borderRadius: 6,
+              border: `1px solid ${tc.border}`,
+              background: `${tc.bgInput}80`,
+              fontSize: 11,
+              fontFamily: "monospace",
+              maxWidth: "100%",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              alignSelf: "flex-start",
+            }}
+            title={JSON.stringify(tu.input)}
+          >
+            <span style={{ opacity: 0.7 }}>⚙</span>
+            <span style={{ fontWeight: 600 }}>{tu.name}</span>
+            {summary && <span style={{ opacity: 0.8 }}>({summary})</span>}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function ThinkingPanel({ thinking }: { thinking: string }) {
   const [open, setOpen] = useState(false);
   return (
@@ -470,6 +555,8 @@ export interface MessageListProps {
   /** Set di messageId per cui l'utente ha gia' inviato feedback positivo (UI mostra stato confermato). */
   positiveFeedback?: Set<string>;
   lastUserRef: RefObject<HTMLDivElement | null>;
+  /** ID progetto corrente: abilita esecuzione comandi dai blocchi codice shell. */
+  projectId?: string;
 }
 
 type CopyFeedbackState = { messageId: string; status: "success" | "error" } | null;
@@ -522,6 +609,7 @@ export function MessageList({
   onFeedbackPositive,
   positiveFeedback,
   lastUserRef,
+  projectId,
 }: MessageListProps) {
   const [copyFeedback, setCopyFeedback] = useState<CopyFeedbackState>(null);
   const copyFeedbackTimeoutRef = useRef<number | null>(null);
@@ -546,7 +634,11 @@ export function MessageList({
     }, 1100);
   };
 
-  const grouped = groupMessages(messages);
+  // Filtra messaggi sintetici (auto-continuazione "Continua") prima del raggruppamento.
+  // Restano persistiti nel DB per coerenza del run, ma non vanno mostrati come se
+  // fossero stati digitati dall'utente.
+  const visibleMessages = messages.filter((m) => !m.synthetic);
+  const grouped = groupMessages(visibleMessages);
 
   return (
     <>
@@ -663,43 +755,56 @@ export function MessageList({
                   </button>
                 ) : (
                   <>
-                    {onFeedbackPositive && (() => {
-                      const alreadyVoted = positiveFeedback?.has(message.id) ?? false;
+                    {/* Feedback abilitato SOLO per messaggi con UUID reale dal DB.
+                        I messaggi sintetici creati lato frontend hanno id "agent-{runId}"
+                        (vedi use-chat.ts::createTerminalMessage) e l'API
+                        /feedback-positive | /feedback-error fa Uuid::parse_str
+                        che fallisce con "Message id non valido". */}
+                    {(() => {
+                      const isPersistedUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(message.id);
+                      if (!isPersistedUuid) return null;
                       return (
-                        <button
-                          type="button"
-                          disabled={Boolean(busyAction) || alreadyVoted}
-                          onClick={() => onFeedbackPositive(message.id)}
-                          style={messageActionIconStyle(
-                            tc,
-                            Boolean(busyAction),
-                            alreadyVoted ? "success" : null,
-                          )}
-                          title={
-                            alreadyVoted
-                              ? "Feedback positivo gia' inviato"
-                              : "Risposta corretta (rinforza apprendimento)"
-                          }
-                          aria-label="Feedback positivo"
-                        >
-                          {busyAction === "feedback-positive"
-                            ? "…"
-                            : alreadyVoted
-                              ? "👍"
-                              : "👍🏻"}
-                        </button>
+                        <>
+                          {onFeedbackPositive && (() => {
+                            const alreadyVoted = positiveFeedback?.has(message.id) ?? false;
+                            return (
+                              <button
+                                type="button"
+                                disabled={Boolean(busyAction) || alreadyVoted}
+                                onClick={() => onFeedbackPositive(message.id)}
+                                style={messageActionIconStyle(
+                                  tc,
+                                  Boolean(busyAction),
+                                  alreadyVoted ? "success" : null,
+                                )}
+                                title={
+                                  alreadyVoted
+                                    ? "Feedback positivo gia' inviato"
+                                    : "Risposta corretta (rinforza apprendimento)"
+                                }
+                                aria-label="Feedback positivo"
+                              >
+                                {busyAction === "feedback-positive"
+                                  ? "…"
+                                  : alreadyVoted
+                                    ? "👍"
+                                    : "👍🏻"}
+                              </button>
+                            );
+                          })()}
+                          <button
+                            type="button"
+                            disabled={Boolean(busyAction)}
+                            onClick={() => onFeedback(message.id, message.content ?? "")}
+                            style={messageActionIconStyle(tc, Boolean(busyAction))}
+                            title="Segnala errore"
+                            aria-label="Segnala errore"
+                          >
+                            {busyAction === "feedback" ? "…" : "⚠"}
+                          </button>
+                        </>
                       );
                     })()}
-                    <button
-                      type="button"
-                      disabled={Boolean(busyAction)}
-                      onClick={() => onFeedback(message.id, message.content ?? "")}
-                      style={messageActionIconStyle(tc, Boolean(busyAction))}
-                      title="Segnala errore"
-                      aria-label="Segnala errore"
-                    >
-                      {busyAction === "feedback" ? "…" : "⚠"}
-                    </button>
                   </>
                 )}
                 <button
@@ -721,10 +826,17 @@ export function MessageList({
                 <MarkdownBlock content={message.content} />
               ) : (() => {
                 const { thinking, text } = parseThinking(message.content ?? "");
+                const { toolUses, cleanText } = extractToolUseBlocks(text);
                 return (
                   <>
                     {thinking && <ThinkingPanel thinking={thinking} />}
-                    <MarkdownBlock content={text} />
+                    {cleanText.trim() && <MarkdownBlock content={cleanText} projectId={projectId} />}
+                    {toolUses.length > 0 && <ToolUseBadges toolUses={toolUses} tc={tc} />}
+                    {!cleanText.trim() && toolUses.length === 0 && (
+                      <span style={{ opacity: 0.6, fontStyle: "italic", fontSize: 12 }}>
+                        (nessun contenuto)
+                      </span>
+                    )}
                   </>
                 );
               })()}

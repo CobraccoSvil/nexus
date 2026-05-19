@@ -18,7 +18,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::agent_types::{
-    AgentRunResult, AgentRunStatus, AgentStep, AgentStepEvent, AgentStepStatus,
+    AgentMetaStep, AgentRunResult, AgentRunStatus, AgentStep, AgentStepEvent, AgentStepStatus,
 };
 use crate::agent_tools::AGENT_TOOLS_JSON;
 
@@ -601,6 +601,7 @@ pub async fn run_via_brain(
                             trace: None,
                             is_final: false,
                             token_delta: Some(text),
+                            meta_step: None,
                         });
                     }
                 }
@@ -628,6 +629,7 @@ pub async fn run_via_brain(
                         trace: None,
                         is_final: false,
                         token_delta: None,
+                        meta_step: None,
                     });
                     steps.push(step);
                 }
@@ -664,6 +666,7 @@ pub async fn run_via_brain(
                             trace: None,
                             is_final: false,
                             token_delta: None,
+                            meta_step: None,
                         });
                     } else {
                         tracing::warn!(
@@ -740,6 +743,50 @@ pub async fn run_via_brain(
                     // si riavvia ad ogni Ok). Nessuna azione necessaria.
                     tracing::debug!("brain SSE ping: run attivo");
                 }
+                "meta_step" => {
+                    // Step semantico (plan/routing/clarify/fallback/reflection)
+                    // ritrasmesso al frontend come AgentMetaStep. La persistenza
+                    // su nexus_agent_meta_steps avviene lato brain Python che
+                    // ha gia' accesso al DB tramite psycopg2 (vedi event_bus.py).
+                    let kind = evt
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if kind.is_empty() {
+                        tracing::warn!("meta_step senza kind, scarto: {payload}");
+                        continue;
+                    }
+                    let title = evt
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let payload_val = evt.get("payload").cloned().unwrap_or(json!({}));
+                    let correlation_id = evt
+                        .get("correlation_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let created_at = evt
+                        .get("created_at")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+                    let _ = step_tx.send(AgentStepEvent {
+                        run_id: run_id_str.clone(),
+                        step: None,
+                        trace: None,
+                        is_final: false,
+                        token_delta: None,
+                        meta_step: Some(AgentMetaStep {
+                            kind,
+                            title,
+                            payload: payload_val,
+                            correlation_id,
+                            created_at,
+                        }),
+                    });
+                }
                 "done" => {
                     // Segnale terminale esplicito dal brain: il graph LangGraph
                     // ha concluso (END node raggiunto). Usciamo subito dal loop
@@ -811,6 +858,7 @@ pub async fn run_via_brain(
             trace: None,
             is_final: true,
             token_delta: None,
+            meta_step: None,
         });
     }
 

@@ -138,7 +138,7 @@ struct AppState {
     pub(crate) monitor_registry: Arc<parking_lot::RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, serde_json::Value>>>>,
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 32)]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
@@ -190,13 +190,15 @@ async fn main() -> anyhow::Result<()> {
         for row in stale {
             let id: uuid::Uuid = row.get("id");
             let pid: Option<i32> = row.try_get("pid").unwrap_or(None);
-            let still_alive = pid.map(|p| {
-                std::process::Command::new("kill")
+            let still_alive = match pid {
+                Some(p) => tokio::process::Command::new("kill")
                     .args(["-0", &p.to_string()])
                     .status()
+                    .await
                     .map(|s| s.success())
-                    .unwrap_or(false)
-            }).unwrap_or(false);
+                    .unwrap_or(false),
+                None => false,
+            };
 
             if !still_alive {
                 let _ = sqlx::query(
@@ -232,15 +234,17 @@ async fn main() -> anyhow::Result<()> {
                             // Aspettiamo che termini tramite polling
                             loop {
                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                                let alive = std::process::Command::new("kill")
+                                let alive = tokio::process::Command::new("kill")
                                     .args(["-0", &pid_val.to_string()])
                                     .status()
+                                    .await
                                     .map(|s| s.success())
                                     .unwrap_or(false);
                                 if !alive {
-                                    let exit_code: Option<i32> = std::process::Command::new("sh")
+                                    let exit_code: Option<i32> = tokio::process::Command::new("sh")
                                         .args(["-c", &format!("cat /proc/{}/status 2>/dev/null | grep -c VmPeak", pid_val)])
                                         .output()
+                                        .await
                                         .ok()
                                         .and_then(|o| String::from_utf8(o.stdout).ok())
                                         .and_then(|s| s.trim().parse().ok());
@@ -1438,6 +1442,14 @@ async fn main() -> anyhow::Result<()> {
                     middleware::require_auth,
                 )),
             )
+            // ── Esecuzione comandi dalla chat ─────────────────────────────────
+            .route(
+                "/api/projects/:id/execute-command",
+                post(project_workspace::execute_command).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
             // ── PR hardening: endpoint sicurezza/quote ────────────────────────
             .route(
                 "/api/projects/:id/security/audit",
@@ -1630,6 +1642,20 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/projects/:id/github/clone",
                 post(github::github_clone_repository).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/projects/:id/github/create-repo",
+                post(github::github_create_repo).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/projects/:id/github/publish",
+                post(github::github_publish_project).layer(axum_mw::from_fn_with_state(
                     state.clone(),
                     middleware::require_auth,
                 )),

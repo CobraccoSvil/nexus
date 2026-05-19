@@ -1,8 +1,10 @@
 "use client";
 
+import React from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useThemeColors } from "../../lib/theme";
+import { ExecutableCodeBlock } from "./executable-code-block";
 
 function normalizeContent(raw: string): string {
   let s = raw;
@@ -31,29 +33,40 @@ function normalizeContent(raw: string): string {
   return s;
 }
 
-export function MarkdownBlock({
+/** Linguaggi shell per cui mostrare il pulsante "Esegui". */
+const SHELL_LANGUAGES = new Set(["bash", "sh", "shell", "zsh", "console"]);
+
+const remarkPluginsList = [remarkGfm];
+
+/** Estrae testo puro da children React (ReactMarkdown passa stringhe o array). */
+function extractText(node: React.ReactNode): string {
+  if (typeof node === "string") return node;
+  if (Array.isArray(node)) return node.map(extractText).join("");
+  if (React.isValidElement(node)) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return extractText((node.props as any)?.children);
+  }
+  return "";
+}
+
+export const MarkdownBlock = React.memo(function MarkdownBlock({
   content,
   skipNormalize = false,
+  projectId,
 }: {
   content: string;
-  /** Disabilita normalizeContent (utile per file .md gia' formattati con
-   *  tabelle, blocchi codice e diagrammi ASCII che la normalizzazione
-   *  rompe inserendo a-capo dopo "frase.Maiuscola"). */
   skipNormalize?: boolean;
+  projectId?: string;
 }) {
   const tc = useThemeColors();
   const normalized = skipNormalize ? (content ?? "") : normalizeContent(content ?? "");
 
-  return (
-    <div style={{ lineHeight: 1.7, fontSize: 13.5 }}>
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          p: ({ children }) => (
+  const components = React.useMemo(() => ({
+          p: ({ children }: { children?: React.ReactNode }) => (
             <p style={{ margin: "10px 0", lineHeight: 1.75 }}>{children}</p>
           ),
-          strong: ({ children }) => <strong>{children}</strong>,
-          em: ({ children }) => <em>{children}</em>,
+          strong: ({ children }: { children?: React.ReactNode }) => <strong>{children}</strong>,
+          em: ({ children }: { children?: React.ReactNode }) => <em>{children}</em>,
           a: (({ href, children }: { href?: string; children?: React.ReactNode }) => (
             <a
               href={href}
@@ -102,56 +115,80 @@ export function MarkdownBlock({
             );
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           }) as any,
-          pre: (({ children }: { children?: React.ReactNode }) => (
-            <pre
-              style={{
-                background: tc.bgInput,
-                border: `1px solid ${tc.border}`,
-                borderRadius: 6,
-                padding: "10px 12px",
-                overflowX: "auto",
-                fontFamily: '"JetBrains Mono", "Consolas", monospace',
-                fontSize: 12,
-                lineHeight: 1.5,
-                color: tc.text,
-                margin: "12px 0",
-                whiteSpace: "pre",
-              }}
-            >
-              {children}
-            </pre>
+          pre: (({ children }: { children?: React.ReactNode }) => {
+            // Se projectId e' fornito, intercetta blocchi bash/sh per renderizzarli
+            // come ExecutableCodeBlock con pulsante "Esegui" e stato controllato.
+            if (projectId && React.isValidElement(children)) {
+              const childEl = children as React.ReactElement<{
+                className?: string;
+                children?: React.ReactNode;
+              }>;
+              const className = childEl.props?.className ?? "";
+              const langMatch = className.match(/^language-(\w+)/);
+              if (langMatch && SHELL_LANGUAGES.has(langMatch[1])) {
+                const code = extractText(childEl.props?.children).replace(/\n$/, "");
+                return (
+                  <ExecutableCodeBlock
+                    code={code}
+                    language={langMatch[1]}
+                    projectId={projectId}
+                    tc={tc}
+                  />
+                );
+              }
+            }
+            // Fallback: rendering pre standard
+            return (
+              <pre
+                style={{
+                  background: tc.bgInput,
+                  border: `1px solid ${tc.border}`,
+                  borderRadius: 6,
+                  padding: "10px 12px",
+                  overflowX: "auto",
+                  fontFamily: '"JetBrains Mono", "Consolas", monospace',
+                  fontSize: 12,
+                  lineHeight: 1.5,
+                  color: tc.text,
+                  margin: "12px 0",
+                  whiteSpace: "pre",
+                }}
+              >
+                {children}
+              </pre>
+            );
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          )) as any,
-          h1: ({ children }) => (
+          }) as any,
+          h1: ({ children }: { children?: React.ReactNode }) => (
             <div style={{ fontWeight: 700, fontSize: 18, color: tc.text, margin: "18px 0 8px", borderBottom: `1px solid ${tc.border}`, paddingBottom: 4 }}>
               {children}
             </div>
           ),
-          h2: ({ children }) => (
+          h2: ({ children }: { children?: React.ReactNode }) => (
             <div style={{ fontWeight: 700, fontSize: 16, color: tc.text, margin: "16px 0 6px", borderBottom: `1px solid ${tc.border}`, paddingBottom: 3 }}>
               {children}
             </div>
           ),
-          h3: ({ children }) => (
+          h3: ({ children }: { children?: React.ReactNode }) => (
             <div style={{ fontWeight: 700, fontSize: 14, color: tc.text, margin: "14px 0 6px" }}>
               {children}
             </div>
           ),
-          h4: ({ children }) => (
+          h4: ({ children }: { children?: React.ReactNode }) => (
             <div style={{ fontWeight: 600, fontSize: 13, color: tc.text, margin: "12px 0 4px" }}>
               {children}
             </div>
           ),
-          ul: ({ children }) => (
+          ul: ({ children }: { children?: React.ReactNode }) => (
             <ul style={{ margin: "8px 0", paddingLeft: 20 }}>{children}</ul>
           ),
-          ol: ({ children }) => (
+          ol: ({ children }: { children?: React.ReactNode }) => (
             <ol style={{ margin: "8px 0", paddingLeft: 22 }}>{children}</ol>
           ),
-          li: ({ children }) => (
+          li: ({ children }: { children?: React.ReactNode }) => (
             <li style={{ marginBottom: 4, lineHeight: 1.65 }}>{children}</li>
           ),
-          blockquote: ({ children }) => (
+          blockquote: ({ children }: { children?: React.ReactNode }) => (
             <blockquote style={{ borderLeft: `3px solid ${tc.accent}`, paddingLeft: 12, margin: "10px 0", color: tc.textSecondary, fontStyle: "italic" }}>
               {children}
             </blockquote>
@@ -159,7 +196,7 @@ export function MarkdownBlock({
           hr: () => (
             <hr style={{ border: "none", borderTop: `1px solid ${tc.border}`, margin: "14px 0" }} />
           ),
-          table: ({ children }) => (
+          table: ({ children }: { children?: React.ReactNode }) => (
             <div style={{ overflowX: "auto", margin: "12px 0", border: `1px solid ${tc.border}`, borderRadius: 6 }}>
               <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 12.5 }}>
                 {children}
@@ -186,10 +223,16 @@ export function MarkdownBlock({
             </td>
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           )) as any,
-        }}
+  }), [tc, projectId]);
+
+  return (
+    <div style={{ lineHeight: 1.7, fontSize: 13.5 }}>
+      <ReactMarkdown
+        remarkPlugins={remarkPluginsList}
+        components={components}
       >
         {normalized}
       </ReactMarkdown>
     </div>
   );
-}
+});

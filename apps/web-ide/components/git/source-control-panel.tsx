@@ -26,6 +26,7 @@ import {
   type GitRepositoryState,
   pullGit,
   publishGitHubBranch,
+  publishProjectToGitHub,
   pushGit,
   stageGitPaths,
   type UserProjectDetails,
@@ -495,7 +496,9 @@ export function SourceControlPanel({
     }
   };
 
-  // Fix M15: crea nuovo repo GitHub e configura origin sul progetto
+  // Pubblica progetto su GitHub: orchestra init + commit + crea repo + push.
+  // Endpoint backend: github::github_publish_project (idempotente: salta i
+  // passi gia' fatti). Vedere github.rs.
   const handleCreateGithubRepo = async () => {
     if (!project?.id) return;
     const name = createRepoName.trim();
@@ -507,27 +510,13 @@ export function SourceControlPanel({
       setCreateRepoBusy(true);
       setGitHubError(null);
       setGitHubMessage(null);
-      const res = await fetch(`/api/projects/${project.id}/github/create-repo`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name,
-          private: createRepoPrivate,
-          description: createRepoDesc.trim() || undefined,
-        }),
+      const data = await publishProjectToGitHub(project.id, {
+        name,
+        description: createRepoDesc.trim() || undefined,
+        private: createRepoPrivate,
       });
-      if (!res.ok) {
-        const errBody = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(errBody.error ?? `HTTP ${res.status}`);
-      }
-      const data = (await res.json()) as {
-        html_url?: string;
-        full_name?: string;
-        origin_configured?: boolean;
-      };
-      setGitHubMessage(
-        `Repo ${data.full_name ?? name} creato${data.origin_configured ? " e origin configurato" : ""}`,
-      );
+      const pushedMsg = data.pushed ? " e push completato" : " (push fallito — verifica manualmente)";
+      setGitHubMessage(`Repo ${data.full_name ?? name} creato${pushedMsg}`);
       setCreateRepoOpen(false);
       setCreateRepoName("");
       setCreateRepoDesc("");
@@ -537,7 +526,7 @@ export function SourceControlPanel({
       }
     } catch (nextError) {
       setGitHubError(
-        nextError instanceof Error ? nextError.message : "Impossibile creare il repository",
+        nextError instanceof Error ? nextError.message : "Impossibile pubblicare il progetto",
       );
     } finally {
       setCreateRepoBusy(false);
@@ -1125,6 +1114,77 @@ export function SourceControlPanel({
       </div>
 
       {!isGitRepo ? (
+        <>
+        {/* Pubblica progetto locale su GitHub: orchestrazione completa
+            (init git + commit + crea repo + push). Mostrato solo se
+            l'utente e' connesso a GitHub. */}
+        {githubAccount?.connected ? (
+          <div style={cardStyle(tc)}>
+            <div style={sectionTitleStyle(tc)}>Pubblica progetto su GitHub</div>
+            <div style={{ color: tc.textMuted, fontSize: 12 }}>
+              Il progetto non e' ancora versionato. Nexus puo' inizializzare git,
+              creare un repository su <strong>github.com/{githubAccount.username ?? "..."}</strong>{" "}
+              e fare il push iniziale in un solo passaggio.
+            </div>
+            {!createRepoOpen ? (
+              <button
+                disabled={createRepoBusy || githubBusy || busy}
+                onClick={() => {
+                  setCreateRepoOpen(true);
+                  if (!createRepoName) setCreateRepoName(project?.slug ?? project?.name ?? "");
+                }}
+                style={smallButtonStyle(tc, createRepoBusy || githubBusy || busy)}
+              >
+                Pubblica su GitHub
+              </button>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                <input
+                  value={createRepoName}
+                  onChange={(e) => setCreateRepoName(e.target.value)}
+                  placeholder="Nome repository (alfanumerico, '-', '_', '.')"
+                  style={inputStyle(tc)}
+                />
+                <input
+                  value={createRepoDesc}
+                  onChange={(e) => setCreateRepoDesc(e.target.value)}
+                  placeholder="Descrizione (opzionale)"
+                  style={inputStyle(tc)}
+                />
+                <label style={{ display: "flex", alignItems: "center", gap: 8, color: tc.text }}>
+                  <input
+                    type="checkbox"
+                    checked={createRepoPrivate}
+                    onChange={(e) => setCreateRepoPrivate(e.target.checked)}
+                  />
+                  Repository privato
+                </label>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <button
+                    disabled={createRepoBusy || !createRepoName.trim()}
+                    onClick={() => void handleCreateGithubRepo()}
+                    style={smallButtonStyle(tc, createRepoBusy || !createRepoName.trim())}
+                  >
+                    {createRepoBusy ? "Pubblicazione in corso..." : "Conferma e pubblica"}
+                  </button>
+                  <button
+                    disabled={createRepoBusy}
+                    onClick={() => setCreateRepoOpen(false)}
+                    style={smallButtonStyle(tc, createRepoBusy)}
+                  >
+                    Annulla
+                  </button>
+                </div>
+                <div style={{ fontSize: 10, color: tc.textMuted }}>
+                  L'operazione esegue: git init -b main → .gitignore (se manca) →
+                  git add -A → git commit → crea repo GitHub → git push -u origin main.
+                </div>
+              </div>
+            )}
+            {githubMessage ? <div style={{ color: tc.success, fontSize: 12 }}>{githubMessage}</div> : null}
+            {githubError ? <div style={{ color: tc.error, fontSize: 12 }}>{githubError}</div> : null}
+          </div>
+        ) : null}
         <div style={cardStyle(tc)}>
           <div style={sectionTitleStyle(tc)}>Importa Repository GitHub</div>
           <div style={{ color: tc.textMuted, fontSize: 12 }}>
@@ -1192,6 +1252,7 @@ export function SourceControlPanel({
           {githubMessage ? <div style={{ color: tc.success }}>{githubMessage}</div> : null}
           {githubError ? <div style={{ color: tc.error }}>{githubError}</div> : null}
         </div>
+        </>
       ) : (
         <>
       <div style={cardStyle(tc)}>

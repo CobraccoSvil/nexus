@@ -211,6 +211,24 @@ pub struct AITraceEvent {
     pub cache_read_tokens: u32,
 }
 
+/// Meta-step pubblicato in chat per dare visibilità a passaggi interni del
+/// graph (plan del planner, decisione di routing, richiesta di chiarimento,
+/// fallback provider, riflessione post-hoc). Discriminato da `kind`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMetaStep {
+    /// `plan` | `routing` | `clarify` | `fallback` | `reflection`.
+    pub kind: String,
+    /// Titolo umano sintetico mostrato in UI (collassato).
+    pub title: String,
+    /// Payload strutturato dipendente da `kind`.
+    pub payload: Value,
+    /// Collega il meta_step a un evento precedente (es. fallback ↔ tool_use).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    pub created_at: String,
+}
+
 /// Evento trasmesso via broadcast per l'SSE del frontend.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -222,6 +240,10 @@ pub struct AgentStepEvent {
     /// Token parziale durante la generazione (streaming). Se presente, è evento `agent_token`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_delta: Option<String>,
+    /// Meta-step (plan/routing/clarify/fallback/reflection). Mutuamente
+    /// esclusivo con `step`/`trace`/`token_delta` ma non vincolato.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta_step: Option<AgentMetaStep>,
 }
 
 // ---------------------------------------------------------------------------

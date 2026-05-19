@@ -29,7 +29,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from . import orchestrator_config, prompt_registry, todo_store
+from . import meta_steps, orchestrator_config, prompt_registry, todo_store
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -291,6 +291,31 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
         active.get("seq") if active else None,
     )
 
+    # ── Meta-step `plan` per pubblicazione in chat ──────────────────────────
+    plan_meta = meta_steps.make(
+        kind="plan",
+        title=f"Piano creato — {len(todos)} step",
+        payload={
+            "plan_id": run_id,
+            "todos": [
+                {
+                    "id": t.get("id"),
+                    "seq": t.get("seq"),
+                    "content": t.get("content"),
+                    "status": t.get("status"),
+                    "priority": t.get("priority"),
+                }
+                for t in todos
+            ],
+            "provider": used_provider,
+            "model": used_model,
+            "active_todo_id": (active.get("id") if active else None),
+        },
+    )
+    plan_meta_list = [plan_meta] if plan_meta else []
+    if plan_meta:
+        meta_steps.persist_async(run_id, plan_meta)
+
     # Costruzione assistant message + tool_result message per continuity
     # della conversazione (cosi' il prossimo turno dell'executor vede il plan).
     assistant_content = meta.get("assistant_content")
@@ -324,6 +349,7 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
         # cosi' eventuali replan futuri di questo run lo riusano direttamente.
         "planner_sticky_provider": used_provider,
         "planner_sticky_model": used_model,
+        "meta_steps": plan_meta_list,
     }
 
 

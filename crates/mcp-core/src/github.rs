@@ -1343,9 +1343,10 @@ pub async fn github_clone_repository(
 
     // If the current project directory is not empty, clone into a new subdirectory
     // inside projects_base_root and register it as a separate project.
-    let is_empty = std::fs::read_dir(&context.repository_root_path)
-        .map(|mut e| e.next().is_none())
-        .unwrap_or(false);
+    let is_empty = match tokio::fs::read_dir(&context.repository_root_path).await {
+        Ok(mut entries) => entries.next_entry().await.ok().flatten().is_none(),
+        Err(_) => false,
+    };
 
     if !is_empty {
         // Derive a clean directory name from the repo name
@@ -1358,8 +1359,9 @@ pub async fn github_clone_repository(
         let base_root = crate::projects::load_projects_base_root(&state.db).await?;
         let dest = base_root.join(&dir_name);
 
-        if !dest.exists() {
-            std::fs::create_dir_all(&dest)
+        if !tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+            tokio::fs::create_dir_all(&dest)
+                .await
                 .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
 
@@ -1831,5 +1833,222 @@ pub async fn github_create_repo(
         "private": private,
         "default_branch": default_branch,
         "origin_configured": origin_configured,
+    })))
+}
+
+/// POST /api/projects/:id/github/publish
+///
+/// Orchestrazione completa "pubblica progetto su GitHub":
+/// 1. (se manca) git init -b main + .gitignore default
+/// 2. git add -A + git commit (se ci sono modifiche staged)
+/// 3. Crea repository GitHub via API (riusa github_create_repo)
+/// 4. git remote add origin (idempotente)
+/// 5. git push -u origin main (con token GitHub iniettato)
+///
+/// Body: `{name, description?, private?, commit_message?}`
+/// Output: `{ok, html_url, clone_url, full_name, pushed: bool}`
+pub async fn github_publish_project(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let context = load_project_context(&state.db, project_id, user_id).await?;
+
+    if !context.access.can_manage_git {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Non hai permessi Git su questo progetto",
+        ));
+    }
+
+    let authorized = ensure_github_authorized_user(&state.db, user_id)
+        .await
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "Collega GitHub a Nexus prima di pubblicare",
+            )
+        })?;
+
+    let name = body
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'name' obbligatorio"))?
+        .to_string();
+
+    if !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Nome repository non valido (solo alfanumerico, '-', '_', '.')",
+        ));
+    }
+
+    let private = body
+        .get("private")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let description = body
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let commit_message = body
+        .get("commit_message")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("Initial commit (Nexus)")
+        .to_string();
+
+    let root = context.root_path.clone();
+
+    // ── 1. Init git locale se manca ──────────────────────────────────────
+    let dot_git = root.join(".git");
+    if !tokio::fs::try_exists(&dot_git).await.unwrap_or(false) {
+        run_git_command(&root, &["init", "-b", "main"])
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("git init: {e}")))?;
+    }
+
+    // .gitignore di default se manca
+    let gitignore_path = root.join(".gitignore");
+    if !tokio::fs::try_exists(&gitignore_path).await.unwrap_or(false) {
+        let default_gitignore = "# Dependencies\nnode_modules/\n.pnpm-store/\n\n# Build output\ndist/\nbuild/\n.next/\n.turbo/\nout/\ntarget/\n\n# Environment\n.env\n.env.local\n.env.*.local\n!.env.example\n\n# Logs\n*.log\nnpm-debug.log*\npnpm-debug.log*\n\n# Editor\n.vscode/\n.idea/\n*.swp\n*.swo\n.DS_Store\n\n# Test artifacts\nplaywright-report/\ntest-results/\ncoverage/\n\n# OS\nThumbs.db\n";
+        let _ = tokio::fs::write(&gitignore_path, default_gitignore).await;
+    }
+
+    // Configura user.email/name locali (idempotente) per consentire git commit
+    let _ = run_git_command(&root, &["config", "user.email", "nexus@local"]).await;
+    let _ = run_git_command(&root, &["config", "user.name", "Nexus"]).await;
+
+    // ── 2. add + commit (no-op se nulla da committare) ───────────────────
+    let _ = run_git_command(&root, &["add", "-A"]).await;
+    // git commit ritorna errore se nulla da committare: ignoriamo (e' lecito ripubblicare)
+    let _ = run_git_command(&root, &["commit", "-m", &commit_message]).await;
+
+    // ── 3. Crea repo su GitHub ───────────────────────────────────────────
+    let client = Client::builder()
+        .user_agent("nexus-mcp-core")
+        .build()
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("http client: {}", e)))?;
+
+    let resp = client
+        .post("https://api.github.com/user/repos")
+        .bearer_auth(&authorized.access_token)
+        .header("Accept", "application/vnd.github+json")
+        .json(&json!({
+            "name": &name,
+            "private": private,
+            "description": &description,
+            "auto_init": false,
+        }))
+        .send()
+        .await
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, format!("GitHub API call: {}", e)))?;
+
+    let status = resp.status();
+    let resp_body: serde_json::Value = resp.json().await.unwrap_or_else(|_| json!({}));
+
+    // Idempotenza: se il repo esiste gia' (422 "name already exists on this
+    // account"), riusiamo quello esistente facendo GET /repos/:owner/:repo,
+    // cosi' il flusso "Pubblica su GitHub" funziona anche per
+    // ripubblicazioni e progetti gia' creati ma senza origin/push.
+    let reused = if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+        let already_exists = resp_body
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .map(|errs| {
+                errs.iter().any(|e| {
+                    e.get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|m| m.contains("already exists"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if already_exists {
+            let owner = &authorized.username;
+            let lookup = client
+                .get(format!("https://api.github.com/repos/{}/{}", owner, name))
+                .bearer_auth(&authorized.access_token)
+                .header("Accept", "application/vnd.github+json")
+                .send()
+                .await
+                .map_err(|e| api_error(StatusCode::BAD_GATEWAY, format!("GitHub lookup: {}", e)))?;
+            if !lookup.status().is_success() {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Il repository {}/{} esiste su GitHub ma non e' accessibile col tuo token (404/403). Verifica i permessi del token.",
+                        owner, name
+                    ),
+                ));
+            }
+            Some(lookup.json::<serde_json::Value>().await.unwrap_or_else(|_| json!({})))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let resp_body = if let Some(reused_body) = reused {
+        reused_body
+    } else if !status.is_success() {
+        let msg = resp_body
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("errore sconosciuto");
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("GitHub API {} — {}", status, msg),
+        ));
+    } else {
+        resp_body
+    };
+
+    let clone_url = resp_body.get("clone_url").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+    let html_url = resp_body.get("html_url").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+    let full_name = resp_body.get("full_name").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+    let default_branch = resp_body.get("default_branch").and_then(serde_json::Value::as_str).unwrap_or("main").to_string();
+
+    // ── 4. Configura origin (idempotente) ────────────────────────────────
+    if !clone_url.is_empty() {
+        let _ = run_git_command(&root, &["remote", "remove", "origin"]).await;
+        run_git_command(&root, &["remote", "add", "origin", &clone_url])
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("remote add: {e}")))?;
+    }
+
+    // ── 5. Push con token iniettato ──────────────────────────────────────
+    let git_options = github_auth_git_options(&authorized.access_token);
+    let pushed = match run_git_command_with_options(
+        &root,
+        &["push", "-u", "origin", &default_branch],
+        &git_options,
+    )
+    .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("github_publish_project: push fallito: {e}");
+            false
+        }
+    };
+
+    Ok(Json(json!({
+        "ok": true,
+        "full_name": full_name,
+        "html_url": html_url,
+        "clone_url": clone_url,
+        "private": private,
+        "default_branch": default_branch,
+        "pushed": pushed,
     })))
 }

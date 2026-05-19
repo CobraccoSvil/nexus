@@ -111,12 +111,9 @@ pub async fn event_stream(
         let topics = topics_for_filter.clone();
         async move {
             match msg {
-                Ok(env) => {
-                    tracing::info!(seq = env.seq, kind = env.payload.kind_name(), "event_stream live: received from broadcast");
-                    Some(Ok(env))
-                }
+                Ok(env) => Some(Ok(env)),
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                    let _ = topics; // captured for closure
+                    let _ = topics;
                     tracing::warn!(missed = n, "event_stream live: Lagged");
                     None
                 }
@@ -141,7 +138,6 @@ pub async fn event_stream(
                 let event_type = env.payload.kind_name();
                 let id_str = env.seq.to_string();
                 let data = serde_json::to_string(&env).unwrap_or_default();
-                tracing::info!(seq = env.seq, kind = event_type, data_len = data.len(), "event_stream outer: emitting SSE Event");
                 Some(Ok(Event::default().event(event_type).id(id_str).data(data)))
             }
         },

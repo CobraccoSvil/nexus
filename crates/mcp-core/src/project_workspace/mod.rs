@@ -14,6 +14,7 @@ pub mod sync_ports;
 pub mod services;
 pub mod wizard;
 pub mod workbench;
+pub mod execute_cmd;
 
 // Import condivisi usati da tutti i sotto-moduli tramite `use super::*`
 use std::collections::BTreeMap;
@@ -54,6 +55,8 @@ pub use changes::get_project_changes;
 
 pub use allocate_port::allocate_port as allocate_project_port;
 pub use allocate_port::find_or_allocate as find_or_allocate_port;
+
+pub use execute_cmd::execute_command;
 
 pub use services::{
     get_project_services_status,

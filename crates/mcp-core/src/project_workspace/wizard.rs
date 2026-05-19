@@ -354,10 +354,38 @@ pub async fn wizard_install_service(
             || (has("dotnet") && has(" run"))
     }
 
+    /// Risolve quale tool reale esegue uno script npm/pnpm/yarn leggendo
+    /// `package.json` nella `cwd`. Es: `pnpm run dev` → "vite" se
+    /// `scripts.dev = "vite"`. Ritorna `Some(tool_command)` se trovato.
+    /// Importante per Vite/Astro/Nuxt che IGNORANO $PORT env e richiedono
+    /// `--port` esplicito sulla command line.
+    fn resolve_script_command(cwd: &str, exec: &str) -> Option<String> {
+        let lower = exec.to_lowercase();
+        let script_name = if lower.contains(" run dev") || lower.ends_with(" dev") {
+            "dev"
+        } else if lower.contains(" run start") || lower.contains(" start") {
+            "start"
+        } else if lower.contains(" run serve") {
+            "serve"
+        } else {
+            return None;
+        };
+        let pkg = std::path::Path::new(cwd).join("package.json");
+        let content = std::fs::read_to_string(&pkg).ok()?;
+        let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let cmd = parsed.get("scripts")?.get(script_name)?.as_str()?.to_string();
+        if cmd.trim().is_empty() { None } else { Some(cmd) }
+    }
+
     fn rewrite_port_flags(command: &str, target_port: u16) -> String {
         let p = target_port.to_string();
         let mut out = command.to_string();
-        for bad in ["3000", "4000", "4010", "4020", "4030", "4040", "4050", "4060", "8001"] {
+        // Rimpiazza porte note (default tool framework) anche per Vite (5173), Svelte (5173),
+        // Astro (4321), Nuxt (3000), CRA (3000), Angular (4200), Webpack (8080).
+        for bad in [
+            "3000", "3001", "3002", "4000", "4010", "4020", "4030", "4040", "4050", "4060",
+            "4200", "4321", "5173", "5174", "5000", "5001", "8000", "8001", "8080", "9000",
+        ] {
             out = out.replace(&format!("--port={}", bad), &format!("--port={}", p));
             out = out.replace(&format!("--port {}", bad), &format!("--port {}", p));
             out = out.replace(&format!("-p {}", bad), &format!("-p {}", p));
@@ -367,8 +395,22 @@ pub async fn wizard_install_service(
         }
         let lower = out.to_lowercase();
         let has_flag = lower.contains("--port") || lower.split_whitespace().any(|t| t == "-p" || t.starts_with("-p"));
-        if (lower.contains("next dev") || lower.contains("next start")) && !has_flag {
-            out.push_str(&format!(" -p {}", p));
+        // Forza --port per tool che ignorano $PORT env var:
+        // - Vite (5173 default, ignora PORT senza --port o vite.config)
+        // - Astro (4321 default, idem)
+        // - Nuxt (3000 default, idem)
+        // - Next.js (3000 default, accetta -p)
+        // - Svelte/Kit (5173 default tramite Vite)
+        if !has_flag {
+            let needs_vite_port = lower.contains("vite") || lower.contains("svelte");
+            let needs_astro_port = lower.contains("astro");
+            let needs_nuxt_port = lower.contains("nuxt");
+            let needs_next_port = lower.contains("next dev") || lower.contains("next start");
+            if needs_vite_port || needs_astro_port || needs_nuxt_port {
+                out.push_str(&format!(" --port {}", p));
+            } else if needs_next_port {
+                out.push_str(&format!(" -p {}", p));
+            }
         }
         out
     }
@@ -412,7 +454,38 @@ pub async fn wizard_install_service(
     };
 
     let exec_start = if let Some(p) = final_port {
-        rewrite_port_flags(&exec_start, p)
+        // Per script alias (npm/pnpm/yarn run dev) prova a risolvere il tool
+        // reale dal package.json. Necessario per Vite/Astro/Nuxt che ignorano
+        // $PORT env e richiedono --port sulla CLI del tool, non del wrapper.
+        let lower_exec = exec_start.to_lowercase();
+        let is_script_runner = (lower_exec.contains("npm") || lower_exec.contains("pnpm") || lower_exec.contains("yarn"))
+            && (lower_exec.contains(" run ") || lower_exec.ends_with(" dev") || lower_exec.ends_with(" start"));
+        if is_script_runner {
+            if let Some(resolved) = resolve_script_command(cwd, &exec_start) {
+                let resolved_lower = resolved.to_lowercase();
+                let uses_vite_like = resolved_lower.contains("vite") || resolved_lower.contains("astro") || resolved_lower.contains("nuxt") || resolved_lower.contains("svelte");
+                if uses_vite_like {
+                    // Estrai il package manager (npm/pnpm/yarn) per usare `<pm> exec`.
+                    let pm = if lower_exec.contains("pnpm") { "pnpm exec" }
+                             else if lower_exec.contains("yarn") { "yarn" }
+                             else { "npx" };
+                    let needs_host = resolved_lower.contains("vite") || resolved_lower.contains("svelte");
+                    let host_flag = if needs_host { " --host 0.0.0.0" } else { "" };
+                    // resolved e' qualcosa come "vite" o "vite --some-flag" — manteniamo i suoi flag
+                    // ma aggiungiamo --port se manca.
+                    let resolved_rewritten = rewrite_port_flags(&resolved, p);
+                    let needs_port_append = !resolved_rewritten.to_lowercase().contains("--port") && !resolved_rewritten.to_lowercase().contains(" -p ");
+                    let port_flag = if needs_port_append { format!(" --port {}", p) } else { String::new() };
+                    format!("{} {}{}{}", pm, resolved_rewritten, port_flag, host_flag)
+                } else {
+                    rewrite_port_flags(&exec_start, p)
+                }
+            } else {
+                rewrite_port_flags(&exec_start, p)
+            }
+        } else {
+            rewrite_port_flags(&exec_start, p)
+        }
     } else {
         exec_start
     };

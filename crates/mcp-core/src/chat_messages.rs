@@ -43,6 +43,12 @@ pub struct SendChatMessageRequest {
     /// Hint opzionale: nome dell'AgentType da usare (es. "Coder", "Tester").
     /// Se presente, bypassa il Q-Learning router e forza quel tipo di agente.
     pub agent_type_hint: Option<String>,
+    /// Se true, il messaggio e' generato automaticamente dal sistema
+    /// (es. auto-continuazione in modalita' "automatic") e NON deve essere
+    /// mostrato nella UI come messaggio utente. Viene comunque persistito
+    /// nel DB e usato per triggerare l'agent run.
+    #[serde(default)]
+    pub synthetic: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -103,6 +109,9 @@ struct ChatMessageView {
     currency: Option<String>,
     automation_mode: Option<String>,
     resend_of_message_id: Option<String>,
+    /// True quando il messaggio e' auto-generato dal sistema (es. auto-continuazione).
+    /// La UI nasconde questi messaggi per non confondere l'utente.
+    synthetic: bool,
 }
 
 fn to_message_view(row: &sqlx::postgres::PgRow) -> Result<ChatMessageView, ApiError> {
@@ -170,6 +179,10 @@ fn to_message_view(row: &sqlx::postgres::PgRow) -> Result<ChatMessageView, ApiEr
             .get("resendOf")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        synthetic: metadata
+            .get("synthetic")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -381,6 +394,38 @@ async fn build_composed_system_context(
     let base = build_static_system_context(github_username.as_deref());
     let analysis_summary = load_project_analysis_summary(db, project_id).await;
 
+    // Servizi attivi e porte allocate: l'agente DEVE sapere quali servizi
+    // sono gia' attivi cosi' non lancia duplicati ne' invoca curl su porte
+    // sbagliate. Hardcoded list di allocazioni + (best effort) servizi systemd.
+    let services_block = {
+        let allocations: Vec<(i32, String, String)> = sqlx::query_as(
+            "SELECT port, label, allocation_mode FROM nexus_port_allocations \
+             WHERE project_id = $1 ORDER BY port",
+        )
+        .bind(project_id)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+        if allocations.is_empty() {
+            String::new()
+        } else {
+            let mut s = String::from("=== INFRASTRUTTURA DEL PROGETTO (informativo) ===\n");
+            s.push_str("I seguenti servizi sono GIA' avviati e raggiungibili. Sono solo info di context — NON sostituiscono il task dell'utente, devi comunque procedere col compito richiesto usando i tool a disposizione.\n");
+            for (port, label, mode) in &allocations {
+                s.push_str(&format!(
+                    "- {} → http://localhost:{} ({})\n",
+                    label, port, mode
+                ));
+            }
+            s.push_str("\nQuando hai bisogno di:\n");
+            s.push_str("- chiamare curl al backend: usa una delle URL qui sopra invece di porte default (3001, 3000, 5173, 8080)\n");
+            s.push_str("- riavviare un servizio: usa service_restart con la sua label, NON lanciare un nuovo pnpm dev\n");
+            s.push_str("- modificare file del progetto: procedi normalmente con read_file/edit_file/write_file/run_command (questo blocco NON ti impedisce di lavorare)\n");
+            s.push_str("=== FINE INFRASTRUTTURA ===\n\n");
+            s
+        }
+    };
+
     let project_header = match load_project_context(db, project_id, user_id).await {
         Ok(proj) => {
             if let Some(summary) = analysis_summary {
@@ -415,7 +460,7 @@ async fn build_composed_system_context(
         ),
     };
 
-    format!("{}{}{}", project_header, profile_prompt_block, base)
+    format!("{}{}{}{}", services_block, project_header, profile_prompt_block, base)
 }
 
 #[allow(dead_code)]
@@ -1664,6 +1709,7 @@ async fn spawn_agent_run(
             trace: None,
             is_final: true,
             token_delta: None,
+            meta_step: None,
         });
         return Some(SpawnAgentResult {
             run_id,
@@ -2141,6 +2187,29 @@ async fn spawn_agent_run(
                 run_id, current_provider, current_model,
                 if hollow_retry { "hollow completion" } else { "provider error/cooldown" }
             );
+            // Meta-step `fallback` pubblicato in chat per trasparenza:
+            // utente vede in tempo reale che il sistema ha cambiato
+            // provider/modello (es. anthropic -> openai per quota_exceeded).
+            let reason = if hollow_retry { "hollow_completion" } else { "provider_error_or_cooldown" };
+            let _ = tx_for_brain.send(AgentStepEvent {
+                run_id: run_id.to_string(),
+                step: None,
+                trace: None,
+                is_final: false,
+                token_delta: None,
+                meta_step: Some(crate::agent_types::AgentMetaStep {
+                    kind: "fallback".to_string(),
+                    title: format!("Fallback su {}/{}", current_provider, current_model),
+                    payload: serde_json::json!({
+                        "to_provider": current_provider,
+                        "to_model": current_model,
+                        "reason": reason,
+                        "attempt": fallback_attempt,
+                    }),
+                    correlation_id: None,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                }),
+            });
         }
         // Emetti is_final solo DOPO la fine del retry loop, cosi' il
         // frontend non chiude lo stream SSE dopo il primo tentativo fallito
@@ -2151,6 +2220,7 @@ async fn spawn_agent_run(
             trace: None,
             is_final: true,
             token_delta: None,
+            meta_step: None,
         });
         channels_clone.remove(&run_id);
 
@@ -2199,6 +2269,15 @@ async fn spawn_agent_run(
                 "automationMode": "agent",
                 "privacyRerouted": privacy_rerouted,
                 "hollowCompletion": result.hollow_completion,
+                // Usage tracking: senza questi campi il TokenUsageBar resta
+                // invisibile (la query in billing::get_session_usage somma
+                // metadata->>'totalTokens'). I valori sono gia' calcolati e
+                // scritti su agent_runs subito sotto.
+                "promptTokens": result.prompt_tokens,
+                "completionTokens": result.completion_tokens,
+                "totalTokens": result.total_tokens,
+                "totalCost": result.total_cost,
+                "currency": "USD",
             });
             let _ = sqlx::query(
                 r#"INSERT INTO chat_messages
@@ -2305,6 +2384,7 @@ async fn spawn_agent_run(
                 trace: None,
                 is_final: true,
                 token_delta: None,
+                meta_step: None,
             });
             panic_channels.remove(&panic_run_id);
 
@@ -2377,6 +2457,10 @@ pub async fn send_chat_message(
             "modelOverride": body.model_override.clone(),
             "automationMode": body.automation_mode.clone().unwrap_or_else(|| "confirm".to_string()),
             "attachments": body.attachments.clone(),
+            // Marca i messaggi auto-generati dal sistema (es. auto-continuazione).
+            // Il frontend filtra questi messaggi dalla UI per non confondere l'utente
+            // facendogli credere di averli scritti lui.
+            "synthetic": body.synthetic,
         }),
         None,
     )
@@ -2708,6 +2792,11 @@ pub async fn send_chat_message(
                                 "iterationCount": result.iteration_count,
                                 "automationMode": "automatic",
                                 "resumed": true,
+                                "promptTokens": result.prompt_tokens,
+                                "completionTokens": result.completion_tokens,
+                                "totalTokens": result.total_tokens,
+                                "totalCost": result.total_cost,
+                                "currency": "USD",
                             });
                             let _ = sqlx::query(
                                 r#"INSERT INTO chat_messages
@@ -3364,11 +3453,28 @@ pub async fn feedback_error(
         .get("model")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let run_id = metadata
+    let raw_run_id = metadata
         .get("runId")
         .or_else(|| metadata.get("agentRunId"))
         .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok());
+    // Verifica esistenza in orchestrator_runs (FK target).
+    // I run agent moderni vivono in `agent_runs`, ma la FK del feedback punta
+    // a `orchestrator_runs`. Se l'ID non esiste li', settiamo NULL invece di
+    // far fallire l'insert (la colonna ammette NULL).
+    let run_id: Option<Uuid> = match raw_run_id {
+        Some(id) => {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE id = $1)",
+            )
+            .bind(id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(false);
+            if exists { Some(id) } else { None }
+        }
+        None => None,
+    };
 
     // Recupera il messaggio utente precedente nella stessa sessione:
     // è la domanda che ha generato questa risposta AI — usata per costruire
@@ -3621,11 +3727,28 @@ pub async fn feedback_positive(
         .get("model")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let run_id = metadata
+    let raw_run_id = metadata
         .get("runId")
         .or_else(|| metadata.get("agentRunId"))
         .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok());
+    // Verifica esistenza in orchestrator_runs (FK target).
+    // I run agent moderni vivono in `agent_runs`, ma la FK del feedback punta
+    // a `orchestrator_runs`. Se l'ID non esiste li', settiamo NULL invece di
+    // far fallire l'insert (la colonna ammette NULL).
+    let run_id: Option<Uuid> = match raw_run_id {
+        Some(id) => {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE id = $1)",
+            )
+            .bind(id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(false);
+            if exists { Some(id) } else { None }
+        }
+        None => None,
+    };
     let agent_type_hint = metadata
         .get("agentType")
         .or_else(|| metadata.get("profile"))

@@ -43,14 +43,82 @@ pub async fn agent_stream(
         .get("run_id")
         .and_then(|s| Uuid::parse_str(s).ok());
 
-    // Trova il sender nel DashMap per il run specificato
+    // ── REPLAY dal DB ─────────────────────────────────────────────────────
+    // Race condition fix: il client riceve la response POST /messages e POI
+    // apre lo SSE. Se l'agente risponde velocemente (Mistral/Haiku ~500ms),
+    // gli eventi nel broadcast vengono emessi PRIMA che il client si connetta
+    // e sono persi (0 receiver). Il client vede stream vuoto.
+    //
+    // Fix: replay degli step gia' persistiti + final_answer come primo blob
+    // di eventi, POI continua col live broadcast.
+    let mut replay_events: Vec<Event> = Vec::new();
+    if let Some(rid) = run_id {
+        // Replay step dal DB
+        if let Ok(rows) = sqlx::query(
+            "SELECT step_index, tool_name, tool_input, tool_result, status, created_at
+             FROM agent_steps WHERE run_id = $1 ORDER BY step_index ASC",
+        )
+        .bind(rid)
+        .fetch_all(&state.db)
+        .await
+        {
+            for r in rows {
+                let step_index: i32 = r.try_get("step_index").unwrap_or(0);
+                let tool_name: String = r.try_get("tool_name").unwrap_or_default();
+                let tool_input: Value = r.try_get("tool_input").unwrap_or(json!({}));
+                let tool_result: Option<String> = r.try_get("tool_result").unwrap_or(None);
+                let status: String = r.try_get("status").unwrap_or_default();
+                let data = json!({
+                    "runId": rid.to_string(),
+                    "isFinal": false,
+                    "step": {
+                        "stepIndex": step_index,
+                        "toolName": tool_name,
+                        "toolInput": tool_input,
+                        "toolResult": tool_result,
+                        "status": status,
+                    },
+                })
+                .to_string();
+                replay_events.push(Event::default().event("agent_step").data(data));
+            }
+        }
+        // Se il run e' gia' terminato, emette agent_final con final_answer
+        if let Ok(Some(run_row)) = sqlx::query(
+            "SELECT status, final_answer FROM agent_runs WHERE id = $1",
+        )
+        .bind(rid)
+        .fetch_optional(&state.db)
+        .await
+        {
+            let status: String = run_row.try_get("status").unwrap_or_default();
+            let is_terminal = matches!(
+                status.as_str(),
+                "completed" | "failed" | "timed_out" | "cancelled" | "interrupted"
+                    | "loop_aborted" | "provider_unavailable"
+            );
+            if is_terminal {
+                let final_answer: Option<String> = run_row.try_get("final_answer").unwrap_or(None);
+                let data = json!({
+                    "runId": rid.to_string(),
+                    "isFinal": true,
+                    "status": status,
+                    "finalAnswer": final_answer,
+                })
+                .to_string();
+                replay_events.push(Event::default().event("agent_final").data(data));
+            }
+        }
+    }
+
+    // Trova il sender nel DashMap per il run specificato (eventi live)
     let sender = if let Some(rid) = run_id {
         state.agent_channels.get(&rid).map(|e| e.value().clone())
     } else {
         state.agent_channels.iter().next().map(|e| e.value().clone())
     };
 
-    let boxed: futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> =
+    let live_stream: futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> =
         match sender {
             None => Box::pin(stream::empty()),
             Some(tx) => {
@@ -60,6 +128,8 @@ pub async fn agent_stream(
                         Ok(event) => {
                             let event_type = if event.token_delta.is_some() {
                                 "agent_token"
+                            } else if event.meta_step.is_some() {
+                                "agent_meta_step"
                             } else if event.is_final {
                                 "agent_final"
                             } else if event.trace.is_some() {
@@ -68,7 +138,6 @@ pub async fn agent_stream(
                                 "agent_step"
                             };
                             let data = if event_type == "agent_token" {
-                                // Per i token parziali invia solo il delta per minimizzare il payload SSE
                                 serde_json::json!({ "delta": event.token_delta }).to_string()
                             } else {
                                 serde_json::to_string(&event).unwrap_or_default()
@@ -81,6 +150,13 @@ pub async fn agent_stream(
                 Box::pin(s)
             }
         };
+
+    // Combina replay + live. Replay viene emesso immediatamente (stream::iter),
+    // poi il live broadcast prende il sopravvento.
+    let replay_stream = stream::iter(replay_events.into_iter().map(Ok));
+    let combined = replay_stream.chain(live_stream);
+    let boxed: futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> =
+        Box::pin(combined);
 
     Ok(Sse::new(boxed).keep_alive(KeepAlive::default()))
 }
@@ -425,6 +501,7 @@ pub async fn cancel_agent_run(
             trace: None,
             is_final: true,
             token_delta: None,
+            meta_step: None,
         });
     }
 

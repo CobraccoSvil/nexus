@@ -3,6 +3,7 @@
 import React, { useState } from "react";
 import type { AgentRunInfo, AgentStep } from "../../lib/api-client";
 import type { useThemeColors } from "../../lib/theme";
+import { AgentMetaStepCard, type AgentMetaStepData } from "./agent-meta-step-card";
 import { MarkdownBlock } from "./markdown-renderer";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
@@ -158,6 +159,10 @@ export interface AgentStepsPanelProps {
   // Opzionale: mappa di run paralleli (se presente, mostra tabs)
   agentRuns?: Map<string, AgentRunInfo>;
   agentStepsMap?: Map<string, AgentStep[]>;
+  // Meta-step semantici (plan/routing/clarify/fallback/reflection) pubblicati
+  // dal backend per il run corrente. Mostrati come card collassabili sopra
+  // la lista degli step di tool.
+  metaSteps?: AgentMetaStepData[];
   streamingToken?: string;
   // Soglie per il badge di narrazione — lette da settings DB, fallback ai default hardcoded
   narrationWarnAfterMs?: number;
@@ -772,6 +777,7 @@ export function AgentStepsPanel({
   onConfirm,
   agentRuns,
   agentStepsMap,
+  metaSteps,
   streamingToken,
   narrationWarnAfterMs,
   narrationWarnAfterChars,
@@ -832,6 +838,15 @@ export function AgentStepsPanel({
           </span>
         )}
       </div>
+
+      {/* Meta-step semantici (plan/routing/clarify/fallback/reflection) */}
+      {metaSteps && metaSteps.length > 0 && (
+        <div style={{ marginBottom: 8 }} data-testid="agent-meta-steps">
+          {metaSteps.map((m, idx) => (
+            <AgentMetaStepCard key={`${m.kind}-${m.createdAt}-${idx}`} data={m} />
+          ))}
+        </div>
+      )}
 
       {/* Tabs — solo se ci sono più run */}
       {isMulti && (

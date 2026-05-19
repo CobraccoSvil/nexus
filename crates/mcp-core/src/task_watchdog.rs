@@ -630,6 +630,7 @@ async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
                 trace: None,
                 is_final: true,
                 token_delta: None,
+                meta_step: None,
             });
         }
         agent_channels.remove(run_id);

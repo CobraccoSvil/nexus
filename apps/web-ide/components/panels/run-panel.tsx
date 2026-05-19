@@ -424,16 +424,39 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
   const [wizardLoading,  setWizardLoading]  = useState(false);
   const [installingUnit, setInstallingUnit] = useState<ServiceWizardSuggestion|null>(null);
   const [wizardMsg,      setWizardMsg]      = useState("");
+  // Conteggio servizi rilevati ma non installati. Calcolato dal wizard detect
+  // al mount + ogni 60s. Mostrato come badge accanto al pulsante "+ Configura"
+  // per segnalare all'utente che ci sono servizi da configurare.
+  const [pendingCount,   setPendingCount]   = useState(0);
 
   const runWizard = async () => {
     setWizardOpen(true); setWizardLoading(true); setSuggestions([]); setWizardMsg("");
     try {
       const r = await detectProjectServices(projectId);
-      setSuggestions(r.suggestions ?? []);
-      if ((r.suggestions ?? []).length === 0) setWizardMsg("Nessun servizio rilevato automaticamente. Aggiungi una configurazione manualmente.");
+      const items = r.suggestions ?? [];
+      setSuggestions(items);
+      setPendingCount(items.filter(s => !s.existing).length);
+      if (items.length === 0) setWizardMsg("Nessun servizio rilevato automaticamente. Aggiungi una configurazione manualmente.");
     } catch { setWizardMsg("Errore durante il rilevamento. Controlla che il backend sia raggiungibile."); }
     finally { setWizardLoading(false); }
   };
+
+  // Auto-fetch al mount + ogni 60s per popolare il badge "pending".
+  // Niente UI: solo conteggio. L'utente apre il wizard manualmente quando vede il badge.
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const r = await detectProjectServices(projectId);
+        if (!cancelled) {
+          setPendingCount((r.suggestions ?? []).filter(s => !s.existing).length);
+        }
+      } catch { /* ignora errori in background */ }
+    };
+    tick();
+    const t = window.setInterval(tick, 60_000);
+    return () => { cancelled = true; window.clearInterval(t); };
+  }, [projectId]);
 
   const handleInstall = async (svc: ServiceWizardSuggestion, env: Record<string,string>, description: string) => {
     setInstallingUnit(null);
@@ -507,7 +530,7 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
   });
 
   return (
-    <div style={{ display:"flex", flexDirection:"column", height:"100%", minHeight:0, overflow:"auto" }}>
+    <div style={{ display:"flex", flexDirection:"column", height:"100%", minHeight:0, overflow:"auto", position:"relative" }}>
 
       {/* ════════════════════════════════ 0: SERVIZI NEXUS ═════════════════ */}
       <div
@@ -649,7 +672,39 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
           <button onClick={fetchServices} title="Aggiorna stato" disabled={batchBusy} style={{ background:"none",border:`1px solid ${tc.border}`,borderRadius:3,color:tc.textMuted,cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10 }}>↺</button>
           <button onClick={handleRestartAll} title={services.length===0 ? "Nessun servizio systemd. Clicca per dettagli." : "Riavvia tutti i servizi del progetto"} disabled={batchBusy} style={{ background:"transparent",border:`1px solid #f59e0b`,borderRadius:3,color:"#f59e0b",cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10,opacity:batchBusy?0.5:1 }}>↻ Tutti</button>
           <button onClick={handleCleanupPorts} title="Termina processi su porte conflittuali (esclude i servizi del progetto)" disabled={batchBusy} style={{ background:"transparent",border:`1px solid #ef4444`,borderRadius:3,color:"#ef4444",cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10,opacity:batchBusy?0.5:1 }}>✕ Porte</button>
-          <button onClick={runWizard} title="Wizard rilevamento servizi" disabled={batchBusy} style={{ background:tc.accent,border:"none",borderRadius:3,color:"#fff",cursor:batchBusy?"wait":"pointer",padding:"2px 10px",fontSize:10,opacity:batchBusy?0.6:1 }}>+ Configura</button>
+          <button
+            onClick={runWizard}
+            title={pendingCount > 0
+              ? `${pendingCount} servizi rilevati pronti per essere installati. Clicca per aprire il wizard.`
+              : "Wizard rilevamento servizi"}
+            disabled={batchBusy}
+            style={{
+              background: pendingCount > 0 ? "#f59e0b" : tc.accent,
+              border: "none",
+              borderRadius: 3,
+              color: "#fff",
+              cursor: batchBusy ? "wait" : "pointer",
+              padding: "2px 10px",
+              fontSize: 10,
+              opacity: batchBusy ? 0.6 : 1,
+              display: "flex",
+              alignItems: "center",
+              gap: 4,
+            }}
+          >
+            <span>+ Configura</span>
+            {pendingCount > 0 && (
+              <span style={{
+                background: "rgba(255,255,255,0.25)",
+                borderRadius: 8,
+                padding: "0 5px",
+                fontSize: 9,
+                fontWeight: 700,
+                minWidth: 14,
+                textAlign: "center",
+              }}>{pendingCount}</span>
+            )}
+          </button>
         </div>
       </div>
 
@@ -1006,12 +1061,38 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
       </div>
 
       {/* ════════════════════════════════ C: WIZARD ═══════════════════════ */}
+      {/* Overlay assoluto: copre l'intero pannello run quando aperto.
+          Risolve il problema di spazio insufficiente quando le sezioni
+          sopra (Nexus, systemd, porte) occupano tutto il pannello.
+          Backdrop semi-trasparente + pannello centrale scrollabile. */}
       {wizardOpen && (
-        <div style={{ flex:1,overflow:"auto",padding:"8px 12px" }}>
-          <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8 }}>
-            <div style={{ fontSize:11,fontWeight:600,color:tc.text }}>Wizard — installa servizi systemd</div>
-            <button onClick={()=>setWizardOpen(false)} style={{ background:"none",border:"none",color:tc.textMuted,cursor:"pointer",fontSize:14 }}>✕</button>
+        <div style={{
+          position: "absolute",
+          inset: 0,
+          background: "rgba(0,0,0,0.45)",
+          zIndex: 50,
+          display: "flex",
+          flexDirection: "column",
+          padding: "8px",
+          overflow: "hidden",
+        }}
+          onClick={(e) => { if (e.target === e.currentTarget) setWizardOpen(false); }}
+        >
+          <div style={{
+            background: tc.bgSidebar,
+            border: `2px solid ${tc.accent}`,
+            borderRadius: 8,
+            flex: 1,
+            display: "flex",
+            flexDirection: "column",
+            minHeight: 0,
+            boxShadow: "0 8px 24px rgba(0,0,0,0.3)",
+          }}>
+          <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 14px",borderBottom:`1px solid ${tc.border}`,background:tc.bgHeader,borderRadius:"6px 6px 0 0" }}>
+            <div style={{ fontSize:12,fontWeight:600,color:tc.text }}>Wizard — installa servizi systemd</div>
+            <button onClick={()=>setWizardOpen(false)} title="Chiudi wizard" style={{ background:"none",border:"none",color:tc.textMuted,cursor:"pointer",fontSize:18,padding:"0 4px",lineHeight:1 }}>✕</button>
           </div>
+          <div style={{ flex:1, overflowY:"auto", padding:"8px 12px" }}>
           <div style={{ fontSize:10,color:tc.textMuted,marginBottom:8,padding:"6px 8px",background:tc.bgCard,border:`1px solid ${tc.border}`,borderRadius:4 }}>
             Crea unit systemd in <code>~/.config/systemd/user/</code> per avviare automaticamente i servizi del progetto. Per comandi <em>on-demand</em> (script di build, test, dev manuale) usa invece la sezione <strong>Run Configurations</strong> nella sidebar a sinistra.
           </div>
@@ -1126,6 +1207,8 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
               I servizi vengono installati come unit systemd --user. Puoi modificarli in <code>~/.config/systemd/user/</code>.
             </div>
           )}
+          </div>{/* /scroll area */}
+          </div>{/* /pannello centrale */}
         </div>
       )}
 

@@ -33,6 +33,11 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// Loop principale: chiamato da `main.rs` startup via `tokio::spawn(...)`.
 /// Richiede il pool DB per cross-referencing PID-progetto e il registry dei
 /// canali per emettere notifiche real-time al frontend.
+/// Timeout per singola iterazione di scan: se supera questo limite la scan
+/// viene abortita e il loop continua. Protegge il runtime tokio da blocchi
+/// in /proc o query DB lente.
+const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub async fn port_enforcer_loop(
     db: PgPool,
     project_channels: nexus_events::ProjectChannels,
@@ -42,8 +47,10 @@ pub async fn port_enforcer_loop(
     tracing::info!("port_enforcer avviato (scan ogni {}s)", SCAN_INTERVAL.as_secs());
     loop {
         ticker.tick().await;
-        if let Err(e) = scan_and_enforce(&db, &project_channels).await {
-            tracing::warn!("port_enforcer scan fallito: {e}");
+        match tokio::time::timeout(SCAN_TIMEOUT, scan_and_enforce(&db, &project_channels)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("port_enforcer scan fallito: {e}"),
+            Err(_) => tracing::error!("port_enforcer scan timeout ({}s): iterazione abortita", SCAN_TIMEOUT.as_secs()),
         }
     }
 }
@@ -92,8 +99,12 @@ async fn scan_and_enforce(
         // Attendi grace period
         tokio::time::sleep(KILL_GRACE).await;
 
-        // Se ancora vivo: SIGKILL
-        if process_alive(b.pid) {
+        // Se ancora vivo: SIGKILL (check via spawn_blocking per non bloccare tokio)
+        let pid_check = b.pid;
+        let still_alive = tokio::task::spawn_blocking(move || process_alive(pid_check))
+            .await
+            .unwrap_or(false);
+        if still_alive {
             kill_process(b.pid, Signal::Kill).await;
         }
 

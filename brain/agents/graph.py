@@ -19,6 +19,11 @@ from .nodes import (
 )
 from .planner_node import planner_node, configure as _configure_planner
 from .verifier_node import verifier_node, configure as _configure_verifier
+from .clarify_or_expand_node import (
+    clarify_or_expand_node,
+    configure as _configure_clarify,
+    route_after_clarify,
+)
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -101,12 +106,14 @@ def create_agent_graph(
         _routing_client = None
     _configure_planner(providers=providers, tool_runner=tool_runner, routing_client=_routing_client)
     _configure_verifier(tool_runner=tool_runner)
+    _configure_clarify(providers=providers, routing_client=_routing_client)
 
     # Crea il grafo con lo schema di stato
     workflow: StateGraph = StateGraph(AgentState)
 
     # Aggiunge nodi
     workflow.add_node("router", router_node)  # type: ignore[arg-type]
+    workflow.add_node("clarify_or_expand", clarify_or_expand_node)  # type: ignore[arg-type]
     workflow.add_node("planner", planner_node)  # type: ignore[arg-type]
     workflow.add_node("executor", executor_node)  # type: ignore[arg-type]
     workflow.add_node("tool_dispatch", tool_dispatch_node)  # type: ignore[arg-type]
@@ -117,13 +124,22 @@ def create_agent_graph(
     # Imposta entry point
     workflow.set_entry_point("router")
 
-    # PR-1: Routing condizionale da router a planner OPPURE executor direttamente.
-    # Default OFF: orchestrator_config.is_eligible ritorna False finche'
-    # plan_phase_enabled = false in settings → comportamento legacy invariato.
+    # Fase 2: router → clarify_or_expand (sempre, ma no-op se confidence alta).
+    workflow.add_edge("router", "clarify_or_expand")
+
+    # Dopo clarify_or_expand:
+    #   - se ha emesso una richiesta di chiarimento → END (turno si ferma,
+    #     l'utente risponde nel turno successivo).
+    #   - altrimenti → route_after_router (planner o executor).
+    def _route_after_clarify_or_expand(state: AgentState) -> str:
+        if state.get("pending_clarify"):
+            return "end"
+        return route_after_router(state)
+
     workflow.add_conditional_edges(
-        "router",
-        route_after_router,
-        {"planner": "planner", "executor": "executor"},
+        "clarify_or_expand",
+        _route_after_clarify_or_expand,
+        {"end": END, "planner": "planner", "executor": "executor"},
     )
     # Il planner emette il piano e poi passa il controllo all'executor.
     workflow.add_edge("planner", "executor")

@@ -181,13 +181,20 @@ pub fn emit_global(project_id: Uuid, event: ProjectEvent) -> Option<EnvelopedEve
 /// Usato per eventi che non appartengono a un progetto specifico
 /// (es. ProviderHealthChanged, SettingChanged).
 /// Clona l'evento per ogni canale. No-op se nessun canale registrato.
+///
+/// IMPORTANTE: raccoglie gli ID prima di emettere per evitare deadlock.
+/// `channels.iter()` tiene un read lock sullo shard corrente del DashMap;
+/// se dentro l'iter si chiama `emit_with_classifier` che fa `channels.entry()`
+/// (write lock sullo stesso shard), il write lock blocca sul read lock
+/// detenuto dall'iter -> deadlock del runtime tokio.
 pub fn broadcast_all(channels: &ProjectChannels, event: ProjectEvent)
 where
     ProjectEvent: Clone,
 {
+    // Raccogli ID con read lock breve (poi rilasciato).
+    let pids: Vec<Uuid> = channels.iter().map(|e| *e.key()).collect();
     let classifier = Classifier::rules_only();
-    for entry in channels.iter() {
-        let pid = *entry.key();
+    for pid in pids {
         emit_with_classifier(channels, pid, event.clone(), &classifier);
     }
 }

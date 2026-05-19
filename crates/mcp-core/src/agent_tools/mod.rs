@@ -365,7 +365,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         },
         "label": {
           "type": "string",
-          "description": "Etichetta breve per identificare il servizio (es. 'Backend .NET', 'Frontend React'). Apparira' nel pannello Output."
+          "description": "Etichetta breve che descrive ESATTAMENTE quello che fa il comando, derivata dal package.json/Cargo.toml/pom.xml del progetto. NON inventare nomi (es. NON usare 'Backend .NET' se il progetto e' Node). Apparira' nel pannello Servizi. Riusa lo stesso label per riavviare un servizio gia' attivo invece di crearne un duplicato."
         }
       },
       "required": [
@@ -413,7 +413,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
       "properties": {
         "label": {
           "type": "string",
-          "description": "Label del servizio da riavviare (es. 'Backend .NET', 'Frontend React')"
+          "description": "Label esatto del servizio da riavviare (deve coincidere con un servizio gia' avviato via run_service). Usa list_active_services per vedere i label disponibili."
         }
       },
       "required": [
