@@ -359,9 +359,14 @@ async fn run_stdio_jsonrpc(
         .stderr(std::process::Stdio::piped());
 
     let mut child = cmd.spawn().map_err(McpError::Io)?;
-    let mut stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    // stdin/stdout/stderr sono Some per costruzione (Stdio::piped() impostato
+    // sopra), ma esprimiamo l'invariante esplicitamente per non panicare.
+    let mut stdin = child.stdin.take()
+        .ok_or_else(|| McpError::Protocol("child stdin non disponibile dopo spawn".into()))?;
+    let stdout = child.stdout.take()
+        .ok_or_else(|| McpError::Protocol("child stdout non disponibile dopo spawn".into()))?;
+    let stderr = child.stderr.take()
+        .ok_or_else(|| McpError::Protocol("child stderr non disponibile dopo spawn".into()))?;
 
     for msg in messages {
         stdin.write_all(msg.as_bytes()).await.map_err(McpError::Io)?;

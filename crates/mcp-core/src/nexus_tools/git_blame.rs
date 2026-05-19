@@ -99,7 +99,8 @@ fn parse_blame_porcelain(stdout: &str) -> Vec<Value> {
                 // Questa è la riga di contenuto, la prendiamo e usciamo
                 break;
             }
-            let line = iter.next().unwrap();
+            // peek() era Some, quindi next() lo e' a sua volta.
+            let Some(line) = iter.next() else { break };
             if let Some(rest) = line.strip_prefix("author ") {
                 author = rest.to_string();
             } else if let Some(rest) = line.strip_prefix("summary ") {

@@ -864,8 +864,9 @@ oppure\n\
                 let end = raw.rfind(']').map(|i| i + 1).unwrap_or(raw.len());
                 let json_slice = &raw[start..end];
                 match serde_json::from_str::<serde_json::Value>(json_slice) {
-                    Ok(arr) if arr.is_array() => {
-                        let arr_ref = arr.as_array().unwrap();
+                    // Match con if-let invece di guardia is_array() + unwrap successivo.
+                    Ok(serde_json::Value::Array(ref arr_ref_owned)) => {
+                        let arr_ref = arr_ref_owned;
                         // Parsing robusto:
                         // - accetta ["tool_name", ...]
                         // - accetta [{tool_name, usage_context?}, ...]

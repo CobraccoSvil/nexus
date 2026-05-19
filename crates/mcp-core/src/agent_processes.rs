@@ -90,7 +90,11 @@ pub async fn spawn_agent_process(
         && (kind != "service" || service_image.is_some());
 
     let mut child = if use_docker {
-        let root = project_root.as_ref().unwrap();
+        // use_docker e' true SOLO se will_use_docker E (kind != "service"
+        // OR service_image.is_some()). Ma project_root resta Option; se
+        // assente il caller ha sbagliato a invocare: errore esplicito.
+        let root = project_root.as_ref()
+            .ok_or_else(|| "project_root mancante con use_docker=true".to_string())?;
         let cwd = PathBuf::from(working_dir);
         let project_cfg = sandbox::load_project_sandbox_config(db, project_id).await;
         let mut config = SandboxConfig::new(root.clone(), process_id)

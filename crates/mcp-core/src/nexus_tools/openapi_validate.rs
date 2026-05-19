@@ -68,21 +68,20 @@ fn validate_spec(spec: &Value) -> Report {
     }
 
     // info
-    let info = spec.get("info");
-    if info.is_none() {
-        report.errors.push("missing 'info' object".into());
-    } else {
-        let info = info.unwrap();
-        if info.get("title").and_then(Value::as_str).unwrap_or("").is_empty() {
-            report.errors.push("missing 'info.title'".into());
-        }
-        if info
-            .get("version")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .is_empty()
-        {
-            report.errors.push("missing 'info.version'".into());
+    match spec.get("info") {
+        None => report.errors.push("missing 'info' object".into()),
+        Some(info) => {
+            if info.get("title").and_then(Value::as_str).unwrap_or("").is_empty() {
+                report.errors.push("missing 'info.title'".into());
+            }
+            if info
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty()
+            {
+                report.errors.push("missing 'info.version'".into());
+            }
         }
     }
 

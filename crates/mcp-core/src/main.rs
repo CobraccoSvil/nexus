@@ -208,7 +208,12 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("Stale process {} (pid={:?}) marked failed", id, pid);
             } else {
                 tracing::info!("Process {} (pid={:?}) still running, re-attaching monitor", id, pid);
-                let pid_val = pid.unwrap();
+                // still_alive=true implica pid.is_some(); difensivamente saltiamo
+                // la re-attach se la condizione viene violata in futuro.
+                let Some(pid_val) = pid else {
+                    tracing::warn!("Process {} alive ma pid=None: skip re-attach", id);
+                    continue;
+                };
                 let db_clone = db.clone();
                 // Rilancia un task che segue stdout+stderr tramite /proc/{pid}/fd/1,2
                 tokio::spawn(async move {

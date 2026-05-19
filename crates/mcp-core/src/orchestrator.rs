@@ -2382,8 +2382,9 @@ impl Orchestrator {
                 && suggested_provider.as_deref() == Some(provider.as_str())
                 && suggested_model.is_some()
             {
-                // In dinamico fidiamoci del catalogo: niente override da provider_model_<x>
-                suggested_model.clone().unwrap()
+                // In dinamico fidiamoci del catalogo: niente override da provider_model_<x>.
+                // suggested_model.is_some() controllato sopra; clone+unwrap_or e' difensivo.
+                suggested_model.clone().unwrap_or_default()
             } else {
                 routing.resolve_model(
                     matrix,

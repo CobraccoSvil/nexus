@@ -23,23 +23,21 @@ pub(super) fn format_json(v: &Value) -> String {
 pub(super) async fn handle_prompt_template_list(db: &PgPool, args: &Value) -> String {
     let category_filter = args.get("category").and_then(Value::as_str);
 
-    let (query_str, use_filter) = if category_filter.is_some() {
-        ("SELECT key, category, title, is_active, version, updated_by, updated_at
-          FROM nexus_prompt_templates WHERE category=$1 ORDER BY category, key", true)
+    let result = if let Some(cat) = category_filter.as_ref() {
+        sqlx::query(
+            "SELECT key, category, title, is_active, version, updated_by, updated_at
+             FROM nexus_prompt_templates WHERE category=$1 ORDER BY category, key",
+        )
+        .bind(cat)
+        .fetch_all(db)
+        .await
     } else {
-        ("SELECT key, category, title, is_active, version, updated_by, updated_at
-          FROM nexus_prompt_templates ORDER BY category, key", false)
-    };
-
-    let result = if use_filter {
-        sqlx::query(query_str)
-            .bind(category_filter.unwrap())
-            .fetch_all(db)
-            .await
-    } else {
-        sqlx::query(query_str)
-            .fetch_all(db)
-            .await
+        sqlx::query(
+            "SELECT key, category, title, is_active, version, updated_by, updated_at
+             FROM nexus_prompt_templates ORDER BY category, key",
+        )
+        .fetch_all(db)
+        .await
     };
 
     match result {

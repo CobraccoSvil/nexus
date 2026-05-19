@@ -31,7 +31,11 @@ fn parse_sql_multidialect(sql: &str) -> Result<Vec<Statement>, sqlparser::parser
             Err(e) => last_err = Some(e),
         }
     }
-    Err(last_err.unwrap())
+    // `dialects` non e' vuoto: last_err e' sempre Some quando arriviamo qui.
+    // Il fallback ParserError difensivo evita panic se la lista venisse svuotata.
+    Err(last_err.unwrap_or_else(|| sqlparser::parser::ParserError::ParserError(
+        "nessun dialect SQL configurato".into(),
+    )))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

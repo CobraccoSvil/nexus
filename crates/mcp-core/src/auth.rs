@@ -304,7 +304,10 @@ pub async fn logout(
         .status(200)
         .header(header::SET_COOKIE, clear_cookie_header())
         .body(axum::body::Body::from(r#"{"status":"ok"}"#))
-        .unwrap()
+        .unwrap_or_else(|e| {
+            tracing::error!("auth/logout: build response fallito: {e}");
+            Response::new(axum::body::Body::from(r#"{"status":"ok"}"#))
+        })
 }
 
 // validate_token is now re-exported from nexus_auth crate

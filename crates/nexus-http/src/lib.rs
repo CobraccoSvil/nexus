@@ -60,15 +60,15 @@ pub fn init_global_config(timeout_secs: Option<u64>, pool_max: Option<usize>) {
     let mut cfg = NexusHttpConfig::from_env();
     // L'env var ha priorita' sulla lettura DB: applica override DB solo se
     // l'env var non e' impostata.
-    if timeout_secs.is_some()
-        && std::env::var("NEXUS_HTTP_TIMEOUT_SECS").is_err()
-    {
-        cfg.timeout_secs = timeout_secs.unwrap();
+    if std::env::var("NEXUS_HTTP_TIMEOUT_SECS").is_err() {
+        if let Some(v) = timeout_secs {
+            cfg.timeout_secs = v;
+        }
     }
-    if pool_max.is_some()
-        && std::env::var("NEXUS_HTTP_POOL_MAX").is_err()
-    {
-        cfg.pool_max = pool_max.unwrap();
+    if std::env::var("NEXUS_HTTP_POOL_MAX").is_err() {
+        if let Some(v) = pool_max {
+            cfg.pool_max = v;
+        }
     }
     let _ = GLOBAL_CONFIG.set(cfg);
 }
@@ -107,6 +107,10 @@ pub fn build_client_with_config(config: &NexusHttpConfig) -> Client {
         }
     }
 
+    // safety: reqwest::ClientBuilder::build() puo' fallire solo per
+    // init TLS o allocazione. E' bootstrap del client HTTP globale —
+    // se fallisce qui, l'intera applicazione non puo' fare HTTP comunque.
+    // Ammesso da CLAUDE.md §F come "bootstrap critico".
     builder.build().expect("nexus-http: impossibile costruire il client HTTP")
 }
 

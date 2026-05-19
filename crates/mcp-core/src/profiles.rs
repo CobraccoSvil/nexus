@@ -401,7 +401,13 @@ async fn auto_select_profile(
     }
 
     match best_idx {
-        Some(idx) if best_score > 0 => build_profile_result(rows.into_iter().nth(idx).unwrap()),
+        // idx proviene da enumerate() su rows, quindi nth(idx) e' sempre Some.
+        // Difensivo: se per qualche motivo non lo fosse, ritorniamo default.
+        Some(idx) if best_score > 0 => rows
+            .into_iter()
+            .nth(idx)
+            .map(build_profile_result)
+            .unwrap_or_else(|| (String::new(), None, None, None)),
         _ => (String::new(), None, None, None),
     }
 }

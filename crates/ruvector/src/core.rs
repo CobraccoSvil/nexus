@@ -271,11 +271,9 @@ impl HnswDb {
         let nodes = self.nodes.read();
 
         // Se entry point è deleted, cerca il primo nodo attivo
-        let ep = self.find_active_entry(&nodes, entry_point);
-        if ep.is_none() {
+        let Some(ep) = self.find_active_entry(&nodes, entry_point) else {
             return Ok(Vec::new());
-        }
-        let ep = ep.unwrap();
+        };
         let ep_level = nodes[ep].level;
 
         // ── Greedy descent nei livelli superiori (ef=1) ───────────────────────

@@ -18,6 +18,9 @@
 //! NB: best-effort, regex-based. Non un AST refactor. Pensato per chiudere
 //! la divergenza M40 sui progetti generati pre-migration 0141.
 
+// safety: tutte le `Regex::new("...").unwrap()` in questo modulo sono
+// pattern literal hardcoded ammessi da CLAUDE.md §F.
+
 use super::*;
 use regex::Regex;
 

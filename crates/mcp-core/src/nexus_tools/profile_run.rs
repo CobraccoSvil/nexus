@@ -29,7 +29,9 @@ fn stats(samples: &[u64]) -> (f64, u64, u64, u64) {
     sorted.sort_unstable();
     let p95_idx = ((sorted.len() as f64) * 0.95).ceil() as usize - 1;
     let p95 = sorted[p95_idx.min(sorted.len() - 1)];
-    (mean, sorted[0], *sorted.last().unwrap(), p95)
+    // sorted non e' vuoto (guardia is_empty sopra), quindi l'ultimo index esiste.
+    let max = sorted[sorted.len() - 1];
+    (mean, sorted[0], max, p95)
 }
 
 #[async_trait]
