@@ -15,6 +15,7 @@ from .google_provider import GoogleProvider
 from .deepseek_provider import DeepSeekProvider
 from .mistral_provider import MistralProvider
 from .ollama_provider import OllamaProvider
+from .vllm_provider import VllmProvider
 
 logger = logging.getLogger(__name__)
 
@@ -309,6 +310,7 @@ class ProviderRegistry:
             "deepseek": DeepSeekProvider(),
             "mistral": MistralProvider(),
             "ollama": OllamaProvider(),   # Provider locale on-premise — zero cloud
+            "vllm": VllmProvider(),       # Provider vLLM via OpenAI-compat API (profile onprem)
         }
         # Tutti i provider abilitati di default; _load_keys_from_db() può sovrascrivere
         self._disabled: set[str] = set()

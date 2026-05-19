@@ -177,7 +177,7 @@ function CheckRow({
           {statusIcon(check.status)}
         </span>
         <div style={{ flex: 1 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div className="flex-row" style={{ justifyContent: "space-between" }}>
             <span style={{ fontWeight: 600, fontSize: 13, color: "var(--color-text)" }}>
               {check.label}
             </span>
@@ -193,7 +193,7 @@ function CheckRow({
           </div>
 
           {showFix && check.id === "playwright_libs" && (
-            <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <div className="flex-row-gap-8" style={{ marginTop: 8, flexWrap: "wrap" }}>
               <button
                 onClick={() => onSudoInstall("install_system_deps", check.id)}
                 disabled={fixLoading[check.id] ?? false}
@@ -355,13 +355,13 @@ export function EnvironmentPanel() {
 
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
+      <div className="flex-row" style={{ justifyContent: "space-between", marginBottom: 20 }}>
         <div>
-          <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0, color: "var(--color-text)" }}>
+          <h2 className="font-semibold" style={{ fontSize: 18, margin: 0, color: "var(--color-text)" }}>
             Stato ambiente Nexus
           </h2>
           {lastCheck && (
-            <p style={{ fontSize: 12, color: "var(--color-textMuted)", margin: "4px 0 0" }}>
+            <p className="text-sm text-muted" style={{ margin: "4px 0 0" }}>
               Ultimo aggiornamento: {lastCheck.toLocaleTimeString()}
               {checks.length > 0 && (
                 <span style={{ marginLeft: 12 }}>
@@ -408,7 +408,7 @@ export function EnvironmentPanel() {
       )}
 
       {checks.length === 0 && !loading && !error && (
-        <div style={{ padding: 40, textAlign: "center", color: "var(--color-textMuted)", fontSize: 13 }}>
+        <div className="text-base text-center text-muted" style={{ padding: 40 }}>
           Nessun dato disponibile. Clicca Aggiorna per caricare.
         </div>
       )}
@@ -465,7 +465,7 @@ export function EnvironmentPanel() {
               }}
             />
             {sudoError && <div style={{ color: "var(--color-error)", fontSize: 12, marginBottom: 12 }}>{sudoError}</div>}
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+            <div className="flex-row-gap-8" style={{ justifyContent: "flex-end" }}>
               <button
                 onClick={() => { setSudoModal(null); setSudoPassword(""); setSudoError(""); }}
                 style={{ padding: "6px 14px", borderRadius: 6, border: "1px solid var(--color-border)", background: "none", color: "var(--color-textMuted)", cursor: "pointer" }}
