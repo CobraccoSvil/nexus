@@ -3,7 +3,7 @@
  * GET /api/admin/nexus-database-stats
  */
 
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 
 interface TableStats {
   name: string;
@@ -13,10 +13,10 @@ interface TableStats {
 
 interface DatabaseStats {
   tables: TableStats[];
-  stats: Record<string, any>;
+  stats: Record<string, unknown>;
 }
 
-export async function GET(request: NextRequest): Promise<NextResponse> {
+export async function GET(): Promise<NextResponse> {
   try {
     // Recupera i dati dal mcp-core
     const coreUrl = process.env.CORE_SERVICE_URL || "http://127.0.0.1:4000";

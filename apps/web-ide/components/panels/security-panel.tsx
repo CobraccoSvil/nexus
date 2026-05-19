@@ -49,7 +49,7 @@ const OUTCOME_LABELS: Record<string, string> = {
   killed: "Terminato",
 };
 
-export function SecurityPanel({ projectId, onSendToChat }: SecurityPanelProps) {
+export function SecurityPanel({ projectId }: SecurityPanelProps) {
   const tc = useThemeColors();
   const [items, setItems] = useState<AuditItem[]>([]);
   const [quota, setQuota] = useState<QuotaInfo | null>(null);

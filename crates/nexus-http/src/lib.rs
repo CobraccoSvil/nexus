@@ -182,9 +182,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // I test in questo modulo mutano variabili d'ambiente di processo. Se eseguiti
+    // in parallelo (default di cargo test) causano poisoning reciproco (es. uno
+    // imposta NEXUS_PROXY, un altro lo legge prima che il primo faccia remove_var,
+    // un terzo confonde l'asserzione). Serializziamo con un mutex statico.
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_config_defaults() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var("NEXUS_HTTP_TIMEOUT_SECS");
         std::env::remove_var("NEXUS_PROXY");
         let c = NexusHttpConfig::from_env();
@@ -194,11 +202,14 @@ mod tests {
 
     #[test]
     fn test_build_no_proxy() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("NEXUS_PROXY");
         let _ = build_client();
     }
 
     #[test]
     fn test_build_invalid_proxy() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("NEXUS_PROXY", "not-a-valid-url!!!");
         let _ = build_client(); // non deve crashare, solo warn
         std::env::remove_var("NEXUS_PROXY");

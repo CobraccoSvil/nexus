@@ -386,7 +386,7 @@ export function ChatPanel({
   }, [externalInput]);
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
-  const [precheckPending, setPrecheckPending] = useState(false);
+  const [precheckPending] = useState(false);
   const [precheckResult, setPrecheckResult] = useState<PrecheckResult & { originalText: string } | null>(null);
   const [micSupported, setMicSupported] = useState(false);
   const [isListening, setIsListening] = useState(false);

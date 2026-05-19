@@ -4,6 +4,7 @@
 // backend via SSE — niente piu' polling indipendente per pannello.
 
 import { create } from "zustand";
+import type { PlaywrightArtifact } from "../api-client";
 import type {
   ConnectionStatus,
   EnvelopedEvent,
@@ -59,6 +60,16 @@ export interface EventEnrichment {
   severityInferred?: string;
   panelTarget?: string;
   ts: number;
+}
+
+/** Snapshot iniziale ricevuto dall'endpoint /snapshot. Campi opzionali per
+ *  tollerare versioni server diverse. */
+export interface ProjectSnapshot {
+  seq?: number;
+  playwright?: { runs?: PlaywrightRunSummary[] };
+  flags?: Record<string, unknown>;
+  monitors?: Record<string, MonitorState>;
+  [k: string]: unknown;
 }
 
 export interface ProjectStoreState {
@@ -124,7 +135,7 @@ export interface ProjectStoreState {
   // Actions
   setConnectionStatus: (s: ConnectionStatus) => void;
   setProject: (projectId: string | null) => void;
-  applySnapshot: (snapshot: any) => void;
+  applySnapshot: (snapshot: ProjectSnapshot) => void;
   applyEvent: (env: EnvelopedEvent) => void;
   dismissToast: (id: string) => void;
   bumpReconnect: () => void;
@@ -209,7 +220,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
     return () => { eventListeners.delete(listener); };
   },
 
-  applySnapshot: (snapshot) => set((state) => {
+  applySnapshot: (snapshot: ProjectSnapshot) => set((state) => {
     const next: Partial<ProjectStoreState> = { lastSeq: snapshot.seq ?? 0 };
     if (snapshot.playwright?.runs) {
       next.playwright = { runs: snapshot.playwright.runs, configChangedAt: 0 };
@@ -242,7 +253,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
             label: p.label,
             status: p.status,
             summary: p.summary,
-            artifacts: Array.isArray(p.artifacts) ? (p.artifacts as unknown[]) : [],
+            artifacts: Array.isArray(p.artifacts) ? (p.artifacts as PlaywrightArtifact[]) : [],
             createdAt: new Date(env.ts).toISOString(),
           };
           const without = next.playwright.runs.filter((r) => r.id !== p.id);

@@ -3509,7 +3509,12 @@ export interface SubagentDefinition {
   [k: string]: _Any;
 }
 
-export type PlaywrightArtifact = any;
+export type PlaywrightArtifact = {
+  path: string;
+  kind: string;
+  name?: string;
+  [k: string]: unknown;
+};
 
 
 export async function resetProviderCooldown(_providerKey: string): Promise<{ ok: boolean }> {

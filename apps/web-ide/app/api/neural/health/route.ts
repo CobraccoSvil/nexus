@@ -16,8 +16,8 @@ export async function GET() {
     console.log(`[API] Risposta dal Brain: status=${response.status}`);
 
     return NextResponse.json(data, { status: response.status });
-  } catch (error: any) {
-    const errorMsg = error?.message || String(error);
+  } catch (error: unknown) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
     console.error("Brain health endpoint error:", errorMsg);
     return NextResponse.json(
       { error: `Brain non disponibile: ${errorMsg}` },

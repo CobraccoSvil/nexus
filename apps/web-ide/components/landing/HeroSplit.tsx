@@ -27,7 +27,7 @@ export function HeroSplit() {
             color: "#e2e8f0",
           }}
         >
-          {t("landing.v2.hero.title" as any)}
+          {t("landing.v2.hero.title")}
         </h1>
         <p
           style={{
@@ -38,14 +38,14 @@ export function HeroSplit() {
             maxWidth: 480,
           }}
         >
-          {t("landing.v2.hero.subtitle" as any)}
+          {t("landing.v2.hero.subtitle")}
         </p>
         <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
           <a href="/pricing" style={ctaPrimary}>
-            {t("landing.v2.hero.cta" as any)}
+            {t("landing.v2.hero.cta")}
           </a>
           <a href="#preview" style={ctaSecondary}>
-            {t("landing.v2.hero.ctaSecondary" as any)}
+            {t("landing.v2.hero.ctaSecondary")}
           </a>
         </div>
       </div>

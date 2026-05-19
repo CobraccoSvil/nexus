@@ -181,7 +181,7 @@ export function PluginManager() {
   const [instanceReleaseChoice, setInstanceReleaseChoice] = useState<Record<string, string>>({});
   const [policyDrafts, setPolicyDrafts] = useState<Record<string, PolicyDraft>>({});
   const [secretDrafts, setSecretDrafts] = useState<Record<string, string>>({});
-  const [integrateDraft, setIntegrateDraft] = useState<IntegratePluginDraftResult | null>(null);
+  const [, setIntegrateDraft] = useState<IntegratePluginDraftResult | null>(null);
 
   const loadData = useCallback(async () => {
     setError(null);
@@ -302,16 +302,6 @@ export function PluginManager() {
       return !legacyServerKeys.has(legacyKey);
     });
   }, [filteredLegacyCatalog, legacyServerKeys, showAlreadyPresent]);
-
-  const requiredSecretRefs = useMemo(() => {
-    const keys = new Set<string>();
-    for (const item of catalog) {
-      for (const key of item.requiredSecretRefs ?? []) {
-        if (key.trim()) keys.add(key.trim());
-      }
-    }
-    return Array.from(keys).sort();
-  }, [catalog]);
 
   const settingsByKey = useMemo(() => {
     return new Map(adminSettings.map((setting) => [setting.key, setting]));

@@ -20,48 +20,48 @@ export default function PricingPage() {
 
   const tiers = [
     {
-      name: t("landing.v2.pricing.selfHost.name" as any),
-      price: t("landing.v2.pricing.selfHost.price" as any),
-      description: t("landing.v2.pricing.selfHost.desc" as any),
+      name: t("landing.v2.pricing.selfHost.name"),
+      price: t("landing.v2.pricing.selfHost.price"),
+      description: t("landing.v2.pricing.selfHost.desc"),
       features: [
-        t("landing.v2.pricing.selfHost.feat1" as any),
-        t("landing.v2.pricing.selfHost.feat2" as any),
-        t("landing.v2.pricing.selfHost.feat3" as any),
-        t("landing.v2.pricing.selfHost.feat4" as any),
+        t("landing.v2.pricing.selfHost.feat1"),
+        t("landing.v2.pricing.selfHost.feat2"),
+        t("landing.v2.pricing.selfHost.feat3"),
+        t("landing.v2.pricing.selfHost.feat4"),
       ],
     },
     {
-      name: t("landing.v2.pricing.pro.name" as any),
-      price: t("landing.v2.pricing.pro.price" as any),
-      description: t("landing.v2.pricing.pro.desc" as any),
+      name: t("landing.v2.pricing.pro.name"),
+      price: t("landing.v2.pricing.pro.price"),
+      description: t("landing.v2.pricing.pro.desc"),
       features: [
-        t("landing.v2.pricing.pro.feat1" as any),
-        t("landing.v2.pricing.pro.feat2" as any),
-        t("landing.v2.pricing.pro.feat3" as any),
-        t("landing.v2.pricing.pro.feat4" as any),
+        t("landing.v2.pricing.pro.feat1"),
+        t("landing.v2.pricing.pro.feat2"),
+        t("landing.v2.pricing.pro.feat3"),
+        t("landing.v2.pricing.pro.feat4"),
       ],
     },
     {
-      name: t("landing.v2.pricing.team.name" as any),
-      price: t("landing.v2.pricing.team.price" as any),
-      description: t("landing.v2.pricing.team.desc" as any),
+      name: t("landing.v2.pricing.team.name"),
+      price: t("landing.v2.pricing.team.price"),
+      description: t("landing.v2.pricing.team.desc"),
       features: [
-        t("landing.v2.pricing.team.feat1" as any),
-        t("landing.v2.pricing.team.feat2" as any),
-        t("landing.v2.pricing.team.feat3" as any),
-        t("landing.v2.pricing.team.feat4" as any),
+        t("landing.v2.pricing.team.feat1"),
+        t("landing.v2.pricing.team.feat2"),
+        t("landing.v2.pricing.team.feat3"),
+        t("landing.v2.pricing.team.feat4"),
       ],
       highlighted: true,
     },
     {
-      name: t("landing.v2.pricing.enterprise.name" as any),
-      price: t("landing.v2.pricing.enterprise.price" as any),
-      description: t("landing.v2.pricing.enterprise.desc" as any),
+      name: t("landing.v2.pricing.enterprise.name"),
+      price: t("landing.v2.pricing.enterprise.price"),
+      description: t("landing.v2.pricing.enterprise.desc"),
       features: [
-        t("landing.v2.pricing.enterprise.feat1" as any),
-        t("landing.v2.pricing.enterprise.feat2" as any),
-        t("landing.v2.pricing.enterprise.feat3" as any),
-        t("landing.v2.pricing.enterprise.feat4" as any),
+        t("landing.v2.pricing.enterprise.feat1"),
+        t("landing.v2.pricing.enterprise.feat2"),
+        t("landing.v2.pricing.enterprise.feat3"),
+        t("landing.v2.pricing.enterprise.feat4"),
       ],
     },
   ];
@@ -81,7 +81,7 @@ export default function PricingPage() {
               letterSpacing: "-0.03em",
             }}
           >
-            {t("landing.v2.pricing.title" as any)}
+            {t("landing.v2.pricing.title")}
           </h1>
           <p
             style={{
@@ -92,7 +92,7 @@ export default function PricingPage() {
               margin: "12px auto 0",
             }}
           >
-            {t("landing.v2.pricing.subtitle" as any)}
+            {t("landing.v2.pricing.subtitle")}
           </p>
         </div>
       </Band>
@@ -125,7 +125,7 @@ export default function PricingPage() {
               color: "#171717",
             }}
           >
-            {t("landing.v2.providers.title" as any)}
+            {t("landing.v2.providers.title")}
           </h3>
         </div>
         <div
@@ -154,7 +154,7 @@ export default function PricingPage() {
             margin: "0 auto",
           }}
         >
-          {t("landing.v2.pricing.disclaimer" as any)}
+          {t("landing.v2.pricing.disclaimer")}
         </p>
       </Band>
 
@@ -171,13 +171,13 @@ export default function PricingPage() {
             color: "#8494a7",
           }}
         >
-          <span>&copy; 2026 {t("landing.v2.footer.copyright" as any)}</span>
+          <span>&copy; 2026 {t("landing.v2.footer.copyright")}</span>
           <div style={{ display: "flex", gap: 24 }}>
             <a href="/" style={{ color: "#8494a7", textDecoration: "none" }}>
-              {t("landing.v2.nav.product" as any)}
+              {t("landing.v2.nav.product")}
             </a>
             <a href="/pricing" style={{ color: "#8494a7", textDecoration: "none" }}>
-              {t("landing.v2.nav.pricing" as any)}
+              {t("landing.v2.nav.pricing")}
             </a>
           </div>
         </div>

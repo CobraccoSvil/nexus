@@ -44,10 +44,10 @@ export function NavBar() {
         {/* Links */}
         <div style={{ display: "flex", alignItems: "center", gap: 28 }}>
           <a href="#preview" style={linkStyle}>
-            {t("landing.v2.nav.product" as any)}
+            {t("landing.v2.nav.product")}
           </a>
           <a href="/pricing" style={linkStyle}>
-            {t("landing.v2.nav.pricing" as any)}
+            {t("landing.v2.nav.pricing")}
           </a>
 
           {/* Language selector */}

@@ -296,6 +296,8 @@ export function useChat(
       totalTokens: lastCompact.totalTokens,
       totalCostUsd: lastCompact.totalCostUsd,
     });
+    // Trigger solo sul timestamp di lastCompact (lo stesso oggetto cambia identita').
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastCompact?.ts, sessionId]);
 
   useEffect(() => {
@@ -307,6 +309,9 @@ export function useChat(
         totalCostUsd: lastMessage.totalCostUsd,
       });
     }
+    // Trigger sul messageId; lastMessage stesso e' read solo per i totalTokens/cost
+    // del messaggio corrente.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastMessage?.messageId, sessionId]);
 
   // ── Auto-continuazione: quando il run completa in modalita' "automatic" e

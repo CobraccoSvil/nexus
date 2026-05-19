@@ -13,6 +13,8 @@ export default [
       "**/.next/**",
       "**/node_modules/**",
       "**/build/**",
+      // File generato da Next.js (vedi `next-env.d.ts`: "should not be edited").
+      "apps/web-ide/next-env.d.ts",
     ],
     languageOptions: {
       ecmaVersion: "latest",

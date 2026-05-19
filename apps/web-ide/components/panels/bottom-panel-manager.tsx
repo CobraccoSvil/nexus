@@ -101,7 +101,6 @@ export function BottomPanelManager({
   ports,
   playwrightRuns,
   playwrightConfigured,
-  traces = [],
   onOpenFile,
   onSelectOutputChannel,
   onClearPanel,
@@ -109,7 +108,6 @@ export function BottomPanelManager({
   onSendToChat,
   onAutoSendToChat,
   agentRunEndSignal,
-  onClearTraces,
 }: BottomPanelManagerProps) {
   const tc = useThemeColors();
 

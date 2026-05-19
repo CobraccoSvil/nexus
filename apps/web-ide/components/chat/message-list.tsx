@@ -15,7 +15,7 @@ function parseThinking(content: string): { thinking: string | null; text: string
   return { thinking: match[1].trim(), text: content.slice(match[0].length) };
 }
 
-function ThinkingPanel({ thinking, tc }: { thinking: string; tc: ThemeColors }) {
+function ThinkingPanel({ thinking }: { thinking: string }) {
   const [open, setOpen] = useState(false);
   return (
     <div style={{
@@ -723,7 +723,7 @@ export function MessageList({
                 const { thinking, text } = parseThinking(message.content ?? "");
                 return (
                   <>
-                    {thinking && <ThinkingPanel thinking={thinking} tc={tc} />}
+                    {thinking && <ThinkingPanel thinking={thinking} />}
                     <MarkdownBlock content={text} />
                   </>
                 );

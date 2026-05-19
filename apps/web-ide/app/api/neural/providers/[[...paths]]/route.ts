@@ -23,8 +23,9 @@ export async function GET(
 
     const data = await response.json();
     return NextResponse.json(data, { status: response.status });
-  } catch (error: any) {
-    console.error(`Brain GET /providers/${pathStr} error:`, error?.message);
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : String(error);
+    console.error(`Brain GET /providers/${pathStr} error:`, msg);
     return NextResponse.json(
       { error: "Provider non disponibile" },
       { status: 503 }

@@ -2,7 +2,6 @@
 
 import { useEffect } from "react";
 import { connectDispatcher, disconnectDispatcher } from "./connection";
-import { useProjectStore } from "./store";
 
 /**
  * Hook unico per la pagina IDE: aggancia il dispatcher al progetto attivo.

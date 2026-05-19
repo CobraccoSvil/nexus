@@ -31,7 +31,11 @@ function ProjectDatabasePageInner() {
   const [applying, setApplying] = useState(false);
   const [rollingBack, setRollingBack] = useState(false);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
-  const [nexusDbStats, setNexusDbStats] = useState<any>(null);
+  const [nexusDbStats, setNexusDbStats] = useState<{
+    tables?: Array<{ name: string; row_count?: number; last_updated?: string }>;
+    stats?: Record<string, unknown>;
+    [key: string]: unknown;
+  } | null>(null);
   const [nexusLoading, setNexusLoading] = useState(false);
 
   async function loadMigrations() {
@@ -61,7 +65,7 @@ function ProjectDatabasePageInner() {
           setNexusLoading(false);
           return;
         }
-      } catch (e) {
+      } catch {
         // Continua con i dati mock
       }
 
@@ -374,8 +378,8 @@ function ProjectDatabasePageInner() {
                         </tr>
                       </thead>
                       <tbody>
-                        {nexusDbStats.tables.map((table: any, idx: number) => (
-                          <tr key={table.name} style={{ borderBottom: idx < nexusDbStats.tables.length - 1 ? `1px solid ${tc.border}` : "none" }}>
+                        {(nexusDbStats.tables ?? []).map((table, idx, arr) => (
+                          <tr key={table.name} style={{ borderBottom: idx < arr.length - 1 ? `1px solid ${tc.border}` : "none" }}>
                             <td style={{ padding: "10px 12px", color: tc.text, fontFamily: "monospace", fontSize: 12 }}>{table.name}</td>
                             <td style={{ padding: "10px 12px", color: tc.textMuted, textAlign: "right" }}>{table.row_count?.toLocaleString("it-IT") ?? "—"}</td>
                             <td style={{ padding: "10px 12px", color: tc.textMuted, fontSize: 12 }}>
@@ -394,7 +398,7 @@ function ProjectDatabasePageInner() {
                 <div>
                   <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 12, color: tc.text }}>Statistiche Globali</h3>
                   <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 12 }}>
-                    {Object.entries(nexusDbStats.stats).map(([key, value]: [string, any]) => (
+                    {Object.entries(nexusDbStats.stats).map(([key, value]) => (
                       <div
                         key={key}
                         style={{
@@ -406,7 +410,7 @@ function ProjectDatabasePageInner() {
                           {key.replace(/_/g, " ")}
                         </div>
                         <div style={{ fontSize: 18, fontWeight: 700, color: tc.accent }}>
-                          {typeof value === "number" ? value.toLocaleString("it-IT") : value}
+                          {typeof value === "number" ? value.toLocaleString("it-IT") : String(value ?? "—")}
                         </div>
                       </div>
                     ))}

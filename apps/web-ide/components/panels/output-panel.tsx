@@ -36,48 +36,7 @@ interface OutputPanelProps {
   onSendToChat?: (message: string) => void;
 }
 
-// ── Helpers ANSI ────────────────────────────────────────────────────────────
-
-const ANSI_COLORS: Record<number, string> = {
-  30: "#1e1e1e", 31: "#ef4444", 32: "#22c55e", 33: "#f59e0b",
-  34: "#3b82f6", 35: "#a855f7", 36: "#06b6d4", 37: "#d1d5db",
-  90: "#6b7280", 91: "#f87171", 92: "#4ade80", 93: "#fbbf24",
-  94: "#60a5fa", 95: "#c084fc", 96: "#22d3ee", 97: "#f9fafb",
-};
-
-function ansiToNodes(text: string): React.ReactNode[] {
-  // Supporto minimo: colori foreground + reset
-  const re = /\x1b\[([0-9;]*)m/g;
-  const nodes: React.ReactNode[] = [];
-  let lastIdx = 0;
-  let currentColor: string | undefined;
-  let match: RegExpExecArray | null;
-
-  while ((match = re.exec(text)) !== null) {
-    if (match.index > lastIdx) {
-      const chunk = text.slice(lastIdx, match.index);
-      nodes.push(
-        <span key={lastIdx} style={currentColor ? { color: currentColor } : undefined}>
-          {chunk}
-        </span>
-      );
-    }
-    const codes = match[1].split(";").map(Number);
-    for (const code of codes) {
-      if (code === 0) { currentColor = undefined; }
-      else if (ANSI_COLORS[code]) { currentColor = ANSI_COLORS[code]; }
-    }
-    lastIdx = match.index + match[0].length;
-  }
-  if (lastIdx < text.length) {
-    nodes.push(
-      <span key={lastIdx} style={currentColor ? { color: currentColor } : undefined}>
-        {text.slice(lastIdx)}
-      </span>
-    );
-  }
-  return nodes;
-}
+// (helpers ANSI rimossi — unused. Vedi git history se servono.)
 
 function linkify(text: string): React.ReactNode[] {
   const re = /(https?:\/\/[^\s<>"')]+)/gi;

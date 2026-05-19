@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { useI18n } from "../lib/i18n";
-import { Band, PALETTE } from "../components/landing/Band";
+import { Band } from "../components/landing/Band";
 import { NavBar } from "../components/landing/NavBar";
 import { HeroSplit } from "../components/landing/HeroSplit";
 import { FeatureCard } from "../components/landing/FeatureCard";
@@ -56,10 +56,10 @@ export default function LandingPage() {
       <Band tone="light" id="preview">
         <div style={{ textAlign: "center", marginBottom: 32 }}>
           <h2 style={{ fontSize: mobile ? 24 : 36, fontWeight: 800, color: C.light.text }}>
-            {t("landing.v2.preview.title" as any)}
+            {t("landing.v2.preview.title")}
           </h2>
           <p style={{ fontSize: 16, color: C.light.muted, maxWidth: 560, margin: "8px auto 0" }}>
-            {t("landing.v2.preview.subtitle" as any)}
+            {t("landing.v2.preview.subtitle")}
           </p>
         </div>
         <div
@@ -87,10 +87,10 @@ export default function LandingPage() {
       <Band tone="light">
         <div style={{ maxWidth: 640, margin: "0 auto", textAlign: "center" }}>
           <h2 style={{ fontSize: mobile ? 26 : 40, fontWeight: 800, color: C.light.text }}>
-            {t("landing.v2.builtDifferent.title" as any)}
+            {t("landing.v2.builtDifferent.title")}
           </h2>
           <p style={{ fontSize: 16, lineHeight: 1.7, color: C.light.muted, marginTop: 16 }}>
-            {t("landing.v2.builtDifferent.desc" as any)}
+            {t("landing.v2.builtDifferent.desc")}
           </p>
         </div>
       </Band>
@@ -107,10 +107,10 @@ export default function LandingPage() {
         >
           <div>
             <h2 style={{ fontSize: mobile ? 24 : 36, fontWeight: 800, color: C.light.text }}>
-              {t("landing.v2.agents.title" as any)}
+              {t("landing.v2.agents.title")}
             </h2>
             <p style={{ fontSize: 16, lineHeight: 1.7, color: C.light.muted, marginTop: 16 }}>
-              {t("landing.v2.agents.desc" as any)}
+              {t("landing.v2.agents.desc")}
             </p>
           </div>
           <div
@@ -138,10 +138,10 @@ export default function LandingPage() {
       <Band tone="light">
         <div style={{ textAlign: "center", marginBottom: 40 }}>
           <h2 style={{ fontSize: mobile ? 24 : 36, fontWeight: 800, color: C.light.text }}>
-            {t("landing.v2.providers.title" as any)}
+            {t("landing.v2.providers.title")}
           </h2>
           <p style={{ fontSize: 16, color: C.light.muted, maxWidth: 560, margin: "8px auto 0" }}>
-            {t("landing.v2.providers.subtitle" as any)}
+            {t("landing.v2.providers.subtitle")}
           </p>
         </div>
         <div
@@ -179,10 +179,10 @@ export default function LandingPage() {
       <Band tone="light">
         <div style={{ textAlign: "center", marginBottom: 40 }}>
           <h2 style={{ fontSize: mobile ? 24 : 36, fontWeight: 800, color: C.light.text }}>
-            {t("landing.v2.integrations.title" as any)}
+            {t("landing.v2.integrations.title")}
           </h2>
           <p style={{ fontSize: 16, color: C.light.muted }}>
-            {t("landing.v2.integrations.subtitle" as any)}
+            {t("landing.v2.integrations.subtitle")}
           </p>
         </div>
         <div
@@ -194,27 +194,27 @@ export default function LandingPage() {
         >
           <FeatureCard
             icon={<span>▶</span>}
-            title={t("landing.v2.integrations.playwright.title" as any)}
-            description={t("landing.v2.integrations.playwright.desc" as any)}
+            title={t("landing.v2.integrations.playwright.title")}
+            description={t("landing.v2.integrations.playwright.desc")}
             screenshot="/screenshots/playwright-live.jpg"
             tone="light"
           />
           <FeatureCard
             icon={<span>⎇</span>}
-            title={t("landing.v2.integrations.github.title" as any)}
-            description={t("landing.v2.integrations.github.desc" as any)}
+            title={t("landing.v2.integrations.github.title")}
+            description={t("landing.v2.integrations.github.desc")}
             tone="light"
           />
           <FeatureCard
             icon={<span>$</span>}
-            title={t("landing.v2.integrations.terminal.title" as any)}
-            description={t("landing.v2.integrations.terminal.desc" as any)}
+            title={t("landing.v2.integrations.terminal.title")}
+            description={t("landing.v2.integrations.terminal.desc")}
             tone="light"
           />
           <FeatureCard
             icon={<span>D</span>}
-            title={t("landing.v2.integrations.docs.title" as any)}
-            description={t("landing.v2.integrations.docs.desc" as any)}
+            title={t("landing.v2.integrations.docs.title")}
+            description={t("landing.v2.integrations.docs.desc")}
             tone="light"
           />
         </div>
@@ -232,10 +232,10 @@ export default function LandingPage() {
         >
           <div>
             <h2 style={{ fontSize: mobile ? 24 : 36, fontWeight: 800, color: C.light.text }}>
-              {t("landing.v2.memory.title" as any)}
+              {t("landing.v2.memory.title")}
             </h2>
             <p style={{ fontSize: 16, lineHeight: 1.7, color: C.light.muted, marginTop: 16 }}>
-              {t("landing.v2.memory.desc" as any)}
+              {t("landing.v2.memory.desc")}
             </p>
           </div>
           <div
@@ -262,10 +262,10 @@ export default function LandingPage() {
       <Band tone="light" style={{ background: "#f5f5f4" }}>
         <div style={{ maxWidth: 640, margin: "0 auto", textAlign: "center" }}>
           <h2 style={{ fontSize: mobile ? 24 : 36, fontWeight: 800, color: C.light.text }}>
-            {t("landing.v2.onprem.title" as any)}
+            {t("landing.v2.onprem.title")}
           </h2>
           <p style={{ fontSize: 16, lineHeight: 1.7, color: C.light.muted, marginTop: 16 }}>
-            {t("landing.v2.onprem.desc" as any)}
+            {t("landing.v2.onprem.desc")}
           </p>
         </div>
       </Band>
@@ -347,7 +347,7 @@ export default function LandingPage() {
                       }}
                     >
                       {ci === 0
-                        ? t(cell as any)
+                        ? t(cell as Parameters<typeof t>[0])
                         : cell === true
                           ? "✅"
                           : cell === "~"
@@ -413,10 +413,10 @@ export default function LandingPage() {
                   {icon}
                 </div>
                 <h4 style={{ fontSize: mobile ? 16 : 18, fontWeight: 700, margin: 0, color }}>
-                  {t(`landing.compDetail.${key}` as any)}
+                  {t(`landing.compDetail.${key}`)}
                 </h4>
                 <p style={{ fontSize: 14, lineHeight: 1.6, color: C.light.muted, margin: 0 }}>
-                  {t(`landing.compDetail.${key}Desc` as any)}
+                  {t(`landing.compDetail.${key}Desc`)}
                 </p>
               </div>
             ))}
@@ -428,10 +428,10 @@ export default function LandingPage() {
       <Band tone="light" style={{ padding: mobile ? "60px 0" : "100px 0" }}>
         <div style={{ textAlign: "center" }}>
           <h2 style={{ fontSize: mobile ? 28 : 44, fontWeight: 800, color: C.light.text }}>
-            {t("landing.v2.cta.title" as any)}
+            {t("landing.v2.cta.title")}
           </h2>
           <p style={{ fontSize: 16, color: C.light.muted, marginTop: 12 }}>
-            {t("landing.v2.cta.subtitle" as any)}
+            {t("landing.v2.cta.subtitle")}
           </p>
           <a
             href="/pricing"
@@ -448,7 +448,7 @@ export default function LandingPage() {
               textDecoration: "none",
             }}
           >
-            {t("landing.v2.cta.button" as any)}
+            {t("landing.v2.cta.button")}
           </a>
         </div>
       </Band>
@@ -466,13 +466,13 @@ export default function LandingPage() {
             color: C.dark.muted,
           }}
         >
-          <span>&copy; 2026 {t("landing.v2.footer.copyright" as any)}</span>
+          <span>&copy; 2026 {t("landing.v2.footer.copyright")}</span>
           <div style={{ display: "flex", gap: 24 }}>
             <a href="#preview" style={{ color: C.dark.muted, textDecoration: "none" }}>
-              {t("landing.v2.nav.product" as any)}
+              {t("landing.v2.nav.product")}
             </a>
             <a href="/pricing" style={{ color: C.dark.muted, textDecoration: "none" }}>
-              {t("landing.v2.nav.pricing" as any)}
+              {t("landing.v2.nav.pricing")}
             </a>
             <a href="#comparison" style={{ color: C.dark.muted, textDecoration: "none" }}>
               {t("landing.comparison")}

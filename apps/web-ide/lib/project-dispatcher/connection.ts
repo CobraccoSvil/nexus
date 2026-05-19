@@ -34,8 +34,8 @@ async function fetchSnapshot(projectId: string): Promise<void> {
     if (currentProjectId === projectId) {
       useProjectStore.getState().applySnapshot(snapshot);
     }
-  } catch (err: any) {
-    if (err?.name !== "AbortError") {
+  } catch (err: unknown) {
+    if (!(err instanceof Error && err.name === "AbortError")) {
       console.warn("[dispatcher] snapshot fallita:", err);
     }
   }

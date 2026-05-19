@@ -13,7 +13,6 @@ import {
   getMyProjects,
   getPlaywrightRuns,
   clearPlaywrightRuns,
-  getProviderHealth,
   getGatewayProviders,
   getProjectFile,
   getProjectPorts,
@@ -322,42 +321,6 @@ function StatusDot({ ok, billing }: { ok: boolean | null; billing?: boolean }) {
       }}
     />
   );
-}
-
-function inferProviderHealth(payload: Record<string, unknown>): boolean {
-  const candidates = [
-    payload.ok,
-    payload.ready,
-    payload.available,
-    payload.healthy,
-    payload.status === "ok",
-    payload.status === "healthy",
-    payload.status === "ready",
-    payload.health === "ok",
-  ];
-  return candidates.some((value) => value === true);
-}
-
-const BILLING_ERROR_CLASSES = ["billing_error", "insufficient_quota", "auth_error"];
-const BILLING_REASON_PATTERNS = ["credit", "quota", "billing", "upgrade", "purchase", "credits"];
-
-function parseProviderHealth(payload: Record<string, unknown>): ProviderHealthState {
-  const ok = inferProviderHealth(payload);
-  const status = typeof payload.status === "string" ? payload.status : undefined;
-  const reason =
-    typeof payload.reason === "string"
-      ? payload.reason
-      : typeof payload.error === "string"
-        ? payload.error
-        : typeof payload.message === "string"
-          ? payload.message
-          : undefined;
-  const errorClass = typeof payload.error_class === "string" ? payload.error_class : "";
-  const billing =
-    !ok &&
-    (BILLING_ERROR_CLASSES.includes(errorClass) ||
-      BILLING_REASON_PATTERNS.some((p) => reason?.toLowerCase().includes(p)));
-  return { ok, status, reason, billing };
 }
 
 function summarizeProviderReason(reason?: string): string | undefined {
@@ -898,10 +861,12 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     return () => {
       cancelled = true;
     };
+    // initialProjectId e' una prop stabile: vogliamo che il bootstrap di
+    // progetti giri una volta sola al mount + quando handleOpenProject cambia.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [handleOpenProject]);
 
   const refreshProviderStatus = useCallback(async () => {
-    const providerKeys: ProviderKey[] = ["openai", "anthropic", "google", "deepseek", "mistral"];
     try {
       // Usa il gateway come fonte autoritativa (ha le chiavi caricate dal DB).
       // Il backend mcp-core arricchisce ogni entry con `cooldown_seconds_remaining`
@@ -1031,6 +996,8 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   useEffect(() => {
     if (!activeProject || !selectedOutputChannel) return;
     void loadOutputEvents(activeProject.id, selectedOutputChannel);
+    // activeProject viene letto solo per .id (gia' in deps come activeProject?.id).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProject?.id, selectedOutputChannel, loadOutputEvents]);
 
   // Polling Fix M45 RIMOSSO: ora i pannelli operativi (porte, playwright,
@@ -1123,6 +1090,9 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     primarySidebarVisible,
     rightWidth,
     workbenchReady,
+    chatAutomationMode,
+    chatModel,
+    chatProvider,
   ]);
 
   useEffect(() => {
