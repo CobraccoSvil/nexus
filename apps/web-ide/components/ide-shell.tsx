@@ -1534,10 +1534,16 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
                   : "Compatta chat"}
                 style={{
                   ...iconButton(tc, !multiChat.activeTabId),
+                  // Larghezza dinamica: il bottone si allarga per contenere
+                  // l'icona + badge percentuale senza tagliare il testo.
+                  width: "auto",
+                  minWidth: 30,
                   display: "inline-flex",
                   alignItems: "center",
+                  justifyContent: "center",
                   gap: 4,
-                  paddingInline: pct != null ? 8 : undefined,
+                  paddingInline: pct != null ? 8 : 0,
+                  whiteSpace: "nowrap",
                 }}
               >
                 <span>⌁</span>

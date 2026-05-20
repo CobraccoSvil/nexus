@@ -702,6 +702,35 @@ export function useChat(
             const next = [...current, meta.metaStep];
             return new Map(prev).set(runId, next);
           });
+          // Quando arriva un meta_step di fallback / routing context-aware /
+          // executor_call, il provider/model effettivo cambia: aggiorniamo
+          // anche agentRun cosi' l'indicatore "run: X/Y" nel composer
+          // riflette il provider che sta effettivamente girando ORA.
+          const m = meta.metaStep;
+          const payload = (m.payload ?? {}) as Record<string, unknown>;
+          let newProvider: string | null = null;
+          let newModel: string | null = null;
+          if (m.kind === "fallback") {
+            newProvider = (payload.to_provider as string | undefined) ?? null;
+            newModel = (payload.to_model as string | undefined) ?? null;
+          } else if (m.kind === "executor_call") {
+            newProvider = (payload.provider as string | undefined) ?? null;
+            newModel = (payload.model as string | undefined) ?? null;
+          }
+          if (newProvider && newModel) {
+            setAgentRun((prev) =>
+              prev && prev.runId === runId
+                ? { ...prev, provider: newProvider!, model: newModel! }
+                : prev,
+            );
+            setAgentRuns((prevMap) => {
+              const cur = prevMap.get(runId);
+              if (!cur) return prevMap;
+              const next = new Map(prevMap);
+              next.set(runId, { ...cur, provider: newProvider!, model: newModel! });
+              return next;
+            });
+          }
         },
       );
     },
