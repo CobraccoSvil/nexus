@@ -309,6 +309,20 @@ export function useChat(
       totalTokens: lastCompact.totalTokens,
       totalCostUsd: lastCompact.totalCostUsd,
     });
+    // Ricarica i messaggi dal DB cosi' i messaggi pre-compact (ora con
+    // deleted_at valorizzato dal backend) vengano filtrati e il calcolo
+    // di ratio/ctx% sul bottone Compatta usi solo i messaggi vivi.
+    // Senza questo refresh, lastAssistantWithTokens resta legato al
+    // vecchio messaggio gigante e ctx% rimane bloccato su valori >100%.
+    (async () => {
+      try {
+        const history = await getChatMessages(sessionId);
+        if (history.messages) setMessages(history.messages);
+      } catch {
+        // ignore: il TokenUsage e' gia' aggiornato; il refresh dei messaggi
+        // riavverra' al prossimo turno.
+      }
+    })();
     // Trigger solo sul timestamp di lastCompact (lo stesso oggetto cambia identita').
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastCompact?.ts, sessionId]);

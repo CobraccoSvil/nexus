@@ -384,10 +384,30 @@ pub async fn compact_chat_session(
         .trim()
         .to_string();
 
-    if summary_text.is_empty() {
+    // Detection riassunto degenere: il neural service ritorna sempre 200 anche
+    // quando tutti i provider falliscono, con `content` tipo "[Error: ...]" o
+    // "Errore del provider AI. Controlla i log per i dettagli." (vedi
+    // error_handler.py). Questi NON sono riassunti validi: trattali come
+    // failure cosi' il frontend mostra errore esplicito invece di salvare un
+    // "riassunto" inutile che spreca lo slot della session memory.
+    let lower = summary_text.to_lowercase();
+    let is_degenerate = summary_text.is_empty()
+        || summary_text.len() < 40
+        || lower.starts_with("[error")
+        || lower.starts_with("errore del provider")
+        || lower.contains("controlla i log per i dettagli")
+        || lower.contains("nessun provider")
+        || lower.contains("billing");
+    if is_degenerate {
+        tracing::warn!(
+            "compact_chat_session: riassunto degenere ({} char): \"{}\"",
+            summary_text.len(),
+            summary_text.chars().take(120).collect::<String>()
+        );
         return Err(api_error(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Il modello non ha restituito un riassunto valido",
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Compattazione fallita: tutti i provider AI hanno restituito errore. \
+             Riprova fra qualche minuto o sblocca un provider in /admin/settings/providers.",
         ));
     }
 

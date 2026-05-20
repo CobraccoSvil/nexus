@@ -1535,15 +1535,20 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
                 style={{
                   ...iconButton(tc, !multiChat.activeTabId),
                   // Larghezza dinamica: il bottone si allarga per contenere
-                  // l'icona + badge percentuale senza tagliare il testo.
+                  // l'icona + badge percentuale senza tagliare il testo,
+                  // anche per valori a 4 cifre (es. 1952%).
                   width: "auto",
                   minWidth: 30,
+                  maxWidth: "none",
+                  flex: "0 0 auto",
+                  boxSizing: "content-box",
                   display: "inline-flex",
                   alignItems: "center",
                   justifyContent: "center",
                   gap: 4,
-                  paddingInline: pct != null ? 8 : 0,
+                  paddingInline: pct != null ? 10 : 0,
                   whiteSpace: "nowrap",
+                  overflow: "visible",
                 }}
               >
                 <span>⌁</span>
