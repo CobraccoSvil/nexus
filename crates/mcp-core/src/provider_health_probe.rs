@@ -163,6 +163,45 @@ async fn run_one_round(orchestrator: &Orchestrator, db: &PgPool) {
 
 /// Pinga un singolo provider. Persiste sempre il risultato (anche success).
 async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
+    // ── Budget exhausted check ────────────────────────────────────────────
+    // I provider AI consumer non espongono balance via API per la maggior
+    // parte (vedi tabella in 0173_provider_budget_tracking.sql). Tracciamo
+    // internamente lo speso e dichiariamo il provider unhealthy quando
+    // (monthly_budget - spent) < min_threshold. Cosi' la UI mostra LED
+    // giallo/rosso e il routing dinamico evita il provider.
+    let budget_exhausted: Option<bool> = sqlx::query_scalar(
+        "SELECT is_exhausted FROM provider_budget_remaining_view
+          WHERE provider = $1 AND monthly_budget_usd > 0",
+    )
+    .bind(provider)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    if budget_exhausted == Some(true) {
+        tracing::warn!(
+            "provider_health_probe: {provider} budget esaurito (tracking interno) — skip probe + cooldown lungo"
+        );
+        put_provider_in_long_cooldown(provider, "budget_exhausted");
+        let _ = sqlx::query(
+            r#"INSERT INTO nexus_provider_health_history
+               (provider, healthy, latency_ms, error_kind, error_message)
+               VALUES ($1, false, 0, 'budget_exhausted',
+                       'Budget mensile per il provider esaurito. Vai in Admin > Provider LLM > Ricarica budget.')"#,
+        )
+        .bind(provider)
+        .execute(db)
+        .await;
+        nexus_events::dispatcher::broadcast_all_global(
+            nexus_events::ProjectEvent::ProviderHealthChanged {
+                provider: provider.to_string(),
+                status: "down".to_string(),
+                latency_ms: None,
+            },
+        );
+        return;
+    }
+
     let matrix_arc = match orchestrator.routing_matrix.current_async().await {
         Ok(m) => m,
         Err(e) => {
@@ -183,26 +222,75 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
     let latency_ms = started.elapsed().as_millis() as i32;
 
     let (healthy, error_kind, error_message) = match result {
-        Ok(Ok(_response)) => {
-            // Successo. Provider rispondente in <PROBE_TIMEOUT_S.
-            // Se c'era un cooldown residuo (anche persistito in Redis), il
-            // provider è tornato a rispondere correttamente: lo togliamo
-            // automaticamente cosi' il routing dinamico puo' tornare a
-            // sceglierlo senza intervento manuale dell'admin.
-            // Caso reale: l'utente vede "Quota esaurita" su google nella UI
-            // anche dopo aver ricaricato il credito o aspettato il reset
-            // mensile della quota free; senza questo cleanup il provider
-            // resta "down" fino allo scadere del TTL di 6h del cooldown.
-            if is_provider_in_cooldown(provider) {
-                tracing::info!(
-                    "provider_health_probe: {provider} RECOVERED — rimuovo cooldown residuo"
+        Ok(Ok(response)) => {
+            // Detection "errore ingoiato dal brain": brain/providers/*.py
+            // intercetta Exception e ritorna ProviderResult con content
+            // "[Error: ...]" invece di propagare. Senza questo check, il probe
+            // marcava il provider come healthy mentre in realta' billing era
+            // esaurito (caso reale 2026-05-20: LED verde su anthropic ma run
+            // reali fallivano con credit_balance_too_low).
+            let content_text = extract_response_content_text(&response);
+            let trimmed = content_text.trim();
+            let is_brain_swallowed_error = trimmed.starts_with("[Error:")
+                || trimmed.starts_with("[error:");
+            if is_brain_swallowed_error {
+                let inner = trimmed.trim_start_matches('[').trim_end_matches(']');
+                tracing::warn!(
+                    "provider_health_probe: {provider} brain ha ingoiato errore: {}",
+                    &inner[..inner.len().min(200)]
                 );
-                remove_cooldown(provider);
+                let kind = classify_probe_error(inner);
+                let billing = matches!(
+                    kind.as_str(),
+                    "quota_exceeded" | "credit_balance_too_low" | "billing_required"
+                );
+                if billing {
+                    put_provider_in_long_cooldown(provider, &kind);
+                } else {
+                    put_provider_in_cooldown(provider, Some(SLOW_COOLDOWN_S));
+                }
+                (false, Some(kind), Some(truncate(inner, 500)))
+            } else {
+                // Probe-OK con "hi" (1-2 token output): NON garantisce che
+                // il provider sia veramente pronto per workload reali. Un
+                // account anthropic con credit basso accetta call da 1 token
+                // ma fallisce su 5000+ token. Quindi:
+                //   - se in LONG cooldown (billing/quota): NON rimuovo. Solo
+                //     un run reale di chat_messages.rs puo' confermare il
+                //     recovery (vede [Error:] o success reale).
+                //   - se in SHORT cooldown (rate_limit/timeout): rimuovo,
+                //     perche' "hi" e' sufficiente a verificare che il provider
+                //     non sia piu' rate-limited.
+                let long_kinds = ["billing_error", "quota_exceeded",
+                    "credit_balance_too_low", "billing_required"];
+                let is_in_long = crate::provider_cooldown::cooldown_snapshot()
+                    .iter()
+                    .find(|(name, _, _)| name == provider)
+                    .map(|(_, _, reason)| {
+                        reason.as_ref().is_some_and(|r| {
+                            long_kinds.iter().any(|k| r.contains(k)) ||
+                            r.contains("credit") || r.contains("quota") ||
+                            r.contains("billing")
+                        })
+                    })
+                    .unwrap_or(false);
+                if is_provider_in_cooldown(provider) {
+                    if is_in_long {
+                        tracing::debug!(
+                            "provider_health_probe: {provider} probe-OK ma in LONG cooldown — non rimuovo (attendo run reale)"
+                        );
+                    } else {
+                        tracing::info!(
+                            "provider_health_probe: {provider} RECOVERED — rimuovo cooldown breve residuo"
+                        );
+                        remove_cooldown(provider);
+                    }
+                }
+                tracing::debug!(
+                    "provider_health_probe: {provider} OK in {latency_ms}ms"
+                );
+                (true, None, None)
             }
-            tracing::debug!(
-                "provider_health_probe: {provider} OK in {latency_ms}ms"
-            );
-            (true, None, None)
         }
         Ok(Err(e)) => {
             // Provider ha risposto con errore (HTTP error o JSON parse).
@@ -293,6 +381,27 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
 
 /// Classifica un messaggio di errore in una categoria nota. Mirror della
 /// logica di `brain_agent_client.rs::classify_provider_error`.
+/// Estrae il content testuale dalla response gRPC del brain.
+/// Usato per intercettare "[Error: ...]" che il brain ritorna in caso di
+/// exception (vedi brain/providers/anthropic_provider.py:211 e simili).
+fn extract_response_content_text(value: &serde_json::Value) -> String {
+    if let Some(s) = value.get("content").and_then(|v| v.as_str()) {
+        return s.to_string();
+    }
+    if let Some(arr) = value.get("choices").and_then(|v| v.as_array()) {
+        if let Some(first) = arr.first() {
+            if let Some(s) = first
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+            {
+                return s.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 fn classify_probe_error(msg: &str) -> String {
     let lc = msg.to_lowercase();
     if lc.contains("credit balance") && lc.contains("too low") {

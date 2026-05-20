@@ -655,6 +655,16 @@ pub async fn gateway_providers_handler(
                 .map(|mut p| {
                     let name = p["name"].as_str().unwrap_or("").to_lowercase();
                     // Arricchimento con dati health probe (se disponibili).
+                    // Il probe mcp-core (provider_health_probe.rs) e' la fonte di
+                    // verita' canonica per lo stato dei provider: scrive in DB,
+                    // gira ogni 5 min, ha auto-recovery cooldown e outage detection.
+                    // Il gateway TypeScript ha un suo in-memory cache che puo'
+                    // restare stale (es. se loadApiKeysFromDb fallisce al boot
+                    // per ECONNRESET, marca tutti unhealthy senza retry). Quindi:
+                    //   - se il probe dice healthy=true E recente (<10 min) →
+                    //     sovrascrive il gateway: e' la verita' attuale.
+                    //   - se il probe dice unhealthy → mantiene unhealthy
+                    //     (ribadiamo anche se cooldown e' stato perso).
                     if let Some(h) = health_map.get(&name) {
                         p["last_health_check_at"] = json!(h.checked_at.to_rfc3339());
                         if let Some(lat) = h.latency_ms {
@@ -663,12 +673,20 @@ pub async fn gateway_providers_handler(
                         if let Some(kind) = &h.error_kind {
                             p["last_known_error_kind"] = json!(kind);
                         }
-                        // Se il probe ha visto unhealthy, ribadiamo lo stato anche se
-                        // il cooldown in-memory non e' attivo (es. mcp-core riavviato
-                        // ha perso il cooldown, ma il probe lo recuperera' al prossimo
-                        // round e nel frattempo il dato storico e' visibile).
-                        if !h.healthy {
-                            p["last_known_healthy"] = json!(false);
+                        p["last_known_healthy"] = json!(h.healthy);
+                        let probe_recent = chrono::Utc::now()
+                            .signed_duration_since(h.checked_at)
+                            .num_seconds() < 600;
+                        if h.healthy && probe_recent {
+                            // Probe recente positivo: forza healthy=true
+                            // anche se il gateway dice il contrario (cache stale).
+                            p["healthy"] = json!(true);
+                            // Pulisce eventuale "error" stale dal gateway.
+                            if p.get("error").is_some() {
+                                p["error"] = json!(null);
+                            }
+                        } else if !h.healthy {
+                            p["healthy"] = json!(false);
                         }
                     }
                     if let Some((secs, reason)) = cooldown_map.get(&name) {
@@ -936,6 +954,222 @@ pub async fn embeddings_apply_handler(
 }
 
 // ── Admin: gestione cooldown provider ────────────────────────────────────────
+
+/// GET /api/internal/providers/status
+///
+/// Endpoint no-auth dedicato al nexus-gateway TypeScript per leggere lo stato
+/// canonico dei provider senza tenere una sua cache in-memory (che andava
+/// stale e creava inconsistenza tra le due "verità" mcp-core vs gateway).
+///
+/// Ritorna per ogni provider noto:
+///   - `healthy`: true/false dal probe Rust (provider_health_probe.rs)
+///   - `last_check`: ISO timestamp dell'ultimo probe
+///   - `latency_ms`: latency del probe (se disponibile)
+///   - `error_kind`: tipo errore se unhealthy (quota_exceeded, billing_required, ecc.)
+///   - `cooldown_seconds_remaining`: se in cooldown attivo
+///   - `configured`: se la API key è presente in `settings`
+///
+/// Differenza con `gateway_providers_handler`: questo NON chiama il gateway
+/// (evita loop), e NON richiede auth (è solo lettura aggregata pubblica).
+pub async fn providers_status_internal(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+) -> Json<Value> {
+    const KNOWN_PROVIDERS: [&str; 5] = ["anthropic", "openai", "google", "deepseek", "mistral"];
+
+    // Ultimo health check per provider.
+    #[derive(sqlx::FromRow)]
+    struct HealthRow {
+        provider: String,
+        healthy: bool,
+        latency_ms: Option<i32>,
+        error_kind: Option<String>,
+        checked_at: chrono::DateTime<chrono::Utc>,
+    }
+    let health_rows: Vec<HealthRow> = sqlx::query_as::<_, HealthRow>(
+        r#"SELECT DISTINCT ON (provider)
+                  provider, healthy, latency_ms, error_kind, checked_at
+           FROM nexus_provider_health_history
+           ORDER BY provider, checked_at DESC"#,
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let health_map: std::collections::HashMap<String, HealthRow> = health_rows
+        .into_iter()
+        .map(|r| (r.provider.clone(), r))
+        .collect();
+
+    // API key presenti in settings.
+    #[derive(sqlx::FromRow)]
+    struct SettingsRow { key: String, value: String }
+    let settings_rows: Vec<SettingsRow> = sqlx::query_as::<_, SettingsRow>(
+        "SELECT key, value FROM settings WHERE category = 'providers' AND key LIKE '%_api_key'",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let api_key_configured: std::collections::HashMap<String, bool> = settings_rows
+        .into_iter()
+        .map(|r| (r.key.trim_end_matches("_api_key").to_string(), !r.value.trim().is_empty()))
+        .collect();
+
+    // Cooldown snapshot.
+    let cooldown_map: std::collections::HashMap<String, (u64, Option<String>)> =
+        crate::provider_cooldown::cooldown_snapshot()
+            .into_iter()
+            .map(|(name, secs, reason)| (name, (secs, reason)))
+            .collect();
+
+    let providers: Vec<Value> = KNOWN_PROVIDERS.iter().map(|&name| {
+        let mut p = json!({
+            "name": name,
+            "configured": api_key_configured.get(name).copied().unwrap_or(false),
+            "healthy": serde_json::Value::Null,
+        });
+        if let Some(h) = health_map.get(name) {
+            p["healthy"] = json!(h.healthy);
+            p["last_check"] = json!(h.checked_at.to_rfc3339());
+            if let Some(lat) = h.latency_ms { p["latency_ms"] = json!(lat); }
+            if let Some(kind) = &h.error_kind { p["error_kind"] = json!(kind); }
+        }
+        if let Some((secs, reason)) = cooldown_map.get(name) {
+            p["healthy"] = json!(false);
+            p["cooldown_seconds_remaining"] = json!(secs);
+            if let Some(r) = reason { p["error"] = json!(r); }
+        }
+        p
+    }).collect();
+
+    Json(json!({ "providers": providers }))
+}
+
+/// POST /api/admin/routing-matrix/auto-promote-now
+/// Forza un round del routing_matrix_auto_promoter (per test e admin)
+pub async fn admin_routing_matrix_auto_promote_now(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+) -> Json<Value> {
+    match crate::routing_matrix_auto_promoter::run_one_round(&state.db).await {
+        Ok(stats) => Json(json!({
+            "ok": true,
+            "updated": stats.updated,
+            "skipped_manual": stats.skipped_manual,
+            "no_candidates": stats.no_candidates,
+        })),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
+}
+
+/// GET /api/admin/providers/budget
+/// Ritorna il budget residuo per ogni provider (vista comoda della UI admin).
+pub async fn admin_providers_budget_list(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+) -> Json<Value> {
+    // Casto NUMERIC -> TEXT in SQL per evitare la dipendenza rust_decimal.
+    // sqlx mappa NUMERIC::text -> String senza problemi.
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        provider: String,
+        monthly_budget_usd: String,
+        spent_current_period_usd: String,
+        remaining_usd: String,
+        min_threshold_usd: String,
+        is_exhausted: bool,
+        period_start: chrono::DateTime<chrono::Utc>,
+    }
+    let rows: Vec<Row> = sqlx::query_as::<_, Row>(
+        "SELECT provider,
+                monthly_budget_usd::text AS monthly_budget_usd,
+                spent_current_period_usd::text AS spent_current_period_usd,
+                remaining_usd::text AS remaining_usd,
+                min_threshold_usd::text AS min_threshold_usd,
+                is_exhausted,
+                period_start
+           FROM provider_budget_remaining_view
+          ORDER BY provider",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "provider": r.provider,
+                "monthly_budget_usd": r.monthly_budget_usd,
+                "spent_usd": r.spent_current_period_usd,
+                "remaining_usd": r.remaining_usd,
+                "min_threshold_usd": r.min_threshold_usd,
+                "is_exhausted": r.is_exhausted,
+                "period_start": r.period_start.to_rfc3339(),
+            })
+        })
+        .collect();
+    Json(json!({ "providers": items }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetBudgetBody {
+    pub monthly_budget_usd: f64,
+    #[serde(default)]
+    pub min_threshold_usd: Option<f64>,
+}
+
+/// POST /api/admin/providers/:name/set-budget
+/// Imposta il budget mensile (e opzionalmente soglia minima) per un provider.
+/// Tipicamente chiamato quando l'admin ricarica l'account presso il provider.
+pub async fn admin_set_provider_budget(
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+    Json(body): Json<SetBudgetBody>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    if body.monthly_budget_usd < 0.0 {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": "monthly_budget_usd deve essere >= 0"})),
+        ));
+    }
+    let provider = name.to_lowercase();
+    let threshold = body.min_threshold_usd.unwrap_or(1.0);
+    let _ = sqlx::query(
+        "INSERT INTO provider_budget_status
+            (provider, monthly_budget_usd, min_threshold_usd, period_start, spent_current_period_usd)
+         VALUES ($1, $2, $3, NOW(), 0)
+         ON CONFLICT (provider) DO UPDATE
+            SET monthly_budget_usd = EXCLUDED.monthly_budget_usd,
+                min_threshold_usd = EXCLUDED.min_threshold_usd,
+                updated_at = NOW()",
+    )
+    .bind(&provider)
+    .bind(body.monthly_budget_usd)
+    .bind(threshold)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+    Ok(Json(json!({"ok": true, "provider": provider, "monthly_budget_usd": body.monthly_budget_usd})))
+}
+
+/// POST /api/admin/providers/:name/recharge-budget
+/// Azzera lo `spent` e ricomincia il periodo. Da chiamare dopo che l'admin
+/// ha effettivamente ricaricato l'account presso il provider.
+pub async fn admin_recharge_provider_budget(
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+) -> Json<Value> {
+    let provider = name.to_lowercase();
+    let _ = sqlx::query(
+        "UPDATE provider_budget_status
+            SET spent_current_period_usd = 0,
+                period_start = NOW(),
+                updated_at = NOW()
+          WHERE provider = $1",
+    )
+    .bind(&provider)
+    .execute(&state.db)
+    .await;
+    // Rimuovi anche eventuale cooldown billing (l'utente ha ricaricato).
+    crate::provider_cooldown::remove_cooldown(&provider);
+    Json(json!({"ok": true, "provider": provider}))
+}
 
 /// GET /api/admin/providers/cooldown
 /// Restituisce la lista di tutti i provider attualmente in cooldown.

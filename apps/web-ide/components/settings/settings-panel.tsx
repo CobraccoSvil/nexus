@@ -15,6 +15,7 @@ import { InfrastructureSettings } from "./infrastructure-settings";
 import { SecuritySettings } from "./security-settings";
 import { GatewayConfig } from "./gateway-config";
 import { CatalogMaintenance } from "./catalog-maintenance";
+import { ProviderBudget } from "./provider-budget";
 import { getGatewayProviders } from "../../lib/api-client";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
@@ -394,6 +395,8 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
         />
           {/* ── Sezione Catalogo modelli ── */}
           <CatalogMaintenance />
+          {/* ── Sezione Budget mensile provider ── */}
+          <ProviderBudget />
           {/* ── Sezione Gateway LLM integrata ── */}
           <div style={{ marginTop: 40, borderTop: "1px solid var(--color-border)", paddingTop: 24 }}>
             <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 6 }}>Gateway LLM</h2>

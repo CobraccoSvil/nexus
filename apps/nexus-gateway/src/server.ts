@@ -40,19 +40,38 @@ const DB_KEY_MAP: Record<string, string> = {
 async function loadApiKeysFromDb(): Promise<void> {
   const dbUrl = process.env.POSTGRES_URL ?? process.env.DATABASE_URL;
   if (!dbUrl) return;
-  const sql = postgres(dbUrl, { max: 1, idle_timeout: 5 });
-  try {
-    const rows = await sql<{ key: string; value: string }[]>`
-      SELECT key, value FROM settings
-      WHERE key = ANY(${Object.keys(DB_KEY_MAP)})
-        AND value IS NOT NULL AND value <> ''
-    `;
-    for (const { key, value } of rows) {
-      const envKey = DB_KEY_MAP[key];
-      if (envKey) process.env[envKey] = value;
+  // Retry con backoff esponenziale per resilienza al boot: Postgres potrebbe
+  // ancora essere in fase di startup (container Docker non pronto, race con
+  // systemd) e dare ECONNRESET. Senza retry, il gateway moriva e systemd lo
+  // riavviava in loop. Con retry, attende fino a ~30s che il DB sia pronto.
+  const MAX_ATTEMPTS = 5;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const sql = postgres(dbUrl, { max: 1, idle_timeout: 5, connect_timeout: 5 });
+    try {
+      const rows = await sql<{ key: string; value: string }[]>`
+        SELECT key, value FROM settings
+        WHERE key = ANY(${Object.keys(DB_KEY_MAP)})
+          AND value IS NOT NULL AND value <> ''
+      `;
+      for (const { key, value } of rows) {
+        const envKey = DB_KEY_MAP[key];
+        if (envKey) process.env[envKey] = value;
+      }
+      await sql.end();
+      return; // successo
+    } catch (err) {
+      await sql.end().catch(() => {});
+      if (attempt === MAX_ATTEMPTS) {
+        // Non rilanciare: meglio partire senza chiavi e farle ricaricare dopo
+        // (via /admin/reload o restart) piuttosto che crashare e impedire al
+        // gateway di accettare anche request che non richiedono LLM (health).
+        console.error(`[gateway] loadApiKeysFromDb fallito dopo ${MAX_ATTEMPTS} tentativi: ${(err as Error).message}. Provider keys NON caricate dal DB.`);
+        return;
+      }
+      const wait = Math.min(2000 * Math.pow(2, attempt - 1), 8000);
+      console.warn(`[gateway] loadApiKeysFromDb tentativo ${attempt}/${MAX_ATTEMPTS} fallito (${(err as Error).message}), retry tra ${wait}ms`);
+      await new Promise((r) => setTimeout(r, wait));
     }
-  } finally {
-    await sql.end();
   }
 }
 
@@ -279,19 +298,58 @@ app.addHook("preHandler", async (req, reply) => {
 
 // ── Routes ─────────────────────────────────────────────────────────────────────
 
-app.get("/health", async () => ({
-  status: "ok",
-  profile: config.profile,
-  providers: gateway.getProviderStatuses().map((p) => ({
-    name: p.name,
-    healthy: p.healthy,
-    last_check: p.last_check,
-  })),
-}));
+// ── Stato provider: delega a mcp-core ─────────────────────────────────────
+//
+// Il gateway TypeScript NON tiene piu' una cache locale dello stato dei
+// provider. La fonte di verita' canonica e' `nexus_provider_health_history`
+// scritto da `provider_health_probe.rs` (Rust) che gira ogni 5 min, persiste
+// in DB e ha auto-recovery cooldown + outage detection.
+//
+// Motivazione: in passato il gateway aveva una sua `Map<provider, healthy>`
+// in memoria popolata da `gateway.startHealthChecks()` con cadenza 60s. Se
+// `loadApiKeysFromDb` falliva al boot (es. ECONNRESET su Postgres), tutti
+// i provider risultavano unhealthy nella memoria del gateway e l'utente
+// vedeva tutti i LED rossi nella UI ANCHE quando il probe Rust diceva
+// healthy. Due fonti di verita' = inconsistenza garantita.
+//
+// Ora: `/health` e `/providers` proxano a mcp-core; se irraggiungibile,
+// fallback a un payload minimale (cosi' i monitoring esterni che pollano
+// `/health` continuano a vedere status=ok).
+const MCP_CORE_URL = process.env.MCP_CORE_URL ?? "http://localhost:4000";
 
-app.get("/providers", async () => ({
-  providers: gateway.getProviderStatuses(),
-}));
+async function fetchProvidersFromMcpCore(): Promise<Array<Record<string, unknown>> | null> {
+  try {
+    const res = await fetch(`${MCP_CORE_URL}/api/internal/providers/status`, {
+      method: "GET",
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { providers?: Array<Record<string, unknown>> };
+    return Array.isArray(data?.providers) ? data.providers : null;
+  } catch {
+    return null;
+  }
+}
+
+app.get("/health", async () => {
+  const fromMcp = await fetchProvidersFromMcpCore();
+  return {
+    status: "ok",
+    profile: config.profile,
+    providers: fromMcp ?? gateway.getProviderStatuses().map((p) => ({
+      name: p.name,
+      healthy: p.healthy,
+      last_check: p.last_check,
+    })),
+  };
+});
+
+app.get("/providers", async () => {
+  const fromMcp = await fetchProvidersFromMcpCore();
+  return {
+    providers: fromMcp ?? gateway.getProviderStatuses(),
+  };
+});
 
 app.post("/v1/complete", async (req, reply) => {
   const body = req.body as LLMRequest;

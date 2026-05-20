@@ -209,18 +209,32 @@ async fn probe_one_model(
     let outcome = match result {
         Ok(Ok(response)) => {
             // Distingue OK genuino da hollow_completion: il content deve
-            // contenere almeno 1 carattere. Reasoning models possono
-            // restituire content vuoto se max_tokens troppo basso lato
-            // brain; consideriamo questo come "model-specific" perche'
-            // significa che il modello non e' usabile in pratica.
-            let content_len = extract_content_len(&response);
-            if content_len > 0 {
-                Classification::Ok
-            } else {
+            // contenere almeno 1 carattere E non essere un errore ingoiato.
+            //
+            // Il brain Python (es. brain/providers/anthropic_provider.py:211)
+            // intercetta exception API (billing_error, quota_exceeded, ecc.)
+            // e ritorna ProviderResult con content="[Error: ...]" invece di
+            // propagare l'eccezione. Cosi' il Rust riceveva "completed" e
+            // marcava healthy=true mentre in realta' il provider era giu'.
+            // Quindi controlliamo anche il pattern "[Error:" / "[error:".
+            let content_text = extract_content_text(&response);
+            let trimmed = content_text.trim();
+            if trimmed.is_empty() {
                 Classification::ModelSpecific(
                     "hollow_completion".to_string(),
-                    Some(format!("response had {} chars of content", content_len)),
+                    Some("response had 0 chars of content".to_string()),
                 )
+            } else if trimmed.starts_with("[Error:") || trimmed.starts_with("[error:") {
+                // Errore ingoiato dal brain. Estrai messaggio e classifica.
+                let inner = trimmed
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .trim_start_matches("Error:")
+                    .trim_start_matches("error:")
+                    .trim();
+                classify_model_error(inner)
+            } else {
+                Classification::Ok
             }
         }
         Ok(Err(e)) => {
@@ -257,22 +271,18 @@ async fn probe_one_model(
     // Applica logica counter / auto-disable / auto-reenable.
     match outcome {
         Classification::Ok => {
-            // Reset counter; se era auto-disabled, riabilita.
-            let _ = sqlx::query(
-                "UPDATE ai_price_catalog
-                    SET consecutive_failures = 0,
-                        auto_disabled_at = NULL,
-                        auto_disabled_reason = NULL,
-                        updated_at = NOW()
-                  WHERE provider = $1 AND model = $2 AND consecutive_failures > 0",
-            )
-            .bind(provider)
-            .bind(model)
-            .execute(db)
-            .await;
+            // Il probe usa prompt "ping" (1-2 token output) — un account
+            // con budget quasi vuoto puo' passare il probe ma fallire sui
+            // workload reali (es. anthropic con credit basso risponde
+            // a "hi" ma fallisce su 5000+ token). Quindi il probe-OK NON
+            // resetta il counter di consecutive_failures: solo i run REALI
+            // (in chat_messages.rs::2117+) possono resettarlo, perche'
+            // solo loro testano workload reale.
+            // Il probe puo' SOLO segnalare success per logging.
             if prior_failures > 0 {
-                tracing::info!(
-                    "model_health_probe: {provider}/{model} recovered (was failing x{prior_failures})"
+                tracing::debug!(
+                    "model_health_probe: {provider}/{model} probe-OK ma prior_failures={} (non reset, attende run reale)",
+                    prior_failures
                 );
             }
             ProbeOutcome::Ok
@@ -384,6 +394,44 @@ fn classify_model_error(msg: &str) -> Classification {
     // Default: trattalo come model-specific (conservativo: meglio
     // disabilitare un modello dubbio che continuare a pingerlo a vuoto).
     Classification::ModelSpecific("unknown".into(), Some(truncate(msg, 500)))
+}
+
+/// Estrae il testo del content dalla response in vari formati provider.
+/// Versione "text" usata per pattern-match su "[Error:". `extract_content_len`
+/// resta come wrapper per backward-compat con i test esistenti.
+fn extract_content_text(value: &serde_json::Value) -> String {
+    if let Some(s) = value.get("content").and_then(|v| v.as_str()) {
+        return s.to_string();
+    }
+    if let Some(arr) = value.get("choices").and_then(|v| v.as_array()) {
+        if let Some(first) = arr.first() {
+            if let Some(s) = first
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+            {
+                return s.to_string();
+            }
+        }
+    }
+    if let Some(candidates) = value.get("candidates").and_then(|v| v.as_array()) {
+        if let Some(first) = candidates.first() {
+            if let Some(parts) = first
+                .get("content")
+                .and_then(|c| c.get("parts"))
+                .and_then(|p| p.as_array())
+            {
+                let mut buf = String::new();
+                for p in parts {
+                    if let Some(s) = p.get("text").and_then(|t| t.as_str()) {
+                        buf.push_str(s);
+                    }
+                }
+                return buf;
+            }
+        }
+    }
+    String::new()
 }
 
 fn extract_content_len(value: &serde_json::Value) -> usize {

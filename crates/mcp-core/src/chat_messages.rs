@@ -790,7 +790,12 @@ async fn build_message_with_recent_context_for_classifier(
     }
     let mut ctx = ctx_parts.join("\n");
     if ctx.len() > 600 {
-        ctx.truncate(600);
+        // UTF-8 safe truncate (vedi nota analoga in embed_input)
+        let mut cut = 600;
+        while cut > 0 && !ctx.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        ctx.truncate(cut);
         ctx.push_str("...");
     }
     format!(
@@ -1093,7 +1098,14 @@ async fn build_vectorized_conversation_history(
     embed_input.push_str("user: ");
     embed_input.push_str(current_message);
     if embed_input.len() > 1500 {
-        embed_input.truncate(1500);
+        // Truncate UTF-8 safe: cerca il char boundary piu' vicino sotto 1500
+        // per evitare panic "assertion failed: self.is_char_boundary(new_len)"
+        // se 1500 cade in mezzo a un byte multi-byte (accentate, emoji, ecc.).
+        let mut cut = 1500;
+        while cut > 0 && !embed_input.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        embed_input.truncate(cut);
     }
     let vector = match neural.embed_text("", &embed_input).await {
         Ok(v) => {
@@ -2115,6 +2127,77 @@ async fn spawn_agent_run(
             )
             .await;
 
+            // ── Counter hollow per modello (auto-disable) ────────────────────
+            // Se il run e' hollow_completion REALE in produzione, incrementa
+            // il counter consecutive_failures su ai_price_catalog. Questo e'
+            // piu' affidabile del model_health_probe perche' rileva il problema
+            // su workload reali (prompt lunghi, max_tokens reali) — non con
+            // "ping" che a volte passa anche su modelli broken (es. gemini-3.5-flash
+            // risponde a "ping" in 5s ma da hollow su prompt agente).
+            //
+            // Soglia 3 fallimenti consecutivi → is_enabled=false. Reset a 0 al
+            // primo successo (status=Completed e final_answer NON vuoto).
+            let intent_uses_tools = classified_intent_for_loop != "chat";
+            if matches!(result.status, AgentRunStatus::Completed) && intent_uses_tools {
+                let success_now = !result.hollow_completion
+                    && result.final_answer.as_ref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false);
+                if result.hollow_completion {
+                    let new_count: Option<i32> = sqlx::query_scalar(
+                        "UPDATE ai_price_catalog
+                            SET consecutive_failures = consecutive_failures + 1,
+                                updated_at = NOW()
+                          WHERE provider = $1 AND model = $2
+                        RETURNING consecutive_failures",
+                    )
+                    .bind(&result.provider)
+                    .bind(&result.model)
+                    .fetch_optional(&db_clone)
+                    .await
+                    .ok()
+                    .flatten();
+                    if let Some(n) = new_count {
+                        tracing::warn!(
+                            "agent_run {}: hollow run reale su {}/{} — counter={}/3",
+                            run_id, result.provider, result.model, n
+                        );
+                        if n >= 3 {
+                            let _ = sqlx::query(
+                                "UPDATE ai_price_catalog
+                                    SET is_enabled = false,
+                                        auto_disabled_at = NOW(),
+                                        auto_disabled_reason = 'hollow_completion_runtime',
+                                        updated_at = NOW()
+                                  WHERE provider = $1 AND model = $2
+                                    AND is_enabled = true",
+                            )
+                            .bind(&result.provider)
+                            .bind(&result.model)
+                            .execute(&db_clone)
+                            .await;
+                            tracing::warn!(
+                                "AUTO-DISABLE runtime {}/{} dopo {} hollow consecutivi",
+                                result.provider, result.model, n
+                            );
+                        }
+                    }
+                } else if success_now {
+                    let _ = sqlx::query(
+                        "UPDATE ai_price_catalog
+                            SET consecutive_failures = 0,
+                                auto_disabled_at = NULL,
+                                auto_disabled_reason = NULL,
+                                updated_at = NOW()
+                          WHERE provider = $1 AND model = $2 AND consecutive_failures > 0",
+                    )
+                    .bind(&result.provider)
+                    .bind(&result.model)
+                    .execute(&db_clone)
+                    .await;
+                }
+            }
+
             // Decide se ritentare: nuova logica basata su error_class strutturato
             // propagato dal brain via SSE, oltre allo stato cooldown del provider.
             // Casi che giustificano un retry su altro provider:
@@ -2152,37 +2235,98 @@ async fn spawn_agent_run(
                 );
             }
 
-            // Cerca il prossimo provider nella gerarchia, non già provato e non in cooldown
-            let next = provider_hierarchy.iter().find(|p| {
-                !tried.contains(*p) && !crate::provider_cooldown::is_provider_in_cooldown(p)
-            });
-            let Some(next_provider) = next else {
-                tracing::warn!("agent_run {}: nessun provider alternativo disponibile, mantengo risultato", run_id);
-                break;
-            };
-            current_provider = next_provider.clone();
-            // Modello di default per il nuovo provider, letto da DB (registry routing).
-            // Se la matrice non e' caricata o il provider non e' configurato,
-            // mantengo il modello corrente invece di applicare un fallback hardcoded.
-            // Background task: log warn ma non blocco il run.
-            current_model = match routing_matrix_for_loop.current_async().await {
-                Ok(matrix_arc) => matrix_arc
-                    .default_model(&current_provider)
-                    .unwrap_or_else(|| {
-                        tracing::warn!(
-                            "agent_run {}: provider '{}' non configurato in nexus_provider_default_model, mantengo modello corrente",
-                            run_id, current_provider
-                        );
-                        current_model
-                    }),
-                Err(e) => {
-                    tracing::error!(
-                        "agent_run {}: routing_matrix non disponibile ({}), mantengo modello corrente",
-                        run_id, e
+            // ── ESCALATION su hollow ricorrente ─────────────────────────────
+            // Se gia' 1 hollow nel run (questo e' il 2o tentativo dopo hollow),
+            // smetti di girare in tondo sui modelli small e scala al primo
+            // modello "di ordine superiore" disponibile nel catalog:
+            // performance_tier='heavy' AND is_enabled, ordinato per qualita'
+            // (costo input desc = proxy di capacita'). Provider-agnostic:
+            // sceglie qualunque heavy disponibile non gia' tried/in-cooldown.
+            //
+            // Esempi attesi (sort cost desc):
+            //   anthropic/claude-opus-4-7 > openai/gpt-5 > anthropic/claude-sonnet-4-6
+            //   > mistral/mistral-large-latest > google/gemini-2.5-pro > deepseek/deepseek-reasoner
+            //
+            // Conta come "hollow precedente" se hollow_retry == true ora E
+            // questo e' fallback_attempt >= 1 (cioe' siamo gia' al 2o turno).
+            let escalate_on_hollow = hollow_retry && fallback_attempt >= 1;
+            let next_pair: Option<(String, String)> = if escalate_on_hollow {
+                let tried_models: Vec<String> = tried.iter().cloned().collect();
+                // Ordina i candidati in base alla "potenza" desumibile dal catalog:
+                //   1. tier_rank: heavy(2) > medium(1) > light(0)
+                //   2. input_cost_per_million_tokens desc (proxy di capacita')
+                // Filtri:
+                //   - is_enabled
+                //   - supports_tool_use (l'intent richiede tool)
+                //   - consecutive_failures = 0 (non ha gia' dato hollow di recente)
+                //   - provider non gia' tried in questo run
+                //   - provider non in cooldown billing/quota
+                let candidates: Vec<(String, String, String)> = sqlx::query_as::<_, (String, String, String)>(
+                    "SELECT provider, model, performance_tier
+                       FROM ai_price_catalog
+                      WHERE is_enabled = true
+                        AND supports_tool_use = true
+                        AND consecutive_failures = 0
+                        AND NOT (provider = ANY($1))
+                      ORDER BY CASE performance_tier
+                                 WHEN 'heavy' THEN 2
+                                 WHEN 'medium' THEN 1
+                                 ELSE 0
+                               END DESC,
+                               input_cost_per_million_tokens DESC NULLS LAST,
+                               output_cost_per_million_tokens DESC NULLS LAST",
+                )
+                .bind(&tried_models)
+                .fetch_all(&db_clone)
+                .await
+                .unwrap_or_default();
+                // Primo candidato il cui provider non e' in cooldown
+                candidates.into_iter().find(|(p, _, _)| {
+                    !crate::provider_cooldown::is_provider_in_cooldown(p)
+                }).map(|(p, m, tier)| {
+                    tracing::warn!(
+                        "agent_run {}: ESCALATION hollow ricorrente — salto a tier={} {}/{} (provider-agnostic)",
+                        run_id, tier, p, m
                     );
-                    current_model
-                }
+                    (p, m)
+                })
+            } else { None };
+
+            let (chosen_provider, chosen_model) = if let Some(pair) = next_pair {
+                pair
+            } else {
+                // Cerca il prossimo provider nella gerarchia, non gia' provato e non in cooldown
+                let next = provider_hierarchy.iter().find(|p| {
+                    !tried.contains(*p) && !crate::provider_cooldown::is_provider_in_cooldown(p)
+                });
+                let Some(next_provider) = next else {
+                    tracing::warn!("agent_run {}: nessun provider alternativo disponibile, mantengo risultato", run_id);
+                    break;
+                };
+                let new_provider = next_provider.clone();
+                // Modello di default per il nuovo provider, letto da DB (registry routing).
+                let new_model = match routing_matrix_for_loop.current_async().await {
+                    Ok(matrix_arc) => matrix_arc
+                        .default_model(&new_provider)
+                        .unwrap_or_else(|| {
+                            tracing::warn!(
+                                "agent_run {}: provider '{}' non configurato in nexus_provider_default_model, mantengo modello corrente",
+                                run_id, new_provider
+                            );
+                            current_model.clone()
+                        }),
+                    Err(e) => {
+                        tracing::error!(
+                            "agent_run {}: routing_matrix non disponibile ({}), mantengo modello corrente",
+                            run_id, e
+                        );
+                        current_model.clone()
+                    }
+                };
+                (new_provider, new_model)
             };
+            current_provider = chosen_provider;
+            current_model = chosen_model;
             fallback_attempt += 1;
             tracing::warn!(
                 "agent_run {}: fallback automatico a {}/{} (motivo: {})",
@@ -2359,6 +2503,28 @@ async fn spawn_agent_run(
         .bind(result.nexus_task_type.as_deref())
         .execute(&db_clone)
         .await;
+
+        // ── Budget tracking ──────────────────────────────────────────────
+        // Incrementa il `spent_current_period_usd` per il provider del run.
+        // Strategia comune a tutti i 5 provider visto che la maggior parte
+        // (anthropic/openai/google/mistral) non espone balance via API: il
+        // budget va stimato sommando il cost dei run reali. L'admin imposta
+        // monthly_budget_usd quando ricarica l'account presso il provider.
+        // Quando residuo < min_threshold → probe marca unhealthy con
+        // error_kind='budget_exhausted'.
+        if result.total_cost > 0.0 {
+            let _ = sqlx::query(
+                "INSERT INTO provider_budget_status (provider, spent_current_period_usd)
+                   VALUES ($1, $2)
+                 ON CONFLICT (provider) DO UPDATE
+                   SET spent_current_period_usd = provider_budget_status.spent_current_period_usd + EXCLUDED.spent_current_period_usd,
+                       updated_at = NOW()",
+            )
+            .bind(&result.provider)
+            .bind(result.total_cost)
+            .execute(&db_clone)
+            .await;
+        }
 
         // Persisti gli step del run su agent_steps (fix bug: la tabella veniva letta
         // da chat_agent.rs:121,195 ma non scritta — dashboard "AI Workspace" mostrava

@@ -57,6 +57,8 @@ mod port_registry;
 mod provider_health_probe;
 mod model_health_probe;
 mod catalog_sync_worker;
+mod deepseek_balance_sync;
+mod routing_matrix_auto_promoter;
 mod dispatcher_routes;
 mod task_watchdog;
 
@@ -657,6 +659,42 @@ async fn main() -> anyhow::Result<()> {
         model_probe_threshold,
     );
 
+    // Worker `deepseek_balance_sync`: DeepSeek e' l'unico provider con
+    // endpoint pubblico /user/balance. Sincronizza provider_budget_status
+    // con il dato reale ogni 15 min (default).
+    deepseek_balance_sync::spawn_deepseek_balance_sync(
+        state.db.clone(),
+        true,
+        900,
+    );
+
+    // Worker `routing_matrix_auto_promoter`: ricostruisce le righe della
+    // routing matrix dal catalog modelli ogni 6h (default), promuovendo i
+    // nuovi modelli appena rilasciati e sostituendo quelli auto-disabled
+    // dal model_health_probe. Le righe con manual_override=true (admin) NON
+    // vengono toccate. Vedi `routing_matrix_auto_promoter.rs`.
+    let auto_promote_enabled: Option<String> =
+        settings::get_setting(&state.db, "routing_matrix_auto_promote_enabled")
+            .await
+            .ok()
+            .flatten();
+    let auto_promote_interval: Option<String> =
+        settings::get_setting(&state.db, "routing_matrix_auto_promote_interval_s")
+            .await
+            .ok()
+            .flatten();
+    let ap_enabled = auto_promote_enabled
+        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true);
+    let ap_interval = auto_promote_interval
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(21600);
+    routing_matrix_auto_promoter::spawn_routing_matrix_auto_promoter(
+        state.db.clone(),
+        ap_enabled,
+        ap_interval,
+    );
+
     // ToolRunner gRPC server (Fase 1 refactor orchestrazione LangGraph).
     // Valore canonico: settings.tool_runner_enabled nel DB (admin panel).
     // Override emergenza: ENABLE_TOOL_RUNNER=1 (priorita' piu' alta del DB).
@@ -758,6 +796,14 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/internal/routing/decide",
                 post(internal_routing::decide_routing).get(internal_routing::decide_routing_get),
+            )
+            // /api/internal/providers/status — no-auth, ritorna lo stato
+            // canonico dei provider (last health probe + cooldown). Usato dal
+            // nexus-gateway TypeScript per evitare di tenere una sua cache
+            // locale (era fonte di stale/inconsistency).
+            .route(
+                "/api/internal/providers/status",
+                get(environment::providers_status_internal),
             )
             // /api/internal/routing/catalog — Fase D consolidamento: espone
             // il catalogo prezzi LLM al brain Python e dashboard admin.
@@ -2157,8 +2203,28 @@ async fn main() -> anyhow::Result<()> {
                     .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
             )
             .route(
+                "/api/admin/providers/budget",
+                get(environment::admin_providers_budget_list)
+                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+            )
+            .route(
+                "/api/admin/routing-matrix/auto-promote-now",
+                post(environment::admin_routing_matrix_auto_promote_now)
+                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+            )
+            .route(
                 "/api/admin/providers/:name/reset-cooldown",
                 post(environment::admin_reset_provider_cooldown)
+                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+            )
+            .route(
+                "/api/admin/providers/:name/set-budget",
+                post(environment::admin_set_provider_budget)
+                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+            )
+            .route(
+                "/api/admin/providers/:name/recharge-budget",
+                post(environment::admin_recharge_provider_budget)
                     .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
             )
             .route(
