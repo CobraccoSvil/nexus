@@ -2084,7 +2084,24 @@ async fn spawn_agent_run(
         // viene messo in cooldown lungo (in brain_agent_client). Qui rileviamo
         // il fallimento e ritentiamo con il prossimo provider della gerarchia
         // ammin (escludendo quelli in cooldown).
-        const MAX_PROVIDER_FALLBACKS: usize = 4;
+        //
+        // Limite dinamico: tante iterazioni quanti sono i provider con almeno
+        // un modello idoneo nel catalog (is_enabled + supports_tool_use +
+        // consecutive_failures=0). Il +1 copre il tentativo iniziale. Floor=2
+        // per garantire almeno un fallback se il catalog e' parziale.
+        let max_provider_fallbacks: usize = {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(DISTINCT provider)
+                   FROM ai_price_catalog
+                  WHERE is_enabled = true
+                    AND supports_tool_use = true
+                    AND consecutive_failures = 0"
+            )
+            .fetch_one(&db_clone)
+            .await
+            .unwrap_or(4);
+            std::cmp::max(2, (n as usize).saturating_add(1))
+        };
         let provider_hierarchy: Vec<String> = {
             let row: Option<String> = sqlx::query_scalar(
                 "SELECT value FROM settings WHERE key = 'provider_hierarchy' LIMIT 1"
@@ -2110,7 +2127,7 @@ async fn spawn_agent_run(
             tried.insert(current_provider.to_lowercase());
             tracing::info!(
                 "agent_run {}: tentativo {}/{} con provider={} model={}",
-                run_id, fallback_attempt + 1, MAX_PROVIDER_FALLBACKS, current_provider, current_model
+                run_id, fallback_attempt + 1, max_provider_fallbacks, current_provider, current_model
             );
             result = crate::brain_agent_client::run_via_brain(
                 run_id,
@@ -2223,7 +2240,7 @@ async fn spawn_agent_run(
                 && classified_intent_for_loop != "chat";
             let should_retry = failed_retry || hollow_retry;
 
-            if !should_retry || fallback_attempt + 1 >= MAX_PROVIDER_FALLBACKS {
+            if !should_retry || fallback_attempt + 1 >= max_provider_fallbacks {
                 break;
             }
 
