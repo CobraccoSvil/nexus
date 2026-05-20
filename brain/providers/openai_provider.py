@@ -7,7 +7,35 @@ from typing import Any, AsyncIterator
 
 # Modelli della serie "reasoning" di OpenAI che non accettano temperature, top_p
 # e usano max_completion_tokens invece di max_tokens.
-_O_SERIES_MODELS = frozenset({"o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini"})
+#
+# Aggiornato 2026-05-20: aggiunti gpt-5 family e gpt-4.5. Prima i log brain
+# erano pieni di "Unsupported parameter: 'max_tokens' is not supported with
+# this model. Use 'max_completion_tokens' instead." per gpt-5, gpt-5-mini,
+# gpt-5.4, gpt-5.5 ecc. che ricadevano nel ramo "use max_tokens".
+_O_SERIES_MODELS = frozenset({
+    # Reasoning models (originale)
+    "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini",
+    # GPT-5 family (rilasciati 2025+): tutti richiedono max_completion_tokens
+    "gpt-5", "gpt-5-mini", "gpt-5-nano",
+    "gpt-5.2", "gpt-5.3", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.5",
+    # GPT-4.5 family (anche reasoning)
+    "gpt-4.5", "gpt-4.5-preview",
+})
+
+# Modelli OpenAI che NON sono supportati su /v1/chat/completions ma solo
+# sull'endpoint /v1/responses (release 2025). Il brain attuale non li
+# supporta: ritorniamo errore strutturato cosi' il model_health_probe Rust
+# li auto-disabilita dal catalog.
+_RESPONSES_ONLY_MODELS = frozenset({
+    "gpt-5-pro", "gpt-5-codex", "gpt-5.4-pro", "gpt-5.5-pro", "gpt-5.2-pro",
+    "o1-pro", "o3-pro", "o3-deep-research", "o4-mini-deep-research",
+})
+
+
+def _is_responses_only(model: str) -> bool:
+    """Modelli OpenAI che richiedono /v1/responses (non supportati dal brain)."""
+    model_lower = model.lower()
+    return any(model_lower == m or model_lower.startswith(m + "-") for m in _RESPONSES_ONLY_MODELS)
 
 # Soglia: se un modello o-series riceve piu' di N tool, applichiamo il filtro
 # safety net lato Python (il filtro principale avviene lato Rust in
@@ -103,6 +131,14 @@ class OpenAIProvider(BaseProvider):
                 content="[OpenAI API key not configured]",
                 metadata={"error": "missing_api_key"},
             )
+        # Early return per modelli che richiedono v1/responses (brain non supporta).
+        # Il model_health_probe Rust riconosce "model_not_found" e auto-disabilita.
+        if _is_responses_only(model):
+            return ProviderResult(
+                provider=self.name, model=model,
+                content=f"[Error: model_not_found — {model} requires v1/responses endpoint, not supported by brain]",
+                metadata={"error": "responses_only_model", "model": model},
+            )
         try:
             client = self._get_client()
             max_tok = kwargs.get("max_tokens", 4096)
@@ -154,6 +190,12 @@ class OpenAIProvider(BaseProvider):
                 provider=self.name, model=model,
                 content="[OpenAI API key not configured]",
                 metadata={"error": "missing_api_key"},
+            )
+        if _is_responses_only(model):
+            return ProviderResult(
+                provider=self.name, model=model,
+                content=f"[Error: model_not_found — {model} requires v1/responses endpoint, not supported by brain]",
+                metadata={"error": "responses_only_model", "model": model},
             )
         try:
             client = self._get_client()
@@ -292,6 +334,13 @@ class OpenAIProvider(BaseProvider):
         """
         if not self._api_key:
             yield {"type": "error", "message": "OpenAI API key non configurata"}
+            return
+        if _is_responses_only(model):
+            yield {
+                "type": "error",
+                "message": f"model_not_found — {model} requires v1/responses endpoint, not supported by brain",
+                "metadata": {"error": "responses_only_model", "model": model},
+            }
             return
         try:
             import json as _json
