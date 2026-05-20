@@ -1460,6 +1460,21 @@ export async function deletePortAllocation(
   );
 }
 
+/** Termina il processo in ascolto sulla porta e rilascia l'allocazione. */
+export async function killPortProcess(
+  projectId: string,
+  port: number,
+): Promise<{ ok: boolean; port: number; freed: boolean; deleted_allocations: number }> {
+  return fetchJson(
+    `${API_BASE}/api/projects/${projectId}/services/kill-port-process`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ port }),
+    },
+  );
+}
+
 /** Disinstalla un servizio systemd del progetto (stop+disable+rimuove unit file). */
 export async function uninstallProjectService(
   projectId: string,

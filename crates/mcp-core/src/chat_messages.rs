@@ -697,7 +697,7 @@ async fn build_recent_conversation_history(
         FROM chat_messages
         WHERE session_id = $1
           AND deleted_at IS NULL
-          AND role IN ('user', 'assistant')
+          AND role IN ('user', 'assistant', 'summary')
         ORDER BY created_at DESC
         LIMIT $2
         "#,
@@ -717,7 +717,9 @@ async fn build_recent_conversation_history(
         let role = row.try_get::<String, _>("role").ok()?;
         let content = row.try_get::<String, _>("content").ok()?;
         if content.trim().is_empty() { return None; }
-        // Normalizza il ruolo per compatibilità con il formato messages LLM
+        // Normalizza il ruolo per compatibilità con il formato messages LLM.
+        // 'summary' (iniettato dal compact) viene inviato come messaggio user
+        // — il content e' gia' prefissato con "[Riassunto ...]".
         let llm_role = match role.as_str() {
             "assistant" => "assistant",
             _ => "user",
@@ -2247,10 +2249,35 @@ async fn spawn_agent_run(
             );
         }
 
-        // Save final answer as assistant message
-        if let Some(ref answer) = result.final_answer {
-            // Annota la risposta solo se l'intent richiedeva tool (NON chat/docs)
-            let effective_answer = if report_hollow {
+        // Save final answer as assistant message.
+        // Se l'agente ha completato ma final_answer e' None o whitespace-only
+        // (caso hollow EMPTY_ANSWER, es. deepseek-coder che chiude il turno
+        // senza emettere body), generiamo comunque un messaggio chiaro per
+        // l'utente — altrimenti la UI mostra solo lo status "completed"
+        // senza alcun contenuto, lasciando l'utente con l'impressione che il
+        // sistema abbia "fatto qualcosa" che in realta' non e' avvenuto.
+        let answer_owned: Option<String> = match result.final_answer.as_ref() {
+            Some(s) if !s.trim().is_empty() => Some(s.clone()),
+            // Final answer mancante o vuoto: fabrichiamo un placeholder solo
+            // se siamo arrivati qui DOPO il retry loop (hollow_completion
+            // confermato e tentativi esauriti). Altrimenti il body fantasma
+            // confonderebbe la storia turni.
+            _ if report_hollow => Some(format!(
+                "_(Nessuna risposta utile prodotta dall'agente — {} / {} ha chiuso \
+                 il turno con un completamento vuoto dopo aver esaurito i tentativi \
+                 di fallback. Riformula la richiesta o cambia provider/modello manualmente.)_",
+                result.provider, result.model
+            )),
+            _ => None,
+        };
+
+        if let Some(ref answer) = answer_owned {
+            // Annota la risposta solo se l'intent richiedeva tool e l'agente
+            // ha prodotto un body (per evitare doppia annotazione sul placeholder).
+            let had_real_body = result.final_answer.as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let effective_answer = if report_hollow && had_real_body {
                 format!(
                     "{answer}\n\n---\n*Avviso: l'agente ({}/{}) ha risposto senza \
                      eseguire alcun tool (0 step). La risposta potrebbe essere \

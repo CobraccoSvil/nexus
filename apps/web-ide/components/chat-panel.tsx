@@ -1429,10 +1429,18 @@ export function ChatPanel({
 
       {/* Token usage bar */}
       {(() => {
-        // Ultimo messaggio assistant con metriche (copre sia chat normale che agent run)
+        // Ultimo messaggio assistant ATTIVO con metriche. Esclude i soft-deleted
+        // perche' dopo un compact i vecchi assistant restano nel DB con
+        // deletedAt valorizzato — se li contassimo, la TokenUsageBar resterebbe
+        // bloccata sulla %ctx del messaggio gigante pre-compact.
         const lastAssistantWithTokens = [...messages]
           .reverse()
-          .find((m) => m.role === "assistant" && (m.promptTokens ?? 0) > 0);
+          .find(
+            (m) =>
+              m.role === "assistant" &&
+              !m.deletedAt &&
+              (m.promptTokens ?? 0) > 0,
+          );
         const activeModel =
           agentRun?.model ||
           lastAssistantWithTokens?.model ||

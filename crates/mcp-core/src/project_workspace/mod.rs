@@ -6,6 +6,7 @@ pub mod changes;
 pub mod fs_events;
 pub mod logs;
 pub mod playwright_install;
+pub mod port_recovery;
 pub mod processes;
 pub mod run_configs;
 pub mod runtime_issues;
@@ -55,6 +56,8 @@ pub use changes::get_project_changes;
 
 pub use allocate_port::allocate_port as allocate_project_port;
 pub use allocate_port::find_or_allocate as find_or_allocate_port;
+pub use allocate_port::kill_orphan_processes as kill_project_orphan_processes;
+pub use allocate_port::kill_port_process as kill_project_port_process;
 
 pub use execute_cmd::execute_command;
 

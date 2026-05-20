@@ -55,6 +55,8 @@ mod internal_routing;
 mod internal_learning;
 mod port_registry;
 mod provider_health_probe;
+mod model_health_probe;
+mod catalog_sync_worker;
 mod dispatcher_routes;
 mod task_watchdog;
 
@@ -555,6 +557,11 @@ async fn main() -> anyhow::Result<()> {
         s_tool_runner,
         s_http_timeout,
         s_http_pool,
+        s_model_health_enabled,
+        s_model_health_interval,
+        s_model_health_threshold,
+        s_catalog_sync_enabled,
+        s_catalog_sync_interval,
     ) = tokio::join!(
         settings::get_setting(&state.db, "llm_classifier_enabled"),
         settings::get_setting(&state.db, "provider_health_probe_enabled"),
@@ -562,6 +569,11 @@ async fn main() -> anyhow::Result<()> {
         settings::get_setting(&state.db, "tool_runner_enabled"),
         settings::get_setting(&state.db, "http_timeout_secs"),
         settings::get_setting(&state.db, "http_pool_max"),
+        settings::get_setting(&state.db, "model_health_probe_enabled"),
+        settings::get_setting(&state.db, "model_health_probe_interval_s"),
+        settings::get_setting(&state.db, "model_health_probe_failure_threshold"),
+        settings::get_setting(&state.db, "model_catalog_sync_enabled"),
+        settings::get_setting(&state.db, "model_catalog_sync_interval_s"),
     );
 
     // Inizializza il flag AtomicBool per il classificatore LLM.
@@ -609,27 +621,41 @@ async fn main() -> anyhow::Result<()> {
         state.agent_channels.clone(),
     );
 
-    // Worker `model_catalog_sync`: ogni 24h aggiorna ai_price_catalog
-    // dal JSON LiteLLM (prezzi, context_window, supports_function_calling).
-    // Nuovi modelli scoperti vengono inseriti con is_enabled=false: l'admin
-    // li attiva quando vuole dopo aver impostato tier/capabilities.
-    // Primo run a 60s dall'avvio per avere tempo di stabilizzarsi.
-    {
-        let db = state.db.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            loop {
-                match models::run_catalog_sync(&db).await {
-                    Ok((added, updated, skipped)) => tracing::info!(
-                        "model_catalog_sync: added={} updated={} skipped={}",
-                        added, updated, skipped
-                    ),
-                    Err(e) => tracing::warn!("model_catalog_sync fallito: {}", e),
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
-            }
-        });
-    }
+    // Worker `catalog_sync`: aggiorna periodicamente ai_price_catalog dal
+    // JSON LiteLLM. Cadenza configurabile via settings.model_catalog_sync_interval_s
+    // (default 12h, minimo 1h). Disabilitabile via settings.model_catalog_sync_enabled.
+    let catalog_sync_enabled = s_catalog_sync_enabled.ok().flatten()
+        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true);
+    let catalog_sync_interval = s_catalog_sync_interval.ok().flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(43200);
+    catalog_sync_worker::spawn_catalog_sync_worker(
+        state.db.clone(),
+        catalog_sync_enabled,
+        catalog_sync_interval,
+    );
+
+    // Worker `model_health_probe`: pinga ogni modello enabled in ai_price_catalog
+    // per rilevare modelli broken model-specific (model_not_found, hollow_completion,
+    // unsupported, ecc.). Auto-disable dopo N fallimenti consecutivi
+    // (settings.model_health_probe_failure_threshold, default 3).
+    let model_probe_enabled = s_model_health_enabled.ok().flatten()
+        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true);
+    let model_probe_interval = s_model_health_interval.ok().flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(1800);
+    let model_probe_threshold = s_model_health_threshold.ok().flatten()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .unwrap_or(3);
+    model_health_probe::spawn_model_health_probe(
+        std::sync::Arc::new(state.orchestrator.clone()),
+        state.db.clone(),
+        model_probe_enabled,
+        model_probe_interval,
+        model_probe_threshold,
+    );
 
     // ToolRunner gRPC server (Fase 1 refactor orchestrazione LangGraph).
     // Valore canonico: settings.tool_runner_enabled nel DB (admin panel).
@@ -1406,6 +1432,20 @@ async fn main() -> anyhow::Result<()> {
                 )),
             )
             .route(
+                "/api/projects/:id/services/kill-orphan-processes",
+                post(project_workspace::kill_project_orphan_processes).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/projects/:id/services/kill-port-process",
+                post(project_workspace::kill_project_port_process).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
                 "/api/projects/:id/services/:service",
                 axum::routing::delete(project_workspace::uninstall_project_service).layer(axum_mw::from_fn_with_state(
                     state.clone(),
@@ -1992,6 +2032,11 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/admin/sync-model-catalog",
                 post(models::sync_model_catalog)
+                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+            )
+            .route(
+                "/api/admin/probe-models",
+                post(models::probe_models_now)
                     .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
             )
             // Admin users management

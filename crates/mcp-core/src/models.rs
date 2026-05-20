@@ -483,3 +483,28 @@ pub async fn auto_upgrade_models_endpoint(State(state): State<AppState>) -> Json
     }
 }
 
+/// POST /api/admin/probe-models
+/// Esegue un round one-shot del model_health_probe: pinga ogni modello
+/// enabled, applica counter / auto-disable. Usa la soglia configurata in
+/// settings.model_health_probe_failure_threshold (default 3).
+pub async fn probe_models_now(State(state): State<AppState>) -> Json<Value> {
+    let threshold = crate::settings::get_setting(&state.db, "model_health_probe_failure_threshold")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .unwrap_or(3);
+    let orchestrator = std::sync::Arc::new(state.orchestrator.clone());
+    let stats = crate::model_health_probe::run_one_round(&orchestrator, &state.db, threshold).await;
+    Json(json!({
+        "ok": true,
+        "total": stats.total,
+        "healthy": stats.healthy,
+        "provider_wide_errors": stats.provider_wide_errors,
+        "model_errors": stats.model_errors,
+        "auto_disabled": stats.auto_disabled,
+        "skipped_provider_cooldown": stats.skipped_provider_cooldown,
+        "failure_threshold": threshold,
+    }))
+}
+

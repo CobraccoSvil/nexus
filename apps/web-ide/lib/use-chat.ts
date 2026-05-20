@@ -430,11 +430,13 @@ export function useChat(
       } catch { /* ignore */ }
       const history = await getChatMessages(activeSessionId);
       setMessages(history.messages ?? []);
-      // Accumulate token usage from history
+      // Accumulate token usage from history — esclude i messaggi soft-deleted
+      // (es. assistant compattati). Senza il filtro, dopo un compact la
+      // TokenUsageBar mostrerebbe ancora i token dei messaggi pre-compact.
       let histTokens = 0;
       let histCost = 0;
       for (const msg of history.messages ?? []) {
-        if (msg.role === "assistant") {
+        if (msg.role === "assistant" && !msg.deletedAt) {
           histTokens += msg.totalTokens ?? 0;
           histCost += msg.totalCost ?? 0;
         }

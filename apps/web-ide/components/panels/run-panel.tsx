@@ -951,34 +951,10 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
         {svcMsg && <div style={{ fontSize:11,color:(svcMsg.toLowerCase().includes("errore")||svcMsg.toLowerCase().includes("error"))?"#ef4444":"#22c55e",marginTop:4 }}>{svcMsg}</div>}
       </div>
 
-      {/* ════════════════════════════════ B: PORTE RILEVATE ═══════════════ */}
-      {ports.length > 0 && (
-        <>
-          <div style={hdr()}>
-            <span>Porte rilevate ({ports.length})</span>
-          </div>
-          <div style={{ padding:"6px 12px", borderBottom:`1px solid ${tc.border}` }}>
-            {ports.map((p,i) => (
-              <div key={`${p.port}-${i}`} style={{ display:"flex",alignItems:"center",gap:8,marginBottom:3 }}>
-                <span style={{ background:tc.accentBg,color:tc.accent,borderRadius:3,padding:"1px 6px",fontSize:10,fontFamily:'"JetBrains Mono", monospace',flexShrink:0,minWidth:48,textAlign:"center" }}>
-                  {p.port}
-                </span>
-                <span style={{ flex:1,minWidth:0,fontSize:11,color:tc.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }} title={p.label}>
-                  {p.label || `(processo ${p.port})`}
-                </span>
-                {p.url && (
-                  <a href={p.url} target="_blank" rel="noreferrer"
-                    style={{ fontSize:10,color:tc.accent,textDecoration:"none",fontFamily:'"JetBrains Mono", monospace',flexShrink:0 }}
-                    onMouseEnter={e=>(e.currentTarget.style.textDecoration="underline")}
-                    onMouseLeave={e=>(e.currentTarget.style.textDecoration="none")}>
-                    apri ↗
-                  </a>
-                )}
-              </div>
-            ))}
-          </div>
-        </>
-      )}
+      {/* B/B2: lista porte rilevate e allocate spostate nel pannello dedicato
+          "Porte" (tab in basso). Qui resta solo la sezione "Porte allocate"
+          come strumento gestionale (allocazione manuale + rilascio), per
+          gli utenti che lavorano dal pannello Run & Debug. */}
 
       {/* ════════════════════════════════ B2: PORTE ALLOCATE ═════════════ */}
       <div style={hdr()}>

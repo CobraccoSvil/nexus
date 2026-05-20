@@ -39,8 +39,11 @@ const statusColorMap: Record<string, string> = {
   overridden: "#8b5cf6",
 };
 
+import { useGlobalDialog } from "../global-dialog-provider";
+
 export function ProjectDbPanel({ project }: Props) {
   const tc = useThemeColors();
+  const { confirmDialog } = useGlobalDialog();
   const projectId = project?.id ?? "";
 
   const [migrations, setMigrations] = useState<ProjectMigration[]>([]);
@@ -317,7 +320,11 @@ export function ProjectDbPanel({ project }: Props) {
 
   const handleDeleteConnection = async (conn: ProjectDbConnection) => {
     if (!projectId) return;
-    if (!window.confirm(`Eliminare la connessione "${conn.name}"? La configurazione verra' rimossa (le migrazioni restano).`)) {
+    const ok = await confirmDialog(
+      `Eliminare la connessione "${conn.name}"? La configurazione verra' rimossa (le migrazioni restano).`,
+      "Elimina connessione DB",
+    );
+    if (!ok) {
       return;
     }
     setBusy(true);

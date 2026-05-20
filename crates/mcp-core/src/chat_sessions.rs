@@ -325,18 +325,10 @@ pub async fn compact_chat_session(
 
     let ctx = load_session_context(&state.db, session_id, user_id).await?;
 
-    // Guard: already compacted?
-    let status: String = sqlx::query_scalar(
-        "SELECT status FROM chat_sessions WHERE id = $1"
-    )
-    .bind(ctx.session_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if status == "compacted" {
-        return Err(api_error(axum::http::StatusCode::CONFLICT, "Sessione gia' compattata in memoria"));
-    }
+    // La compattazione e' sempre ripetibile: ogni invocazione produce un nuovo
+    // riassunto + nuovo correction_id, e ri-marca la sessione come 'compacted'.
+    // Necessario perche' dopo una compattazione l'utente continua a chattare
+    // accumulando nuovi token che devono poter essere a loro volta compattati.
 
     // Load non-deleted messages
     let rows = sqlx::query(
@@ -451,6 +443,52 @@ pub async fn compact_chat_session(
     .await
     .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Soft-delete dei messaggi user/assistant precedenti il compact: la
+    // sintesi e' ora in vector memory e verra' iniettata come messaggio
+    // 'summary' nuovo (sotto). Questo riduce davvero il contesto inviato alle
+    // chiamate LLM successive (build_recent_conversation_history filtra
+    // deleted_at IS NULL) e fa scendere la TokenUsageBar nella UI.
+    let soft_deleted = sqlx::query(
+        "UPDATE chat_messages SET deleted_at = NOW() \
+         WHERE session_id = $1 AND deleted_at IS NULL \
+           AND role IN ('user', 'assistant')",
+    )
+    .bind(ctx.session_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Stima del costo "logico" del summary in token (approx 4 char per token).
+    let summary_tokens_est: i64 = ((summary_text.chars().count() as i64) / 4).max(1);
+
+    // Inserisce un messaggio role='summary' nel thread, in modo che
+    // build_recent_conversation_history lo carichi come primo messaggio nelle
+    // chiamate LLM future (deve essere whitelisted nel filtro role).
+    let summary_metadata = serde_json::json!({
+        "isCompactSummary": true,
+        "qdrantPointId": point_id,
+        "totalTokens": summary_tokens_est,
+        "totalCost": 0.0,
+        "softDeletedCount": soft_deleted.rows_affected(),
+    });
+    let summary_msg_id = Uuid::new_v4();
+    let summary_content = format!(
+        "[Riassunto della conversazione precedente — generato al compact]\n\n{}",
+        summary_text
+    );
+    sqlx::query(
+        "INSERT INTO chat_messages (id, session_id, project_id, role, content, metadata, created_at) \
+         VALUES ($1, $2, $3, 'summary', $4, $5, NOW())",
+    )
+    .bind(summary_msg_id)
+    .bind(ctx.session_id)
+    .bind(ctx.project_id)
+    .bind(&summary_content)
+    .bind(&summary_metadata)
+    .execute(&state.db)
+    .await
+    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
     // Mark session as compacted
     sqlx::query(
         "UPDATE chat_sessions SET status = 'compacted', updated_at = NOW() WHERE id = $1"
@@ -460,26 +498,12 @@ pub async fn compact_chat_session(
     .await
     .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Calcola totali token freschi (sommando dai metadata dei messaggi rimasti)
-    // per permettere al frontend `use-chat` di riallineare immediatamente la
-    // TokenUsageBar senza bisogno di refresh browser. I messaggi non vengono
-    // cancellati al compact (rimangono in DB), quindi il totale e' stabile,
-    // ma inviarlo nell'evento rimuove qualsiasi desync col cliente.
-    let totals: Option<(i64, f64)> = sqlx::query_as::<_, (i64, f64)>(
-        r#"SELECT
-            COALESCE(SUM((metadata->>'totalTokens')::bigint), 0)::bigint AS total_tokens,
-            COALESCE(SUM((metadata->>'totalCost')::float8), 0.0)::float8 AS total_cost
-           FROM chat_messages
-           WHERE session_id = $1
-             AND role = 'assistant'
-             AND deleted_at IS NULL
-             AND metadata->>'totalTokens' IS NOT NULL"#,
-    )
-    .bind(ctx.session_id)
-    .fetch_one(&state.db)
-    .await
-    .ok();
-    let (total_tokens, total_cost_usd) = totals.unwrap_or((0, 0.0));
+    // Dopo il soft-delete, il totale token mostrato dalla TokenUsageBar e'
+    // solo quello del summary nuovo (i precedenti sono deleted_at NOT NULL e
+    // la query frontend li filtra). Inviamo direttamente la stima per il reset
+    // immediato della barra.
+    let total_tokens: i64 = summary_tokens_est;
+    let total_cost_usd: f64 = 0.0;
 
     // Emette eventi dispatcher: il frontend ascolta via SSE e ricalcola UI.
     // - ChatSessionCompacted → use-chat aggiorna tokenUsage

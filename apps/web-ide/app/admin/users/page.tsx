@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../../lib/theme";
 import { useI18n } from "../../../lib/i18n";
 import * as api from "../../../lib/api-client";
+import { useGlobalDialog } from "../../../components/global-dialog-provider";
 
 interface User {
   id: string;
@@ -18,6 +19,7 @@ interface User {
 
 export default function UsersPage() {
   const tc = useThemeColors();
+  const { confirmDialog } = useGlobalDialog();
   const { t } = useI18n();
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);
@@ -47,7 +49,11 @@ export default function UsersPage() {
   }, [page, loadUsers]);
 
   const handleDeleteUser = async (userId: string) => {
-    if (!window.confirm("Sei sicuro di voler eliminare questo utente?")) return;
+    const ok = await confirmDialog(
+      "Sei sicuro di voler eliminare questo utente?",
+      "Elimina utente",
+    );
+    if (!ok) return;
     try {
       await api.deleteAdminUser(userId);
       loadUsers();

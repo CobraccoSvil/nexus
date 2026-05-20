@@ -16,6 +16,7 @@ import {
   getGatewayProviders,
   getProjectFile,
   getProjectPorts,
+  killPortProcess,
   getProjectProblems,
   getRunConfigs,
   getProviderModels,
@@ -380,7 +381,7 @@ function iconButton(tc: ReturnType<typeof useThemeColors>, disabled = false, act
 
 export function IdeShell({ dashboard, initialProjectId }: { dashboard: DashboardSnapshot; initialProjectId?: string }) {
   const tc = useThemeColors();
-  const { promptDialog, confirmDialog } = useGlobalDialog();
+  const { promptDialog, confirmDialog, alertDialog } = useGlobalDialog();
   // Polling client-side dello health: il prop `dashboard` è uno snapshot SSR
   // e non si aggiorna mai. Senza questo, i LED DB/Redis/Brain restano congelati
   // sullo stato del primo render della pagina /ide.
@@ -2290,6 +2291,38 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               setPendingChatMessage(msg);
               setPendingAutoSend(true);
               setPendingExternalAutomation("confirm");
+            }}
+            onKillPort={async (port) => {
+              if (!activeProject) return;
+              // Optimistic update: rimuovi subito la porta dalla lista, cosi'
+              // l'utente vede feedback immediato senza dover aspettare il
+              // refresh (1-2s). Se la porta torna a essere live nel refresh
+              // successivo, riapparira' da sola — segno che il kill non e'
+              // riuscito (es. docker-proxy respawned, processo non killabile).
+              setPorts((current) => current.filter((p) => p.port !== port));
+              try {
+                const res = await killPortProcess(activeProject.id, port);
+                // Attesa breve: il kernel impiega ~100-300ms a rilasciare il
+                // socket. Senza questa attesa il refresh successivo a volte
+                // ritrova la porta in TIME_WAIT e la rimostra.
+                await new Promise((r) => setTimeout(r, 800));
+                await refreshOperationalViews(activeProject.id);
+                if (!res.freed) {
+                  console.warn(
+                    `[ports] kill port ${port}: backend ha eseguito kill ma la porta non e' stata liberata. deleted_allocations=${res.deleted_allocations}`,
+                  );
+                  void alertDialog(
+                    `Il backend ha provato a terminare il processo ma la porta ${port} risulta ancora in ascolto. ` +
+                    `Probabile causa: container Docker (il proxy si rigenera automaticamente) o processo non killabile. ` +
+                    `Allocazione DB rimossa: ${res.deleted_allocations}.`,
+                    "Porta non liberata",
+                  );
+                }
+              } catch (e) {
+                console.error("[ports] killPortProcess fallito:", e);
+                // Ripristina la porta nella UI se il kill ha fallito.
+                await refreshOperationalViews(activeProject.id);
+              }
             }}
             agentRunEndSignal={agentRunEndSignal}
             traces={aiTraces}

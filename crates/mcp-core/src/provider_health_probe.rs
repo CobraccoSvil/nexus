@@ -23,14 +23,14 @@
 //!   - `NEXUS_PROVIDER_HEALTH_PROBE_ENABLED=true` (default: true; disabilita in dev)
 //!   - `NEXUS_PROVIDER_HEALTH_PROBE_INTERVAL_S=300` (default: 300, min 60)
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
 use tokio::time::sleep;
 
 use crate::orchestrator::{default_model_for_provider, Orchestrator};
-use crate::provider_cooldown::{is_provider_in_cooldown, put_provider_in_long_cooldown};
+use crate::provider_cooldown::{is_provider_in_cooldown, put_provider_in_long_cooldown, remove_cooldown};
 // `put_provider_in_cooldown` e' `pub(crate)` -> accessibile, ma la signature
 // e' `(provider: &str, retry_after_seconds: Option<u64>)`. Per slow/timeout
 // usiamo l'overload corto.
@@ -94,19 +94,70 @@ pub fn spawn_health_probe(orchestrator: Arc<Orchestrator>, db: PgPool, enabled: 
     });
 }
 
+/// Soglia "outage locale": se in un solo round 3+ provider distinti falliscono
+/// con un errore non-billing, e' praticamente certo che il problema sia
+/// l'infrastruttura locale (brain bridge giu', rete WSL ko, DNS) e non un
+/// guasto simultaneo dei provider remoti. In quel caso annulliamo i
+/// cooldown applicati nel round per evitare di marcare tutti i provider
+/// come down (visto in prod il 17-18 maggio: 5 provider down in 8 secondi
+/// con "tcp connect error" mentre il brain era riavviato).
+const OUTAGE_THRESHOLD: usize = 3;
+
+/// Accumula i provider che hanno fallito nel round corrente con cooldown
+/// applicato, per poterli liberare se viene rilevato un outage locale.
+static ROUND_COOLDOWN_VICTIMS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+fn round_victims_push(provider: &str) {
+    let store = ROUND_COOLDOWN_VICTIMS.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut v) = store.lock() {
+        v.push(provider.to_string());
+    }
+}
+
+fn round_victims_drain() -> Vec<String> {
+    let store = ROUND_COOLDOWN_VICTIMS.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut v) = store.lock() {
+        std::mem::take(&mut *v)
+    } else {
+        Vec::new()
+    }
+}
+
 /// Esegue un ciclo completo di probe per tutti i provider.
+///
+/// Anche i provider in cooldown vengono pingati (a cadenza ridotta) per
+/// rilevare il recovery automatico: senza questo, un provider che torna
+/// a funzionare dopo billing recharge resterebbe "down" fino alla scadenza
+/// naturale del cooldown (anche 6h). Il costo extra e' trascurabile —
+/// stiamo parlando di una chiamata da ~1 token ogni 5 minuti.
 async fn run_one_round(orchestrator: &Orchestrator, db: &PgPool) {
+    let _ = round_victims_drain(); // reset accumulator
     for provider in PROBED_PROVIDERS {
-        // Skip se gia' in cooldown lungo (>1h): inutile spendere chiamate
-        // su provider che sappiamo gia' essere giu' per quota/billing.
-        if is_provider_in_cooldown(provider) {
-            tracing::debug!("provider_health_probe: skip {provider} (in cooldown)");
-            continue;
+        let in_cooldown = is_provider_in_cooldown(provider);
+        if in_cooldown {
+            tracing::debug!(
+                "provider_health_probe: probe {provider} (era in cooldown — test recovery)"
+            );
         }
         probe_one(orchestrator, db, provider).await;
         // Distanzia le chiamate ai provider per non saturare la rete
         // (anche se sono indipendenti, evita spike di traffico).
         sleep(Duration::from_secs(2)).await;
+    }
+    // Outage detection: se troppi provider sono andati in cooldown breve
+    // nello stesso round, e' infrastruttura locale. Rollback.
+    let victims = round_victims_drain();
+    if victims.len() >= OUTAGE_THRESHOLD {
+        tracing::warn!(
+            "provider_health_probe: OUTAGE LOCALE rilevato — {} provider hanno fallito \
+             nello stesso round ({:?}). Rollback dei cooldown applicati: e' quasi \
+             sicuramente brain bridge / rete / DNS, non i provider remoti.",
+            victims.len(),
+            victims,
+        );
+        for p in victims {
+            remove_cooldown(&p);
+        }
     }
 }
 
@@ -134,6 +185,20 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
     let (healthy, error_kind, error_message) = match result {
         Ok(Ok(_response)) => {
             // Successo. Provider rispondente in <PROBE_TIMEOUT_S.
+            // Se c'era un cooldown residuo (anche persistito in Redis), il
+            // provider è tornato a rispondere correttamente: lo togliamo
+            // automaticamente cosi' il routing dinamico puo' tornare a
+            // sceglierlo senza intervento manuale dell'admin.
+            // Caso reale: l'utente vede "Quota esaurita" su google nella UI
+            // anche dopo aver ricaricato il credito o aspettato il reset
+            // mensile della quota free; senza questo cleanup il provider
+            // resta "down" fino allo scadere del TTL di 6h del cooldown.
+            if is_provider_in_cooldown(provider) {
+                tracing::info!(
+                    "provider_health_probe: {provider} RECOVERED — rimuovo cooldown residuo"
+                );
+                remove_cooldown(provider);
+            }
             tracing::debug!(
                 "provider_health_probe: {provider} OK in {latency_ms}ms"
             );
@@ -148,15 +213,36 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
                 "provider_health_probe: {provider} ERROR ({kind}) in {latency_ms}ms: {msg}",
                 msg = &msg[..msg.len().min(200)],
             );
-            // Errori billing/quota → cooldown lungo (6h)
-            // Tutti gli altri errori → cooldown breve (60s)
+            // Categorie di errore:
+            //   - billing/quota → cooldown lungo (6h): provider DAVVERO down per credito
+            //   - infrastruttura locale (tcp connect / gRPC Unavailable / DNS):
+            //     NON cooldown — il problema e' della rete o del brain bridge,
+            //     non del provider remoto. Senza questa eccezione un hiccup
+            //     di rete locale marcava simultaneamente tutti i provider come
+            //     down (visto in produzione: 5 provider falliti in 8 secondi).
+            //   - altri (rate_limit/timeout/auth/unknown) → cooldown breve 60s
+            let is_local_infra =
+                matches!(kind.as_str(), "connection_error")
+                || msg.contains("tcp connect error")
+                || msg.contains("Unavailable")
+                || msg.contains("ECONNREFUSED");
             if matches!(
                 kind.as_str(),
                 "quota_exceeded" | "credit_balance_too_low" | "billing_required"
             ) {
                 put_provider_in_long_cooldown(provider, &kind);
+            } else if is_local_infra {
+                tracing::warn!(
+                    "provider_health_probe: {provider} ERROR ma sembra problema di rete \
+                     locale / brain bridge — NESSUN cooldown applicato"
+                );
+                // Anche se NON applichiamo cooldown ora, contiamolo per
+                // outage detection: se 3+ provider hanno is_local_infra in
+                // un round, e' OUTAGE certo e NON dobbiamo applicare nulla.
+                round_victims_push(provider);
             } else {
                 put_provider_in_cooldown(provider, Some(SLOW_COOLDOWN_S));
+                round_victims_push(provider);
             }
             (false, Some(kind), Some(truncate(&msg, 500)))
         }
@@ -166,6 +252,10 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
                 "provider_health_probe: {provider} TIMEOUT (>{PROBE_TIMEOUT_S}s)"
             );
             put_provider_in_cooldown(provider, Some(SLOW_COOLDOWN_S));
+            // Timeout: spesso e' anch'esso un sintomo di outage locale
+            // (brain bridge lento, WSL DNS lento, internet bloccato). Conta
+            // come victim per outage detection.
+            round_victims_push(provider);
             (
                 false,
                 Some("timeout".to_string()),

@@ -8,7 +8,7 @@ import { OptimizationPanel } from "./optimization-panel";
 import { MonitorPanel } from "./monitor-panel";
 import { RunPanel } from "./run-panel";
 import { SecurityPanel } from "./security-panel";
-import { promptFromPlaywrightRun, promptFromPort, promptFromProblem, promptEnablePlaywright, promptRunPlaywrightTests } from "../../lib/chat-prompts";
+import { promptFromPlaywrightRun, promptFromProblem, promptEnablePlaywright, promptRunPlaywrightTests } from "../../lib/chat-prompts";
 import type {
   AITraceEvent,
   OutputChannel,
@@ -22,6 +22,7 @@ import type {
 } from "../../lib/api-client";
 import { subscribePlaywrightRunStream } from "../../lib/api-client";
 import { useState, useEffect, useRef } from "react";
+import { useGlobalDialog } from "../global-dialog-provider";
 
 export type PanelTab =
   | "problems"
@@ -53,6 +54,7 @@ export interface BottomPanelManagerProps {
   onRefreshPanel?: (tab: PanelTab) => void;
   onSendToChat?: (message: string) => void;
   onAutoSendToChat?: (message: string) => void;
+  onKillPort?: (port: number) => void | Promise<void>;
   agentRunEndSignal?: number;
   onClearTraces?: () => void;
 }
@@ -107,9 +109,11 @@ export function BottomPanelManager({
   onRefreshPanel,
   onSendToChat,
   onAutoSendToChat,
+  onKillPort,
   agentRunEndSignal,
 }: BottomPanelManagerProps) {
   const tc = useThemeColors();
+  const { confirmDialog } = useGlobalDialog();
 
   const clearBar = (tab: PanelTab, hasContent: boolean) =>
     (hasContent || onRefreshPanel) ? (
@@ -282,31 +286,42 @@ export function BottomPanelManager({
                   <span style={{ color: tc.text, fontWeight: 500, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {port.label || `Porta ${port.port}`}
                   </span>
-                  {onSendToChat && (
+                  {onKillPort && typeof port.port === "number" && (() => {
+                    // Narrowing manuale: la callback gira async, TS non
+                    // propaga il type guard del rendering condizionale.
+                    const portNum: number = port.port;
+                    return (
                     <button
                       type="button"
-                      onClick={() => {
-                      onSendToChat(promptFromPort(port));
+                      onClick={async () => {
+                        const ok = await confirmDialog(
+                          `Terminare il processo in ascolto sulla porta ${portNum} e rilasciare l'allocazione?`,
+                          "Termina porta",
+                        );
+                        if (ok) {
+                          void onKillPort(portNum);
+                        }
                       }}
-                      title="Invia questa porta alla chat di Nexus"
+                      title="Termina processo e rilascia porta"
                       style={{
                         background: "rgba(239,68,68,0.85)",
                         color: "#fff",
                         border: "none",
                         borderRadius: 3,
-                        padding: "0 6px",
-                        fontSize: 10,
+                        padding: "0 8px",
+                        fontSize: 11,
                         cursor: "pointer",
                         verticalAlign: "middle",
-                        lineHeight: "16px",
-                        height: 16,
+                        lineHeight: "18px",
+                        height: 18,
                         fontWeight: 600,
                         flexShrink: 0,
                       }}
                     >
-                      ↗ chat
+                      🗑 kill
                     </button>
-                  )}
+                    );
+                  })()}
                 </div>
                 {port.url ? (
                   <a

@@ -823,27 +823,47 @@ pub async fn run_via_brain(
     };
 
     // ── Hollow completion detection ─────────────────────────────────────────
-    // Se il task aveva tool disponibili, l'agente non ne ha usato nessuno, e
-    // la risposta e' sospettosamente breve/generica, il modello ha "allucinato
-    // il completamento" (tipico di modelli piccoli). Loggiamo un warning e
-    // annotiamo il risultato per il caller.
+    // Cattura due varianti del "completamento allucinato":
+    //   (A) had_tools && steps.is_empty() && iteration <= 1: l'agente aveva
+    //       tool disponibili e ha chiuso senza usarne nessuno al primo turno
+    //       (tipico di modelli piccoli che non sanno come usare le tool).
+    //   (B) final_answer vuoto/whitespace-only: l'agente ha dichiarato Completed
+    //       ma il body della risposta e' assente. Travestito da successo,
+    //       tipico ad esempio di deepseek-coder/deepseek-reasoner quando il
+    //       provider risponde solo con la status line "Operazione completata"
+    //       senza il content reale (visto in prod il 2026-05-20).
+    // In entrambi i casi il caller (chat_messages.rs) deve poter ri-tentare
+    // con un altro provider (hollow_retry path).
     let had_tools = tools_json
         .as_array()
         .map(|a| !a.is_empty())
         .unwrap_or(false);
-    let hollow_completion = status == AgentRunStatus::Completed
+    let final_answer_empty = final_answer.trim().is_empty();
+    let hollow_no_tools = status == AgentRunStatus::Completed
         && had_tools
         && steps.is_empty()
         && iteration <= 1;
+    let hollow_empty_answer = status == AgentRunStatus::Completed && final_answer_empty;
+    let hollow_completion = hollow_no_tools || hollow_empty_answer;
     if hollow_completion {
+        let kind = if hollow_empty_answer && !hollow_no_tools {
+            "EMPTY_ANSWER"
+        } else if hollow_empty_answer {
+            "EMPTY_ANSWER+NO_TOOLS"
+        } else {
+            "NO_TOOLS"
+        };
         tracing::warn!(
-            "agent_run {}: HOLLOW COMPLETION — il modello {}/{} ha dichiarato \
-             di aver completato senza invocare alcun tool (0 step, iteration={}). \
+            "agent_run {}: HOLLOW COMPLETION [{}] — modello {}/{} ha dichiarato \
+             di aver completato (steps={}, iteration={}, final_answer_chars={}). \
              Risposta: {:?}",
             run_id_str,
+            kind,
             provider,
             model,
+            steps.len(),
             iteration,
+            final_answer.len(),
             final_answer.chars().take(120).collect::<String>(),
         );
     }
