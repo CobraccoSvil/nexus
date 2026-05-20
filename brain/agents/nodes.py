@@ -783,6 +783,25 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         provider, model, intent, len(tools_json),
     )
 
+    # Heartbeat A: pubblica step "calling_model" cosi' l'utente vede in chat
+    # che l'agente sta lavorando (LLM call puo' durare 30-60s su contesti grandi).
+    try:
+        _calling_meta = meta_steps.make(
+            kind="executor_call",
+            title=f"Sto interrogando {provider}/{model}",
+            payload={
+                "provider": provider,
+                "model": model,
+                "intent": intent,
+                "iteration": state.get("iterations", 0),
+                "tools_count": len(tools_json),
+            },
+        )
+        if _calling_meta:
+            meta_steps.persist_async(state.get("thread_id"), _calling_meta)
+    except Exception as _hb_exc:
+        logger.debug("executor_node: heartbeat calling_model fallito: %s", _hb_exc)
+
     start_ms = time.monotonic() * 1000
     created_at = datetime.datetime.utcnow().isoformat() + "Z"
     result_text = ""
@@ -910,6 +929,27 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             stop_reason = meta.get("stop_reason") or "end_turn"
             pending_tool_uses = list(meta.get("tool_use_blocks") or [])
             assistant_content = meta.get("assistant_content")
+            # Heartbeat A: pubblica step "tool_calls" con elenco tool richiesti.
+            if pending_tool_uses:
+                try:
+                    _tools_meta = meta_steps.make(
+                        kind="tool_calls",
+                        title=f"Sto usando {len(pending_tool_uses)} tool",
+                        payload={
+                            "tools": [
+                                {
+                                    "name": tu.get("name"),
+                                    "input_keys": list((tu.get("input") or {}).keys())[:8],
+                                }
+                                for tu in pending_tool_uses[:10]
+                            ],
+                            "iteration": _current_iterations,
+                        },
+                    )
+                    if _tools_meta:
+                        meta_steps.persist_async(state.get("thread_id"), _tools_meta)
+                except Exception as _hb_exc:
+                    logger.debug("executor_node: heartbeat tool_calls fallito: %s", _hb_exc)
             usage = meta.get("usage") or {}
             prompt_tokens = int(usage.get("input_tokens", 0))
             completion_tokens = int(usage.get("output_tokens", 0))

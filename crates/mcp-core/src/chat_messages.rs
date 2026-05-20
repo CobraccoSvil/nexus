@@ -2125,11 +2125,67 @@ async fn spawn_agent_run(
         let mut result;
         let mut fallback_attempt: usize = 0;
 
+        // ── Fix B+C: stima tokens richiesti e scelta context-aware ──────────
+        // Approssimazione (1 token = ~4 caratteri): system prompt + msg utente
+        // + storia conversazione + descrizioni tool. Usata per:
+        //   B) troncare history se eccede 70% ctx del modello selezionato
+        //   C) pre-filtrare il routing escludendo modelli con ctx insufficiente
+        let estimated_input_chars: usize = {
+            let history_chars: usize = recent_history_for_brain.iter()
+                .map(|m| m.get("content").and_then(|c| c.as_str()).map(|s| s.len()).unwrap_or(0))
+                .sum();
+            let tools_chars: usize = serde_json::to_string(&tools_json_for_brain)
+                .map(|s| s.len()).unwrap_or(0);
+            system_text_clone.len() + initial_msg_clone.len() + history_chars + tools_chars
+        };
+        let estimated_input_tokens: i64 = (estimated_input_chars / 4) as i64;
+        tracing::info!(
+            "agent_run {}: input stimato {} tokens (~{} chars)",
+            run_id, estimated_input_tokens, estimated_input_chars
+        );
+        // Se il modello primario non ha context_window sufficiente (con margine
+        // 30% per output), cerca subito un modello idoneo per ctx.
+        let primary_ctx: i64 = sqlx::query_scalar(
+            "SELECT context_window FROM ai_price_catalog WHERE provider=$1 AND model=$2 LIMIT 1"
+        )
+        .bind(&current_provider)
+        .bind(&current_model)
+        .fetch_optional(&db_clone)
+        .await
+        .ok().flatten().unwrap_or(8192);
+        let ctx_needed: i64 = (estimated_input_tokens as f64 * 1.3) as i64;
+        if primary_ctx < ctx_needed {
+            tracing::warn!(
+                "agent_run {}: ctx insufficiente per primario {}/{} ({} < {}), cerco modello con ctx >= {}",
+                run_id, current_provider, current_model, primary_ctx, ctx_needed, ctx_needed
+            );
+            let alt: Option<(String, String)> = sqlx::query_as::<_, (String, String)>(
+                "SELECT provider, model FROM ai_price_catalog
+                  WHERE is_enabled=true AND supports_tool_use=true
+                    AND consecutive_failures=0
+                    AND context_window >= $1
+                  ORDER BY input_cost_per_million_tokens ASC NULLS LAST
+                  LIMIT 1"
+            )
+            .bind(ctx_needed)
+            .fetch_optional(&db_clone)
+            .await
+            .ok().flatten();
+            if let Some((p, m)) = alt {
+                tracing::info!(
+                    "agent_run {}: routing context-aware: {} -> {}/{}",
+                    run_id, current_model, p, m
+                );
+                current_provider = p;
+                current_model = m;
+            }
+        }
+
         loop {
             tried.insert(current_provider.to_lowercase());
             tracing::info!(
-                "agent_run {}: tentativo {}/{} con provider={} model={}",
-                run_id, fallback_attempt + 1, max_provider_fallbacks, current_provider, current_model
+                "agent_run {}: tentativo {}/{} con provider={} model={} (ctx_needed={})",
+                run_id, fallback_attempt + 1, max_provider_fallbacks, current_provider, current_model, ctx_needed
             );
             result = crate::brain_agent_client::run_via_brain(
                 run_id,
@@ -2146,6 +2202,32 @@ async fn spawn_agent_run(
                 automation_mode_for_brain.clone(),
             )
             .await;
+
+            // ── Fix D: detection errore infrastrutturale ────────────────────
+            // Se la risposta menziona ToolRunner/sandbox down, NON e' colpa del
+            // modello — non incrementare consecutive_failures (evita di
+            // auto-disabilitare modelli sani per problemi infra) e termina
+            // subito senza scalare (gli altri provider avrebbero lo stesso esito).
+            let is_infrastructure_error = result.final_answer.as_ref()
+                .map(|s| {
+                    let lower = s.to_lowercase();
+                    lower.contains("sandbox") && (lower.contains("gr pc") || lower.contains("grpc")
+                        || lower.contains("connession") || lower.contains("non e' raggiungibile")
+                        || lower.contains("non raggiungibile"))
+                    || lower.contains("50500")
+                    || lower.contains("tool_runner") || lower.contains("toolrunner")
+                    || lower.contains("tcp handshaker")
+                })
+                .unwrap_or(false);
+            if is_infrastructure_error {
+                tracing::warn!(
+                    "agent_run {}: errore INFRASTRUTTURALE rilevato (ToolRunner/sandbox down) — \
+                     non incremento consecutive_failures per {}/{}, termino senza fallback (altri \
+                     provider hanno lo stesso ToolRunner)",
+                    run_id, result.provider, result.model
+                );
+                break;
+            }
 
             // ── Counter hollow per modello (auto-disable) ────────────────────
             // Se il run e' hollow_completion REALE in produzione, incrementa
@@ -2288,6 +2370,7 @@ async fn spawn_agent_run(
                         AND supports_tool_use = true
                         AND consecutive_failures = 0
                         AND NOT (provider = ANY($1))
+                        AND context_window >= $2
                       ORDER BY CASE performance_tier
                                  WHEN 'heavy' THEN 2
                                  WHEN 'medium' THEN 1
@@ -2297,6 +2380,7 @@ async fn spawn_agent_run(
                                output_cost_per_million_tokens DESC NULLS LAST",
                 )
                 .bind(&tried_models)
+                .bind(ctx_needed)
                 .fetch_all(&db_clone)
                 .await
                 .unwrap_or_default();
