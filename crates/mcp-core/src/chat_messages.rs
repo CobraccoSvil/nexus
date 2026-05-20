@@ -2508,11 +2508,62 @@ async fn spawn_agent_run(
         // Incrementa il `spent_current_period_usd` per il provider del run.
         // Strategia comune a tutti i 5 provider visto che la maggior parte
         // (anthropic/openai/google/mistral) non espone balance via API: il
-        // budget va stimato sommando il cost dei run reali. L'admin imposta
-        // monthly_budget_usd quando ricarica l'account presso il provider.
-        // Quando residuo < min_threshold → probe marca unhealthy con
-        // error_kind='budget_exhausted'.
-        if result.total_cost > 0.0 {
+        // budget va stimato sommando il cost dei run reali.
+        //
+        // Calcolo del cost:
+        //   - Se brain ha propagato result.total_cost > 0 -> usalo.
+        //   - Altrimenti: calcolo da prompt_tokens/completion_tokens × prezzi
+        //     dal catalog (caso comune: brain non emette total_cost nelle
+        //     SSE events, ma propaga i token usage che sono affidabili).
+        let cost_to_charge: f64 = if result.total_cost > 0.0 {
+            result.total_cost
+        } else if result.prompt_tokens > 0 || result.completion_tokens > 0 {
+            // Look up prezzi dal catalog. Costo per milione di token.
+            #[derive(sqlx::FromRow)]
+            struct PriceRow {
+                input_cost: f64,
+                output_cost: f64,
+            }
+            let prices: Option<PriceRow> = sqlx::query_as::<_, PriceRow>(
+                "SELECT input_cost_per_million_tokens::float8 AS input_cost,
+                        output_cost_per_million_tokens::float8 AS output_cost
+                   FROM ai_price_catalog
+                  WHERE provider = $1 AND model = $2 AND is_enabled = true
+                  ORDER BY effective_from DESC LIMIT 1",
+            )
+            .bind(&result.provider)
+            .bind(&result.model)
+            .fetch_optional(&db_clone)
+            .await
+            .ok()
+            .flatten();
+            if let Some(p) = prices {
+                let input_cost = (result.prompt_tokens as f64) * p.input_cost / 1_000_000.0;
+                let output_cost = (result.completion_tokens as f64) * p.output_cost / 1_000_000.0;
+                let total = input_cost + output_cost;
+                if total > 0.0 {
+                    // Aggiorna anche agent_runs.total_cost per coerenza UI.
+                    let _ = sqlx::query(
+                        "UPDATE agent_runs SET total_cost = $2 WHERE id = $1 AND total_cost = 0",
+                    )
+                    .bind(run_id)
+                    .bind(total)
+                    .execute(&db_clone)
+                    .await;
+                    tracing::debug!(
+                        "budget: cost calcolato da Rust per {}/{} = ${:.6} (prompt={} comp={})",
+                        result.provider, result.model, total,
+                        result.prompt_tokens, result.completion_tokens
+                    );
+                }
+                total
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        if cost_to_charge > 0.0 {
             let _ = sqlx::query(
                 "INSERT INTO provider_budget_status (provider, spent_current_period_usd)
                    VALUES ($1, $2)
@@ -2521,7 +2572,7 @@ async fn spawn_agent_run(
                        updated_at = NOW()",
             )
             .bind(&result.provider)
-            .bind(result.total_cost)
+            .bind(cost_to_charge)
             .execute(&db_clone)
             .await;
         }

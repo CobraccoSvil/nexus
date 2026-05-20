@@ -48,8 +48,27 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
   // Proxy via Next.js /neural/* → brain :8001 (server-side, no CORS)
   const NEURAL_BASE = "/neural";
 
+  // "Testa" provider: smart-test che ricarica il provider in modo completo.
+  //   1. Reset cooldown lato mcp-core (rimuove sia in-memory sia Redis).
+  //   2. Probe brain via /neural/providers/:name/health.
+  //   3. Se status=ok → il provider torna attivo immediatamente, l'UI vede
+  //      LED verde tramite dispatcher SSE ProviderHealthChanged.
+  //   4. Se status!=ok → il probe lo rimette automaticamente in cooldown.
+  //
+  // L'admin tipicamente clicca "Testa" dopo aver ricaricato il credito o
+  // risolto la quota presso il provider, e si aspetta che il provider torni
+  // attivo se davvero ricaricato. Con la sola probe (vecchia logica) il
+  // cooldown residuo restava per 6h impedendo la riattivazione.
   const handleTestProvider = useCallback(async (provider: string) => {
     setTestResults((current) => ({ ...current, [provider]: "testing..." }));
+    // Step 1: reset cooldown (idempotente, no-op se non in cooldown).
+    try {
+      const { resetProviderCooldown } = await import("../../lib/api-client");
+      await resetProviderCooldown(provider);
+    } catch {
+      // ignora — il provider potrebbe non essere in cooldown
+    }
+    // Step 2: probe brain.
     try {
       const res = await fetch(`${NEURAL_BASE}/providers/${provider}/health`);
       const data = await res.json();

@@ -243,7 +243,10 @@ fn is_test_failure_resolution(message: &str) -> bool {
     if !mentions_tests {
         return false;
     }
-    // Verbi correttivi (prefissi che coprono coniugazioni it/en):
+    // Verbi/pattern correttivi (prefissi che coprono coniugazioni it/en).
+    // Sono inclusi anche pattern di fallimento osservati in produzione
+    // (problemi di catch playwright_test): "falliti", "fallit*", "fix m"
+    // ("fix M44" è un format ricorrente nei prompt di Nexus M-tickets).
     const CORRECTIVE_VERBS: &[&str] = &[
         "risolv", "fix", "correg", "ripar", "ripara",
         "fai funzionare", "fai passare", "make pass", "make work",
@@ -252,8 +255,14 @@ fn is_test_failure_resolution(message: &str) -> bool {
         "make them pass", "pass all tests", "tutti i test passino",
         "fai in modo che", "fai sì che", "fa sì che",
         "non funziona", "non funzionano", "non passano",
-        "stanno fallendo", "stanno fallendo", "are failing", "is failing",
-        "failure", "fallimento", "fallimenti",
+        "stanno fallendo", "are failing", "is failing", "failing",
+        "failure", "failures", "failed",
+        // Italiano: fallit* matcha fallito/falliti/fallita/fallite
+        "fallit", "falliscono", "fallimento", "fallimenti",
+        // Format M-ticket Nexus: "Fix M44: ..." viene generato per ogni problema
+        "fix m", "errore — problema",
+        // Errori da error-fix workflow
+        "errore rilevato", "severita: error", "severità: error",
     ];
     CORRECTIVE_VERBS.iter().any(|kw| lc.contains(*kw))
 }
