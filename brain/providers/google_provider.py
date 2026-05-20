@@ -1,6 +1,7 @@
 """Google Gemini provider — usa il nuovo SDK google-genai (v1.x)."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any, AsyncIterator
@@ -18,7 +19,11 @@ class GoogleProvider(BaseProvider):
         # API key letta dal DB con cache 60s. Vedi api_key_loader.py.
         from .api_key_loader import load_api_key
         self._api_key_provider = lambda: load_api_key(self.name)
-        self._client: Any | None = None
+        # Cache per-event-loop: id(loop) -> Client. genai.Client contiene un
+        # httpx.AsyncClient legato al loop dove e' stato creato; se il loop
+        # cambia o si chiude (riload, shutdown lifespan) il client va ricreato,
+        # altrimenti tutte le chiamate falliscono con "Event loop is closed".
+        self._clients_by_loop: dict[int, Any] = {}
         self._cached_key: str = ""
 
     @property
@@ -26,7 +31,7 @@ class GoogleProvider(BaseProvider):
         new_key = self._api_key_provider()
         if new_key != self._cached_key:
             self._cached_key = new_key
-            self._client = None
+            self._clients_by_loop.clear()
         return new_key
 
     @_api_key.setter
@@ -34,10 +39,23 @@ class GoogleProvider(BaseProvider):
         from .api_key_loader import invalidate_cache
         invalidate_cache(self.name)
         self._cached_key = value or ""
-        self._client = None
+        self._clients_by_loop.clear()
 
     def _get_client(self) -> Any:
-        if self._client is None:
+        # Risolvi il loop corrente; se chiamato fuori da contesto async
+        # (caso anomalo, ma per sicurezza) ne crea uno temporaneo.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+        loop_id = id(loop)
+        # Se il loop cachato e' diverso o chiuso, scarta tutti i client stale.
+        if loop_id not in self._clients_by_loop or loop.is_closed():
+            # Pulizia entries per loop ormai chiusi
+            stale = [k for k in self._clients_by_loop.keys() if k != loop_id]
+            for k in stale:
+                self._clients_by_loop.pop(k, None)
+        if self._clients_by_loop.get(loop_id) is None:
             from google import genai  # type: ignore[import]
             from .dns_transport import get_global_dns_transport
             transport = get_global_dns_transport()
@@ -67,8 +85,8 @@ class GoogleProvider(BaseProvider):
                     except Exception:
                         return _original(host, port, family, type, proto, flags)
                 _socket.getaddrinfo = _custom_gai
-            self._client = genai.Client(api_key=self._api_key)
-        return self._client
+            self._clients_by_loop[loop_id] = genai.Client(api_key=self._api_key)
+        return self._clients_by_loop[loop_id]
 
     def list_models(self) -> list[ProviderCatalogEntry]:
         # Lista modelli letta da DB (ai_price_catalog) con cache 60s.
