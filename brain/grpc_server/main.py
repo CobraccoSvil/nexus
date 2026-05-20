@@ -1107,6 +1107,10 @@ class AgentRunRequest(BaseModel):
     profile_name: str | None = None
     conversation_history: list[dict] | None = None
     run_id: str | None = None
+    # Modalita' automazione del turno chat propagata da mcp-core.
+    # Valori attesi: "none" | "confirm" | "automatic" | "continuous".
+    # Letta da clarify_or_expand_node per skip in modalita' autonoma.
+    automation_mode: str | None = None
 
 
 class AgentFeedbackRequest(BaseModel):
@@ -1380,6 +1384,7 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
         "provider_override": body.provider_override,
         "model_override": body.model_override,
         "profile_name": body.profile_name,
+        "automation_mode": body.automation_mode,
         "pending_tool_uses": [],
         "stop_reason": None,
         "approved": False,

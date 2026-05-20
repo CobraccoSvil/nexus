@@ -2035,6 +2035,8 @@ async fn spawn_agent_run(
     // bug del modello e non giustifica un fallback su un modello piu' costoso.
     // `classified.intent` e' `&'static str` quindi e' Copy: nessun clone serve.
     let classified_intent_for_loop: &'static str = classified.intent;
+    // Modalita' automazione propagata al brain (per clarify_or_expand skip).
+    let automation_mode_for_brain: String = params.automation_mode.as_str().to_string();
 
     // Calcola il payload tools dinamico (discovery mode vs inline) prima dello spawn.
     // Il filtering per automation_mode avviene dentro build_tools_json_for_agent:
@@ -2141,6 +2143,7 @@ async fn spawn_agent_run(
                 tools_json_for_brain.clone(),
                 sse_max_silence_secs,
                 false, // emit_final_event: emesso manualmente dopo il break del retry loop
+                automation_mode_for_brain.clone(),
             )
             .await;
 
@@ -3041,6 +3044,7 @@ pub async fn send_chat_message(
                             tools_for_resume,
                             sse_silence_resume,
                             true, // emit_final_event: caller singolo-shot, nessun retry loop
+                            automation_r.as_str().to_string(),
                         )
                         .await;
                         channels2.remove(&new_run_id);

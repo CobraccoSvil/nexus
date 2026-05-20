@@ -111,6 +111,17 @@ async def clarify_or_expand_node(state: AgentState) -> dict[str, Any]:
     if not cfg["enabled"]:
         logger.info("clarify_or_expand: disabilitato via settings, skip")
         return {}
+    # Short-circuit autonomia: se mcp-core ha propagato automation_mode
+    # "automatic" o "continuous" l'utente ha chiesto esplicitamente che
+    # l'agente proceda autonomamente. Non bloccarlo con clarify: l'agente
+    # downstream esplora codebase via tool invece di chiedere.
+    automation = (state.get("automation_mode") or "").strip().lower()
+    if automation in ("automatic", "automatico", "auto", "continuous", "continuo"):
+        logger.info(
+            "clarify_or_expand: skip (automation_mode=%s, agente autonomo)",
+            automation,
+        )
+        return {}
     confidence = float(state.get("intent_confidence") or 1.0)
     logger.info(
         "clarify_or_expand: entrata run_id=%s confidence=%.2f threshold=%.2f",

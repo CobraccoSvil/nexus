@@ -444,6 +444,7 @@ pub async fn run_via_brain(
     tools_json: Value,
     sse_max_silence_secs: u64,
     emit_final_event: bool,
+    automation_mode: String,
 ) -> AgentRunResult {
     let run_id_str = run_id.to_string();
     let url = format!("{}/agent/run/stream", brain_rest_url().trim_end_matches('/'));
@@ -459,6 +460,7 @@ pub async fn run_via_brain(
         "model_override": model,
         "conversation_history": conversation_history,
         "run_id": run_id_str,
+        "automation_mode": automation_mode,
     });
 
     // Solo connect_timeout: il timeout sulla connessione TCP iniziale.

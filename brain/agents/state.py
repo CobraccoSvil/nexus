@@ -134,3 +134,10 @@ class AgentState(TypedDict, total=False):
     # ri-tentare la chain completa (anthropic -> openai -> google -> deepseek).
     planner_sticky_provider: str | None
     planner_sticky_model: str | None
+
+    # Modalita' automazione del turno chat propagata da mcp-core.
+    # Valori attesi: "none" | "confirm" | "automatic" | "continuous".
+    # Usato dal clarify_or_expand_node per saltare la domanda di chiarimento
+    # quando l'utente ha scelto un livello autonomo ("automatic"/"continuous"):
+    # l'agente downstream esplora invece di bloccare l'utente.
+    automation_mode: str | None
