@@ -24,7 +24,7 @@ export default function LoginPage() {
           Sign in to access the development environment
         </p>
         <a
-          href="http://localhost:4000/auth/github"
+          href="/auth/github"
           style={{
             display: "inline-flex",
             alignItems: "center",
