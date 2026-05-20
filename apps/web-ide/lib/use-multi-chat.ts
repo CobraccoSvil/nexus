@@ -35,12 +35,18 @@ function savePersisted(projectId: string, tabs: string[], active: string | null)
 }
 
 export type AgentActivityMap = Map<string, boolean>;
+/** Mappa sessionId → ratio (0..1+) del context_window usato nell'ultimo turno.
+ *  Aggiornata da ChatPanel via onCtxRatioChange; letta da ide-shell per
+ *  mostrare la % sul bottone "Compatta chat" (icona di compattazione).
+ *  Valore > 1.0 ammesso (es. 1.34 = 134% ctx) per indicare overflow. */
+export type CtxRatioMap = Map<string, number>;
 
 export interface UseMultiChatReturn {
   allSessions: ChatSessionSummary[];
   openTabs: string[];
   activeTabId: string | null;
   agentActivity: AgentActivityMap;
+  ctxRatio: CtxRatioMap;
   isLoading: boolean;
   error: string | null;
   openTab: (id: string) => void;
@@ -51,6 +57,7 @@ export interface UseMultiChatReturn {
   deleteSession: (id: string) => Promise<void>;
   compactSession: (id: string) => Promise<{ summary: string }>;
   setAgentActive: (sessionId: string, active: boolean) => void;
+  setCtxRatio: (sessionId: string, ratio: number | null) => void;
   refreshSessions: () => Promise<void>;
 }
 
@@ -59,6 +66,7 @@ export function useMultiChat(projectId: string): UseMultiChatReturn {
   const [openTabs, setOpenTabs] = useState<string[]>([]);
   const [activeTabId, setActiveTabIdState] = useState<string | null>(null);
   const [agentActivity, setAgentActivity] = useState<AgentActivityMap>(new Map());
+  const [ctxRatio, setCtxRatioState] = useState<CtxRatioMap>(new Map());
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const openTabsRef = useRef<string[]>([]);
@@ -213,11 +221,22 @@ export function useMultiChat(projectId: string): UseMultiChatReturn {
     });
   }, []);
 
+  // ── Ctx ratio tracking (per badge sul bottone Compatta) ──────────────────────
+  const setCtxRatio = useCallback((sessionId: string, ratio: number | null) => {
+    setCtxRatioState((prev) => {
+      const next = new Map(prev);
+      if (ratio == null) next.delete(sessionId);
+      else next.set(sessionId, ratio);
+      return next;
+    });
+  }, []);
+
   return {
     allSessions,
     openTabs,
     activeTabId,
     agentActivity,
+    ctxRatio,
     isLoading,
     error,
     openTab,
@@ -228,6 +247,7 @@ export function useMultiChat(projectId: string): UseMultiChatReturn {
     deleteSession,
     compactSession,
     setAgentActive,
+    setCtxRatio,
     refreshSessions,
   };
 }

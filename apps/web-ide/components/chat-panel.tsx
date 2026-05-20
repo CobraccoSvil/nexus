@@ -247,6 +247,7 @@ export function ChatPanel({
   activeFiles = [],
   sessionId,
   onAgentActivityChange,
+  onCtxRatioChange,
   selectedProvider,
   setSelectedProvider,
   selectedModel,
@@ -272,6 +273,10 @@ export function ChatPanel({
   activeFiles?: string[];
   sessionId?: string;
   onAgentActivityChange?: (active: boolean) => void;
+  /** Notifica al parent il ratio (0..1+) di riempimento context_window
+   *  dell'ultimo turno; null se non disponibile. Usato dall'ide-shell per
+   *  mostrare la % sul bottone "Compatta chat". */
+  onCtxRatioChange?: (ratio: number | null) => void;
   selectedProvider: string;
   setSelectedProvider: (v: string) => void;
   selectedModel: string;
@@ -337,6 +342,46 @@ export function ChatPanel({
       onAgentActivityChange?.(isActive);
     }
   }, [agentRun?.status, onAgentActivityChange]);
+
+  // Notifica al parent (ide-shell) il ratio % di riempimento context_window
+  // dell'ultimo turno: usato per mostrare il valore sul bottone "Compatta chat".
+  // Calcoliamo gli stessi input di TokenUsageBar (vedi piu' sotto nel JSX).
+  useEffect(() => {
+    if (!onCtxRatioChange) return;
+    const lastAssistantWithTokens = [...messages]
+      .reverse()
+      .find(
+        (m) =>
+          m.role === "assistant" &&
+          !m.deletedAt &&
+          (m.promptTokens ?? 0) > 0,
+      );
+    const activeModel =
+      agentRun?.model ||
+      lastAssistantWithTokens?.model ||
+      (selectedModel !== "auto" ? selectedModel : null);
+    const catalogEntry = activeModel
+      ? modelCatalog.find((m) => m.model === activeModel)
+      : null;
+    const ctxWindow =
+      catalogEntry?.contextWindow ?? fallbackContextWindow(activeModel);
+    const lastInputTokens =
+      agentRun?.usage?.totalPromptTokens ??
+      lastAssistantWithTokens?.promptTokens ??
+      null;
+    const ratio =
+      ctxWindow && ctxWindow > 0 && lastInputTokens && lastInputTokens > 0
+        ? lastInputTokens / ctxWindow
+        : null;
+    onCtxRatioChange(ratio);
+  }, [
+    messages,
+    agentRun?.model,
+    agentRun?.usage?.totalPromptTokens,
+    selectedModel,
+    modelCatalog,
+    onCtxRatioChange,
+  ]);
   useEffect(() => {
     onTracesChange?.(traces);
   }, [traces, onTracesChange]);
@@ -426,25 +471,21 @@ export function ChatPanel({
   const secondsSinceLastStepInternal = Math.max(0, Math.floor((nowTick - lastStepAt) / 1000));
   const isAgentStuck = isAgentRunning && secondsSinceLastStepInternal > 60;
 
-  // Auto-abort: se nessun nuovo step parte entro 3 minuti, ferma automaticamente
-  const autoAbortRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    if (!isAgentRunning) {
-      if (autoAbortRef.current) clearTimeout(autoAbortRef.current);
-      return;
-    }
-    if (autoAbortRef.current) clearTimeout(autoAbortRef.current);
-    autoAbortRef.current = setTimeout(() => {
-      if (agentRun?.runId) {
-        console.warn("[auto-abort] Nessun progresso da 3 minuti — interrompo agente", agentRun.runId);
-        void cancelRun(agentRun.runId);
-      }
-    }, 3 * 60 * 1000);
-    return () => {
-      if (autoAbortRef.current) clearTimeout(autoAbortRef.current);
-    };
-  // Reset timer ogni volta che arriva un nuovo step
-  }, [isAgentRunning, agentSteps.length, agentRun?.runId, cancelRun]);
+  // Auto-abort rimosso: il client non puo' sapere se "nessun nuovo step da Xs"
+  // significa "bloccato" o "legittimamente lento" (provider in fallback dopo
+  // cooldown billing, LLM call su contesto grande, tool long-running).
+  //
+  // Veri guardrail (lato backend) gia' attivi:
+  //   - mcp-core: sse_max_silence_secs (settings DB, default 120s) — se SSE
+  //     non emette eventi (incluso ping heartbeat ogni 30s) per N secondi
+  //     chiude lo stream e segna il run fallito
+  //   - mcp-core: max_provider_fallbacks dinamico = N provider idonei
+  //   - mcp-core: HOLLOW detection (EMPTY_ANSWER / NO_TOOLS / RESIGNED)
+  //
+  // Lato client conserviamo solo:
+  //   - pulsante Stop rosso sempre visibile (cancellazione esplicita utente)
+  //   - banner informativo nella timeline se isAgentStuck (gia' presente:
+  //     calcolo `secondsSinceLastStepInternal > 60` poco sopra)
 
   const timelineSteps = [...agentSteps]
     .sort((a, b) => a.stepIndex - b.stepIndex)

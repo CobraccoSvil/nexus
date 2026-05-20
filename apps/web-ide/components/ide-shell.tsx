@@ -1502,22 +1502,60 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           >
             🗑
           </button>
-          <button
-            type="button"
-            disabled={!multiChat.activeTabId}
-            onClick={() => {
-              const currentId = multiChat.activeTabId;
-              if (!currentId) return;
-              // Il backend emette ChatSessionCompacted via dispatcher SSE,
-              // use-chat ascolta e riallinea tokenUsage senza re-mount.
-              void multiChat.compactSession(currentId);
-            }}
-            title="Compatta chat"
-            aria-label="Compatta chat"
-            style={iconButton(tc, !multiChat.activeTabId)}
-          >
-            ⌁
-          </button>
+          {(() => {
+            // % di riempimento context_window dell'ultimo turno della chat attiva.
+            // Aggiornata da ChatPanel via onCtxRatioChange → multiChat.setCtxRatio.
+            // Mostriamo il valore sul bottone "Compatta chat" cosi' l'utente vede
+            // a colpo d'occhio quando e' opportuno compattare (>70% giallo, >=90% rosso).
+            const activeId = multiChat.activeTabId;
+            const ratio = activeId ? multiChat.ctxRatio.get(activeId) : undefined;
+            const pct = ratio != null ? Math.round(ratio * 100) : null;
+            const ratioColor = pct == null
+              ? tc.textMuted
+              : pct >= 90 ? tc.error
+              : pct >= 70 ? tc.warning
+              : tc.textMuted;
+            return (
+              <button
+                type="button"
+                disabled={!multiChat.activeTabId}
+                onClick={() => {
+                  const currentId = multiChat.activeTabId;
+                  if (!currentId) return;
+                  // Il backend emette ChatSessionCompacted via dispatcher SSE,
+                  // use-chat ascolta e riallinea tokenUsage senza re-mount.
+                  void multiChat.compactSession(currentId);
+                }}
+                title={pct != null
+                  ? `Compatta chat — context usato: ${pct}%`
+                  : "Compatta chat"}
+                aria-label={pct != null
+                  ? `Compatta chat (context ${pct}%)`
+                  : "Compatta chat"}
+                style={{
+                  ...iconButton(tc, !multiChat.activeTabId),
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 4,
+                  paddingInline: pct != null ? 8 : undefined,
+                }}
+              >
+                <span>⌁</span>
+                {pct != null && (
+                  <span
+                    style={{
+                      fontSize: 10,
+                      fontWeight: 600,
+                      color: ratioColor,
+                      lineHeight: 1,
+                    }}
+                  >
+                    {pct}%
+                  </span>
+                )}
+              </button>
+            );
+          })()}
         </div>
       </div>
       <div
@@ -1543,6 +1581,9 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               profileId={selectedProfileId}
               onAgentActivityChange={(active) =>
                 multiChat.setAgentActive(multiChat.activeTabId!, active)
+              }
+              onCtxRatioChange={(ratio) =>
+                multiChat.setCtxRatio(multiChat.activeTabId!, ratio)
               }
               selectedProvider={chatProvider}
               setSelectedProvider={(v) => { setChatProvider(v); try { localStorage.setItem("nexus:chatProvider", v); } catch {} }}
