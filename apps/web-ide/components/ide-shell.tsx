@@ -423,6 +423,23 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     "study" | "confirm" | "automatic" | undefined
   >(undefined);
   const [agentRunEndSignal, setAgentRunEndSignal] = useState(0);
+
+  // Bridge globale `nexus:chat:send` -> chat composer.
+  // Permette ad altri pannelli (es. project-db-panel "Crea database via agente")
+  // di iniettare un prompt + auto-send senza dover passare per props/context.
+  // Detail atteso: { content: string, autoSend?: boolean, automation?: "study"|"confirm"|"automatic" }
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      const ce = ev as CustomEvent<{ content?: string; autoSend?: boolean; automation?: "study" | "confirm" | "automatic" }>;
+      const content = ce.detail?.content;
+      if (!content || typeof content !== "string") return;
+      setPendingChatMessage(content);
+      setPendingAutoSend(ce.detail?.autoSend !== false);
+      if (ce.detail?.automation) setPendingExternalAutomation(ce.detail.automation);
+    };
+    window.addEventListener("nexus:chat:send", handler);
+    return () => window.removeEventListener("nexus:chat:send", handler);
+  }, []);
   const [leftWidth, setLeftWidth] = useState(300);
   const [rightWidth, setRightWidth] = useState(430);
   const [bottomHeight, setBottomHeight] = useState(250);

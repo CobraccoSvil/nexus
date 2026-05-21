@@ -39,6 +39,63 @@ const statusColorMap: Record<string, string> = {
   overridden: "#8b5cf6",
 };
 
+/** Classifica l'errore di test-connection per proporre azioni mirate.
+ *  - `unreachable`: host/porta non raggiungibili (connection refused, timeout, DNS).
+ *  - `no_database` : il database non esiste sul server (es. "database X does not exist").
+ *  - `auth_failed` : credenziali sbagliate (password authentication failed, role does not exist).
+ *  - `tables_missing`: connessione OK ma schema vuoto (table_count=0 senza migrazioni applicate).
+ *  - `unknown`     : tutto il resto (errore SQL generico, sintassi, permessi su singolo oggetto).
+ */
+type DbErrorCategory = "unreachable" | "no_database" | "auth_failed" | "tables_missing" | "unknown";
+function categorizeDbError(error: string | null | undefined, tableCount?: number | null): DbErrorCategory {
+  if ((tableCount ?? -1) === 0) return "tables_missing";
+  if (!error) return "unknown";
+  const lower = error.toLowerCase();
+  if (
+    lower.includes("connection refused") ||
+    lower.includes("connessione rifiutata") ||
+    lower.includes("no route to host") ||
+    lower.includes("network is unreachable") ||
+    lower.includes("lookup address information") ||
+    lower.includes("name or service not known") ||
+    lower.includes("could not connect") ||
+    lower.includes("timed out") ||
+    lower.includes("timeout") ||
+    lower.includes("server closed the connection")
+  ) return "unreachable";
+  if (
+    lower.includes("does not exist") && (lower.includes("database") || lower.includes("3d000")) ||
+    lower.includes("unknown database") ||
+    lower.includes("no such database")
+  ) return "no_database";
+  if (
+    lower.includes("password authentication failed") ||
+    lower.includes("authentication failed") ||
+    lower.includes("role") && lower.includes("does not exist") ||
+    lower.includes("access denied") ||
+    lower.includes("28p01") ||
+    lower.includes("28000")
+  ) return "auth_failed";
+  return "unknown";
+}
+
+/** Estrae host/port/db/user da una connection string semplificata. */
+function parseConnPartsForActions(connStr: string): { host: string; port: string; database: string } | null {
+  // postgres://user:pass@host:port/dbname o postgresql:// ; mysql:// ; mssql:// ; ecc.
+  const m = connStr.match(/^[a-z]+:\/\/(?:[^@]+@)?([^:/]+)(?::(\d+))?(?:\/([^?]+))?/i);
+  if (!m) return null;
+  return { host: m[1] ?? "", port: m[2] ?? "", database: (m[3] ?? "").split("?")[0] ?? "" };
+}
+
+/** Lista di host candidati quando il primo è unreachable (es. localhost dev → server prod). */
+function alternativeHostsFor(currentHost: string): string[] {
+  const local = ["localhost", "127.0.0.1", "::1"];
+  if (local.includes(currentHost)) return ["192.168.0.6", "192.168.0.3"];
+  if (currentHost === "192.168.0.6") return ["192.168.0.3", "localhost"];
+  if (currentHost === "192.168.0.3") return ["192.168.0.6", "localhost"];
+  return ["localhost", "192.168.0.6", "192.168.0.3"].filter((h) => h !== currentHost);
+}
+
 import { useGlobalDialog } from "../global-dialog-provider";
 
 export function ProjectDbPanel({ project }: Props) {
@@ -1006,6 +1063,214 @@ export function ProjectDbPanel({ project }: Props) {
                 )}
               </div>
             )}
+
+            {/* Azioni suggerite quando il test della config rilevata fallisce.
+                La categorizzazione e' deterministica (parsing testo errore +
+                table_count) e le azioni sono context-aware: per "unreachable"
+                tentiamo automaticamente host alternativi sulla LAN; per
+                "no_database" generiamo un prompt agente per creare il DB;
+                per "tables_missing" suggeriamo di eseguire le migrazioni. */}
+            {detectedTestResult && !detectedTestResult.ok && detectedConfig?.connection_string && (() => {
+              const category = categorizeDbError(detectedTestResult.error, detectedTestResult.table_count);
+              const parts = parseConnPartsForActions(detectedConfig.connection_string ?? "");
+              const dbName = parts?.database || "<nome_db>";
+              const altHosts = parts ? alternativeHostsFor(parts.host) : [];
+              const labelByCategory: Record<DbErrorCategory, string> = {
+                unreachable: "Host non raggiungibile",
+                no_database: `Database "${dbName}" non esiste sul server`,
+                auth_failed: "Credenziali non valide",
+                tables_missing: "Connesso ma nessuna tabella",
+                unknown: "Errore non classificato",
+              };
+              const tryAlternativeHost = async (altHost: string) => {
+                if (!projectId || !parts) return;
+                const newConn = (detectedConfig.connection_string ?? "")
+                  .replace(`@${parts.host}`, `@${altHost}`)
+                  .replace(`//${parts.host}`, `//${altHost}`);
+                setBusy(true);
+                setDetectedTestResult(null);
+                try {
+                  const res = await testProjectDbConnection(projectId, {
+                    engine: detectedConfig?.engine ?? undefined,
+                    connection_string: newConn,
+                  });
+                  setDetectedTestResult(res);
+                  if (res.ok) {
+                    // Salva il connection_string corretto come override
+                    setDetectedConfig({
+                      ...detectedConfig,
+                      connection_string: newConn,
+                    });
+                  }
+                } catch (e) {
+                  setDetectedTestResult({
+                    ok: false,
+                    error: e instanceof Error ? e.message : `Test fallito su ${altHost}`,
+                  });
+                } finally {
+                  setBusy(false);
+                }
+              };
+              return (
+                <div
+                  style={{
+                    marginTop: 4,
+                    padding: "6px 8px",
+                    borderRadius: 4,
+                    background: tc.bgCard,
+                    border: `1px dashed ${tc.warning}80`,
+                  }}
+                >
+                  <div style={{ fontSize: 10, fontWeight: 700, color: tc.warning, marginBottom: 4 }}>
+                    {labelByCategory[category]} · Azioni suggerite
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    {category === "unreachable" && altHosts.length > 0 && (
+                      <>
+                        <div style={{ fontSize: 9, color: tc.textMuted }}>
+                          Cerca il DB su altre macchine della LAN:
+                        </div>
+                        {altHosts.map((h) => (
+                          <button
+                            key={h}
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void tryAlternativeHost(h)}
+                            style={{
+                              alignSelf: "flex-start",
+                              padding: "2px 8px",
+                              borderRadius: 4,
+                              border: `1px solid ${tc.accent}`,
+                              background: "transparent",
+                              color: tc.accent,
+                              cursor: busy ? "not-allowed" : "pointer",
+                              fontSize: 10,
+                              fontWeight: 600,
+                            }}
+                          >
+                            Prova host {h}
+                          </button>
+                        ))}
+                      </>
+                    )}
+                    {category === "no_database" && (
+                      <>
+                        <div style={{ fontSize: 9, color: tc.textMuted }}>
+                          Il server e' raggiungibile ma manca il database <code>{dbName}</code>.
+                        </div>
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => {
+                            const prompt =
+                              `Crea il database "${dbName}" sul server PostgreSQL accessibile da ` +
+                              `${detectedConfig?.connection_string?.replace(/:([^:@]+)@/, ":***@") ?? "questa configurazione"}, ` +
+                              `quindi applica le migrazioni del progetto (cartella migrations) ` +
+                              `e verifica con un test di connessione.`;
+                            try {
+                              window.dispatchEvent(
+                                new CustomEvent("nexus:chat:send", { detail: { content: prompt } }),
+                              );
+                              setActionMsg(`Prompt inviato all'agente per creare "${dbName}".`);
+                            } catch {
+                              navigator.clipboard?.writeText(prompt).catch(() => {});
+                              setActionMsg("Prompt copiato negli appunti. Incollalo in chat.");
+                            }
+                          }}
+                          style={{
+                            alignSelf: "flex-start",
+                            padding: "2px 8px",
+                            borderRadius: 4,
+                            border: `1px solid ${tc.accent}`,
+                            background: "transparent",
+                            color: tc.accent,
+                            cursor: busy ? "not-allowed" : "pointer",
+                            fontSize: 10,
+                            fontWeight: 600,
+                          }}
+                        >
+                          Crea database "{dbName}" via agente
+                        </button>
+                      </>
+                    )}
+                    {category === "tables_missing" && (
+                      <>
+                        <div style={{ fontSize: 9, color: tc.textMuted }}>
+                          Connessione OK ma lo schema e' vuoto. Esegui le migrazioni del progetto.
+                        </div>
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => {
+                            setShowInit(true);
+                            setActionMsg("Configura connessione e poi clicca \"Esegui migrazioni\" nella sezione Migrazioni.");
+                          }}
+                          style={{
+                            alignSelf: "flex-start",
+                            padding: "2px 8px",
+                            borderRadius: 4,
+                            border: `1px solid ${tc.accent}`,
+                            background: "transparent",
+                            color: tc.accent,
+                            cursor: busy ? "not-allowed" : "pointer",
+                            fontSize: 10,
+                            fontWeight: 600,
+                          }}
+                        >
+                          Apri pannello migrazioni
+                        </button>
+                      </>
+                    )}
+                    {category === "auth_failed" && (
+                      <div style={{ fontSize: 9, color: tc.textMuted }}>
+                        Username/password sbagliati. Aggiorna i campi nella sezione "Usa questa configurazione" e ritesta.
+                      </div>
+                    )}
+                    {/* Azione comune sempre disponibile */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const parsedX = detectedConfig?.connection_string
+                          ? parseConnectionString(detectedConfig.connection_string)
+                          : null;
+                        setInitForm((f) => ({
+                          ...f,
+                          engine: detectedConfig?.engine ?? f.engine,
+                          hosting_mode: detectedConfig?.hosting_mode ?? f.hosting_mode,
+                          migration_tool: detectedConfig?.migration_tool ?? f.migration_tool,
+                          migration_path: detectedConfig?.migration_path ?? f.migration_path,
+                          connection_string: detectedConfig?.connection_string ?? f.connection_string,
+                        }));
+                        if (parsedX) {
+                          setUseConnFields(true);
+                          setConnFields({
+                            host: parsedX.host,
+                            port: parsedX.port || "5432",
+                            database: parsedX.database,
+                            username: parsedX.username,
+                            password: parsedX.password,
+                          });
+                        }
+                        setShowInit(true);
+                      }}
+                      style={{
+                        alignSelf: "flex-start",
+                        padding: "2px 8px",
+                        borderRadius: 4,
+                        border: `1px solid ${tc.border}`,
+                        background: "transparent",
+                        color: tc.textSecondary,
+                        cursor: "pointer",
+                        fontSize: 10,
+                        fontWeight: 600,
+                      }}
+                    >
+                      Configura manualmente
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}
