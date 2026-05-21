@@ -1279,10 +1279,9 @@ async def agent_state(thread_id: str) -> dict[str, object]:
 async def agent_feedback(thread_id: str, body: AgentFeedbackRequest) -> dict[str, object]:
     """Registra il feedback utente per l'ultima interazione di un thread."""
     try:
-        from brain.memory.storage import LocalLearningStorage
-        from brain.agents.checkpointer import get_memory_db_path
+        from brain.memory.storage import PostgresLearningStorage
 
-        storage = LocalLearningStorage(db_path=get_memory_db_path())
+        storage = PostgresLearningStorage()
         updated = storage.update_feedback(thread_id, body.score)
         return {"thread_id": thread_id, "updated": updated, "score": body.score}
     except Exception as exc:
@@ -1294,10 +1293,9 @@ async def agent_feedback(thread_id: str, body: AgentFeedbackRequest) -> dict[str
 async def agent_stats() -> dict[str, object]:
     """Restituisce statistiche aggregate sulle interazioni per tipo di task."""
     try:
-        from brain.memory.storage import LocalLearningStorage
-        from brain.agents.checkpointer import get_memory_db_path
+        from brain.memory.storage import PostgresLearningStorage
 
-        storage = LocalLearningStorage(db_path=get_memory_db_path())
+        storage = PostgresLearningStorage()
         return {"stats": storage.get_task_stats()}
     except Exception as exc:
         logger.error("agent_stats error: %s", exc)

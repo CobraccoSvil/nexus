@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from brain.grpc_clients.agent_router_client import AgentRouterClient
     from brain.grpc_clients.tool_runner_client import ToolRunnerClient
     from brain.memory.retrieval import InteractionRetriever
-    from brain.memory.storage import LocalLearningStorage
+    from brain.memory.storage import PostgresLearningStorage as LocalLearningStorage
     from brain.providers import ProviderRegistry
     from brain.router import SemanticRouter
 
@@ -759,7 +759,8 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             # Passa anche il message originale: il router lo usa per detection
             # task rischiosi (override automatico a behavior_mode "approfondita"
             # se rileva verbi distruttivi: rm -rf, drop table, docker prune, ecc.)
-            decision = _router.route_model(intent, token_budget, behavior_mode, message=str(text))
+            _last_msg_text = messages[-1].content if messages else ""
+            decision = _router.route_model(intent, token_budget, behavior_mode, message=str(_last_msg_text))
             provider = provider or decision.provider
             model = model or decision.model
             logger.info("executor_node routing: %s", decision.rationale)
@@ -803,7 +804,7 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         logger.debug("executor_node: heartbeat calling_model fallito: %s", _hb_exc)
 
     start_ms = time.monotonic() * 1000
-    created_at = datetime.datetime.utcnow().isoformat() + "Z"
+    created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     result_text = ""
     token_usage = 0
     prompt_tokens = 0
@@ -1691,7 +1692,7 @@ async def learner_node(state: AgentState) -> dict[str, Any]:
     latency_ms = state.get("latency_ms")
     token_usage = state.get("token_usage")
     created_at = state.get("created_at")
-    completed_at = datetime.datetime.utcnow().isoformat() + "Z"
+    completed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     # Recupera testo input utente
     user_input = ""
@@ -1748,7 +1749,7 @@ async def learner_node(state: AgentState) -> dict[str, Any]:
         if not stored:
             qdrant_id = None
 
-    # Salva in SQLite
+    # Salva in PostgreSQL (brain_learning_interactions)
     if _storage is not None and user_input:
         try:
             _storage.save_interaction(
@@ -1765,7 +1766,7 @@ async def learner_node(state: AgentState) -> dict[str, Any]:
                 metadata={"iterations": state.get("iterations", 1)},
             )
         except Exception as exc:
-            logger.warning("learner_node: salvataggio SQLite fallito thread=%s: %s", thread_id, exc)
+            logger.warning("learner_node: salvataggio PostgreSQL fallito thread=%s: %s", thread_id, exc)
 
     # ── Feedback al router Q-Learning ──────────────────────────────────────
     # Reward: usa final_reward dal reflection_node se disponibile,

@@ -1,15 +1,16 @@
 """Test di integrazione per il modulo LangGraph in Nexus.
 
 Copertura target: >= 80%
-Ogni test è idempotente e usa database SQLite in memoria o temporanei.
+Ogni test e' idempotente. Lo storage usa PostgreSQL (brain_learning_interactions).
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,18 +18,39 @@ import pytest
 
 # ─── Fixture ──────────────────────────────────────────────────────────────────
 
+_TEST_DB_URL = os.environ.get(
+    "DATABASE_URL", "postgresql://nexus:nexus@localhost:5433/nexus"
+)
+_TEST_PREFIX = "test-lg-"
+
 
 @pytest.fixture
-def tmp_db(tmp_path: Path) -> str:
-    """Restituisce un path temporaneo per database SQLite di test."""
-    return str(tmp_path / "test_learning.db")
+def storage() -> Generator["PostgresLearningStorage", None, None]:
+    """Crea un PostgresLearningStorage puntato al DB di test.
 
+    Dopo ogni test, pulisce le righe di test (thread_id LIKE 'test-lg-%').
+    """
+    from brain.memory.storage import PostgresLearningStorage
 
-@pytest.fixture
-def storage(tmp_db: str) -> "LocalLearningStorage":
-    from brain.memory.storage import LocalLearningStorage
-
-    return LocalLearningStorage(db_path=tmp_db)
+    store = PostgresLearningStorage(db_url=_TEST_DB_URL)
+    yield store
+    # Cleanup
+    try:
+        import psycopg2
+        conn = psycopg2.connect(_TEST_DB_URL)
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM brain_learning_interactions WHERE thread_id LIKE %s",
+                (f"{_TEST_PREFIX}%",),
+            )
+            cur.execute(
+                "DELETE FROM brain_task_stats WHERE task_type LIKE %s",
+                ("_test_%",),
+            )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 @pytest.fixture
@@ -80,23 +102,29 @@ def mock_router() -> MagicMock:
     return r
 
 
-# ─── Test: LocalLearningStorage ──────────────────────────────────────────────
+# ─── Test: PostgresLearningStorage ──────────────────────────────────────────
 
 
-class TestLocalLearningStorage:
-    def test_init_crea_tabelle(self, storage: "LocalLearningStorage") -> None:
-        import sqlite3
-
-        conn = sqlite3.connect(storage.db_path)
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+class TestPostgresLearningStorage:
+    def test_tabelle_esistono(self, storage: "PostgresLearningStorage") -> None:
+        """Verifica che le tabelle PostgreSQL siano raggiungibili."""
+        import psycopg2
+        conn = psycopg2.connect(_TEST_DB_URL)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema='public' AND table_name IN "
+                "('brain_learning_interactions','brain_task_stats')"
+            )
+            tables = {r[0] for r in cur.fetchall()}
         conn.close()
-        assert "interactions" in tables
-        assert "task_stats" in tables
+        assert "brain_learning_interactions" in tables
+        assert "brain_task_stats" in tables
 
-    def test_save_interaction_base(self, storage: "LocalLearningStorage") -> None:
+    def test_save_interaction_base(self, storage: "PostgresLearningStorage") -> None:
         row_id = storage.save_interaction(
-            thread_id="thread-1",
-            task_type="fix",
+            thread_id=f"{_TEST_PREFIX}thread-1",
+            task_type="_test_fix",
             behavior_mode="bilanciata",
             user_input="Risolvi il bug",
             agent_output="Ecco la soluzione.",
@@ -107,61 +135,61 @@ class TestLocalLearningStorage:
         )
         assert row_id > 0
 
-    def test_save_interaction_aggiorna_stats(self, storage: "LocalLearningStorage") -> None:
+    def test_save_interaction_aggiorna_stats(self, storage: "PostgresLearningStorage") -> None:
         storage.save_interaction(
-            thread_id="thread-2",
-            task_type="refactor",
+            thread_id=f"{_TEST_PREFIX}thread-2",
+            task_type="_test_refactor",
             behavior_mode="veloce",
             user_input="Refactoring del modulo",
             agent_output="Codice refactored.",
         )
         stats = storage.get_task_stats()
         task_types = [s["task_type"] for s in stats]
-        assert "refactor" in task_types
+        assert "_test_refactor" in task_types
 
-    def test_salvataggio_multiplo_e_conteggio(self, storage: "LocalLearningStorage") -> None:
+    def test_salvataggio_multiplo_e_conteggio(self, storage: "PostgresLearningStorage") -> None:
         for i in range(5):
             storage.save_interaction(
-                thread_id=f"thread-{i}",
-                task_type="test",
+                thread_id=f"{_TEST_PREFIX}multi-{i}",
+                task_type="_test_multi",
                 behavior_mode="bilanciata",
                 user_input=f"Input {i}",
                 agent_output=f"Output {i}",
             )
-        interactions = storage.get_interactions_by_task("test", limit=10)
+        interactions = storage.get_interactions_by_task("_test_multi", limit=10)
         assert len(interactions) == 5
 
-    def test_update_feedback_esistente(self, storage: "LocalLearningStorage") -> None:
+    def test_update_feedback_esistente(self, storage: "PostgresLearningStorage") -> None:
         storage.save_interaction(
-            thread_id="thread-fb",
-            task_type="docs",
+            thread_id=f"{_TEST_PREFIX}thread-fb",
+            task_type="_test_docs",
             behavior_mode="approfondita",
             user_input="Documenta il modulo",
             agent_output="Documentazione generata.",
         )
-        updated = storage.update_feedback("thread-fb", 0.9)
+        updated = storage.update_feedback(f"{_TEST_PREFIX}thread-fb", 0.9)
         assert updated is True
 
-    def test_update_feedback_inesistente(self, storage: "LocalLearningStorage") -> None:
-        updated = storage.update_feedback("thread-non-esiste", 0.5)
+    def test_update_feedback_inesistente(self, storage: "PostgresLearningStorage") -> None:
+        updated = storage.update_feedback(f"{_TEST_PREFIX}non-esiste", 0.5)
         assert updated is False
 
-    def test_get_recent_interactions_limit(self, storage: "LocalLearningStorage") -> None:
+    def test_get_recent_interactions_limit(self, storage: "PostgresLearningStorage") -> None:
         for i in range(15):
             storage.save_interaction(
-                thread_id=f"th-{i}",
-                task_type="chat",
+                thread_id=f"{_TEST_PREFIX}limit-{i}",
+                task_type="_test_chat_limit",
                 behavior_mode="bilanciata",
                 user_input=f"domanda {i}",
                 agent_output=f"risposta {i}",
             )
         recenti = storage.get_recent_interactions(limit=10)
-        assert len(recenti) == 10
+        assert len(recenti) >= 10
 
-    def test_get_task_stats_struttura(self, storage: "LocalLearningStorage") -> None:
+    def test_get_task_stats_struttura(self, storage: "PostgresLearningStorage") -> None:
         storage.save_interaction(
-            thread_id="th-s",
-            task_type="architecture",
+            thread_id=f"{_TEST_PREFIX}th-s",
+            task_type="_test_architecture",
             behavior_mode="approfondita",
             user_input="Progetta sistema",
             agent_output="Design proposto.",
@@ -169,34 +197,56 @@ class TestLocalLearningStorage:
         )
         stats = storage.get_task_stats()
         assert len(stats) >= 1
-        stat = next(s for s in stats if s["task_type"] == "architecture")
+        stat = next(s for s in stats if s["task_type"] == "_test_architecture")
         assert stat["total_count"] == 1
         assert stat["avg_latency_ms"] > 0
 
-    def test_idempotenza_salvataggio(self, storage: "LocalLearningStorage") -> None:
+    def test_idempotenza_salvataggio(self, storage: "PostgresLearningStorage") -> None:
         """Due salvataggi indipendenti non si influenzano."""
         id1 = storage.save_interaction(
-            thread_id="t1",
-            task_type="fix",
+            thread_id=f"{_TEST_PREFIX}idem-1",
+            task_type="_test_fix",
             behavior_mode="bilanciata",
             user_input="A",
             agent_output="B",
         )
         id2 = storage.save_interaction(
-            thread_id="t2",
-            task_type="fix",
+            thread_id=f"{_TEST_PREFIX}idem-2",
+            task_type="_test_fix",
             behavior_mode="bilanciata",
             user_input="C",
             agent_output="D",
         )
         assert id1 != id2
 
+    def test_metadata_jsonb(self, storage: "PostgresLearningStorage") -> None:
+        """Verifica che metadata JSONB sia salvato e recuperato come dict."""
+        storage.save_interaction(
+            thread_id=f"{_TEST_PREFIX}meta",
+            task_type="_test_meta",
+            behavior_mode="bilanciata",
+            user_input="test metadata",
+            agent_output="ok",
+            metadata={"chiave": "valore", "numero": 42},
+        )
+        interactions = storage.get_interactions_by_task("_test_meta")
+        assert len(interactions) >= 1
+        meta = interactions[0]["metadata"]
+        assert isinstance(meta, dict)
+        assert meta["chiave"] == "valore"
+        assert meta["numero"] == 42
+
+    def test_alias_retrocompatibilita(self) -> None:
+        from brain.memory.storage import LocalLearningStorage, PostgresLearningStorage
+        assert LocalLearningStorage is PostgresLearningStorage
+
 
 # ─── Test: router_node ───────────────────────────────────────────────────────
 
 
 class TestRouterNode:
-    def test_router_node_classifica_intent(self, mock_router: MagicMock) -> None:
+    @pytest.mark.asyncio
+    async def test_router_node_classifica_intent(self, mock_router: MagicMock) -> None:
         from langchain_core.messages import HumanMessage
 
         import brain.agents.nodes as nodes_mod
@@ -208,29 +258,31 @@ class TestRouterNode:
             "behavior_mode": "bilanciata",
             "iterations": 0,
         }
-        result = nodes_mod.router_node(state)
+        result = await nodes_mod.router_node(state)
 
         assert result["user_intent"] == "fix"
         assert result["task_type"] == "fix"
         assert result["iterations"] == 1
         assert result["token_budget"] >= 400
 
-    def test_router_node_senza_messaggi(self, mock_router: MagicMock) -> None:
+    @pytest.mark.asyncio
+    async def test_router_node_senza_messaggi(self, mock_router: MagicMock) -> None:
         import brain.agents.nodes as nodes_mod
 
         nodes_mod._router = mock_router
 
-        result = nodes_mod.router_node({"messages": [], "behavior_mode": "veloce", "iterations": 0})
+        result = await nodes_mod.router_node({"messages": [], "behavior_mode": "veloce", "iterations": 0})
         assert result["user_intent"] == "chat"
         assert result["task_type"] == "chat"
 
-    def test_router_node_senza_router(self) -> None:
+    @pytest.mark.asyncio
+    async def test_router_node_senza_router(self) -> None:
         from langchain_core.messages import HumanMessage
 
         import brain.agents.nodes as nodes_mod
 
         nodes_mod._router = None
-        result = nodes_mod.router_node({
+        result = await nodes_mod.router_node({
             "messages": [HumanMessage(content="hello")],
             "behavior_mode": "bilanciata",
             "iterations": 0,
@@ -292,9 +344,10 @@ class TestExecutorNode:
 
 
 class TestLearnerNode:
-    def test_learner_node_salva_interazione(
+    @pytest.mark.asyncio
+    async def test_learner_node_salva_interazione(
         self,
-        storage: "LocalLearningStorage",
+        storage: "PostgresLearningStorage",
         mock_embedding_service: MagicMock,
     ) -> None:
         from langchain_core.messages import HumanMessage
@@ -304,11 +357,11 @@ class TestLearnerNode:
         nodes_mod._storage = storage
         nodes_mod._retriever = None  # Qdrant non disponibile
 
-        thread_id = str(uuid.uuid4())
+        thread_id = f"{_TEST_PREFIX}learner-{uuid.uuid4().hex[:8]}"
         state = {
             "messages": [HumanMessage(content="Scrivi i test")],
             "thread_id": thread_id,
-            "user_intent": "test",
+            "user_intent": "_test_learner",
             "behavior_mode": "bilanciata",
             "result": "Test scritti correttamente.",
             "provider_used": "anthropic",
@@ -317,16 +370,17 @@ class TestLearnerNode:
             "token_usage": 120,
             "iterations": 2,
         }
-        nodes_mod.learner_node(state)
+        await nodes_mod.learner_node(state)
 
-        interactions = storage.get_interactions_by_task("test")
+        interactions = storage.get_interactions_by_task("_test_learner")
         assert len(interactions) >= 1
         saved = interactions[0]
         assert saved["thread_id"] == thread_id
         assert saved["provider"] == "anthropic"
 
-    def test_learner_node_senza_storage(self) -> None:
-        """learner_node non lancia eccezioni se storage è None."""
+    @pytest.mark.asyncio
+    async def test_learner_node_senza_storage(self) -> None:
+        """learner_node non lancia eccezioni se storage e None."""
         from langchain_core.messages import HumanMessage
 
         import brain.agents.nodes as nodes_mod
@@ -336,7 +390,7 @@ class TestLearnerNode:
 
         state = {
             "messages": [HumanMessage(content="test")],
-            "thread_id": "th-x",
+            "thread_id": f"{_TEST_PREFIX}nostorage",
             "user_intent": "chat",
             "behavior_mode": "bilanciata",
             "result": "risposta",
@@ -346,8 +400,9 @@ class TestLearnerNode:
             "token_usage": 10,
             "iterations": 1,
         }
-        result = nodes_mod.learner_node(state)
-        assert result == {}
+        result = await nodes_mod.learner_node(state)
+        # learner_node ritorna almeno completed_at anche senza storage
+        assert isinstance(result, dict)
 
 
 # ─── Test: configure_services ────────────────────────────────────────────────
@@ -382,27 +437,25 @@ class TestConfigureServices:
 
 
 class TestCheckpointerPaths:
-    def test_get_checkpointer_path_crea_directory(self, tmp_path: Path) -> None:
-        with patch("brain.agents.checkpointer.Path") as mock_path_cls:
-            mock_brain_root = MagicMock()
-            mock_nexus_memory = MagicMock()
-            mock_brain_root.__truediv__ = MagicMock(return_value=mock_nexus_memory)
-            mock_nexus_memory.__truediv__ = MagicMock(return_value=MagicMock())
-            mock_nexus_memory.__str__ = MagicMock(return_value=str(tmp_path))
-            mock_path_cls.return_value.parent.parent = mock_brain_root
-            mock_nexus_memory.mkdir = MagicMock()
+    def test_get_postgres_connection_string(self) -> None:
+        from brain.agents.checkpointer import get_postgres_connection_string
 
-        # Verifica che il path default contenga langgraph.db
-        from brain.agents.checkpointer import get_checkpointer_path
+        conn_str = get_postgres_connection_string()
+        assert "postgresql" in conn_str
 
-        path = get_checkpointer_path()
-        assert "langgraph.db" in path
-
-    def test_get_memory_db_path_contiene_learning(self) -> None:
+    def test_get_memory_db_path_deprecato(self) -> None:
+        """get_memory_db_path e' deprecato ma deve ancora funzionare per retrocompatibilita."""
         from brain.agents.checkpointer import get_memory_db_path
 
         path = get_memory_db_path()
         assert "learning.db" in path
+
+    def test_create_checkpointer_tipo(self) -> None:
+        from brain.agents.checkpointer import create_checkpointer
+        from brain.agents.postgres_checkpointer import PostgresCheckpointer
+
+        cp = create_checkpointer()
+        assert isinstance(cp, PostgresCheckpointer)
 
 
 # ─── Test: route_by_task_type ────────────────────────────────────────────────

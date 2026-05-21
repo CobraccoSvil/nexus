@@ -68,20 +68,20 @@ def create_agent_graph(
         providers: ProviderRegistry globale di Nexus
         router: SemanticRouter globale di Nexus
         embeddings: EmbeddingService globale di Nexus
-        checkpointer_path: Path opzionale al database SQLite per il checkpointer.
-                           Se None usa il path default in nexus_memory/langgraph.db.
+        checkpointer_path: Deprecato, ignorato. Il checkpointer usa PostgreSQL.
+        tool_runner: Runner opzionale per tool dispatch.
+        agent_router: Router agente opzionale.
 
     Returns:
-        Grafo compilato con SqliteSaver e interrupt_before=["executor"].
+        Grafo compilato con PostgresCheckpointer e interrupt_before=["executor"].
     """
     from brain.memory.retrieval import InteractionRetriever
-    from brain.memory.storage import LocalLearningStorage
+    from brain.memory.storage import PostgresLearningStorage
 
-    from .checkpointer import create_checkpointer, get_memory_db_path
+    from .checkpointer import create_checkpointer
 
-    # Inizializza storage locale
-    memory_path = get_memory_db_path()
-    storage = LocalLearningStorage(db_path=memory_path)
+    # Inizializza storage PostgreSQL (sostituisce il vecchio SQLite locale)
+    storage = PostgresLearningStorage()
     retriever = InteractionRetriever(embedding_service=embeddings)
 
     # Inietta servizi nei nodi
@@ -184,9 +184,8 @@ def create_agent_graph(
     compiled = workflow.compile(**compile_kwargs)
 
     logger.info(
-        "Grafo LangGraph compilato: checkpointer=%s (PostgreSQL asincrono) memory=%s",
+        "Grafo LangGraph compilato: checkpointer=%s (PostgreSQL asincrono) learning=PostgreSQL",
         checkpointer.__class__.__name__,
-        memory_path,
     )
 
     return compiled

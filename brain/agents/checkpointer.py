@@ -41,7 +41,11 @@ def create_checkpointer() -> PostgresCheckpointer:
 
 
 def get_memory_db_path() -> str:
-    """Restituisce il path del database SQLite per l'apprendimento locale."""
+    """Deprecato: il learning storage ora usa PostgreSQL.
+
+    Mantenuto per retrocompatibilita. Il path non viene piu utilizzato
+    dal sistema — i dati sono in brain_learning_interactions su PostgreSQL.
+    """
     brain_root = Path(__file__).parent.parent
     nexus_memory = brain_root / "nexus_memory"
     nexus_memory.mkdir(parents=True, exist_ok=True)

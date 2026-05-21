@@ -1,6 +1,9 @@
-"""Modulo di apprendimento locale persistente per Nexus."""
+"""Modulo di apprendimento persistente per Nexus (PostgreSQL-backed)."""
 from __future__ import annotations
 
-from .storage import LocalLearningStorage
+from .storage import PostgresLearningStorage
 
-__all__ = ["LocalLearningStorage"]
+# Alias retrocompatibile
+LocalLearningStorage = PostgresLearningStorage
+
+__all__ = ["PostgresLearningStorage", "LocalLearningStorage"]
