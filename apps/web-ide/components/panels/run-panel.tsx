@@ -103,9 +103,12 @@ interface WizardInstallModalProps {
   onInstall: (svc: ServiceWizardSuggestion, env: Record<string,string>, description: string) => Promise<void>;
   onCancel: () => void;
   tc: ReturnType<typeof useThemeColors>;
+  /** Feedback dall'ultimo tentativo: stringa libera (es. "✓ taskboard-frontend.service installato" o
+   *  "Errore: ..."). Quando inizia con "✓" o "OK" la modale si auto-chiude dopo 1.2s. */
+  feedback?: string;
 }
 
-function WizardInstallModal({ svc, onInstall, onCancel, tc }: WizardInstallModalProps) {
+function WizardInstallModal({ svc, onInstall, onCancel, tc, feedback }: WizardInstallModalProps) {
   const [env, setEnv] = useState(() => {
     const obj = (svc.env ?? {}) as Record<string, string>;
     const lines = Object.entries(obj)
@@ -115,6 +118,15 @@ function WizardInstallModal({ svc, onInstall, onCancel, tc }: WizardInstallModal
   });
   const [desc, setDesc] = useState(svc.label);
   const [saving, setSaving] = useState(false);
+  // Auto-close su successo
+  useEffect(() => {
+    if (!feedback) return;
+    const isOk = feedback.startsWith("✓") || feedback.toUpperCase().startsWith("OK");
+    if (isOk) {
+      const t = setTimeout(() => onCancel(), 1200);
+      return () => clearTimeout(t);
+    }
+  }, [feedback, onCancel]);
 
   const inp: React.CSSProperties = {
     width:"100%", background:tc.bgCard, border:`1px solid ${tc.border}`,
@@ -146,9 +158,28 @@ function WizardInstallModal({ svc, onInstall, onCancel, tc }: WizardInstallModal
         <div style={{ fontSize:10,color:tc.textMuted }}>
           Verrà creato <code>~/.config/systemd/user/{svc.unit}</code> e abilitato con systemctl --user enable.
         </div>
+        {/* Banner feedback: mostrato dopo il tentativo di install.
+            - "✓"/"OK" → verde, la modale si chiude da sola dopo 1.2s.
+            - altro → rosso, la modale resta aperta cosi' l'utente puo' correggere. */}
+        {feedback && (
+          <div
+            style={{
+              fontSize: 11,
+              padding: "6px 8px",
+              borderRadius: 4,
+              background: feedback.startsWith("✓") ? "#22c55e20" : `${tc.error}20`,
+              border: `1px solid ${feedback.startsWith("✓") ? "#22c55e60" : `${tc.error}60`}`,
+              color: feedback.startsWith("✓") ? "#22c55e" : tc.error,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+            }}
+          >
+            {feedback}
+          </div>
+        )}
         <div style={{ display:"flex",gap:8,justifyContent:"flex-end" }}>
-          <button onClick={onCancel} style={{ background:"none",border:`1px solid ${tc.border}`,borderRadius:4,color:tc.textMuted,cursor:"pointer",padding:"4px 14px",fontSize:12 }}>Annulla</button>
-          <button onClick={handleInstall} disabled={saving} style={{ background:tc.accent,border:"none",borderRadius:4,color:"#fff",cursor:saving?"wait":"pointer",padding:"4px 14px",fontSize:12,opacity:saving?0.6:1 }}>{saving?"…":"Installa"}</button>
+          <button onClick={onCancel} style={{ background:"none",border:`1px solid ${tc.border}`,borderRadius:4,color:tc.textMuted,cursor:"pointer",padding:"4px 14px",fontSize:12 }}>{feedback && !feedback.startsWith("✓") ? "Chiudi" : "Annulla"}</button>
+          <button onClick={handleInstall} disabled={saving} style={{ background:tc.accent,border:"none",borderRadius:4,color:"#fff",cursor:saving?"wait":"pointer",padding:"4px 14px",fontSize:12,opacity:saving?0.6:1 }}>{saving?"installazione…":(feedback && !feedback.startsWith("✓") ? "Riprova" : "Installa")}</button>
         </div>
       </div>
     </div>
@@ -459,17 +490,30 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
   }, [projectId]);
 
   const handleInstall = async (svc: ServiceWizardSuggestion, env: Record<string,string>, description: string) => {
-    setInstallingUnit(null);
+    // Non chiudere la modale prima di sapere l'esito: l'utente deve vedere
+    // se l'installazione e' andata a buon fine o no. Inoltre, anche quando
+    // il backend risponde ok=false, ri-eseguiamo il detect cosi' se il file
+    // unit e' stato comunque creato la riga si aggiorna a "✓ Installato".
+    setWizardMsg("");
     try {
       const r = await installProjectService(projectId, { ...svc, env, description });
       if (r.ok) {
         setSuggestions(prev => prev.map(s => s.unit===svc.unit ? {...s,existing:true} : s));
         setWizardMsg(`✓ ${svc.unit} installato.`);
-        fetchServices();
+        setInstallingUnit(null);
       } else {
         setWizardMsg(`Errore durante l'installazione di ${svc.unit}.`);
+        // Non chiudere la modale in caso di errore: l'utente puo' correggere e ritentare.
       }
-    } catch { setWizardMsg("Errore di rete."); }
+    } catch (e) {
+      setWizardMsg(`Errore di rete: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      // SEMPRE re-fetch dello stato reale: copre il caso in cui il backend
+      // segnala errore ma il file unit e' stato comunque creato (parziale),
+      // o viceversa "ok" ma una verifica di systemd dice il contrario.
+      // Cosi' la riga del wizard riflette la realta' del sistema.
+      fetchServices();
+    }
   };
 
   // ── Servizi Nexus ──
@@ -1193,8 +1237,9 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
         <WizardInstallModal
           svc={installingUnit}
           onInstall={handleInstall}
-          onCancel={()=>setInstallingUnit(null)}
+          onCancel={() => { setInstallingUnit(null); setWizardMsg(""); }}
           tc={tc}
+          feedback={wizardMsg}
         />
       )}
     </div>
