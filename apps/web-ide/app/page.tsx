@@ -259,6 +259,87 @@ export default function LandingPage() {
         </div>
       </Band>
 
+      {/* ─── KNOWLEDGE BASE (light, alternato) ─── */}
+      <Band tone="light" id="knowledge" style={{ background: "#f5f5f4" }}>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: mobile ? "1fr" : "1fr 1fr",
+            gap: 48,
+            alignItems: "center",
+          }}
+        >
+          <div>
+            <div
+              style={{
+                display: "inline-block",
+                padding: "4px 12px",
+                borderRadius: 20,
+                background: "rgba(139,92,246,0.1)",
+                color: "#8b5cf6",
+                fontSize: 12,
+                fontWeight: 600,
+                marginBottom: 16,
+                letterSpacing: 0.5,
+              }}
+            >
+              NEW
+            </div>
+            <h2 style={{ fontSize: mobile ? 24 : 36, fontWeight: 800, color: C.light.text }}>
+              {t("landing.v2.knowledge.title")}
+            </h2>
+            <p style={{ fontSize: 16, lineHeight: 1.7, color: C.light.muted, marginTop: 16 }}>
+              {t("landing.v2.knowledge.desc")}
+            </p>
+            <ul style={{ marginTop: 20, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 10 }}>
+              {(["feat1", "feat2", "feat3", "feat4"] as const).map((k) => (
+                <li
+                  key={k}
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    gap: 8,
+                    fontSize: 14,
+                    color: C.light.muted,
+                    lineHeight: 1.5,
+                  }}
+                >
+                  <span style={{ color: "#8b5cf6", fontWeight: 700, flexShrink: 0 }}>-</span>
+                  {t(`landing.v2.knowledge.${k}`)}
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div
+            style={{
+              borderRadius: 12,
+              overflow: "hidden",
+              border: `1px solid ${C.light.border}`,
+              background: "#fff",
+              aspectRatio: "16/10",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              boxShadow: "0 4px 24px rgba(0,0,0,0.08)",
+            }}
+          >
+            <img
+              src="/screenshots/knowledge-base.jpg"
+              alt="Knowledge Base"
+              style={{ width: "100%", height: "100%", objectFit: "cover" }}
+              loading="lazy"
+              onError={(e) => {
+                const parent = (e.target as HTMLImageElement).parentElement!;
+                parent.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:40px;color:${C.light.muted}">
+                  <div style="font-size:48px">K</div>
+                  <div style="font-size:14px;text-align:center">Knowledge Base<br/>Obsidian-compatible vault</div>
+                </div>`;
+              }}
+            />
+          </div>
+        </div>
+      </Band>
+
       {/* ─── MULTI-TENANT ON-PREM (light, alternato) ─── */}
       <Band tone="light" style={{ background: "#f5f5f4" }}>
         <div style={{ maxWidth: 640, margin: "0 auto", textAlign: "center" }}>
@@ -375,7 +456,7 @@ export default function LandingPage() {
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: mobile ? "1fr" : "repeat(3, 1fr)",
+              gridTemplateColumns: mobile ? "1fr" : "repeat(4, 1fr)",
               gap: 20,
             }}
           >
@@ -383,6 +464,7 @@ export default function LandingPage() {
               { key: "routing", color: C.accent, icon: "R" },
               { key: "privacy", color: "#8b5cf6", icon: "P" },
               { key: "cost", color: "#22d3ee", icon: "C" },
+              { key: "knowledge", color: "#f59e0b", icon: "K" },
             ] as const).map(({ key, color, icon }) => (
               <div
                 key={key}
@@ -501,13 +583,14 @@ export default function LandingPage() {
   );
 }
 
-/* ─── COMPARISON DATA (12 rows, 8 competitors + Nexus) ─── */
+/* ─── COMPARISON DATA (13 rows, 8 competitors + Nexus) ─── */
 // Columns: [feature_key, Nexus, Cursor, Copilot, Windsurf, Devin, ClaudeCode, Aider, Continue]
 const COMPARISON_ROWS: [string, ...(boolean | string)[]][] = [
   ["landing.comp.multiProvider", true, "~", false, "~", false, false, "~", "~"],
   ["landing.comp.mlRouting", true, false, false, false, false, false, false, false],
   ["landing.comp.planActVerify", true, "~", false, "~", true, true, false, false],
   ["landing.comp.agents", true, "~", false, false, "~", true, false, false],
+  ["landing.comp.knowledgeBase", true, false, false, false, false, false, false, false],
   ["landing.comp.learning", true, false, false, false, false, false, false, false],
   ["landing.comp.liveMonitoring", true, false, false, false, false, false, false, false],
   ["landing.comp.costBreakdown", true, false, false, false, "~", false, "~", false],

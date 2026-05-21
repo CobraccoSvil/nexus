@@ -104,12 +104,28 @@ export function NotesTab({ projectId }: Props) {
             border: "1px solid #e5e5e5",
             cursor: "pointer",
             transition: "border-color 0.15s",
+            overflow: "hidden",
           }}
           onMouseEnter={(e) => (e.currentTarget.style.borderColor = "#a3a3a3")}
           onMouseLeave={(e) => (e.currentTarget.style.borderColor = "#e5e5e5")}
         >
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <span style={{ fontSize: 13, fontWeight: 600, color: "#171717" }}>{note.title}</span>
+          {/* Riga 1: titolo + badge stato */}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, minWidth: 0 }}>
+            <span
+              style={{
+                fontSize: 13,
+                fontWeight: 600,
+                color: "#171717",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                minWidth: 0,
+                flex: 1,
+              }}
+              title={note.title}
+            >
+              {note.title}
+            </span>
             <span
               style={{
                 fontSize: 10,
@@ -117,19 +133,40 @@ export function NotesTab({ projectId }: Props) {
                 borderRadius: 8,
                 background: note.status === "active" ? "#dcfce7" : note.status === "draft" ? "#fef9c3" : "#f5f5f5",
                 color: note.status === "active" ? "#166534" : note.status === "draft" ? "#854d0e" : "#737373",
+                flexShrink: 0,
+                whiteSpace: "nowrap",
               }}
             >
               {t(STATUS_I18N[note.status] ?? "knowledge.note.draft")}
             </span>
           </div>
-          <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+          {/* Riga 2: intent + tag + data */}
+          <div style={{ display: "flex", gap: 6, marginTop: 4, alignItems: "center", minWidth: 0, overflow: "hidden" }}>
             {note.intent && (
-              <span style={{ fontSize: 11, color: "#6366f1", fontWeight: 500 }}>{note.intent}</span>
+              <span style={{ fontSize: 11, color: "#6366f1", fontWeight: 500, flexShrink: 0 }}>{note.intent}</span>
             )}
-            {note.tags.slice(0, 3).map((tag) => (
-              <span key={tag} style={{ fontSize: 10, color: "#737373" }}>#{tag}</span>
-            ))}
-            <span style={{ fontSize: 10, color: "#a3a3a3", marginLeft: "auto" }}>
+            <div style={{ display: "flex", gap: 4, overflow: "hidden", flex: 1, minWidth: 0 }}>
+              {note.tags.slice(0, 2).map((tag) => (
+                <span
+                  key={tag}
+                  style={{
+                    fontSize: 10,
+                    color: "#737373",
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    maxWidth: 90,
+                  }}
+                  title={`#${tag}`}
+                >
+                  #{tag}
+                </span>
+              ))}
+              {note.tags.length > 2 && (
+                <span style={{ fontSize: 10, color: "#a3a3a3", flexShrink: 0 }}>+{note.tags.length - 2}</span>
+              )}
+            </div>
+            <span style={{ fontSize: 10, color: "#a3a3a3", flexShrink: 0, whiteSpace: "nowrap" }}>
               {new Date(note.createdAt).toLocaleDateString()}
             </span>
           </div>

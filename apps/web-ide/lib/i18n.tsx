@@ -209,6 +209,14 @@ const translations = {
     "landing.feat.browser": "Browser Bridge (Chrome Extension)",
     "landing.feat.browserDesc": "Chrome extension that connects the browser to the IDE in real time. The agent can inspect pages, interact with the DOM, run tests on live sites and debug frontend issues directly.",
 
+    // Knowledge Base landing section
+    "landing.v2.knowledge.title": "Per-project Knowledge Base.",
+    "landing.v2.knowledge.desc": "Every request automatically becomes a persistent note — with intent, related files, and semantic links. An Obsidian-compatible vault lives inside your repo: YAML frontmatter, wikilinks, bidirectional sync. Open it in Obsidian or browse it from the IDE sidebar. Duplicate detection warns you before you repeat work. The system builds your project memory for you.",
+    "landing.v2.knowledge.feat1": "Auto-created from every chat message",
+    "landing.v2.knowledge.feat2": "Obsidian-compatible vault (.md + YAML frontmatter + [[wikilinks]])",
+    "landing.v2.knowledge.feat3": "Semantic similarity banner to prevent duplicate work",
+    "landing.v2.knowledge.feat4": "Bidirectional sync: IDE, DB, and filesystem always in sync",
+
     // Comparison section
     "landing.compTitle": "Nexus vs. the market.",
     "landing.compDesc": "Compared to the most popular AI development tools — feature by feature.",
@@ -221,6 +229,7 @@ const translations = {
     "landing.comp.tools": "70+ Builtin Tools",
     "landing.comp.learning": "Project Learning",
     "landing.comp.qualityGuard": "Quality Guard & Reflection",
+    "landing.comp.knowledgeBase": "Per-Project Knowledge Base (Obsidian)",
     "landing.comp.openSource": "Open Source / Self-Hostable",
     "landing.comp.promptCache": "Advanced Prompt Caching",
 
@@ -233,6 +242,8 @@ const translations = {
     "landing.compDetail.privacyDesc": "Every competitor except Aider requires sending code to their cloud. Nexus runs entirely on your infrastructure: PostgreSQL, Redis, Qdrant, vLLM — complete control over where your code goes.",
     "landing.compDetail.cost": "Cost Control",
     "landing.compDetail.costDesc": "No credits, no opaque pricing. You use your own API keys with real-time token tracking, per-provider cost monitoring, prompt caching (90% savings on Anthropic), and configurable quota policies per user and project.",
+    "landing.compDetail.knowledge": "Project Knowledge Base",
+    "landing.compDetail.knowledgeDesc": "No competitor builds a navigable, persistent knowledge base from your interactions. Nexus auto-creates linked notes from every request, stores them as Obsidian-compatible Markdown with wikilinks, and warns you before duplicate work — a living project memory that grows smarter over time.",
 
     // Landing v2 (Cursor-style rebuild)
     "landing.v2.nav.product": "Product",
@@ -551,6 +562,14 @@ const translations = {
     "landing.feat.browser": "Browser Bridge (Estensione Chrome)",
     "landing.feat.browserDesc": "Estensione Chrome che connette il browser all'IDE in tempo reale. L'agente puo ispezionare pagine, interagire col DOM, eseguire test su siti live e fare debug di problemi frontend direttamente.",
 
+    // Sezione Knowledge Base landing
+    "landing.v2.knowledge.title": "Knowledge Base per-progetto.",
+    "landing.v2.knowledge.desc": "Ogni richiesta diventa automaticamente una nota persistente — con intent, file coinvolti e link semantici. Un vault Obsidian-compatible vive dentro il tuo repo: frontmatter YAML, wikilink, sync bidirezionale. Aprilo in Obsidian o sfoglialo dalla sidebar dell'IDE. Il rilevamento duplicati ti avvisa prima di rifare lavoro gia fatto. Il sistema costruisce la memoria del progetto al posto tuo.",
+    "landing.v2.knowledge.feat1": "Creazione automatica da ogni messaggio chat",
+    "landing.v2.knowledge.feat2": "Vault Obsidian-compatible (.md + frontmatter YAML + [[wikilink]])",
+    "landing.v2.knowledge.feat3": "Banner di similarita semantica per evitare lavoro duplicato",
+    "landing.v2.knowledge.feat4": "Sync bidirezionale: IDE, DB e filesystem sempre allineati",
+
     // Sezione confronto
     "landing.compTitle": "Nexus vs. il mercato.",
     "landing.compDesc": "Confronto con i piu popolari strumenti di sviluppo AI — funzionalita per funzionalita.",
@@ -563,6 +582,7 @@ const translations = {
     "landing.comp.tools": "70+ Tool Integrati",
     "landing.comp.learning": "Apprendimento Progetto",
     "landing.comp.qualityGuard": "Quality Guard & Riflessione",
+    "landing.comp.knowledgeBase": "Knowledge Base per-Progetto (Obsidian)",
     "landing.comp.openSource": "Open Source / Self-Hostable",
     "landing.comp.promptCache": "Prompt Caching Avanzato",
 
@@ -575,6 +595,8 @@ const translations = {
     "landing.compDetail.privacyDesc": "Ogni competitor tranne Aider richiede di inviare il codice al loro cloud. Nexus gira interamente sulla tua infrastruttura: PostgreSQL, Redis, Qdrant, vLLM — controllo completo su dove va il tuo codice.",
     "landing.compDetail.cost": "Controllo dei Costi",
     "landing.compDetail.costDesc": "Niente crediti, niente pricing opaco. Usi le tue API key con tracking token in tempo reale, monitoraggio costi per provider, prompt caching (90% di risparmio su Anthropic) e policy di quota configurabili per utente e progetto.",
+    "landing.compDetail.knowledge": "Knowledge Base Progetto",
+    "landing.compDetail.knowledgeDesc": "Nessun competitor costruisce una knowledge base navigabile e persistente dalle tue interazioni. Nexus crea automaticamente note collegate da ogni richiesta, le salva come Markdown Obsidian-compatible con wikilink, e ti avvisa prima di lavoro duplicato — una memoria di progetto viva che migliora nel tempo.",
 
     // Landing v2
     "landing.v2.nav.product": "Prodotto",
@@ -892,6 +914,14 @@ const translations = {
     "landing.feat.browser": "Browser Bridge (Extension Chrome)",
     "landing.feat.browserDesc": "Extension Chrome que conecta el navegador al IDE en tiempo real. El agente puede inspeccionar paginas, interactuar con el DOM, ejecutar tests en sitios live y depurar problemas frontend directamente.",
 
+    // Seccion Knowledge Base landing
+    "landing.v2.knowledge.title": "Knowledge Base por proyecto.",
+    "landing.v2.knowledge.desc": "Cada solicitud se convierte automaticamente en una nota persistente — con intent, archivos relacionados y enlaces semanticos. Un vault compatible con Obsidian vive dentro de tu repo: frontmatter YAML, wikilinks, sincronizacion bidireccional. Abrelo en Obsidian o navegalo desde la sidebar del IDE. La deteccion de duplicados te avisa antes de repetir trabajo. El sistema construye la memoria del proyecto por ti.",
+    "landing.v2.knowledge.feat1": "Creacion automatica desde cada mensaje de chat",
+    "landing.v2.knowledge.feat2": "Vault compatible con Obsidian (.md + frontmatter YAML + [[wikilinks]])",
+    "landing.v2.knowledge.feat3": "Banner de similitud semantica para evitar trabajo duplicado",
+    "landing.v2.knowledge.feat4": "Sincronizacion bidireccional: IDE, DB y filesystem siempre alineados",
+
     // Seccion comparacion
     "landing.compTitle": "Nexus vs. el mercado.",
     "landing.compDesc": "Comparado con las herramientas de desarrollo AI mas populares — funcion por funcion.",
@@ -904,6 +934,7 @@ const translations = {
     "landing.comp.tools": "70+ Herramientas Integradas",
     "landing.comp.learning": "Aprendizaje de Proyecto",
     "landing.comp.qualityGuard": "Quality Guard & Reflexion",
+    "landing.comp.knowledgeBase": "Knowledge Base por Proyecto (Obsidian)",
     "landing.comp.openSource": "Open Source / Self-Hostable",
     "landing.comp.promptCache": "Prompt Caching Avanzado",
 
@@ -916,6 +947,8 @@ const translations = {
     "landing.compDetail.privacyDesc": "Cada competidor excepto Aider requiere enviar el codigo a su cloud. Nexus corre enteramente en tu infraestructura: PostgreSQL, Redis, Qdrant, vLLM — control completo sobre donde va tu codigo.",
     "landing.compDetail.cost": "Control de Costos",
     "landing.compDetail.costDesc": "Sin creditos, sin pricing opaco. Usas tus propias API keys con tracking de tokens en tiempo real, monitoreo de costos por proveedor, prompt caching (90% de ahorro en Anthropic) y politicas de cuota configurables por usuario y proyecto.",
+    "landing.compDetail.knowledge": "Knowledge Base del Proyecto",
+    "landing.compDetail.knowledgeDesc": "Ningun competidor construye una knowledge base navegable y persistente a partir de tus interacciones. Nexus crea automaticamente notas enlazadas de cada solicitud, las guarda como Markdown compatible con Obsidian con wikilinks, y te avisa antes de trabajo duplicado — una memoria de proyecto viva que mejora con el tiempo.",
 
     // Landing v2
     "landing.v2.nav.product": "Producto",

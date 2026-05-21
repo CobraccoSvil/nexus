@@ -29,22 +29,26 @@ export function TagsTab({ projectId }: Props) {
   const maxCount = Math.max(...tags.map((tg) => tg.noteCount), 1);
 
   return (
-    <div style={{ padding: 16, display: "flex", flexWrap: "wrap", gap: 8, alignContent: "flex-start" }}>
+    <div style={{ padding: 12, display: "flex", flexWrap: "wrap", gap: 6, alignContent: "flex-start", overflow: "hidden" }}>
       {tags.map((tg) => {
-        const size = 12 + Math.round((tg.noteCount / maxCount) * 6);
+        const size = 12 + Math.round((tg.noteCount / maxCount) * 4);
         return (
           <span
             key={tg.tag}
             style={{
               fontSize: size,
-              padding: "4px 10px",
+              padding: "3px 8px",
               borderRadius: 12,
               background: "#f0f0ff",
               color: "#4338ca",
               fontWeight: 500,
               cursor: "default",
+              maxWidth: "100%",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
             }}
-            title={`${tg.noteCount} note`}
+            title={`#${tg.tag} (${tg.noteCount} note)`}
           >
             #{tg.tag}
             <span style={{ fontSize: 10, color: "#818cf8", marginLeft: 4 }}>{tg.noteCount}</span>

@@ -85,18 +85,20 @@ export function SearchTab({ projectId }: Props) {
 
       {/* Risultati full-text */}
       {results.map((note) => (
-        <div key={note.id} style={{ padding: "8px 10px", marginBottom: 4, borderRadius: 6, border: "1px solid #e5e5e5", fontSize: 13 }}>
-          <span style={{ fontWeight: 600, color: "#171717" }}>{note.title}</span>
-          {note.intent && <span style={{ fontSize: 11, color: "#6366f1", marginLeft: 8 }}>{note.intent}</span>}
+        <div key={note.id} style={{ padding: "8px 10px", marginBottom: 4, borderRadius: 6, border: "1px solid #e5e5e5", fontSize: 13, overflow: "hidden" }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", minWidth: 0 }}>
+            <span style={{ fontWeight: 600, color: "#171717", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }} title={note.title}>{note.title}</span>
+            {note.intent && <span style={{ fontSize: 11, color: "#6366f1", flexShrink: 0 }}>{note.intent}</span>}
+          </div>
         </div>
       ))}
 
       {/* Risultati semantici */}
       {semanticResults.map((hit) => (
-        <div key={hit.noteId} style={{ padding: "8px 10px", marginBottom: 4, borderRadius: 6, border: "1px solid #e5e5e5", fontSize: 13 }}>
-          <div style={{ display: "flex", justifyContent: "space-between" }}>
-            <span style={{ fontWeight: 600, color: "#171717" }}>{hit.title}</span>
-            <span style={{ fontSize: 11, color: "#22c55e", fontWeight: 600 }}>{(hit.score * 100).toFixed(0)}%</span>
+        <div key={hit.noteId} style={{ padding: "8px 10px", marginBottom: 4, borderRadius: 6, border: "1px solid #e5e5e5", fontSize: 13, overflow: "hidden" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 8, minWidth: 0 }}>
+            <span style={{ fontWeight: 600, color: "#171717", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }} title={hit.title}>{hit.title}</span>
+            <span style={{ fontSize: 11, color: "#22c55e", fontWeight: 600, flexShrink: 0 }}>{(hit.score * 100).toFixed(0)}%</span>
           </div>
           {hit.intent && <span style={{ fontSize: 11, color: "#6366f1" }}>{hit.intent}</span>}
         </div>

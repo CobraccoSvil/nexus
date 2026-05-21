@@ -52,7 +52,7 @@ export function NoteDetail({ projectId, noteId, onBack }: Props) {
     <div style={{ padding: 16 }}>
       <button onClick={onBack} style={{ fontSize: 12, color: "#6366f1", background: "none", border: "none", cursor: "pointer", marginBottom: 12 }}>&larr; Indietro</button>
 
-      <h4 style={{ fontSize: 15, fontWeight: 700, color: "#171717", margin: "0 0 8px" }}>{note.title}</h4>
+      <h4 style={{ fontSize: 15, fontWeight: 700, color: "#171717", margin: "0 0 8px", wordBreak: "break-word" }}>{note.title}</h4>
 
       {/* Meta */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12, fontSize: 11, color: "#737373" }}>
@@ -96,7 +96,7 @@ export function NoteDetail({ projectId, noteId, onBack }: Props) {
           <span style={{ fontSize: 11, fontWeight: 600, color: "#525252" }}>{t("knowledge.detail.files")}:</span>
           <div style={{ marginTop: 4 }}>
             {note.filePaths.map((fp) => (
-              <code key={fp} style={{ display: "block", fontSize: 11, color: "#6366f1", padding: "2px 0" }}>{fp}</code>
+              <code key={fp} style={{ display: "block", fontSize: 11, color: "#6366f1", padding: "2px 0", wordBreak: "break-all", overflowWrap: "anywhere" }}>{fp}</code>
             ))}
           </div>
         </div>
