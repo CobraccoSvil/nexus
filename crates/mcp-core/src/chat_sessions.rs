@@ -366,11 +366,24 @@ pub async fn compact_chat_session(
     let messages_json = serde_json::to_string(&msgs)
         .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Call Neural Core for summary (empty provider/model → uses defaults)
+    // Risolvi provider/modello dalla routing matrix (purpose 'conversation_summary')
+    // cosi' la compattazione usa lo stesso router dei modelli della chat.
+    let (summary_provider, summary_model) = match state
+        .orchestrator
+        .routing_matrix
+        .current_async()
+        .await
+    {
+        Ok(matrix) => matrix
+            .purpose_model("conversation_summary")
+            .unwrap_or(("openai".to_string(), "gpt-4.1-mini".to_string())),
+        Err(_) => ("openai".to_string(), "gpt-4.1-mini".to_string()),
+    };
+
     let summary_resp = state
         .orchestrator
         .neural
-        .generate_agent_turn("", "", &messages_json, "[]", 1500, "")
+        .generate_agent_turn(&summary_provider, &summary_model, &messages_json, "[]", 1500, "")
         .await
         .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Neural Core error: {e}")))?;
 

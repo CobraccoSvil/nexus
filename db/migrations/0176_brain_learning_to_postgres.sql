@@ -18,9 +18,9 @@ CREATE TABLE IF NOT EXISTS brain_learning_interactions (
     metadata       JSONB
 );
 
-CREATE INDEX idx_bli_thread    ON brain_learning_interactions(thread_id);
-CREATE INDEX idx_bli_task_type ON brain_learning_interactions(task_type);
-CREATE INDEX idx_bli_created   ON brain_learning_interactions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bli_thread    ON brain_learning_interactions(thread_id);
+CREATE INDEX IF NOT EXISTS idx_bli_task_type ON brain_learning_interactions(task_type);
+CREATE INDEX IF NOT EXISTS idx_bli_created   ON brain_learning_interactions(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS brain_task_stats (
     task_type      TEXT PRIMARY KEY,

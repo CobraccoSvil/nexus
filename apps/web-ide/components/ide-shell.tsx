@@ -1398,7 +1398,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     <div
       style={{
         display: "grid",
-        gridTemplateRows: "32px 1fr",
+        gridTemplateRows: "36px 1fr",
         minHeight: 0,
         minWidth: 0,
         width: "100%",
@@ -1411,7 +1411,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
-          padding: "0 12px 0 8px",
+          padding: "3px 12px 3px 8px",
           borderBottom: `1px solid ${tc.border}`,
           background: tc.bgHeader,
           gap: 8,
@@ -1556,17 +1556,17 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
                   // l'icona + badge percentuale senza tagliare il testo,
                   // anche per valori a 4 cifre (es. 1952%).
                   width: "auto",
+                  height: 30,
                   minWidth: 30,
                   maxWidth: "none",
                   flex: "0 0 auto",
-                  boxSizing: "content-box",
                   display: "inline-flex",
                   alignItems: "center",
                   justifyContent: "center",
                   gap: 4,
                   paddingInline: pct != null ? 10 : 0,
                   whiteSpace: "nowrap",
-                  overflow: "visible",
+                  overflow: "hidden",
                 }}
               >
                 <span>⌁</span>
