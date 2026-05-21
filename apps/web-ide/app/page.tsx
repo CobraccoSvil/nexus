@@ -7,6 +7,7 @@ import { NavBar } from "../components/landing/NavBar";
 import { HeroSplit } from "../components/landing/HeroSplit";
 import { FeatureCard } from "../components/landing/FeatureCard";
 import { ProviderLogo } from "../components/landing/ProviderLogo";
+import { CobraccoMark } from "../components/landing/CobraccoMark";
 
 /* ─── CONFIG ─── */
 const SHOW_LOGIN_CTA = false;
@@ -472,9 +473,10 @@ export default function LandingPage() {
               href="https://cobracco.it"
               target="_blank"
               rel="noopener noreferrer"
+              aria-label="Cobracco"
               style={{ color: "inherit", textDecoration: "underline" }}
             >
-              Cobracco
+              <CobraccoMark />
             </a>
           </span>
           <div style={{ display: "flex", gap: 24 }}>

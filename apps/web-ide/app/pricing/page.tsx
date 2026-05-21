@@ -6,6 +6,7 @@ import { Band } from "../../components/landing/Band";
 import { NavBar } from "../../components/landing/NavBar";
 import { PricingTier } from "../../components/landing/PricingTier";
 import { ProviderLogo } from "../../components/landing/ProviderLogo";
+import { CobraccoMark } from "../../components/landing/CobraccoMark";
 
 export default function PricingPage() {
   const { t } = useI18n();
@@ -177,9 +178,10 @@ export default function PricingPage() {
               href="https://cobracco.it"
               target="_blank"
               rel="noopener noreferrer"
+              aria-label="Cobracco"
               style={{ color: "inherit", textDecoration: "underline" }}
             >
-              Cobracco
+              <CobraccoMark />
             </a>
           </span>
           <div style={{ display: "flex", gap: 24 }}>
