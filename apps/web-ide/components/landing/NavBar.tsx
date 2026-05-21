@@ -1,6 +1,7 @@
 "use client";
 
 import { useI18n, LOCALE_LABELS, type Locale } from "../../lib/i18n";
+import { NexusLogo } from "./NexusLogo";
 
 export function NavBar() {
   const { t, locale, setLocale } = useI18n();
@@ -27,18 +28,23 @@ export function NavBar() {
           height: 56,
         }}
       >
-        {/* Logo */}
+        {/* Logo (icona N + wordmark) */}
         <a
           href="/"
           style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 10,
             fontWeight: 700,
             fontSize: 20,
             color: "#171717",
             textDecoration: "none",
             letterSpacing: "-0.02em",
           }}
+          aria-label="Nexus"
         >
-          Nexus
+          <NexusLogo size={28} />
+          <span>Nexus</span>
         </a>
 
         {/* Links */}
