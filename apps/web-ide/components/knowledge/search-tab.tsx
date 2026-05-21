@@ -37,8 +37,8 @@ export function SearchTab({ projectId }: Props) {
   }, [projectId, query, mode]);
 
   return (
-    <div style={{ padding: 12 }}>
-      <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+    <div style={{ padding: 10, overflow: "hidden", minWidth: 0 }}>
+      <div style={{ display: "flex", gap: 4, marginBottom: 6, minWidth: 0 }}>
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -46,8 +46,9 @@ export function SearchTab({ projectId }: Props) {
           placeholder={t("knowledge.search.placeholder")}
           style={{
             flex: 1,
-            padding: "6px 10px",
-            fontSize: 13,
+            minWidth: 0,
+            padding: "5px 8px",
+            fontSize: 12,
             border: "1px solid #d4d4d4",
             borderRadius: 6,
             outline: "none",
@@ -56,8 +57,10 @@ export function SearchTab({ projectId }: Props) {
         <button
           onClick={search}
           disabled={searching || !query.trim()}
+          title={t("knowledge.tab.search")}
           style={{
-            padding: "6px 14px",
+            flexShrink: 0,
+            padding: "5px 8px",
             fontSize: 12,
             fontWeight: 600,
             background: "#171717",
@@ -66,19 +69,20 @@ export function SearchTab({ projectId }: Props) {
             borderRadius: 6,
             cursor: searching ? "default" : "pointer",
             opacity: searching ? 0.5 : 1,
+            lineHeight: 1,
           }}
         >
-          {searching ? "..." : t("knowledge.tab.search")}
+          {searching ? "..." : "Vai"}
         </button>
       </div>
 
-      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-        <label style={{ fontSize: 11, color: "#737373", display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
-          <input type="radio" name="searchMode" checked={mode === "fulltext"} onChange={() => setMode("fulltext")} />
+      <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
+        <label style={{ fontSize: 11, color: "#737373", display: "flex", alignItems: "center", gap: 3, cursor: "pointer", whiteSpace: "nowrap" }}>
+          <input type="radio" name="searchMode" checked={mode === "fulltext"} onChange={() => setMode("fulltext")} style={{ margin: 0 }} />
           {t("knowledge.search.fulltext")}
         </label>
-        <label style={{ fontSize: 11, color: "#737373", display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
-          <input type="radio" name="searchMode" checked={mode === "semantic"} onChange={() => setMode("semantic")} />
+        <label style={{ fontSize: 11, color: "#737373", display: "flex", alignItems: "center", gap: 3, cursor: "pointer", whiteSpace: "nowrap" }}>
+          <input type="radio" name="searchMode" checked={mode === "semantic"} onChange={() => setMode("semantic")} style={{ margin: 0 }} />
           {t("knowledge.search.semantic")}
         </label>
       </div>

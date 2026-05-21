@@ -26,21 +26,23 @@ export function KnowledgePanel({ project }: Props) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
-      <div style={{ padding: "12px 16px 0", borderBottom: "1px solid #e5e5e5" }}>
-        <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: "#171717" }}>
+      <div style={{ padding: "12px 12px 0", borderBottom: "1px solid #e5e5e5", overflow: "hidden", minWidth: 0 }}>
+        <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: "#171717", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {t("knowledge.title")}
         </h3>
-        <p style={{ margin: "4px 0 8px", fontSize: 12, color: "#737373" }}>
+        <p style={{ margin: "2px 0 6px", fontSize: 11, color: "#737373", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {t("knowledge.subtitle")}
         </p>
-        <div style={{ display: "flex", gap: 0 }}>
+        <div style={{ display: "flex", gap: 0, overflow: "hidden", minWidth: 0 }}>
           {tabs.map((tab) => (
             <button
               key={tab.key}
               onClick={() => setActiveTab(tab.key)}
               style={{
-                padding: "6px 12px",
-                fontSize: 12,
+                flex: "1 1 0",
+                minWidth: 0,
+                padding: "6px 4px",
+                fontSize: 11,
                 fontWeight: activeTab === tab.key ? 600 : 400,
                 color: activeTab === tab.key ? "#171717" : "#737373",
                 background: "none",
@@ -48,7 +50,11 @@ export function KnowledgePanel({ project }: Props) {
                 borderBottom: activeTab === tab.key ? "2px solid #171717" : "2px solid transparent",
                 cursor: "pointer",
                 transition: "all 0.15s",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
               }}
+              title={tab.label}
             >
               {tab.label}
             </button>
