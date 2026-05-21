@@ -8,7 +8,8 @@ import {
   type FormEvent,
 } from "react";
 import { useChat } from "../lib/use-chat";
-import { listProjectMemories, getProjectDbConfig, listAdminSettings, getModels, type AITraceEvent, type ChatAttachment, type ModelCatalogEntry, type PrecheckResult, type ProjectDbConfig } from "../lib/api-client";
+import { listProjectMemories, getProjectDbConfig, listAdminSettings, getModels, findSimilarKnowledge, type AITraceEvent, type ChatAttachment, type ModelCatalogEntry, type PrecheckResult, type ProjectDbConfig, type SimilarHit } from "../lib/api-client";
+import { SimilarRequestBanner } from "./knowledge/similar-request-banner";
 import { fallbackContextWindow } from "../lib/context-window";
 import { useThemeColors } from "../lib/theme";
 import { useI18n } from "../lib/i18n";
@@ -305,6 +306,7 @@ export function ChatPanel({
   const hasProject = UUID_RE.test(projectId);
   const [activeMemoryCount, setActiveMemoryCount] = useState(0);
   const [dbStatus, setDbStatus] = useState<ProjectDbConfig | null>(null);
+  const [similarHits, setSimilarHits] = useState<SimilarHit[]>([]);
   useEffect(() => {
     if (!hasProject) return;
     listProjectMemories(projectId!).then(res => {
@@ -645,6 +647,12 @@ export function ChatPanel({
         : undefined;
     const modeForSend = automationOnceRef.current ?? automationMode;
     automationOnceRef.current = null;
+    // Knowledge: ricerca note simili (non bloccante)
+    if (hasProject) {
+      findSimilarKnowledge(projectId, text)
+        .then((r) => { if (r.hits.length > 0) setSimilarHits(r.hits); })
+        .catch(() => {});
+    }
     void send(text, {
       profileId,
       activeFiles,
@@ -1646,6 +1654,15 @@ export function ChatPanel({
             </div>
           </div>
         </div>
+      )}
+
+      {similarHits.length > 0 && (
+        <SimilarRequestBanner
+          hits={similarHits}
+          onProceed={() => setSimilarHits([])}
+          onOpenNote={() => setSimilarHits([])}
+          onDismiss={() => setSimilarHits([])}
+        />
       )}
 
       {/* Composer */}

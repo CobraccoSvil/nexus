@@ -104,6 +104,8 @@ export interface ProjectStoreState {
   runConfigs: { lastChangeAt: number };
   // Memory: timestamp dell'ultimo aggiornamento per trigger refresh pannello memoria
   memory: { lastChangeAt: number };
+  // Knowledge: timestamp dell'ultimo evento per trigger refresh pannello knowledge
+  knowledge: { lastChangeAt: number };
   // Provider health: ultimo stato per provider
   providerHealth: { lastChangeAt: number };
   // Plugin: timestamp dell'ultimo evento per trigger refresh
@@ -178,6 +180,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
   migrations: { lastChangeAt: 0 },
   runConfigs: { lastChangeAt: 0 },
   memory: { lastChangeAt: 0 },
+  knowledge: { lastChangeAt: 0 },
   providerHealth: { lastChangeAt: 0 },
   plugins: { lastChangeAt: 0 },
   settings: { lastChangeAt: 0 },
@@ -542,6 +545,13 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
         next.outputChannels = { lastChangeAt: env.ts };
         break;
       }
+      // ── Knowledge ─────────────────────────────────────────────────
+      case "KnowledgeNoteCreated":
+      case "KnowledgeNoteUpdated":
+      case "KnowledgeLinkCreated": {
+        next.knowledge = { lastChangeAt: env.ts };
+        break;
+      }
       case "Notification":
       case "HighlightPanel":
       case "AgentToolUsed":
@@ -649,6 +659,7 @@ export const selectSettingsChangedAt = (s: ProjectStoreState) => s.settings.last
 export const selectSubagentRunsChangedAt = (s: ProjectStoreState) => s.subagentRuns.lastChangeAt;
 export const selectQualityScan = (s: ProjectStoreState) => s.qualityScan;
 export const selectOutputChannelsChangedAt = (s: ProjectStoreState) => s.outputChannels.lastChangeAt;
+export const selectKnowledgeChangedAt = (s: ProjectStoreState) => s.knowledge.lastChangeAt;
 export const subscribeAll = (
   listener: (env: EnvelopedEvent) => void,
 ) => useProjectStore.getState().subscribeAll(listener);

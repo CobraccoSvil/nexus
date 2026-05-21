@@ -44,6 +44,7 @@ mod documents;
 mod environment;
 mod settings;
 mod vector_memory;
+mod knowledge;
 mod project_context;
 mod quality_guard;
 mod project_db;
@@ -61,6 +62,8 @@ mod deepseek_balance_sync;
 mod routing_matrix_auto_promoter;
 mod dispatcher_routes;
 mod task_watchdog;
+mod knowledge_workers;
+mod knowledge_watcher;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -694,6 +697,20 @@ async fn main() -> anyhow::Result<()> {
         ap_enabled,
         ap_interval,
     );
+
+    // Worker `knowledge_link_inference`: inferisce link automatici tra note
+    // Knowledge Base via similarita' vettoriale. Intervallo configurabile via
+    // settings.knowledge.link_worker_interval_secs (default 600s).
+    knowledge_workers::start_knowledge_link_worker(
+        state.db.clone(),
+        state.orchestrator.neural.clone(),
+        state.project_channels.clone(),
+    );
+
+    // Worker `knowledge_cleanup`: archivia note draft vecchie oltre la soglia
+    // configurabile via settings.knowledge.cleanup_draft_days (default 30 giorni).
+    // Intervallo giornaliero (86400s).
+    knowledge_workers::start_knowledge_cleanup_worker(state.db.clone());
 
     // ToolRunner gRPC server (Fase 1 refactor orchestrazione LangGraph).
     // Valore canonico: settings.tool_runner_enabled nel DB (admin panel).
@@ -1375,6 +1392,50 @@ async fn main() -> anyhow::Result<()> {
                 axum::routing::delete(project_db_routes::delete_project_db_connection).layer(
                     axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
                 ),
+            )
+            // ── knowledge ─────────────────────────────────────────
+            .route(
+                "/api/projects/:id/knowledge/notes",
+                get(knowledge::routes::list_notes).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/projects/:id/knowledge/notes/:note_id",
+                get(knowledge::routes::get_note)
+                    .patch(knowledge::routes::patch_note)
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_auth,
+                    )),
+            )
+            .route(
+                "/api/projects/:id/knowledge/similar",
+                post(knowledge::routes::similar_handler).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/projects/:id/knowledge/links",
+                post(knowledge::routes::create_link).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/projects/:id/knowledge/links/:link_id",
+                axum::routing::delete(knowledge::routes::delete_link).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
+            )
+            .route(
+                "/api/projects/:id/knowledge/tags",
+                get(knowledge::routes::list_tags).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
             )
             // ── documents ──────────────────────────────────────────
             .route(

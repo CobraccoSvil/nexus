@@ -340,6 +340,17 @@ impl Classifier {
             // ── Eventi di arricchimento ───────────────────────────────
             // EventEnriched e' il VEICOLO di hint, non un evento da
             // arricchire ulteriormente. Ritorna None per evitare loop.
+            // ── Knowledge Base ────────────────────────────────────
+            ProjectEvent::KnowledgeNoteCreated { title, .. } => Some(UiHint {
+                highlight_panel: Some("knowledge".to_string()),
+                toast_severity: Some("info".to_string()),
+                toast_msg: Some(format!("Nota KB creata: {title}")),
+                badge_increment: None,
+                flash_duration_ms: Some(2000),
+            }),
+            ProjectEvent::KnowledgeNoteUpdated { .. } => None, // silente
+            ProjectEvent::KnowledgeLinkCreated { .. } => None,  // silente
+
             ProjectEvent::EventEnriched { .. } => None,
         }
     }

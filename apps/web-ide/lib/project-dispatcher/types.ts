@@ -67,7 +67,10 @@ export type ProjectEvent =
   | { kind: "SubagentRunChanged"; run_id: string; status: string; parent_run_id?: string }
   | { kind: "QualityScanProgress"; scan_id: string; phase: string; percent?: number }
   | { kind: "OutputChannelCreated"; channel_id: string; label: string }
-  | { kind: "SnapshotRequired"; reason: string; last_known_seq: number };
+  | { kind: "SnapshotRequired"; reason: string; last_known_seq: number }
+  | { kind: "KnowledgeNoteCreated"; note_id: string; title: string; intent: string | null }
+  | { kind: "KnowledgeNoteUpdated"; note_id: string; status: string }
+  | { kind: "KnowledgeLinkCreated"; link_id: string; from: string; to: string; rel_type: string; created_by: string };
 
 export interface EnvelopedEvent {
   event_id: string;

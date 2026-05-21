@@ -8,6 +8,7 @@ import { ProjectExplorer } from "../project-explorer";
 import { SourceControlPanel } from "../git/source-control-panel";
 import { ServerMonitorPanel } from "./server-monitor-panel";
 import { ProjectDbPanel } from "../project-db/project-db-panel";
+import { KnowledgePanel } from "../knowledge/knowledge-panel";
 import {
   useProjectStore,
   selectServicesMap,
@@ -40,7 +41,8 @@ export type SidebarView =
   | "run"
   | "docs"
   | "server-monitor"
-  | "project-db";
+  | "project-db"
+  | "knowledge";
 
 export interface SidebarManagerProps {
   activeSidebarView: SidebarView;
@@ -1259,6 +1261,14 @@ export function SidebarManager({
         onSendToChat={onSendToChat}
         onOpenInEditor={(relativePath) => onOpenFile(relativePath)}
       />
+    );
+  }
+
+  if (activeSidebarView === "knowledge" && project) {
+    return (
+      <div style={{ flex: 1, minHeight: 0, height: "100%", overflow: "hidden", display: "flex", flexDirection: "column" }}>
+        <KnowledgePanel project={project} />
+      </div>
     );
   }
 

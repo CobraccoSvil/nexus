@@ -113,6 +113,7 @@ type ProviderHealthState = {
 
 const sidebarItems: Array<{ key: SidebarView; label: string; icon: string }> = [
   { key: "project-db", label: "Database", icon: "🗄" },
+  { key: "knowledge", label: "Knowledge", icon: "🧠" },
   { key: "explorer", label: "Explorer", icon: "🗂" },
   { key: "search", label: "Ricerca", icon: "🔍" },
   { key: "source-control", label: "Git", icon: "⑂" },

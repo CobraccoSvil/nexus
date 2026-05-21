@@ -37,6 +37,7 @@ pub const TOPIC_MUTATION: &str = "mutation";
 /// Eventi di arricchimento (re-emit asincrono dopo classifier LLM) — payload
 /// `EventEnriched` con `event_id` originale + `ui_hint`/`semantic_tags` aggiunti.
 pub const TOPIC_META: &str = "meta";
+pub const TOPIC_KNOWLEDGE: &str = "knowledge";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
@@ -316,6 +317,24 @@ pub enum ProjectEvent {
         label: String,
     },
 
+    // ── Knowledge Base ────────────────────────────────────────────────────────────────
+    KnowledgeNoteCreated {
+        note_id: Uuid,
+        title: String,
+        intent: Option<String>,
+    },
+    KnowledgeNoteUpdated {
+        note_id: Uuid,
+        status: String,
+    },
+    KnowledgeLinkCreated {
+        link_id: Uuid,
+        from: Uuid,
+        to: Uuid,
+        rel_type: String,
+        created_by: String,
+    },
+
     // ── Eventi di servizio del dispatcher ──────────────────────────────────
     /// Inviato quando il consumer e' rimasto indietro oltre la capacita'
     /// del ring buffer. Il client deve ricaricare lo snapshot REST.
@@ -360,6 +379,9 @@ impl ProjectEvent {
             Self::SubagentRunChanged { .. } => TOPIC_AGENT,
             Self::QualityScanProgress { .. } => TOPIC_PROBLEMS,
             Self::OutputChannelCreated { .. } => TOPIC_SERVICES,
+            Self::KnowledgeNoteCreated { .. }
+            | Self::KnowledgeNoteUpdated { .. }
+            | Self::KnowledgeLinkCreated { .. } => TOPIC_KNOWLEDGE,
             Self::SnapshotRequired { .. } => TOPIC_SYSTEM,
         }
     }
@@ -403,6 +425,9 @@ impl ProjectEvent {
             Self::SubagentRunChanged { .. } => "SubagentRunChanged",
             Self::QualityScanProgress { .. } => "QualityScanProgress",
             Self::OutputChannelCreated { .. } => "OutputChannelCreated",
+            Self::KnowledgeNoteCreated { .. } => "KnowledgeNoteCreated",
+            Self::KnowledgeNoteUpdated { .. } => "KnowledgeNoteUpdated",
+            Self::KnowledgeLinkCreated { .. } => "KnowledgeLinkCreated",
             Self::SnapshotRequired { .. } => "SnapshotRequired",
         }
     }

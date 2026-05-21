@@ -185,6 +185,9 @@ pub async fn deep_analyze_project(
 
     // Snapshot dei dati per la fase async (la closure vive con 'static).
     let db = state.db.clone();
+    let neural = state.orchestrator.neural.clone();
+    let project_channels = state.project_channels.clone();
+    let repo_root_str = root.to_string_lossy().to_string();
     let project_name = context.details.name.clone();
     let project_slug = context.details.slug.clone();
 
@@ -304,6 +307,7 @@ pub async fn deep_analyze_project(
         .bind(cfg_count)
         .bind(status_str)
         .bind(&error_msg)
+        .bind(run_id)
         .execute(&db)
         .await;
 
@@ -311,6 +315,18 @@ pub async fn deep_analyze_project(
             "deep_analyze background: run_id={} status={} duration_ms={}",
             run_id, status_str, duration_ms
         );
+
+        // Se l'analisi e' completata con successo, popola la Knowledge Base
+        if status_str == "completed" && !insights_payload.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            crate::knowledge::seed_knowledge_from_insights(
+                db,
+                neural,
+                project_id,
+                insights_payload,
+                Some(repo_root_str),
+                project_channels,
+            ).await;
+        }
     });
 
     // Risposta immediata 202 Accepted con run_id per polling client-side

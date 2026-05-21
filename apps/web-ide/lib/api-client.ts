@@ -3623,3 +3623,112 @@ export async function executeProjectCommand(
     body: JSON.stringify({ command, timeout_secs: timeoutSecs }),
   }, clientTimeoutMs);
 }
+
+// ── Knowledge Base ──────────────────────────────────────────────────
+
+export interface KnowledgeNote {
+  id: string;
+  projectId: string;
+  sourceMessageId: string | null;
+  sourceRunId: string | null;
+  intent: string | null;
+  title: string;
+  bodyMd: string;
+  status: string;
+  tags: string[];
+  filePaths: string[];
+  vaultFilePath: string | null;
+  accessCount: number;
+  createdAt: string;
+  updatedAt: string;
+  lastAccessedAt: string | null;
+  // detail only
+  outgoing?: KnowledgeLink[];
+  backlinks?: KnowledgeLink[];
+}
+
+export interface KnowledgeLink {
+  linkId: string;
+  fromNoteId?: string;
+  toNoteId?: string;
+  fromTitle?: string;
+  toTitle?: string;
+  relType: string;
+  createdBy: string;
+  confidence: number;
+}
+
+export interface KnowledgeTag {
+  tag: string;
+  noteCount: number;
+  lastUsedAt: string;
+}
+
+export interface SimilarHit {
+  noteId: string;
+  title: string;
+  intent: string | null;
+  status: string;
+  score: number;
+  createdAt: string;
+}
+
+export async function listKnowledgeNotes(
+  projectId: string,
+  params?: { status?: string; intent?: string; tag?: string; q?: string; limit?: number; offset?: number },
+): Promise<{ notes: KnowledgeNote[]; total: number; limit: number; offset: number }> {
+  const sp = new URLSearchParams();
+  if (params?.status) sp.set("status", params.status);
+  if (params?.intent) sp.set("intent", params.intent);
+  if (params?.tag) sp.set("tag", params.tag);
+  if (params?.q) sp.set("q", params.q);
+  if (params?.limit) sp.set("limit", String(params.limit));
+  if (params?.offset) sp.set("offset", String(params.offset));
+  const qs = sp.toString();
+  return fetchJson(`/api/projects/${projectId}/knowledge/notes${qs ? `?${qs}` : ""}`);
+}
+
+export async function getKnowledgeNote(projectId: string, noteId: string): Promise<KnowledgeNote> {
+  return fetchJson(`/api/projects/${projectId}/knowledge/notes/${noteId}`);
+}
+
+export async function patchKnowledgeNote(
+  projectId: string,
+  noteId: string,
+  body: { title?: string; body_md?: string; tags?: string[]; status?: string },
+): Promise<{ ok: boolean; noteId: string }> {
+  return fetchJson(`/api/projects/${projectId}/knowledge/notes/${noteId}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function findSimilarKnowledge(
+  projectId: string,
+  text: string,
+  signal?: AbortSignal,
+): Promise<{ hits: SimilarHit[] }> {
+  return fetchJson(`/api/projects/${projectId}/knowledge/similar`, {
+    method: "POST",
+    body: JSON.stringify({ text }),
+    signal,
+  });
+}
+
+export async function createKnowledgeLink(
+  projectId: string,
+  body: { from_note_id: string; to_note_id: string; rel_type: string },
+): Promise<{ linkId: string }> {
+  return fetchJson(`/api/projects/${projectId}/knowledge/links`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function deleteKnowledgeLink(projectId: string, linkId: string): Promise<{ ok: boolean }> {
+  return fetchJson(`/api/projects/${projectId}/knowledge/links/${linkId}`, { method: "DELETE" });
+}
+
+export async function listKnowledgeTags(projectId: string): Promise<{ tags: KnowledgeTag[] }> {
+  return fetchJson(`/api/projects/${projectId}/knowledge/tags`);
+}

@@ -205,6 +205,8 @@ start_brain() {
     local logfile="/tmp/nexus-neural.log"
     setsid nohup env \
         DATABASE_URL="${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}" \
+        HF_HUB_OFFLINE=1 \
+        TRANSFORMERS_OFFLINE=1 \
         python3 -m brain.grpc_server.main --rest \
         > "$logfile" 2>&1 < /dev/null &
     local pid=$!
@@ -415,6 +417,7 @@ sleep 2
 
 log "Avvio Neural Core (Python) con REST endpoint su :8001..."
 setsid nohup env DATABASE_URL="${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}" \
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
     python3 -m brain.grpc_server.main --rest > /tmp/nexus-neural.log 2>&1 < /dev/null &
 disown || true
 sleep 4

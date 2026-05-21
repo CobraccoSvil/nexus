@@ -2825,6 +2825,33 @@ pub async fn send_chat_message(
         content.to_string(),
     );
 
+    // ── Hook: auto-creazione nota Knowledge Base ───────────────────────────
+    // Ogni messaggio utente genera una nota in background (non blocca il turno).
+    {
+        let db_clone = state.db.clone();
+        let neural_clone = state.orchestrator.neural.clone();
+        let channels_clone = state.project_channels.clone();
+        let pid = context.project_id;
+        let mid = user_message_id;
+        let cnt = content.to_string();
+        let intent_val: Option<String> = None; // l'intent verra' aggiornato dal classifier
+        // Recupera repo root per vault PUSH
+        let repo_root: Option<String> = sqlx::query_scalar(
+            "SELECT repository_root_path FROM projects WHERE id = "
+        )
+        .bind(pid)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+        tokio::spawn(async move {
+            crate::knowledge::create_note_from_user_message(
+                db_clone, neural_clone, pid, mid, cnt, intent_val, repo_root, channels_clone,
+            )
+            .await;
+        });
+    }
+
     // ── Rilevamento cambio modello esplicito ────────────────────────────────
     // Se il messaggio è un comando "usa mistral / cambia a claude / ecc." e
     // il client non ha già impostato un override manuale, gestiamo lo switch

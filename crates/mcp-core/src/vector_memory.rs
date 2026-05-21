@@ -16,7 +16,7 @@ pub struct VectorPointHit {
     pub payload: Value,
 }
 
-async fn get_setting(db: &PgPool, key: &str) -> anyhow::Result<Option<String>> {
+pub(crate) async fn get_setting(db: &PgPool, key: &str) -> anyhow::Result<Option<String>> {
     let value = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
         .bind(key)
         .fetch_optional(db)
@@ -1127,4 +1127,184 @@ pub fn conversation_point_id(session_id: Uuid, message_id: Uuid) -> String {
     hasher.update(message_id.as_bytes());
     let hash = hasher.finalize();
     format!("{:x}", hash)[..32].to_string()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Knowledge Notes — collection Qdrant per la KB per-progetto
+// ═══════════════════════════════════════════════════════════════════════════
+
+const DEFAULT_KNOWLEDGE_COLLECTION: &str = "knowledge_notes";
+
+async fn qdrant_knowledge_config(db: &PgPool) -> anyhow::Result<(String, String)> {
+    let url = get_setting(db, "qdrant_url").await?.unwrap_or_else(|| {
+        std::env::var("QDRANT_URL").unwrap_or_else(|_| DEFAULT_QDRANT_URL.to_string())
+    });
+    let collection = get_setting(db, "qdrant_knowledge_collection")
+        .await?
+        .unwrap_or_else(|| DEFAULT_KNOWLEDGE_COLLECTION.to_string());
+    Ok((url, collection))
+}
+
+/// Crea la collection Qdrant `knowledge_notes` se non esiste (idempotente).
+pub async fn ensure_knowledge_collection(db: &PgPool) -> anyhow::Result<()> {
+    let (base_url, collection) = qdrant_knowledge_config(db).await?;
+    let client = nexus_http::build_client();
+    let get_url = format!("{base_url}/collections/{collection}");
+
+    let response = client
+        .get(&get_url)
+        .send()
+        .await
+        .context("impossibile verificare collection knowledge_notes")?;
+
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let create_url = format!("{base_url}/collections/{collection}");
+    let create_body = json!({
+        "vectors": {
+            "size": 384,
+            "distance": "Cosine"
+        }
+    });
+
+    let create_response = client
+        .put(&create_url)
+        .json(&create_body)
+        .send()
+        .await
+        .context("impossibile creare collection knowledge_notes")?;
+
+    if !create_response.status().is_success() {
+        let payload = create_response.text().await.unwrap_or_default();
+        return Err(anyhow!("creazione collection knowledge_notes fallita: {payload}"));
+    }
+
+    Ok(())
+}
+
+/// Inserisce/aggiorna un punto nella collection knowledge_notes.
+pub async fn upsert_knowledge_point(
+    db: &PgPool,
+    point_id: &str,
+    vector: Vec<f32>,
+    payload: Value,
+) -> anyhow::Result<()> {
+    ensure_knowledge_collection(db).await?;
+    let (base_url, collection) = qdrant_knowledge_config(db).await?;
+    let url = format!("{base_url}/collections/{collection}/points?wait=true");
+    let body = json!({
+        "points": [{
+            "id": point_id,
+            "vector": vector,
+            "payload": payload,
+        }]
+    });
+
+    let client = nexus_http::build_client();
+    let response = client
+        .put(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("knowledge upsert fallito")?;
+
+    if !response.status().is_success() {
+        let payload = response.text().await.unwrap_or_default();
+        return Err(anyhow!("knowledge upsert fallito: {payload}"));
+    }
+    Ok(())
+}
+
+/// Cerca note simili nella collection knowledge_notes, filtrate per project_id.
+pub async fn search_knowledge_points(
+    db: &PgPool,
+    vector: Vec<f32>,
+    project_id: Uuid,
+    top_k: usize,
+) -> anyhow::Result<Vec<VectorPointHit>> {
+    ensure_knowledge_collection(db).await?;
+    let (base_url, collection) = qdrant_knowledge_config(db).await?;
+    let url = format!("{base_url}/collections/{collection}/points/search");
+    let body = json!({
+        "vector": vector,
+        "limit": top_k,
+        "with_payload": true,
+        "filter": {
+            "must": [
+                {
+                    "key": "project_id",
+                    "match": { "value": project_id.to_string() }
+                },
+                {
+                    "key": "status",
+                    "match": { "any": ["active", "draft"] }
+                }
+            ]
+        }
+    });
+
+    let client = nexus_http::build_client();
+    let response = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("knowledge search fallita")?;
+
+    if !response.status().is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(anyhow!("knowledge search fallita: {text}"));
+    }
+
+    let payload: Value = response.json().await.context("payload ricerca knowledge non valido")?;
+    let result = payload
+        .get("result")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut hits = Vec::with_capacity(result.len());
+    for hit in result {
+        let score = hit.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        let point_id = match hit.get("id") {
+            Some(Value::String(v)) => v.clone(),
+            Some(Value::Number(v)) => v.to_string(),
+            _ => continue,
+        };
+        let pl = hit.get("payload").cloned().unwrap_or(json!({}));
+        hits.push(VectorPointHit { point_id, score, payload: pl });
+    }
+    Ok(hits)
+}
+
+/// Elimina punti dalla collection knowledge_notes per lista di point_id.
+pub async fn delete_knowledge_points(
+    db: &PgPool,
+    point_ids: &[String],
+) -> anyhow::Result<()> {
+    if point_ids.is_empty() {
+        return Ok(());
+    }
+    ensure_knowledge_collection(db).await?;
+    let (base_url, collection) = qdrant_knowledge_config(db).await?;
+    let url = format!("{base_url}/collections/{collection}/points/delete?wait=true");
+    let body = json!({
+        "points": point_ids,
+    });
+
+    let client = nexus_http::build_client();
+    let response = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("eliminazione punti knowledge fallita")?;
+
+    if !response.status().is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(anyhow!("eliminazione punti knowledge fallita: {text}"));
+    }
+    Ok(())
 }
