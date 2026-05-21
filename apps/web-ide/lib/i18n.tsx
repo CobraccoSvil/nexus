@@ -283,7 +283,7 @@ const translations = {
     "landing.v2.cta.subtitle": "Start with your own API keys. No vendor lock-in, no opaque credits.",
     "landing.v2.cta.button": "Get started",
 
-    "landing.v2.footer.copyright": "Nexus by IDEAI",
+    "landing.v2.footer.copyright": "Nexus by",
     "landing.v2.footer.privacy": "Privacy",
     "landing.v2.footer.terms": "Terms",
 
@@ -596,7 +596,7 @@ const translations = {
     "landing.v2.cta.subtitle": "Inizia con le tue API key. Niente vendor lock-in, niente crediti opachi.",
     "landing.v2.cta.button": "Inizia ora",
 
-    "landing.v2.footer.copyright": "Nexus by IDEAI",
+    "landing.v2.footer.copyright": "Nexus by",
     "landing.v2.footer.privacy": "Privacy",
     "landing.v2.footer.terms": "Termini",
 
@@ -908,7 +908,7 @@ const translations = {
     "landing.v2.cta.subtitle": "Empieza con tus propias API keys. Sin vendor lock-in, sin creditos opacos.",
     "landing.v2.cta.button": "Empieza ahora",
 
-    "landing.v2.footer.copyright": "Nexus by IDEAI",
+    "landing.v2.footer.copyright": "Nexus by",
     "landing.v2.footer.privacy": "Privacidad",
     "landing.v2.footer.terms": "Terminos",
 

@@ -466,7 +466,17 @@ export default function LandingPage() {
             color: C.dark.muted,
           }}
         >
-          <span>&copy; 2026 {t("landing.v2.footer.copyright")}</span>
+          <span>
+            &copy; 2026 {t("landing.v2.footer.copyright")}{" "}
+            <a
+              href="https://cobracco.it"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: "inherit", textDecoration: "underline" }}
+            >
+              Cobracco
+            </a>
+          </span>
           <div style={{ display: "flex", gap: 24 }}>
             <a href="#preview" style={{ color: C.dark.muted, textDecoration: "none" }}>
               {t("landing.v2.nav.product")}

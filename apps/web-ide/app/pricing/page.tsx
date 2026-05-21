@@ -171,7 +171,17 @@ export default function PricingPage() {
             color: "#8494a7",
           }}
         >
-          <span>&copy; 2026 {t("landing.v2.footer.copyright")}</span>
+          <span>
+            &copy; 2026 {t("landing.v2.footer.copyright")}{" "}
+            <a
+              href="https://cobracco.it"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: "inherit", textDecoration: "underline" }}
+            >
+              Cobracco
+            </a>
+          </span>
           <div style={{ display: "flex", gap: 24 }}>
             <a href="/" style={{ color: "#8494a7", textDecoration: "none" }}>
               {t("landing.v2.nav.product")}
