@@ -12,7 +12,7 @@ source_files:
   - crates/mcp-core/src/meta_docs/generators/concepts.rs
 auto_generated: true
 created_at: 2026-05-23T11:09:01Z
-updated_at: 2026-05-23T11:29:57Z
+updated_at: 2026-05-23T11:38:17Z
 nexus_meta_version: 1
 ---
 

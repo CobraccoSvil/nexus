@@ -1529,6 +1529,13 @@ async fn main() -> anyhow::Result<()> {
                     middleware::require_auth,
                 )),
             )
+            .route(
+                "/api/meta-docs/export-archive",
+                get(meta_docs::routes::export_vault_archive).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
             // ── change-drafts (ChangeDrafter proposte di modifica) ─
             .route(
                 "/api/change-drafts",

@@ -254,6 +254,25 @@ export default function NexusDocsAdminPage() {
         >
           Apri in Obsidian
         </button>
+        <a
+          href="/api/meta-docs/export-archive"
+          download
+          title="Scarica un archivio del meta-vault per aprirlo localmente in Obsidian"
+          style={{
+            padding: "8px 14px",
+            fontSize: 13,
+            fontWeight: 600,
+            background: "#16a34a",
+            color: "#fff",
+            border: "none",
+            borderRadius: 8,
+            cursor: "pointer",
+            textDecoration: "none",
+            display: "inline-block",
+          }}
+        >
+          Scarica vault (.tar.gz)
+        </a>
         <button
           onClick={() => setShowVaultSettings((v) => !v)}
           style={{

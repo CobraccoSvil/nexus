@@ -433,6 +433,71 @@ pub async fn ingest_commit_stub(
 // Note: la registrazione route avviene direttamente in main.rs accanto
 // alle altre route del crate (pattern Router<AppState>).
 
+// ── GET /api/meta-docs/export-archive ────────────────────────────────────
+//
+// Crea un archivio `.tar.gz` della cartella `docs/.nexus-vault/` e lo
+// ritorna come download. Usato per scaricare il vault e aprirlo
+// localmente in Obsidian (estrarre con tar/7zip/winrar).
+// Scelto tar.gz al posto di zip perche' `tar` e' sempre disponibile su
+// Linux (zip richiede install separata).
+
+pub async fn export_vault_archive(
+    State(state): State<AppState>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    use axum::body::Body;
+    use axum::http::header;
+
+    let vault_root = crate::meta_docs::apply::resolve_vault_root(&state).await;
+
+    if !std::path::Path::new(&vault_root).exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("vault non trovato: {vault_root}"),
+        ));
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let tmp_archive = format!("/tmp/nexus-vault-{timestamp}.tar.gz");
+
+    let parent = std::path::Path::new(&vault_root)
+        .parent()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "parent vault path mancante".to_string()))?;
+
+    let output = tokio::process::Command::new("tar")
+        .args(["-czf", &tmp_archive, ".nexus-vault"])
+        .current_dir(parent)
+        .output()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tar exec error: {e}")))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("tar fallito: {err}"),
+        ));
+    }
+
+    let bytes = tokio::fs::read(&tmp_archive)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read archive: {e}")))?;
+
+    let _ = tokio::fs::remove_file(&tmp_archive).await;
+
+    let filename = format!("nexus-meta-vault-{timestamp}.tar.gz");
+    let response = axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/gzip")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(Body::from(bytes))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("response build: {e}")))?;
+
+    Ok(response)
+}
+
 // ── POST /api/meta-docs/recompute-links ─────────────────────────────────
 //
 // Per ogni nota: parsa i wikilink `[[slug]]` dal body Markdown e li
