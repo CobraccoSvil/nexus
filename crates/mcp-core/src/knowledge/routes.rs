@@ -894,6 +894,46 @@ pub async fn rebuild_knowledge(
     })))
 }
 
+// ── POST /api/projects/:id/knowledge/generate-rich ───────────────────────
+//
+// Esegue i 3 generator (technical/functional/test) e UPSERT le note nella KB
+// del progetto. Idempotente: nota esistente con stesso (project_id, kind, title)
+// viene UPDATE invece di duplicata.
+
+pub async fn generate_rich_kb(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(project_id): AxumPath<String>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&project_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    let (total, applied) =
+        crate::knowledge::generators::generate_and_apply_all(&state, project_id)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("generate: {e}")))?;
+
+    // Dopo aver creato le note, ricalcola anche i link automatici
+    let (linked_notes, links_created) = crate::knowledge_workers::recompute_links_for_project(
+        &state.db,
+        &state.orchestrator.neural,
+        &state.project_channels,
+        project_id,
+    )
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("recompute links: {e}")))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "notes_generated": total,
+        "notes_applied": applied,
+        "linked_notes": linked_notes,
+        "links_created": links_created,
+    })))
+}
+
 // ── POST /api/projects/:id/knowledge/recompute-links ─────────────────────
 //
 // Forza il ricalcolo dei link automatici su TUTTE le note del progetto

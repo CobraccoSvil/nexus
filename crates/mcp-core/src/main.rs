@@ -1487,6 +1487,13 @@ async fn main() -> anyhow::Result<()> {
                 )),
             )
             .route(
+                "/api/projects/:id/knowledge/generate-rich",
+                post(knowledge::routes::generate_rich_kb).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
                 "/api/projects/:id/knowledge/notes/manual",
                 post(knowledge::routes::create_note_manual).layer(axum_mw::from_fn_with_state(
                     state.clone(),

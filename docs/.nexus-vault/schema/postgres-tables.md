@@ -6,11 +6,12 @@ slug: postgres-tables
 tags:
   - schema
   - postgres
+source_commit: 3d8bab3a5bf856c05d0f7967dd6ccee6ced0c5b0
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T11:11:50Z
+updated_at: 2026-05-23T13:27:05Z
 nexus_meta_version: 1
 ---
 

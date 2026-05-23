@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: 999489cd74071f52d4a79f725275c33342b35e4a
+source_commit: 3d8bab3a5bf856c05d0f7967dd6ccee6ced0c5b0
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T12:09:46Z
+updated_at: 2026-05-23T13:27:07Z
 nexus_meta_version: 1
 ---
 
@@ -114,7 +114,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | Chiave | Valore default | Descrizione |
 |---|---|---|
 | `automation.o_series_essential_tools` | `read_file,read_file_lines,list_files,search_in_files,writ...` | Tool essenziali esposti ai modelli o-series (o1/o3/o4-mini). Gli altri tool sono disponibili via nexus_mcp_tool_search. CSV. |
-| `knowledge.autolink_threshold` | `0.65` |  |
+| `knowledge.autolink_threshold` | `0.45` |  |
 | `knowledge.cleanup_draft_days` | `30` |  |
 | `knowledge.commit_vault_to_git` | `false` |  |
 | `knowledge.link_worker_interval_secs` | `600` |  |
@@ -149,6 +149,14 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `qdrant_project_context_collection` | `project_context` | Qdrant collection per indicizzazione iniziale del contesto/storia progetto |
 | `qdrant_url` | `http://localhost:6333` | Qdrant vector DB URL |
 | `redis_url` | `redis://localhost:6379` | Redis connection URL |
+
+## `knowledge`
+
+| Chiave | Valore default | Descrizione |
+|---|---|---|
+| `knowledge.context_injection_enabled` | `true` | Abilita iniezione automatica delle note KB rilevanti nel system prompt agente |
+| `knowledge.context_injection_min_score` | `0.5` | Soglia minima di similarita cosine 0-1 |
+| `knowledge.context_injection_top_k` | `5` | Numero massimo di note KB da iniettare (1-20) |
 
 ## `learning`
 
@@ -285,7 +293,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `default_model` | `claude-sonnet-4-6` | Default model for chat |
 | `default_provider` | `anthropic` | Default LLM provider |
 | `max_token_budget` | `32000` | Maximum token budget allowed |
-| `model_catalog_last_sync` | `2026-05-23T11:59:10.071655540+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
+| `model_catalog_last_sync` | `2026-05-23T12:13:10.919082131+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
 | `nexus_active_routing_pct` | `50` | Percentuale di richieste chat gestite dal router Q-Learning Nexus (0=off, 100=tutto). A/B testing: imposta 10-50 per un rollout graduale. |
 | `nexus_behavior_mode` | `dinamico` | Modalità comportamento Nexus: veloce|economica|bilanciata|approfondita |
 | `provider_hierarchy` | `anthropic,openai,google,deepseek,mistral` | Ordered fallback chain for chat providers |
@@ -338,4 +346,4 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 ---
 
-**Totale chiavi**: 196
+**Totale chiavi**: 199

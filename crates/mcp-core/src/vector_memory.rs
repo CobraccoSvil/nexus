@@ -1280,6 +1280,42 @@ pub async fn search_knowledge_points(
 }
 
 /// Elimina punti dalla collection knowledge_notes per lista di point_id.
+/// Recupera il vettore di un point Qdrant `knowledge_notes` per id.
+/// Permette il link inference senza ri-embedding via brain.
+pub async fn get_knowledge_point_vector(
+    db: &PgPool,
+    point_id: &str,
+) -> anyhow::Result<Vec<f32>> {
+    let (base_url, collection) = qdrant_knowledge_config(db).await?;
+    let url = format!("{base_url}/collections/{collection}/points/{point_id}?with_vector=true");
+    let client = nexus_http::build_client();
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .context("get_knowledge_point_vector: GET point fallito")?;
+    if !response.status().is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(anyhow!("get_knowledge_point_vector: HTTP error: {text}"));
+    }
+    let payload: Value = response
+        .json()
+        .await
+        .context("get_knowledge_point_vector: parse JSON")?;
+    let vector = payload
+        .get("result")
+        .and_then(|r| r.get("vector"))
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("get_knowledge_point_vector: vector mancante"))?
+        .iter()
+        .filter_map(|x| x.as_f64().map(|f| f as f32))
+        .collect::<Vec<f32>>();
+    if vector.is_empty() {
+        return Err(anyhow!("get_knowledge_point_vector: vettore vuoto"));
+    }
+    Ok(vector)
+}
+
 pub async fn delete_knowledge_points(
     db: &PgPool,
     point_ids: &[String],

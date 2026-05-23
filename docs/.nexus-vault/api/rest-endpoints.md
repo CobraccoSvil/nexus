@@ -6,18 +6,18 @@ slug: rest-endpoints
 tags:
   - api
   - rest
-source_commit: 999489cd74071f52d4a79f725275c33342b35e4a
+source_commit: 3d8bab3a5bf856c05d0f7967dd6ccee6ced0c5b0
 source_files:
   - crates/mcp-core/src/main.rs
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T12:09:46Z
+updated_at: 2026-05-23T13:27:07Z
 nexus_meta_version: 1
 ---
 
 Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src/main.rs`.
 
-**Totale endpoint**: 250
+**Totale endpoint**: 251
 
 Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]].
 
@@ -163,6 +163,7 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 | `GET` | `/api/internal/providers/status` | `environment::providers_status_internal` |
 | `GET` | `/api/internal/routing/catalog` | `internal_routing::list_catalog` |
 | `GET` | `/api/internal/routing/purpose` | `internal_routing::resolve_purpose` |
+| `POST` | `/api/internal/knowledge/search` | `knowledge::routes::internal_kb_search` |
 | `POST` | `/api/internal/learning/feedback` | `internal_learning::submit_feedback` |
 | `POST` | `/api/internal/prompt-templates/batch-assign-tools` | `prompt_templates::internal_batch_assign_tools_handler` |
 | `POST` | `/api/internal/provider-error` | `internal_routing::provider_error_handler` |

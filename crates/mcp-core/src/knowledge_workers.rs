@@ -169,10 +169,10 @@ async fn link_inference_tick(
             let result = sqlx::query(
                 r#"
                 INSERT INTO project_knowledge_links (
-                    id, project_id, from_note_id, to_note_id,
+                    id, from_note_id, to_note_id,
                     rel_type, created_by, confidence, created_at
                 )
-                VALUES ($1, $2, $3, $4, 'relates', 'auto', $5, NOW())
+                VALUES ($1, $2, $3, 'relates', 'auto', $4, NOW())
                 ON CONFLICT (from_note_id, to_note_id, rel_type)
                 DO UPDATE SET confidence = GREATEST(
                     project_knowledge_links.confidence,
@@ -181,7 +181,6 @@ async fn link_inference_tick(
                 "#,
             )
             .bind(link_id)
-            .bind(note.project_id)
             .bind(note.id)
             .bind(target_note_id)
             .bind(confidence)
@@ -275,14 +274,38 @@ pub async fn recompute_links_for_project(
     let mut links_created: usize = 0;
 
     for note in &notes {
-        let embed_text = if note.body_md.len() > 2000 {
-            &note.body_md[..2000]
+        // Preferisci il vettore GIA' stoccato in Qdrant (zero costo brain).
+        // Fallback a ri-embedding via brain solo se il point Qdrant manca.
+        let vector = if let Some(point_id) = note.qdrant_point_id.as_ref() {
+            match crate::vector_memory::get_knowledge_point_vector(db, point_id).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(
+                        note_id = %note.id,
+                        point_id = %point_id,
+                        "recompute_links: get_point fallito, fallback embed: {e}"
+                    );
+                    let embed_text = if note.body_md.len() > 2000 {
+                        &note.body_md[..2000]
+                    } else {
+                        &note.body_md
+                    };
+                    match neural.embed_text("", embed_text).await {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    }
+                }
+            }
         } else {
-            &note.body_md
-        };
-        let vector = match neural.embed_text("", embed_text).await {
-            Ok(v) => v,
-            Err(_) => continue,
+            let embed_text = if note.body_md.len() > 2000 {
+                &note.body_md[..2000]
+            } else {
+                &note.body_md
+            };
+            match neural.embed_text("", embed_text).await {
+                Ok(v) => v,
+                Err(_) => continue,
+            }
         };
 
         let hits = match crate::vector_memory::search_knowledge_points(
@@ -294,8 +317,18 @@ pub async fn recompute_links_for_project(
         .await
         {
             Ok(h) => h,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(note_id = %note.id, error = %e, "recompute: search failed");
+                continue;
+            }
         };
+        tracing::info!(
+            note_id = %note.id,
+            hits_count = hits.len(),
+            top_score = hits.first().map(|h| h.score).unwrap_or(0.0),
+            threshold,
+            "recompute: hits ricevuti"
+        );
 
         for hit in &hits {
             if hit.score < threshold {
@@ -308,7 +341,15 @@ pub async fn recompute_links_for_project(
                 .and_then(|s| s.parse::<Uuid>().ok())
             {
                 Some(id) if id != note.id => id,
-                _ => continue,
+                _ => {
+                    tracing::debug!(
+                        from_note = %note.id,
+                        score = hit.score,
+                        payload_note_id = ?hit.payload.get("note_id"),
+                        "recompute: hit skipped (same note or bad payload)"
+                    );
+                    continue;
+                }
             };
 
             let link_id = Uuid::new_v4();
@@ -316,10 +357,10 @@ pub async fn recompute_links_for_project(
             let result = sqlx::query(
                 r#"
                 INSERT INTO project_knowledge_links (
-                    id, project_id, from_note_id, to_note_id,
+                    id, from_note_id, to_note_id,
                     rel_type, created_by, confidence, created_at
                 )
-                VALUES ($1, $2, $3, $4, 'relates', 'auto', $5, NOW())
+                VALUES ($1, $2, $3, 'relates', 'auto', $4, NOW())
                 ON CONFLICT (from_note_id, to_note_id, rel_type)
                 DO UPDATE SET confidence = GREATEST(
                     project_knowledge_links.confidence,
@@ -328,26 +369,42 @@ pub async fn recompute_links_for_project(
                 "#,
             )
             .bind(link_id)
-            .bind(note.project_id)
             .bind(note.id)
             .bind(target_note_id)
             .bind(confidence)
             .execute(db)
             .await;
 
-            if let Ok(r) = result {
-                if r.rows_affected() > 0 {
-                    links_created += 1;
-                    let _ = nexus_events::dispatcher::emit(
-                        project_channels,
-                        note.project_id,
-                        nexus_events::ProjectEvent::KnowledgeLinkCreated {
-                            link_id,
-                            from: note.id,
-                            to: target_note_id,
-                            rel_type: "relates".to_string(),
-                            created_by: "auto".to_string(),
-                        },
+            match result {
+                Ok(r) => {
+                    if r.rows_affected() > 0 {
+                        links_created += 1;
+                        let _ = nexus_events::dispatcher::emit(
+                            project_channels,
+                            note.project_id,
+                            nexus_events::ProjectEvent::KnowledgeLinkCreated {
+                                link_id,
+                                from: note.id,
+                                to: target_note_id,
+                                rel_type: "relates".to_string(),
+                                created_by: "auto".to_string(),
+                            },
+                        );
+                    } else {
+                        tracing::warn!(
+                            from = %note.id,
+                            to = %target_note_id,
+                            score = hit.score,
+                            "recompute: INSERT rows_affected=0 (conflict no-op)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        from = %note.id,
+                        to = %target_note_id,
+                        error = %e,
+                        "recompute: INSERT link fallito"
                     );
                 }
             }
