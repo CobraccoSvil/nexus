@@ -211,11 +211,12 @@ const translations = {
 
     // Knowledge Base landing section
     "landing.v2.knowledge.title": "Per-project Knowledge Base.",
-    "landing.v2.knowledge.desc": "Every request automatically becomes a persistent note — with intent, related files, and semantic links. An Obsidian-compatible vault lives inside your repo: YAML frontmatter, wikilinks, bidirectional sync. Open it in Obsidian or browse it from the IDE sidebar. Duplicate detection warns you before you repeat work. The system builds your project memory for you.",
+    "landing.v2.knowledge.desc": "Every request automatically becomes a persistent note — with intent, related files, and semantic links. An Obsidian-compatible vault lives inside your repo: YAML frontmatter, wikilinks, bidirectional sync. Browse it from the IDE sidebar, explore the interactive graph, or open it in Obsidian. The system builds your project memory — and makes it navigable.",
     "landing.v2.knowledge.feat1": "Auto-created from every chat message",
     "landing.v2.knowledge.feat2": "Obsidian-compatible vault (.md + YAML frontmatter + [[wikilinks]])",
-    "landing.v2.knowledge.feat3": "Semantic similarity banner to prevent duplicate work",
-    "landing.v2.knowledge.feat4": "Bidirectional sync: IDE, DB, and filesystem always in sync",
+    "landing.v2.knowledge.feat3": "Interactive knowledge graph — pan, zoom, click to open notes",
+    "landing.v2.knowledge.feat4": "Semantic similarity banner to prevent duplicate work",
+    "landing.v2.knowledge.feat5": "Bidirectional sync: IDE, DB, and filesystem always in sync",
 
     // Comparison section
     "landing.compTitle": "Nexus vs. the market.",
@@ -364,7 +365,7 @@ const translations = {
     "knowledge.detail.files": "Related files",
     "knowledge.detail.created": "Created on",
     "knowledge.detail.updated": "Updated on",
-    "knowledge.graph.placeholder": "Graph view available in a future version",
+    "knowledge.graph.placeholder": "No notes yet — create notes to see the graph",
   },
 
   it: {
@@ -564,11 +565,12 @@ const translations = {
 
     // Sezione Knowledge Base landing
     "landing.v2.knowledge.title": "Knowledge Base per-progetto.",
-    "landing.v2.knowledge.desc": "Ogni richiesta diventa automaticamente una nota persistente — con intent, file coinvolti e link semantici. Un vault Obsidian-compatible vive dentro il tuo repo: frontmatter YAML, wikilink, sync bidirezionale. Aprilo in Obsidian o sfoglialo dalla sidebar dell'IDE. Il rilevamento duplicati ti avvisa prima di rifare lavoro gia fatto. Il sistema costruisce la memoria del progetto al posto tuo.",
+    "landing.v2.knowledge.desc": "Ogni richiesta diventa automaticamente una nota persistente — con intent, file coinvolti e link semantici. Un vault Obsidian-compatible vive dentro il tuo repo: frontmatter YAML, wikilink, sync bidirezionale. Sfoglialo dalla sidebar dell'IDE, esplora il grafo interattivo o aprilo in Obsidian. Il sistema costruisce la memoria del progetto — e la rende navigabile.",
     "landing.v2.knowledge.feat1": "Creazione automatica da ogni messaggio chat",
     "landing.v2.knowledge.feat2": "Vault Obsidian-compatible (.md + frontmatter YAML + [[wikilink]])",
-    "landing.v2.knowledge.feat3": "Banner di similarita semantica per evitare lavoro duplicato",
-    "landing.v2.knowledge.feat4": "Sync bidirezionale: IDE, DB e filesystem sempre allineati",
+    "landing.v2.knowledge.feat3": "Grafo interattivo della conoscenza — pan, zoom, click per aprire le note",
+    "landing.v2.knowledge.feat4": "Banner di similarita semantica per evitare lavoro duplicato",
+    "landing.v2.knowledge.feat5": "Sync bidirezionale: IDE, DB e filesystem sempre allineati",
 
     // Sezione confronto
     "landing.compTitle": "Nexus vs. il mercato.",
@@ -717,7 +719,7 @@ const translations = {
     "knowledge.detail.files": "File coinvolti",
     "knowledge.detail.created": "Creata il",
     "knowledge.detail.updated": "Aggiornata il",
-    "knowledge.graph.placeholder": "Visualizzazione grafo disponibile in una versione futura",
+    "knowledge.graph.placeholder": "Nessuna nota ancora — crea note per vedere il grafo",
   },
 
   es: {

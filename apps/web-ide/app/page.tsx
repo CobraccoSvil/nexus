@@ -292,7 +292,7 @@ export default function LandingPage() {
               {t("landing.v2.knowledge.desc")}
             </p>
             <ul style={{ marginTop: 20, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 10 }}>
-              {(["feat1", "feat2", "feat3", "feat4"] as const).map((k) => (
+              {(["feat1", "feat2", "feat3", "feat4", "feat5"] as const).map((k) => (
                 <li
                   key={k}
                   style={{
@@ -332,7 +332,7 @@ export default function LandingPage() {
                 const parent = (e.target as HTMLImageElement).parentElement!;
                 parent.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:40px;color:${C.light.muted}">
                   <div style="font-size:48px">K</div>
-                  <div style="font-size:14px;text-align:center">Knowledge Base<br/>Obsidian-compatible vault</div>
+                  <div style="font-size:14px;text-align:center">Knowledge Base<br/>Interactive graph + Obsidian vault</div>
                 </div>`;
               }}
             />
