@@ -2486,8 +2486,15 @@ async fn spawn_agent_run(
             // disabilitiamo il retry. Per altri intent (anche `docs` quando
             // l'utente chiede di scrivere/leggere documentazione) il retry
             // serve perche' il modello dovrebbe usare tool.
+            //
+            // G1 override: se il messaggio utente e' una richiesta d'azione
+            // (avvia/installa/configura/docker/...) forziamo il retry ANCHE se
+            // l'intent classifier ha classificato come "chat" — in questo caso
+            // la classificazione e' probabile mente errata e la risposta senza
+            // tool e' sempre un fallimento.
+            let is_action_request = crate::agent_types::detect_action_request(&initial_msg_clone);
             let hollow_retry = result.hollow_completion
-                && classified_intent_for_loop != "chat";
+                && (classified_intent_for_loop != "chat" || is_action_request);
             let should_retry = failed_retry || hollow_retry;
 
             if !should_retry || fallback_attempt + 1 >= max_provider_fallbacks {
@@ -2772,6 +2779,18 @@ async fn spawn_agent_run(
         .bind(result.nexus_task_type.as_deref())
         .execute(&db_clone)
         .await;
+
+        // ── G4: memorizza startup_command dopo avvio servizio riuscito ─────
+        // Se il run è completato con successo e ha eseguito un `docker compose up`,
+        // salva il comando in memory_entries → al turno successivo l'agente lo
+        // trova in "Memoria di progetto" e sa già cosa eseguire.
+        if matches!(result.status, AgentRunStatus::Completed) {
+            crate::agent_types::save_startup_command_if_needed(
+                &db_clone,
+                project_id_cp,
+                &result.steps,
+            ).await;
+        }
 
         // ── Budget tracking ──────────────────────────────────────────────
         // Incrementa il `spent_current_period_usd` per il provider del run.

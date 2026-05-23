@@ -535,3 +535,106 @@ Thumbs.db
         Err(e) => tracing::warn!("auto_commit: spawn git commit fallito: {}", e),
     }
 }
+
+// ---------------------------------------------------------------------------
+// G4 — Memorizzazione startup_command dopo avvio servizio riuscito
+// ---------------------------------------------------------------------------
+
+/// G4: dopo un run completato con successo cerca l'ultimo `shell_exec` che ha
+/// eseguito `docker compose up` e salva il comando esatto in `memory_entries`
+/// con ns_type='project'. Al turno successivo, `build_project_context_block`
+/// lo mostrerà in "Memoria di progetto" → l'agente sa già cosa eseguire.
+///
+/// Fire-and-forget: gli errori non bloccano il return del run.
+pub async fn save_startup_command_if_needed(
+    db: &PgPool,
+    project_id: Uuid,
+    steps: &[AgentStep],
+) {
+    // Cerca l'ultimo step shell_exec riuscito con `docker compose up`
+    let docker_cmd = steps
+        .iter()
+        .rev()
+        .filter(|s| {
+            s.tool_name == "shell_exec"
+                && s.status == AgentStepStatus::Completed
+        })
+        .find_map(|s| {
+            let cmd = s.tool_input.get("command").and_then(|v| v.as_str())?;
+            if cmd.contains("docker") && cmd.contains("compose") && cmd.contains("up") {
+                Some(cmd.to_string())
+            } else {
+                None
+            }
+        });
+
+    let cmd = match docker_cmd {
+        Some(c) => c,
+        None => return, // nessun docker compose up → niente da salvare
+    };
+
+    // Cerca o crea il namespace di tipo 'project' per questo progetto
+    let ns_key = format!("project:{project_id}");
+    let ns_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM memory_namespaces WHERE ns_key = $1 AND active = TRUE LIMIT 1",
+    )
+    .bind(&ns_key)
+    .fetch_optional(db)
+    .await
+    .unwrap_or(None);
+
+    let ns_id = match ns_id {
+        Some(id) => id,
+        None => {
+            let new_id = Uuid::new_v4();
+            let _ = sqlx::query(
+                "INSERT INTO memory_namespaces \
+                 (id, ns_key, ns_type, project_id, merge_strategy, active) \
+                 VALUES ($1, $2, 'project', $3, 'lww', TRUE) \
+                 ON CONFLICT (ns_key) DO NOTHING",
+            )
+            .bind(new_id)
+            .bind(&ns_key)
+            .bind(project_id)
+            .execute(db)
+            .await;
+            match sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM memory_namespaces WHERE ns_key = $1 AND active = TRUE LIMIT 1",
+            )
+            .bind(&ns_key)
+            .fetch_optional(db)
+            .await
+            {
+                Ok(Some(id)) => id,
+                _ => {
+                    tracing::debug!(
+                        "G4: impossibile creare/trovare namespace per {ns_key}"
+                    );
+                    return;
+                }
+            }
+        }
+    };
+
+    let value = serde_json::json!(cmd);
+    let _ = sqlx::query(
+        "INSERT INTO memory_entries \
+         (id, namespace_id, entry_key, value, written_by, version, vector_clock) \
+         VALUES (gen_random_uuid(), $1, 'startup_command', $2, 'agent_run', 1, '{}') \
+         ON CONFLICT (namespace_id, entry_key) WHERE deleted = FALSE \
+         DO UPDATE SET value = EXCLUDED.value, \
+                       written_by = EXCLUDED.written_by, \
+                       version = memory_entries.version + 1, \
+                       updated_at = NOW()",
+    )
+    .bind(ns_id)
+    .bind(&value)
+    .execute(db)
+    .await
+    .map(|_| {
+        tracing::info!(
+            "G4: startup_command salvato per progetto {project_id}: {cmd:?}"
+        );
+    })
+    .map_err(|e| tracing::warn!("G4: salvataggio startup_command fallito: {e}"));
+}
