@@ -432,3 +432,82 @@ pub async fn ingest_commit_stub(
 
 // Note: la registrazione route avviene direttamente in main.rs accanto
 // alle altre route del crate (pattern Router<AppState>).
+
+// ── GET /api/meta-docs/graph ────────────────────────────────────────────
+//
+// Ritorna nodi + edge del meta-vault Nexus per Cytoscape.
+
+#[derive(Deserialize)]
+pub struct MetaGraphQuery {
+    pub kind: Option<String>,
+}
+
+pub async fn graph_handler(
+    State(state): State<AppState>,
+    Query(q): Query<MetaGraphQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let kind_filter = q.kind.unwrap_or_default();
+
+    let nodes = sqlx::query(
+        r#"
+        SELECT id, kind, title, slug, tags, auto_generated, updated_at
+        FROM nexus_meta_docs
+        WHERE ($1 = '' OR kind = $1)
+        ORDER BY updated_at DESC
+        LIMIT 2000
+        "#,
+    )
+    .bind(&kind_filter)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("nodes: {e}")))?;
+
+    let nodes_json: Vec<serde_json::Value> = nodes
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.try_get::<Uuid, _>("id").ok(),
+                "kind": r.try_get::<String, _>("kind").unwrap_or_default(),
+                "title": r.try_get::<String, _>("title").unwrap_or_default(),
+                "slug": r.try_get::<String, _>("slug").unwrap_or_default(),
+                "tags": r.try_get::<Vec<String>, _>("tags").unwrap_or_default(),
+                "auto_generated": r.try_get::<bool, _>("auto_generated").unwrap_or(true),
+                "updated_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at").ok(),
+            })
+        })
+        .collect();
+
+    let edges = sqlx::query(
+        r#"
+        SELECT id, from_doc_id, to_doc_id, rel_type, created_by, confidence
+        FROM nexus_meta_doc_links
+        LIMIT 5000
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("edges: {e}")))?;
+
+    let edges_json: Vec<serde_json::Value> = edges
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.try_get::<Uuid, _>("id").ok(),
+                "from": r.try_get::<Uuid, _>("from_doc_id").ok(),
+                "to": r.try_get::<Uuid, _>("to_doc_id").ok(),
+                "rel_type": r.try_get::<String, _>("rel_type").unwrap_or_default(),
+                "created_by": r.try_get::<String, _>("created_by").unwrap_or_default(),
+                "confidence": r.try_get::<f32, _>("confidence").unwrap_or(1.0),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "nodes": nodes_json,
+        "edges": edges_json,
+        "stats": {
+            "nodes_count": nodes_json.len(),
+            "edges_count": edges_json.len(),
+        }
+    })))
+}

@@ -1,5 +1,16 @@
 "use client";
 
+/**
+ * MetaTab — visualizza la documentazione del META-PROGETTO Nexus stesso
+ * (architettura, ADR, runbook, changelog di Nexus, NON dei progetti utente).
+ *
+ * NOTA: questo componente NON va inserito nella sidebar del progetto utente
+ * (eventuale confusione: l'utente vede la doc di Nexus al posto della propria).
+ * Va montato solo in una vista admin/dev separata (es. /admin/meta-docs).
+ *
+ * Per la doc DEL progetto gestito, vedi NotesTab + GraphTab del KnowledgePanel.
+ */
+
 import { useState, useEffect, useCallback } from "react";
 import {
   listMetaDocs,
@@ -10,6 +21,9 @@ import {
   type MetaDocKind,
 } from "../../lib/api-client";
 import { MarkdownBlock } from "../chat/markdown-renderer";
+import { KnowledgeGraph } from "./knowledge-graph";
+
+const META_VAULT_NAME_KEY = "nexus.meta_docs.obsidian_vault_name";
 
 const KIND_LABELS: Record<MetaDocKind, string> = {
   architecture: "Architettura",
@@ -43,6 +57,7 @@ export function MetaTab() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selected, setSelected] = useState<MetaDocDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [graphOpen, setGraphOpen] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -89,27 +104,67 @@ export function MetaTab() {
     }
   }, [load]);
 
+  const openInObsidian = (vaultFilePath?: string) => {
+    let name = "";
+    try {
+      name = localStorage.getItem(META_VAULT_NAME_KEY) ?? "";
+    } catch {
+      // localStorage non disponibile
+    }
+    if (!name) {
+      const prompted = window.prompt(
+        "Nome del vault Obsidian per docs/.nexus-vault/\n" +
+          "(In Obsidian: File -> Open vault -> Open folder as vault -> seleziona docs/.nexus-vault/)",
+        "",
+      );
+      if (!prompted || !prompted.trim()) return;
+      name = prompted.trim();
+      try {
+        localStorage.setItem(META_VAULT_NAME_KEY, name);
+      } catch {
+        // ignore
+      }
+    }
+    const fileParam = vaultFilePath ? `&file=${encodeURIComponent(vaultFilePath.replace(/\.md$/, ""))}` : "";
+    window.location.href = `obsidian://open?vault=${encodeURIComponent(name)}${fileParam}`;
+  };
+
   if (selected) {
     return (
       <div style={{ padding: 10, overflow: "hidden", minWidth: 0, height: "100%", display: "flex", flexDirection: "column" }}>
-        <button
-          onClick={() => {
-            setSelectedId(null);
-            setSelected(null);
-          }}
-          style={{
-            alignSelf: "flex-start",
-            marginBottom: 8,
-            padding: "4px 10px",
-            fontSize: 12,
-            background: "transparent",
-            border: "1px solid #d4d4d4",
-            borderRadius: 6,
-            cursor: "pointer",
-          }}
-        >
-          {"< Indietro"}
-        </button>
+        <div style={{ display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap" }}>
+          <button
+            onClick={() => {
+              setSelectedId(null);
+              setSelected(null);
+            }}
+            style={{
+              padding: "4px 10px",
+              fontSize: 12,
+              background: "transparent",
+              border: "1px solid #d4d4d4",
+              borderRadius: 6,
+              cursor: "pointer",
+            }}
+          >
+            {"< Indietro"}
+          </button>
+          <button
+            onClick={() => openInObsidian(selected.vault_file_path)}
+            title="Apri questa nota in Obsidian"
+            style={{
+              padding: "4px 10px",
+              fontSize: 12,
+              background: "#7c3aed",
+              color: "#fff",
+              border: "none",
+              borderRadius: 6,
+              cursor: "pointer",
+            }}
+          >
+            Apri in Obsidian
+          </button>
+        </div>
         <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6, minWidth: 0 }}>
           <span
             style={{
@@ -162,6 +217,43 @@ export function MetaTab() {
 
   return (
     <div style={{ padding: 10, overflow: "hidden", minWidth: 0, height: "100%", display: "flex", flexDirection: "column" }}>
+      <div style={{ display: "flex", gap: 4, marginBottom: 8, flexWrap: "wrap" }}>
+        <button
+          onClick={() => setGraphOpen(true)}
+          style={{
+            flex: 1,
+            minWidth: 0,
+            padding: "5px 8px",
+            fontSize: 11,
+            fontWeight: 600,
+            background: "#171717",
+            color: "#fff",
+            border: "none",
+            borderRadius: 6,
+            cursor: "pointer",
+          }}
+        >
+          Mostra grafo
+        </button>
+        <button
+          onClick={() => openInObsidian()}
+          title="Apri il meta-vault in Obsidian"
+          style={{
+            flex: 1,
+            minWidth: 0,
+            padding: "5px 8px",
+            fontSize: 11,
+            fontWeight: 600,
+            background: "#7c3aed",
+            color: "#fff",
+            border: "none",
+            borderRadius: 6,
+            cursor: "pointer",
+          }}
+        >
+          Apri in Obsidian
+        </button>
+      </div>
       <div style={{ display: "flex", gap: 4, marginBottom: 6, minWidth: 0 }}>
         <input
           value={q}
@@ -309,6 +401,8 @@ export function MetaTab() {
           </div>
         )}
       </div>
+
+      <KnowledgeGraph mode="meta" open={graphOpen} onClose={() => setGraphOpen(false)} />
     </div>
   );
 }

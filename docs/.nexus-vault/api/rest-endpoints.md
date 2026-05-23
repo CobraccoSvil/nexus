@@ -6,18 +6,18 @@ slug: rest-endpoints
 tags:
   - api
   - rest
-source_commit: 4a9397442aee48941b64520b98a5c4cb5d97848c
+source_commit: 700dacf37bfb9b980a8121425eb5d66cffcd4ac0
 source_files:
   - crates/mcp-core/src/main.rs
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T07:20:03Z
+updated_at: 2026-05-23T09:24:06Z
 nexus_meta_version: 1
 ---
 
 Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src/main.rs`.
 
-**Totale endpoint**: 238
+**Totale endpoint**: 242
 
 
 ## `/api/admin`
@@ -91,6 +91,15 @@ Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src
 |---|---|---|
 | `GET` | `/api/billing/session-usage` | `billing::get_session_usage` |
 | `GET` | `/api/billing/usage/me` | `billing::my_usage_report` |
+
+## `/api/change-drafts`
+
+| Metodo | Path | Handler |
+|---|---|---|
+| `GET` | `/api/change-drafts/:id` | `change_drafts::get_draft` |
+| `POST` | `/api/change-drafts` | `change_drafts::create_draft` |
+| `POST` | `/api/change-drafts/:id/approve` | `change_drafts::approve_draft` |
+| `POST` | `/api/change-drafts/:id/reject` | `change_drafts::reject_draft` |
 
 ## `/api/chat`
 

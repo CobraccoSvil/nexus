@@ -1459,6 +1459,22 @@ async fn main() -> anyhow::Result<()> {
                     middleware::require_auth,
                 )),
             )
+            .route(
+                "/api/projects/:id/knowledge/graph",
+                get(knowledge::routes::graph_handler).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/projects/:id/knowledge/obsidian-vault",
+                get(knowledge::routes::get_obsidian_vault)
+                    .put(knowledge::routes::put_obsidian_vault)
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_auth,
+                    )),
+            )
             // ── meta-docs (Nexus self-documentation vault) ────────
             .route(
                 "/api/meta-docs/list",
@@ -1481,6 +1497,13 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/meta-docs/:id",
                 get(meta_docs::routes::get_meta_doc).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/meta-docs/graph",
+                get(meta_docs::routes::graph_handler).layer(axum_mw::from_fn_with_state(
                     state.clone(),
                     middleware::require_auth,
                 )),

@@ -624,3 +624,176 @@ pub async fn list_tags(
 
     Ok(Json(json!({ "tags": tags })))
 }
+
+// ── GET/PUT /api/projects/:id/knowledge/obsidian-vault ───────────────────
+//
+// GET ritorna il nome del vault Obsidian configurato per il progetto.
+// PUT aggiorna il nome (stringa vuota = reset).
+
+pub async fn get_obsidian_vault(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(project_id): AxumPath<String>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&project_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    let row = sqlx::query("SELECT obsidian_vault_name FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("query: {e}")))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Progetto non trovato"))?;
+
+    let name: String = row.try_get("obsidian_vault_name").unwrap_or_default();
+    Ok(Json(json!({ "obsidian_vault_name": name })))
+}
+
+#[derive(Deserialize)]
+pub struct ObsidianVaultBody {
+    pub obsidian_vault_name: String,
+}
+
+pub async fn put_obsidian_vault(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(project_id): AxumPath<String>,
+    Json(body): Json<ObsidianVaultBody>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&project_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    // Validation: max 100 char, no spazi all'inizio/fine, niente caratteri di filesystem
+    let name = body.obsidian_vault_name.trim().to_string();
+    if name.len() > 100 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Nome vault troppo lungo (max 100 char)",
+        ));
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Nome vault contiene caratteri invalidi",
+        ));
+    }
+
+    sqlx::query("UPDATE projects SET obsidian_vault_name = $1 WHERE id = $2")
+        .bind(&name)
+        .bind(project_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("update: {e}")))?;
+
+    Ok(Json(json!({ "ok": true, "obsidian_vault_name": name })))
+}
+
+// ── GET /api/projects/:id/knowledge/graph ────────────────────────────────
+//
+// Ritorna nodi + edge per la visualizzazione graph del Knowledge vault.
+// Query params opzionali:
+//   - center: id nota su cui centrare (per future espansioni focused-view)
+//   - depth: profondita' max hop dal center (default tutto)
+//   - kind:  filtro per status (active/draft/archived/deprecated)
+//   - min_confidence: nasconde edge con confidence < soglia (default 0.0)
+//
+// Implementazione MVP: ritorna TUTTI i nodi + TUTTI gli edge del progetto
+// (graph completo). Il filtering avanzato per center/depth e' lasciato al
+// client (Cytoscape supporta bene il client-side filtering).
+
+#[derive(Deserialize)]
+pub struct GraphQuery {
+    pub status: Option<String>,
+    pub min_confidence: Option<f32>,
+}
+
+pub async fn graph_handler(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(project_id): AxumPath<String>,
+    Query(params): Query<GraphQuery>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&project_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    let status_filter = params.status.unwrap_or_default();
+    let min_conf = params.min_confidence.unwrap_or(0.0);
+
+    let nodes = sqlx::query(
+        r#"
+        SELECT id, title, intent, status, tags, access_count, updated_at
+        FROM project_knowledge_notes
+        WHERE project_id = $1
+          AND ($2 = '' OR status = $2)
+        ORDER BY updated_at DESC
+        LIMIT 1500
+        "#,
+    )
+    .bind(project_id)
+    .bind(&status_filter)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("nodes query: {e}")))?;
+
+    let nodes_json: Vec<Value> = nodes
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.try_get::<Uuid, _>("id").ok(),
+                "title": r.try_get::<String, _>("title").unwrap_or_default(),
+                "intent": r.try_get::<Option<String>, _>("intent").ok().flatten(),
+                "status": r.try_get::<String, _>("status").unwrap_or_default(),
+                "tags": r.try_get::<Vec<String>, _>("tags").unwrap_or_default(),
+                "access_count": r.try_get::<i32, _>("access_count").unwrap_or(0),
+                "updated_at": r.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at").ok(),
+            })
+        })
+        .collect();
+
+    let edges = sqlx::query(
+        r#"
+        SELECT l.id, l.from_note_id, l.to_note_id, l.rel_type, l.created_by, l.confidence
+        FROM project_knowledge_links l
+        JOIN project_knowledge_notes n1 ON n1.id = l.from_note_id
+        JOIN project_knowledge_notes n2 ON n2.id = l.to_note_id
+        WHERE n1.project_id = $1
+          AND n2.project_id = $1
+          AND l.confidence >= $2
+        LIMIT 5000
+        "#,
+    )
+    .bind(project_id)
+    .bind(min_conf)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("edges query: {e}")))?;
+
+    let edges_json: Vec<Value> = edges
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.try_get::<Uuid, _>("id").ok(),
+                "from": r.try_get::<Uuid, _>("from_note_id").ok(),
+                "to": r.try_get::<Uuid, _>("to_note_id").ok(),
+                "rel_type": r.try_get::<String, _>("rel_type").unwrap_or_default(),
+                "created_by": r.try_get::<String, _>("created_by").unwrap_or_default(),
+                "confidence": r.try_get::<f32, _>("confidence").unwrap_or(0.0),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "nodes": nodes_json,
+        "edges": edges_json,
+        "stats": {
+            "nodes_count": nodes_json.len(),
+            "edges_count": edges_json.len(),
+        }
+    })))
+}

@@ -6,25 +6,22 @@ slug: crates-rust
 tags:
   - architecture
   - rust
-source_commit: 4a9397442aee48941b64520b98a5c4cb5d97848c
+source_commit: 700dacf37bfb9b980a8121425eb5d66cffcd4ac0
 source_files:
   - Cargo.toml
   - crates/
 auto_generated: true
 created_at: 2026-05-23T07:19:16Z
-updated_at: 2026-05-23T07:20:03Z
+updated_at: 2026-05-23T09:24:06Z
 nexus_meta_version: 1
 ---
 
 Mappa dei crate Rust nel workspace `ideai`. Generato automaticamente dai `Cargo.toml`.
 
-Workspace members: **54**
+Workspace members: **51**
 
 | Crate | Path | Descrizione |
 |---|---|---|
-| `[workspace.dependencies.tonic-build]` | `[workspace.dependencies.tonic-build]` | (senza descrizione) |
-| `[workspace.dependencies]` | `[workspace.dependencies]` | (senza descrizione) |
-| `[workspace.package]` | `[workspace.package]` | (senza descrizione) |
 | `anyhow = "1.0` | `anyhow = "1.0` | (senza descrizione) |
 | `authors = ["Cobracco S.r.l."]` | `authors = ["Cobracco S.r.l."]` | (senza descrizione) |
 | `axum = { version = "0.7", features = ["ws", "http2", "macros"] }` | `axum = { version = "0.7", features = ["ws", "http2", "macros"] }` | (senza descrizione) |

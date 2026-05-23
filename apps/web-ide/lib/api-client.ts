@@ -3733,6 +3733,60 @@ export async function listKnowledgeTags(projectId: string): Promise<{ tags: Know
   return fetchJson(`/api/projects/${projectId}/knowledge/tags`);
 }
 
+// ── Knowledge graph (Cytoscape data) ────────────────────────────────────
+
+export interface KnowledgeGraphNode {
+  id: string;
+  title: string;
+  intent: string | null;
+  status: string;
+  tags: string[];
+  access_count: number;
+  updated_at: string | null;
+}
+
+export interface KnowledgeGraphEdge {
+  id: string;
+  from: string;
+  to: string;
+  rel_type: string;
+  created_by: string;
+  confidence: number;
+}
+
+export interface KnowledgeGraphData {
+  nodes: KnowledgeGraphNode[];
+  edges: KnowledgeGraphEdge[];
+  stats: { nodes_count: number; edges_count: number };
+}
+
+export async function getKnowledgeGraph(
+  projectId: string,
+  params?: { status?: string; min_confidence?: number },
+): Promise<KnowledgeGraphData> {
+  const sp = new URLSearchParams();
+  if (params?.status) sp.set("status", params.status);
+  if (params?.min_confidence != null) sp.set("min_confidence", String(params.min_confidence));
+  const qs = sp.toString();
+  return fetchJson(`/api/projects/${projectId}/knowledge/graph${qs ? `?${qs}` : ""}`);
+}
+
+// ── Obsidian vault config (per progetto) ────────────────────────────────
+
+export async function getObsidianVaultName(projectId: string): Promise<{ obsidian_vault_name: string }> {
+  return fetchJson(`/api/projects/${projectId}/knowledge/obsidian-vault`);
+}
+
+export async function putObsidianVaultName(
+  projectId: string,
+  obsidian_vault_name: string,
+): Promise<{ ok: boolean; obsidian_vault_name: string }> {
+  return fetchJson(`/api/projects/${projectId}/knowledge/obsidian-vault`, {
+    method: "PUT",
+    body: JSON.stringify({ obsidian_vault_name }),
+  });
+}
+
 // ── Meta-docs (documentazione del meta-progetto Nexus) ──────────────────
 
 export type MetaDocKind =
@@ -3807,6 +3861,29 @@ export async function triggerMetaDocsRefresh(): Promise<{
   errors?: string[];
 }> {
   return fetchJson(`/api/meta-docs/refresh-all`, { method: "POST", body: "{}" });
+}
+
+export interface MetaDocsGraphNode {
+  id: string;
+  kind: MetaDocKind;
+  title: string;
+  slug: string;
+  tags: string[];
+  auto_generated: boolean;
+  updated_at: string | null;
+}
+
+export interface MetaDocsGraphData {
+  nodes: MetaDocsGraphNode[];
+  edges: KnowledgeGraphEdge[];
+  stats: { nodes_count: number; edges_count: number };
+}
+
+export async function getMetaDocsGraph(params?: { kind?: MetaDocKind }): Promise<MetaDocsGraphData> {
+  const sp = new URLSearchParams();
+  if (params?.kind) sp.set("kind", params.kind);
+  const qs = sp.toString();
+  return fetchJson(`/api/meta-docs/graph${qs ? `?${qs}` : ""}`);
 }
 
 // ── Change drafts (ChangeDrafter proposte di modifica) ─────────────────
