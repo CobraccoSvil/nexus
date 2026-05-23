@@ -33,6 +33,7 @@ pub(crate) mod todos;
 pub(crate) mod subagent;
 pub(crate) mod safety;
 pub(crate) mod dispatcher;
+pub(crate) mod knowledge;
 
 // Re-export per uso interno crate (tool_run_tests è chiamato da agent_loop, in teoria).
 pub(crate) use command::tool_run_tests;
@@ -1092,6 +1093,75 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
       },
       "required": ["doc_type", "content_json"]
     }
+  },
+  {
+    "name": "knowledge_search",
+    "description": "Cerca note rilevanti nella Knowledge Base del progetto corrente. Usalo quando devi verificare se una richiesta simile e' gia' stata affrontata, se ci sono decisioni precedenti, o se ci sono requirement/feature gia' documentati. Restituisce top-K note ordinate per rilevanza semantica.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Testo da cercare (es. 'autenticazione OAuth Google', 'fix bug timezone'). Max 2000 char."
+        },
+        "top_k": {
+          "type": "integer",
+          "description": "Numero massimo di hit (default 5, max 20)"
+        },
+        "min_score": {
+          "type": "number",
+          "description": "Soglia minima similarita' 0-1 (default 0.4)"
+        }
+      },
+      "required": ["query"]
+    }
+  },
+  {
+    "name": "knowledge_get_note",
+    "description": "Recupera il body COMPLETO di una nota della KB. Usalo dopo knowledge_search quando lo snippet non basta e serve il testo completo della nota. Aggiorna access_count della nota.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "note_id": {
+          "type": "string",
+          "description": "UUID della nota (dal risultato di knowledge_search)"
+        }
+      },
+      "required": ["note_id"]
+    }
+  },
+  {
+    "name": "knowledge_create_note",
+    "description": "Crea una nuova nota FUNZIONALE/CONCETTUALE nella KB del progetto. Usalo per documentare decisioni di design, requirement, feature, user story, dominio. Non usarlo per le chat utente (gia' auto-create). La nota viene indicizzata in Qdrant per ricerche future.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Titolo breve (1-200 char)"
+        },
+        "body_md": {
+          "type": "string",
+          "description": "Contenuto Markdown della nota"
+        },
+        "intent": {
+          "type": "string",
+          "enum": ["feature", "requirement", "decision", "domain", "user_story", "architecture", "fix", "refactor", "docs", "other"],
+          "description": "Categoria semantica della nota (default 'feature')"
+        },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Tag opzionali per facilitare ricerca"
+        },
+        "file_paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Path file correlati (opzionale)"
+        }
+      },
+      "required": ["title", "body_md"]
+    }
   }
 ]"#;
 
@@ -1450,6 +1520,10 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "dispatcher_set_flag" => dispatcher::tool_dispatcher_set_flag(ctx, input).await,
         "dispatcher_update_monitor" => dispatcher::tool_dispatcher_update_monitor(ctx, input).await,
         "dispatcher_highlight_panel" => dispatcher::tool_dispatcher_highlight_panel(ctx, input).await,
+        // ── Knowledge Base per-progetto ────────────────────────────────────
+        "knowledge_search" => knowledge::tool_knowledge_search(ctx, input).await,
+        "knowledge_get_note" => knowledge::tool_knowledge_get_note(ctx, input).await,
+        "knowledge_create_note" => knowledge::tool_knowledge_create_note(ctx, input).await,
         // ── Nexus Builtin tool (prefisso nexus_*) ──────────────────────────
         // Dispatch verso nexus_builtin::execute_with_neural per usare
         // la ricerca semantica quando neural è disponibile (Qdrant).

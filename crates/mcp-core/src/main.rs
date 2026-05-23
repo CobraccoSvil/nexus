@@ -836,6 +836,12 @@ async fn main() -> anyhow::Result<()> {
                 "/api/internal/routing/decide",
                 post(internal_routing::decide_routing).get(internal_routing::decide_routing_get),
             )
+            // /api/internal/knowledge/search — NO-AUTH, chiamato dal brain
+            // Python per RAG inline sulle note KB del progetto.
+            .route(
+                "/api/internal/knowledge/search",
+                post(knowledge::routes::internal_kb_search),
+            )
             // /api/internal/providers/status — no-auth, ritorna lo stato
             // canonico dei provider (last health probe + cooldown). Usato dal
             // nexus-gateway TypeScript per evitare di tenere una sua cache

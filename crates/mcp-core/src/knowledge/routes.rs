@@ -625,6 +625,130 @@ pub async fn list_tags(
     Ok(Json(json!({ "tags": tags })))
 }
 
+// ── POST /api/internal/knowledge/search ──────────────────────────────────
+//
+// Endpoint NO-AUTH chiamato dal brain Python per il RAG inline.
+// Cerca top-K note rilevanti per il progetto, ritorna title+snippet+score.
+//
+// Stesso pattern di /api/internal/routing/decide: brain e' isolato dietro
+// rete privata, non serve auth per chiamate localhost. Body include
+// `project_id` esplicito (il brain lo passa dallo state LangGraph).
+
+#[derive(Deserialize)]
+pub struct InternalKbSearchBody {
+    pub project_id: String,
+    pub query: String,
+    pub top_k: Option<usize>,
+    pub min_score: Option<f32>,
+}
+
+pub async fn internal_kb_search(
+    State(state): State<AppState>,
+    Json(body): Json<InternalKbSearchBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let project_id = Uuid::parse_str(&body.project_id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "project_id non valido".to_string()))?;
+    let query = body.query.trim();
+    if query.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "query vuota".to_string()));
+    }
+    let top_k = body.top_k.unwrap_or(5).clamp(1, 20);
+    let min_score = body.min_score.unwrap_or(0.4);
+
+    let embed_text = if query.len() > 2000 { &query[..2000] } else { query };
+    let vector = match state.orchestrator.neural.embed_text("", embed_text).await {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(Json(json!({
+                "results": [],
+                "warning": format!("embed fallito: {e}"),
+            })));
+        }
+    };
+
+    let hits = match crate::vector_memory::search_knowledge_points(
+        &state.db,
+        vector,
+        project_id,
+        top_k * 2,
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            return Ok(Json(json!({
+                "results": [],
+                "warning": format!("Qdrant search fallita: {e}"),
+            })));
+        }
+    };
+
+    let note_hits: Vec<(Uuid, f32)> = hits
+        .iter()
+        .filter(|h| (h.score as f32) >= min_score)
+        .filter_map(|h| {
+            h.payload
+                .get("note_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<Uuid>().ok())
+                .map(|id| (id, h.score as f32))
+        })
+        .take(top_k)
+        .collect();
+    if note_hits.is_empty() {
+        return Ok(Json(json!({"results": []})));
+    }
+
+    let ids: Vec<Uuid> = note_hits.iter().map(|(id, _)| *id).collect();
+    let rows = sqlx::query(
+        r#"
+        SELECT id, title, body_md, tags, intent, status
+        FROM project_knowledge_notes
+        WHERE id = ANY($1) AND project_id = $2 AND status IN ('active', 'draft')
+        "#,
+    )
+    .bind(&ids)
+    .bind(project_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("query: {e}")))?;
+
+    let mut by_id: std::collections::HashMap<Uuid, serde_json::Value> =
+        std::collections::HashMap::new();
+    for r in &rows {
+        let id: Uuid = match r.try_get("id") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let body: String = r.try_get("body_md").unwrap_or_default();
+        let snippet = body.chars().take(400).collect::<String>();
+        by_id.insert(
+            id,
+            json!({
+                "note_id": id.to_string(),
+                "title": r.try_get::<String, _>("title").unwrap_or_default(),
+                "intent": r.try_get::<Option<String>, _>("intent").ok().flatten(),
+                "status": r.try_get::<String, _>("status").unwrap_or_default(),
+                "tags": r.try_get::<Vec<String>, _>("tags").unwrap_or_default(),
+                "snippet": snippet,
+            }),
+        );
+    }
+
+    let results: Vec<serde_json::Value> = note_hits
+        .iter()
+        .filter_map(|(id, score)| {
+            by_id.get(id).map(|note| {
+                let mut n = note.clone();
+                n["score"] = json!(*score);
+                n
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({"results": results, "count": results.len()})))
+}
+
 // ── POST /api/projects/:id/knowledge/rebuild ─────────────────────────────
 //
 // Ricostruisce la Knowledge Base del progetto reprocessando tutti i messaggi

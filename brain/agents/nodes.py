@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import random
 import time
 import uuid
@@ -283,6 +284,82 @@ def _build_rag_context(intent: str, query_text: str) -> str:
             + "\n".join(snippets) + "\n</contesto_pertinente>")
 
 
+# URL mcp-core per chiamate internal (no auth, solo localhost backend).
+# Configurabile via env per deploy non-locali.
+_MCP_CORE_INTERNAL_URL = os.environ.get(
+    "MCP_CORE_INTERNAL_URL", "http://localhost:4000"
+)
+
+
+def _build_kb_rag_context(intent: str, project_id: str, query_text: str) -> str:
+    """Recupera note rilevanti dalla Knowledge Base per-progetto e formatta come contesto.
+
+    Diverso da `_build_rag_context` (che cerca in chat_messages via Qdrant
+    `project_context`): questo consulta `project_knowledge_notes` via endpoint
+    `/api/internal/knowledge/search` di mcp-core. Le note KB contengono:
+      - Messaggi user precedenti gia' classificati con intent
+      - Note manuali (feature, requirement, decision, domain) curate dall'utente
+      - Decisioni di design del progetto
+
+    Failsafe: se mcp-core down, project_id vuoto, o nessun match, ritorna "".
+    Non solleva eccezioni.
+    """
+    if not project_id or intent not in _RAG_INTENTS:
+        return ""
+    if not query_text or len(query_text.strip()) < 10:
+        return ""
+    try:
+        import requests  # noqa: PLC0415 (import lazy)
+        resp = requests.post(
+            f"{_MCP_CORE_INTERNAL_URL}/api/internal/knowledge/search",
+            json={
+                "project_id": project_id,
+                "query": query_text,
+                "top_k": _RAG_TOP_K,
+                "min_score": _RAG_MIN_SCORE,
+            },
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            logger.debug("KB RAG: HTTP %s da mcp-core", resp.status_code)
+            return ""
+        data = resp.json()
+    except Exception as exc:
+        logger.debug("KB RAG retrieval fallito: %s", exc)
+        return ""
+
+    results = data.get("results", [])
+    if not results:
+        return ""
+
+    snippets: list[str] = []
+    for r in results:
+        title = str(r.get("title") or "").strip()
+        snippet_text = str(r.get("snippet") or "").strip()
+        if not title and not snippet_text:
+            continue
+        intent_attr = r.get("intent") or "chat"
+        score = float(r.get("score") or 0)
+        if len(snippet_text) > _RAG_SNIPPET_MAX_CHARS:
+            snippet_text = snippet_text[: _RAG_SNIPPET_MAX_CHARS - 3] + "..."
+        snippets.append(
+            f'  <nota intent="{intent_attr}" score="{score:.2f}">\n'
+            f'    <titolo>{title}</titolo>\n'
+            f'    <contenuto>{snippet_text}</contenuto>\n'
+            f'  </nota>'
+        )
+    if not snippets:
+        return ""
+
+    logger.info("router_node: KB-RAG injected %d note (intent=%s, project=%s)",
+                len(snippets), intent, project_id[:8])
+    return ("<knowledge_base_progetto>\n"
+            "  <!-- Note dal Knowledge Base del progetto: contesto, decisioni,\n"
+            "       requirement, e messaggi simili gia' affrontati. Usa per\n"
+            "       evitare duplicazioni e mantenere coerenza. -->\n"
+            + "\n".join(snippets) + "\n</knowledge_base_progetto>")
+
+
 # ─── Nodo: router ────────────────────────────────────────────────────────────
 
 async def router_node(state: AgentState) -> dict[str, Any]:
@@ -405,6 +482,12 @@ async def router_node(state: AgentState) -> dict[str, Any]:
                 rag_block = _build_rag_context(intent, str(text))
                 if rag_block:
                     rendered = rag_block + "\n\n" + rendered
+                # KB inline: cerca note rilevanti nella Knowledge Base del progetto.
+                # Diverso da _build_rag_context (interazioni chat passate):
+                # qui prendiamo note auto+manuali con context specifico del progetto.
+                kb_block = _build_kb_rag_context(intent, str(state.get("project_id") or ""), str(text))
+                if kb_block:
+                    rendered = kb_block + "\n\n" + rendered
                 # PR-3 Codex pattern: project_instructions.md injection nel system_text.
                 # PR-3 Cursor pattern: <available_subagents> block per auto-delegation.
                 try:

@@ -311,6 +311,171 @@ fn build_static_system_context(github_username: Option<&str>) -> String {
     ctx
 }
 
+/// Costruisce un blocco "Contesto progetto (Knowledge Base)" da iniettare nel system prompt.
+///
+/// Pipeline:
+///   1. Legge settings `knowledge.context_injection_*` (enabled, top_k, min_score)
+///   2. Genera embedding del messaggio user via brain
+///   3. Cerca top-K note simili in Qdrant filtrate per project_id + status (active/draft)
+///   4. Carica title+body delle note matching da `project_knowledge_notes`
+///   5. Formatta come Markdown con tag + intent + snippet
+///
+/// Failsafe: se brain down, Qdrant vuoto, o KB disabilitata, ritorna `None` e il
+/// flow normale prosegue senza KB context.
+async fn build_knowledge_context(
+    state: &AppState,
+    project_id: Uuid,
+    user_message: &str,
+) -> Option<String> {
+    // 1. Settings (cache-friendly: una sola query in batch)
+    let enabled: bool = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'knowledge.context_injection_enabled'",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .map(|v| v.trim().eq_ignore_ascii_case("true"))
+    .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+    let top_k: usize = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'knowledge.context_injection_top_k'",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|s| s.parse::<usize>().ok())
+    .unwrap_or(5)
+    .clamp(1, 20);
+    let min_score: f32 = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'knowledge.context_injection_min_score'",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|s| s.parse::<f32>().ok())
+    .unwrap_or(0.5);
+
+    // 2. Embed messaggio user
+    let embed_text = if user_message.len() > 2000 {
+        &user_message[..2000]
+    } else {
+        user_message
+    };
+    let vector = match state.orchestrator.neural.embed_text("", embed_text).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, "build_knowledge_context: embed fallito (brain down?), skip");
+            return None;
+        }
+    };
+
+    // 3. Search Qdrant
+    let hits = match crate::vector_memory::search_knowledge_points(
+        &state.db,
+        vector,
+        project_id,
+        top_k * 2, // overfetch, filtreremo per score
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::debug!(error = %e, "build_knowledge_context: Qdrant search fallita");
+            return None;
+        }
+    };
+    let note_ids: Vec<(Uuid, f32)> = hits
+        .iter()
+        .filter(|h| (h.score as f32) >= min_score)
+        .filter_map(|h| {
+            h.payload
+                .get("note_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<Uuid>().ok())
+                .map(|id| (id, h.score as f32))
+        })
+        .take(top_k)
+        .collect();
+    if note_ids.is_empty() {
+        return None;
+    }
+
+    // 4. Carica title+body+tags+intent dalle note
+    use sqlx::Row;
+    let ids: Vec<Uuid> = note_ids.iter().map(|(id, _)| *id).collect();
+    let rows = sqlx::query(
+        r#"
+        SELECT id, title, body_md, tags, intent, status
+        FROM project_knowledge_notes
+        WHERE id = ANY($1)
+          AND status IN ('active', 'draft')
+        "#,
+    )
+    .bind(&ids)
+    .fetch_all(&state.db)
+    .await
+    .ok()?;
+    if rows.is_empty() {
+        return None;
+    }
+
+    // 5. Format markdown (ordinato per score)
+    let mut by_id: std::collections::HashMap<Uuid, (String, String, Vec<String>, Option<String>, String)> =
+        std::collections::HashMap::new();
+    for r in &rows {
+        let id: Uuid = r.try_get("id").ok()?;
+        let title: String = r.try_get("title").unwrap_or_default();
+        let body: String = r.try_get("body_md").unwrap_or_default();
+        let tags: Vec<String> = r.try_get("tags").unwrap_or_default();
+        let intent: Option<String> = r.try_get("intent").ok();
+        let status: String = r.try_get("status").unwrap_or_default();
+        by_id.insert(id, (title, body, tags, intent, status));
+    }
+
+    let mut out = String::with_capacity(1024);
+    out.push_str("## Contesto dal Knowledge Base del progetto\n\n");
+    out.push_str("Note pertinenti dalla cronologia del progetto (ordinate per rilevanza). ");
+    out.push_str("Considera questi precedenti per evitare duplicazioni e mantenere coerenza con le decisioni gia' prese:\n\n");
+    for (id, score) in &note_ids {
+        let Some((title, body, tags, intent, status)) = by_id.get(id) else {
+            continue;
+        };
+        let snippet = body.chars().take(280).collect::<String>();
+        let intent_disp = intent.as_deref().unwrap_or("-");
+        let tags_disp = if tags.is_empty() {
+            "".to_string()
+        } else {
+            format!(" #{}", tags.join(" #"))
+        };
+        out.push_str(&format!(
+            "- **{}** _(intent: {}, status: {}, rilevanza: {:.2}){}_\n  {}{}\n\n",
+            title.trim(),
+            intent_disp,
+            status,
+            score,
+            tags_disp,
+            snippet.trim(),
+            if body.len() > 280 { "..." } else { "" }
+        ));
+    }
+    out.push_str(
+        "_(Fonte: project_knowledge_notes — KB automatica del progetto. Aggiornata ad ogni messaggio utente.)_\n",
+    );
+
+    tracing::info!(
+        project_id = %project_id,
+        notes_injected = note_ids.len(),
+        "build_knowledge_context: contesto KB iniettato"
+    );
+
+    Some(out)
+}
+
 #[allow(dead_code)]
 async fn load_project_analysis_summary(db: &PgPool, project_id: Uuid) -> Option<String> {
     sqlx::query_scalar::<_, serde_json::Value>(
@@ -3010,6 +3175,14 @@ pub async fn send_chat_message(
         }
         if let Some(ref gh) = github_username {
             ctx.push_str(&format!(" Account GitHub: @{gh}."));
+        }
+        // ── Iniezione Knowledge Base (top-K note semanticamente rilevanti) ──
+        // Embed del messaggio user → search Qdrant `knowledge_notes` filtrata per progetto
+        // → carica title+body delle top hit → prependi come "Contesto progetto" al system prompt.
+        // Failsafe: se brain down o KB vuota, il flow normale prosegue (no contesto KB).
+        if let Some(kb_block) = build_knowledge_context(&state, context.project_id, content).await {
+            ctx.push_str("\n\n");
+            ctx.push_str(&kb_block);
         }
         ctx
     };
