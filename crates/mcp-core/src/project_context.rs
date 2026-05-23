@@ -42,6 +42,10 @@ pub async fn build_project_context_block(
         sections.push(conv);
     }
 
+    // Porte riservate dall'infrastruttura Nexus — sempre iniettate.
+    // Previene conflitti quando l'agente sceglie porte per nuovi servizi.
+    sections.push(nexus_reserved_ports_section());
+
     if user_query.len() >= 20 {
         if let Some(rag) = search_qdrant_context(db, neural, project_id, user_query).await {
             sections.push(rag);
@@ -289,6 +293,22 @@ fn extract_scripts(analysis: &Value) -> Option<String> {
         })
         .unwrap_or_default();
     if scripts.is_empty() { None } else { Some(scripts) }
+}
+
+/// Sezione fissa con le porte riservate dall'infrastruttura Nexus.
+/// Iniettata sempre nel system prompt per evitare che l'agente scelga
+/// porte già occupate quando avvia o configura nuovi servizi di progetto.
+fn nexus_reserved_ports_section() -> String {
+    "## Porte riservate Nexus (NON usare per nuovi servizi)\n\
+     PostgreSQL Nexus:  5432, 5433, 5434\n\
+     Qdrant:            6333, 6334\n\
+     Redis:             6379\n\
+     Grafana:           3001\n\
+     mcp-core API:      8000\n\
+     brain Python:      8001\n\
+     web-ide (Next.js): 3000\n\
+     Usa 5440+ per PostgreSQL di progetto, 8080+ per backend, 5173+ per frontend Vite."
+        .to_string()
 }
 
 /// G2 — Costruisce la sezione `## Docker Services` da iniettare in Project Facts.

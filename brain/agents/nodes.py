@@ -50,6 +50,63 @@ logger = logging.getLogger(__name__)
 # di un'app full-stack.
 MAX_AGENT_ITERATIONS = 60
 
+# ── G1 Python: rilevamento richieste d'azione ─────────────────────────────
+_ACTION_PATTERNS: tuple[str, ...] = (
+    # Italiano — imperativo / infinito / futuro
+    "avvia", "avviare", "lancia", "lanciare",
+    "esegui", "eseguire",
+    "builda", "buildare",
+    "crea ", "creare", "crea il", "crea la",
+    "installa", "installare",
+    "configura", "configurare",
+    "deploya", "deployare",
+    "compila", "compilare",
+    "fai partire", "metti in piedi", "porta in su", "metti online",
+    "avvia i servizi", "avvia il backend", "avvia il frontend", "avvia il server",
+    "scaffolda", "inizializza il progetto", "crea il progetto",
+    "scrivi i file", "genera il progetto",
+    # Inglese — imperativo / common forms
+    "start ", "launch ", " run ", "run the", " build", "build the",
+    " create ", "create the", "install ", "setup ", "set up ",
+    "configure ", "deploy ", "compile ", "scaffold ",
+    # Tecnologie specifiche
+    "docker", "docker-compose", "docker compose",
+    "npm install", "npm run", "pnpm install", "pnpm run",
+    "cargo build", "cargo run", "dotnet run", "dotnet build",
+    "pip install", "pip3 install", "apt install", "apt-get install",
+    "systemctl start", "service start", "make ",
+    # Creazione struttura progetto
+    "crea la struttura", "crea le directory", "crea i file",
+    "structure", "scaffolding",
+)
+
+
+def _detect_action_request(text: str) -> bool:
+    """G1 Python: True se il testo contiene una richiesta d'azione concreta.
+
+    Speculare a crates/mcp-core/src/agent_types.rs::detect_action_request.
+    Usato per forzare nudge quando l'agente risponde con 0 tool call.
+    """
+    if not text or not text.strip():
+        return False
+    lower = text.lower()
+    return any(p in lower for p in _ACTION_PATTERNS)
+
+
+def _has_tool_calls_in_history(messages: list) -> bool:
+    """Controlla se nella history ci sono già stati tool call effettivi (AIMessage con tool_use)."""
+    for m in messages:
+        if not isinstance(m, AIMessage):
+            continue
+        extra = getattr(m, "additional_kwargs", {}) or {}
+        blocks = extra.get("anthropic_content") or []
+        if isinstance(blocks, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks
+        ):
+            return True
+    return False
+
+
 # ── Lookup prezzi modelli da ai_price_catalog ──────────────────────────────
 _PRICE_CACHE: dict[str, tuple[float, float]] = {}
 _PRICE_CACHE_TS: dict[str, float] = {}
@@ -867,6 +924,45 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         provider, model, intent, len(tools_json),
     )
 
+    # ── G1 Python: nudge anti-descrittivo ─────────────────────────────────────
+    # Se il modello ha già risposto almeno una volta (iterations >= 1) senza
+    # chiamare NESSUN tool (risposta puramente descrittiva) e la richiesta
+    # originale era un'azione concreta (avvia, installa, crea, docker, ...)
+    # inietta un messaggio di nudge PRIMA di chiamare il LLM.
+    # Cap: max 2 nudge per run (action_nudge_count in state) per evitare loop.
+    _current_iter = int(state.get("iterations") or 0)
+    _nudge_count = int(state.get("action_nudge_count") or 0)
+    if (
+        tools_json                                        # l'agente ha tool disponibili
+        and _current_iter >= 1                            # non è la prima iterazione
+        and _nudge_count < 2                              # max 2 nudge totali
+        and not _has_tool_calls_in_history(messages)     # nessun tool call finora
+    ):
+        # Estrai il primo messaggio umano per capire se è action-oriented
+        _first_human_text = next(
+            (getattr(m, "content", "") for m in messages if hasattr(m, "type") and m.type == "human"),
+            "",
+        )
+        if isinstance(_first_human_text, list):
+            _first_human_text = " ".join(
+                b.get("text", "") for b in _first_human_text if isinstance(b, dict)
+            )
+        if _detect_action_request(str(_first_human_text)):
+            _nudge_msg = HumanMessage(
+                content=(
+                    "⚠️ ERRORE: hai risposto descrivendo cosa avresti fatto, "
+                    "ma NON hai chiamato nessun tool. Questo non è accettabile. "
+                    "AGISCI ADESSO — usa shell_exec per comandi (docker, npm, dotnet, ecc.), "
+                    "write_file/edit_file per creare o modificare file. "
+                    "Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call."
+                )
+            )
+            messages = list(messages) + [_nudge_msg]
+            logger.warning(
+                "G1 nudge iniettato (iter=%d, nudge_count=%d, intent=%s)",
+                _current_iter, _nudge_count, intent,
+            )
+
     # Heartbeat A: pubblica step "calling_model" cosi' l'utente vede in chat
     # che l'agente sta lavorando (LLM call puo' durare 30-60s su contesti grandi).
     try:
@@ -1288,6 +1384,15 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         "temperature": temperature,
         "top_p": top_p,
         "created_at": created_at,
+        # G1: incrementa il counter nudge se è stato iniettato in questo turno
+        "action_nudge_count": (
+            _nudge_count + 1
+            if (
+                locals().get("_nudge_msg") is not None
+                and not pending_tool_uses  # il nudge non ha prodotto tool calls ancora
+            )
+            else _nudge_count
+        ),
         **sticky_out,
     }
 

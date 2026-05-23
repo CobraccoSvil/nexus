@@ -122,6 +122,10 @@ class AgentState(TypedDict, total=False):
     active_subagent_runs: list[str]
     subagent_cost_cumulative_usd: float
 
+    # G1: contatore nudge iniettati per richieste d'azione senza tool call.
+    # Reset a 0 ad ogni nuovo run. Cap a 2 (evita loop di nudge).
+    action_nudge_count: int
+
     # M61 sticky cascade fallback: dopo un cascade riuscito, persisti il
     # provider/model effettivo cosi' le iter successive partono direttamente
     # da li' invece di ri-tentare il primario fallito ad ogni round.
