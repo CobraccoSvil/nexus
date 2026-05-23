@@ -195,14 +195,39 @@ export function KnowledgeGraph(props: Props) {
       layout: {
         name: "cose-bilkent",
         animate: false,
+        animationDuration: 0,
+        randomize: false,
         nodeDimensionsIncludeLabels: true,
         idealEdgeLength: 80,
         nodeRepulsion: 4500,
+        numIter: 2500,
+        tile: true,
+        fit: true,
+        padding: 30,
       } as unknown as cytoscape.LayoutOptions,
       minZoom: 0.2,
       maxZoom: 3.0,
       wheelSensitivity: 0.2,
     });
+
+    // Stop ogni animazione residua: dopo layout.run() iniziale, blocca
+    // qualunque transizione/animation che continua a far oscillare i nodi.
+    const cy = cyRef.current;
+    if (cy) {
+      const stopAll = () => {
+        cy.stop(true, true);
+        cy.nodes().forEach((n) => {
+          n.stop(true);
+        });
+      };
+      // Esegui dopo che il layout iniziale ha posizionato i nodi
+      cy.one("layoutstop", () => {
+        stopAll();
+        cy.fit(undefined, 40);
+      });
+      // Fallback: forza stop dopo 1.5s nel caso layoutstop non emetta
+      setTimeout(stopAll, 1500);
+    }
 
     if (props.onNodeClick) {
       cyRef.current.on("tap", "node", (evt) => {
