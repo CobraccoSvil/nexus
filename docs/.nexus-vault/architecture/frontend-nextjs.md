@@ -6,12 +6,12 @@ slug: frontend-nextjs
 tags:
   - architecture
   - frontend
-source_commit: ca6caf007c84eada35e86b205fa30ce7e3c3e7a7
+source_commit: d812586cb0ad3a227aad1318d5d33956a6c590e3
 source_files:
   - apps/
 auto_generated: true
 created_at: 2026-05-23T07:19:16Z
-updated_at: 2026-05-23T11:19:43Z
+updated_at: 2026-05-23T11:29:56Z
 nexus_meta_version: 1
 ---
 

@@ -453,6 +453,10 @@ export default function NexusDocsAdminPage() {
                   transition: "background 0.12s, border-left-color 0.12s",
                   display: "block",
                   width: "100%",
+                  boxSizing: "border-box",
+                  flexShrink: 0,
+                  fontFamily: "inherit",
+                  minHeight: 54,
                 }}
               >
                 <div
