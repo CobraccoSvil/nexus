@@ -3780,6 +3780,24 @@ export async function recomputeKnowledgeLinks(
   });
 }
 
+export async function rebuildKnowledge(
+  projectId: string,
+  opts?: { reset?: boolean },
+): Promise<{
+  ok: boolean;
+  reset: boolean;
+  messages_total: number;
+  notes_created: number;
+  skipped_short: number;
+  linked_notes: number;
+  links_created: number;
+}> {
+  return fetchJson(`/api/projects/${projectId}/knowledge/rebuild`, {
+    method: "POST",
+    body: JSON.stringify({ reset: opts?.reset ?? false }),
+  });
+}
+
 export async function createKnowledgeNoteManual(
   projectId: string,
   body: { title: string; body_md: string; intent?: string; tags?: string[]; file_paths?: string[] },

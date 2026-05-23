@@ -1474,6 +1474,13 @@ async fn main() -> anyhow::Result<()> {
                 )),
             )
             .route(
+                "/api/projects/:id/knowledge/rebuild",
+                post(knowledge::routes::rebuild_knowledge).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
                 "/api/projects/:id/knowledge/notes/manual",
                 post(knowledge::routes::create_note_manual).layer(axum_mw::from_fn_with_state(
                     state.clone(),

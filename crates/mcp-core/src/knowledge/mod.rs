@@ -120,7 +120,7 @@ pub async fn create_note_from_user_message(
     }
 }
 
-async fn create_note_inner(
+pub async fn create_note_inner(
     db: &PgPool,
     neural: &crate::orchestrator::NeuralCoreClient,
     project_id: Uuid,

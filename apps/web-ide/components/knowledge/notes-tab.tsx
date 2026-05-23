@@ -5,6 +5,7 @@ import { useI18n, type TranslationKey } from "../../lib/i18n";
 import {
   listKnowledgeNotes,
   createKnowledgeNoteManual,
+  rebuildKnowledge,
   type KnowledgeNote,
 } from "../../lib/api-client";
 
@@ -52,6 +53,8 @@ export function NotesTab({ projectId }: Props) {
   const [newTags, setNewTags] = useState("");
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [rebuilding, setRebuilding] = useState(false);
+  const [rebuildMsg, setRebuildMsg] = useState<string | null>(null);
   const limit = 20;
 
   const load = useCallback(async () => {
@@ -72,6 +75,26 @@ export function NotesTab({ projectId }: Props) {
   }, [projectId, statusFilter, offset]);
 
   useEffect(() => { load(); }, [load, knowledgeChanged]);
+
+  const handleRebuild = async (reset: boolean) => {
+    const confirmMsg = reset
+      ? "Cancellare TUTTE le note auto del progetto e ricostruirle dai messaggi chat? Le note curate manualmente NON saranno toccate."
+      : "Ricostruire le note KB mancanti dai messaggi chat? Le note esistenti non saranno modificate.";
+    if (!window.confirm(confirmMsg)) return;
+    setRebuilding(true);
+    setRebuildMsg(null);
+    try {
+      const r = await rebuildKnowledge(projectId, { reset });
+      setRebuildMsg(
+        `Note create: ${r.notes_created}/${r.messages_total} (su ${r.linked_notes} note, ${r.links_created} link).`,
+      );
+      await load();
+    } catch (e) {
+      setRebuildMsg("Errore: " + (e instanceof Error ? e.message : String(e)));
+    } finally {
+      setRebuilding(false);
+    }
+  };
 
   const submitNewNote = async () => {
     const title = newTitle.trim();
@@ -118,6 +141,62 @@ export function NotesTab({ projectId }: Props) {
 
   return (
     <div style={{ padding: 12 }}>
+      {/* Azioni KB */}
+      <div style={{ display: "flex", gap: 4, marginBottom: 6, flexWrap: "wrap" }}>
+        <button
+          onClick={() => handleRebuild(false)}
+          disabled={rebuilding}
+          title="Ricostruisci le note mancanti dai messaggi chat (idempotente)"
+          style={{
+            flex: 1,
+            minWidth: 0,
+            padding: "6px 10px",
+            fontSize: 11,
+            fontWeight: 600,
+            background: rebuilding ? "#a3a3a3" : "#0ea5e9",
+            color: "#fff",
+            border: "none",
+            borderRadius: 6,
+            cursor: rebuilding ? "default" : "pointer",
+          }}
+        >
+          {rebuilding ? "..." : "Rigenera KB"}
+        </button>
+        <button
+          onClick={() => handleRebuild(true)}
+          disabled={rebuilding}
+          title="ATTENZIONE: cancella tutte le note auto e ricostruisce da zero"
+          style={{
+            flexShrink: 0,
+            padding: "6px 10px",
+            fontSize: 11,
+            fontWeight: 600,
+            background: "transparent",
+            color: "#dc2626",
+            border: "1px solid #dc2626",
+            borderRadius: 6,
+            cursor: rebuilding ? "default" : "pointer",
+          }}
+        >
+          Reset
+        </button>
+      </div>
+
+      {rebuildMsg && (
+        <div
+          style={{
+            fontSize: 11,
+            color: rebuildMsg.startsWith("Errore") ? "#dc2626" : "#16a34a",
+            marginBottom: 8,
+            padding: 6,
+            background: rebuildMsg.startsWith("Errore") ? "#fef2f2" : "#f0fdf4",
+            borderRadius: 4,
+          }}
+        >
+          {rebuildMsg}
+        </div>
+      )}
+
       {/* Pulsante "Nuova nota funzionale" */}
       <button
         onClick={() => setCreateOpen((v) => !v)}

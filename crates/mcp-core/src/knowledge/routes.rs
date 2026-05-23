@@ -625,6 +625,151 @@ pub async fn list_tags(
     Ok(Json(json!({ "tags": tags })))
 }
 
+// ── POST /api/projects/:id/knowledge/rebuild ─────────────────────────────
+//
+// Ricostruisce la Knowledge Base del progetto reprocessando tutti i messaggi
+// user esistenti in `chat_messages`. Utile dopo:
+//   - Import progetto da git (le note non sono state create al primo passaggio)
+//   - Perdita/svuotamento DB
+//   - Cambio della logica di auto-classificazione intent
+//
+// Pipeline:
+//   1. Trova tutti i messaggi user del progetto NON gia' associati a una nota
+//      (idempotente: skip messaggi con source_message_id gia' presente)
+//   2. Per ciascuno: chiama create_note_from_user_message (genera nota +
+//      embedding + upsert Qdrant + scrittura vault .md)
+//   3. Al termine: chiama recompute_links_for_project per popolare i link
+
+#[derive(Deserialize)]
+pub struct RebuildBody {
+    /// Se true, cancella TUTTE le note auto del progetto prima di ricreare.
+    /// Default false: idempotente (skip note gia' esistenti).
+    pub reset: Option<bool>,
+}
+
+pub async fn rebuild_knowledge(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(project_id): AxumPath<String>,
+    body: Option<Json<RebuildBody>>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&project_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    let body = body.map(|Json(b)| b).unwrap_or(RebuildBody { reset: None });
+    let reset = body.reset.unwrap_or(false);
+
+    // Opzionale: cancella note auto esistenti (mantiene quelle curate manualmente
+    // identificate da source_message_id IS NULL OR status='active' senza source)
+    if reset {
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM project_knowledge_notes
+            WHERE project_id = $1
+              AND source_message_id IS NOT NULL
+            "#,
+        )
+        .bind(project_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("reset: {e}")))?
+        .rows_affected();
+        tracing::info!(project_id = %project_id, deleted, "rebuild: reset note auto");
+    }
+
+    // Trova messaggi user non ancora con nota associata
+    let rows = sqlx::query(
+        r#"
+        SELECT cm.id, cm.content, cm.metadata
+        FROM chat_messages cm
+        JOIN chat_sessions cs ON cs.id = cm.session_id
+        WHERE cs.project_id = $1
+          AND cm.role = 'user'
+          AND length(cm.content) >= 10
+          AND NOT EXISTS (
+            SELECT 1 FROM project_knowledge_notes n
+            WHERE n.source_message_id = cm.id
+          )
+        ORDER BY cm.created_at ASC
+        LIMIT 2000
+        "#,
+    )
+    .bind(project_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("query messages: {e}")))?;
+
+    // Trova la repo root del progetto per il vault path
+    let repo_root: Option<String> = sqlx::query_scalar(
+        "SELECT repository_root_path FROM projects WHERE id = $1",
+    )
+    .bind(project_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    let total = rows.len();
+    let mut processed = 0usize;
+    let mut skipped_short = 0usize;
+
+    for row in rows {
+        let message_id: Uuid = row.try_get("id").unwrap_or_else(|_| Uuid::nil());
+        let content: String = row.try_get("content").unwrap_or_default();
+        if content.trim().is_empty() {
+            skipped_short += 1;
+            continue;
+        }
+        let metadata: serde_json::Value = row
+            .try_get("metadata")
+            .unwrap_or(serde_json::json!({}));
+        let intent = metadata
+            .get("intent")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        // Esegui sincronamente per progress tracking accurato
+        if let Err(e) = crate::knowledge::create_note_inner(
+            &state.db,
+            &state.orchestrator.neural,
+            project_id,
+            message_id,
+            &content,
+            intent.as_deref(),
+            repo_root.as_deref(),
+            &state.project_channels,
+        )
+        .await
+        {
+            tracing::debug!(message_id = %message_id, "rebuild: create_note skip: {e}");
+            continue;
+        }
+        processed += 1;
+    }
+
+    // Al termine: ricalcola i link
+    let (linked_notes, links_created) = crate::knowledge_workers::recompute_links_for_project(
+        &state.db,
+        &state.orchestrator.neural,
+        &state.project_channels,
+        project_id,
+    )
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("recompute links: {e}")))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "reset": reset,
+        "messages_total": total,
+        "notes_created": processed,
+        "skipped_short": skipped_short,
+        "linked_notes": linked_notes,
+        "links_created": links_created,
+    })))
+}
+
 // ── POST /api/projects/:id/knowledge/recompute-links ─────────────────────
 //
 // Forza il ricalcolo dei link automatici su TUTTE le note del progetto

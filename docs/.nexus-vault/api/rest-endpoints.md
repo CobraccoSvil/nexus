@@ -6,17 +6,18 @@ slug: rest-endpoints
 tags:
   - api
   - rest
+source_commit: 6187464b1a087981566ddd761df14762ba3a53d2
 source_files:
   - crates/mcp-core/src/main.rs
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T11:11:50Z
+updated_at: 2026-05-23T11:55:35Z
 nexus_meta_version: 1
 ---
 
 Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src/main.rs`.
 
-**Totale endpoint**: 248
+**Totale endpoint**: 249
 
 Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]].
 
@@ -187,6 +188,7 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 | Metodo | Path | Handler |
 |---|---|---|
 | `GET` | `/api/meta-docs/:id` | `meta_docs::routes::get_meta_doc` |
+| `GET` | `/api/meta-docs/export-archive` | `meta_docs::routes::export_vault_archive` |
 | `GET` | `/api/meta-docs/graph` | `meta_docs::routes::graph_handler` |
 | `GET` | `/api/meta-docs/list` | `meta_docs::routes::list_meta_docs` |
 | `POST` | `/api/meta-docs/ingest-commit` | `meta_docs::routes::ingest_commit_stub` |
