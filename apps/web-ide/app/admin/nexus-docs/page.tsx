@@ -415,9 +415,12 @@ export default function NexusDocsAdminPage() {
             flex: "0 0 380px",
             display: "flex",
             flexDirection: "column",
-            gap: 4,
+            gap: 0,
             overflowY: "auto",
             maxHeight: "calc(100vh - 360px)",
+            border: `1px solid ${tc.border}`,
+            borderRadius: 8,
+            background: tc.bgCard,
           }}
         >
           {loading && items.length === 0 && (
@@ -428,41 +431,42 @@ export default function NexusDocsAdminPage() {
               Nessuna doc nel vault. Click su "Rigenera tutta la doc".
             </div>
           )}
-          {items.map((it) => {
+          {items.map((it, idx) => {
             const selected = selectedId === it.id;
             return (
               <button
                 key={it.id}
                 onClick={() => setSelectedId(it.id)}
+                className="admin-doc-row"
                 style={{
                   textAlign: "left",
-                  padding: "10px 12px",
-                  border: `1px solid ${selected ? tc.accent : tc.border}`,
-                  background: selected ? tc.bgCard : "transparent",
-                  borderRadius: 8,
+                  padding: "8px 12px",
+                  border: "none",
+                  borderTop: idx === 0 ? "none" : `1px solid ${tc.border}`,
+                  borderLeft: `3px solid ${selected ? KIND_COLORS[it.kind] : "transparent"}`,
+                  background: selected ? tc.bgHover : "transparent",
+                  borderRadius: 0,
                   cursor: "pointer",
                   overflow: "hidden",
                   minWidth: 0,
                   color: tc.text,
+                  transition: "background 0.12s, border-left-color 0.12s",
                 }}
               >
-                <div style={{ display: "flex", gap: 6, alignItems: "center", minWidth: 0 }}>
+                <div style={{ display: "flex", gap: 10, alignItems: "center", minWidth: 0 }}>
                   <span
                     style={{
-                      fontSize: 9,
-                      fontWeight: 700,
-                      padding: "1px 6px",
-                      borderRadius: 3,
-                      background: KIND_COLORS[it.kind] + "22",
-                      color: KIND_COLORS[it.kind],
+                      width: 8,
+                      height: 8,
+                      borderRadius: "50%",
+                      background: KIND_COLORS[it.kind],
                       flexShrink: 0,
                     }}
-                  >
-                    {KIND_LABELS[it.kind]}
-                  </span>
+                    title={KIND_LABELS[it.kind]}
+                  />
                   <span
                     style={{
-                      fontWeight: 600,
+                      fontWeight: selected ? 600 : 500,
                       fontSize: 13,
                       overflow: "hidden",
                       textOverflow: "ellipsis",
@@ -474,22 +478,26 @@ export default function NexusDocsAdminPage() {
                   >
                     {it.title}
                   </span>
-                </div>
-                <div
-                  style={{
-                    fontSize: 10,
-                    color: tc.textMuted,
-                    marginTop: 2,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {it.vault_file_path}
+                  <span
+                    style={{
+                      fontSize: 9,
+                      color: tc.textMuted,
+                      flexShrink: 0,
+                      textTransform: "uppercase",
+                      letterSpacing: 0.6,
+                    }}
+                  >
+                    {KIND_LABELS[it.kind]}
+                  </span>
                 </div>
               </button>
             );
           })}
+          <style jsx>{`
+            .admin-doc-row:hover {
+              background: ${tc.bgHover} !important;
+            }
+          `}</style>
         </div>
 
         <div
