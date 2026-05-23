@@ -934,9 +934,9 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     _nudge_count = int(state.get("action_nudge_count") or 0)
     if (
         tools_json                                        # l'agente ha tool disponibili
-        and _current_iter >= 1                            # non è la prima iterazione
+        and _current_iter >= 1                            # route_after_executor ha già ri-mandato qui
         and _nudge_count < 2                              # max 2 nudge totali
-        and not _has_tool_calls_in_history(messages)     # nessun tool call finora
+        and not _has_tool_calls_in_history(messages)     # nessun tool call nella history
     ):
         # Estrai il primo messaggio umano per capire se è action-oriented
         _first_human_text = next(
@@ -1598,6 +1598,29 @@ def route_after_executor(state: AgentState) -> str:
         cfg = orchestrator_config.get()
         if cfg.get("verifier_enabled"):
             return "verifier"
+    # G1: risposta puramente descrittiva su richiesta action-oriented.
+    # Se il modello ha risposto senza tool call (end_turn, no pending) e
+    # la richiesta originale era un'azione concreta, ri-manda all'executor
+    # cosi' il nudge puo' attivarsi (max 2 volte, poi learner normale).
+    if not pending and stop_reason in ("end_turn", "stop", None):
+        _nudge_count = int(state.get("action_nudge_count") or 0)
+        if _nudge_count < 2:
+            _msgs = state.get("messages") or []
+            _first_human = next(
+                (getattr(m, "content", "") for m in _msgs if hasattr(m, "type") and m.type == "human"),
+                "",
+            )
+            if isinstance(_first_human, list):
+                _first_human = " ".join(
+                    b.get("text", "") for b in _first_human if isinstance(b, dict)
+                )
+            if _detect_action_request(str(_first_human)):
+                logger.warning(
+                    "route_after_executor: G1 risposta descrittiva su action request "
+                    "(iter=%d nudge=%d) → re-executor con nudge",
+                    iterations, _nudge_count,
+                )
+                return "executor"
     return "learner"
 
 
