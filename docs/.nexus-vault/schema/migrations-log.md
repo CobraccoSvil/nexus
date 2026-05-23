@@ -6,12 +6,12 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: 700dacf37bfb9b980a8121425eb5d66cffcd4ac0
+source_commit: 3deaf53b5cafe303c52068cbfbac92125e4fd86e
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T09:24:06Z
+updated_at: 2026-05-23T10:09:38Z
 nexus_meta_version: 1
 ---
 
@@ -192,7 +192,8 @@ Cronologia migrazioni SQL in `db/migrations/`. Generato automaticamente.
 | `0175_knowledge_base.sql` | ========================================================================== |
 | `0176_brain_learning_to_postgres.sql` | Migrazione del learning storage dal SQLite locale del brain a PostgreSQL. |
 | `0177_nexus_meta_docs.sql` | Migrazione meta-docs vault: documentazione del meta-progetto Nexus |
+| `0178_obsidian_vault_name.sql` | Migrazione: registra il nome del vault Obsidian per il meta-vault Nexus e per |
 
-**Totale**: 173 migrazioni.
+**Totale**: 174 migrazioni.
 
-Ultima migrazione: `0177_nexus_meta_docs.sql`.
+Ultima migrazione: `0178_obsidian_vault_name.sql`.

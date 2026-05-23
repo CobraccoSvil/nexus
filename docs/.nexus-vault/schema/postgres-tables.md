@@ -6,12 +6,12 @@ slug: postgres-tables
 tags:
   - schema
   - postgres
-source_commit: 700dacf37bfb9b980a8121425eb5d66cffcd4ac0
+source_commit: 3deaf53b5cafe303c52068cbfbac92125e4fd86e
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T09:24:06Z
+updated_at: 2026-05-23T10:09:38Z
 nexus_meta_version: 1
 ---
 
@@ -1388,6 +1388,7 @@ Tabelle attuali nello schema `public` di PostgreSQL. Generato automaticamente da
 | `repository_root_path` | text | YES | `—` |
 | `default_profile_id` | uuid | YES | `—` |
 | `sandbox_config` | jsonb | YES | `—` |
+| `obsidian_vault_name` | text | NO | `''::text` |
 
 ## `prompt_ab_experiments`
 

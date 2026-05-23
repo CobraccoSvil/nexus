@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: 700dacf37bfb9b980a8121425eb5d66cffcd4ac0
+source_commit: 3deaf53b5cafe303c52068cbfbac92125e4fd86e
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T09:24:06Z
+updated_at: 2026-05-23T10:09:39Z
 nexus_meta_version: 1
 ---
 
@@ -167,6 +167,7 @@ Tutte le chiavi di configurazione di Nexus (tabella `settings`). Generato dal DB
 | `meta_docs.e2e_smoke_cron` | `0 2 * * *` | Cron schedule per smoke test notturno |
 | `meta_docs.e2e_smoke_url` | `http://localhost:3000` | URL base per smoke test E2E di Nexus stesso |
 | `meta_docs.enabled` | `true` | Abilita la generazione documentazione meta-progetto |
+| `meta_docs.obsidian_vault_name` | `` | Nome del vault Obsidian registrato per docs/.nexus-vault/ (vuoto = non configurato) |
 | `meta_docs.refresh_worker_interval_secs` | `900` | Failsafe refresh ogni N secondi (default 15 min) |
 | `meta_docs.vault_path` | `docs/.nexus-vault` | Path relativo del vault dentro la repository Nexus |
 | `meta_docs.watcher_debounce_ms` | `500` | Debounce file watcher su docs/.nexus-vault/ |
@@ -282,7 +283,7 @@ Tutte le chiavi di configurazione di Nexus (tabella `settings`). Generato dal DB
 | `default_model` | `claude-sonnet-4-6` | Default model for chat |
 | `default_provider` | `anthropic` | Default LLM provider |
 | `max_token_budget` | `32000` | Maximum token budget allowed |
-| `model_catalog_last_sync` | `2026-05-23T07:23:57.217995697+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
+| `model_catalog_last_sync` | `2026-05-23T09:26:46.938177861+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
 | `nexus_active_routing_pct` | `50` | Percentuale di richieste chat gestite dal router Q-Learning Nexus (0=off, 100=tutto). A/B testing: imposta 10-50 per un rollout graduale. |
 | `nexus_behavior_mode` | `dinamico` | Modalità comportamento Nexus: veloce|economica|bilanciata|approfondita |
 | `provider_hierarchy` | `anthropic,openai,google,deepseek,mistral` | Ordered fallback chain for chat providers |
@@ -335,4 +336,4 @@ Tutte le chiavi di configurazione di Nexus (tabella `settings`). Generato dal DB
 
 ---
 
-**Totale chiavi**: 195
+**Totale chiavi**: 196

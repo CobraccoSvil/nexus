@@ -6,18 +6,18 @@ slug: rest-endpoints
 tags:
   - api
   - rest
-source_commit: 700dacf37bfb9b980a8121425eb5d66cffcd4ac0
+source_commit: 3deaf53b5cafe303c52068cbfbac92125e4fd86e
 source_files:
   - crates/mcp-core/src/main.rs
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T09:24:06Z
+updated_at: 2026-05-23T10:09:39Z
 nexus_meta_version: 1
 ---
 
 Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src/main.rs`.
 
-**Totale endpoint**: 242
+**Totale endpoint**: 245
 
 
 ## `/api/admin`
@@ -186,6 +186,7 @@ Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src
 | Metodo | Path | Handler |
 |---|---|---|
 | `GET` | `/api/meta-docs/:id` | `meta_docs::routes::get_meta_doc` |
+| `GET` | `/api/meta-docs/graph` | `meta_docs::routes::graph_handler` |
 | `GET` | `/api/meta-docs/list` | `meta_docs::routes::list_meta_docs` |
 | `POST` | `/api/meta-docs/ingest-commit` | `meta_docs::routes::ingest_commit_stub` |
 | `POST` | `/api/meta-docs/refresh-all` | `meta_docs::routes::refresh_all_stub` |
@@ -257,8 +258,10 @@ Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src
 | `GET` | `/api/projects/:id/github/status` | `github::github_project_status` |
 | `GET` | `/api/projects/:id/index-status` | `projects::get_index_status` |
 | `GET` | `/api/projects/:id/insights` | `projects::get_project_insights` |
+| `GET` | `/api/projects/:id/knowledge/graph` | `knowledge::routes::graph_handler` |
 | `GET` | `/api/projects/:id/knowledge/notes` | `knowledge::routes::list_notes` |
 | `GET` | `/api/projects/:id/knowledge/notes/:note_id` | `knowledge::routes::get_note` |
+| `GET` | `/api/projects/:id/knowledge/obsidian-vault` | `knowledge::routes::get_obsidian_vault` |
 | `GET` | `/api/projects/:id/knowledge/tags` | `knowledge::routes::list_tags` |
 | `GET` | `/api/projects/:id/output/channels` | `project_workspace::get_output_channels` |
 | `GET` | `/api/projects/:id/output/events` | `project_workspace::get_output_events` |
