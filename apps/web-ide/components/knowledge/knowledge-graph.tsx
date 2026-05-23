@@ -91,8 +91,15 @@ export function KnowledgeGraph(props: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.open]);
 
+  // Estraggo i campi rilevanti come variabili stabili: usare `props` come
+  // dep dell'effect causa rebuild ad ogni render (identita' nuova),
+  // distruggendo lo stato del graph (zoom/pan reset continuo).
+  const mode = props.mode;
+  const onNodeClickProp = props.onNodeClick;
+  const open = props.open;
+
   useEffect(() => {
-    if (!props.open) return;
+    if (!open) return;
     if (!data) return;
     if (!containerRef.current) return;
 
@@ -101,13 +108,13 @@ export function KnowledgeGraph(props: Props) {
 
     for (const n of data.nodes) {
       const color =
-        props.mode === "meta"
+        mode === "meta"
           ? KIND_COLOR[(n as MetaDocsGraphData["nodes"][number]).kind] ?? "#737373"
           : INTENT_COLOR[
               (n as KnowledgeGraphData["nodes"][number]).intent ?? "chat"
             ] ?? "#737373";
       const subtitle =
-        props.mode === "meta"
+        mode === "meta"
           ? (n as MetaDocsGraphData["nodes"][number]).kind
           : (n as KnowledgeGraphData["nodes"][number]).intent ?? "";
       elements.push({
@@ -205,34 +212,34 @@ export function KnowledgeGraph(props: Props) {
         fit: true,
         padding: 30,
       } as unknown as cytoscape.LayoutOptions,
-      minZoom: 0.2,
-      maxZoom: 3.0,
-      wheelSensitivity: 0.2,
+      // Interazioni utente: zoom rotella, pan trascinamento, drag nodi.
+      // wheelSensitivity 1 = default Cytoscape (zoom percepibile).
+      minZoom: 0.1,
+      maxZoom: 4.0,
+      wheelSensitivity: 1,
+      userZoomingEnabled: true,
+      userPanningEnabled: true,
+      boxSelectionEnabled: false,
+      autoungrabify: false,
+      autounselectify: false,
     });
 
-    // Stop ogni animazione residua: dopo layout.run() iniziale, blocca
-    // qualunque transizione/animation che continua a far oscillare i nodi.
+    // Stop solo animazioni residue del layout iniziale (NON disabilita zoom/pan).
     const cy = cyRef.current;
     if (cy) {
-      const stopAll = () => {
+      cy.one("layoutstop", () => {
         cy.stop(true, true);
         cy.nodes().forEach((n) => {
           n.stop(true);
         });
-      };
-      // Esegui dopo che il layout iniziale ha posizionato i nodi
-      cy.one("layoutstop", () => {
-        stopAll();
         cy.fit(undefined, 40);
       });
-      // Fallback: forza stop dopo 1.5s nel caso layoutstop non emetta
-      setTimeout(stopAll, 1500);
     }
 
-    if (props.onNodeClick) {
+    if (onNodeClickProp) {
       cyRef.current.on("tap", "node", (evt) => {
         const id = evt.target.id();
-        props.onNodeClick?.(id);
+        onNodeClickProp(id);
       });
     }
 
@@ -240,7 +247,7 @@ export function KnowledgeGraph(props: Props) {
       cyRef.current?.destroy();
       cyRef.current = null;
     };
-  }, [data, hideAutoLinks, props]);
+  }, [data, hideAutoLinks, open, mode, onNodeClickProp]);
 
   if (!props.open) return null;
 
