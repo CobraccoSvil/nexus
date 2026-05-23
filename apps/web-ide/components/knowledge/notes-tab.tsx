@@ -17,6 +17,7 @@ const STATUS_I18N: Record<string, TranslationKey> = {
 };
 import { useProjectStore, selectKnowledgeChangedAt } from "../../lib/project-dispatcher/store";
 import { NoteDetail } from "./note-detail";
+import { useGlobalDialog } from "../global-dialog-provider";
 
 interface Props {
   projectId: string;
@@ -39,6 +40,7 @@ const INTENT_OPTIONS = [
 
 export function NotesTab({ projectId }: Props) {
   const { t } = useI18n();
+  const { confirmDialog } = useGlobalDialog();
   const knowledgeChanged = useProjectStore(selectKnowledgeChangedAt);
   const [notes, setNotes] = useState<KnowledgeNote[]>([]);
   const [total, setTotal] = useState(0);
@@ -80,7 +82,9 @@ export function NotesTab({ projectId }: Props) {
     const confirmMsg = reset
       ? "Cancellare TUTTE le note auto del progetto e ricostruirle dai messaggi chat? Le note curate manualmente NON saranno toccate."
       : "Ricostruire le note KB mancanti dai messaggi chat? Le note esistenti non saranno modificate.";
-    if (!window.confirm(confirmMsg)) return;
+    const title = reset ? "Reset Knowledge Base" : "Rigenera Knowledge Base";
+    const ok = await confirmDialog(confirmMsg, title);
+    if (!ok) return;
     setRebuilding(true);
     setRebuildMsg(null);
     try {

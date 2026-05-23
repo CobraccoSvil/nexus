@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: 6187464b1a087981566ddd761df14762ba3a53d2
+source_commit: 999489cd74071f52d4a79f725275c33342b35e4a
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T11:55:35Z
+updated_at: 2026-05-23T12:09:46Z
 nexus_meta_version: 1
 ---
 
@@ -285,7 +285,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `default_model` | `claude-sonnet-4-6` | Default model for chat |
 | `default_provider` | `anthropic` | Default LLM provider |
 | `max_token_budget` | `32000` | Maximum token budget allowed |
-| `model_catalog_last_sync` | `2026-05-23T10:50:27.227845773+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
+| `model_catalog_last_sync` | `2026-05-23T11:59:10.071655540+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
 | `nexus_active_routing_pct` | `50` | Percentuale di richieste chat gestite dal router Q-Learning Nexus (0=off, 100=tutto). A/B testing: imposta 10-50 per un rollout graduale. |
 | `nexus_behavior_mode` | `dinamico` | Modalità comportamento Nexus: veloce|economica|bilanciata|approfondita |
 | `provider_hierarchy` | `anthropic,openai,google,deepseek,mistral` | Ordered fallback chain for chat providers |

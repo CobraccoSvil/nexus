@@ -6,18 +6,18 @@ slug: rest-endpoints
 tags:
   - api
   - rest
-source_commit: 6187464b1a087981566ddd761df14762ba3a53d2
+source_commit: 999489cd74071f52d4a79f725275c33342b35e4a
 source_files:
   - crates/mcp-core/src/main.rs
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T11:55:35Z
+updated_at: 2026-05-23T12:09:46Z
 nexus_meta_version: 1
 ---
 
 Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src/main.rs`.
 
-**Totale endpoint**: 249
+**Totale endpoint**: 250
 
 Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]].
 
@@ -324,6 +324,7 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 | `POST` | `/api/projects/:id/github/pull-request` | `github::github_create_pull_request` |
 | `POST` | `/api/projects/:id/knowledge/links` | `knowledge::routes::create_link` |
 | `POST` | `/api/projects/:id/knowledge/notes/manual` | `knowledge::routes::create_note_manual` |
+| `POST` | `/api/projects/:id/knowledge/rebuild` | `knowledge::routes::rebuild_knowledge` |
 | `POST` | `/api/projects/:id/knowledge/recompute-links` | `knowledge::routes::recompute_links` |
 | `POST` | `/api/projects/:id/knowledge/similar` | `knowledge::routes::similar_handler` |
 | `POST` | `/api/projects/:id/open` | `project_workspace::open_project` |

@@ -22,6 +22,7 @@ import {
 } from "../../lib/api-client";
 import { MarkdownBlock } from "../chat/markdown-renderer";
 import { KnowledgeGraph } from "./knowledge-graph";
+import { useGlobalDialog } from "../global-dialog-provider";
 
 const META_VAULT_NAME_KEY = "nexus.meta_docs.obsidian_vault_name";
 
@@ -48,6 +49,7 @@ const KIND_COLORS: Record<MetaDocKind, string> = {
 };
 
 export function MetaTab() {
+  const { promptDialog } = useGlobalDialog();
   const [items, setItems] = useState<MetaDocSummary[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -104,7 +106,7 @@ export function MetaTab() {
     }
   }, [load]);
 
-  const openInObsidian = (vaultFilePath?: string) => {
+  const openInObsidian = async (vaultFilePath?: string) => {
     let name = "";
     try {
       name = localStorage.getItem(META_VAULT_NAME_KEY) ?? "";
@@ -112,10 +114,10 @@ export function MetaTab() {
       // localStorage non disponibile
     }
     if (!name) {
-      const prompted = window.prompt(
-        "Nome del vault Obsidian per docs/.nexus-vault/\n" +
-          "(In Obsidian: File -> Open vault -> Open folder as vault -> seleziona docs/.nexus-vault/)",
+      const prompted = await promptDialog(
+        "Nome del vault Obsidian per docs/.nexus-vault/ (In Obsidian: File -> Open vault -> Open folder as vault -> seleziona docs/.nexus-vault/)",
         "",
+        "Vault Obsidian",
       );
       if (!prompted || !prompted.trim()) return;
       name = prompted.trim();
