@@ -64,6 +64,11 @@ mod dispatcher_routes;
 mod task_watchdog;
 mod knowledge_workers;
 mod knowledge_watcher;
+mod meta_docs;
+mod meta_docs_watcher;
+mod meta_docs_workers;
+mod change_drafts;
+mod nexus_autofix_worker;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -711,6 +716,23 @@ async fn main() -> anyhow::Result<()> {
     // configurabile via settings.knowledge.cleanup_draft_days (default 30 giorni).
     // Intervallo giornaliero (86400s).
     knowledge_workers::start_knowledge_cleanup_worker(state.db.clone());
+
+    // Meta-docs vault watcher: file watcher bidirezionale per docs/.nexus-vault/.
+    // Quando l'utente modifica un .md (es. via Obsidian), il watcher aggiorna il DB.
+    // Loop detection via SHA-256 per evitare reazioni ai propri write.
+    {
+        let vault_root = meta_docs::apply::resolve_vault_root(&state).await;
+        meta_docs_watcher::start_meta_docs_watcher(state.db.clone(), vault_root);
+    }
+    // Pre-crea la collection Qdrant `nexus_meta_docs` (idempotente).
+    if let Err(e) = vector_memory::ensure_meta_docs_collection(&state.db).await {
+        tracing::warn!(error = %e, "meta-docs: ensure collection Qdrant fallita");
+    }
+    // Worker periodico failsafe: recupera commit non ingeriti dall'hook lefthook.
+    meta_docs_workers::start_meta_docs_refresh_worker(state.clone());
+
+    // NexusAutoFixAgent: intercetta E2E fallimenti e genera change_drafts.
+    nexus_autofix_worker::start_nexus_autofix_worker(state.clone());
 
     // ToolRunner gRPC server (Fase 1 refactor orchestrazione LangGraph).
     // Valore canonico: settings.tool_runner_enabled nel DB (admin panel).
@@ -1433,6 +1455,60 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/projects/:id/knowledge/tags",
                 get(knowledge::routes::list_tags).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            // ── meta-docs (Nexus self-documentation vault) ────────
+            .route(
+                "/api/meta-docs/list",
+                get(meta_docs::routes::list_meta_docs).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/meta-docs/refresh-all",
+                post(meta_docs::routes::refresh_all_stub).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/meta-docs/ingest-commit",
+                post(meta_docs::routes::ingest_commit_stub),
+            )
+            .route(
+                "/api/meta-docs/:id",
+                get(meta_docs::routes::get_meta_doc).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            // ── change-drafts (ChangeDrafter proposte di modifica) ─
+            .route(
+                "/api/change-drafts",
+                post(change_drafts::create_draft)
+                    .get(change_drafts::list_drafts)
+                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_auth)),
+            )
+            .route(
+                "/api/change-drafts/:id",
+                get(change_drafts::get_draft).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/change-drafts/:id/approve",
+                post(change_drafts::approve_draft).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/change-drafts/:id/reject",
+                post(change_drafts::reject_draft).layer(axum_mw::from_fn_with_state(
                     state.clone(),
                     middleware::require_auth,
                 )),

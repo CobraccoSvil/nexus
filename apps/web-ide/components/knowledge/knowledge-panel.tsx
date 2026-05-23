@@ -6,12 +6,13 @@ import { NotesTab } from "./notes-tab";
 import { TagsTab } from "./tags-tab";
 import { SearchTab } from "./search-tab";
 import { GraphTab } from "./graph-tab";
+import { MetaTab } from "./meta-tab";
 
 interface Props {
   project: { id: string };
 }
 
-type TabKey = "notes" | "tags" | "search" | "graph";
+type TabKey = "notes" | "tags" | "search" | "graph" | "meta";
 
 export function KnowledgePanel({ project }: Props) {
   const { t } = useI18n();
@@ -22,6 +23,7 @@ export function KnowledgePanel({ project }: Props) {
     { key: "tags", label: t("knowledge.tab.tags") },
     { key: "search", label: t("knowledge.tab.search") },
     { key: "graph", label: t("knowledge.tab.graph") },
+    { key: "meta", label: "Meta" },
   ];
 
   return (
@@ -66,6 +68,7 @@ export function KnowledgePanel({ project }: Props) {
         {activeTab === "tags" && <TagsTab projectId={project.id} />}
         {activeTab === "search" && <SearchTab projectId={project.id} />}
         {activeTab === "graph" && <GraphTab />}
+        {activeTab === "meta" && <MetaTab />}
       </div>
     </div>
   );

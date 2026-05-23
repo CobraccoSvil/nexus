@@ -1,0 +1,12 @@
+{
+  "promptDelete": false,
+  "alwaysUpdateLinks": true,
+  "newLinkFormat": "shortest",
+  "useMarkdownLinks": false,
+  "showFrontmatter": true,
+  "attachmentFolderPath": "_attachments",
+  "userIgnoreFilters": [],
+  "showInlineTitle": true,
+  "showViewHeader": true,
+  "showLineNumber": true
+}

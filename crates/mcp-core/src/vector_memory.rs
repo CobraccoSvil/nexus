@@ -1308,3 +1308,182 @@ pub async fn delete_knowledge_points(
     }
     Ok(())
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Meta-docs (Nexus self-documentation vault) — collection Qdrant
+// Pattern clonato da knowledge_notes, ma singleton (no project_id filter).
+// Filtro opzionale per `kind` (architecture/adr/api/schema/runbook/changelog/decision).
+// ═══════════════════════════════════════════════════════════════════════════
+
+const DEFAULT_META_DOCS_COLLECTION: &str = "nexus_meta_docs";
+
+async fn qdrant_meta_docs_config(db: &PgPool) -> anyhow::Result<(String, String)> {
+    let url = get_setting(db, "qdrant_url").await?.unwrap_or_else(|| {
+        std::env::var("QDRANT_URL").unwrap_or_else(|_| DEFAULT_QDRANT_URL.to_string())
+    });
+    let collection = get_setting(db, "qdrant_meta_docs_collection")
+        .await?
+        .unwrap_or_else(|| DEFAULT_META_DOCS_COLLECTION.to_string());
+    Ok((url, collection))
+}
+
+/// Crea la collection Qdrant `nexus_meta_docs` se non esiste (idempotente).
+pub async fn ensure_meta_docs_collection(db: &PgPool) -> anyhow::Result<()> {
+    let (base_url, collection) = qdrant_meta_docs_config(db).await?;
+    let client = nexus_http::build_client();
+    let get_url = format!("{base_url}/collections/{collection}");
+
+    let response = client
+        .get(&get_url)
+        .send()
+        .await
+        .context("impossibile verificare collection nexus_meta_docs")?;
+
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let create_url = format!("{base_url}/collections/{collection}");
+    let create_body = json!({
+        "vectors": {
+            "size": 384,
+            "distance": "Cosine"
+        }
+    });
+
+    let create_response = client
+        .put(&create_url)
+        .json(&create_body)
+        .send()
+        .await
+        .context("impossibile creare collection nexus_meta_docs")?;
+
+    if !create_response.status().is_success() {
+        let payload = create_response.text().await.unwrap_or_default();
+        return Err(anyhow!("creazione collection nexus_meta_docs fallita: {payload}"));
+    }
+
+    Ok(())
+}
+
+/// Inserisce/aggiorna un punto nella collection nexus_meta_docs.
+pub async fn upsert_meta_doc_point(
+    db: &PgPool,
+    point_id: &str,
+    vector: Vec<f32>,
+    payload: Value,
+) -> anyhow::Result<()> {
+    ensure_meta_docs_collection(db).await?;
+    let (base_url, collection) = qdrant_meta_docs_config(db).await?;
+    let url = format!("{base_url}/collections/{collection}/points?wait=true");
+    let body = json!({
+        "points": [{
+            "id": point_id,
+            "vector": vector,
+            "payload": payload,
+        }]
+    });
+
+    let client = nexus_http::build_client();
+    let response = client
+        .put(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("meta-docs upsert fallito")?;
+
+    if !response.status().is_success() {
+        let payload = response.text().await.unwrap_or_default();
+        return Err(anyhow!("meta-docs upsert fallito: {payload}"));
+    }
+    Ok(())
+}
+
+/// Cerca note meta-docs simili. Se `kind_filter` e' Some, filtra per `kind` esatto.
+pub async fn search_meta_doc_points(
+    db: &PgPool,
+    vector: Vec<f32>,
+    kind_filter: Option<&str>,
+    top_k: usize,
+) -> anyhow::Result<Vec<VectorPointHit>> {
+    ensure_meta_docs_collection(db).await?;
+    let (base_url, collection) = qdrant_meta_docs_config(db).await?;
+    let url = format!("{base_url}/collections/{collection}/points/search");
+
+    let mut body = json!({
+        "vector": vector,
+        "limit": top_k,
+        "with_payload": true,
+    });
+    if let Some(kind) = kind_filter {
+        body["filter"] = json!({
+            "must": [{
+                "key": "kind",
+                "match": { "value": kind }
+            }]
+        });
+    }
+
+    let client = nexus_http::build_client();
+    let response = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("meta-docs search fallita")?;
+
+    if !response.status().is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(anyhow!("meta-docs search fallita: {text}"));
+    }
+
+    let payload: Value = response.json().await.context("payload ricerca meta-docs non valido")?;
+    let result = payload
+        .get("result")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut hits = Vec::with_capacity(result.len());
+    for hit in result {
+        let score = hit.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        let point_id = match hit.get("id") {
+            Some(Value::String(v)) => v.clone(),
+            Some(Value::Number(v)) => v.to_string(),
+            _ => continue,
+        };
+        let pl = hit.get("payload").cloned().unwrap_or(json!({}));
+        hits.push(VectorPointHit { point_id, score, payload: pl });
+    }
+    Ok(hits)
+}
+
+/// Elimina punti dalla collection nexus_meta_docs per lista di point_id.
+pub async fn delete_meta_doc_points(
+    db: &PgPool,
+    point_ids: &[String],
+) -> anyhow::Result<()> {
+    if point_ids.is_empty() {
+        return Ok(());
+    }
+    ensure_meta_docs_collection(db).await?;
+    let (base_url, collection) = qdrant_meta_docs_config(db).await?;
+    let url = format!("{base_url}/collections/{collection}/points/delete?wait=true");
+    let body = json!({
+        "points": point_ids,
+    });
+
+    let client = nexus_http::build_client();
+    let response = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("eliminazione punti meta-docs fallita")?;
+
+    if !response.status().is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(anyhow!("eliminazione punti meta-docs fallita: {text}"));
+    }
+    Ok(())
+}

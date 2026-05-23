@@ -39,3 +39,21 @@ commit-msg:
           echo "Commit message contiene emoji: rimuovile - direttiva editoriale" >&2
           exit 1
         fi
+
+# Post-commit: notifica mcp-core per aggiornare il meta-vault.
+# Fail-soft: se mcp-core non e' raggiungibile (dev offline), il commit passa
+# comunque e il MetaDocsRefreshWorker recupera al prossimo tick periodico.
+post-commit:
+  parallel: false
+  commands:
+    meta_docs_ingest:
+      run: |
+        COMMIT=$(git rev-parse HEAD)
+        if curl -sf -m 3 -X POST http://localhost:4000/api/meta-docs/ingest-commit \
+             -H "Content-Type: application/json" \
+             -d "{\"commit\":\"$COMMIT\"}" > /dev/null; then
+          echo "[meta-docs] commit $COMMIT registrato"
+        else
+          echo "[meta-docs] mcp-core non raggiungibile (commit registrato, worker recuperera')"
+        fi
+      fail_text: ""
