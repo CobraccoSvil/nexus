@@ -6,16 +6,18 @@ slug: brain-python
 tags:
   - architecture
   - python
-source_commit: a600f5a449346b748a221e1837f1f00d84b6beb1
+source_commit: 6c6e4c456876ae421280e2fc0e4c2cdf7494eff4
 source_files:
   - brain/
 auto_generated: true
 created_at: 2026-05-23T07:19:16Z
-updated_at: 2026-05-23T10:23:39Z
+updated_at: 2026-05-23T11:08:57Z
 nexus_meta_version: 1
 ---
 
 Mappa modulare di `brain/` (Python + FastAPI + LangGraph). Generato automaticamente.
+
+Vedi anche: [[crates-rust]], [[overview]], [[multi-provider-routing]], [[nexus-architetturale]].
 
 ## Top-level modules
 

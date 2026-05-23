@@ -89,6 +89,7 @@ async fn generate_rest_endpoints(ctx: &MetaDocContext<'_>) -> Result<String> {
     let mut out = String::new();
     out.push_str("Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src/main.rs`.\n\n");
     out.push_str(&format!("**Totale endpoint**: {}\n\n", endpoints.len()));
+    out.push_str("Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]].\n\n");
 
     // Raggruppa per prefisso (/api/projects, /api/chat, ...)
     let mut groups: std::collections::BTreeMap<String, Vec<(String, String, String)>> =
@@ -127,6 +128,7 @@ async fn generate_settings_keys(ctx: &MetaDocContext<'_>) -> Result<String> {
 
     let mut out = String::new();
     out.push_str("Tutte le chiavi di configurazione di Nexus (tabella `settings`). Generato dal DB.\n\n");
+    out.push_str("Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]].\n\n");
 
     let mut current_cat = String::new();
     for r in &rows {

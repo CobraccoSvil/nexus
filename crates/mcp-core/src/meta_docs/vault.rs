@@ -235,6 +235,7 @@ pub fn build_vault_path(kind: &str, slug: &str, date: &DateTime<Utc>) -> String 
         "architecture" | "adr" | "api" | "schema" | "runbook" | "other" => {
             format!("{kind}/{slug}.md")
         }
+        "concept" => format!("concepts/{slug}.md"),
         _ => format!("other/{slug}.md"),
     }
 }

@@ -517,11 +517,63 @@ pub async fn recompute_meta_links(
         }
     }
 
+    // ── Fase 2: linking semantico via embedding (top-5 per nota, soglia 0.55) ──
+    let mut semantic_created = 0usize;
+    let semantic_threshold: f32 = 0.55;
+    for (from_id, _slug, body) in &all_notes {
+        let embed_text = if body.len() > 2000 { &body[..2000] } else { body };
+        if embed_text.trim().is_empty() {
+            continue;
+        }
+        let vector = match state.orchestrator.neural.embed_text("", embed_text).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let hits = match crate::vector_memory::search_meta_doc_points(&state.db, vector, None, 6).await {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        for hit in &hits {
+            if (hit.score as f32) < semantic_threshold {
+                continue;
+            }
+            let target_id = match hit
+                .payload
+                .get("doc_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            {
+                Some(id) if id != *from_id => id,
+                _ => continue,
+            };
+            let result = sqlx::query(
+                r#"
+                INSERT INTO nexus_meta_doc_links
+                    (from_doc_id, to_doc_id, rel_type, created_by, confidence)
+                VALUES ($1, $2, 'relates', 'auto', $3)
+                ON CONFLICT (from_doc_id, to_doc_id, rel_type) DO UPDATE SET
+                    confidence = GREATEST(nexus_meta_doc_links.confidence, EXCLUDED.confidence)
+                "#,
+            )
+            .bind(from_id)
+            .bind(target_id)
+            .bind(hit.score as f32)
+            .execute(&state.db)
+            .await;
+            if let Ok(r) = result {
+                if r.rows_affected() > 0 {
+                    semantic_created += 1;
+                }
+            }
+        }
+    }
+
     Ok(Json(json!({
         "ok": true,
         "notes_processed": all_notes.len(),
         "wikilinks_created": wikilinks_created,
         "wikilinks_unresolved": wikilinks_unresolved,
+        "semantic_links_created": semantic_created,
     })))
 }
 

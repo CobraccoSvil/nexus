@@ -16,6 +16,7 @@ pub mod architecture;
 pub mod api;
 pub mod changelog;
 pub mod decisions;
+pub mod concepts;
 
 /// Output di un generator: una nota da scrivere/aggiornare nel vault.
 pub struct GeneratedDoc {
@@ -60,5 +61,6 @@ pub fn all_generators() -> Vec<Box<dyn MetaDocGenerator>> {
         Box::new(api::ApiGenerator),
         Box::new(changelog::ChangelogGenerator),
         Box::new(decisions::DecisionExtractor),
+        Box::new(concepts::ConceptsGenerator),
     ]
 }

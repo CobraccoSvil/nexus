@@ -3910,6 +3910,7 @@ export async function recomputeMetaDocsLinks(): Promise<{
   notes_processed: number;
   wikilinks_created: number;
   wikilinks_unresolved: number;
+  semantic_links_created?: number;
 }> {
   return fetchJson(`/api/meta-docs/recompute-links`, { method: "POST", body: "{}" });
 }

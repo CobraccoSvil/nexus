@@ -133,8 +133,9 @@ export default function NexusDocsAdminPage() {
     setRecomputeMsg(null);
     try {
       const r = await recomputeMetaDocsLinks();
+      const sem = r.semantic_links_created ?? 0;
       setRecomputeMsg(
-        `${r.wikilinks_created} link creati su ${r.notes_processed} note. ${r.wikilinks_unresolved} wikilink non risolti.`,
+        `Wikilink: ${r.wikilinks_created} su ${r.notes_processed} note (${r.wikilinks_unresolved} non risolti). Link semantici: ${sem}.`,
       );
     } catch (e) {
       setRecomputeMsg("Errore: " + (e instanceof Error ? e.message : String(e)));

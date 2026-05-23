@@ -6,18 +6,20 @@ slug: rest-endpoints
 tags:
   - api
   - rest
-source_commit: 3deaf53b5cafe303c52068cbfbac92125e4fd86e
+source_commit: 6c6e4c456876ae421280e2fc0e4c2cdf7494eff4
 source_files:
   - crates/mcp-core/src/main.rs
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T10:09:39Z
+updated_at: 2026-05-23T11:08:58Z
 nexus_meta_version: 1
 ---
 
 Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src/main.rs`.
 
-**Totale endpoint**: 245
+**Totale endpoint**: 248
+
+Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]].
 
 
 ## `/api/admin`
@@ -189,6 +191,7 @@ Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src
 | `GET` | `/api/meta-docs/graph` | `meta_docs::routes::graph_handler` |
 | `GET` | `/api/meta-docs/list` | `meta_docs::routes::list_meta_docs` |
 | `POST` | `/api/meta-docs/ingest-commit` | `meta_docs::routes::ingest_commit_stub` |
+| `POST` | `/api/meta-docs/recompute-links` | `meta_docs::routes::recompute_meta_links` |
 | `POST` | `/api/meta-docs/refresh-all` | `meta_docs::routes::refresh_all_stub` |
 
 ## `/api/models`
@@ -319,6 +322,8 @@ Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src
 | `POST` | `/api/projects/:id/github/publish-branch` | `github::github_publish_branch` |
 | `POST` | `/api/projects/:id/github/pull-request` | `github::github_create_pull_request` |
 | `POST` | `/api/projects/:id/knowledge/links` | `knowledge::routes::create_link` |
+| `POST` | `/api/projects/:id/knowledge/notes/manual` | `knowledge::routes::create_note_manual` |
+| `POST` | `/api/projects/:id/knowledge/recompute-links` | `knowledge::routes::recompute_links` |
 | `POST` | `/api/projects/:id/knowledge/similar` | `knowledge::routes::similar_handler` |
 | `POST` | `/api/projects/:id/open` | `project_workspace::open_project` |
 | `POST` | `/api/projects/:id/quality-findings/:finding_id/mark-fixed` | `projects::mark_finding_fixed` |

@@ -127,6 +127,46 @@ impl MetaDocGenerator for ChangelogGenerator {
         body.push_str(commit_sha);
         body.push_str("`\n");
 
+        // Wikilink ai documenti correlati in base ai file toccati
+        let mut related: Vec<&str> = Vec::new();
+        if files_changed.iter().any(|f| f.starts_with("crates/")) {
+            related.push("[[crates-rust]]");
+        }
+        if files_changed.iter().any(|f| f.starts_with("brain/")) {
+            related.push("[[brain-python]]");
+        }
+        if files_changed.iter().any(|f| f.starts_with("apps/")) {
+            related.push("[[frontend-nextjs]]");
+        }
+        if files_changed.iter().any(|f| f.starts_with("db/migrations/")) {
+            related.push("[[postgres-tables]]");
+            related.push("[[migrations-log]]");
+        }
+        if files_changed.iter().any(|f| f.contains("router") || f.contains("routes") || f.ends_with("_router.rs")) {
+            related.push("[[rest-endpoints]]");
+        }
+        if files_changed.iter().any(|f| f.contains("vector_memory") || f.contains("qdrant")) {
+            related.push("[[qdrant-collections]]");
+        }
+        if files_changed.iter().any(|f| f.contains("knowledge")) {
+            related.push("[[knowledge-base-funzionamento]]");
+        }
+        if files_changed.iter().any(|f| f.contains("meta_docs") || f.contains("meta-docs")) {
+            related.push("[[meta-vault-architettura]]");
+        }
+        if files_changed.iter().any(|f| f.contains("routing") || f.contains("provider")) {
+            related.push("[[multi-provider-routing]]");
+            related.push("[[routing-matrix]]");
+        }
+        if !related.is_empty() {
+            body.push_str("\n## Documenti correlati\n\n");
+            for r in related {
+                body.push_str("- ");
+                body.push_str(r);
+                body.push('\n');
+            }
+        }
+
         let vault_file_path =
             super::super::vault::build_vault_path("changelog", &slug, &processed_at);
 

@@ -150,6 +150,46 @@ pub async fn apply_generated_doc(
         .context("INSERT nexus_meta_docs")?;
     }
 
+    // Genera embedding + upsert in Qdrant `nexus_meta_docs` per linking semantico
+    let embed_text = if doc.body_md.len() > 2000 {
+        &doc.body_md[..2000]
+    } else {
+        doc.body_md.as_str()
+    };
+    let combined = format!("{}\n\n{}", doc.title, embed_text);
+    match state.orchestrator.neural.embed_text("", &combined).await {
+        Ok(vector) => {
+            let point_id = doc_id.to_string();
+            let payload = serde_json::json!({
+                "doc_id": doc_id.to_string(),
+                "kind": doc.kind,
+                "slug": doc.slug,
+                "title": doc.title,
+            });
+            if let Err(e) = crate::vector_memory::upsert_meta_doc_point(
+                &state.db,
+                &point_id,
+                vector,
+                payload,
+            )
+            .await
+            {
+                tracing::debug!(slug = %doc.slug, error = %e, "meta-doc embed upsert fallito");
+            } else {
+                let _ = sqlx::query(
+                    "UPDATE nexus_meta_docs SET qdrant_point_id = $1 WHERE id = $2",
+                )
+                .bind(&point_id)
+                .bind(doc_id)
+                .execute(&state.db)
+                .await;
+            }
+        }
+        Err(e) => {
+            tracing::debug!(slug = %doc.slug, error = %e, "meta-doc embed fallito");
+        }
+    }
+
     Ok((doc_id, true))
 }
 

@@ -100,6 +100,7 @@ async fn generate_postgres_tables(ctx: &MetaDocContext<'_>) -> Result<String> {
 
     let mut out = String::with_capacity(8192);
     out.push_str("Tabelle attuali nello schema `public` di PostgreSQL. Generato automaticamente da `information_schema`.\n\n");
+    out.push_str("Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]], [[knowledge-base-funzionamento]], [[meta-vault-architettura]].\n\n");
 
     let mut current_table = String::new();
     for row in &rows {
@@ -156,6 +157,7 @@ async fn generate_migrations_log(ctx: &MetaDocContext<'_>) -> Result<String> {
 
     let mut out = String::with_capacity(4096);
     out.push_str("Cronologia migrazioni SQL in `db/migrations/`. Generato automaticamente.\n\n");
+    out.push_str("Vedi anche: [[postgres-tables]], [[nexus-architetturale]].\n\n");
     out.push_str("| File | Descrizione |\n");
     out.push_str("|---|---|\n");
     for (fname, desc) in &entries {
@@ -208,6 +210,6 @@ async fn generate_qdrant_collections(ctx: &MetaDocContext<'_>) -> Result<String>
         }
     }
 
-    out.push_str("\n---\n\nVedi anche [[crates-rust#vector_memory]] per l'uso programmatico delle collection.\n");
+    out.push_str("\n---\n\nVedi anche: [[crates-rust]], [[postgres-tables]], [[knowledge-base-funzionamento]], [[meta-vault-architettura]] per l'uso programmatico delle collection.\n");
     Ok(out)
 }

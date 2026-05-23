@@ -130,7 +130,7 @@ async fn generate_crates_rust(ctx: &MetaDocContext<'_>) -> Result<String> {
         out.push_str(&format!("| `{name}` | `{m}` | {desc} |\n"));
     }
 
-    out.push_str("\n---\n\nVedi anche:\n- [[crates-rust|mappa]] (questa pagina)\n- [[brain-python]]\n- [[frontend-nextjs]]\n");
+    out.push_str("\n---\n\nVedi anche:\n- [[overview]]\n- [[brain-python]]\n- [[frontend-nextjs]]\n- [[nexus-architetturale]]\n- [[pattern-learning-worker]]\n- [[pattern-mcp-tool]]\n- [[multi-provider-routing]]\n");
     Ok(out)
 }
 
@@ -174,6 +174,7 @@ async fn generate_brain_python(ctx: &MetaDocContext<'_>) -> Result<String> {
 
     let mut out = String::new();
     out.push_str("Mappa modulare di `brain/` (Python + FastAPI + LangGraph). Generato automaticamente.\n\n");
+    out.push_str("Vedi anche: [[crates-rust]], [[overview]], [[multi-provider-routing]], [[nexus-architetturale]].\n\n");
     out.push_str("## Top-level modules\n\n");
     for m in &top_modules {
         out.push_str(&format!("### `{m}/`\n\n"));
@@ -217,6 +218,7 @@ async fn generate_frontend(ctx: &MetaDocContext<'_>) -> Result<String> {
     let apps_dir = format!("{}/apps", ctx.repo_root);
     let mut out = String::new();
     out.push_str("Mappa delle app frontend / TS in `apps/`. Generato automaticamente dai `package.json`.\n\n");
+    out.push_str("Vedi anche: [[crates-rust]], [[overview]], [[nexus-architetturale]], [[knowledge-base-funzionamento]].\n\n");
     out.push_str("| App | Name | Versione | Descrizione |\n");
     out.push_str("|---|---|---|---|\n");
 
