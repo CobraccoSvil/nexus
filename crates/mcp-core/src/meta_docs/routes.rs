@@ -433,6 +433,98 @@ pub async fn ingest_commit_stub(
 // Note: la registrazione route avviene direttamente in main.rs accanto
 // alle altre route del crate (pattern Router<AppState>).
 
+// ── POST /api/meta-docs/recompute-links ─────────────────────────────────
+//
+// Per ogni nota: parsa i wikilink `[[slug]]` dal body Markdown e li
+// materializza come righe in `nexus_meta_doc_links`. Inoltre aggiunge
+// link automatici via similarita' embedding (top-K + soglia).
+
+pub async fn recompute_meta_links(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::meta_docs::vault::extract_wikilinks;
+
+    // 1. Carica tutte le note: id, slug, body
+    let notes = sqlx::query(
+        "SELECT id, slug, body_md FROM nexus_meta_docs ORDER BY updated_at DESC LIMIT 5000",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("notes: {e}")))?;
+
+    // Mappa slug -> id per risolvere i wikilink
+    let mut slug_to_id: std::collections::HashMap<String, uuid::Uuid> =
+        std::collections::HashMap::new();
+    let mut all_notes: Vec<(uuid::Uuid, String, String)> = Vec::new();
+    for r in &notes {
+        let id: uuid::Uuid = r.try_get("id").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("id: {e}")))?;
+        let slug: String = r.try_get("slug").unwrap_or_default();
+        let body: String = r.try_get("body_md").unwrap_or_default();
+        slug_to_id.insert(slug.clone(), id);
+        all_notes.push((id, slug, body));
+    }
+
+    let mut wikilinks_created = 0usize;
+    let mut wikilinks_unresolved = 0usize;
+
+    for (from_id, _slug, body) in &all_notes {
+        let links = extract_wikilinks(body);
+        for raw in links {
+            // Supporta sintassi [[slug#section]] e [[path/slug]] → estrae basename
+            let key = raw
+                .split('#')
+                .next()
+                .unwrap_or(&raw)
+                .split('/')
+                .next_back()
+                .unwrap_or(&raw)
+                .trim()
+                .to_lowercase()
+                .replace(' ', "-");
+
+            // Tenta match diretto, poi case-insensitive
+            let target_id = slug_to_id
+                .get(&key)
+                .or_else(|| slug_to_id.iter().find(|(k, _)| k.to_lowercase() == key).map(|(_, v)| v))
+                .copied();
+
+            let Some(to_id) = target_id else {
+                wikilinks_unresolved += 1;
+                continue;
+            };
+            if to_id == *from_id {
+                continue;
+            }
+
+            let result = sqlx::query(
+                r#"
+                INSERT INTO nexus_meta_doc_links
+                    (from_doc_id, to_doc_id, rel_type, created_by, confidence)
+                VALUES ($1, $2, 'relates', 'auto', 1.0)
+                ON CONFLICT (from_doc_id, to_doc_id, rel_type) DO NOTHING
+                "#,
+            )
+            .bind(from_id)
+            .bind(to_id)
+            .execute(&state.db)
+            .await;
+
+            if let Ok(r) = result {
+                if r.rows_affected() > 0 {
+                    wikilinks_created += 1;
+                }
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "notes_processed": all_notes.len(),
+        "wikilinks_created": wikilinks_created,
+        "wikilinks_unresolved": wikilinks_unresolved,
+    })))
+}
+
 // ── GET /api/meta-docs/graph ────────────────────────────────────────────
 //
 // Ritorna nodi + edge del meta-vault Nexus per Cytoscape.

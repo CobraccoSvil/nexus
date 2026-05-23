@@ -1467,6 +1467,20 @@ async fn main() -> anyhow::Result<()> {
                 )),
             )
             .route(
+                "/api/projects/:id/knowledge/recompute-links",
+                post(knowledge::routes::recompute_links).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/projects/:id/knowledge/notes/manual",
+                post(knowledge::routes::create_note_manual).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
                 "/api/projects/:id/knowledge/obsidian-vault",
                 get(knowledge::routes::get_obsidian_vault)
                     .put(knowledge::routes::put_obsidian_vault)
@@ -1504,6 +1518,13 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/meta-docs/graph",
                 get(meta_docs::routes::graph_handler).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/meta-docs/recompute-links",
+                post(meta_docs::routes::recompute_meta_links).layer(axum_mw::from_fn_with_state(
                     state.clone(),
                     middleware::require_auth,
                 )),

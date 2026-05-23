@@ -239,6 +239,131 @@ struct NoteForLinking {
     qdrant_point_id: Option<String>,
 }
 
+/// Esegue il calcolo link su TUTTE le note di un progetto specifico (senza filtro temporale).
+/// Usato dall'endpoint `POST /api/projects/:id/knowledge/recompute-links`.
+///
+/// Restituisce `(notes_processed, links_created)`.
+pub async fn recompute_links_for_project(
+    db: &PgPool,
+    neural: &NeuralCoreClient,
+    project_channels: &nexus_events::ProjectChannels,
+    project_id: Uuid,
+) -> anyhow::Result<(usize, usize)> {
+    let threshold = read_f64_setting(
+        db,
+        "knowledge.autolink_threshold",
+        DEFAULT_AUTOLINK_THRESHOLD,
+    )
+    .await;
+
+    let notes = sqlx::query_as::<_, NoteForLinking>(
+        r#"
+        SELECT id, project_id, title, body_md, qdrant_point_id
+        FROM project_knowledge_notes
+        WHERE project_id = $1
+          AND status IN ('draft', 'active')
+          AND qdrant_point_id IS NOT NULL
+        ORDER BY updated_at DESC
+        LIMIT 500
+        "#,
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await
+    .context("recompute: lettura note fallita")?;
+
+    let mut links_created: usize = 0;
+
+    for note in &notes {
+        let embed_text = if note.body_md.len() > 2000 {
+            &note.body_md[..2000]
+        } else {
+            &note.body_md
+        };
+        let vector = match neural.embed_text("", embed_text).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let hits = match crate::vector_memory::search_knowledge_points(
+            db,
+            vector,
+            note.project_id,
+            10,
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+
+        for hit in &hits {
+            if hit.score < threshold {
+                continue;
+            }
+            let target_note_id = match hit
+                .payload
+                .get("note_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<Uuid>().ok())
+            {
+                Some(id) if id != note.id => id,
+                _ => continue,
+            };
+
+            let link_id = Uuid::new_v4();
+            let confidence = hit.score as f32;
+            let result = sqlx::query(
+                r#"
+                INSERT INTO project_knowledge_links (
+                    id, project_id, from_note_id, to_note_id,
+                    rel_type, created_by, confidence, created_at
+                )
+                VALUES ($1, $2, $3, $4, 'relates', 'auto', $5, NOW())
+                ON CONFLICT (from_note_id, to_note_id, rel_type)
+                DO UPDATE SET confidence = GREATEST(
+                    project_knowledge_links.confidence,
+                    EXCLUDED.confidence
+                )
+                "#,
+            )
+            .bind(link_id)
+            .bind(note.project_id)
+            .bind(note.id)
+            .bind(target_note_id)
+            .bind(confidence)
+            .execute(db)
+            .await;
+
+            if let Ok(r) = result {
+                if r.rows_affected() > 0 {
+                    links_created += 1;
+                    let _ = nexus_events::dispatcher::emit(
+                        project_channels,
+                        note.project_id,
+                        nexus_events::ProjectEvent::KnowledgeLinkCreated {
+                            link_id,
+                            from: note.id,
+                            to: target_note_id,
+                            rel_type: "relates".to_string(),
+                            created_by: "auto".to_string(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        project_id = %project_id,
+        notes = notes.len(),
+        links_created,
+        "recompute_links_for_project: completato"
+    );
+
+    Ok((notes.len(), links_created))
+}
+
 // ======================================================================
 // KnowledgeCleanupWorker
 // ======================================================================

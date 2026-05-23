@@ -625,6 +625,159 @@ pub async fn list_tags(
     Ok(Json(json!({ "tags": tags })))
 }
 
+// ── POST /api/projects/:id/knowledge/recompute-links ─────────────────────
+//
+// Forza il ricalcolo dei link automatici su TUTTE le note del progetto
+// (no filtro temporale). Utile quando le note esistono ma il worker
+// periodico non ha ancora generato edge.
+
+pub async fn recompute_links(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(project_id): AxumPath<String>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&project_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    let (notes, links) = crate::knowledge_workers::recompute_links_for_project(
+        &state.db,
+        &state.orchestrator.neural,
+        &state.project_channels,
+        project_id,
+    )
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("recompute: {e}")))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "notes_processed": notes,
+        "links_created": links,
+    })))
+}
+
+// ── POST /api/projects/:id/knowledge/notes (creazione manuale nota) ──────
+//
+// Permette di creare note "funzionali" del progetto (requirement, feature,
+// decision, domain, user_story, architecture) non legate alla chat.
+
+#[derive(Deserialize)]
+pub struct CreateNoteBody {
+    pub title: String,
+    pub body_md: String,
+    /// intent semantico: feature, requirement, decision, domain, user_story, architecture, ...
+    pub intent: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub file_paths: Option<Vec<String>>,
+}
+
+pub async fn create_note_manual(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(project_id): AxumPath<String>,
+    Json(body): Json<CreateNoteBody>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&project_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    let title = body.title.trim();
+    if title.is_empty() || title.len() > 200 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Titolo obbligatorio (1-200 caratteri)",
+        ));
+    }
+    let body_md = body.body_md.trim();
+    if body_md.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Body obbligatorio"));
+    }
+
+    let note_id = Uuid::new_v4();
+    let tags = body.tags.unwrap_or_default();
+    let file_paths = body.file_paths.unwrap_or_default();
+    let intent = body.intent.unwrap_or_else(|| "feature".to_string());
+
+    // Genera embedding e popola Qdrant
+    let embed_text = if body_md.len() > 2000 { &body_md[..2000] } else { body_md };
+    let qdrant_point_id = match state.orchestrator.neural.embed_text("", embed_text).await {
+        Ok(vector) => {
+            let point_id = Uuid::new_v4().to_string();
+            let payload = json!({
+                "project_id": project_id.to_string(),
+                "note_id": note_id.to_string(),
+                "intent": intent,
+                "status": "active",
+            });
+            match crate::vector_memory::upsert_knowledge_point(&state.db, &point_id, vector, payload).await {
+                Ok(_) => Some(point_id),
+                Err(e) => {
+                    tracing::warn!(error = %e, "knowledge create_note_manual: upsert Qdrant fallito");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "knowledge create_note_manual: embed fallito");
+            None
+        }
+    };
+
+    sqlx::query(
+        r#"
+        INSERT INTO project_knowledge_notes
+            (id, project_id, intent, title, body_md, status, qdrant_point_id, tags, file_paths)
+        VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8)
+        "#,
+    )
+    .bind(note_id)
+    .bind(project_id)
+    .bind(&intent)
+    .bind(title)
+    .bind(body_md)
+    .bind(qdrant_point_id.as_deref())
+    .bind(&tags)
+    .bind(&file_paths)
+    .execute(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("insert nota: {e}")))?;
+
+    // Aggiorna tag aggregati
+    for tag in &tags {
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO project_knowledge_tags (project_id, tag, note_count, last_used_at)
+            VALUES ($1, $2, 1, NOW())
+            ON CONFLICT (project_id, tag) DO UPDATE SET
+                note_count = project_knowledge_tags.note_count + 1,
+                last_used_at = NOW()
+            "#,
+        )
+        .bind(project_id)
+        .bind(tag)
+        .execute(&state.db)
+        .await;
+    }
+
+    let _ = nexus_events::dispatcher::emit(
+        &state.project_channels,
+        project_id,
+        nexus_events::ProjectEvent::KnowledgeNoteCreated {
+            note_id,
+            title: title.to_string(),
+            intent: Some(intent.clone()),
+        },
+    );
+
+    Ok(Json(json!({
+        "ok": true,
+        "note_id": note_id,
+        "intent": intent,
+    })))
+}
+
 // ── GET/PUT /api/projects/:id/knowledge/obsidian-vault ───────────────────
 //
 // GET ritorna il nome del vault Obsidian configurato per il progetto.

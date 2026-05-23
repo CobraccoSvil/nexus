@@ -3771,6 +3771,25 @@ export async function getKnowledgeGraph(
   return fetchJson(`/api/projects/${projectId}/knowledge/graph${qs ? `?${qs}` : ""}`);
 }
 
+export async function recomputeKnowledgeLinks(
+  projectId: string,
+): Promise<{ ok: boolean; notes_processed: number; links_created: number }> {
+  return fetchJson(`/api/projects/${projectId}/knowledge/recompute-links`, {
+    method: "POST",
+    body: "{}",
+  });
+}
+
+export async function createKnowledgeNoteManual(
+  projectId: string,
+  body: { title: string; body_md: string; intent?: string; tags?: string[]; file_paths?: string[] },
+): Promise<{ ok: boolean; note_id: string; intent: string }> {
+  return fetchJson(`/api/projects/${projectId}/knowledge/notes/manual`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
 // ── Obsidian vault config (per progetto) ────────────────────────────────
 
 export async function getObsidianVaultName(projectId: string): Promise<{ obsidian_vault_name: string }> {
@@ -3884,6 +3903,15 @@ export async function getMetaDocsGraph(params?: { kind?: MetaDocKind }): Promise
   if (params?.kind) sp.set("kind", params.kind);
   const qs = sp.toString();
   return fetchJson(`/api/meta-docs/graph${qs ? `?${qs}` : ""}`);
+}
+
+export async function recomputeMetaDocsLinks(): Promise<{
+  ok: boolean;
+  notes_processed: number;
+  wikilinks_created: number;
+  wikilinks_unresolved: number;
+}> {
+  return fetchJson(`/api/meta-docs/recompute-links`, { method: "POST", body: "{}" });
 }
 
 // ── Change drafts (ChangeDrafter proposte di modifica) ─────────────────

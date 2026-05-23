@@ -6,6 +6,7 @@ import { KnowledgeGraph } from "./knowledge-graph";
 import {
   getObsidianVaultName,
   putObsidianVaultName,
+  recomputeKnowledgeLinks,
 } from "../../lib/api-client";
 
 interface Props {
@@ -30,6 +31,8 @@ export function GraphTab({ projectId, vaultPathHint }: Props) {
   const [savedVaultName, setSavedVaultName] = useState("");
   const [savingVault, setSavingVault] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [recomputing, setRecomputing] = useState(false);
+  const [recomputeMsg, setRecomputeMsg] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -53,6 +56,19 @@ export function GraphTab({ projectId, vaultPathHint }: Props) {
       setShowSettings(false);
     } finally {
       setSavingVault(false);
+    }
+  };
+
+  const handleRecompute = async () => {
+    setRecomputing(true);
+    setRecomputeMsg(null);
+    try {
+      const r = await recomputeKnowledgeLinks(projectId);
+      setRecomputeMsg(`${r.links_created} link su ${r.notes_processed} note`);
+    } catch (e) {
+      setRecomputeMsg("Errore: " + (e instanceof Error ? e.message : String(e)));
+    } finally {
+      setRecomputing(false);
     }
   };
 
@@ -113,6 +129,37 @@ export function GraphTab({ projectId, vaultPathHint }: Props) {
       >
         Apri in Obsidian
       </button>
+
+      <button
+        onClick={handleRecompute}
+        disabled={recomputing}
+        title="Ricalcola i link automatici tra le note del progetto"
+        style={{
+          width: "100%",
+          padding: "8px 12px",
+          fontSize: 12,
+          fontWeight: 600,
+          background: recomputing ? "#a3a3a3" : "#0ea5e9",
+          color: "#fff",
+          border: "none",
+          borderRadius: 8,
+          cursor: recomputing ? "default" : "pointer",
+          marginBottom: 8,
+        }}
+      >
+        {recomputing ? "Calcolo in corso..." : "Ricalcola link automatici"}
+      </button>
+      {recomputeMsg && (
+        <div
+          style={{
+            fontSize: 11,
+            color: recomputeMsg.startsWith("Errore") ? "#dc2626" : "#16a34a",
+            marginBottom: 6,
+          }}
+        >
+          {recomputeMsg}
+        </div>
+      )}
 
       <button
         onClick={() => setShowSettings((v) => !v)}

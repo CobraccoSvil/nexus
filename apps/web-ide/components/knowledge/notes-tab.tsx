@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from "react";
 import { useI18n, type TranslationKey } from "../../lib/i18n";
 import {
   listKnowledgeNotes,
+  createKnowledgeNoteManual,
   type KnowledgeNote,
 } from "../../lib/api-client";
 
@@ -22,6 +23,19 @@ interface Props {
 
 const STATUS_OPTIONS = ["", "active", "draft", "archived", "deprecated"];
 
+const INTENT_OPTIONS = [
+  { value: "feature", label: "Feature" },
+  { value: "requirement", label: "Requirement" },
+  { value: "decision", label: "Decisione" },
+  { value: "domain", label: "Dominio" },
+  { value: "user_story", label: "User story" },
+  { value: "architecture", label: "Architettura" },
+  { value: "fix", label: "Fix" },
+  { value: "refactor", label: "Refactor" },
+  { value: "docs", label: "Doc" },
+  { value: "other", label: "Altro" },
+];
+
 export function NotesTab({ projectId }: Props) {
   const { t } = useI18n();
   const knowledgeChanged = useProjectStore(selectKnowledgeChangedAt);
@@ -31,6 +45,13 @@ export function NotesTab({ projectId }: Props) {
   const [statusFilter, setStatusFilter] = useState("");
   const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [newTitle, setNewTitle] = useState("");
+  const [newBody, setNewBody] = useState("");
+  const [newIntent, setNewIntent] = useState("feature");
+  const [newTags, setNewTags] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
   const limit = 20;
 
   const load = useCallback(async () => {
@@ -52,6 +73,39 @@ export function NotesTab({ projectId }: Props) {
 
   useEffect(() => { load(); }, [load, knowledgeChanged]);
 
+  const submitNewNote = async () => {
+    const title = newTitle.trim();
+    const body = newBody.trim();
+    if (!title || !body) {
+      setCreateError("Titolo e contenuto sono obbligatori");
+      return;
+    }
+    setCreating(true);
+    setCreateError(null);
+    try {
+      const tags = newTags
+        .split(/[,\s]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      await createKnowledgeNoteManual(projectId, {
+        title,
+        body_md: body,
+        intent: newIntent,
+        tags,
+      });
+      setNewTitle("");
+      setNewBody("");
+      setNewTags("");
+      setNewIntent("feature");
+      setCreateOpen(false);
+      await load();
+    } catch (e) {
+      setCreateError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCreating(false);
+    }
+  };
+
   if (selectedNoteId) {
     return (
       <NoteDetail
@@ -64,6 +118,127 @@ export function NotesTab({ projectId }: Props) {
 
   return (
     <div style={{ padding: 12 }}>
+      {/* Pulsante "Nuova nota funzionale" */}
+      <button
+        onClick={() => setCreateOpen((v) => !v)}
+        style={{
+          width: "100%",
+          padding: "8px 12px",
+          fontSize: 12,
+          fontWeight: 600,
+          background: createOpen ? "#525252" : "#16a34a",
+          color: "#fff",
+          border: "none",
+          borderRadius: 6,
+          cursor: "pointer",
+          marginBottom: 10,
+        }}
+      >
+        {createOpen ? "Annulla" : "+ Nuova nota funzionale"}
+      </button>
+
+      {createOpen && (
+        <div
+          style={{
+            padding: 10,
+            border: "1px solid #d4d4d4",
+            borderRadius: 8,
+            background: "#fafafa",
+            marginBottom: 12,
+          }}
+        >
+          <input
+            value={newTitle}
+            onChange={(e) => setNewTitle(e.target.value)}
+            placeholder="Titolo (es. Login con Google)"
+            style={{
+              width: "100%",
+              padding: "5px 8px",
+              fontSize: 12,
+              border: "1px solid #d4d4d4",
+              borderRadius: 6,
+              outline: "none",
+              boxSizing: "border-box",
+              marginBottom: 6,
+            }}
+          />
+          <select
+            value={newIntent}
+            onChange={(e) => setNewIntent(e.target.value)}
+            style={{
+              width: "100%",
+              padding: "5px 8px",
+              fontSize: 12,
+              border: "1px solid #d4d4d4",
+              borderRadius: 6,
+              outline: "none",
+              boxSizing: "border-box",
+              marginBottom: 6,
+              background: "#fff",
+            }}
+          >
+            {INTENT_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+          <textarea
+            value={newBody}
+            onChange={(e) => setNewBody(e.target.value)}
+            placeholder="Contenuto Markdown..."
+            rows={6}
+            style={{
+              width: "100%",
+              padding: "5px 8px",
+              fontSize: 12,
+              border: "1px solid #d4d4d4",
+              borderRadius: 6,
+              outline: "none",
+              boxSizing: "border-box",
+              fontFamily: "Menlo, monospace",
+              resize: "vertical",
+              marginBottom: 6,
+            }}
+          />
+          <input
+            value={newTags}
+            onChange={(e) => setNewTags(e.target.value)}
+            placeholder="Tag separati da virgola (opzionale)"
+            style={{
+              width: "100%",
+              padding: "5px 8px",
+              fontSize: 12,
+              border: "1px solid #d4d4d4",
+              borderRadius: 6,
+              outline: "none",
+              boxSizing: "border-box",
+              marginBottom: 6,
+            }}
+          />
+          {createError && (
+            <div style={{ fontSize: 11, color: "#dc2626", marginBottom: 6 }}>{createError}</div>
+          )}
+          <button
+            onClick={submitNewNote}
+            disabled={creating}
+            style={{
+              width: "100%",
+              padding: "6px 12px",
+              fontSize: 12,
+              fontWeight: 600,
+              background: creating ? "#a3a3a3" : "#171717",
+              color: "#fff",
+              border: "none",
+              borderRadius: 6,
+              cursor: creating ? "default" : "pointer",
+            }}
+          >
+            {creating ? "Salvataggio..." : "Salva nota"}
+          </button>
+        </div>
+      )}
+
       {/* Filtri */}
       <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
         {STATUS_OPTIONS.map((s) => (

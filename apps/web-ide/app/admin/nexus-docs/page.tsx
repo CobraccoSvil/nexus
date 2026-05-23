@@ -22,6 +22,7 @@ import {
   listMetaDocs,
   getMetaDoc,
   triggerMetaDocsRefresh,
+  recomputeMetaDocsLinks,
   type MetaDocSummary,
   type MetaDocDetail,
   type MetaDocKind,
@@ -68,6 +69,8 @@ export default function NexusDocsAdminPage() {
   const [graphOpen, setGraphOpen] = useState(false);
   const [vaultName, setVaultName] = useState("");
   const [showVaultSettings, setShowVaultSettings] = useState(false);
+  const [recomputingLinks, setRecomputingLinks] = useState(false);
+  const [recomputeMsg, setRecomputeMsg] = useState<string | null>(null);
 
   useEffect(() => {
     try {
@@ -122,6 +125,21 @@ export default function NexusDocsAdminPage() {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setRefreshing(false);
+    }
+  };
+
+  const handleRecomputeLinks = async () => {
+    setRecomputingLinks(true);
+    setRecomputeMsg(null);
+    try {
+      const r = await recomputeMetaDocsLinks();
+      setRecomputeMsg(
+        `${r.wikilinks_created} link creati su ${r.notes_processed} note. ${r.wikilinks_unresolved} wikilink non risolti.`,
+      );
+    } catch (e) {
+      setRecomputeMsg("Errore: " + (e instanceof Error ? e.message : String(e)));
+    } finally {
+      setRecomputingLinks(false);
     }
   };
 
@@ -201,6 +219,23 @@ export default function NexusDocsAdminPage() {
           }}
         >
           Mostra grafo
+        </button>
+        <button
+          onClick={handleRecomputeLinks}
+          disabled={recomputingLinks}
+          title="Parsa i wikilink [[...]] nei body delle note e crea le relazioni nel DB"
+          style={{
+            padding: "8px 14px",
+            fontSize: 13,
+            fontWeight: 600,
+            background: recomputingLinks ? tc.bgHover : "#0ea5e9",
+            color: "#fff",
+            border: "none",
+            borderRadius: 8,
+            cursor: recomputingLinks ? "default" : "pointer",
+          }}
+        >
+          {recomputingLinks ? "Calcolo..." : "Ricalcola link"}
         </button>
         <button
           onClick={() => openInObsidian()}
@@ -512,9 +547,47 @@ export default function NexusDocsAdminPage() {
               <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 12 }}>
                 {selected.vault_file_path}
               </div>
-              <div style={{ fontSize: 13, lineHeight: 1.6 }}>
+              <div
+                style={{ fontSize: 13, lineHeight: 1.6 }}
+                className="meta-docs-md"
+              >
                 <MarkdownBlock content={selected.body_md} skipNormalize />
               </div>
+              <style jsx>{`
+                .meta-docs-md :global(code) {
+                  background: transparent !important;
+                  padding: 0 !important;
+                  border: none !important;
+                  font-family: "JetBrains Mono", "Fira Code", monospace !important;
+                  font-size: 12px !important;
+                  color: ${tc.textSecondary} !important;
+                }
+                .meta-docs-md :global(li code),
+                .meta-docs-md :global(p code) {
+                  background: ${tc.bgHover} !important;
+                  padding: 1px 5px !important;
+                  border-radius: 3px !important;
+                }
+                .meta-docs-md :global(table) {
+                  border-collapse: collapse;
+                  margin: 8px 0;
+                  font-size: 12px;
+                }
+                .meta-docs-md :global(th),
+                .meta-docs-md :global(td) {
+                  border: 1px solid ${tc.border};
+                  padding: 4px 8px;
+                  text-align: left;
+                }
+                .meta-docs-md :global(h2) {
+                  font-size: 15px;
+                  margin: 16px 0 6px;
+                }
+                .meta-docs-md :global(h3) {
+                  font-size: 13px;
+                  margin: 12px 0 4px;
+                }
+              `}</style>
               {(selected.incoming_links?.length ?? 0) > 0 && (
                 <div style={{ marginTop: 20, paddingTop: 12, borderTop: `1px solid ${tc.border}` }}>
                   <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>Backlinks</div>
