@@ -6,12 +6,11 @@ slug: qdrant-collections
 tags:
   - schema
   - qdrant
-source_commit: 3deaf53b5cafe303c52068cbfbac92125e4fd86e
 source_files:
   - crates/mcp-core/src/vector_memory.rs
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T10:09:38Z
+updated_at: 2026-05-23T11:11:50Z
 nexus_meta_version: 1
 ---
 
@@ -32,4 +31,4 @@ Collection Qdrant attualmente create. Generato chiamando `GET /collections`.
 
 ---
 
-Vedi anche [[crates-rust#vector_memory]] per l'uso programmatico delle collection.
+Vedi anche: [[crates-rust]], [[postgres-tables]], [[knowledge-base-funzionamento]], [[meta-vault-architettura]] per l'uso programmatico delle collection.

@@ -412,7 +412,7 @@ export default function NexusDocsAdminPage() {
       <div style={{ display: "flex", gap: 16, minHeight: 480 }}>
         <div
           style={{
-            flex: "0 0 380px",
+            flex: "0 0 440px",
             display: "flex",
             flexDirection: "column",
             gap: 0,
@@ -440,7 +440,7 @@ export default function NexusDocsAdminPage() {
                 className="admin-doc-row"
                 style={{
                   textAlign: "left",
-                  padding: "8px 12px",
+                  padding: "10px 14px",
                   border: "none",
                   borderTop: idx === 0 ? "none" : `1px solid ${tc.border}`,
                   borderLeft: `3px solid ${selected ? KIND_COLORS[it.kind] : "transparent"}`,
@@ -451,13 +451,23 @@ export default function NexusDocsAdminPage() {
                   minWidth: 0,
                   color: tc.text,
                   transition: "background 0.12s, border-left-color 0.12s",
+                  display: "block",
+                  width: "100%",
                 }}
               >
-                <div style={{ display: "flex", gap: 10, alignItems: "center", minWidth: 0 }}>
+                <div
+                  style={{
+                    display: "flex",
+                    gap: 10,
+                    alignItems: "center",
+                    minWidth: 0,
+                    overflow: "hidden",
+                  }}
+                >
                   <span
                     style={{
-                      width: 8,
-                      height: 8,
+                      width: 9,
+                      height: 9,
                       borderRadius: "50%",
                       background: KIND_COLORS[it.kind],
                       flexShrink: 0,
@@ -468,26 +478,46 @@ export default function NexusDocsAdminPage() {
                     style={{
                       fontWeight: selected ? 600 : 500,
                       fontSize: 13,
+                      lineHeight: 1.35,
                       overflow: "hidden",
                       textOverflow: "ellipsis",
                       whiteSpace: "nowrap",
                       flex: 1,
                       minWidth: 0,
+                      color: tc.text,
                     }}
                     title={it.title}
                   >
                     {it.title}
                   </span>
+                </div>
+                <div
+                  style={{
+                    marginTop: 4,
+                    marginLeft: 19,
+                    fontSize: 10,
+                    color: tc.textMuted,
+                    display: "flex",
+                    gap: 6,
+                    overflow: "hidden",
+                    minWidth: 0,
+                  }}
+                >
+                  <span style={{ flexShrink: 0, fontWeight: 600, letterSpacing: 0.4 }}>
+                    {KIND_LABELS[it.kind].toUpperCase()}
+                  </span>
+                  <span style={{ flexShrink: 0 }}>·</span>
                   <span
                     style={{
-                      fontSize: 9,
-                      color: tc.textMuted,
-                      flexShrink: 0,
-                      textTransform: "uppercase",
-                      letterSpacing: 0.6,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      minWidth: 0,
+                      fontFamily: "JetBrains Mono, Fira Code, monospace",
                     }}
+                    title={it.vault_file_path}
                   >
-                    {KIND_LABELS[it.kind]}
+                    {it.vault_file_path}
                   </span>
                 </div>
               </button>

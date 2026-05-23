@@ -6,16 +6,17 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: 3deaf53b5cafe303c52068cbfbac92125e4fd86e
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T10:09:38Z
+updated_at: 2026-05-23T11:11:50Z
 nexus_meta_version: 1
 ---
 
 Cronologia migrazioni SQL in `db/migrations/`. Generato automaticamente.
+
+Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 
 | File | Descrizione |
 |---|---|
