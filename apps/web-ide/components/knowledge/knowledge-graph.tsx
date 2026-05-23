@@ -20,7 +20,6 @@ import {
   getMetaDocsGraph,
   type KnowledgeGraphData,
   type MetaDocsGraphData,
-  type MetaDocKind,
 } from "../../lib/api-client";
 
 cytoscape.use(coseBilkent);
