@@ -6,18 +6,18 @@ slug: rest-endpoints
 tags:
   - api
   - rest
-source_commit: 3d8bab3a5bf856c05d0f7967dd6ccee6ced0c5b0
+source_commit: 5e78f4566b1dabad67e2e8669f8b2c91dc9b7130
 source_files:
   - crates/mcp-core/src/main.rs
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T13:27:07Z
+updated_at: 2026-05-23T18:11:15Z
 nexus_meta_version: 1
 ---
 
 Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src/main.rs`.
 
-**Totale endpoint**: 251
+**Totale endpoint**: 254
 
 Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]].
 
@@ -323,6 +323,9 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 | `POST` | `/api/projects/:id/github/publish` | `github::github_publish_project` |
 | `POST` | `/api/projects/:id/github/publish-branch` | `github::github_publish_branch` |
 | `POST` | `/api/projects/:id/github/pull-request` | `github::github_create_pull_request` |
+| `POST` | `/api/projects/:id/knowledge/extract-functional` | `knowledge::routes::extract_functional_handler` |
+| `POST` | `/api/projects/:id/knowledge/generate-rich` | `knowledge::routes::generate_rich_kb` |
+| `POST` | `/api/projects/:id/knowledge/init-or-refresh` | `knowledge::routes::init_or_refresh_knowledge` |
 | `POST` | `/api/projects/:id/knowledge/links` | `knowledge::routes::create_link` |
 | `POST` | `/api/projects/:id/knowledge/notes/manual` | `knowledge::routes::create_note_manual` |
 | `POST` | `/api/projects/:id/knowledge/rebuild` | `knowledge::routes::rebuild_knowledge` |

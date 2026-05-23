@@ -6,12 +6,12 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: 3d8bab3a5bf856c05d0f7967dd6ccee6ced0c5b0
+source_commit: ba9fc87e7ec6685d8fc38dbcf6f88c6202ebe9f1
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T13:27:05Z
+updated_at: 2026-05-23T15:32:18Z
 nexus_meta_version: 1
 ---
 
@@ -196,7 +196,8 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0177_nexus_meta_docs.sql` | Migrazione meta-docs vault: documentazione del meta-progetto Nexus |
 | `0178_obsidian_vault_name.sql` | Migrazione: registra il nome del vault Obsidian per il meta-vault Nexus e per |
 | `0179_kb_context_injection.sql` | Knowledge Base context injection nel system prompt agente. |
+| `0180_project_kb_kind.sql` | Aggiunge colonna `kind` a project_knowledge_notes per supportare note |
 
-**Totale**: 175 migrazioni.
+**Totale**: 176 migrazioni.
 
-Ultima migrazione: `0179_kb_context_injection.sql`.
+Ultima migrazione: `0180_project_kb_kind.sql`.
