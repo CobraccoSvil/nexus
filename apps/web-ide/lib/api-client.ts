@@ -3825,6 +3825,47 @@ export async function extractFunctionalSpecs(
   });
 }
 
+/**
+ * Endpoint unificato: inizializza o aggiorna l'intera KB del progetto in
+ * un solo colpo (resiliente). Sostituisce il flusso a tre tasti.
+ *
+ * Pipeline interna:
+ *   1. FunctionalSpecAgent (chat + file `.md`/sorgenti) → note kind=functional
+ *   2. 3 generator (technical/functional/test)
+ *   3. Rebuild idempotente da chat_messages user
+ *   4. Ricalcolo link automatici
+ */
+export async function initOrRefreshKnowledge(
+  projectId: string,
+  opts?: { reset?: boolean; chat_limit?: number; files_limit?: number },
+): Promise<{
+  ok: boolean;
+  reset: boolean;
+  deleted_notes: number;
+  functional_agent: {
+    messages_scanned?: number;
+    messages_with_specs?: number;
+    files_scanned?: number;
+    files_with_specs?: number;
+    specs_extracted?: number;
+    specs_applied?: number;
+    llm_errors?: number;
+  };
+  generators: { notes_generated?: number; notes_applied?: number };
+  rebuild_from_chat: { messages_total?: number; notes_created?: number };
+  links: { notes_processed?: number; links_created?: number };
+  warnings: string[];
+}> {
+  return fetchJson(`/api/projects/${projectId}/knowledge/init-or-refresh`, {
+    method: "POST",
+    body: JSON.stringify({
+      reset: opts?.reset ?? false,
+      chat_limit: opts?.chat_limit ?? 100,
+      files_limit: opts?.files_limit ?? 80,
+    }),
+  });
+}
+
 export async function createKnowledgeNoteManual(
   projectId: string,
   body: { title: string; body_md: string; intent?: string; tags?: string[]; file_paths?: string[] },

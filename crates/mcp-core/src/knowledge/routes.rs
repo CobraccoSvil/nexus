@@ -894,6 +894,222 @@ pub async fn rebuild_knowledge(
     })))
 }
 
+// ── POST /api/projects/:id/knowledge/init-or-refresh ────────────────────
+//
+// **Endpoint unificato** per inizializzare o aggiornare la Knowledge Base
+// del progetto in un solo colpo, in modo resiliente (gli errori parziali
+// non fanno fallire l'intero processo). Sostituisce il flusso a tre tasti:
+//   1. Estrai spec funzionali (chat + file `.md` + sorgenti rilevanti)
+//   2. Genera note arricchite tech/functional/test via i 3 generator
+//   3. Rebuild idempotente da chat_messages user non ancora notati
+//   4. Ricalcola i link automatici sulle note risultanti
+//
+// Body opzionale `{ "reset": true }` cancella PRIMA tutte le note auto
+// (action distruttiva, mantiene solo quelle curate manualmente).
+//
+// Risposta: stats per ogni fase + warning se qualche step ha fallito.
+
+#[derive(Deserialize)]
+pub struct InitRefreshBody {
+    /// Se true, cancella tutte le note auto (`source_message_id IS NOT NULL`
+    /// o kind in tech/functional/test) prima della rigenerazione.
+    pub reset: Option<bool>,
+    /// Quanti chat_messages processare per l'extract LLM (default 100, max 500).
+    pub chat_limit: Option<i64>,
+    /// Massimo file da analizzare per spec funzionali (default 80, max 300).
+    pub files_limit: Option<usize>,
+}
+
+pub async fn init_or_refresh_knowledge(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(project_id): AxumPath<String>,
+    body: Option<Json<InitRefreshBody>>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&project_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    let body = body.map(|Json(b)| b).unwrap_or(InitRefreshBody {
+        reset: None,
+        chat_limit: None,
+        files_limit: None,
+    });
+    let reset = body.reset.unwrap_or(false);
+    let chat_limit = body.chat_limit;
+    let files_limit = body.files_limit;
+
+    let mut warnings: Vec<String> = Vec::new();
+    let mut deleted_count: u64 = 0;
+
+    // Fase 0: reset opzionale (mantiene note manuali con source_message_id NULL
+    // e kind non in tech/functional/test)
+    if reset {
+        match sqlx::query(
+            r#"
+            DELETE FROM project_knowledge_notes
+            WHERE project_id = $1
+              AND (
+                source_message_id IS NOT NULL
+                OR kind IN ('technical','functional','test')
+              )
+            "#,
+        )
+        .bind(project_id)
+        .execute(&state.db)
+        .await
+        {
+            Ok(r) => {
+                deleted_count = r.rows_affected();
+                tracing::info!(project_id = %project_id, deleted = deleted_count, "init-or-refresh: reset");
+            }
+            Err(e) => warnings.push(format!("reset fallito: {e}")),
+        }
+    }
+
+    // Fase 1: FunctionalSpecAgent (chat + file)
+    let mut functional_stats = json!({});
+    match crate::knowledge::functional_spec_agent::extract_functional_specs_for_project(
+        &state,
+        project_id,
+        chat_limit,
+        true,
+        files_limit,
+    )
+    .await
+    {
+        Ok(s) => {
+            functional_stats = json!({
+                "messages_scanned": s.messages_scanned,
+                "messages_with_specs": s.messages_with_specs,
+                "files_scanned": s.files_scanned,
+                "files_with_specs": s.files_with_specs,
+                "specs_extracted": s.specs_extracted,
+                "specs_applied": s.specs_applied,
+                "llm_errors": s.llm_errors,
+            });
+        }
+        Err(e) => warnings.push(format!("functional spec agent: {e}")),
+    }
+
+    // Fase 2: 3 generator tech/functional/test
+    let mut generators_stats = json!({});
+    match crate::knowledge::generators::generate_and_apply_all(&state, project_id).await {
+        Ok((total, applied)) => {
+            generators_stats = json!({
+                "notes_generated": total,
+                "notes_applied": applied,
+            });
+        }
+        Err(e) => warnings.push(format!("generators: {e}")),
+    }
+
+    // Fase 3: rebuild idempotente da chat_messages
+    let mut rebuild_stats = json!({});
+    {
+        let rows_res = sqlx::query(
+            r#"
+            SELECT cm.id, cm.content, cm.metadata
+            FROM chat_messages cm
+            JOIN chat_sessions cs ON cs.id = cm.session_id
+            WHERE cs.project_id = $1
+              AND cm.role = 'user'
+              AND length(cm.content) >= 10
+              AND NOT EXISTS (
+                SELECT 1 FROM project_knowledge_notes n
+                WHERE n.source_message_id = cm.id
+              )
+            ORDER BY cm.created_at ASC
+            LIMIT 2000
+            "#,
+        )
+        .bind(project_id)
+        .fetch_all(&state.db)
+        .await;
+
+        match rows_res {
+            Ok(rows) => {
+                let repo_root: Option<String> = sqlx::query_scalar(
+                    "SELECT repository_root_path FROM projects WHERE id = $1",
+                )
+                .bind(project_id)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
+
+                let total = rows.len();
+                let mut processed = 0usize;
+                for row in rows {
+                    let message_id: Uuid = row.try_get("id").unwrap_or_else(|_| Uuid::nil());
+                    let content: String = row.try_get("content").unwrap_or_default();
+                    if content.trim().is_empty() {
+                        continue;
+                    }
+                    let metadata: serde_json::Value =
+                        row.try_get("metadata").unwrap_or(json!({}));
+                    let intent = metadata
+                        .get("intent")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    if let Err(e) = crate::knowledge::create_note_inner(
+                        &state.db,
+                        &state.orchestrator.neural,
+                        project_id,
+                        message_id,
+                        &content,
+                        intent.as_deref(),
+                        repo_root.as_deref(),
+                        &state.project_channels,
+                    )
+                    .await
+                    {
+                        tracing::debug!(message_id = %message_id, "init-refresh rebuild skip: {e}");
+                        continue;
+                    }
+                    processed += 1;
+                }
+                rebuild_stats = json!({
+                    "messages_total": total,
+                    "notes_created": processed,
+                });
+            }
+            Err(e) => warnings.push(format!("rebuild query: {e}")),
+        }
+    }
+
+    // Fase 4: ricalcolo link automatici (best-effort)
+    let mut links_stats = json!({});
+    match crate::knowledge_workers::recompute_links_for_project(
+        &state.db,
+        &state.orchestrator.neural,
+        &state.project_channels,
+        project_id,
+    )
+    .await
+    {
+        Ok((notes, links)) => {
+            links_stats = json!({
+                "notes_processed": notes,
+                "links_created": links,
+            });
+        }
+        Err(e) => warnings.push(format!("recompute links: {e}")),
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "reset": reset,
+        "deleted_notes": deleted_count,
+        "functional_agent": functional_stats,
+        "generators": generators_stats,
+        "rebuild_from_chat": rebuild_stats,
+        "links": links_stats,
+        "warnings": warnings,
+    })))
+}
+
 // ── POST /api/projects/:id/knowledge/generate-rich ───────────────────────
 //
 // Esegue i 3 generator (technical/functional/test) e UPSERT le note nella KB

@@ -5,8 +5,7 @@ import { useI18n, type TranslationKey } from "../../lib/i18n";
 import {
   listKnowledgeNotes,
   createKnowledgeNoteManual,
-  rebuildKnowledge,
-  extractFunctionalSpecs,
+  initOrRefreshKnowledge,
   type KnowledgeNote,
 } from "../../lib/api-client";
 
@@ -56,10 +55,8 @@ export function NotesTab({ projectId }: Props) {
   const [newTags, setNewTags] = useState("");
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
-  const [rebuilding, setRebuilding] = useState(false);
-  const [rebuildMsg, setRebuildMsg] = useState<string | null>(null);
-  const [extractingFunctional, setExtractingFunctional] = useState(false);
-  const [extractFunctionalMsg, setExtractFunctionalMsg] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshMsg, setRefreshMsg] = useState<string | null>(null);
   const limit = 20;
 
   const load = useCallback(async () => {
@@ -81,52 +78,45 @@ export function NotesTab({ projectId }: Props) {
 
   useEffect(() => { load(); }, [load, knowledgeChanged]);
 
-  const handleExtractFunctional = async () => {
-    const ok = await confirmDialog(
-      "Avviare l'agente di estrazione specifiche funzionali? Verranno scansionati: (1) i file .md e i sorgenti chiave del repository (route, handler, model, schema, migrations); (2) i messaggi user della chat. Per ogni feature/requirement/decision/user_story rilevata verra' creata o aggiornata una nota kind='functional'. Puo' richiedere diversi minuti.",
-      "Estrai specifiche funzionali",
-    );
-    if (!ok) return;
-    setExtractingFunctional(true);
-    setExtractFunctionalMsg(null);
-    try {
-      const r = await extractFunctionalSpecs(projectId, {
-        limit: 100,
-        include_files: true,
-        files_limit: 100,
-      });
-      setExtractFunctionalMsg(
-        `File: ${r.files_with_specs}/${r.files_scanned} con spec. Chat: ${r.messages_with_specs}/${r.messages_scanned} con spec. Note funzionali applicate: ${r.specs_applied}/${r.specs_extracted} (${r.links_created} link).`,
-      );
-      await load();
-    } catch (e) {
-      setExtractFunctionalMsg(
-        "Errore: " + (e instanceof Error ? e.message : String(e)),
-      );
-    } finally {
-      setExtractingFunctional(false);
-    }
-  };
-
-  const handleRebuild = async (reset: boolean) => {
+  // Inizializza o aggiorna l'intera KB in un solo flusso (resiliente).
+  // Esegue: (1) FunctionalSpecAgent (chat + file .md/sorgenti chiave),
+  // (2) 3 generator tech/functional/test, (3) rebuild idempotente da chat
+  // user, (4) ricalcolo link automatici. `reset` cancella prima le note auto.
+  const handleInitOrRefresh = async (reset: boolean) => {
     const confirmMsg = reset
-      ? "Cancellare TUTTE le note auto del progetto e ricostruirle dai messaggi chat? Le note curate manualmente NON saranno toccate."
-      : "Ricostruire le note KB mancanti dai messaggi chat? Le note esistenti non saranno modificate.";
-    const title = reset ? "Reset Knowledge Base" : "Rigenera Knowledge Base";
+      ? "RESET KB: cancellare TUTTE le note auto-generate (chat/technical/functional/test) e ricostruire la KB completa? Le note curate manualmente (kind diverso, source_message_id NULL) NON saranno toccate. L'agente LLM rianalizzera' file .md, sorgenti chiave e chat user."
+      : "Inizializzare/aggiornare la KB del progetto? L'agente LLM analizzera' i file .md, i sorgenti chiave (routes, handlers, models, schema, migrations), i messaggi chat user, e generera' note tech/functional/test arricchite. Le note esistenti vengono aggiornate, non duplicate. Puo' richiedere diversi minuti.";
+    const title = reset ? "Reset Knowledge Base" : "Inizializza / Aggiorna KB";
     const ok = await confirmDialog(confirmMsg, title);
     if (!ok) return;
-    setRebuilding(true);
-    setRebuildMsg(null);
+    setRefreshing(true);
+    setRefreshMsg(null);
     try {
-      const r = await rebuildKnowledge(projectId, { reset });
-      setRebuildMsg(
-        `Note create: ${r.notes_created}/${r.messages_total} (su ${r.linked_notes} note, ${r.links_created} link).`,
+      const r = await initOrRefreshKnowledge(projectId, {
+        reset,
+        chat_limit: 100,
+        files_limit: 100,
+      });
+      const f = r.functional_agent;
+      const g = r.generators;
+      const rb = r.rebuild_from_chat;
+      const l = r.links;
+      const warn = r.warnings?.length
+        ? ` Warning: ${r.warnings.join("; ")}`
+        : "";
+      setRefreshMsg(
+        `KB aggiornata.${reset ? ` Reset: ${r.deleted_notes} note rimosse.` : ""}` +
+          ` Agente funzionale: ${f.specs_applied ?? 0}/${f.specs_extracted ?? 0} spec applicate (file ${f.files_with_specs ?? 0}/${f.files_scanned ?? 0}, chat ${f.messages_with_specs ?? 0}/${f.messages_scanned ?? 0}).` +
+          ` Generator: ${g.notes_applied ?? 0}/${g.notes_generated ?? 0} note.` +
+          ` Rebuild chat: ${rb.notes_created ?? 0}/${rb.messages_total ?? 0}.` +
+          ` Link: ${l.links_created ?? 0} (${l.notes_processed ?? 0} note).` +
+          warn,
       );
       await load();
     } catch (e) {
-      setRebuildMsg("Errore: " + (e instanceof Error ? e.message : String(e)));
+      setRefreshMsg("Errore: " + (e instanceof Error ? e.message : String(e)));
     } finally {
-      setRebuilding(false);
+      setRefreshing(false);
     }
   };
 
@@ -175,97 +165,63 @@ export function NotesTab({ projectId }: Props) {
 
   return (
     <div style={{ padding: 12 }}>
-      {/* Azioni KB */}
-      <div style={{ display: "flex", gap: 4, marginBottom: 6, flexWrap: "wrap" }}>
+      {/* Azione KB unificata: un solo bottone primario fa tutto
+          (FunctionalSpecAgent + generators + rebuild chat + link).
+          Reset e' azione separata distruttiva. */}
+      <div style={{ display: "flex", gap: 4, marginBottom: 6 }}>
         <button
-          onClick={() => handleRebuild(false)}
-          disabled={rebuilding}
-          title="Ricostruisci le note mancanti dai messaggi chat (idempotente)"
+          onClick={() => handleInitOrRefresh(false)}
+          disabled={refreshing}
+          title="Inizializza o aggiorna la KB del progetto: scansiona file .md + sorgenti chiave, chat user, genera note tech/functional/test, ricalcola link. Idempotente."
           style={{
             flex: 1,
             minWidth: 0,
-            padding: "6px 10px",
-            fontSize: 11,
+            padding: "8px 12px",
+            fontSize: 12,
             fontWeight: 600,
-            background: rebuilding ? "#a3a3a3" : "#0ea5e9",
+            background: refreshing ? "#a3a3a3" : "#0ea5e9",
             color: "#fff",
             border: "none",
             borderRadius: 6,
-            cursor: rebuilding ? "default" : "pointer",
+            cursor: refreshing ? "default" : "pointer",
           }}
         >
-          {rebuilding ? "..." : "Rigenera KB"}
+          {refreshing ? "Aggiornamento in corso..." : "Inizializza / Aggiorna KB"}
         </button>
         <button
-          onClick={() => handleRebuild(true)}
-          disabled={rebuilding}
-          title="ATTENZIONE: cancella tutte le note auto e ricostruisce da zero"
+          onClick={() => handleInitOrRefresh(true)}
+          disabled={refreshing}
+          title="ATTENZIONE: cancella tutte le note auto-generate (chat/technical/functional/test) e ricostruisce la KB da zero"
           style={{
             flexShrink: 0,
-            padding: "6px 10px",
+            padding: "8px 10px",
             fontSize: 11,
             fontWeight: 600,
             background: "transparent",
             color: "#dc2626",
             border: "1px solid #dc2626",
             borderRadius: 6,
-            cursor: rebuilding ? "default" : "pointer",
+            cursor: refreshing ? "default" : "pointer",
           }}
         >
           Reset
         </button>
       </div>
 
-      {/* FunctionalSpecAgent — estrae feature/requirement/user_story dalla chat */}
-      <div style={{ display: "flex", gap: 4, marginBottom: 6 }}>
-        <button
-          onClick={handleExtractFunctional}
-          disabled={extractingFunctional}
-          title="Avvia l'agente che analizza i messaggi chat e crea note funzionali (feature, requirement, decision, user_story, domain)"
-          style={{
-            flex: 1,
-            minWidth: 0,
-            padding: "6px 10px",
-            fontSize: 11,
-            fontWeight: 600,
-            background: extractingFunctional ? "#a3a3a3" : "#7c3aed",
-            color: "#fff",
-            border: "none",
-            borderRadius: 6,
-            cursor: extractingFunctional ? "default" : "pointer",
-          }}
-        >
-          {extractingFunctional ? "Estrazione in corso..." : "Estrai spec funzionali (LLM)"}
-        </button>
-      </div>
-
-      {rebuildMsg && (
+      {refreshMsg && (
         <div
           style={{
             fontSize: 11,
-            color: rebuildMsg.startsWith("Errore") ? "#dc2626" : "#16a34a",
+            color: refreshMsg.startsWith("Errore") ? "#dc2626" : "#16a34a",
             marginBottom: 8,
             padding: 6,
-            background: rebuildMsg.startsWith("Errore") ? "#fef2f2" : "#f0fdf4",
+            background: refreshMsg.startsWith("Errore") ? "#fef2f2" : "#f0fdf4",
             borderRadius: 4,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
           }}
         >
-          {rebuildMsg}
-        </div>
-      )}
-
-      {extractFunctionalMsg && (
-        <div
-          style={{
-            fontSize: 11,
-            color: extractFunctionalMsg.startsWith("Errore") ? "#dc2626" : "#7c3aed",
-            marginBottom: 8,
-            padding: 6,
-            background: extractFunctionalMsg.startsWith("Errore") ? "#fef2f2" : "#f5f3ff",
-            borderRadius: 4,
-          }}
-        >
-          {extractFunctionalMsg}
+          {refreshMsg}
         </div>
       )}
 

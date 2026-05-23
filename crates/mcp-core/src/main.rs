@@ -1501,6 +1501,13 @@ async fn main() -> anyhow::Result<()> {
                 )),
             )
             .route(
+                "/api/projects/:id/knowledge/init-or-refresh",
+                post(knowledge::routes::init_or_refresh_knowledge).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
                 "/api/projects/:id/knowledge/notes/manual",
                 post(knowledge::routes::create_note_manual).layer(axum_mw::from_fn_with_state(
                     state.clone(),
