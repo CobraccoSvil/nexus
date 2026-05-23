@@ -3798,6 +3798,33 @@ export async function rebuildKnowledge(
   });
 }
 
+export async function extractFunctionalSpecs(
+  projectId: string,
+  opts?: { limit?: number; include_files?: boolean; files_limit?: number },
+): Promise<{
+  ok: boolean;
+  messages_scanned: number;
+  messages_skipped_short: number;
+  messages_with_specs: number;
+  files_scanned: number;
+  files_skipped_short: number;
+  files_with_specs: number;
+  specs_extracted: number;
+  specs_applied: number;
+  llm_errors: number;
+  linked_notes: number;
+  links_created: number;
+}> {
+  return fetchJson(`/api/projects/${projectId}/knowledge/extract-functional`, {
+    method: "POST",
+    body: JSON.stringify({
+      limit: opts?.limit ?? 50,
+      include_files: opts?.include_files ?? true,
+      files_limit: opts?.files_limit ?? 80,
+    }),
+  });
+}
+
 export async function createKnowledgeNoteManual(
   projectId: string,
   body: { title: string; body_md: string; intent?: string; tags?: string[]; file_paths?: string[] },

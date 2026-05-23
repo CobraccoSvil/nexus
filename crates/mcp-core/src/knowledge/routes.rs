@@ -1154,6 +1154,76 @@ pub async fn put_obsidian_vault(
     Ok(Json(json!({ "ok": true, "obsidian_vault_name": name })))
 }
 
+// ── POST /api/projects/:id/knowledge/extract-functional ──────────────────
+//
+// Esegue il FunctionalSpecAgent: scansiona i chat_messages user del progetto
+// e usa LLM (purpose `functional_spec_extractor`) per estrarre specifiche
+// funzionali concrete (feature/requirement/user_story/decision/domain/...).
+// Le specifiche estratte vengono materializzate come note kind='functional'
+// nella KB del progetto.
+
+#[derive(Deserialize)]
+pub struct ExtractFunctionalBody {
+    /// Quanti chat_messages user processare (default 50, max 500).
+    pub limit: Option<i64>,
+    /// Se true, scansiona anche i file `.md` + sorgenti chiave del repository
+    /// del progetto (default true — utile alla prima inizializzazione).
+    pub include_files: Option<bool>,
+    /// Massimo file da analizzare (default 80, max 300).
+    pub files_limit: Option<usize>,
+}
+
+pub async fn extract_functional_handler(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(project_id): AxumPath<String>,
+    body: Option<Json<ExtractFunctionalBody>>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&project_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    let (limit, include_files, files_limit) = body
+        .map(|Json(b)| (b.limit, b.include_files.unwrap_or(true), b.files_limit))
+        .unwrap_or((None, true, None));
+
+    let stats = crate::knowledge::functional_spec_agent::extract_functional_specs_for_project(
+        &state,
+        project_id,
+        limit,
+        include_files,
+        files_limit,
+    )
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("extract: {e}")))?;
+
+    // Dopo aver creato note funzionali, ricalcola i link
+    let (linked_notes, links_created) = crate::knowledge_workers::recompute_links_for_project(
+        &state.db,
+        &state.orchestrator.neural,
+        &state.project_channels,
+        project_id,
+    )
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("recompute links: {e}")))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "messages_scanned": stats.messages_scanned,
+        "messages_skipped_short": stats.messages_skipped_short,
+        "messages_with_specs": stats.messages_with_specs,
+        "files_scanned": stats.files_scanned,
+        "files_skipped_short": stats.files_skipped_short,
+        "files_with_specs": stats.files_with_specs,
+        "specs_extracted": stats.specs_extracted,
+        "specs_applied": stats.specs_applied,
+        "llm_errors": stats.llm_errors,
+        "linked_notes": linked_notes,
+        "links_created": links_created,
+    })))
+}
+
 // ── GET /api/projects/:id/knowledge/graph ────────────────────────────────
 //
 // Ritorna nodi + edge per la visualizzazione graph del Knowledge vault.

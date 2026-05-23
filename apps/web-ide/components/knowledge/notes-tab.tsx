@@ -6,6 +6,7 @@ import {
   listKnowledgeNotes,
   createKnowledgeNoteManual,
   rebuildKnowledge,
+  extractFunctionalSpecs,
   type KnowledgeNote,
 } from "../../lib/api-client";
 
@@ -57,6 +58,8 @@ export function NotesTab({ projectId }: Props) {
   const [createError, setCreateError] = useState<string | null>(null);
   const [rebuilding, setRebuilding] = useState(false);
   const [rebuildMsg, setRebuildMsg] = useState<string | null>(null);
+  const [extractingFunctional, setExtractingFunctional] = useState(false);
+  const [extractFunctionalMsg, setExtractFunctionalMsg] = useState<string | null>(null);
   const limit = 20;
 
   const load = useCallback(async () => {
@@ -77,6 +80,33 @@ export function NotesTab({ projectId }: Props) {
   }, [projectId, statusFilter, offset]);
 
   useEffect(() => { load(); }, [load, knowledgeChanged]);
+
+  const handleExtractFunctional = async () => {
+    const ok = await confirmDialog(
+      "Avviare l'agente di estrazione specifiche funzionali? Verranno scansionati: (1) i file .md e i sorgenti chiave del repository (route, handler, model, schema, migrations); (2) i messaggi user della chat. Per ogni feature/requirement/decision/user_story rilevata verra' creata o aggiornata una nota kind='functional'. Puo' richiedere diversi minuti.",
+      "Estrai specifiche funzionali",
+    );
+    if (!ok) return;
+    setExtractingFunctional(true);
+    setExtractFunctionalMsg(null);
+    try {
+      const r = await extractFunctionalSpecs(projectId, {
+        limit: 100,
+        include_files: true,
+        files_limit: 100,
+      });
+      setExtractFunctionalMsg(
+        `File: ${r.files_with_specs}/${r.files_scanned} con spec. Chat: ${r.messages_with_specs}/${r.messages_scanned} con spec. Note funzionali applicate: ${r.specs_applied}/${r.specs_extracted} (${r.links_created} link).`,
+      );
+      await load();
+    } catch (e) {
+      setExtractFunctionalMsg(
+        "Errore: " + (e instanceof Error ? e.message : String(e)),
+      );
+    } finally {
+      setExtractingFunctional(false);
+    }
+  };
 
   const handleRebuild = async (reset: boolean) => {
     const confirmMsg = reset
@@ -186,6 +216,29 @@ export function NotesTab({ projectId }: Props) {
         </button>
       </div>
 
+      {/* FunctionalSpecAgent — estrae feature/requirement/user_story dalla chat */}
+      <div style={{ display: "flex", gap: 4, marginBottom: 6 }}>
+        <button
+          onClick={handleExtractFunctional}
+          disabled={extractingFunctional}
+          title="Avvia l'agente che analizza i messaggi chat e crea note funzionali (feature, requirement, decision, user_story, domain)"
+          style={{
+            flex: 1,
+            minWidth: 0,
+            padding: "6px 10px",
+            fontSize: 11,
+            fontWeight: 600,
+            background: extractingFunctional ? "#a3a3a3" : "#7c3aed",
+            color: "#fff",
+            border: "none",
+            borderRadius: 6,
+            cursor: extractingFunctional ? "default" : "pointer",
+          }}
+        >
+          {extractingFunctional ? "Estrazione in corso..." : "Estrai spec funzionali (LLM)"}
+        </button>
+      </div>
+
       {rebuildMsg && (
         <div
           style={{
@@ -198,6 +251,21 @@ export function NotesTab({ projectId }: Props) {
           }}
         >
           {rebuildMsg}
+        </div>
+      )}
+
+      {extractFunctionalMsg && (
+        <div
+          style={{
+            fontSize: 11,
+            color: extractFunctionalMsg.startsWith("Errore") ? "#dc2626" : "#7c3aed",
+            marginBottom: 8,
+            padding: 6,
+            background: extractFunctionalMsg.startsWith("Errore") ? "#fef2f2" : "#f5f3ff",
+            borderRadius: 4,
+          }}
+        >
+          {extractFunctionalMsg}
         </div>
       )}
 

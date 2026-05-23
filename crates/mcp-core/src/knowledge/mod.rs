@@ -5,6 +5,7 @@
 pub mod vault;
 pub mod routes;
 pub mod generators;
+pub mod functional_spec_agent;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
