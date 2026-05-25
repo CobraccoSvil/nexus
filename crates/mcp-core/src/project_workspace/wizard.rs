@@ -71,6 +71,11 @@ pub async fn wizard_detect_services(
                 } else {
                     "npm"
                 };
+                // Rileva se node_modules esiste: se assente il wizard install
+                // eseguirà il package manager automaticamente prima di abilitare
+                // il servizio. Il flag `needs_install` permette alla UI di
+                // mostrare uno step "Installa dipendenze" nel wizard.
+                let needs_install = tokio::fs::metadata(format!("{}/node_modules", cwd)).await.is_err();
                 for script_name in ["dev", "start", "serve", "preview"] {
                     if scripts.map(|s| s.contains_key(script_name)).unwrap_or(false) {
                         let svc_short = if rel.is_empty() {
@@ -79,15 +84,17 @@ pub async fn wizard_detect_services(
                             format!("{}-{}", rel.replace('/', "-"), script_name)
                         };
                         suggestions.push(json!({
-                            "short":    svc_short,
-                            "unit":     format!("{}-{}.service", slug, svc_short),
-                            "label":    format!("{} {} ({})", pkg_manager, script_name, if rel.is_empty() { "root" } else { rel }),
-                            "kind":     if pkg_manager == "pnpm" { "pnpm" } else { "npm" },
-                            "command":  pkg_manager,
-                            "args":     ["run", script_name],
-                            "cwd":      cwd,
-                            "env":      { "PORT": suggest_port(&state, &project_id, &svc_short).await.to_string() },
-                            "existing": false,
+                            "short":         svc_short,
+                            "unit":          format!("{}-{}.service", slug, svc_short),
+                            "label":         format!("{} {} ({})", pkg_manager, script_name, if rel.is_empty() { "root" } else { rel }),
+                            "kind":          if pkg_manager == "pnpm" { "pnpm" } else { "npm" },
+                            "command":       pkg_manager,
+                            "args":          ["run", script_name],
+                            "cwd":           cwd,
+                            "env":           { "PORT": suggest_port(&state, &project_id, &svc_short).await.to_string() },
+                            "existing":      false,
+                            "needs_install": needs_install,
+                            "pkg_manager":   pkg_manager,
                         }));
                         break; // un solo script per package.json
                     }
@@ -669,12 +676,73 @@ pub async fn wizard_install_service(
         );
     }
 
+    // ── Auto-setup ambiente: installa dipendenze se mancanti ─────────────────
+    // Se il cwd contiene un package.json ma non node_modules, esegue
+    // automaticamente pnpm install (o npm install) prima che il servizio parta,
+    // evitando il crash-loop "vite: not found" / "tsx: not found".
+    let mut setup_log: Vec<serde_json::Value> = Vec::new();
+    let pkg_json_path = format!("{}/package.json", cwd);
+    let node_modules_path = format!("{}/node_modules", cwd);
+    let has_pkg_json = tokio::fs::metadata(&pkg_json_path).await.is_ok();
+    let has_node_modules = tokio::fs::metadata(&node_modules_path).await.is_ok();
+    if has_pkg_json && !has_node_modules {
+        // Scegli il package manager: pnpm se c'è pnpm-lock.yaml, altrimenti npm
+        let pkg_manager = if tokio::fs::metadata(format!("{}/pnpm-lock.yaml", cwd)).await.is_ok() {
+            "pnpm"
+        } else {
+            "npm"
+        };
+        tracing::info!(
+            unit = %unit_name,
+            cwd = %cwd,
+            pkg_manager = %pkg_manager,
+            "node_modules assenti — eseguo {} install automatico",
+            pkg_manager
+        );
+        let install_out = tokio::process::Command::new(pkg_manager)
+            .args(["install", "--frozen-lockfile"])
+            .current_dir(&cwd)
+            .output()
+            .await;
+        match install_out {
+            Ok(out) => {
+                let success = out.status.success();
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                if success {
+                    tracing::info!(unit = %unit_name, cwd = %cwd, "{} install completato", pkg_manager);
+                } else {
+                    tracing::warn!(
+                        unit = %unit_name, cwd = %cwd,
+                        stderr = %stderr,
+                        "{} install fallito (exit {:?})", pkg_manager, out.status.code()
+                    );
+                }
+                setup_log.push(json!({
+                    "step":    format!("{} install", pkg_manager),
+                    "ok":      success,
+                    "stdout":  stdout.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"),
+                    "stderr":  if success { "".to_string() } else { stderr.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n") },
+                }));
+            }
+            Err(e) => {
+                tracing::warn!(unit = %unit_name, cwd = %cwd, "impossibile eseguire {} install: {}", pkg_manager, e);
+                setup_log.push(json!({
+                    "step":  format!("{} install", pkg_manager),
+                    "ok":    false,
+                    "error": e.to_string(),
+                }));
+            }
+        }
+    }
+
     Ok(Json(json!({
-        "ok":      ok,
-        "unit":    unit_name,
-        "path":    svc_path,
-        "content": unit_content,
-        "cleaned": cleaned,
+        "ok":        ok,
+        "unit":      unit_name,
+        "path":      svc_path,
+        "content":   unit_content,
+        "cleaned":   cleaned,
+        "setup_log": setup_log,
     })))
 }
 
