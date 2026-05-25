@@ -1,5 +1,143 @@
 use super::*;
 
+// ── Auto-setup ambiente: rilevamento e installazione dipendenze ───────────────
+
+/// Descrive un singolo step di setup dell'ambiente (es. `pnpm install`).
+struct SetupStep {
+    /// Nome leggibile dello step (es. "pnpm install")
+    label:         &'static str,
+    /// Eseguibile da lanciare
+    cmd:           &'static str,
+    /// Argomenti da passare all'eseguibile
+    args:          &'static [&'static str],
+    /// File/directory che indica la presenza del progetto (es. "package.json")
+    indicator:     &'static str,
+    /// File/directory che indica che il setup è GIA' stato fatto (es. "node_modules").
+    /// Se questo path NON esiste, lo step viene eseguito.
+    done_marker:   &'static str,
+}
+
+/// Tabella di rilevamento framework → step di setup.
+/// Ordinata per priorità: lock file prima del file generico dello stesso ecosistema.
+static SETUP_STEPS: &[SetupStep] = &[
+    // ── Node.js ──────────────────────────────────────────────────────────────
+    SetupStep { label: "pnpm install",  cmd: "pnpm", args: &["install", "--frozen-lockfile"],
+                indicator: "pnpm-lock.yaml",   done_marker: "node_modules" },
+    SetupStep { label: "yarn install",  cmd: "yarn", args: &["install", "--frozen-lockfile"],
+                indicator: "yarn.lock",         done_marker: "node_modules" },
+    SetupStep { label: "npm install",   cmd: "npm",  args: &["install"],
+                indicator: "package.json",      done_marker: "node_modules" },
+    // ── .NET ─────────────────────────────────────────────────────────────────
+    // Nota: l'indicatore *.csproj viene gestito a parte (glob) perché ha
+    // un'estensione variabile; qui usiamo il file di soluzione come proxy.
+    SetupStep { label: "dotnet restore", cmd: "dotnet", args: &["restore"],
+                indicator: "*.csproj",          done_marker: "bin" },
+    // ── Python ───────────────────────────────────────────────────────────────
+    SetupStep { label: "uv sync",        cmd: "uv",     args: &["sync"],
+                indicator: "uv.lock",           done_marker: ".venv" },
+    SetupStep { label: "poetry install", cmd: "poetry", args: &["install", "--no-interaction"],
+                indicator: "poetry.lock",       done_marker: ".venv" },
+    SetupStep { label: "pip install",    cmd: "pip",    args: &["install", "-r", "requirements.txt"],
+                indicator: "requirements.txt",  done_marker: ".venv" },
+    SetupStep { label: "pipenv install", cmd: "pipenv", args: &["install"],
+                indicator: "Pipfile",           done_marker: ".venv" },
+    // ── Go ───────────────────────────────────────────────────────────────────
+    SetupStep { label: "go mod download", cmd: "go", args: &["mod", "download"],
+                indicator: "go.mod",            done_marker: "vendor" },
+    // ── Ruby ─────────────────────────────────────────────────────────────────
+    SetupStep { label: "bundle install", cmd: "bundle", args: &["install"],
+                indicator: "Gemfile",           done_marker: "vendor/bundle" },
+    // ── PHP ───────────────────────────────────────────────────────────────────
+    SetupStep { label: "composer install", cmd: "composer", args: &["install", "--no-interaction"],
+                indicator: "composer.json",     done_marker: "vendor" },
+];
+
+/// Rileva quale step di setup è necessario per il `cwd` dato e lo esegue.
+/// Restituisce la lista degli step eseguiti con il relativo esito.
+/// Il `done_marker` per `*.csproj` viene gestito tramite glob; per tutti gli
+/// altri framework il match è diretto sul nome del file.
+async fn run_env_setup(cwd: &str, unit_name: &str) -> Vec<serde_json::Value> {
+    let mut log: Vec<serde_json::Value> = Vec::new();
+
+    for step in SETUP_STEPS {
+        // Controlla se l'indicatore esiste nella directory
+        let indicator_exists = if step.indicator.contains('*') {
+            // Glob semplice: cerca file con quell'estensione nella directory
+            let ext = step.indicator.trim_start_matches('*');
+            tokio::fs::read_dir(cwd).await
+                .ok()
+                .map(|mut rd| {
+                    // La lettura in async richiede un loop; usiamo std come fallback
+                    // perché il read_dir async non ha un metodo .any() diretto.
+                    drop(rd);
+                    std::fs::read_dir(cwd).ok()
+                        .map(|rd| rd.filter_map(|e| e.ok())
+                            .any(|e| e.file_name().to_string_lossy().ends_with(ext)))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        } else {
+            tokio::fs::metadata(format!("{}/{}", cwd, step.indicator)).await.is_ok()
+        };
+
+        if !indicator_exists {
+            continue;
+        }
+
+        // Controlla se il done_marker è già presente (setup già fatto)
+        let done = tokio::fs::metadata(format!("{}/{}", cwd, step.done_marker)).await.is_ok();
+        if done {
+            tracing::debug!(unit = %unit_name, cwd = %cwd, step = %step.label, "setup già presente, skip");
+            continue;
+        }
+
+        // Esegui lo step
+        tracing::info!(unit = %unit_name, cwd = %cwd, step = %step.label, "eseguo setup ambiente");
+        let result = tokio::process::Command::new(step.cmd)
+            .args(step.args)
+            .current_dir(cwd)
+            .output()
+            .await;
+
+        match result {
+            Ok(out) => {
+                let ok = out.status.success();
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                // Ultime 15 righe per non saturare la risposta JSON
+                let tail = |s: &str| s.lines().rev().take(15)
+                    .collect::<Vec<_>>().into_iter().rev()
+                    .collect::<Vec<_>>().join("\n");
+                if ok {
+                    tracing::info!(unit = %unit_name, cwd = %cwd, step = %step.label, "setup completato");
+                } else {
+                    tracing::warn!(
+                        unit = %unit_name, cwd = %cwd, step = %step.label,
+                        stderr = %stderr, "setup fallito (exit {:?})", out.status.code()
+                    );
+                }
+                log.push(json!({
+                    "step":   step.label,
+                    "ok":     ok,
+                    "stdout": tail(&stdout),
+                    "stderr": if ok { "".to_string() } else { tail(&stderr) },
+                }));
+            }
+            Err(e) => {
+                tracing::warn!(unit = %unit_name, cwd = %cwd, step = %step.label,
+                               "impossibile eseguire setup: {}", e);
+                log.push(json!({ "step": step.label, "ok": false, "error": e.to_string() }));
+            }
+        }
+
+        // Un solo step per directory: il primo match vince.
+        // (es. se c'è pnpm-lock.yaml non eseguiamo anche npm install)
+        break;
+    }
+
+    log
+}
+
 // ── Helper systemd user ───────────────────────────────────────────────────────
 
 /// Risolve `XDG_RUNTIME_DIR` per il processo corrente.
@@ -71,11 +209,10 @@ pub async fn wizard_detect_services(
                 } else {
                     "npm"
                 };
-                // Rileva se node_modules esiste: se assente il wizard install
-                // eseguirà il package manager automaticamente prima di abilitare
-                // il servizio. Il flag `needs_install` permette alla UI di
-                // mostrare uno step "Installa dipendenze" nel wizard.
-                let needs_install = tokio::fs::metadata(format!("{}/node_modules", cwd)).await.is_err();
+                // Controlla se node_modules esiste. Il flag `needs_install`
+                // viene usato dalla UI per mostrare uno step "Setup ambiente";
+                // il wizard install eseguirà automaticamente il setup.
+                let needs_install = tokio::fs::metadata(format!("{}/node_modules", &cwd)).await.is_err();
                 for script_name in ["dev", "start", "serve", "preview"] {
                     if scripts.map(|s| s.contains_key(script_name)).unwrap_or(false) {
                         let svc_short = if rel.is_empty() {
@@ -115,16 +252,20 @@ pub async fn wizard_detect_services(
         let rel = cwd.strip_prefix(&root).unwrap_or("").trim_start_matches('/');
         let svc_short = if rel.is_empty() { "dotnet".to_string() }
                         else { rel.replace('/', "-") };
+        // needs_install: manca la directory bin/ → dotnet restore necessario
+        let needs_install = tokio::fs::metadata(format!("{}/bin", cwd)).await.is_err();
         suggestions.push(json!({
-            "short":    svc_short,
-            "unit":     format!("{}-{}.service", slug, svc_short),
-            "label":    format!("dotnet run ({})", if rel.is_empty() { "root" } else { rel }),
-            "kind":     "dotnet",
-            "command":  "dotnet",
-            "args":     ["run", "--project", proj_arg],
-            "cwd":      cwd,
-            "env":      { "PORT": suggest_port(&state, &project_id, &svc_short).await.to_string() },
-            "existing": false,
+            "short":         svc_short,
+            "unit":          format!("{}-{}.service", slug, svc_short),
+            "label":         format!("dotnet run ({})", if rel.is_empty() { "root" } else { rel }),
+            "kind":          "dotnet",
+            "command":       "dotnet",
+            "args":          ["run", "--project", proj_arg],
+            "cwd":           cwd,
+            "env":           { "PORT": suggest_port(&state, &project_id, &svc_short).await.to_string() },
+            "existing":      false,
+            "needs_install": needs_install,
+            "pkg_manager":   "dotnet restore",
         }));
     }
 
@@ -185,15 +326,34 @@ pub async fn wizard_detect_services(
         let py_path = format!("{}/{}", root, py_entry);
         if tokio::fs::metadata(&py_path).await.is_ok() {
             let svc_short = py_entry.strip_suffix(".py").unwrap_or(py_entry);
+            // Rileva il package manager Python e se l'ambiente è già pronto
+            let (py_pkg_manager, needs_install) = {
+                let venv_ok = tokio::fs::metadata(format!("{}/.venv", root)).await.is_ok()
+                    || tokio::fs::metadata(format!("{}/venv", root)).await.is_ok();
+                let pm = if tokio::fs::metadata(format!("{}/uv.lock", root)).await.is_ok() {
+                    "uv sync"
+                } else if tokio::fs::metadata(format!("{}/poetry.lock", root)).await.is_ok() {
+                    "poetry install"
+                } else if tokio::fs::metadata(format!("{}/Pipfile", root)).await.is_ok() {
+                    "pipenv install"
+                } else if tokio::fs::metadata(format!("{}/requirements.txt", root)).await.is_ok() {
+                    "pip install -r requirements.txt"
+                } else {
+                    ""
+                };
+                (pm, !venv_ok && !pm.is_empty())
+            };
             suggestions.push(json!({
-                "short":    svc_short,
-                "unit":     format!("{}-{}.service", slug, svc_short),
-                "label":    format!("python {} (root)", py_entry),
-                "kind":     "python",
-                "command":  "python3",
-                "args":     [py_entry],
-                "cwd":      root,
-                "existing": false,
+                "short":         svc_short,
+                "unit":          format!("{}-{}.service", slug, svc_short),
+                "label":         format!("python {} (root)", py_entry),
+                "kind":          "python",
+                "command":       "python3",
+                "args":          [py_entry],
+                "cwd":           root,
+                "existing":      false,
+                "needs_install": needs_install,
+                "pkg_manager":   py_pkg_manager,
             }));
         }
     }
@@ -676,65 +836,10 @@ pub async fn wizard_install_service(
         );
     }
 
-    // ── Auto-setup ambiente: installa dipendenze se mancanti ─────────────────
-    // Se il cwd contiene un package.json ma non node_modules, esegue
-    // automaticamente pnpm install (o npm install) prima che il servizio parta,
-    // evitando il crash-loop "vite: not found" / "tsx: not found".
-    let mut setup_log: Vec<serde_json::Value> = Vec::new();
-    let pkg_json_path = format!("{}/package.json", cwd);
-    let node_modules_path = format!("{}/node_modules", cwd);
-    let has_pkg_json = tokio::fs::metadata(&pkg_json_path).await.is_ok();
-    let has_node_modules = tokio::fs::metadata(&node_modules_path).await.is_ok();
-    if has_pkg_json && !has_node_modules {
-        // Scegli il package manager: pnpm se c'è pnpm-lock.yaml, altrimenti npm
-        let pkg_manager = if tokio::fs::metadata(format!("{}/pnpm-lock.yaml", cwd)).await.is_ok() {
-            "pnpm"
-        } else {
-            "npm"
-        };
-        tracing::info!(
-            unit = %unit_name,
-            cwd = %cwd,
-            pkg_manager = %pkg_manager,
-            "node_modules assenti — eseguo {} install automatico",
-            pkg_manager
-        );
-        let install_out = tokio::process::Command::new(pkg_manager)
-            .args(["install", "--frozen-lockfile"])
-            .current_dir(&cwd)
-            .output()
-            .await;
-        match install_out {
-            Ok(out) => {
-                let success = out.status.success();
-                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                if success {
-                    tracing::info!(unit = %unit_name, cwd = %cwd, "{} install completato", pkg_manager);
-                } else {
-                    tracing::warn!(
-                        unit = %unit_name, cwd = %cwd,
-                        stderr = %stderr,
-                        "{} install fallito (exit {:?})", pkg_manager, out.status.code()
-                    );
-                }
-                setup_log.push(json!({
-                    "step":    format!("{} install", pkg_manager),
-                    "ok":      success,
-                    "stdout":  stdout.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"),
-                    "stderr":  if success { "".to_string() } else { stderr.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n") },
-                }));
-            }
-            Err(e) => {
-                tracing::warn!(unit = %unit_name, cwd = %cwd, "impossibile eseguire {} install: {}", pkg_manager, e);
-                setup_log.push(json!({
-                    "step":  format!("{} install", pkg_manager),
-                    "ok":    false,
-                    "error": e.to_string(),
-                }));
-            }
-        }
-    }
+    // ── Auto-setup ambiente: installa dipendenze per qualsiasi framework ────────
+    // Rilevamento automatico: pnpm/yarn/npm, .NET, Python (uv/poetry/pip/pipenv),
+    // Go, Ruby, PHP. Lo step viene saltato se il done_marker è già presente.
+    let setup_log = run_env_setup(&cwd, &unit_name).await;
 
     Ok(Json(json!({
         "ok":        ok,
