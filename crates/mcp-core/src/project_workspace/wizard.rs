@@ -1,5 +1,39 @@
 use super::*;
 
+// ── Helper systemd user ───────────────────────────────────────────────────────
+
+/// Risolve `XDG_RUNTIME_DIR` per il processo corrente.
+/// Se la variabile d'ambiente è già impostata (es. sessione interattiva), la usa.
+/// Altrimenti legge l'UID effettivo da `/proc/self/status` e costruisce il path.
+/// Questo è necessario quando `mcp-core` gira come servizio system senza variabili
+/// di sessione utente nell'ambiente (es. `systemctl start nexus-core.service`).
+fn resolve_xdg_runtime_dir() -> String {
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        return dir;
+    }
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        if let Some(line) = status.lines().find(|l| l.starts_with("Uid:")) {
+            if let Some(uid) = line.split_whitespace().nth(1) {
+                return format!("/run/user/{}", uid);
+            }
+        }
+    }
+    "/run/user/1000".to_string()
+}
+
+/// Crea un `Command` per `systemctl` pre-configurato con le variabili d'ambiente
+/// necessarie per operare in modalità `--user` anche da un servizio system.
+fn systemctl_user() -> tokio::process::Command {
+    let xdg = resolve_xdg_runtime_dir();
+    let bus = format!("unix:path={}/bus", xdg);
+    let mut cmd = tokio::process::Command::new("systemctl");
+    cmd.env("XDG_RUNTIME_DIR", xdg)
+        .env("DBUS_SESSION_BUS_ADDRESS", bus);
+    cmd
+}
+
+// ── Wizard ────────────────────────────────────────────────────────────────────
+
 /// Analizza il filesystem del progetto e suggerisce definizioni di servizi systemd.
 /// Riconosce: npm/pnpm scripts, Cargo binaries, .csproj / launchSettings.json,
 /// docker-compose.yml, python app entry points.
@@ -158,7 +192,7 @@ pub async fn wizard_detect_services(
     }
 
     // Marca quelli già installati come .service files
-    if let Ok(svc_out) = tokio::process::Command::new("systemctl")
+    if let Ok(svc_out) = systemctl_user()
         .args(["--user", "list-unit-files", "--type=service", "--no-legend", "--no-pager"])
         .output().await
     {
@@ -576,7 +610,7 @@ pub async fn wizard_install_service(
     // perche' il nome corto del vecchio servizio e' un prefisso del nuovo.
     let mut cleaned: Vec<String> = Vec::new();
     let slug_prefix = format!("{}-", slug);
-    if let Ok(list_out) = tokio::process::Command::new("systemctl")
+    if let Ok(list_out) = systemctl_user()
         .args(["--user", "list-unit-files", "--type=service", "--no-legend", "--no-pager"])
         .output()
         .await
@@ -593,9 +627,9 @@ pub async fn wizard_install_service(
                 .strip_suffix(".service").unwrap_or(old_unit);
             if short.starts_with(old_short) || old_short.starts_with(short) {
                 let old_path = format!("{}/{}", svc_dir, old_unit);
-                let _ = tokio::process::Command::new("systemctl")
+                let _ = systemctl_user()
                     .args(["--user", "stop", old_unit]).output().await;
-                let _ = tokio::process::Command::new("systemctl")
+                let _ = systemctl_user()
                     .args(["--user", "disable", old_unit]).output().await;
                 let _ = tokio::fs::remove_file(&old_path).await;
                 cleaned.push(old_unit.to_string());
@@ -605,9 +639,9 @@ pub async fn wizard_install_service(
     }
 
     // daemon-reload + enable
-    let _ = tokio::process::Command::new("systemctl")
+    let _ = systemctl_user()
         .args(["--user", "daemon-reload"]).output().await;
-    let enable_out = tokio::process::Command::new("systemctl")
+    let enable_out = systemctl_user()
         .args(["--user", "enable", &unit_name]).output().await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -623,8 +657,20 @@ pub async fn wizard_install_service(
         }
     }
 
+    let ok = enable_out.status.success();
+    if !ok {
+        let stderr = String::from_utf8_lossy(&enable_out.stderr);
+        let stdout = String::from_utf8_lossy(&enable_out.stdout);
+        tracing::warn!(
+            unit = %unit_name,
+            stderr = %stderr,
+            stdout = %stdout,
+            "systemctl --user enable fallito"
+        );
+    }
+
     Ok(Json(json!({
-        "ok":      enable_out.status.success(),
+        "ok":      ok,
         "unit":    unit_name,
         "path":    svc_path,
         "content": unit_content,
@@ -661,10 +707,10 @@ pub async fn uninstall_project_service(
     }
 
     // 1. stop (ignora errori: il servizio potrebbe già essere fermo)
-    let _ = tokio::process::Command::new("systemctl")
+    let _ = systemctl_user()
         .args(["--user", "stop", &unit_name]).output().await;
     // 2. disable
-    let _ = tokio::process::Command::new("systemctl")
+    let _ = systemctl_user()
         .args(["--user", "disable", &unit_name]).output().await;
 
     // 3. Prima di rimuovere il file, leggi il contenuto per estrarre le porte da rilasciare
@@ -692,7 +738,7 @@ pub async fn uninstall_project_service(
     };
 
     // 5. daemon-reload
-    let _ = tokio::process::Command::new("systemctl")
+    let _ = systemctl_user()
         .args(["--user", "daemon-reload"]).output().await;
 
     Ok(Json(json!({

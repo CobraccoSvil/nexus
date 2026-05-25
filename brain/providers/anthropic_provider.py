@@ -84,7 +84,14 @@ def _load_thinking_models() -> frozenset[str]:
                         "SELECT model FROM ai_price_catalog "
                         "WHERE provider = 'anthropic' "
                         "  AND is_enabled = TRUE "
-                        "  AND (capabilities ->> 'thinking')::boolean IS TRUE"
+                        "  AND ("
+                        "    (capabilities ->> 'thinking')::boolean IS TRUE"
+                        "    OR EXISTS ("
+                        "      SELECT 1 FROM jsonb_array_elements(CASE jsonb_typeof(capabilities)"
+                        "        WHEN 'array' THEN capabilities ELSE '[]'::jsonb END) AS elem"
+                        "      WHERE (elem ->> 'thinking')::boolean IS TRUE"
+                        "    )"
+                        "  )"
                     )
                     rows = cur.fetchall()
             finally:
@@ -277,11 +284,12 @@ class AnthropicProvider(BaseProvider):
                     if split_at > 200:
                         static_part = raw[:split_at].strip()
                         dynamic_part = raw[split_at:].strip()
-                        system_blocks = [{
-                            "type": "text",
-                            "text": static_part,
-                            "cache_control": _system_cache_control(),
-                        }]
+                        if static_part:  # evita blocco text vuoto con cache_control (→ HTTP 400)
+                            system_blocks = [{
+                                "type": "text",
+                                "text": static_part,
+                                "cache_control": _system_cache_control(),
+                            }]
                         effective_messages = [
                             {"role": "user", "content": dynamic_part},
                             *effective_messages[1:],
@@ -363,11 +371,12 @@ class AnthropicProvider(BaseProvider):
                     msg = dict(msgs[idx])
                     content = msg.get("content")
                     if isinstance(content, str):
-                        msg["content"] = [{
-                            "type": "text",
-                            "text": content,
-                            "cache_control": {"type": "ephemeral"},
-                        }]
+                        if content:  # evita blocco text vuoto con cache_control (→ HTTP 400)
+                            msg["content"] = [{
+                                "type": "text",
+                                "text": content,
+                                "cache_control": {"type": "ephemeral"},
+                            }]
                     elif isinstance(content, list) and len(content) > 0:
                         new_content = [dict(b) for b in content]
                         last = new_content[-1]
@@ -548,7 +557,9 @@ class AnthropicProvider(BaseProvider):
                             split_at = idx
                             break
                     if split_at > 200:
-                        system_blocks = [{"type": "text", "text": raw[:split_at].strip(), "cache_control": _system_cache_control()}]
+                        static_part = raw[:split_at].strip()
+                        if static_part:  # evita blocco text vuoto con cache_control (→ HTTP 400)
+                            system_blocks = [{"type": "text", "text": static_part, "cache_control": _system_cache_control()}]
                         effective_messages = [{"role": "user", "content": raw[split_at:].strip()}, *effective_messages[1:]]
 
             KEEP_RECENT = 12
@@ -597,7 +608,8 @@ class AnthropicProvider(BaseProvider):
                     msg = dict(msgs[idx])
                     content = msg.get("content")
                     if isinstance(content, str):
-                        msg["content"] = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
+                        if content:  # evita blocco text vuoto con cache_control (→ HTTP 400)
+                            msg["content"] = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
                     elif isinstance(content, list) and len(content) > 0:
                         new_content = [dict(b) for b in content]
                         last = new_content[-1]
