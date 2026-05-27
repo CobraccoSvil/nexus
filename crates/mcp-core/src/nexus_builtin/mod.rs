@@ -179,6 +179,8 @@ pub async fn execute(
         "nexus_doc_list" => handle_doc_list(db, &arguments).await,
         "nexus_doc_search" => handle_doc_search(db, project_id, &arguments).await,
         "nexus_doc_status" => handle_doc_status(db, &arguments).await,
+        // ── editor UI ────────────────────────────────────────────────
+        "nexus_open_file_in_editor" => handle_open_file_in_editor(db, project_id, &arguments).await,
         // ── nexus_tool_catalog (Fase 9A) ──────────────────────────────
         // I tool eseguiti da NexusToolCatalog sono invocati tramite il
         // dispatcher qui sotto: si estrae lo short-name (senza prefisso
@@ -1295,4 +1297,78 @@ async fn dispatch_catalog_tool(
         })
         .to_string(),
     }
+}
+
+/// Handler per `nexus_open_file_in_editor`: chiede al frontend di aprire un file
+/// nell'editor del web-ide.
+///
+/// Il tool non esegue azioni sul filesystem direttamente: ritorna un JSON con
+/// `_ui_action: "open_file"` che il frontend (ChatPanel) intercetta nel
+/// tool_result e usa per dispatchare l'evento `nexus:editor:open-file`.
+///
+/// Sicurezza: il `path` deve essere relativo alla root del progetto e non
+/// contenere `..` per evitare directory traversal. Verifichiamo anche che il
+/// file esista realmente nel workspace del progetto.
+async fn handle_open_file_in_editor(
+    db: &PgPool,
+    project_id: Uuid,
+    arguments: &Value,
+) -> String {
+    let path = arguments.get("path").and_then(Value::as_str).unwrap_or("").trim();
+    if path.is_empty() {
+        return json!({
+            "ok": false,
+            "error": "Parametro 'path' mancante o vuoto",
+        }).to_string();
+    }
+    // Security: rifiuta path assoluti o con ".." per traversal.
+    if path.starts_with('/') || path.starts_with('\\') {
+        return json!({
+            "ok": false,
+            "error": format!("Path '{path}' deve essere relativo alla root del progetto, non assoluto"),
+        }).to_string();
+    }
+    if path.split('/').any(|seg| seg == "..") {
+        return json!({
+            "ok": false,
+            "error": format!("Path '{path}' contiene '..', non ammesso"),
+        }).to_string();
+    }
+    // Verifica esistenza file nel workspace del progetto.
+    let root_path = match get_project_root(db, project_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            return json!({
+                "ok": false,
+                "error": format!("Workspace del progetto non disponibile: {e}"),
+            }).to_string();
+        }
+    };
+    let full_path = std::path::Path::new(&root_path).join(path);
+    if !full_path.exists() {
+        return json!({
+            "ok": false,
+            "error": format!("File '{path}' non esiste nel workspace ({root_path})"),
+            "_ui_action": "open_file",
+            "path": path,
+        }).to_string();
+    }
+    if !full_path.is_file() {
+        return json!({
+            "ok": false,
+            "error": format!("Path '{path}' esiste ma non e' un file"),
+        }).to_string();
+    }
+    let line = arguments.get("line").and_then(Value::as_i64);
+    // Risposta strutturata: il frontend intercetta `_ui_action: "open_file"` nel
+    // tool_result e dispatcha l'evento `nexus:editor:open-file` con `path` (e
+    // opzionalmente `line`). L'editor del web-ide apre il file nel gruppo
+    // attivo, riusando una tab esistente se gia' aperta.
+    json!({
+        "ok": true,
+        "message": format!("Apertura {path} richiesta all'editor"),
+        "_ui_action": "open_file",
+        "path": path,
+        "line": line,
+    }).to_string()
 }

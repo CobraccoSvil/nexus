@@ -38,6 +38,31 @@ const SHELL_LANGUAGES = new Set(["bash", "sh", "shell", "zsh", "console"]);
 
 const remarkPluginsList = [remarkGfm];
 
+/** Pattern file path: identifica stringhe che SEMBRANO percorsi a file di progetto.
+ *
+ * Matcha:
+ *   - filename.ext               (es. README.md, function_report.txt)
+ *   - path/to/file.ext           (es. src/main.rs, apps/web-ide/lib/api-client.ts)
+ *   - path/with-dashes_and_dots/file.ext
+ *
+ * Estensioni supportate (ASCII-only, lowercase, max 5 chars):
+ *   txt md ts tsx js jsx json yaml yml toml sql py rs go java cpp h hpp c
+ *   sh bash html css scss less xml csv conf ini env dockerfile makefile etc.
+ *
+ * Esclude:
+ *   - URL (contengono :// o iniziano con http)
+ *   - Stringhe troppo lunghe (>200 char, probabile non e' un path)
+ *   - Caratteri spazio (path con spazi non li gestiamo qui, niente quote)
+ */
+const FILE_PATH_REGEX = /^[\w][\w./-]{0,200}\.[a-zA-Z0-9]{1,8}$/;
+
+function looksLikeFilePath(text: string): boolean {
+  if (!text || text.length > 200) return false;
+  if (text.includes("://") || text.startsWith("http")) return false;
+  if (text.startsWith("/") && text.length < 4) return false;
+  return FILE_PATH_REGEX.test(text);
+}
+
 /** Estrae testo puro da children React (ReactMarkdown passa stringhe o array). */
 function extractText(node: React.ReactNode): string {
   if (typeof node === "string") return node;
@@ -97,7 +122,53 @@ export const MarkdownBlock = React.memo(function MarkdownBlock({
                 </code>
               );
             }
-            // Inline code
+            // Inline code: se sembra un file path, lo rendiamo cliccabile.
+            // Click -> dispatcha evento globale `nexus:editor:open-file` che
+            // ide-shell intercetta e apre il file nel gruppo editor attivo.
+            const text = extractText(children).trim();
+            if (looksLikeFilePath(text)) {
+              return (
+                <code
+                  role="button"
+                  tabIndex={0}
+                  title={`Apri ${text} nell'editor`}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (typeof window !== "undefined") {
+                      window.dispatchEvent(new CustomEvent("nexus:editor:open-file", {
+                        detail: { path: text },
+                      }));
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      if (typeof window !== "undefined") {
+                        window.dispatchEvent(new CustomEvent("nexus:editor:open-file", {
+                          detail: { path: text },
+                        }));
+                      }
+                    }
+                  }}
+                  style={{
+                    background: tc.bgInput,
+                    border: `1px solid ${tc.accent}`,
+                    borderRadius: 4,
+                    padding: "0 4px",
+                    fontFamily: '"JetBrains Mono", monospace',
+                    fontSize: "0.92em",
+                    color: tc.accent,
+                    cursor: "pointer",
+                    textDecoration: "underline",
+                    textDecorationStyle: "dotted",
+                  }}
+                >
+                  {children}
+                </code>
+              );
+            }
+            // Inline code regular
             return (
               <code
                 style={{

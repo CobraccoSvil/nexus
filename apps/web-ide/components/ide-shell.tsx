@@ -441,6 +441,23 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     window.addEventListener("nexus:chat:send", handler);
     return () => window.removeEventListener("nexus:chat:send", handler);
   }, []);
+
+  // Bridge globale `nexus:editor:open-file` -> apri file nell'editor.
+  // Permette al markdown renderer della chat e al tool nexus_open_file_in_editor
+  // (via SSE event) di aprire un file senza passare per props.
+  // Detail atteso: { path: string, line?: number }
+  // openFileInGroup e' definito piu' sotto: usiamo un ref per evitare TDZ.
+  const openFileInGroupRef = useRef<(path: string, line?: number) => Promise<void> | void>(() => {});
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      const ce = ev as CustomEvent<{ path?: string; line?: number }>;
+      const path = ce.detail?.path;
+      if (!path || typeof path !== "string") return;
+      void openFileInGroupRef.current(path, ce.detail?.line);
+    };
+    window.addEventListener("nexus:editor:open-file", handler);
+    return () => window.removeEventListener("nexus:editor:open-file", handler);
+  }, []);
   const [leftWidth, setLeftWidth] = useState(300);
   const [rightWidth, setRightWidth] = useState(430);
   const [bottomHeight, setBottomHeight] = useState(250);
@@ -1330,6 +1347,8 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     },
     [activeProject, editorGroups, layoutMode],
   );
+  // Bind ref dopo che openFileInGroup e' definito (bridge nexus:editor:open-file).
+  openFileInGroupRef.current = openFileInGroup;
 
   const closeEditorTab = useCallback((groupId: string, path: string) => {
     setEditorGroups((current) =>

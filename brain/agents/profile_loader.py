@@ -115,6 +115,11 @@ _LAZY_MINIMAL_TOOLKIT = [
     "search_in_files",
     "search_codebase_semantic",
     "git_status",
+    # UI-side: l'agente puo' aprire un file nell'editor del web-ide quando
+    # l'utente lo chiede (es. "apri main.rs") o per evidenziare un file
+    # menzionato nella risposta. Il tool ritorna { _ui_action: "open_file" }
+    # che il frontend intercetta per dispatchare l'evento.
+    "nexus_open_file_in_editor",
 ]
 
 
@@ -131,9 +136,10 @@ _LAZY_MINIMAL_TOOLKIT = [
 # I tool in AgentProfile._ALWAYS_ON_TOOLS bypassano sempre questo filtro.
 # Mantenere coerente con i nomi tool definiti nel registry Rust/Python.
 _INTENT_TOOL_SUBSET: dict[str, list[str]] = {
-    # Conversazione generica: nessun tool, riduce drammaticamente il payload.
-    "chat": [],
-    "general_chat": [],
+    # Conversazione generica: solo apri file (utile per "apri X" anche in chat),
+    # niente tool di esecuzione/scrittura.
+    "chat": ["nexus_open_file_in_editor"],
+    "general_chat": ["nexus_open_file_in_editor"],
     # Analisi e review: solo lettura.
     "analyze": [
         "read_file", "read_file_lines", "list_files", "search_in_files",

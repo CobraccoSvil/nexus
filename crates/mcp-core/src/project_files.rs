@@ -324,6 +324,7 @@ pub async fn search_project(
     let matches = tokio::task::spawn_blocking(move || {
         let mut stack = vec![root_path.clone()];
         let mut matches = Vec::new();
+        let term_lower = term_owned.to_lowercase();
         while let Some(path) = stack.pop() {
             if matches.len() >= limit {
                 break;
@@ -352,6 +353,27 @@ pub async fn search_project(
                 if !metadata.is_file() {
                     continue;
                 }
+                // ── 1. Match per NOME FILE (path basename + path relativo) ──
+                // Permette di cercare "function_report.txt" e trovare il file
+                // anche se il contenuto non contiene quella stringa. Match
+                // case-insensitive sia sul basename che sul path relativo.
+                let rel_path = to_relative(&root_path, &child_path);
+                let name_lower = name.to_lowercase();
+                let rel_lower = rel_path.to_lowercase();
+                let name_match = name_lower.contains(&term_lower) || rel_lower.contains(&term_lower);
+                if name_match {
+                    matches.push(json!({
+                        "path": rel_path.clone(),
+                        "line": 0,
+                        "column": 0,
+                        "preview": format!("[file] {}", name),
+                        "kind": "filename",
+                    }));
+                    if matches.len() >= limit {
+                        break;
+                    }
+                }
+                // ── 2. Match per CONTENUTO file (linee testuali) ──
                 let content = match std::fs::read_to_string(&child_path) {
                     Ok(content) => content,
                     Err(_) => continue,
@@ -362,10 +384,11 @@ pub async fn search_project(
                     }
                     if let Some(column) = line.find(&*term_owned) {
                         matches.push(json!({
-                            "path": to_relative(&root_path, &child_path),
+                            "path": rel_path.clone(),
                             "line": index + 1,
                             "column": column + 1,
                             "preview": line.trim(),
+                            "kind": "content",
                         }));
                     }
                 }

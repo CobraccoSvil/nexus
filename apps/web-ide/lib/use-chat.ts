@@ -500,6 +500,23 @@ export function useChat(
               return [...prev, event.step!];
             });
           }
+          // Tool `nexus_open_file_in_editor`: il backend ritorna un JSON con
+          // `_ui_action: "open_file"` + path. Intercettiamo qui per dispatchare
+          // l'evento globale che apre il file nell'editor del web-ide.
+          if (event.step.toolName === "nexus_open_file_in_editor" && event.step.toolResult) {
+            try {
+              const parsed = JSON.parse(event.step.toolResult);
+              if (parsed && parsed.ok && parsed._ui_action === "open_file" && typeof parsed.path === "string") {
+                if (typeof window !== "undefined") {
+                  window.dispatchEvent(new CustomEvent("nexus:editor:open-file", {
+                    detail: { path: parsed.path, line: parsed.line ?? undefined },
+                  }));
+                }
+              }
+            } catch {
+              // toolResult non e' JSON parseabile, skip silenzioso
+            }
+          }
           // Se lo step contiene un sub-run lanciato da dispatch_subtask, sottoscriviti
           if (event.step.toolName === "dispatch_subtask" && event.step.toolResult) {
             const match = event.step.toolResult.match(/ID:\s*([0-9a-f-]{36})/i);

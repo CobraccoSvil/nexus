@@ -182,6 +182,12 @@ pub(super) static NEXUS_TOOLS: &[ToolDef] = &[
         description: "Cambia lo stato di un documento (draft, review, approved, outdated).",
         schema: r#"{"type":"object","required":["project_id","document_id","status"],"properties":{"project_id":{"type":"string","description":"UUID del progetto"},"document_id":{"type":"string","description":"UUID del documento"},"status":{"type":"string","enum":["draft","review","approved","outdated"],"description":"Nuovo stato"}}}"#,
     },
+    // ── editor UI ─────────────────────────────────────────────────────────
+    ToolDef {
+        name: "nexus_open_file_in_editor",
+        description: "Apre un file del progetto nell'editor del web-ide. Usalo quando l'utente chiede 'apri il file X' o quando ti riferisci a un file specifico nella risposta. Il frontend intercetta il tool_result e dispatcha l'evento di apertura.",
+        schema: r#"{"type":"object","required":["project_id","path"],"properties":{"project_id":{"type":"string","description":"UUID del progetto"},"path":{"type":"string","description":"Path relativo alla root del progetto (es. 'src/main.rs' o 'README.md'). NON path assoluti."},"line":{"type":"integer","description":"Numero linea su cui posizionare il cursore (opzionale)"}}}"#,
+    },
     // ── nexus_tool_catalog (Fase 9A) ──────────────────────────────────────
     // Questi tool sono eseguiti dal NexusToolCatalog (handler Rust nativi,
     // non dal match dispatcher). Il nome col prefisso `nexus_` viene
