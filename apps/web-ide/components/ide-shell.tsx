@@ -540,6 +540,56 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
 
   const multiChat = useMultiChat(activeProject?.id ?? "default");
 
+  // Audit 27/05/2026: handler memoizzati per evitare loop "Maximum update depth
+  // exceeded" in ChatPanel. Prima erano definiti inline come `(ratio) =>
+  // multiChat.setCtxRatio(...)`, ricreati ad ogni render di IdeShell. Questo
+  // faceva si che il useEffect in chat-panel.tsx:378 (deps include
+  // onCtxRatioChange) si rilanciasse ad ogni render, chiamasse setCtxRatio,
+  // cambiasse lo state di useMultiChat, causasse re-render di IdeShell, e
+  // ricreasse l'handler -> loop infinito. Stessa cosa per onAgentActivityChange.
+  // I setter di useMultiChat (setAgentActive, setCtxRatio) sono gia' useCallback
+  // stabili, quindi questi useRef "indiretti" puntano sempre alla versione
+  // corrente di multiChat.activeTabId/setters.
+  const multiChatRef = useRef(multiChat);
+  multiChatRef.current = multiChat;
+  const handleChatAgentActivityChange = useCallback((active: boolean) => {
+    const mc = multiChatRef.current;
+    if (mc.activeTabId) mc.setAgentActive(mc.activeTabId, active);
+  }, []);
+  const handleChatCtxRatioChange = useCallback((ratio: number | null) => {
+    const mc = multiChatRef.current;
+    if (mc.activeTabId) mc.setCtxRatio(mc.activeTabId, ratio);
+  }, []);
+  // Anche onRunEnd era inline: il useEffect in chat-panel.tsx:391 con deps
+  // [agentRun, onRunEnd] ri-lanciava l'effect ad ogni render di IdeShell,
+  // amplificando la cascata di re-render. Memoizzato con lo stesso pattern.
+  // refreshProviderStatus e' definito piu' sotto (useCallback), usiamo un ref
+  // per evitare il TDZ (Temporal Dead Zone) delle const.
+  const activeProjectRef = useRef(activeProject);
+  activeProjectRef.current = activeProject;
+  const refreshProviderStatusRef = useRef<() => Promise<void>>(async () => {});
+  const handleRunEnd = useCallback((run: { provider: string; model: string; status: string }) => {
+    const delay = run.status === "failed" ? 500 : 2000;
+    void new Promise<void>((resolve) => setTimeout(resolve, delay))
+      .then(() => void refreshProviderStatusRef.current());
+    setAgentRunEndSignal((n) => n + 1);
+    const proj = activeProjectRef.current;
+    if (proj) {
+      void getPlaywrightRuns(proj.id)
+        .then((res) => {
+          setPlaywrightRuns(res.runs ?? []);
+          setPlaywrightConfigured(res.configured ?? false);
+        })
+        .catch(() => { /* ignora */ });
+    }
+  }, []);
+  const handleExternalInputConsumed = useCallback(() => {
+    setPendingChatMessage(undefined);
+    setPendingAutoSend(false);
+    setPendingProviderHint(undefined);
+    setPendingExternalAutomation(undefined);
+  }, []);
+
   // Dispatcher centrale: connessione SSE unica per progetto, alimenta lo store
   // Zustand da cui i pannelli leggono in tempo reale (eliminando il polling 4-8s).
   useProjectDispatcher(activeProject?.id);
@@ -950,21 +1000,37 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           ? { ok: true }
           : { ok: false, reason: gw.error ?? "Provider non disponibile" };
       };
-      setProviderStatus({
+      // Short-circuit: evita re-render se lo stato non e' cambiato (il polling
+      // ogni 15s non deve causare cascate di render inutili).
+      const next = {
         openai: resolve("openai"),
         anthropic: resolve("anthropic"),
         google: resolve("google"),
         deepseek: resolve("deepseek"),
         mistral: resolve("mistral"),
+      };
+      setProviderStatus((prev) => {
+        const keys: ProviderKey[] = ["openai", "anthropic", "google", "deepseek", "mistral"];
+        const changed = keys.some((k) =>
+          prev[k].ok !== next[k].ok ||
+          prev[k].billing !== next[k].billing ||
+          prev[k].reason !== next[k].reason,
+        );
+        return changed ? next : prev;
       });
     } catch {
-      // Gateway non raggiungibile: mantieni stato sconosciuto
-      setProviderStatus({
-        openai: { ok: null }, anthropic: { ok: null }, google: { ok: null },
-        deepseek: { ok: null }, mistral: { ok: null },
+      // Gateway non raggiungibile: mantieni stato sconosciuto (solo se diverso)
+      setProviderStatus((prev) => {
+        const keys: ProviderKey[] = ["openai", "anthropic", "google", "deepseek", "mistral"];
+        const allNull = keys.every((k) => prev[k].ok === null && !prev[k].billing && !prev[k].reason);
+        return allNull ? prev : {
+          openai: { ok: null }, anthropic: { ok: null }, google: { ok: null },
+          deepseek: { ok: null }, mistral: { ok: null },
+        };
       });
     }
   }, []);
+  refreshProviderStatusRef.current = refreshProviderStatus;
 
   useEffect(() => {
     void refreshProviderStatus();
@@ -1244,7 +1310,22 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
         setActiveEditorGroupId(targetGroupId);
         if (line) setPendingEditorFocus({ path: response.path, line });
       } catch (error) {
-        setProjectError(error instanceof Error ? error.message : "Impossibile aprire il file.");
+        // Audit 27/05/2026: messaggio user-friendly per 404 file non trovato
+        // (es. documento DB con file_path stantio dopo cancellazione filesystem).
+        // Prima usciva il toast tecnico "API error 404: Not Found - Percorso non trovato"
+        // che non aiutava l'utente a capire cosa fare.
+        const rawMsg = error instanceof Error ? error.message : "Impossibile aprire il file.";
+        const isNotFound =
+          rawMsg.includes("API error 404") ||
+          rawMsg.includes("Percorso non trovato") ||
+          rawMsg.includes("non e' un file");
+        if (isNotFound) {
+          setProjectError(
+            `File "${path}" non trovato sul filesystem. Il riferimento potrebbe essere stantio: aggiorna il pannello o rigenera il documento.`,
+          );
+        } else {
+          setProjectError(rawMsg);
+        }
       }
     },
     [activeProject, editorGroups, layoutMode],
@@ -1608,12 +1689,8 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               activeFiles={allOpenPaths}
               sessionId={multiChat.activeTabId}
               profileId={selectedProfileId}
-              onAgentActivityChange={(active) =>
-                multiChat.setAgentActive(multiChat.activeTabId!, active)
-              }
-              onCtxRatioChange={(ratio) =>
-                multiChat.setCtxRatio(multiChat.activeTabId!, ratio)
-              }
+              onAgentActivityChange={handleChatAgentActivityChange}
+              onCtxRatioChange={handleChatCtxRatioChange}
               selectedProvider={chatProvider}
               setSelectedProvider={(v) => { setChatProvider(v); try { localStorage.setItem("nexus:chatProvider", v); } catch {} }}
               selectedModel={chatModel}
@@ -1629,32 +1706,10 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               externalAutoSend={pendingAutoSend}
               externalProviderHint={pendingProviderHint}
               externalAutomationOverride={pendingExternalAutomation}
-              onExternalInputConsumed={() => {
-                setPendingChatMessage(undefined);
-                setPendingAutoSend(false);
-                setPendingProviderHint(undefined);
-                setPendingExternalAutomation(undefined);
-              }}
+              onExternalInputConsumed={handleExternalInputConsumed}
               onTracesChange={setAiTraces}
               hasRunningServices={outputChannels.some((ch) => ch.label?.startsWith("●"))}
-              onRunEnd={(run) => {
-                // Dopo ogni run terminato (sia ok che errore), aggiorna le spie provider
-                // con un breve ritardo per dare tempo al backend di aggiornare lo stato
-                const delay = run.status === "failed" ? 500 : 2000;
-                void new Promise<void>((resolve) => setTimeout(resolve, delay))
-                  .then(() => refreshProviderStatus());
-                // Notifica il pannello ottimizzazione per auto-fix sequenziale
-                setAgentRunEndSignal((n) => n + 1);
-                // Refresh dei Playwright runs: l'agente potrebbe aver eseguito test
-                if (activeProject) {
-                  void getPlaywrightRuns(activeProject.id)
-                    .then((res) => {
-                      setPlaywrightRuns(res.runs ?? []);
-                      setPlaywrightConfigured(res.configured ?? false);
-                    })
-                    .catch(() => { /* ignora */ });
-                }
-              }}
+              onRunEnd={handleRunEnd}
             />
           </div>
         ) : null}

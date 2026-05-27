@@ -74,11 +74,17 @@ pub async fn get_project_problems(
         }));
     }
 
+    // Audit 27/05/2026: aggiunto 'passed' alla lista di esclusione.
+    // I job Playwright vengono salvati con status='passed' quando i test
+    // hanno successo, ma la query li includeva nel pannello Problemi
+    // marcandoli erroneamente come severity='error' (30 falsi positivi visti
+    // nel pannello su demo-wsl). Solo i job con status='failed' o stato
+    // anomalo non standard devono apparire come problemi.
     let failed_jobs = sqlx::query(
         r#"
         SELECT id, kind, status, input, created_at
         FROM jobs
-        WHERE project_id = $1 AND status NOT IN ('queued', 'running', 'completed', 'success')
+        WHERE project_id = $1 AND status NOT IN ('queued', 'running', 'completed', 'success', 'passed', 'ok', 'done')
         ORDER BY created_at DESC
         LIMIT 50
         "#,

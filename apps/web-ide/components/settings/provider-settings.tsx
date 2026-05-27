@@ -172,11 +172,18 @@ export function ProviderSettings({
           const currentValue = isEditing ? editValues[setting.key] : setting.value;
           const isSaving = saving[setting.key];
           const isSaved = saved[setting.key];
-          const providerName = setting.key.replace("_api_key", "");
+          // Per setting standard `<provider>_api_key`: deriva providerName.
+          // Per `google_provider_backend` (Vertex selector): trattato come pseudo-api-key
+          // per esporre LED + tasto Testa (usa lo stesso endpoint /providers/google/health
+          // che internamente sceglie Gemini direct o Vertex in base al backend in DB).
+          const isVertexBackendSwitch = setting.key === "google_provider_backend";
+          const providerName = isVertexBackendSwitch
+            ? "google"
+            : setting.key.replace("_api_key", "");
 
           // Cerca il corrispondente setting _enabled (solo per le API key dei provider noti)
           const isProviderApiKey =
-            setting.key.endsWith("_api_key") &&
+            (setting.key.endsWith("_api_key") || isVertexBackendSwitch) &&
             PROVIDER_NAMES.includes(providerName as (typeof PROVIDER_NAMES)[number]);
 
           const enabledItem = isProviderApiKey
@@ -277,8 +284,15 @@ export function ProviderSettings({
                     </button>
                   )}
 
-                  {/* ── LED stato provider ── */}
-                  {setting.is_secret && setting.key.endsWith("_api_key") && (() => {
+                  {/* ── LED stato provider ──
+                       Visibile per (a) le API key dei provider (campi `*_api_key`,
+                       sensitive) e (b) `google_provider_backend` (Vertex selector,
+                       not-secret): cosi' admin che configurano Vertex hanno il
+                       tasto Testa direttamente accanto al campo backend, senza
+                       dover scorrere fino a `google_api_key`.
+                       L'endpoint /providers/google/health usato dal Testa sceglie
+                       internamente Gemini direct o Vertex in base al backend in DB. */}
+                  {((setting.is_secret && setting.key.endsWith("_api_key")) || isVertexBackendSwitch) && (() => {
                     const billingUrls: Record<string, string> = {
                       anthropic: "https://console.anthropic.com/settings/billing",
                       openai:    "https://platform.openai.com/account/billing",

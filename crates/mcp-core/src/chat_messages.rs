@@ -1233,6 +1233,25 @@ async fn build_vectorized_conversation_history(
 ) -> Vec<serde_json::Value> {
     const RAW_FALLBACK: i64 = 8;
 
+    // ── Fast-path messaggi conversazionali brevi ───────────────────────────
+    // L'embedding + ricerca semantica Qdrant costa ~6-8s in totale (model
+    // call all-MiniLM + Qdrant search + dedup). Per messaggi tipo "ciao",
+    // "grazie", "ok" non c'e' valore aggiunto: la ricerca semantica ritorna
+    // hit irrilevanti e il modello risponde comunque dal contesto recente.
+    // Saltiamo direttamente al raw fallback risparmiando ~8s per turno.
+    //
+    // Soglia: 24 char (es. "ciao come stai oggi?" = 20 char, "grazie mille tante" = 18).
+    // Sotto questa soglia il messaggio e' quasi sempre conversazionale e la
+    // ricerca semantica non aggiunge segnale utile.
+    let trimmed = current_message.trim();
+    if trimmed.len() < 24 {
+        tracing::info!(
+            "vectorized history: fast-path msg breve (len={}) per session={}, skip embedding+Qdrant, uso {RAW_FALLBACK} raw",
+            trimmed.len(), session_id,
+        );
+        return build_recent_conversation_history(db, session_id, RAW_FALLBACK).await;
+    }
+
     let recent = build_recent_conversation_history(db, session_id, recent_count).await;
 
     // Costruzione dell'input di embedding: includiamo l'ULTIMA iterazione

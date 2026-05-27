@@ -222,8 +222,15 @@ export function useMultiChat(projectId: string): UseMultiChatReturn {
   }, []);
 
   // ── Ctx ratio tracking (per badge sul bottone Compatta) ──────────────────────
+  // Audit 27/05/2026: short-circuit se il valore non e' cambiato per evitare
+  // re-render e potenziali loop "Maximum update depth exceeded" se il caller
+  // chiama setCtxRatio in un useEffect con dep instabili.
   const setCtxRatio = useCallback((sessionId: string, ratio: number | null) => {
     setCtxRatioState((prev) => {
+      const currentRatio = prev.get(sessionId) ?? null;
+      // Confronto con tolleranza per evitare update se la differenza e' marginale.
+      if (ratio == null && currentRatio == null) return prev;
+      if (ratio != null && currentRatio != null && Math.abs(ratio - currentRatio) < 0.001) return prev;
       const next = new Map(prev);
       if (ratio == null) next.delete(sessionId);
       else next.set(sessionId, ratio);

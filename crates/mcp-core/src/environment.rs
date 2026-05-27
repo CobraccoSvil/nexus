@@ -1013,12 +1013,58 @@ pub async fn providers_status_internal(
         .map(|r| (r.key.trim_end_matches("_api_key").to_string(), !r.value.trim().is_empty()))
         .collect();
 
-    // Cooldown snapshot.
-    let cooldown_map: std::collections::HashMap<String, (u64, Option<String>)> =
+    // Cooldown snapshot — merge da due sorgenti:
+    //   1) provider_cooldown.rs: cooldown applicato da mcp-core (es. da
+    //      brain_agent_client.rs quando rileva stop_reason=error + classify
+    //      provider_error riconosce billing/rate_limit/overloaded).
+    //   2) brain REST endpoint /providers/billing-cooldown: cooldown applicato
+    //      LOCALMENTE dal brain Python in registry.py quando un provider
+    //      ritorna billing_error e il brain fa fallback interno (questo path
+    //      NON arriva mai a mcp-core, quindi senza questo merge il LED UI
+    //      restava verde anche se Anthropic aveva quota esaurita).
+    // La fusione fa l'unione delle due mappe: provider in cooldown su
+    // entrambi i layer prendono il max secs rimanente.
+    let mut cooldown_map: std::collections::HashMap<String, (u64, Option<String>)> =
         crate::provider_cooldown::cooldown_snapshot()
             .into_iter()
             .map(|(name, secs, reason)| (name, (secs, reason)))
             .collect();
+    // Brain billing-cooldown polling (timeout corto, fail-soft).
+    let brain_url = std::env::var("BRAIN_REST_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+    let brain_url = brain_url.trim_end_matches('/').to_string();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(800))
+        .build()
+        .ok();
+    if let Some(client) = client {
+        let url = format!("{}/providers/billing-cooldown", brain_url);
+        if let Ok(resp) = client.get(&url).send().await {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if let Some(providers) = body.get("providers").and_then(|v| v.as_object()) {
+                        for (name, secs_val) in providers.iter() {
+                            if let Some(secs) = secs_val.as_u64() {
+                                let mins = (secs + 59) / 60;
+                                let reason = Some(format!(
+                                    "Quota provider esaurita (rilevato dal brain). Nexus userà un altro provider per ~{}min.",
+                                    mins
+                                ));
+                                cooldown_map.entry(name.clone())
+                                    .and_modify(|existing| {
+                                        // Max delle due durate, mantieni la reason esistente se piu' specifica.
+                                        if secs > existing.0 {
+                                            existing.0 = secs;
+                                        }
+                                    })
+                                    .or_insert((secs, reason));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let providers: Vec<Value> = KNOWN_PROVIDERS.iter().map(|&name| {
         let mut p = json!({

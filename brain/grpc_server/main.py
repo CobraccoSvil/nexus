@@ -439,6 +439,21 @@ def health() -> dict[str, str]:
     return {"service": "neural-core", "status": "ok", "version": "0.2.0"}
 
 
+@app.get("/providers/billing-cooldown")
+def billing_cooldown() -> dict[str, dict[str, int]]:
+    """Snapshot dei provider in billing-error cooldown locale (brain-side).
+
+    Usato da mcp-core per aggiornare lo stato canonico (LED UI gialli).
+    Quando un provider ritorna `billing_error` (credit_balance_too_low) il
+    brain lo mette in cache per evitare chiamate API sprecate. Questo
+    endpoint espone la cache cosi' il LED UI riflette la realta'.
+
+    Output: { providers: { "anthropic": 540, "openai": 0 } } — secondi rimanenti.
+    """
+    from brain.providers.registry import get_billing_cooldown_snapshot
+    return {"providers": get_billing_cooldown_snapshot()}
+
+
 @app.post("/classify-intent")
 def classify_intent(body: IntentRequest) -> dict[str, str]:
     return router.classify_intent(body.message)
@@ -506,6 +521,57 @@ def semantic_search(body: SearchRequest) -> dict[str, object]:
 @app.get("/providers/{provider}/models")
 def list_models(provider: str) -> dict[str, object]:
     return providers.sync_models(provider)
+
+
+@app.get("/providers/{provider}/models/live")
+async def list_models_live(provider: str) -> dict[str, object]:
+    """Lista modelli realmente disponibili sull'API del provider (autodiscovery live).
+
+    Diverso da /providers/{p}/models che legge dal catalog DB: questo endpoint
+    chiama il SDK del provider e ritorna i modelli effettivamente esposti
+    dall'API in questo momento. Usato da catalog_sync_loop (Rust mcp-core) per
+    provider che richiedono auth complessa (Vertex SDK con Service Account):
+    il worker Rust non puo' chiamare Vertex direct (auth Google complica), ma
+    chiama questo endpoint che gira Python con il SDK gia' configurato dal DB.
+
+    Output: { "provider": "google", "models": ["gemini-2.5-flash", ...] }
+    Su errore: HTTP 503 con { "error": "..." }.
+    """
+    prov = providers._providers.get(provider)
+    if prov is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"provider '{provider}' non noto")
+    # Provider Google: chiama il SDK Vertex/Gemini reale
+    if provider == "google":
+        try:
+            from brain.providers.google_provider import GoogleProvider
+            assert isinstance(prov, GoogleProvider)
+            ok, reason = prov._is_configured()
+            if not ok:
+                from fastapi import HTTPException
+                raise HTTPException(status_code=503, detail=f"google non configurato: {reason}")
+            client = prov._get_client()
+            # client.aio.models.list() ritorna AsyncPager iterabile
+            model_names: list[str] = []
+            page = await client.aio.models.list()
+            async for m in page:
+                # Vertex ritorna "publishers/google/models/gemini-2.5-flash"
+                # Gemini direct ritorna "models/gemini-2.5-flash"
+                # Normalizziamo a basename per coerenza col catalog DB.
+                name = (m.name or "").rsplit("/", 1)[-1]
+                if name:
+                    model_names.append(name)
+            return {"provider": provider, "models": sorted(set(model_names))}
+        except Exception as exc:
+            logger.exception("list_models_live(google) fallito: %s", exc)
+            from fastapi import HTTPException
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+    # Altri provider: non implementato qui (Rust worker chiama API direct).
+    from fastapi import HTTPException
+    raise HTTPException(
+        status_code=501,
+        detail=f"live listing per '{provider}' non implementato (usa /v1/models del provider direct)",
+    )
 
 
 @app.get("/providers/{provider}/health")

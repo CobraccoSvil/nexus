@@ -57,6 +57,7 @@ mod internal_learning;
 mod port_registry;
 mod provider_health_probe;
 mod model_health_probe;
+mod model_catalog_sync;
 mod catalog_sync_worker;
 mod deepseek_balance_sync;
 mod routing_matrix_auto_promoter;
@@ -484,6 +485,48 @@ async fn main() -> anyhow::Result<()> {
     // Recovery: sincronizza registro con file .service esistenti su disco.
     port_registry_cache.startup_recovery().await;
 
+    // Pre-creazione collection Qdrant globali (best-effort, async).
+    // La collection `knowledge_notes` deve esistere prima del primo search/upsert.
+    // Senza questa chiamata, la creazione lazy alla prima chiamata `search_knowledge_points`
+    // puo' fallire se Qdrant e' temporaneamente irraggiungibile (race in startup),
+    // generando il toast "Operazione progetto (POST) fallita: Ricerca fallita:
+    // impossibile creare collection knowledge_notes" e bloccando a cascata
+    // l'orchestrator AI sui nuovi progetti.
+    {
+        let db_for_qdrant_init = db.clone();
+        tokio::spawn(async move {
+            let max_attempts = 8;
+            let mut delay_ms = 500u64;
+            for attempt in 1..=max_attempts {
+                match vector_memory::ensure_knowledge_collection(&db_for_qdrant_init).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "ensure_knowledge_collection: collection knowledge_notes pronta (tentativo {})",
+                            attempt
+                        );
+                        return;
+                    }
+                    Err(e) if attempt < max_attempts => {
+                        tracing::warn!(
+                            "ensure_knowledge_collection: tentativo {}/{} fallito ({}), retry tra {}ms",
+                            attempt, max_attempts, e, delay_ms
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        delay_ms = (delay_ms * 2).min(8000);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "ensure_knowledge_collection: tutti i {} tentativi falliti, ultimo errore: {}. \
+                             La collection sara' creata lazily alla prima query knowledge — \
+                             verificare lo stato del container Qdrant.",
+                            max_attempts, e
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     let gw_url = std::env::var("NEXUS_GATEWAY_URL")
         .unwrap_or_else(|_| "http://localhost:4060".to_string());
     let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
@@ -551,6 +594,16 @@ async fn main() -> anyhow::Result<()> {
     security::audit::start_writer(state.db.clone());
     // Port enforcer: scansiona porte TCP in LISTEN ogni 5s, killa processi
     // di progetto che bindano porte fuori dal bucket assegnato.
+    // Bug 7 fix (mig 0182): worker che sincronizza ai_price_catalog con i
+    // modelli realmente esposti dalle API provider. Evita che la routing
+    // matrix punti a modelli deprecati (es. DeepSeek v3 ora rimosso dall'API).
+    {
+        let db_sync = state.db.clone();
+        tokio::spawn(async move {
+            model_catalog_sync::catalog_sync_loop(db_sync).await;
+        });
+    }
+
     tokio::spawn(security::port_enforcer::port_enforcer_loop(
         state.db.clone(),
         state.project_channels.clone(),
@@ -1650,6 +1703,49 @@ async fn main() -> anyhow::Result<()> {
                     middleware::require_auth,
                 )),
             )
+            // Route proxy: metodi HTTP espliciti invece di any() — any() con .layer() ha
+            // comportamento anomalo in Axum 0.7 e restituisce 405 per GET anche se la
+            // route esiste. Con metodi espliciti il MethodRouter è correttamente popolato
+            // e matchit dà priorità al segmento statico "proxy" sul parametrico "/:action".
+            .route(
+                "/api/projects/:id/services/:service/proxy",
+                get(project_workspace::proxy_root)
+                    .post(project_workspace::proxy_root)
+                    .put(project_workspace::proxy_root)
+                    .patch(project_workspace::proxy_root)
+                    .delete(project_workspace::proxy_root)
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_auth,
+                    )),
+            )
+            .route(
+                "/api/projects/:id/services/:service/proxy/",
+                get(project_workspace::proxy_root)
+                    .post(project_workspace::proxy_root)
+                    .put(project_workspace::proxy_root)
+                    .patch(project_workspace::proxy_root)
+                    .delete(project_workspace::proxy_root)
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_auth,
+                    )),
+            )
+            .route(
+                "/api/projects/:id/services/:service/proxy/*path",
+                get(project_workspace::proxy_path)
+                    .post(project_workspace::proxy_path)
+                    .put(project_workspace::proxy_path)
+                    .patch(project_workspace::proxy_path)
+                    .delete(project_workspace::proxy_path)
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_auth,
+                    )),
+            )
+            // Route azione servizio — ripristino /:action (POST only) per mantenere la
+            // firma originale di control_project_service (Path<(String, String, String)>).
+            // matchit dà priorità al segmento statico "proxy" su "/:action" parametrico.
             .route(
                 "/api/projects/:id/services/:service/:action",
                 post(project_workspace::control_project_service).layer(axum_mw::from_fn_with_state(
@@ -2146,6 +2242,21 @@ async fn main() -> anyhow::Result<()> {
                         state.clone(),
                         middleware::require_admin,
                     )),
+            )
+            // Bug 7 fix: trigger manuale del worker model_catalog_sync.
+            // POST /api/admin/catalog-sync -> esegue 1 tick subito e ritorna lo stats.
+            // Utile per onboarding (popola subito catalog) e test E2E (no attesa interval).
+            .route(
+                "/api/admin/catalog-sync",
+                axum::routing::post(|axum::extract::State(s): axum::extract::State<AppState>| async move {
+                    match model_catalog_sync::trigger_sync_now(&s.db).await {
+                        Ok(summary) => axum::Json(serde_json::json!({"ok": true, "summary": summary})),
+                        Err(e) => axum::Json(serde_json::json!({"ok": false, "error": e})),
+                    }
+                }).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/fs/directories",

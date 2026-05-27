@@ -19,6 +19,58 @@ from .vllm_provider import VllmProvider
 
 logger = logging.getLogger(__name__)
 
+# ── Provider billing-error cooldown cache ─────────────────────────────────────
+# Quando un provider ritorna billing_error (credit_balance_too_low, quota
+# esaurita), il brain lo mette in cooldown locale per evitare di sprecare
+# chiamate API che falliranno comunque. Il prossimo turno parte direttamente
+# dal provider successivo nella chain.
+# TTL conservativo: 10 min. La cache e' azzerata al restart del brain.
+# Una soluzione piu' completa (con notifica UI via mcp-core) e' tracciata
+# nel task #30 — qui implementiamo solo il cooldown lato brain per evitare
+# il loop di chiamate Anthropic 400 ogni turno.
+_PROVIDER_COOLDOWN_TTL_S = 600
+_provider_cooldown_until: dict[str, float] = {}
+
+
+def _is_in_billing_cooldown(provider: str) -> bool:
+    """True se il provider e' in cooldown billing-error attivo."""
+    until = _provider_cooldown_until.get(provider.lower())
+    if until is None:
+        return False
+    if time.monotonic() >= until:
+        # Scaduto: pulisci entry
+        _provider_cooldown_until.pop(provider.lower(), None)
+        return False
+    return True
+
+
+def _mark_billing_cooldown(provider: str) -> None:
+    """Registra un provider in cooldown billing-error per `_PROVIDER_COOLDOWN_TTL_S`."""
+    key = provider.lower()
+    _provider_cooldown_until[key] = time.monotonic() + _PROVIDER_COOLDOWN_TTL_S
+    logger.warning(
+        "Provider %s in billing-error cooldown locale per %ds (skip nelle prossime richieste)",
+        provider, _PROVIDER_COOLDOWN_TTL_S,
+    )
+
+
+def get_billing_cooldown_snapshot() -> dict[str, int]:
+    """Restituisce {provider: secondi_rimanenti} per i provider in cooldown.
+
+    Usato dall'endpoint REST /providers/billing-cooldown per esporre lo stato
+    a mcp-core (che a sua volta aggiorna i LED nella UI).
+    """
+    now = time.monotonic()
+    snapshot: dict[str, int] = {}
+    for key, until in list(_provider_cooldown_until.items()):
+        remaining = int(until - now)
+        if remaining > 0:
+            snapshot[key] = remaining
+        else:
+            _provider_cooldown_until.pop(key, None)
+    return snapshot
+
+
 # ── Billing enabled ───────────────────────────────────────────────────────────
 # Valore canonico: settings.brain_billing_enabled nel DB (admin panel).
 # Override emergenza: NEXUS_BRAIN_BILLING=on (priorita' massima).
@@ -576,20 +628,49 @@ class ProviderRegistry:
                     metadata={"error": exc_msg, "stop_reason": stop},
                 )
 
-        result = _run_agent_turn(effective_provider, effective_model)
-        usage = (result.metadata or {}).get("usage")
-        _record_usage(
-            result.provider,
-            result.model,
-            usage if isinstance(usage, dict) else None,
-            {"feature": "neural.GenerateAgentTurn"},
-        )
+        # Se il provider primario e' in billing-error cooldown locale, skip
+        # direttamente al fallback senza sprecare una chiamata API. Il brain
+        # ha gia' visto questo provider fallire con quota esaurita di recente.
+        if _is_in_billing_cooldown(effective_provider):
+            logger.warning(
+                "Provider %s/%s in billing-cooldown locale, skip al fallback chain",
+                effective_provider, effective_model,
+            )
+            result = ProviderResult(
+                provider=effective_provider, model=effective_model,
+                content=f"[Provider {effective_provider} in billing cooldown]",
+                metadata={"error": "billing_cooldown_skip", "stop_reason": "billing_error"},
+            )
+        else:
+            result = _run_agent_turn(effective_provider, effective_model)
+            usage = (result.metadata or {}).get("usage")
+            _record_usage(
+                result.provider,
+                result.model,
+                usage if isinstance(usage, dict) else None,
+                {"feature": "neural.GenerateAgentTurn"},
+            )
+            # Se billing_error, marca il provider in cooldown locale.
+            # billing_error puo' essere su stop_reason (chain interna) o
+            # error_class (format_error_result usa stop_reason="error" generico
+            # e popola error_class con la classificazione fine).
+            if (
+                result.metadata.get("stop_reason") == "billing_error"
+                or result.metadata.get("error_class") == "billing_error"
+            ):
+                _mark_billing_cooldown(effective_provider)
 
         # Fallback a cascata: se il provider fallisce per errori retriable (billing/quota/errore),
         # proviamo i provider successivi nella chain dinamica (DB-driven, niente hardcoded).
         _RETRIABLE_STOPS = {"billing_error", "rate_limit", "overloaded", "provider_error", "error", "timeout"}
         if result.metadata.get("stop_reason") in _RETRIABLE_STOPS or result.content.startswith("[Error:"):
             for fb_prov in self._provider_fallback_chain(exclude=effective_provider):
+                # Skip provider gia' in billing-cooldown locale.
+                if _is_in_billing_cooldown(fb_prov):
+                    logger.info(
+                        "Fallback skip %s: in billing-cooldown locale", fb_prov,
+                    )
+                    continue
                 fb_model = self._default_model_or_none(fb_prov)
                 if fb_model is None:
                     logger.warning(
@@ -611,6 +692,12 @@ class ProviderRegistry:
                     usage if isinstance(usage, dict) else None,
                     {"feature": "neural.GenerateAgentTurn", "fallback": True},
                 )
+                # Se anche il fallback e' billing_error, marca anche lui.
+                if (
+                    fb_result.metadata.get("stop_reason") == "billing_error"
+                    or fb_result.metadata.get("error_class") == "billing_error"
+                ):
+                    _mark_billing_cooldown(fb_prov)
                 if not (fb_result.metadata.get("stop_reason") in _RETRIABLE_STOPS or fb_result.content.startswith("[Error:")):
                     return fb_result
                 # Continua al prossimo fallback

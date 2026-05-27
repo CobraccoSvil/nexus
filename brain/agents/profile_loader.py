@@ -90,6 +90,34 @@ class AgentProfile:
                 if t.get("name") in allow or t.get("name") in self._ALWAYS_ON_TOOLS]
 
 
+# ── Lazy Tool Discovery Toolkit ──────────────────────────────────────────────
+# Subset minimo passato al modello per intent generici (code/implement/fix).
+# Il modello cerca i tool che gli servono via `nexus_mcp_tool_search` e li
+# invoca via `nexus_mcp_tool_call`, evitando di caricare tutti i ~479 tool
+# nel context. Sostituisce il vecchio comportamento ["*"] che saturava ctx.
+#
+# Composizione:
+#   - nexus_mcp_tool_search: ricerca semantica + ILIKE su nome/descrizione
+#   - nexus_mcp_tool_call: invocazione tool dato server_id + tool_name
+#   - read_file/read_file_lines/list_files/search_in_files: lettura base
+#     (sempre utile per orientarsi rapidamente senza scoperta dinamica)
+#   - git_status: stato repo (frequentissimo nei task code/fix/debug)
+#
+# I tool _ALWAYS_ON_TOOLS (recall_context, write_file, edit_file, run_command,
+# run_service) bypassano comunque questo filtro, quindi il modello mantiene
+# capacita' di scrittura/esecuzione anche in lazy mode.
+_LAZY_MINIMAL_TOOLKIT = [
+    "nexus_mcp_tool_search",
+    "nexus_mcp_tool_call",
+    "read_file",
+    "read_file_lines",
+    "list_files",
+    "search_in_files",
+    "search_codebase_semantic",
+    "git_status",
+]
+
+
 # ── Mapping intent → subset di tool (BP5 piano riduzione token) ─────────────
 # Gli intent sono prodotti dal SemanticRouter (brain/agents/router.py).
 # Per ogni intent dichiariamo un sottoinsieme massimo di tool consentiti.
@@ -127,17 +155,35 @@ _INTENT_TOOL_SUBSET: dict[str, list[str]] = {
         "search_codebase_semantic", "write_file", "edit_file",
         "git_status", "git_stage",
     ],
-    # Edit/code/implement/fix: nessun filtro intent (usa profilo).
-    "code": ["*"],
-    "code_edit": ["*"],
-    "implement": ["*"],
-    "fix": ["*"],
-    "debug": ["*"],
-    # Doc generation: lettura + scrittura.
-    "doc_generate": [
-        "read_file", "read_file_lines", "list_files", "search_in_files",
-        "write_file", "edit_file",
-    ],
+    # Edit/code/implement/fix: lazy tool discovery via nexus_mcp_tool_search.
+    # Prima: ["*"] passava TUTTI i ~479 tool al modello, saturando il context
+    # (visti 114K token, 89% ctx prima ancora del primo step) e causando loop
+    # di esplorazione invece di azione. Ora il modello riceve un MINIMAL TOOLKIT
+    # (~10 tool: search/call meta-tool + lettura base) e cerca i tool specifici
+    # via nexus_mcp_tool_search → nexus_mcp_tool_call.
+    "code": _LAZY_MINIMAL_TOOLKIT,
+    "code_edit": _LAZY_MINIMAL_TOOLKIT,
+    "implement": _LAZY_MINIMAL_TOOLKIT,
+    "fix": _LAZY_MINIMAL_TOOLKIT,
+    "debug": _LAZY_MINIMAL_TOOLKIT,
+    # file_ops: intent generico per operazioni su file (lettura + scrittura).
+    # Visto classificare anche messaggi conversazionali come "ciao" se la chat
+    # precedente conteneva generazione doc/file ops (contaminazione contesto).
+    # Lazy toolkit + always-on (write_file, edit_file) sono sufficienti.
+    "file_ops": _LAZY_MINIMAL_TOOLKIT,
+    "scaffold_app": _LAZY_MINIMAL_TOOLKIT,
+    "architecture": _LAZY_MINIMAL_TOOLKIT,
+    # Doc generation: SOLO nexus_doc_generate (single shot).
+    # NON includere write_file/edit_file: bypassano il catalogo DB nexus_docs.
+    # NON includere read_file/list_files: il backend handle_doc_generate
+    # genera il content_json automaticamente via purpose `docs_generator`,
+    # quindi l'agente non deve esplorare il codebase — chiama solo il tool.
+    # Includere troppi tool causa loop di esplorazione (visti 19+ step e timeout)
+    # invece di chiamare immediatamente nexus_doc_generate.
+    "doc_generate": ["nexus_doc_generate"],
+    # Alias usato dal classificatore quando l'utente chiede di generare doc
+    # dal pannello DOCUMENTI (prompt comincia con "ISTRUZIONE PRIORITARIA").
+    "docs": ["nexus_doc_generate"],
 }
 
 

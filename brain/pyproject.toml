@@ -3,7 +3,11 @@ name = "ai-orchestrator-brain"
 version = "0.1.0"
 description = "Neural core for AI-Orchestrator v2"
 authors = ["Cobracco S.r.l."]
-packages = [{ include = "brain" }]
+# La directory `brain/` ha gia' un `__init__.py` ed e' essa stessa il package.
+# Il vecchio `include = "brain"` faceva cercare a poetry-core `brain/brain/`
+# (inesistente) -> wheel build failed. Con `from = ".."` poetry cerca da una
+# dir sopra, trovando `../brain/` cioe' la dir corrente. Fix Bug B (27/05/2026).
+packages = [{ include = "brain", from = ".." }]
 
 [tool.poetry.dependencies]
 python = "^3.12"

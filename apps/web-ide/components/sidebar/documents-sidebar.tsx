@@ -49,105 +49,65 @@ const STATUS_COLORS: Record<string, string> = {
 // Blocco di vincoli operativi prepended a ogni prompt: forza l'uso del tool
 // nexus_doc_generate (che registra il documento nel DB project_documents)
 // invece di write_file (che scrive solo sul filesystem e bypassa il catalogo).
-const TOOL_CONSTRAINTS = `VINCOLI ASSOLUTI (NON NEGOZIABILI):
-- VIETATO usare write_file, nexus_write_file, edit_file o qualunque tool di scrittura diretta per produrre il documento.
-- DEVI chiamare il tool nexus_doc_generate UNA SOLA VOLTA al termine, con i parametri:
-  - doc_type: una di {functional_analysis, technical_analysis, er_diagram, project_management, release_notes}
-  - title: titolo del documento (stringa)
-  - content_json: oggetto con sections (array {title, content})
-- Se non chiami nexus_doc_generate il documento NON apparira' nel pannello DOCUMENTI e il lavoro andra' perso.
-- Esempio chiamata corretta:
-  nexus_doc_generate({ doc_type: "technical_analysis", title: "Analisi Tecnica - X", content_json: { sections: [{ title: "Executive Summary", content: "..." }, ...] } })
+//
+// Audit 27/05/2026: refactor da prompt "esplorativo" a "first-action".
+// Prima i prompt istruivano l'agente a "esplorare TUTTO il codebase" prima di
+// chiamare il tool, il che mandava i modelli piu' deboli (mistral-small,
+// devstral) in loop di read_file fino a saturare il context (visti 8M token,
+// 6513% ctx) senza mai concludere. Il backend `handle_doc_generate` ha gia'
+// una logica di auto-generazione del content_json quando viene chiamato senza:
+// legge README/package.json/Cargo.toml + struttura directory e chiede al
+// brain (purpose=docs_generator, gpt-4.1-nano) di produrre il JSON
+// strutturato. Quindi la cosa giusta da fare per l'agente di chat e' chiamare
+// il tool IMMEDIATAMENTE col solo title, senza esplorare.
+const TOOL_CONSTRAINTS = `ISTRUZIONE PRIORITARIA (FIRST ACTION):
+La PRIMA azione che devi fare e' chiamare IMMEDIATAMENTE il tool nexus_doc_generate, senza esplorazioni preliminari. Il backend genera automaticamente il content_json analizzando il progetto (README, package.json, Cargo.toml, struttura directory) tramite il purpose model 'docs_generator'. Non leggere file, non listare directory, non eseguire git log: chiama solo il tool.
+
+Chiamata richiesta (UNA SOLA VOLTA, come prima azione):
+  nexus_doc_generate({ doc_type: "<tipo>", title: "<titolo descrittivo>" })
+
+Parametri:
+- doc_type (obbligatorio): una di {functional_analysis, technical_analysis, er_diagram, project_management, release_notes}
+- title (obbligatorio): stringa breve, es. "Analisi Tecnica - Demo WSL"
+- content_json (opzionale): se omesso, il backend lo genera automaticamente. Includilo SOLO se hai gia' raccolto contesto reale dal progetto e vuoi scriverlo a mano.
+
+VIETATI: write_file, nexus_write_file, edit_file (bypassano il catalogo DB).
+Se non chiami nexus_doc_generate alla prima azione, il documento NON apparira' nel pannello DOCUMENTI.
 
 `;
 
+// I prompt per ciascun doc_type sono MINIMAL: solo titolo e doc_type.
+// Il backend `handle_doc_generate` genera automaticamente un content_json
+// professionale tramite il purpose model `docs_generator` (gpt-4.1-nano)
+// se content_json e' omesso. Non duplichiamo "esplora il codebase" qui:
+// e' un anti-pattern che mandava in loop infinito i modelli (Mistral, DeepSeek
+// e perfino Sonnet) prima che chiamassero il tool. Vedi commento al
+// TOOL_CONSTRAINTS sopra per il razionale completo.
 const GENERATE_PROMPTS_RAW: Record<string, string> = {
-  functional_analysis: `Genera l'Analisi Funzionale del progetto seguendo lo standard IEEE 830 / ISO 29148.
+  functional_analysis: `Tipo: Analisi Funzionale (standard IEEE 830 / ISO 29148).
 
-ISTRUZIONI OPERATIVE:
-1. Esplora TUTTO il codebase con list_files (ricorsivo) per mappare ogni modulo, controller, servizio, modello.
-2. Leggi i file chiave: entry point, configurazioni, schema DB (migrazioni SQL), API routes, modelli dati.
-3. Costruisci un content_json con ALMENO 8 sezioni principali e sottosezioni:
-   - 1. Introduzione (scopo, ambito, definizioni, riferimenti)
-   - 2. Descrizione Generale (prospettiva prodotto, funzionalita', classi utenti, ambiente operativo, vincoli)
-   - 3. Requisiti Funzionali (elenca OGNI requisito come RF-001..RF-N con priorita', input, output, precondizioni)
-   - 4. Requisiti Non Funzionali (performance, sicurezza, usabilita', affidabilita')
-   - 5. Interfacce Esterne (UI, API, integrazioni terze parti)
-   - 6. Modello Dati (entita', relazioni, vincoli)
-   - 7. Flussi Operativi (scenari principali, diagrammi di sequenza in testo)
-   - 8. Matrice di Tracciabilita' (requisito -> componente -> test)
-4. OGNI sezione deve contenere almeno 4-6 frasi dettagliate basate sul codice REALE analizzato, non generiche.
-5. Chiama nexus_doc_generate con il content_json completo. NON rispondere in chat — genera il .docx.`,
+Chiama subito: nexus_doc_generate({ doc_type: "functional_analysis", title: "Analisi Funzionale - <nome progetto>" }).
+Il backend genera il contenuto. Non esplorare file ne' costruire content_json a mano.`,
 
-  technical_analysis: `Genera l'Analisi Tecnica del progetto con qualita' professionale da consulenza enterprise.
+  technical_analysis: `Tipo: Analisi Tecnica (qualita' professionale, livello consulenza enterprise).
 
-ISTRUZIONI OPERATIVE:
-1. Esplora TUTTO il codebase: list_files ricorsivo su ogni directory. Leggi TUTTI i file di configurazione, entry point, modelli, controller, servizi.
-2. Analizza in profondita': dipendenze (package.json/Cargo.toml/.csproj), schema DB (migrazioni SQL), endpoint API (routes/controller), pattern architetturali usati.
-3. Costruisci un content_json con ALMENO 10 sezioni principali:
-   - 1. Executive Summary (panoramica progetto, obiettivi, stack scelto e motivazioni)
-   - 2. Architettura del Sistema (pattern architetturale, diagramma componenti in testo, layer separation)
-   - 3. Stack Tecnologico (linguaggio, framework, librerie principali con VERSIONI ESATTE lette dai file)
-   - 4. Struttura del Codebase (albero directory commentato, responsabilita' di ogni modulo)
-   - 5. Modello Dati e Database (DBMS, schema completo con tabelle/colonne/tipi/FK/indici letti dalle migrazioni)
-   - 6. API Reference (OGNI endpoint: metodo HTTP, path, request body, response, autenticazione)
-   - 7. Autenticazione e Sicurezza (meccanismo auth, gestione sessioni, CORS, rate limiting, input validation)
-   - 8. Gestione Errori e Logging (pattern, livelli, formato log, monitoraggio)
-   - 9. Build, Deploy e DevOps (comandi build, CI/CD, containerizzazione, ambienti)
-   - 10. Dipendenze Esterne e Integrazioni (servizi terzi, API esterne, message broker)
-   - 11. Performance e Scalabilita' (caching, connection pooling, strategie di scaling)
-   - 12. Debito Tecnico e Raccomandazioni (problemi identificati, miglioramenti suggeriti)
-4. OGNI sezione deve avere contenuto REALE estratto dal codice (nomi file, classi, funzioni, configurazioni specifiche). Minimo 5-8 frasi per sezione.
-5. Chiama nexus_doc_generate con il content_json completo. NON rispondere solo in chat.`,
+Chiama subito: nexus_doc_generate({ doc_type: "technical_analysis", title: "Analisi Tecnica - <nome progetto>" }).
+Il backend genera il contenuto. Non esplorare file ne' costruire content_json a mano.`,
 
-  er_diagram: `Genera il Diagramma Entity-Relationship completo del database del progetto.
+  er_diagram: `Tipo: Diagramma Entity-Relationship del database.
 
-ISTRUZIONI OPERATIVE:
-1. Leggi TUTTE le migrazioni SQL in db/migrations/ o cartelle equivalenti. Se non ci sono migrazioni, cerca modelli ORM (Entity Framework, Sequelize, Prisma, Diesel).
-2. Per ogni tabella/entita' documenta: nome, TUTTE le colonne con tipo e nullable, chiavi primarie, chiavi esterne, indici, vincoli CHECK/UNIQUE.
-3. Costruisci content_json con:
-   - 1. Panoramica del Modello Dati (DBMS, numero entita', strategia naming, convenzioni)
-   - 2. Diagramma ER (sintassi Mermaid erDiagram con TUTTE le relazioni: 1:1, 1:N, N:M)
-   - 3. Catalogo Entita' (per OGNI tabella: descrizione, tutte le colonne, tipi, vincoli)
-   - 4. Relazioni e Vincoli Referenziali (FK con ON DELETE/UPDATE, vincoli compositi)
-   - 5. Indici e Ottimizzazioni (indici per performance, indici parziali, indici GIN/GiST)
-   - 6. Diagramma delle Dipendenze (ordine di creazione tabelle, dipendenze circolari)
-4. NON inventare tabelle — documenta SOLO quelle reali trovate nel codice.
-5. Chiama nexus_doc_generate con doc_type="er_diagram".`,
+Chiama subito: nexus_doc_generate({ doc_type: "er_diagram", title: "Diagramma ER - <nome progetto>" }).
+Il backend genera il contenuto. Non esplorare file ne' costruire content_json a mano.`,
 
-  project_management: `Genera il Piano di Gestione Progetto professionale.
+  project_management: `Tipo: Piano di Gestione Progetto professionale.
 
-ISTRUZIONI OPERATIVE:
-1. Analizza il codebase per inferire: complessita', stato di maturita', copertura test, debito tecnico.
-2. Leggi git log (se disponibile) per capire velocita' di sviluppo, contributor, aree attive.
-3. Costruisci content_json con:
-   - 1. Panoramica Progetto (obiettivi, stakeholder, ambito, vincoli)
-   - 2. Work Breakdown Structure (WBS con attivita' raggruppate per area funzionale)
-   - 3. Timeline e Milestone (milestone realistiche basate sullo stato attuale del codice)
-   - 4. Gestione Rischi (rischi tecnici identificati dall'analisi del codice, matrice probabilita'/impatto, mitigazioni)
-   - 5. Risorse e Competenze (profili tecnici necessari basati sullo stack)
-   - 6. Strategia di Testing (unit, integration, e2e — stato attuale e raccomandazioni)
-   - 7. Piano di Deploy e Rilascio (ambienti, strategia rilascio, rollback)
-   - 8. Metriche e KPI (metriche di qualita' codice, velocita', coverage)
-4. Basa TUTTO sull'analisi reale del codice, non su template generici.
-5. Chiama nexus_doc_generate con doc_type="project_management".`,
+Chiama subito: nexus_doc_generate({ doc_type: "project_management", title: "Gestione Progetto - <nome progetto>" }).
+Il backend genera il contenuto. Non esplorare file ne' costruire content_json a mano.`,
 
-  release_notes: `Genera le Release Notes del progetto.
+  release_notes: `Tipo: Release Notes del progetto.
 
-ISTRUZIONI OPERATIVE:
-1. Usa run_command per eseguire "git log --oneline -50" (o equivalente) per ottenere i commit recenti.
-2. Analizza anche i file modificati di recente con "git diff --stat HEAD~20" per capire le aree impattate.
-3. Costruisci content_json con:
-   - 1. Panoramica della Versione (numero versione SemVer, data, sommario cambiamenti)
-   - 2. Nuove Funzionalita' (raggruppate per area, con descrizione utente-facing)
-   - 3. Miglioramenti (ottimizzazioni, refactoring, UX improvement)
-   - 4. Bug Fix (con riferimento al problema risolto)
-   - 5. Breaking Changes (con istruzioni di migrazione)
-   - 6. Problemi Noti (bug aperti, limitazioni)
-   - 7. Istruzioni di Aggiornamento (passi per aggiornare dalla versione precedente)
-   - 8. Contributori (se disponibile da git log)
-4. Classifica i commit secondo Conventional Commits (feat, fix, refactor, docs, chore).
-5. Chiama nexus_doc_generate con doc_type="release_notes".`,
+Chiama subito: nexus_doc_generate({ doc_type: "release_notes", title: "Release Notes - <nome progetto> v<versione>" }).
+Il backend genera il contenuto. Non esplorare file ne' costruire content_json a mano.`,
 };
 
 // Prefissa ogni prompt con i vincoli operativi sul tool da usare.

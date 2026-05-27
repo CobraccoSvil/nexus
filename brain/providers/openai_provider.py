@@ -51,6 +51,10 @@ _O_SERIES_ESSENTIAL_TOOL_NAMES = frozenset({
     "git_status", "git_commit", "run_tests",
     "nexus_mcp_tool_search", "nexus_mcp_tool_call",
     "search_codebase_semantic",
+    # Generazione documenti professionali .docx (audit 27/05/2026):
+    # senza questi tool, il pannello DOCUMENTI non riusciva a generare
+    # nulla quando il fallback finiva su modelli o-series / gpt-5-nano.
+    "nexus_doc_generate", "nexus_doc_update", "nexus_doc_list", "nexus_doc_status",
 })
 
 

@@ -722,12 +722,15 @@ pub async fn load_mcp_tools_for_agent(
             let short_id = server_id.to_string().replace('-', "")[..8].to_string();
             let prefixed_name = format!("mcp__{}__{}", short_id, tool_name);
 
+            // I campi `_mcp_server_id` e `_mcp_tool_name` sono stati rimossi
+            // (audit 27/05/2026): OpenAI/Anthropic strict mode rifiuta campi
+            // non-standard nel tool definition ("Extra inputs are not permitted").
+            // Il routing al server MCP usa il prefisso `mcp__{short_id}__{tool}`
+            // parsato dal nome, quindi i campi extra erano ridondanti.
             Some(json!({
                 "name": prefixed_name,
                 "description": format!("[MCP: {}] {}", server_name, description.unwrap_or_default()),
                 "input_schema": input_schema,
-                "_mcp_server_id": server_id.to_string(),
-                "_mcp_tool_name": tool_name,
             }))
         })
         .collect();

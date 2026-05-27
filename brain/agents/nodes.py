@@ -42,13 +42,144 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Cap iterazioni agent loop (richiesta executor -> tool_dispatch -> executor ...).
-# Fix M26: alzato da 25 -> 60 per allinearsi al cap Rust (AGENT_MAX_ITERATIONS=60
-# in crates/mcp-core/src/agent_types.rs:14). Run di generazione progetto E2E
-# richiedono tipicamente 40-65 iterazioni (vedi test maturity 2026-05-14T2040
-# run 738fc4f4: 62 step). Cap a 25 forzava completamenti prematuri o "forced
-# text mode" a 20 step impedendo task realmente E2E come scaffolding completo
-# di un'app full-stack.
+# Default conservativo: il valore reale per ogni run e' calcolato adattivamente da
+# `compute_iteration_budget()` sotto, sulla base della complessita' del prompt
+# e dei settings DB (agent.iteration_budget.*). Questo MAX_AGENT_ITERATIONS resta
+# come fallback se il DB non e' raggiungibile o se il budget non e' stato
+# popolato in state["iteration_budget"] dal router_node.
+#
+# Mig 0181 (adaptive_agent_budget): i task semplici prendono ~base (60), i task
+# complessi multi-step (fullstack scaffolding, refactor end-to-end) arrivano a
+# 200-300 senza modificare il codice.
 MAX_AGENT_ITERATIONS = 60
+
+# ── Cache adaptive budget settings (TTL 60s) ─────────────────────────────────
+# Evita N query al DB per ogni run mantenendo i valori freschi al cambio runtime.
+_ADAPTIVE_BUDGET_CACHE: dict[str, Any] = {"loaded_at": 0.0, "config": None}
+_ADAPTIVE_BUDGET_TTL_SEC = 60.0
+_ADAPTIVE_BUDGET_DEFAULTS = {
+    "iteration_budget_base": 60,
+    "iteration_budget_per_complexity_point": 4,
+    "iteration_budget_max": 300,
+    "complexity_step_marker_points": 5,
+    "complexity_file_path_points": 2,
+    "complexity_keyword_weights": {
+        "create": 3, "write_file": 2, "install": 2, "build": 2, "systemctl": 2,
+        "docker": 2, "pnpm": 2, "npm": 1, "deploy": 3, "migrate": 3,
+        "refactor": 4, "fullstack": 10, "end-to-end": 8, "backend": 2,
+        "frontend": 2, "database": 2, "crea": 3, "installa": 2, "esegui": 2,
+        "avvia": 2, "configura": 2,
+    },
+    "weak_model_multiplier": 1.5,
+}
+
+import re as _re_budget
+
+_WEAK_MODELS_HINT = ("mini", "nano", "haiku", "lite", "small", "flash-lite")
+_STEP_MARKER_RE = _re_budget.compile(r"\b(?:\d+\.|step\s+\d+|task\s+\d+|phase\s+\d+|fase\s+\d+|passo\s+\d+)\b", _re_budget.IGNORECASE)
+_FILE_PATH_RE = _re_budget.compile(r"(?:/[a-zA-Z0-9_.-]+){2,}|[a-zA-Z0-9_-]+\.(?:js|ts|tsx|jsx|py|rs|json|yml|yaml|sql|md|env|html|css|toml|sh)")
+
+
+def _load_adaptive_budget_config() -> dict[str, Any]:
+    """Carica i settings agent.iteration_budget.* dal DB con cache 60s.
+
+    Ritorna dict con tutte le chiavi richieste (con fallback ai defaults).
+    Mai solleva: se il DB e' down, ritorna i defaults hardcoded per garantire
+    che l'agente continui a funzionare anche in degraded mode.
+    """
+    now = time.time()
+    if _ADAPTIVE_BUDGET_CACHE["config"] is not None and (now - _ADAPTIVE_BUDGET_CACHE["loaded_at"]) < _ADAPTIVE_BUDGET_TTL_SEC:
+        return _ADAPTIVE_BUDGET_CACHE["config"]
+
+    config = dict(_ADAPTIVE_BUDGET_DEFAULTS)
+    try:
+        import os as _os
+        import psycopg2
+        db_url = _os.environ.get("DATABASE_URL") or "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable"
+        with psycopg2.connect(db_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT key, value FROM settings WHERE key LIKE 'agent.iteration_budget.%%' OR key LIKE 'agent.complexity.%%'"
+                )
+                for key, value in cur.fetchall():
+                    if key == "agent.iteration_budget.base":
+                        config["iteration_budget_base"] = int(value)
+                    elif key == "agent.iteration_budget.per_complexity_point":
+                        config["iteration_budget_per_complexity_point"] = int(value)
+                    elif key == "agent.iteration_budget.max":
+                        config["iteration_budget_max"] = int(value)
+                    elif key == "agent.complexity.step_marker_points":
+                        config["complexity_step_marker_points"] = int(value)
+                    elif key == "agent.complexity.file_path_points":
+                        config["complexity_file_path_points"] = int(value)
+                    elif key == "agent.complexity.keyword_weights":
+                        try:
+                            config["complexity_keyword_weights"] = json.loads(value)
+                        except Exception:
+                            pass
+                    elif key == "agent.complexity.weak_model_multiplier":
+                        try:
+                            config["weak_model_multiplier"] = float(value)
+                        except Exception:
+                            pass
+    except Exception as exc:
+        logger.warning("adaptive_budget: load DB fallito, uso defaults (%s)", exc)
+
+    _ADAPTIVE_BUDGET_CACHE["config"] = config
+    _ADAPTIVE_BUDGET_CACHE["loaded_at"] = now
+    return config
+
+
+def estimate_prompt_complexity(prompt: str, config: dict[str, Any] | None = None) -> int:
+    """Stima la complessita' del task come score 0-100.
+
+    Punteggio = somma(keyword_match * peso) + n_step_markers * step_points
+              + n_file_paths * file_path_points, capped a 100.
+
+    Deterministico: stesso prompt -> stesso score. Idempotente: nessun side effect.
+    """
+    if not prompt:
+        return 0
+    if config is None:
+        config = _load_adaptive_budget_config()
+    text = prompt.lower()
+    score = 0
+    # Keyword weighted match (substring).
+    for keyword, weight in config["complexity_keyword_weights"].items():
+        if keyword in text:
+            score += int(weight)
+    # Step markers (1., 2., step N, fase N, ...).
+    n_steps = len(_STEP_MARKER_RE.findall(prompt))
+    score += n_steps * int(config["complexity_step_marker_points"])
+    # File path / extension markers.
+    n_paths = len(_FILE_PATH_RE.findall(prompt))
+    score += n_paths * int(config["complexity_file_path_points"])
+    return min(score, 100)
+
+
+def compute_iteration_budget(prompt: str, model: str | None = None) -> tuple[int, int]:
+    """Calcola il budget di iterazioni per un run agente.
+
+    Ritorna (iter_budget, complexity_score). Il budget e':
+        base + per_complexity_point * complexity_score, scalato per weak model,
+        capped a max.
+
+    Esempi (config default 60/4/300):
+        prompt semplice (score=0)   -> 60 iter
+        prompt medio    (score=20)  -> 140 iter
+        prompt complesso (score=50) -> 260 iter
+        prompt fullstack (score>=60)-> 300 iter (cap)
+    """
+    config = _load_adaptive_budget_config()
+    score = estimate_prompt_complexity(prompt, config)
+    base = int(config["iteration_budget_base"])
+    per_pt = int(config["iteration_budget_per_complexity_point"])
+    budget = base + per_pt * score
+    # Modelli weak (mini/nano/haiku/lite) tendono a fare G1-nudge senza chiamare
+    # tool: gli serve piu' budget per arrivare al risultato.
+    if model and any(hint in model.lower() for hint in _WEAK_MODELS_HINT):
+        budget = int(budget * float(config["weak_model_multiplier"]))
+    return min(budget, int(config["iteration_budget_max"])), score
 
 # ── G1 Python: rilevamento richieste d'azione ─────────────────────────────
 _ACTION_PATTERNS: tuple[str, ...] = (
@@ -460,6 +591,40 @@ async def router_node(state: AgentState) -> dict[str, Any]:
         intent = "chat"
         intent_confidence = 1.0
 
+    # ── Fast-path conversazionale ────────────────────────────────────────
+    # Euristica: messaggi corti puramente conversazionali (saluti, ringraziamenti,
+    # affermazioni brevi) vengono spesso classificati erroneamente come "file_ops"
+    # o "implement" se la conversazione precedente conteneva quel contesto. Il
+    # classifier vede l'intera storia e si lascia influenzare. Forziamo "chat"
+    # quando il messaggio matcha pattern conversazionali puri: cosi' il flow
+    # bypassa tool/RAG/planner e l'executor risponde direttamente.
+    _text_stripped = str(text).strip().lower().rstrip("!?.,;:")
+    _CHAT_TOKENS = {
+        "ciao", "salve", "buongiorno", "buonasera", "buonanotte", "hey",
+        "hi", "hello", "ehi", "ehila", "yo",
+        "grazie", "grazie mille", "thanks", "thank you", "ok", "okay",
+        "perfetto", "fantastico", "ottimo", "bene", "capito",
+        "addio", "arrivederci", "a presto", "ci sentiamo", "bye",
+    }
+    is_conversational = (
+        len(_text_stripped) < 60
+        and (
+            _text_stripped in _CHAT_TOKENS
+            or any(_text_stripped.startswith(tok + " ") for tok in _CHAT_TOKENS)
+            or _text_stripped in {
+                "come stai", "come va", "tutto bene", "tutto ok",
+                "come ti chiami", "chi sei",
+            }
+        )
+    )
+    if is_conversational and intent not in ("chat", "general_chat"):
+        logger.info(
+            "router_node: fast-path conversazionale (msg=%r len=%d): override intent %s -> chat",
+            _text_stripped[:40], len(_text_stripped), intent,
+        )
+        intent = "chat"
+        intent_confidence = 1.0
+
     behavior_mode = state.get("behavior_mode", "bilanciata")
 
     # Boost token_budget per intent complessi che richiedono piu' output
@@ -512,6 +677,35 @@ async def router_node(state: AgentState) -> dict[str, Any]:
     if profile is None:
         profile = profile_loader.route_profile_for_intent(intent)
 
+    # Mig 0181 — Calcola budget iter adattivo se non già impostato (primo turno).
+    # Prompt complesso (fullstack scaffolding, refactor end-to-end) -> budget alto.
+    # Prompt semplice (chat, fix mirato) -> budget basso. Sostituisce il
+    # MAX_AGENT_ITERATIONS costante in route_after_executor.
+    iter_budget_existing = int(state.get("iteration_budget") or 0)
+    if iter_budget_existing <= 0:
+        # Primo messaggio del turno: prende il content dell'ULTIMO HumanMessage
+        # (quello che ha appena innescato il run, il piu' rappresentativo del task).
+        last_human_text = ""
+        for m in reversed(messages):
+            if hasattr(m, "type") and m.type == "human":
+                content = getattr(m, "content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        b.get("text", "") for b in content if isinstance(b, dict)
+                    )
+                last_human_text = str(content)
+                break
+        initial_model = state.get("model_override") or state.get("sticky_model")
+        iter_budget, complexity_score = compute_iteration_budget(last_human_text, initial_model)
+        logger.info(
+            "router_node: adaptive budget iter=%d complexity=%d model=%s prompt_len=%d",
+            iter_budget, complexity_score, initial_model or "?", len(last_human_text)
+        )
+    else:
+        # Iterazioni successive: mantiene il budget calcolato al primo turno.
+        iter_budget = iter_budget_existing
+        complexity_score = int(state.get("complexity_score") or 0)
+
     updates: dict[str, Any] = {
         "user_intent": intent,
         "task_type": intent,
@@ -519,6 +713,8 @@ async def router_node(state: AgentState) -> dict[str, Any]:
         "token_budget": token_budget,
         "iterations": state.get("iterations", 0) + 1,
         "intent_confidence": intent_confidence,
+        "iteration_budget": iter_budget,
+        "complexity_score": complexity_score,
     }
 
     if profile is not None:
@@ -871,7 +1067,9 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     # continue senza mai produrre testo, consumando tutte le iterazioni senza
     # lasciare una risposta utile all'utente.
     _current_iterations = int(state.get("iterations") or 0)
-    _FORCED_TEXT_THRESHOLD = MAX_AGENT_ITERATIONS - 5
+    # Mig 0181: soglia forced-text proporzionale al budget adattivo del run.
+    _iter_cap = int(state.get("iteration_budget") or 0) or MAX_AGENT_ITERATIONS
+    _FORCED_TEXT_THRESHOLD = _iter_cap - 5
     _prev_stop_reason = state.get("stop_reason")
     if (
         tools_json
@@ -1384,6 +1582,13 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         "temperature": temperature,
         "top_p": top_p,
         "created_at": created_at,
+        # Bug-fix: incrementa iterations a ogni passaggio per il nodo executor.
+        # Senza questo, il safety net `iterations >= MAX_AGENT_ITERATIONS` in
+        # route_after_executor non scatta mai durante i loop
+        # executor → tool_dispatch → executor o executor → executor (G1 nudge).
+        # Senza l'increment, il G1 nudge poteva loop-are infinite volte con
+        # iter=1 nudge=0 quando il modello produceva sempre risposte descrittive.
+        "iterations": int(state.get("iterations") or 0) + 1,
         # G1: incrementa il counter nudge se è stato iniettato in questo turno
         "action_nudge_count": (
             _nudge_count + 1
@@ -1585,11 +1790,16 @@ def route_after_executor(state: AgentState) -> str:
     iterations = int(state.get("iterations") or 0)
     stop_reason = state.get("stop_reason")
     pending = state.get("pending_tool_uses") or []
+    # Mig 0181: cap adattivo dal router_node, fallback a MAX_AGENT_ITERATIONS.
+    iter_cap = int(state.get("iteration_budget") or 0) or MAX_AGENT_ITERATIONS
     if stop_reason == "loop_detected":
         logger.warning("route_after_executor: loop detected, chiusura forzata")
         return "learner"
-    if iterations >= MAX_AGENT_ITERATIONS:
-        logger.warning("route_after_executor: cap iterazioni raggiunto (%d)", iterations)
+    if iterations >= iter_cap:
+        logger.warning(
+            "route_after_executor: cap iterazioni adattivo raggiunto (iter=%d cap=%d complexity=%d)",
+            iterations, iter_cap, int(state.get("complexity_score") or 0)
+        )
         return "learner"
     if stop_reason == "tool_use" and pending:
         return "tool_dispatch"
@@ -1634,8 +1844,9 @@ def route_after_verifier(state: AgentState) -> str:
       prossimo todo): rientra in executor
     """
     iterations = int(state.get("iterations") or 0)
-    if iterations >= MAX_AGENT_ITERATIONS:
-        logger.warning("route_after_verifier: cap iterazioni, chiudo")
+    iter_cap = int(state.get("iteration_budget") or 0) or MAX_AGENT_ITERATIONS
+    if iterations >= iter_cap:
+        logger.warning("route_after_verifier: cap iterazioni adattivo (iter=%d cap=%d), chiudo", iterations, iter_cap)
         return "learner"
     stop_reason = state.get("stop_reason")
     if stop_reason == "tool_use":
@@ -1772,7 +1983,7 @@ async def reflection_node(state: AgentState) -> dict[str, Any]:
     # Reward euristico (uguale logica del learner_node)
     if stop_reason == "error":
         heuristic = 0.0
-    elif iterations >= MAX_AGENT_ITERATIONS:
+    elif iterations >= (int(state.get("iteration_budget") or 0) or MAX_AGENT_ITERATIONS):
         heuristic = 0.3
     elif result:
         heuristic = 1.0

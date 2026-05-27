@@ -68,6 +68,14 @@ const O_SERIES_ESSENTIAL_TOOLS_FALLBACK: &[&str] = &[
     "nexus_mcp_tool_call",
     // Ricerca semantica
     "search_codebase_semantic",
+    // Generazione documenti professionali (.docx). Audit 27/05/2026: senza
+    // questo, il pannello DOCUMENTI invocava nexus_doc_generate ma l'agente
+    // non lo trovava nei 15 tool del safety-net o-series e rispondeva
+    // a parole "procedo con la generazione" senza generare nulla.
+    "nexus_doc_generate",
+    "nexus_doc_update",
+    "nexus_doc_list",
+    "nexus_doc_status",
 ];
 
 /// Ritorna `true` se il modello e' della serie reasoning OpenAI (o1/o3/o4-mini).
