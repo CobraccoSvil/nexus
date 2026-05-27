@@ -133,8 +133,28 @@ async def verifier_node(state: AgentState) -> dict[str, Any]:
         advance["verifier_last_result"] = {"passed": False, "cycle": cycle, "results": results}
         return advance
 
-    # Retry: appendi messaggio <verification_failed> e torna a executor
+    # Retry: appendi messaggio <verification_failed> e torna a executor.
+    # Fix audit 27/05/2026: in modalita' automatico/continuo, prepend un blocco
+    # <autonomy_hint> per forzare l'agente a procedere senza chiedere conferma.
+    # Senza questo, il modello (specie gemini-2.0-flash-lite) interpretava il
+    # blocco verification_failed come "chiedi all'utente" e ripeteva "Vuoi che
+    # lo faccia?" / "Confermi?" anche in autonomia.
     failed_block_text = _render_failed_block(todo, cycle, max_cycles, results)
+    behavior_mode = (state.get("behavior_mode") or "").strip().lower()
+    is_autonomous = behavior_mode in ("automatic", "automatico", "continuous", "continuo")
+    if is_autonomous:
+        autonomy_prefix = (
+            "<autonomy_hint mode=\"" + behavior_mode + "\">\n"
+            "L'utente ha selezionato la modalita' '" + behavior_mode + "': procedi\n"
+            "AUTONOMAMENTE col retry. NON chiedere conferma all'utente, NON\n"
+            "scrivere domande tipo 'Vuoi che lo faccia?' o 'Confermi?'. Esegui\n"
+            "direttamente le azioni necessarie usando i tool disponibili per\n"
+            "risolvere i criteri di accettazione falliti. Se non riesci dopo\n"
+            "questo ciclo, l'agente verra' automaticamente bloccato dal verifier\n"
+            "al raggiungimento del cap di " + str(max_cycles) + " cicli.\n"
+            "</autonomy_hint>\n\n"
+        )
+        failed_block_text = autonomy_prefix + failed_block_text
     hm = HumanMessage(content=failed_block_text)
     return {
         "messages": [hm],

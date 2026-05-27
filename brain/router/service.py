@@ -387,13 +387,27 @@ class SemanticRouter:
                 "mostra il file", "mostrami il file", "mostrami il codice",
                 "elenca i file", "elenca file", "lista file", "lista dei file",
                 "elenco file", "elenco dei file", "struttura del progetto",
+                # Domande "quanti/quante X" su entita' del codice. Catturare
+                # generico: "quante variabili", "quanti file", "quanti componenti",
+                # "quante tabelle" + i casi specifici storici. Evita che cadano
+                # erroneamente su 'docs' (visto bug audit 27/05/2026 dove
+                # "quante variabili ci sono nel progetto" attivava il planner +
+                # verifier di docs con loop infinito).
                 "quante righe", "quante funzioni", "quante classi",
+                "quante variabili", "quanti file", "quanti componenti",
+                "quanti moduli", "quante tabelle", "quanti test", "quanti errori",
+                "quante linee", "quanti record", "quante chiamate",
+                "quanti endpoint", "quanti import", "quanti package",
                 "cosa contiene il file", "cosa c'è nel file",
                 "read the file", "read file", "show the file", "view file",
                 "list files", "list the files", "cat ", "head ", "tail ",
-                "how many lines", "how many functions",
+                "how many lines", "how many functions", "how many files",
+                "how many classes", "how many variables", "how many tests",
                 "cosa fa questa classe", "cosa fa questa funzione",
                 "tree della cartella", "mostra il contenuto",
+                # Domande generali sul progetto/codebase, intent informativo.
+                "ci sono nel progetto", "esistono nel progetto",
+                "dove si trova", "dove sta", "in quale file",
             ],
             "test": ["/test", "test", "coverage", "assert", "spec"],
             "docs": ["/docs", "document", "readme", "jsdoc", "comment",

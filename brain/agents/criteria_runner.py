@@ -156,6 +156,18 @@ async def _check_http(
 async def _check_file_exists(
     spec: dict[str, Any], expected: dict[str, Any], ctx: dict[str, Any], timeout_s: float,
 ) -> tuple[bool, dict[str, Any]]:
+    """Verifica che un file esista usando `list_files` sulla dir parent + match basename.
+
+    Audit 27/05/2026: il vecchio approccio usava `read_file` + string match
+    fragile (`"[Errore"`, `"non trovato"`). Falsi negativi visti quando:
+    - `read_file` ritornava errore in inglese (`"[Error lettura...]"`)
+    - `read_file` falliva con `canonicalize()` → "Percorso non autorizzato"
+      anche per file legittimamente creati fuori dal canonicalize del root
+    - Race condition tra `write_file` e `read_file` sul filesystem
+    Ora usiamo `list_files` sulla dir parent (piu' tollerante) e matchiamo
+    il basename: se la dir esiste e il file e' elencato, esiste davvero.
+    Fallback a `read_file` con string match esteso se la dir non e' listabile.
+    """
     path = spec.get("path") or ""
     if not path:
         return False, {"error": "spec.path obbligatorio"}
@@ -164,8 +176,61 @@ async def _check_file_exists(
     if not tool_runner or not session_id:
         return False, {"error": "tool_runner o session_id assenti"}
 
-    # Usiamo list_files con la directory parent + nome file; oppure read_file:
-    # read_file fallisce se non esiste, list_files se la dir non esiste.
+    # ── 1. Tenta list_files sulla directory parent ─────────────────────────
+    # Estrai parent dir e basename: posix-style perche' i path nei progetti
+    # Nexus usano sempre /. Se path = "variables.txt", parent="." basename="variables.txt".
+    parts = path.rsplit("/", 1)
+    if len(parts) == 1:
+        parent_dir = "."
+        basename = parts[0]
+    else:
+        parent_dir = parts[0] or "."
+        basename = parts[1]
+    try:
+        result = await asyncio.wait_for(
+            tool_runner.execute_tool(
+                tool_name="list_files",
+                tool_input={"directory": parent_dir},
+                session_id=str(session_id),
+                tool_use_id=str(uuid.uuid4()),
+            ),
+            timeout=timeout_s,
+        )
+        raw = result.result_json or ""
+        # list_files ritorna lista di entry (es. "- variables.txt", "📄 variables.txt").
+        # Cerchiamo il basename come token isolato (con boundary spazio/inizio riga).
+        # Match permissivo: il basename appare come parola intera nel raw.
+        import re as _re
+        pattern = r"(?:^|[\s/\"'`])" + _re.escape(basename) + r"(?:$|[\s\"'`])"
+        list_indicates_present = bool(_re.search(pattern, raw, _re.MULTILINE))
+        list_indicates_error = (
+            raw.startswith("❌")
+            or "[Errore" in raw[:30]
+            or "[Error" in raw[:30]
+            or "non trovato" in raw[:80].lower()
+            or "not found" in raw[:80].lower()
+        )
+        if not list_indicates_error:
+            # list_files ha avuto successo: la sua risposta e' la fonte di verita'
+            exists = list_indicates_present
+            expected_exists = bool(expected.get("exists", True))
+            passed = (exists == expected_exists)
+            return passed, {
+                "path": path,
+                "exists": exists,
+                "expected_exists": expected_exists,
+                "method": "list_files",
+                "parent_dir": parent_dir,
+                "basename": basename,
+                "output_excerpt": raw[:300],
+            }
+    except (asyncio.TimeoutError, Exception) as exc:
+        # list_files fallito, prova read_file come fallback (vedi sotto)
+        list_err = str(exc)
+    else:
+        list_err = "list_files ha ritornato errore: " + raw[:80]
+
+    # ── 2. Fallback: read_file con string match esteso ──────────────────────
     try:
         result = await asyncio.wait_for(
             tool_runner.execute_tool(
@@ -177,13 +242,22 @@ async def _check_file_exists(
             timeout=timeout_s,
         )
     except asyncio.TimeoutError:
-        return False, {"error": "timeout", "path": path}
+        return False, {"error": "timeout", "path": path, "list_err": list_err}
     except Exception as exc:
-        return False, {"error": f"execute_tool: {exc}", "path": path}
+        return False, {"error": f"execute_tool: {exc}", "path": path, "list_err": list_err}
 
     raw = result.result_json or ""
-    # read_file ritorna stringa con il contenuto se esiste, errore altrimenti
-    exists = not (raw.startswith("❌") or "[Errore" in raw[:30] or "non trovato" in raw[:80].lower())
+    # Pattern di errore estesi per coprire IT/EN/altri formati
+    error_markers = (
+        raw.startswith("❌")
+        or "[Errore" in raw[:60]
+        or "[Error" in raw[:60]
+        or "non trovato" in raw[:120].lower()
+        or "not found" in raw[:120].lower()
+        or "no such file" in raw[:120].lower()
+        or "enoent" in raw[:120].lower()
+    )
+    exists = not error_markers
     expected_exists = bool(expected.get("exists", True))
     passed = (exists == expected_exists)
 
@@ -191,6 +265,8 @@ async def _check_file_exists(
         "path": path,
         "exists": exists,
         "expected_exists": expected_exists,
+        "method": "read_file_fallback",
+        "list_err": list_err,
         "output_excerpt": raw[:200],
     }
 
