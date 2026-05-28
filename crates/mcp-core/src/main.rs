@@ -1512,6 +1512,7 @@ async fn main() -> anyhow::Result<()> {
                 "/api/projects/:id/knowledge/notes/:note_id",
                 get(knowledge::routes::get_note)
                     .patch(knowledge::routes::patch_note)
+                    .delete(knowledge::routes::delete_note)
                     .layer(axum_mw::from_fn_with_state(
                         state.clone(),
                         middleware::require_auth,

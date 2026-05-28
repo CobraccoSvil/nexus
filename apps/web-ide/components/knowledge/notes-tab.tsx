@@ -6,6 +6,7 @@ import {
   listKnowledgeNotes,
   createKnowledgeNoteManual,
   initOrRefreshKnowledge,
+  deleteKnowledgeNote,
   type KnowledgeNote,
 } from "../../lib/api-client";
 
@@ -57,7 +58,38 @@ export function NotesTab({ projectId }: Props) {
   const [createError, setCreateError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshMsg, setRefreshMsg] = useState<string | null>(null);
+  // ID della nota in corso di cancellazione (per disabilitare il bottone +
+  // dare feedback visivo). null = nessuna cancellazione in atto.
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const limit = 20;
+
+  // Cancella una nota dalla KB. Conferma con dialog nativo: l'utente puo'
+  // annullare. Dopo il successo, refresh della lista e (se la nota era
+  // selezionata) chiusura del dettaglio.
+  const handleDeleteNote = useCallback(
+    async (noteId: string, noteTitle: string) => {
+      if (deletingId) return;
+      const ok = window.confirm(
+        `Eliminare la nota "${noteTitle}"?\n\nL'operazione e' irreversibile: rimuove la nota dal DB, i link in/out e l'embedding Qdrant.`,
+      );
+      if (!ok) return;
+      setDeletingId(noteId);
+      try {
+        await deleteKnowledgeNote(projectId, noteId);
+        // Rimuovi subito dallo stato locale (ottimistico).
+        setNotes((curr) => curr.filter((n) => n.id !== noteId));
+        setTotal((t) => Math.max(0, t - 1));
+        if (selectedNoteId === noteId) setSelectedNoteId(null);
+      } catch (err) {
+        window.alert(
+          `Cancellazione fallita: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      } finally {
+        setDeletingId(null);
+      }
+    },
+    [deletingId, projectId, selectedNoteId],
+  );
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -421,6 +453,41 @@ export function NotesTab({ projectId }: Props) {
             >
               {t(STATUS_I18N[note.status] ?? "knowledge.note.draft")}
             </span>
+            {/* Bottone Cancella nota: stopPropagation per non aprire il dettaglio */}
+            <button
+              type="button"
+              aria-label={`Cancella nota "${note.title}"`}
+              title="Cancella nota"
+              onClick={(e) => {
+                e.stopPropagation();
+                void handleDeleteNote(note.id, note.title);
+              }}
+              disabled={deletingId === note.id}
+              style={{
+                fontSize: 14,
+                lineHeight: 1,
+                padding: "2px 6px",
+                borderRadius: 4,
+                border: "1px solid transparent",
+                background: "transparent",
+                color: "#a3a3a3",
+                cursor: deletingId === note.id ? "wait" : "pointer",
+                flexShrink: 0,
+                opacity: deletingId === note.id ? 0.5 : 1,
+              }}
+              onMouseEnter={(e) => {
+                if (deletingId !== note.id) {
+                  e.currentTarget.style.color = "#dc2626";
+                  e.currentTarget.style.borderColor = "#fecaca";
+                }
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.color = "#a3a3a3";
+                e.currentTarget.style.borderColor = "transparent";
+              }}
+            >
+              {deletingId === note.id ? "..." : "×"}
+            </button>
           </div>
           {/* Riga 2: intent + tag + data */}
           <div style={{ display: "flex", gap: 6, marginTop: 4, alignItems: "center", minWidth: 0, overflow: "hidden" }}>

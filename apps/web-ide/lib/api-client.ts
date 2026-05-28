@@ -3811,6 +3811,15 @@ export async function patchKnowledgeNote(
   });
 }
 
+export async function deleteKnowledgeNote(
+  projectId: string,
+  noteId: string,
+): Promise<{ ok: boolean; deleted: string }> {
+  return fetchJson(`/api/projects/${projectId}/knowledge/notes/${noteId}`, {
+    method: "DELETE",
+  });
+}
+
 export async function findSimilarKnowledge(
   projectId: string,
   text: string,

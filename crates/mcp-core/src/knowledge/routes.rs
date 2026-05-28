@@ -587,6 +587,80 @@ pub async fn delete_link(
     Ok(Json(json!({ "ok": true })))
 }
 
+// ── DELETE /api/projects/:id/knowledge/notes/:note_id ─────────────────────
+//
+// Cancella una nota dalla Knowledge Base del progetto. Effetti propagati:
+//   - DB: row da `project_knowledge_notes` (CASCADE su `project_knowledge_links`
+//     in/out via FK ON DELETE CASCADE).
+//   - Qdrant: rimuove l'embedding point associato (se la nota aveva
+//     `qdrant_point_id` impostato).
+//
+// Idempotente: 404 se la nota non esiste/non appartiene al progetto. Lo
+// stesso utente deve avere accesso al progetto (ensure_project_access).
+pub async fn delete_note(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath((project_id, note_id)): AxumPath<(String, String)>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&project_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let note_id = Uuid::parse_str(&note_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Note id non valido"))?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    // Recupera il qdrant_point_id PRIMA del delete cosi' sappiamo cosa
+    // togliere da Qdrant. Se la nota non esiste ritorniamo 404 subito.
+    let point_id: Option<String> = sqlx::query_scalar(
+        "SELECT qdrant_point_id FROM project_knowledge_notes \
+         WHERE id = $1 AND project_id = $2",
+    )
+    .bind(note_id)
+    .bind(project_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Nota non trovata"))?;
+
+    // DELETE: i link in/out cascadono via FK ON DELETE CASCADE
+    // (vedi project_knowledge_links_{from,to}_note_id_fkey).
+    let deleted = sqlx::query(
+        "DELETE FROM project_knowledge_notes WHERE id = $1 AND project_id = $2",
+    )
+    .bind(note_id)
+    .bind(project_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if deleted.rows_affected() == 0 {
+        return Err(api_error(StatusCode::NOT_FOUND, "Nota non trovata"));
+    }
+
+    // Best-effort Qdrant cleanup: errori loggati ma non bloccanti.
+    // Lo facciamo in background (tokio::spawn) per non rallentare il response,
+    // il DB e' gia' coerente. Se Qdrant fallisce restano dei point orfani,
+    // rimossi al prossimo restart con vacuum (gestito da janitor separato).
+    if let Some(pid) = point_id {
+        let db_clone = state.db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::vector_memory::delete_knowledge_points(
+                &db_clone,
+                &[pid.clone()],
+            )
+            .await
+            {
+                tracing::warn!(
+                    "delete_note: cancellazione point Qdrant '{}' fallita: {}",
+                    pid, e
+                );
+            }
+        });
+    }
+
+    Ok(Json(json!({ "ok": true, "deleted": note_id.to_string() })))
+}
+
 // ── GET /api/projects/:id/knowledge/tags ──────────────────────────────────
 pub async fn list_tags(
     State(state): State<AppState>,
