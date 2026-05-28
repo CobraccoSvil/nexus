@@ -98,6 +98,63 @@ Es: Mistral ha rinominato `mistral-small-4` → `mistral-small-latest`, l'API ri
 
 Soluzione: `UPDATE nexus_routing_matrix SET model_id = 'mistral-small-latest' WHERE model_id = 'mistral-small-4'`. Attendi ≤60s per il refresh cache. **Niente patch codice, niente redeploy, niente env var da cambiare.**
 
+## H. Fix definitivi, mai toppe
+
+Regola autoritativa, valida per qualunque incidente, bug report, errore in produzione o richiesta utente: **non si applica mai un fix immediato come toppa**. Si va sempre alla causa radice e si chiude il problema lì, anche se richiede più tempo.
+
+### Cosa è una toppa (vietata)
+
+Sono toppe — e quindi vietate — i seguenti pattern, anche quando "funzionano":
+
+- **UPDATE/INSERT SQL ad-hoc** per aggirare un comportamento sbagliato di un codice (es. `UPDATE catalog SET is_enabled=false WHERE model='foo'` perché `foo` non funziona). Il fix definitivo è capire *perché* `foo` è entrato nel catalog e correggere il `catalog_sync` o il provider che lo emette.
+- **Aumento di timeout** per nascondere una latenza patologica (es. classifier timeout 5→8s perché Vertex va in cold start). Il fix definitivo è precaricare il provider, predicare il modello veloce, o togliere il provider dalla chain se inadatto.
+- **Disabilitazione di provider/modello dal DB** come azione manuale ricorrente. Il fix definitivo è una policy di auto-disable basata su metriche (`billing_error` → cooldown automatico; N fallimenti consecutivi → escludere).
+- **kill -9 + restart** per sbloccare un servizio. Il fix definitivo è capire perché il graceful shutdown si è bloccato (worker stuck, channel mai chiuso, await senza cancellation token) e correggerlo nel codice.
+- **Modifica diretta di file di config / env var** sul filesystem dell'utente per aggirare un comportamento di default sbagliato. Se il default è sbagliato, va corretto il codice che produce il default.
+- **try/except che inghiotte un errore** "per non far crashare il servizio". L'errore va capito e gestito esplicitamente, oppure deve davvero risalire al chiamante con uno status code coerente.
+- **Hardcode di valori "che ora vanno bene"** (es. nome modello, URL provider, soglia di chunking) dentro la logica di business. Tutto ciò che è configurabile va nel DB (`settings`, `nexus_*`) con TTL/cache documentato.
+- **Restart manuale che diventa abitudine**. Se devi restartare un servizio per farlo riprendere, c'è un fix architetturale dietro (memoria leak, deadlock, cache corrotta).
+
+### Cosa è un fix definitivo (richiesto)
+
+Un fix è definitivo quando:
+
+1. Risolve la causa nel codice o nello schema, non l'effetto.
+2. Sopravvive a un riavvio, a un deploy, a un wipe del DB e re-applicazione delle migrazioni.
+3. È testato (`pnpm verify` passa) e ha almeno un test che cattura la regressione.
+4. È documentato con un commit message che descrive il root cause, non solo il sintomo.
+5. Se richiede dati nuovi/modificati nel DB, è veicolato da una **migrazione SQL versionata** (`db/migrations/NNNN_*.sql`), non da un `psql -c "UPDATE ..."` lanciato a mano.
+6. Se modifica un comportamento configurabile, espone il flag in `settings` o `nexus_*` (vedi sezione G) ed elimina ogni fallback hardcoded.
+
+### Workflow quando arriva un sintomo
+
+1. **Diagnostica fino al codice / migrazione / config sorgente del problema.** Non fermarsi all'osservazione che "se cambio X il sintomo sparisce".
+2. **Identifica il fix architetturale** e stimalo. Se richiede un'ora o meno: implementalo subito. Se richiede di più: apri un task descrittivo e chiedi all'utente come prioritizzarlo.
+3. **Se l'utente è bloccato** e non è ragionevole fargli aspettare il fix completo, il workaround temporaneo è ammesso *solo se*:
+   - L'utente lo richiede esplicitamente con piena consapevolezza ("dammi un workaround mentre sistemi la causa").
+   - Viene immediatamente aperto un task per il fix definitivo, con priorità chiara.
+   - Il workaround è etichettato come tale nei commit (`workaround:` o `temp:`), mai come `fix:` o `feat:`.
+   - C'è un piano (data o trigger) per rimuovere il workaround.
+4. **Senza richiesta esplicita dell'utente, niente workaround.** Si va al fix definitivo.
+
+### Esempi pratici (riferiti a incidenti reali in questo repo)
+
+| Sintomo | Toppa (vietata) | Fix definitivo (richiesto) |
+|---|---|---|
+| Anthropic ritorna `billing_error` ogni chiamata | `UPDATE matrix SET is_active=false WHERE provider='anthropic'` | Aggiungere detection di `billing_error` nel `provider_health_probe` con auto-disable su tutta la routing matrix; ripristino automatico al primo 200 successivo |
+| Classifier Google va in timeout su cold start | `UPDATE settings SET value='8.0' WHERE key='routing.llm_classifier_timeout_seconds'` | Precaricare Vertex SA all'avvio brain (`startup_event`) o spostare Google fuori dalla chain finché non c'è warming pool |
+| `gemini-3.5-flash` appare nel catalog e fallisce | `UPDATE catalog SET is_enabled=false WHERE model='gemini-3.5-flash'` | Correggere `catalog_sync_loop` che lo include: filtro per modelli `chat`-compatibili o whitelist da Google API live |
+| `mcp-core` resta in `deactivating` 1+ min al restart | `pkill -9` + restart | Tracciare il task tokio che non risponde a SIGTERM, aggiungere cancellation token, mettere `TimeoutStopSec=10` sull'unit systemd come safety net |
+| Body 2MB rifiutato per file allegati | Alzare a 25MB nel codice frontend | OK come fix definitivo se accompagnato da `DefaultBodyLimit::max(...)` esplicito sul backend (vedi commit "feat: chat upload limit") |
+
+### Conseguenza pratica per gli agenti
+
+Prima di proporre un fix, chiediti:
+- *Sto sistemando la causa o sto mascherando il sintomo?*
+- *Se domani arriva un nuovo modello rotto / un nuovo provider con billing zero / un nuovo cold start lento, il mio fix di oggi mi servirà a qualcosa?*
+
+Se la risposta a una delle due è "no, ma intanto sblocca l'utente", **fermarsi e ripartire dalla causa**. Comunicare onestamente all'utente: "il fix richiede N minuti/ore in più, procedo lo stesso al fix definitivo perché un workaround creerebbe debito tecnico". Solo se l'utente esplicitamente preferisce sbloccarsi subito, applicare workaround temporaneo seguendo le regole sopra.
+
 ## Esecuzione locale canonica
 
 - Ambiente di sviluppo: **solo WSL**, percorso `/home/administrator/ideai`. Non modificare mai `D:\Sviluppo\IDEAI` dall'host Windows.
