@@ -390,6 +390,45 @@ async def startup_event() -> None:
         logger.error("Errore durante l'inizializzazione del checkpointer: %s", exc)
         raise
 
+    # Pre-warming Google Vertex (fix #77): il client genai e' lazy-init al primo
+    # call; con SA dal DB il cold start carica JSON + AFC init, superando i 5s
+    # di timeout del classifier. Lo facciamo in background per non bloccare
+    # lo startup, ogni errore loggato come INFO e mai propagato.
+    import asyncio as _aio
+    _aio.create_task(_warmup_google_provider())
+
+
+async def _warmup_google_provider() -> None:
+    """Inizializza il client Google genai (Vertex SA + httpx pool) con una
+    chiamata sintetica count_tokens. Cold start eliminato per i call utente.
+
+    Best-effort: ogni errore loggato come INFO, mai propagato.
+    """
+    import asyncio as _aio
+
+    try:
+        from brain.providers.google_provider import GoogleProvider
+
+        provider = GoogleProvider()
+        ok, reason = provider._is_configured()
+        if not ok:
+            logger.info("Vertex warmup: provider google non configurato (%s), skip", reason)
+            return
+
+        def _do_warmup() -> int:
+            client = provider._get_client()
+            response = client.models.count_tokens(model="gemini-2.5-flash", contents="warmup")
+            return int(getattr(response, "total_tokens", 0))
+
+        loop = _aio.get_running_loop()
+        tokens = await loop.run_in_executor(None, _do_warmup)
+        logger.info(
+            "Vertex warmup OK: client genai pre-inizializzato (model=gemini-2.5-flash, total_tokens=%d)",
+            tokens,
+        )
+    except Exception as exc:
+        logger.info("Vertex warmup: skipped (%s)", exc)
+
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:

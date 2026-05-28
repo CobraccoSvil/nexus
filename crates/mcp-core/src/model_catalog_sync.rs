@@ -35,6 +35,45 @@ use crate::settings::get_setting;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_INTERVAL_HOURS: u64 = 6;
 
+/// Filtro chat-compatibilita': i provider espongono nelle loro `/v1/models` API
+/// anche modelli specializzati (voice, TTS, transcribe, embedding, instruct
+/// legacy, image generation, modelli "preview" hollow) che NON sono usabili
+/// dalla chat agentic di Nexus. Senza filtro, il catalog viene inquinato e
+/// il routing puo' selezionarli, generando errori in cascata.
+///
+/// Ritorna `true` se il modello e' un valido modello di chat completion.
+fn is_chat_compatible_model(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    const SUBSTRING_BLACKLIST: &[&str] = &[
+        "voxtral", "whisper", "embedding", "moderation", "unknown-provider",
+    ];
+    for bad in SUBSTRING_BLACKLIST {
+        if lower.contains(bad) { return false; }
+    }
+    const INFIX_BLACKLIST: &[&str] = &[
+        "-tts-", "-transcribe-", "-realtime-", "-instruct-", "-unknown-",
+    ];
+    for bad in INFIX_BLACKLIST {
+        if lower.contains(bad) { return false; }
+    }
+    const PREFIX_BLACKLIST: &[&str] = &[
+        "tts-", "dall-e", "dalle-", "imagen", "instruct-",
+        "babbage", "davinci-00", "text-embedding",
+    ];
+    for bad in PREFIX_BLACKLIST {
+        if lower.starts_with(bad) { return false; }
+    }
+    const SUFFIX_BLACKLIST: &[&str] = &[
+        "-tts", "-transcribe", "-realtime", "-embed", "-instruct",
+    ];
+    for bad in SUFFIX_BLACKLIST {
+        if lower.ends_with(bad) { return false; }
+    }
+    if lower == "gemini-3.5-flash" { return false; }
+    if lower.starts_with("gemini-1.0") { return false; }
+    true
+}
+
 /// Loop principale: chiamato da `main.rs` startup via `tokio::spawn(...)`.
 pub async fn catalog_sync_loop(db: PgPool) {
     // Boot: aspetta 30s per dare priorita' agli altri worker.
@@ -201,6 +240,16 @@ async fn sync_provider(
 
     // 1. Nuovi modelli dall'API non presenti nel catalog -> INSERT
     for api_model in &api_models {
+        // Skip modelli non chat-compatibili (TTS, embedding, instruct legacy,
+        // hollow placeholder) — vedi `is_chat_compatible_model` per la
+        // blacklist consolidata da incidenti reali.
+        if !is_chat_compatible_model(api_model) {
+            tracing::debug!(
+                "catalog_sync[{}]: skip '{}' (non chat-compatible)",
+                provider, api_model
+            );
+            continue;
+        }
         match catalog_models.get(api_model) {
             None => {
                 if insert_new_disabled {

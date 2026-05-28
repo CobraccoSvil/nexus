@@ -134,6 +134,157 @@ pub fn init_redis_client(client: redis::aio::MultiplexedConnection) {
     let _ = REDIS_CLIENT.set(client);
 }
 
+/// Etichetta usata in `auto_disabled_reason` (catalog) e `notes` (matrix)
+/// per identificare le righe disabilitate dalla propagazione del billing
+/// cooldown. La recovery loop le riconosce per riabilitarle quando il
+/// provider torna operativo (cooldown scaduto).
+pub const BILLING_COOLDOWN_TAG: &str = "auto_disable: billing_cooldown";
+
+/// Propaga il cooldown billing-error al DB: disabilita tutti i modelli del
+/// provider in `ai_price_catalog` e tutte le righe in `nexus_routing_matrix`.
+///
+/// Idempotente: aggiorna solo righe attualmente attive che non sono gia'
+/// state disabilitate manualmente (`auto_disabled_reason` non inizia con
+/// 'manual:'). Cosi' una scelta dell'admin non viene mai sovrascritta.
+pub async fn propagate_billing_disable_to_db(db: &sqlx::PgPool, provider: &str) {
+    let provider_lower = provider.to_lowercase();
+    let now_iso = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    let catalog_res = sqlx::query(
+        "UPDATE ai_price_catalog \
+         SET is_enabled = false, \
+             auto_disabled_at = COALESCE(auto_disabled_at, now()), \
+             auto_disabled_reason = $2 \
+         WHERE LOWER(provider) = $1 \
+           AND is_enabled = true \
+           AND (auto_disabled_reason IS NULL OR auto_disabled_reason NOT LIKE 'manual:%')",
+    )
+    .bind(&provider_lower)
+    .bind(format!("{} ({})", BILLING_COOLDOWN_TAG, now_iso))
+    .execute(db)
+    .await;
+    let catalog_n = catalog_res.as_ref().map(|r| r.rows_affected()).unwrap_or(0);
+    if let Err(ref e) = catalog_res {
+        tracing::warn!(
+            "propagate_billing_disable: catalog UPDATE fallita per '{}': {}",
+            provider, e
+        );
+    }
+
+    let matrix_res = sqlx::query(
+        "UPDATE nexus_routing_matrix \
+         SET is_active = false, \
+             manual_override = true, \
+             notes = COALESCE(notes, '') || $2 \
+         WHERE LOWER(provider) = $1 AND is_active = true",
+    )
+    .bind(&provider_lower)
+    .bind(format!(" [{}: {}]", BILLING_COOLDOWN_TAG, now_iso))
+    .execute(db)
+    .await;
+    let matrix_n = matrix_res.as_ref().map(|r| r.rows_affected()).unwrap_or(0);
+    if let Err(ref e) = matrix_res {
+        tracing::warn!(
+            "propagate_billing_disable: matrix UPDATE fallita per '{}': {}",
+            provider, e
+        );
+    }
+
+    tracing::warn!(
+        target: "provider_cooldown",
+        provider = %provider,
+        catalog_disabled = catalog_n,
+        matrix_disabled = matrix_n,
+        "billing cooldown propagato al DB"
+    );
+}
+
+/// Riabilita il provider nel DB dopo che il cooldown e' scaduto.
+/// Tocca solo le righe disabilitate da `propagate_billing_disable_to_db`
+/// (riconosciute dall'etichetta `BILLING_COOLDOWN_TAG`).
+pub async fn propagate_billing_reenable_to_db(db: &sqlx::PgPool, provider: &str) {
+    let provider_lower = provider.to_lowercase();
+
+    let catalog_res = sqlx::query(
+        "UPDATE ai_price_catalog \
+         SET is_enabled = true, \
+             auto_disabled_at = NULL, \
+             auto_disabled_reason = NULL \
+         WHERE LOWER(provider) = $1 \
+           AND is_enabled = false \
+           AND auto_disabled_reason LIKE $2",
+    )
+    .bind(&provider_lower)
+    .bind(format!("{}%", BILLING_COOLDOWN_TAG))
+    .execute(db)
+    .await;
+    let catalog_n = catalog_res.as_ref().map(|r| r.rows_affected()).unwrap_or(0);
+
+    let matrix_res = sqlx::query(
+        "UPDATE nexus_routing_matrix \
+         SET is_active = true, \
+             manual_override = false, \
+             notes = NULL \
+         WHERE LOWER(provider) = $1 \
+           AND is_active = false \
+           AND notes LIKE $2",
+    )
+    .bind(&provider_lower)
+    .bind(format!("%{}%", BILLING_COOLDOWN_TAG))
+    .execute(db)
+    .await;
+    let matrix_n = matrix_res.as_ref().map(|r| r.rows_affected()).unwrap_or(0);
+
+    if catalog_n > 0 || matrix_n > 0 {
+        tracing::info!(
+            target: "provider_cooldown",
+            provider = %provider,
+            catalog_reenabled = catalog_n,
+            matrix_reenabled = matrix_n,
+            "billing cooldown rimosso dal DB: provider riabilitato"
+        );
+    }
+}
+
+/// Worker periodico: ogni `interval_secs` controlla i provider che hanno
+/// righe ancora disabilitate dal billing cooldown e li riabilita nel DB se
+/// il cooldown locale e' scaduto.
+pub async fn billing_cooldown_recovery_loop(db: sqlx::PgPool, interval_secs: u64) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await; // skip immediate
+
+    loop {
+        ticker.tick().await;
+
+        let providers_disabled: Vec<String> = match sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT LOWER(provider) FROM ai_price_catalog \
+             WHERE is_enabled = false AND auto_disabled_reason LIKE $1 \
+             UNION \
+             SELECT DISTINCT LOWER(provider) FROM nexus_routing_matrix \
+             WHERE is_active = false AND notes LIKE $2",
+        )
+        .bind(format!("{}%", BILLING_COOLDOWN_TAG))
+        .bind(format!("%{}%", BILLING_COOLDOWN_TAG))
+        .fetch_all(&db)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("billing_cooldown_recovery: query fallita: {}", e);
+                continue;
+            }
+        };
+
+        for provider in providers_disabled {
+            if is_provider_in_cooldown(&provider) {
+                continue;
+            }
+            propagate_billing_reenable_to_db(&db, &provider).await;
+        }
+    }
+}
+
 /// Variante "lunga" di `put_provider_in_cooldown` per errori semantici tipo
 /// "credit balance too low" / "quota exceeded" che non si risolvono in pochi
 /// minuti (servono soldi/giorni). Bypassa il circuit breaker.

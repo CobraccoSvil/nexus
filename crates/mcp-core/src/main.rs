@@ -610,6 +610,17 @@ async fn main() -> anyhow::Result<()> {
         state.project_channels.clone(),
     ));
 
+    // Worker billing_cooldown_recovery_loop (fix #78): ogni 60s riabilita nel
+    // DB i provider il cui cooldown billing locale e' scaduto. Vedi
+    // `provider_cooldown::propagate_billing_disable_to_db` (chiamata da
+    // `internal_routing::provider_error_handler`) per la fase di disable.
+    {
+        let db_billing = state.db.clone();
+        tokio::spawn(async move {
+            provider_cooldown::billing_cooldown_recovery_loop(db_billing, 60).await;
+        });
+    }
+
     // ── Lettura batch settings DB ────────────────────────────────────────────
     // Leggiamo in parallelo tutti i flag comportamentali dalla tabella settings.
     // I valori sono usati nei blocchi successivi. Le env var restano come
@@ -1718,46 +1729,13 @@ async fn main() -> anyhow::Result<()> {
                     middleware::require_auth,
                 )),
             )
-            // Route proxy: metodi HTTP espliciti invece di any() — any() con .layer() ha
-            // comportamento anomalo in Axum 0.7 e restituisce 405 per GET anche se la
-            // route esiste. Con metodi espliciti il MethodRouter è correttamente popolato
-            // e matchit dà priorità al segmento statico "proxy" sul parametrico "/:action".
-            .route(
-                "/api/projects/:id/services/:service/proxy",
-                get(project_workspace::proxy_root)
-                    .post(project_workspace::proxy_root)
-                    .put(project_workspace::proxy_root)
-                    .patch(project_workspace::proxy_root)
-                    .delete(project_workspace::proxy_root)
-                    .layer(axum_mw::from_fn_with_state(
-                        state.clone(),
-                        middleware::require_auth,
-                    )),
-            )
-            .route(
-                "/api/projects/:id/services/:service/proxy/",
-                get(project_workspace::proxy_root)
-                    .post(project_workspace::proxy_root)
-                    .put(project_workspace::proxy_root)
-                    .patch(project_workspace::proxy_root)
-                    .delete(project_workspace::proxy_root)
-                    .layer(axum_mw::from_fn_with_state(
-                        state.clone(),
-                        middleware::require_auth,
-                    )),
-            )
-            .route(
-                "/api/projects/:id/services/:service/proxy/*path",
-                get(project_workspace::proxy_path)
-                    .post(project_workspace::proxy_path)
-                    .put(project_workspace::proxy_path)
-                    .patch(project_workspace::proxy_path)
-                    .delete(project_workspace::proxy_path)
-                    .layer(axum_mw::from_fn_with_state(
-                        state.clone(),
-                        middleware::require_auth,
-                    )),
-            )
+            // NOTA: rimosse le 3 route /api/projects/:id/services/:service/proxy{,/,/*path}
+            // che facevano riferimento a `project_workspace::proxy_root` e `proxy_path`.
+            // Il modulo `proxy.rs` non era mai stato committato (untracked) ed e' stato
+            // rimosso dal filesystem dopo una sessione di pulizia. Riferimenti orfani
+            // bloccavano la compilazione. Quando si vorra' reimplementare il proxy
+            // servizi-progetto, vanno create sia `project_workspace/proxy.rs` con gli
+            // handler che le route qui sopra.
             // Route azione servizio — ripristino /:action (POST only) per mantenere la
             // firma originale di control_project_service (Path<(String, String, String)>).
             // matchit dà priorità al segmento statico "proxy" su "/:action" parametrico.
@@ -2728,6 +2706,19 @@ async fn main() -> anyhow::Result<()> {
         if let Some(bridge) = nexus_bridge::NexusBridge::global() {
             bridge.shutdown().await;
         }
+
+        // Safety net force-exit (Bug D fix #80): se axum::serve non si chiude
+        // entro 10s dopo il signal (es. SSE/long-poll in-flight), forziamo
+        // l'exit del processo. I dati critici (Q-table) sono gia' stati
+        // flushati da `bridge.shutdown()`. La unit systemd ha TimeoutStopSec=15
+        // come ulteriore safety net (SIGKILL forzato dopo 15s).
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            tracing::warn!(
+                "shutdown timeout 10s superato (probabilmente SSE/long-poll in-flight), force-exit"
+            );
+            std::process::exit(0);
+        });
     };
 
     axum::serve(listener, app)
