@@ -9,6 +9,7 @@ import {
   deleteKnowledgeNote,
   type KnowledgeNote,
 } from "../../lib/api-client";
+import { useConfirmDialog } from "../ui/confirm-dialog";
 
 const STATUS_I18N: Record<string, TranslationKey> = {
   draft: "knowledge.note.draft",
@@ -61,17 +62,27 @@ export function NotesTab({ projectId }: Props) {
   // ID della nota in corso di cancellazione (per disabilitare il bottone +
   // dare feedback visivo). null = nessuna cancellazione in atto.
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  // Dialog modale Nexus (sostituisce window.confirm/alert nativi: blocca
+  // i driver di automazione e UX inconsistente). Riusa il pattern dello
+  // ExplorerModal (task #57) tramite hook condiviso.
+  const { confirm, alert: showAlert, dialogElement: confirmDialogEl } = useConfirmDialog();
   const limit = 20;
 
-  // Cancella una nota dalla KB. Conferma con dialog nativo: l'utente puo'
-  // annullare. Dopo il successo, refresh della lista e (se la nota era
+  // Cancella una nota dalla KB. Conferma con dialog modale Nexus: l'utente
+  // puo' annullare. Dopo il successo, refresh della lista e (se la nota era
   // selezionata) chiusura del dettaglio.
   const handleDeleteNote = useCallback(
     async (noteId: string, noteTitle: string) => {
       if (deletingId) return;
-      const ok = window.confirm(
-        `Eliminare la nota "${noteTitle}"?\n\nL'operazione e' irreversibile: rimuove la nota dal DB, i link in/out e l'embedding Qdrant.`,
-      );
+      const ok = await confirm({
+        title: `Elimina nota`,
+        message:
+          `Vuoi davvero eliminare la nota "${noteTitle}"?\n\n` +
+          "L'operazione e' irreversibile: rimuove la nota dal DB, " +
+          "i link in/out e l'embedding Qdrant.",
+        danger: true,
+        confirmLabel: "Elimina",
+      });
       if (!ok) return;
       setDeletingId(noteId);
       try {
@@ -81,14 +92,15 @@ export function NotesTab({ projectId }: Props) {
         setTotal((t) => Math.max(0, t - 1));
         if (selectedNoteId === noteId) setSelectedNoteId(null);
       } catch (err) {
-        window.alert(
-          `Cancellazione fallita: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        await showAlert({
+          title: "Cancellazione fallita",
+          message: err instanceof Error ? err.message : String(err),
+        });
       } finally {
         setDeletingId(null);
       }
     },
-    [deletingId, projectId, selectedNoteId],
+    [deletingId, projectId, selectedNoteId, confirm, showAlert],
   );
 
   const load = useCallback(async () => {
@@ -544,6 +556,9 @@ export function NotesTab({ projectId }: Props) {
           </button>
         </div>
       )}
+
+      {/* Dialog modale Nexus (sostituisce window.confirm/alert) */}
+      {confirmDialogEl}
     </div>
   );
 }
