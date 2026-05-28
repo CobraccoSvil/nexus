@@ -441,6 +441,12 @@ export function ChatPanel({
   // eslint-disable-next-line -- intentional: only re-run when externalInput changes
   }, [externalInput]);
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  // Snapshot della richiesta in volo: testo + allegati. Se la send fallisce
+  // (es. 500 dal backend, network, body limit), useEffect "restore-on-error"
+  // riporta lo stato cosi' l'utente non perde quello che aveva scritto.
+  // Azzerato al primo response success o quando l'utente ricomincia a scrivere
+  // (per non sovrascrivere il nuovo input se l'errore arriva in ritardo).
+  const pendingSendSnapshotRef = useRef<{ text: string; attachments: ChatAttachment[] } | null>(null);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [precheckPending] = useState(false);
   const [precheckResult, setPrecheckResult] = useState<PrecheckResult & { originalText: string } | null>(null);
@@ -638,6 +644,37 @@ export function ChatPanel({
     if (isNearBottom) setTimeout(scrollToBottom, 40);
   }, [agentSteps.length, isAgentRunning, scrollToBottom]);
 
+  // Restore-on-error: se la send fallisce, ripristina il testo+allegati che
+  // l'utente aveva digitato cosi' non li perde. La logica funziona perche'
+  // useChat::send fa setError(null) all'inizio e setError(formatted) nel catch
+  // — quindi una transizione null -> non-null su `error` significa che la
+  // richiesta in volo (snapshot in ref) e' fallita.
+  //
+  // Safeguard: ripristina SOLO se l'utente non ha gia' iniziato a digitare un
+  // messaggio nuovo dopo il send (cosa che sovrascriverebbe). Se sta scrivendo,
+  // mostra l'errore e mantiene il suo nuovo testo: lo snapshot vecchio si perde.
+  useEffect(() => {
+    if (!error) return;
+    const snap = pendingSendSnapshotRef.current;
+    if (!snap) return;
+    pendingSendSnapshotRef.current = null;
+    // L'utente sta scrivendo qualcos'altro? Allora non sovrascrivere.
+    const userIsTyping = input.trim().length > 0 || attachments.length > 0;
+    if (userIsTyping) return;
+    setInput(snap.text);
+    setAttachments(snap.attachments);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [error]);
+
+  // Cleanup snapshot quando la send completa con successo (= isLoading torna
+  // a false senza error). Cosi' un errore futuro su una send diversa non
+  // ripristina un messaggio vecchio gia' inviato.
+  useEffect(() => {
+    if (!isLoading && !error) {
+      pendingSendSnapshotRef.current = null;
+    }
+  }, [isLoading, error]);
+
   /* ---- Handlers ---- */
 
   const doSend = (text: string, providerHintOverride?: { provider?: string; model?: string }) => {
@@ -663,6 +700,13 @@ export function ChatPanel({
         .then((r) => { if (r.hits.length > 0) setSimilarHits(r.hits); })
         .catch(() => {});
     }
+    // Snapshot del messaggio in volo: se l'invio fallisce (es. 500 backend,
+    // network, body limit), useEffect su `error` riporta input + attachments
+    // nello stato cosi' l'utente non perde quello che aveva scritto e puo'
+    // ritentare con un solo click. Vedi l'useEffect "restore-on-error" piu'
+    // sotto. snapshot azzerato al primo response success o quando l'utente
+    // ricomincia a scrivere.
+    pendingSendSnapshotRef.current = { text, attachments: [...attachments] };
     void send(text, {
       profileId,
       activeFiles,
