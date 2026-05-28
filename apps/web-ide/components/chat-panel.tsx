@@ -751,8 +751,57 @@ export function ChatPanel({
         }
         continue;
       }
+      // Classifica binario: mime-type "binary" tipico (zip/pdf/exe/audio/video)
+      // O file.text() che contiene NULL bytes ( ) — incompatibili con
+      // jsonb di Postgres che li rifiuta con "unsupported Unicode escape
+      // sequence". I file binari vanno inviati come base64; testo come UTF-8.
+      const mt = (file.type || "").toLowerCase();
+      const binaryByMime =
+        mt.startsWith("application/zip") ||
+        mt.startsWith("application/x-zip") ||
+        mt.startsWith("application/pdf") ||
+        mt.startsWith("application/octet-stream") ||
+        mt.startsWith("application/x-tar") ||
+        mt.startsWith("application/gzip") ||
+        mt.startsWith("application/x-7z-compressed") ||
+        mt.startsWith("application/x-rar-compressed") ||
+        mt.startsWith("application/x-executable") ||
+        mt.startsWith("application/x-msdownload") ||
+        mt.startsWith("audio/") ||
+        mt.startsWith("video/") ||
+        mt.startsWith("font/");
+      let textContent = "";
+      let isBinary = binaryByMime;
+      if (!isBinary) {
+        try {
+          textContent = await file.text();
+        } catch {
+          setAttachmentError(`Impossibile leggere ${file.name} come allegato testuale.`);
+          continue;
+        }
+        // Detect NULL bytes nei primi 8KB — segnale chiaro che e' binario
+        // anche se mime e' generico (es. application/octet-stream o vuoto).
+        const sample = textContent.slice(0, 8192);
+        if (sample.indexOf(" ") !== -1) {
+          isBinary = true;
+        }
+      }
+      if (isBinary) {
+        try {
+          const base64Content = await readFileAsBase64(file);
+          next.push({
+            name: file.name,
+            mimeType: file.type || "application/octet-stream",
+            sizeBytes: file.size,
+            textContent: "",
+            base64Content,
+          });
+        } catch {
+          setAttachmentError(`Impossibile leggere ${file.name} come allegato binario.`);
+        }
+        continue;
+      }
       try {
-        const textContent = await file.text();
         if (!textContent.trim()) {
           setAttachmentError(`Il file ${file.name} e' vuoto o non leggibile come testo.`);
           continue;

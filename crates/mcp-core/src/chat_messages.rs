@@ -826,12 +826,29 @@ async fn detect_model_switch(
     Some((provider.to_string(), specific_model))
 }
 
+/// Rimuove i NULL byte ( ) dal testo. PostgreSQL jsonb li rifiuta con
+/// "unsupported Unicode escape sequence:   cannot be converted to text"
+/// quando il content del chat_messages viene serializzato in jsonb. Questo e'
+/// l'ultimo presidio difensivo: il frontend dovrebbe gia' classificare i file
+/// binari come base64 (vedi chat-panel.tsx::handlePickFiles), ma se per
+/// qualunque motivo un null byte arriva qui, lo togliamo senza far crashare
+/// l'INSERT. Idempotente, no-op per testo gia' pulito.
+fn strip_null_bytes(s: &str) -> String {
+    if !s.contains('\0') {
+        return s.to_string();
+    }
+    s.replace('\0', "")
+}
+
 fn normalize_attachments(input: &[ChatAttachmentRequest]) -> Vec<ChatAttachment> {
     input
         .iter()
         .filter_map(|attachment| {
             let name = attachment.name.trim();
-            let text_content = attachment.text_content.trim();
+            // Defense-in-depth: rimuovi NULL bytes prima del trim. Vedi
+            // `strip_null_bytes` per il motivo (jsonb rifiuta  ).
+            let sanitized = strip_null_bytes(&attachment.text_content);
+            let text_content = sanitized.trim();
             let has_text = !name.is_empty() && !text_content.is_empty();
             let has_image = !name.is_empty() && attachment.base64_content.as_ref().map_or(false, |b| !b.is_empty());
             if !has_text && !has_image {
