@@ -1547,6 +1547,7 @@ pub mod crud;
 pub mod browse;
 pub mod clone;
 pub mod analyze;
+pub mod cleanup;
 pub mod deep_analyze;
 pub mod custom_instructions;
 pub mod indexing;

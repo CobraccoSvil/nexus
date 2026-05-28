@@ -523,6 +523,7 @@ pub async fn delete_project(
     }
 
     let project_name = context.details.name.clone();
+    let project_slug = context.details.slug.clone();
 
     // Elimina dal DB (cascade su workspaces, repositories, agent_runs, ecc.)
     sqlx::query("DELETE FROM projects WHERE id = $1 AND owner_user_id = $2")
@@ -540,6 +541,12 @@ pub async fn delete_project(
             name: project_name.clone(),
         },
     );
+
+    // Cleanup propagato delle risorse esterne (Docker + systemd + Qdrant).
+    // Best-effort idempotente: errori non bloccano. Risultato incluso nella
+    // risposta API per tracciabilita' lato client. Vedi `projects::cleanup`.
+    let external_cleanup =
+        super::cleanup::cleanup_external_resources(&state.db, project_id, &project_slug).await;
 
     // Elimina la directory locale.
     // Tentativo preliminare di chmod -R u+rwX per recuperare file readonly
@@ -576,6 +583,10 @@ pub async fn delete_project(
             "Progetto eliminato dal DB ma la directory '{}' non e' stata rimossa completamente. Probabili file con ownership diversa (es. creati da container build): rimuovili a mano con 'sudo rm -rf {}'.",
             p, p
         )),
+        // Esito del cleanup propagato (Docker container, systemd unit, Qdrant
+        // points). Sempre presente: best-effort idempotente, errori dei singoli
+        // step non bloccano l'eliminazione.
+        "externalCleanup": external_cleanup,
     })))
 }
 
