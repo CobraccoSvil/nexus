@@ -76,6 +76,17 @@ export function ProjectExplorer({
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const [modal, setModal] = useState<ModalState>(null);
   const [actionInFlight, setActionInFlight] = useState(false);
+  // Ultima posizione visitata dall'utente nell'albero (click su file/dir o
+  // navigazione tramite breadcrumb). Il breadcrumb in cima riflette questo
+  // path: quando cambia activeFilePath (file aperto nell'editor) lo
+  // riallineamo via useEffect; quando l'utente clicca un segmento del
+  // breadcrumb invece il valore va al path del segmento (sovrascrive
+  // momentaneamente activeFilePath finche' l'utente non apre un altro file).
+  const [lastInteractedPath, setLastInteractedPath] = useState<string>("");
+
+  useEffect(() => {
+    if (activeFilePath) setLastInteractedPath(activeFilePath);
+  }, [activeFilePath]);
 
   // Helper Promise-based per dialog modali. Sostituiscono window.confirm/prompt/alert.
   const confirmDialog = useCallback(
@@ -184,6 +195,55 @@ export function ProjectExplorer({
       await loadPath(path);
     }
   };
+
+  // Naviga al path dato espandendo tutte le directory antenate (caricandole
+  // se non gia' cached), aggiorna lastInteractedPath e scrolla all'elemento
+  // nel DOM. Usato dal breadcrumb cliccabile.
+  const navigateToPath = useCallback(async (targetPath: string) => {
+    if (!project?.id) return;
+    // Path vuoto = root: collassa nulla, solo scroll su.
+    if (!targetPath) {
+      setLastInteractedPath("");
+      window.requestAnimationFrame(() => {
+        const root = document.querySelector("[data-explorer-root]");
+        if (root instanceof HTMLElement) {
+          root.scrollIntoView({ block: "start", behavior: "smooth" });
+        }
+      });
+      return;
+    }
+    const parts = targetPath.split("/").filter(Boolean);
+    // Espande progressivamente le directory antenate (escluso l'ultimo
+    // segmento, che potrebbe essere un file).
+    let cumulative = "";
+    for (let i = 0; i < parts.length - 1; i++) {
+      cumulative = cumulative ? `${cumulative}/${parts[i]}` : parts[i];
+      const dirPath = cumulative;
+      setExpanded((prev) => ({ ...prev, [dirPath]: true }));
+      // Carica i nodi se non gia' cached
+      if (!nodesByPath[dirPath]) {
+        try {
+          const response = await getProjectTree(project.id, dirPath);
+          setNodesByPath((prev) => (prev[dirPath] ? prev : { ...prev, [dirPath]: response.nodes }));
+        } catch {
+          // ignora errori transitori
+        }
+      }
+    }
+    setLastInteractedPath(targetPath);
+    // Scroll all'elemento target dopo un frame, per dare tempo al React di
+    // renderizzare la nuova alberatura espansa.
+    window.requestAnimationFrame(() => {
+      const safeAttr =
+        typeof CSS !== "undefined" && typeof CSS.escape === "function"
+          ? CSS.escape(targetPath)
+          : targetPath.replace(/"/g, '\\"');
+      const el = document.querySelector(`[data-explorer-path="${safeAttr}"]`);
+      if (el instanceof HTMLElement) {
+        el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }
+    });
+  }, [project?.id, nodesByPath]);
 
   // ── Operazioni file (handler context menu) ─────────────────────────────
   const closeContextMenu = useCallback(() => setContextMenu(null), []);
@@ -375,7 +435,9 @@ export function ProjectExplorer({
       return (
         <Fragment key={node.path}>
           <button
+            data-explorer-path={node.path}
             onClick={() => {
+              setLastInteractedPath(node.path);
               if (isDirectory) {
                 void toggleDirectory(node.path);
               } else {
@@ -427,17 +489,20 @@ export function ProjectExplorer({
     return "Nessun file disponibile nella directory selezionata.";
   }, [project]);
 
+  // Path da mostrare nel breadcrumb: ultima interazione. Cambia activeFilePath
+  // -> lastInteractedPath si allinea via useEffect; click su segmento
+  // breadcrumb -> sovrascrive con il path del segmento.
+  const breadcrumbPath = lastInteractedPath;
+
   return (
-    <div style={{ fontSize: 13 }}>
+    <div style={{ fontSize: 13 }} data-explorer-root>
       {project?.rootPath && (
-        <div
-          style={{ color: tc.textMuted, marginBottom: 10, wordBreak: "break-all" }}
-          title={project.rootPath}
-        >
-          {/* Fix M8: mostra path accorciato (es. ~/projects/myslug) invece di
-             leakare /home/administrator/ideai/projects/... — full path nel title */}
-          {shortenAbsolutePath(project.rootPath, project.rootPath)}
-        </div>
+        <ExplorerBreadcrumb
+          rootLabel={shortenAbsolutePath(project.rootPath, project.rootPath)}
+          rootTitle={project.rootPath}
+          currentPath={breadcrumbPath}
+          onNavigate={(p) => void navigateToPath(p)}
+        />
       )}
       {(nodesByPath[""]?.length ?? 0) === 0 ? (
         <div className="text-muted">{emptyMessage}</div>
@@ -860,6 +925,127 @@ function ExplorerModal({
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+
+/** Breadcrumb cliccabile sopra l'albero dell'Explorer.
+ *
+ * Mostra una catena di segmenti: nome del progetto + ogni directory antenata
+ * + file finale (se presente). Ogni segmento (escluso l'ultimo) e' cliccabile
+ * e chiama onNavigate(path) per espandere/scrollare quella directory.
+ *
+ * Il path "" (vuoto) sul nome del progetto torna alla root del progetto.
+ */
+function ExplorerBreadcrumb({
+  rootLabel,
+  rootTitle,
+  currentPath,
+  onNavigate,
+}: {
+  rootLabel: string;
+  rootTitle: string;
+  currentPath: string;
+  onNavigate: (path: string) => void;
+}) {
+  const tc = useThemeColors();
+  // Calcola i segmenti: ogni parte del path con il path cumulativo.
+  const segments = currentPath
+    ? currentPath.split("/").filter(Boolean).reduce<{ name: string; path: string }[]>(
+        (acc, part) => {
+          const prev = acc[acc.length - 1]?.path ?? "";
+          const path = prev ? `${prev}/${part}` : part;
+          acc.push({ name: part, path });
+          return acc;
+        },
+        [],
+      )
+    : [];
+
+  const linkStyle: React.CSSProperties = {
+    border: "none",
+    background: "transparent",
+    padding: "2px 4px",
+    margin: 0,
+    color: tc.textMuted ?? "#9ca3af",
+    cursor: "pointer",
+    fontSize: 12,
+    borderRadius: 4,
+    fontFamily: "inherit",
+    maxWidth: 140,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  };
+  const lastStyle: React.CSSProperties = {
+    ...linkStyle,
+    color: tc.text,
+    fontWeight: 600,
+    cursor: "default",
+  };
+  const sepStyle: React.CSSProperties = {
+    color: tc.textMuted ?? "#6b7280",
+    fontSize: 12,
+    userSelect: "none",
+  };
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        flexWrap: "wrap",
+        gap: 2,
+        marginBottom: 10,
+        paddingBottom: 8,
+        borderBottom: `1px solid ${tc.border ?? "transparent"}`,
+      }}
+      aria-label="Path corrente"
+      title={currentPath ? `${rootTitle}/${currentPath}` : rootTitle}
+    >
+      <button
+        type="button"
+        onClick={() => onNavigate("")}
+        title={rootTitle}
+        style={segments.length === 0 ? lastStyle : linkStyle}
+        onMouseEnter={(e) => {
+          if (segments.length > 0) e.currentTarget.style.color = tc.text;
+        }}
+        onMouseLeave={(e) => {
+          if (segments.length > 0) e.currentTarget.style.color = tc.textMuted ?? "#9ca3af";
+        }}
+      >
+        {rootLabel}
+      </button>
+      {segments.map((seg, idx) => {
+        const isLast = idx === segments.length - 1;
+        return (
+          <Fragment key={seg.path}>
+            <span style={sepStyle}>/</span>
+            {isLast ? (
+              <span style={lastStyle} title={seg.path}>
+                {seg.name}
+              </span>
+            ) : (
+              <button
+                type="button"
+                onClick={() => onNavigate(seg.path)}
+                title={seg.path}
+                style={linkStyle}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.color = tc.text;
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.color = tc.textMuted ?? "#9ca3af";
+                }}
+              >
+                {seg.name}
+              </button>
+            )}
+          </Fragment>
+        );
+      })}
     </div>
   );
 }
