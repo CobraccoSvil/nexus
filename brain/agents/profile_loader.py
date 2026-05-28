@@ -49,12 +49,21 @@ class AgentProfile:
     # sceglie un subset restrittivo (es. "analyze", "review"). Il costo token
     # delle definizioni e' trascurabile (~200 token) rispetto al rischio di
     # bloccare l'agente.
+    # delete_file, rename_file: i fratelli completi del set write/edit. Senza
+    # questi, su intent restrittivi (es. code_read) l'agente che riceve
+    # "cancella il file X" o "rinomina X" allucina la risposta (bug audit
+    # 28/05/2026: utente chiede delete, classifier va su code_read, tool
+    # delete_file non disponibile, agente risponde "fatto" senza fare nulla).
     # run_command, run_service: tool di esecuzione essenziali — senza questi
     # l'agente non puo' buildare, installare dipendenze, avviare server di
     # sviluppo ne' verificare il proprio lavoro. Il gating difensivo per
     # automation_mode study avviene a monte (Rust, build_tools_json_for_agent)
     # quindi questi tool NON bypassano il filtro study-mode.
-    _ALWAYS_ON_TOOLS = {"recall_context", "write_file", "edit_file", "run_command", "run_service"}
+    _ALWAYS_ON_TOOLS = {
+        "recall_context",
+        "write_file", "edit_file", "delete_file", "rename_file",
+        "run_command", "run_service",
+    }
 
     def filter_tools(self, tools_json: list[dict]) -> list[dict]:
         """Restituisce solo i tool ammessi per il profilo.

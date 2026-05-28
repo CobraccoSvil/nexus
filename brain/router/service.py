@@ -409,7 +409,21 @@ class SemanticRouter:
                 "ci sono nel progetto", "esistono nel progetto",
                 "dove si trova", "dove sta", "in quale file",
             ],
-            "test": ["/test", "test", "coverage", "assert", "spec"],
+            # Pattern test piu' specifici: il bare "test" matchava anche
+            # nomi file come "test.js" o "test.spec.ts" facendo cadere
+            # "delete the file test.js" su intent=test invece di file_ops.
+            # Ora richiede contesto di azione/sostantivo composto.
+            "test": [
+                "/test", "esegui test", "esegui i test", "lancia test", "lancia i test",
+                "esegui i test unitari", "run tests", "run the tests",
+                "scrivi test", "scrivi un test", "scrivi i test", "write tests",
+                "write a test", "write the test", "aggiungi test", "add tests",
+                "coverage", "code coverage", "test coverage",
+                "assert ", "assertion", "expect(",
+                "test unitari", "test unitario", "unit test", "unit tests",
+                "test di integrazione", "integration test",
+                "test e2e", "end-to-end test", "playwright test", "spec file",
+            ],
             "docs": ["/docs", "document", "readme", "jsdoc", "comment",
                      "genera documento", "genera analisi", "analisi tecnica",
                      "analisi funzionale", "genera report", "release notes",
@@ -428,6 +442,15 @@ class SemanticRouter:
             "file_ops": [
                 "elimina file", "rimuovi file", "cancella file", "remove file",
                 "delete file", "elimina i file", "remove the file",
+                # Pattern con articolo davanti al sostantivo (errore audit 28/05/2026:
+                # "cancella il file variables.txt" cadeva su code_read invece di file_ops
+                # perche' i pattern qui sotto non includevano l'articolo)
+                "elimina il file", "rimuovi il file", "cancella il file",
+                "delete the file", "remove this file", "delete this file",
+                "elimina questo file", "cancella questo file", "rimuovi questo file",
+                "rinomina il file", "rinomina file", "rename file", "rename the file",
+                "sposta il file", "sposta file", "move file", "move the file",
+                "crea il file", "crea un file", "create file", "create the file",
                 "elimina la cartella", "rimuovi la cartella", "delete folder",
                 "elimina dockerfile", "rimuovi dockerfile",
                 "elimina docker-compose", "rimuovi docker-compose",
