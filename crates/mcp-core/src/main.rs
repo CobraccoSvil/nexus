@@ -12,6 +12,7 @@ mod auth;
 mod billing;
 mod cache;
 mod chat_agent;
+mod chat_attachments;
 mod chat_learning;
 mod chat_messages;
 mod chat_sessions;
@@ -76,7 +77,7 @@ use std::sync::Arc;
 
 use axum::http::{header as http_header, HeaderValue, Method};
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     middleware as axum_mw,
     routing::{delete, get, patch, post, put},
     Json, Router,
@@ -1065,6 +1066,20 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/chat/messages/:id",
                 delete(chat_messages::delete_chat_message).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/chat/messages/:id/attachments/index",
+                post(chat_attachments::index_attachments_to_kb).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/chat/attachments/:attachment_id/raw",
+                get(chat_attachments::get_attachment_raw).layer(axum_mw::from_fn_with_state(
                     state.clone(),
                     middleware::require_auth,
                 )),
@@ -2672,6 +2687,13 @@ async fn main() -> anyhow::Result<()> {
                 middleware::event_capture_middleware,
             ))
             .with_state(state)
+            // Body limit globale = 50 MB. Axum default e' 2 MB, troppo basso
+            // per gli allegati in chat (immagini, file di codice). Il limit
+            // frontend e' 25 MB; con base64 il payload puo' arrivare a ~33 MB,
+            // a cui si aggiunge il resto del JSON (system prompt, history,
+            // tool definitions). 50 MB lascia margine ragionevole senza
+            // esporre a payload abusivi.
+            .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
             .layer(cors);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 4000));

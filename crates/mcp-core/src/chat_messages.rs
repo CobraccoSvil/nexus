@@ -1655,9 +1655,81 @@ pub async fn list_chat_messages(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let mut messages = Vec::with_capacity(rows.len());
+    let mut messages: Vec<Value> = Vec::with_capacity(rows.len());
     for row in &rows {
-        messages.push(to_message_view(row)?);
+        let view = to_message_view(row)?;
+        messages.push(serde_json::to_value(view).unwrap_or_else(|_| json!({})));
+    }
+
+    // ── Carica in batch gli allegati per tutti i messaggi della sessione ──
+    // Una sola query con JOIN su chat_messages, poi raggruppiamo per message_id
+    // ed iniettiamo l'array `attachments` in ogni elemento di `messages`.
+    let attachments_rows = sqlx::query(
+        r#"
+        SELECT cma.id, cma.message_id, cma.project_id, cma.file_name, cma.file_path,
+               cma.mime_type, cma.size_bytes, cma.kind, cma.kb_note_id,
+               cma.indexed_at, cma.created_at
+        FROM chat_message_attachments cma
+        JOIN chat_messages cm ON cm.id = cma.message_id
+        WHERE cm.session_id = $1
+        ORDER BY cma.created_at ASC
+        "#,
+    )
+    .bind(context.session_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let mut attachments_by_msg: std::collections::HashMap<String, Vec<Value>> =
+        std::collections::HashMap::new();
+    for row in &attachments_rows {
+        let msg_id: Uuid = match row.try_get("message_id") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let att_id: Uuid = match row.try_get("id") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let project_id: Uuid = match row.try_get("project_id") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let file_name: String = row.try_get("file_name").unwrap_or_default();
+        let file_path: String = row.try_get("file_path").unwrap_or_default();
+        let mime_type: String = row.try_get("mime_type").unwrap_or_default();
+        let size_bytes: i64 = row.try_get("size_bytes").unwrap_or(0);
+        let kind: String = row.try_get("kind").unwrap_or_else(|_| "binary".to_string());
+        let kb_note_id: Option<Uuid> = row.try_get("kb_note_id").unwrap_or(None);
+        let indexed_at: Option<DateTime<Utc>> = row.try_get("indexed_at").unwrap_or(None);
+        let created_at: Option<DateTime<Utc>> = row.try_get("created_at").ok();
+
+        let entry = attachments_by_msg
+            .entry(msg_id.to_string())
+            .or_insert_with(Vec::new);
+        entry.push(json!({
+            "id": att_id.to_string(),
+            "messageId": msg_id.to_string(),
+            "projectId": project_id.to_string(),
+            "fileName": file_name,
+            "filePath": file_path,
+            "mimeType": mime_type,
+            "sizeBytes": size_bytes,
+            "kind": kind,
+            "kbNoteId": kb_note_id.map(|v| v.to_string()),
+            "indexedAt": indexed_at.map(|v| v.to_rfc3339()),
+            "createdAt": created_at.map(|v| v.to_rfc3339()),
+        }));
+    }
+
+    for msg in messages.iter_mut() {
+        let msg_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        let attachments = attachments_by_msg
+            .remove(msg_id)
+            .unwrap_or_default();
+        if let Value::Object(map) = msg {
+            map.insert("attachments".to_string(), Value::Array(attachments));
+        }
     }
 
     Ok(Json(json!({
@@ -3019,6 +3091,39 @@ pub async fn send_chat_message(
     let user_row = load_message_by_id(&state.db, user_message_id).await?;
     let user_message = to_message_view(&user_row)?;
 
+    // ── Persistenza allegati su filesystem + DB ──────────────────────────────
+    // Gli allegati vengono salvati subito dopo l'INSERT del messaggio user, cosi'
+    // tutti i return path successivi (model_reset, model_switch, resume, DLP,
+    // agent_run, run_turn) restituiscono `savedAttachments` al frontend.
+    // Errori filesystem singoli vengono loggati come WARN ma NON bloccano il
+    // turno: l'utente riceve la lista degli allegati effettivamente persistiti.
+    let saved_attachments_json: Value = if body.attachments.is_empty() {
+        json!([])
+    } else {
+        match crate::projects::load_project_context(&state.db, context.project_id, user_id).await {
+            Ok(project_ctx) => {
+                let saved = crate::chat_attachments::persist_message_attachments(
+                    &state.db,
+                    &project_ctx.repository_root_path,
+                    context.project_id,
+                    user_message_id,
+                    &body.attachments,
+                )
+                .await;
+                crate::chat_attachments::attachments_to_json(&saved)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %context.project_id,
+                    message_id = %user_message_id,
+                    "load_project_context fallito durante persistenza allegati: {}",
+                    e.1["error"].as_str().unwrap_or("errore sconosciuto")
+                );
+                json!([])
+            }
+        }
+    };
+
     spawn_embed_conversation_turn(
         state.orchestrator.neural.clone(),
         state.db.clone(),
@@ -3086,6 +3191,7 @@ pub async fn send_chat_message(
                 "sessionId": context.session_id.to_string(),
                 "userMessage": user_message,
                 "assistantMessage": ack_message,
+                "savedAttachments": saved_attachments_json.clone(),
             })));
         }
 
@@ -3134,6 +3240,7 @@ pub async fn send_chat_message(
                 "sessionId": context.session_id.to_string(),
                 "userMessage": user_message,
                 "assistantMessage": ack_message,
+                "savedAttachments": saved_attachments_json.clone(),
             })));
         }
     }
@@ -3415,7 +3522,8 @@ pub async fn send_chat_message(
                             "provider": prev_provider,
                             "model": prev_model,
                             "resumed": true,
-                        }
+                        },
+                        "savedAttachments": saved_attachments_json.clone(),
                     })));
                 }
             }
@@ -3464,6 +3572,7 @@ pub async fn send_chat_message(
                                     "userMessage": user_message,
                                     "assistantMessage": err_msg,
                                     "dlpBlocked": true,
+                                    "savedAttachments": saved_attachments_json.clone(),
                                 })));
                             }
                         }
@@ -3506,7 +3615,8 @@ pub async fn send_chat_message(
                     "status": "running",
                     "provider": result.provider,
                     "model": result.model,
-                }
+                },
+                "savedAttachments": saved_attachments_json.clone(),
             })));
         }
         // Se il caricamento del progetto fallisce, fallback al singolo turn
@@ -3568,6 +3678,7 @@ pub async fn send_chat_message(
                 "sessionId": context.session_id.to_string(),
                 "userMessage": user_message,
                 "assistantMessage": assistant,
+                "savedAttachments": saved_attachments_json.clone(),
             })));
         }
     };
@@ -3600,7 +3711,8 @@ pub async fn send_chat_message(
             "provider": orchestrator.payload["provider"].as_str().unwrap_or(""),
             "model": orchestrator.payload["model"].as_str().unwrap_or(""),
             "intent": orchestrator.payload["intent"].as_str().unwrap_or("chat"),
-        }
+        },
+        "savedAttachments": saved_attachments_json,
     })))
 }
 

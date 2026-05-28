@@ -2,8 +2,8 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { RefObject } from "react";
-import type { ChatMessage, AgentRunInfo, AgentStep } from "../../lib/api-client";
-import { getAgentRun } from "../../lib/api-client";
+import type { ChatMessage, AgentRunInfo, AgentStep, SavedChatAttachment } from "../../lib/api-client";
+import { getAgentRun, getAttachmentRawUrl } from "../../lib/api-client";
 import type { useThemeColors } from "../../lib/theme";
 import { MarkdownBlock } from "./markdown-renderer";
 
@@ -541,6 +541,159 @@ function AgentRunStepsInline({ runId, tc }: { runId: string; tc: ThemeColors }) 
   );
 }
 
+/** Formattazione dimensione in stringa human-readable. */
+function formatBytes(size: number): string {
+  if (!Number.isFinite(size) || size <= 0) return "0 B";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** Riga di chip per gli allegati persistiti di un messaggio chat.
+ *  - immagini: thumbnail + click apre raw URL in nuova tab
+ *  - testo/binario: click dispatchca `nexus:editor:open-file` con il path
+ *  - se `indexedAt` valorizzato, lo chip mostra un badge KB verde. */
+function AttachmentChips({
+  attachments,
+  tc,
+}: {
+  attachments: SavedChatAttachment[];
+  tc: ThemeColors;
+}) {
+  if (!attachments?.length) return null;
+
+  const openInEditor = (path: string) => {
+    if (typeof window === "undefined") return;
+    window.dispatchEvent(
+      new CustomEvent("nexus:editor:open-file", { detail: { path } }),
+    );
+  };
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexWrap: "wrap",
+        gap: 6,
+        marginTop: 8,
+        paddingTop: 6,
+        borderTop: `1px dashed ${tc.border}`,
+      }}
+    >
+      {attachments.map((att) => {
+        const isIndexed = Boolean(att.indexedAt);
+        const isImage = att.kind === "image";
+        const rawUrl = getAttachmentRawUrl(att.id);
+        const baseStyle: React.CSSProperties = {
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 6,
+          padding: "3px 8px",
+          borderRadius: 8,
+          border: `1px solid ${isIndexed ? tc.success + "88" : tc.border}`,
+          background: isIndexed ? tc.success + "1f" : tc.bgInput,
+          color: tc.text,
+          fontSize: 11,
+          fontFamily: "inherit",
+          cursor: "pointer",
+          maxWidth: 240,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+        };
+        const title = isIndexed
+          ? `${att.fileName} (${formatBytes(att.sizeBytes)}) — indicizzato in KB`
+          : `${att.fileName} (${formatBytes(att.sizeBytes)})`;
+
+        if (isImage) {
+          return (
+            <a
+              key={att.id}
+              href={rawUrl}
+              target="_blank"
+              rel="noreferrer noopener"
+              title={title}
+              style={{ ...baseStyle, textDecoration: "none" }}
+            >
+              <span aria-hidden style={{ fontSize: 10, fontWeight: 700, color: tc.textSecondary, letterSpacing: "0.5px" }}>IMG</span>
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{att.fileName}</span>
+              <span style={{ color: tc.textMuted, fontSize: 10 }}>
+                {formatBytes(att.sizeBytes)}
+              </span>
+              {isIndexed && (
+                <span
+                  aria-label="Indicizzato in Knowledge Base"
+                  title="Indicizzato in Knowledge Base"
+                  style={{ color: tc.success, fontWeight: 700, fontSize: 10 }}
+                >
+                  ⌘ KB
+                </span>
+              )}
+            </a>
+          );
+        }
+
+        // Per i binari (formati non leggibili come testo) usiamo un link al
+        // raw URL che il browser scarica via Content-Disposition: attachment.
+        // Per i testi apriamo nell'editor via l'evento globale.
+        if (att.kind === "binary") {
+          return (
+            <a
+              key={att.id}
+              href={rawUrl}
+              target="_blank"
+              rel="noreferrer noopener"
+              download={att.fileName}
+              title={title}
+              style={{ ...baseStyle, textDecoration: "none" }}
+            >
+              <span aria-hidden style={{ fontSize: 10, fontWeight: 700, color: tc.textSecondary, letterSpacing: "0.5px" }}>BIN</span>
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{att.fileName}</span>
+              <span style={{ color: tc.textMuted, fontSize: 10 }}>
+                {formatBytes(att.sizeBytes)}
+              </span>
+              {isIndexed && (
+                <span
+                  aria-label="Indicizzato in Knowledge Base"
+                  title="Indicizzato in Knowledge Base"
+                  style={{ color: tc.success, fontWeight: 700, fontSize: 10 }}
+                >
+                  ⌘ KB
+                </span>
+              )}
+            </a>
+          );
+        }
+
+        return (
+          <button
+            key={att.id}
+            type="button"
+            onClick={() => openInEditor(att.filePath)}
+            title={title}
+            style={baseStyle}
+          >
+            <span aria-hidden style={{ fontSize: 10, fontWeight: 700, color: tc.textSecondary, letterSpacing: "0.5px" }}>TXT</span>
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{att.fileName}</span>
+            <span style={{ color: tc.textMuted, fontSize: 10 }}>
+              {formatBytes(att.sizeBytes)}
+            </span>
+            {isIndexed && (
+              <span
+                aria-label="Indicizzato in Knowledge Base"
+                title="Indicizzato in Knowledge Base"
+                style={{ color: tc.success, fontWeight: 700, fontSize: 10 }}
+              >
+                KB
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 export interface MessageListProps {
   messages: ChatMessage[];
   busyByMessage: Record<string, string | undefined>;
@@ -841,6 +994,11 @@ export function MessageList({
                 );
               })()}
             </div>
+
+            {/* Chip allegati salvati: cliccabili (immagini -> tab raw, testo/binario -> editor). */}
+            {isUser && message.attachments && message.attachments.length > 0 && (
+              <AttachmentChips attachments={message.attachments} tc={tc} />
+            )}
 
             {/* Pannello step agente (caricamento lazy dal DB) */}
             {!isUser && message.runId && message.automationMode === "agent" && (

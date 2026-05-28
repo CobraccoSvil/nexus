@@ -21,6 +21,7 @@ import {
   type AITraceEvent,
   type SendChatMessageOptions,
   type ChatMessage,
+  type SavedChatAttachment,
 } from "./api-client";
 import {
   selectChatLastCompact,
@@ -284,6 +285,16 @@ export function useChat(
   const [traces, setTraces] = useState<AITraceEvent[]>([]);
   const [streamingToken, setStreamingToken] = useState<string>("");
   const streamingTokenRef = useRef<string>("");
+
+  // ── Proposta di indicizzazione allegati nella Knowledge Base ──
+  // Dopo l'invio di un messaggio con allegati persistiti, il backend
+  // restituisce `savedAttachments`. Questo state segnala al chat-panel di
+  // mostrare un modale che chiede all'utente quali file indicizzare in KB.
+  // null = nessuna proposta in coda; impostato/cancellato esplicitamente.
+  const [attachmentIndexProposal, setAttachmentIndexProposal] = useState<{
+    messageId: string;
+    attachments: SavedChatAttachment[];
+  } | null>(null);
 
   // ── Auto-continuazione per modalita' "Automatico" ──
   // Quando un run primario completa con status "completed" e automationMode "automatic",
@@ -787,12 +798,20 @@ export function useChat(
           profileId: options.profileId ?? profileId,
         });
 
+        // Inietta gli allegati salvati (se presenti) nel messaggio utente,
+        // cosi' i chip vengono renderizzati subito dal MessageList senza
+        // aspettare un refresh manuale.
+        const savedAttachments = response.savedAttachments ?? [];
+        const enrichedUserMessage = response.userMessage
+          ? { ...response.userMessage, attachments: savedAttachments }
+          : response.userMessage;
+
         if (response.agentRun) {
           isAgentMode = true;
           // Modalita' agente: aggiungi solo il messaggio utente, poi ascolta lo stream
           setMessages((current) => [
             ...current,
-            ...(response.userMessage ? [response.userMessage] : []),
+            ...(enrichedUserMessage ? [enrichedUserMessage] : []),
           ]);
           setAgentSteps([]);
           // NON cancellare le trace: accumularle tra le run così il pannello
@@ -819,7 +838,7 @@ export function useChat(
           // Modalita' normale (Study o fallback)
           setMessages((current) => [
             ...current,
-            ...(response.userMessage ? [response.userMessage] : []),
+            ...(enrichedUserMessage ? [enrichedUserMessage] : []),
             ...(response.assistantMessage ? [response.assistantMessage] : []),
           ]);
           if (response.assistantMessage) {
@@ -832,6 +851,15 @@ export function useChat(
               }));
             }
           }
+        }
+
+        // Propone l'indicizzazione KB SE almeno un allegato e' stato salvato.
+        // Il chat-panel mostra un dialog con multi-select; saltabile dall'utente.
+        if (savedAttachments.length > 0 && response.userMessage?.id) {
+          setAttachmentIndexProposal({
+            messageId: response.userMessage.id,
+            attachments: savedAttachments,
+          });
         }
       } catch (e) {
         setError(formatChatError(e, "Invio messaggio fallito."));
@@ -1083,6 +1111,37 @@ export function useChat(
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, sessionId]);
 
+  /** Chiude la modal di indicizzazione KB senza eseguire alcuna richiesta.
+   *  Usato sia dal pulsante "Salta tutto" sia dopo il completamento di una
+   *  indicizzazione confermata. */
+  const clearAttachmentIndexProposal = useCallback(() => {
+    setAttachmentIndexProposal(null);
+  }, []);
+
+  /** Marca come indicizzati gli allegati appena confermati: aggiorna sia
+   *  `messages` (chip → "verde con icona KB") sia la proposta corrente. */
+  const applyAttachmentsIndexed = useCallback(
+    (messageId: string, indexed: Array<{ attachmentId: string; kbNoteId: string }>) => {
+      if (indexed.length === 0) return;
+      const indexedAt = new Date().toISOString();
+      const byId = new Map(indexed.map((row) => [row.attachmentId, row.kbNoteId]));
+      setMessages((current) =>
+        current.map((msg) => {
+          if (msg.id !== messageId || !msg.attachments) return msg;
+          return {
+            ...msg,
+            attachments: msg.attachments.map((att) => {
+              const kbNoteId = byId.get(att.id);
+              if (!kbNoteId) return att;
+              return { ...att, kbNoteId, indexedAt };
+            }),
+          };
+        }),
+      );
+    },
+    [],
+  );
+
   return {
     messages,
     sessionId,
@@ -1099,6 +1158,9 @@ export function useChat(
     tokenUsage,
     traces,
     streamingToken,
+    attachmentIndexProposal,
+    clearAttachmentIndexProposal,
+    applyAttachmentsIndexed,
     send,
     resend,
     remove,

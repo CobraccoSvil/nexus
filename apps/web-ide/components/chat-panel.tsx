@@ -8,7 +8,7 @@ import {
   type FormEvent,
 } from "react";
 import { useChat } from "../lib/use-chat";
-import { listProjectMemories, getProjectDbConfig, listAdminSettings, getModels, findSimilarKnowledge, type AITraceEvent, type ChatAttachment, type ModelCatalogEntry, type PrecheckResult, type ProjectDbConfig, type SimilarHit } from "../lib/api-client";
+import { listProjectMemories, getProjectDbConfig, listAdminSettings, getModels, findSimilarKnowledge, indexAttachmentsToKb, type AITraceEvent, type ChatAttachment, type ModelCatalogEntry, type PrecheckResult, type ProjectDbConfig, type SavedChatAttachment, type SimilarHit } from "../lib/api-client";
 import { SimilarRequestBanner } from "./knowledge/similar-request-banner";
 import { fallbackContextWindow } from "../lib/context-window";
 import { useThemeColors } from "../lib/theme";
@@ -25,7 +25,11 @@ import { MemoryPanel } from "./chat/memory-panel";
 import { TokenUsageBar } from "./chat/token-usage-bar";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const MAX_ATTACHMENT_BYTES = 2_000_000;
+// Limite singolo allegato in chat. Aumentato da 2 MB a 25 MB perche' 2 MB
+// erano scomodi per immagini di schermate, dump JSON, codice voluminoso.
+// Il backend Axum ha DefaultBodyLimit::max(50 MB) (vedi mcp-core main.rs),
+// che lascia margine per il base64 expansion (~33 MB) + resto del JSON.
+const MAX_ATTACHMENT_BYTES = 25_000_000;
 
 function extractRunningCommand(toolInput: Record<string, unknown> | undefined): string | null {
   if (!toolInput) return null;
@@ -334,8 +338,14 @@ export function ChatPanel({
   useEffect(() => {
     getModels().then(({ models }) => setModelCatalog(models)).catch(() => {});
   }, []);
-  const { messages, isLoading, isReady, isReconnecting, error, busyByMessage, agentRun, agentSteps, agentRuns, agentStepsMap, metaStepsMap, tokenUsage, traces, streamingToken, send, resend, remove, feedbackError, feedbackPositive, positiveFeedback, confirmAgent, cancelRun } =
-    useChat(projectId, profileId, { sessionId });
+  const {
+    messages, isLoading, isReady, isReconnecting, error, busyByMessage,
+    agentRun, agentSteps, agentRuns, agentStepsMap, metaStepsMap,
+    tokenUsage, traces, streamingToken,
+    attachmentIndexProposal, clearAttachmentIndexProposal, applyAttachmentsIndexed,
+    send, resend, remove, feedbackError, feedbackPositive, positiveFeedback,
+    confirmAgent, cancelRun,
+  } = useChat(projectId, profileId, { sessionId });
   const prevAgentActiveRef = useRef(false);
   useEffect(() => {
     const isActive = agentRun?.status === "running";
@@ -723,7 +733,7 @@ export function ChatPanel({
     const next: ChatAttachment[] = [];
     for (const file of Array.from(files)) {
       if (file.size > MAX_ATTACHMENT_BYTES) {
-        setAttachmentError(`Il file ${file.name} supera ${Math.round(MAX_ATTACHMENT_BYTES / 1024)} KB.`);
+        setAttachmentError(`Il file ${file.name} supera ${Math.round(MAX_ATTACHMENT_BYTES / 1_000_000)} MB.`);
         continue;
       }
       if (file.type.startsWith("image/")) {
@@ -767,7 +777,7 @@ export function ChatPanel({
     const next: ChatAttachment[] = [];
     for (const file of files) {
       if (file.size > MAX_ATTACHMENT_BYTES) {
-        setAttachmentError(`L'immagine supera ${Math.round(MAX_ATTACHMENT_BYTES / 1024)} KB.`);
+        setAttachmentError(`L'immagine supera ${Math.round(MAX_ATTACHMENT_BYTES / 1_000_000)} MB.`);
         continue;
       }
       try {
@@ -1715,6 +1725,243 @@ export function ChatPanel({
         onCancel={() => setFeedbackDialog(null)}
       />
     )}
+    {/* Dialog indicizzazione KB: appare dopo l'invio di un messaggio con
+        allegati salvati, chiede all'utente quali file vuole aggiungere alla
+        Knowledge Base del progetto. Pre-spunta i 'text', lascia non spuntati
+        immagini e binari. */}
+    {attachmentIndexProposal && (
+      <AttachmentIndexDialog
+        proposal={attachmentIndexProposal}
+        onClose={clearAttachmentIndexProposal}
+        onConfirm={async (ids) => {
+          try {
+            const result = await indexAttachmentsToKb(
+              attachmentIndexProposal.messageId,
+              ids,
+            );
+            applyAttachmentsIndexed(
+              attachmentIndexProposal.messageId,
+              result.indexed,
+            );
+            clearAttachmentIndexProposal();
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : "Errore sconosciuto";
+            setAttachmentError(`Indicizzazione KB fallita: ${msg}`);
+          }
+        }}
+        tc={tc}
+      />
+    )}
     </>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* AttachmentIndexDialog                                              */
+/* ------------------------------------------------------------------ */
+/**
+ * Dialog modale per la scelta dell'utente di quali allegati indicizzare
+ * nella Knowledge Base. Pre-spunta i 'text' (gia' indicizzabili come body)
+ * e lascia non spuntati image/binary. L'utente puo' scegliere un
+ * sottoinsieme o saltare tutto. La chiamata vera all'API la fa il chiamante.
+ */
+function AttachmentIndexDialog({
+  proposal,
+  onClose,
+  onConfirm,
+  tc,
+}: {
+  proposal: { messageId: string; attachments: SavedChatAttachment[] };
+  onClose: () => void;
+  onConfirm: (attachmentIds: string[]) => void | Promise<void>;
+  tc: ReturnType<typeof useThemeColors>;
+}) {
+  // Stato di selezione: default = solo i 'text' pre-spuntati.
+  // Gli 'binary' restano disabilitati (backend rifiuta comunque).
+  const initialSelected = new Set<string>(
+    proposal.attachments
+      .filter((att) => att.kind === "text")
+      .map((att) => att.id),
+  );
+  const [selected, setSelected] = useState<Set<string>>(initialSelected);
+  const [submitting, setSubmitting] = useState(false);
+
+  const toggle = (id: string) => {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const handleConfirm = async () => {
+    if (submitting) return;
+    setSubmitting(true);
+    try {
+      await onConfirm(Array.from(selected));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Indicizzazione allegati nella Knowledge Base"
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(5, 10, 18, 0.5)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 1300,
+        padding: 16,
+      }}
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !submitting) onClose();
+      }}
+    >
+      <div
+        style={{
+          width: 520,
+          maxWidth: "95vw",
+          maxHeight: "85vh",
+          overflow: "auto",
+          borderRadius: 10,
+          border: `1px solid ${tc.border}`,
+          background: tc.bgCard,
+          boxShadow: "0 14px 44px rgba(0,0,0,0.4)",
+          padding: 16,
+          display: "flex",
+          flexDirection: "column",
+          gap: 12,
+        }}
+      >
+        <div style={{ color: tc.text, fontWeight: 700, fontSize: 15 }}>
+          Indicizzare nella Knowledge Base?
+        </div>
+        <div style={{ color: tc.textSecondary, fontSize: 12 }}>
+          Gli allegati salvati possono essere aggiunti alla KB del progetto come
+          note ricercabili. Seleziona quali file vuoi indicizzare. I file di
+          testo sono pre-selezionati; immagini e binari sono disponibili come
+          metadata-only o esclusi.
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {proposal.attachments.map((att) => {
+            const isBinary = att.kind === "binary";
+            return (
+              <label
+                key={att.id}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  padding: "6px 8px",
+                  borderRadius: 6,
+                  border: `1px solid ${tc.border}`,
+                  background: isBinary ? tc.bgInput : tc.bgCard,
+                  color: isBinary ? tc.textMuted : tc.text,
+                  cursor: isBinary ? "not-allowed" : "pointer",
+                  fontSize: 12,
+                }}
+                title={
+                  isBinary
+                    ? "Tipo binario non indicizzabile nella KB"
+                    : att.fileName
+                }
+              >
+                <input
+                  type="checkbox"
+                  disabled={isBinary || submitting}
+                  checked={!isBinary && selected.has(att.id)}
+                  onChange={() => !isBinary && toggle(att.id)}
+                />
+                <span
+                  aria-hidden
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    color: tc.textSecondary,
+                    letterSpacing: "0.5px",
+                    minWidth: 28,
+                    textAlign: "center",
+                  }}
+                >
+                  {att.kind === "image"
+                    ? "IMG"
+                    : att.kind === "text"
+                      ? "TXT"
+                      : "BIN"}
+                </span>
+                <span
+                  style={{
+                    flex: 1,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {att.fileName}
+                </span>
+                <span style={{ color: tc.textMuted, fontSize: 11 }}>
+                  {att.kind}
+                </span>
+              </label>
+            );
+          })}
+        </div>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "flex-end",
+            gap: 8,
+            marginTop: 4,
+          }}
+        >
+          <button
+            type="button"
+            disabled={submitting}
+            onClick={onClose}
+            style={{
+              border: `1px solid ${tc.border}`,
+              background: tc.bgInput,
+              color: tc.text,
+              borderRadius: 8,
+              padding: "6px 12px",
+              fontSize: 12,
+              cursor: submitting ? "not-allowed" : "pointer",
+              fontFamily: "inherit",
+            }}
+          >
+            Salta tutto
+          </button>
+          <button
+            type="button"
+            disabled={submitting || selected.size === 0}
+            onClick={() => void handleConfirm()}
+            style={{
+              border: `1px solid ${tc.accent}`,
+              background: tc.accentBg,
+              color: tc.accent,
+              borderRadius: 8,
+              padding: "6px 12px",
+              fontSize: 12,
+              cursor:
+                submitting || selected.size === 0 ? "not-allowed" : "pointer",
+              fontWeight: 700,
+              fontFamily: "inherit",
+              opacity: selected.size === 0 ? 0.5 : 1,
+            }}
+          >
+            {submitting
+              ? "Indicizzazione…"
+              : `Indicizza selezionati (${selected.size})`}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }

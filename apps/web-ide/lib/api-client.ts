@@ -40,6 +40,53 @@ async function fetchJson<T>(url: string, init?: RequestInit, timeoutMs = 30000):
     window.location.href = "/login";
     throw new Error("Sessione scaduta");
   }
+  // Bug-fix: quando il backend ritorna 403 "Progetto non accessibile" significa
+  // che il progetto e' stato cancellato (server-side) ma il client ha ancora
+  // riferimenti stale (URL ?project=, localStorage activeTab, ecc.). Senza
+  // questo cleanup l'UI continua a riprovare la PUT e mostra il toast
+  // "Operazione progetto (PUT) fallita: Progetto non accessibile" ad ogni
+  // refresh / azione.
+  if (res.status === 403 && typeof window !== "undefined") {
+    try {
+      const cloned = res.clone();
+      const payload = await cloned.json().catch(() => null);
+      const errText =
+        typeof payload?.error === "string"
+          ? payload.error
+          : typeof payload?.message === "string"
+            ? payload.message
+            : "";
+      if (errText.includes("Progetto non accessibile")) {
+        // Estrae l'UUID del progetto dall'URL chiamato (pattern /api/projects/{uuid}/...)
+        const m = String(url).match(/\/api\/projects\/([0-9a-f-]{36})/i);
+        if (m) {
+          const orphanId = m[1];
+          const keysToDrop: string[] = [];
+          for (let i = 0; i < window.localStorage.length; i++) {
+            const k = window.localStorage.key(i);
+            if (!k) continue;
+            // Rimuove tutte le entry ideai:*:{orphanId} e qualsiasi chiave che
+            // contenga l'UUID orfano (cache di altri pannelli)
+            if (k.includes(orphanId)) keysToDrop.push(k);
+          }
+          for (const k of keysToDrop) window.localStorage.removeItem(k);
+          // Se l'URL della pagina punta ancora a quel progetto orfano,
+          // forza il redirect a /ide senza query (il backend selezionera'
+          // automaticamente l'ultimo progetto valido).
+          const currentParam = new URLSearchParams(window.location.search).get("project");
+          if (currentParam === orphanId) {
+            window.location.href = "/ide";
+            throw new Error("Progetto rimosso, reindirizzamento in corso");
+          }
+        }
+      }
+    } catch (cleanupErr) {
+      // se il cleanup fallisce non bloccare il flow di errore originale
+      if (cleanupErr instanceof Error && cleanupErr.message.includes("reindirizzamento")) {
+        throw cleanupErr;
+      }
+    }
+  }
   if (!res.ok) {
     let details = "";
     try {
@@ -163,14 +210,40 @@ export interface ChatMessage {
       per non confondere l'utente: il backend lo persiste comunque per
       coerenza del run. Vedere chat_messages.rs::synthetic. */
   synthetic?: boolean;
+  /** Allegati persistiti su filesystem + chat_message_attachments associati
+      al messaggio. Popolato dal backend tanto in send_chat_message (subito
+      dopo l'INSERT del messaggio user) quanto in list_chat_messages (su
+      refresh sessione). Quando vuoto/undefined il messaggio non ha allegati. */
+  attachments?: SavedChatAttachment[];
 }
 
+/** Allegato pronto per essere inviato al backend (input dell'utente). */
 export interface ChatAttachment {
   name: string;
   mimeType: string;
   sizeBytes: number;
   textContent: string;
   base64Content?: string;
+}
+
+/** Allegato persistito dal backend (output dopo invio o refresh sessione).
+ *  Vedi crates/mcp-core/src/chat_attachments.rs::SavedAttachment. */
+export interface SavedChatAttachment {
+  id: string;
+  messageId: string;
+  projectId: string;
+  fileName: string;
+  filePath: string;
+  mimeType: string;
+  sizeBytes: number;
+  /** Categoria derivata dal mime: governa la pipeline KB
+   *  ('text' indicizzabile, 'image' metadata-only, 'binary' non indicizzabile). */
+  kind: "text" | "image" | "binary";
+  /** Id della nota KB associata, se l'allegato e' stato indicizzato. */
+  kbNoteId?: string | null;
+  /** Timestamp di indicizzazione KB. Null se ancora non indicizzato. */
+  indexedAt?: string | null;
+  createdAt: string;
 }
 
 export interface SendChatMessageOptions {
@@ -910,11 +983,21 @@ export interface AgentRunInfo {
   topP?: number;
 }
 
+export interface SendChatMessageResponse {
+  sessionId: string;
+  userMessage: ChatMessage;
+  assistantMessage?: ChatMessage;
+  agentRun?: { runId: string; status: string; provider: string; model: string };
+  /** Lista di allegati salvati su filesystem + DB. Popolato anche se la
+   *  modalita' selezionata produce solo un agentRun (no assistantMessage). */
+  savedAttachments?: SavedChatAttachment[];
+}
+
 export async function sendChatMessage(
   sessionId: string,
   content: string,
   options: SendChatMessageOptions = {},
-): Promise<{ sessionId: string; userMessage: ChatMessage; assistantMessage?: ChatMessage; agentRun?: { runId: string; status: string; provider: string; model: string } }> {
+): Promise<SendChatMessageResponse> {
   return fetchJson(`${API_BASE}/api/chat/sessions/${sessionId}/messages`, {
     method: "POST",
     body: JSON.stringify({
@@ -932,6 +1015,31 @@ export async function sendChatMessage(
       synthetic: options.synthetic ?? false,
     }),
   }, 120000);
+}
+
+export interface IndexAttachmentsToKbResponse {
+  indexed: Array<{ attachmentId: string; kbNoteId: string }>;
+  skipped: Array<{ attachmentId: string; reason: string }>;
+}
+
+/** Indicizza nella Knowledge Base gli allegati selezionati di un messaggio.
+ *  Crea una nota in project_knowledge_notes con embedding in Qdrant
+ *  (collezione `knowledge_notes`), e popola kb_note_id+indexed_at su
+ *  chat_message_attachments. Vedi crates/mcp-core/src/chat_attachments.rs. */
+export async function indexAttachmentsToKb(
+  messageId: string,
+  attachmentIds: string[],
+): Promise<IndexAttachmentsToKbResponse> {
+  return fetchJson(`${API_BASE}/api/chat/messages/${messageId}/attachments/index`, {
+    method: "POST",
+    body: JSON.stringify({ attachmentIds }),
+  });
+}
+
+/** URL da usare in `<img src>` o link di download per scaricare i bytes
+ *  raw di un allegato. Il backend valida l'accesso via project_id. */
+export function getAttachmentRawUrl(attachmentId: string): string {
+  return `${API_BASE}/api/chat/attachments/${encodeURIComponent(attachmentId)}/raw`;
 }
 
 export interface PrecheckResult {
@@ -952,7 +1060,7 @@ export async function precheckChatMessage(message: string, sessionId?: string): 
 export async function resendChatMessage(
   messageId: string,
   options: SendChatMessageOptions = {},
-): Promise<{ sessionId: string; userMessage?: ChatMessage; assistantMessage?: ChatMessage; agentRun?: { runId: string; status: string; provider: string; model: string } }> {
+): Promise<{ sessionId: string; userMessage?: ChatMessage; assistantMessage?: ChatMessage; agentRun?: { runId: string; status: string; provider: string; model: string }; savedAttachments?: SavedChatAttachment[] }> {
   return fetchJson(`${API_BASE}/api/chat/messages/${messageId}/resend`, {
     method: "POST",
     body: JSON.stringify({
