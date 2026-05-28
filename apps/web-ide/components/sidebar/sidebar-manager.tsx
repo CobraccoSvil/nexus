@@ -66,6 +66,12 @@ export interface SidebarManagerProps {
   onRefreshProject: () => void | Promise<void>;
   onProjectAnalyzed?: () => void;
   onSendToChat?: (msg: string, options?: { providerHint?: string; modelHint?: string }) => void;
+  /** Chiamato dall'Explorer dopo create/rename/delete: il parent ricarica metadata progetto. */
+  onFileTreeChanged?: () => void;
+  /** Chiamato dall'Explorer dopo delete: il parent chiude tab editor aperti su quel path. */
+  onFileDeleted?: (path: string) => void;
+  /** Chiamato dall'Explorer dopo rename/move: il parent aggiorna tab editor (oldPath -> newPath). */
+  onFileRenamed?: (oldPath: string, newPath: string) => void;
 }
 
 function iconButton(
@@ -1037,6 +1043,9 @@ export function SidebarManager({
   onRefreshProject,
   onProjectAnalyzed,
   onSendToChat,
+  onFileTreeChanged,
+  onFileDeleted,
+  onFileRenamed,
 }: SidebarManagerProps) {
   const tc = useThemeColors();
 
@@ -1160,6 +1169,9 @@ export function SidebarManager({
             onOpenFile={async (path) => {
               onOpenFile(path);
             }}
+            onFileTreeChanged={onFileTreeChanged}
+            onFileDeleted={onFileDeleted}
+            onFileRenamed={onFileRenamed}
           />
         </div>
       </>

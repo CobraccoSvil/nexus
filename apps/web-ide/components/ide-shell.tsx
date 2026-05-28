@@ -2228,6 +2228,33 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               setPendingProviderHint({ provider: opts.providerHint, model: opts.modelHint });
             }
           }}
+          onFileTreeChanged={() => void refreshProject()}
+          onFileDeleted={(path) => {
+            // Chiudi eventuali tab editor aperti su questo path in tutti i gruppi.
+            setEditorGroups((groups) =>
+              groups.map((g) => ({
+                ...g,
+                tabs: g.tabs.filter((t) => t.path !== path),
+                activePath: g.activePath === path
+                  ? (g.tabs.filter((t) => t.path !== path).at(-1)?.path ?? null)
+                  : g.activePath,
+              })),
+            );
+          }}
+          onFileRenamed={(oldPath, newPath) => {
+            // Aggiorna i tab editor che puntavano al vecchio path.
+            setEditorGroups((groups) =>
+              groups.map((g) => ({
+                ...g,
+                tabs: g.tabs.map((t) =>
+                  t.path === oldPath
+                    ? { ...t, path: newPath, title: newPath.split("/").pop() ?? newPath }
+                    : t,
+                ),
+                activePath: g.activePath === oldPath ? newPath : g.activePath,
+              })),
+            );
+          }}
         />
       </section>
 
