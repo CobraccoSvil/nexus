@@ -4,8 +4,11 @@
 //! chat-panel, il flusso e':
 //!   1. `send_chat_message` salva la riga `chat_messages` user
 //!   2. `persist_message_attachments` scrive i bytes su disco in
-//!      `<project_root>/.nexus/attachments/<msg_id>/<file_safe>` e inserisce
-//!      una riga in `chat_message_attachments`
+//!      `<project_root>/.nexus/attachments/<safe_name>-<hash8>/<safe_name>`
+//!      (storage content-addressed: directory leggibile e deduplicata sul
+//!      contenuto, non sul message_id) e inserisce una riga in
+//!      `chat_message_attachments`. Stesso contenuto caricato piu' volte ->
+//!      stessa cartella -> stesso file fisico riusato (no duplicazione disco).
 //!   3. Il frontend mostra i chip e (opzionalmente) chiede all'utente se
 //!      vuole indicizzare gli allegati nella Knowledge Base
 //!   4. Su conferma chiama POST `/api/chat/messages/:id/attachments/index`
@@ -33,6 +36,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -186,6 +190,85 @@ pub struct SavedAttachment {
     pub created_at: String,
 }
 
+/// Calcola lo sha256 esadecimale (64 char lowercase) del contenuto.
+fn content_hash_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    // Formattazione esadecimale manuale: niente dipendenze extra, niente panic.
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest.iter() {
+        out.push(char::from_digit((byte >> 4) as u32, 16).unwrap_or('0'));
+        out.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap_or('0'));
+    }
+    out
+}
+
+/// Esito della risoluzione della directory content-addressed per un allegato.
+struct ContentAddressedDir {
+    /// Directory `<safe_name>-<hashN>` (assoluta, sotto `attachments_root`).
+    dir: PathBuf,
+    /// Path finale del file dentro `dir`.
+    final_path: PathBuf,
+    /// `true` se la directory (e quindi potenzialmente il file) esisteva gia'
+    /// prima di questo salvataggio: in tal caso il file NON va rimosso su
+    /// rollback (non l'abbiamo creato noi / e' condiviso).
+    preexisting: bool,
+}
+
+/// Risolve la directory content-addressed `<safe_name>-<hashN>` per il file,
+/// gestendo la deduplica e l'eventuale collisione di `hash8`.
+///
+/// Strategia:
+///   - parte da `hash8` (primi 8 hex char): leggibile e compatto;
+///   - se la cartella `<safe_name>-<hash8>` esiste e contiene gia' un file
+///     `<safe_name>` con la STESSA dimensione -> dedup, riusa il path esistente;
+///   - se esiste ma con dimensione DIVERSA (collisione `hash8` improbabile) ->
+///     estende a `hash` completo (`<safe_name>-<hash64>`) come fallback robusto;
+///   - altrimenti crea la cartella `hash8` (caso nuovo contenuto).
+async fn resolve_content_dir(
+    attachments_root: &Path,
+    safe_name: &str,
+    content_hash: &str,
+    expected_size: u64,
+) -> Result<ContentAddressedDir, std::io::Error> {
+    let hash8 = &content_hash[..content_hash.len().min(8)];
+    let dir8 = attachments_root.join(format!("{safe_name}-{hash8}"));
+    let file8 = dir8.join(safe_name);
+
+    match tokio::fs::metadata(&file8).await {
+        Ok(meta) => {
+            if meta.len() == expected_size {
+                // Stesso nome + stesso hash8 + stessa dimensione: dedup.
+                return Ok(ContentAddressedDir {
+                    dir: dir8,
+                    final_path: file8,
+                    preexisting: true,
+                });
+            }
+            // Collisione hash8 con dimensione diversa: usa hash completo.
+            let dir_full = attachments_root.join(format!("{safe_name}-{content_hash}"));
+            let file_full = dir_full.join(safe_name);
+            let preexisting = tokio::fs::metadata(&file_full).await.is_ok();
+            Ok(ContentAddressedDir {
+                dir: dir_full,
+                final_path: file_full,
+                preexisting,
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // La cartella hash8 potrebbe esistere anche senza il file (raro).
+            let preexisting = tokio::fs::metadata(&dir8).await.is_ok();
+            Ok(ContentAddressedDir {
+                dir: dir8,
+                final_path: file8,
+                preexisting,
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Salva sul filesystem e su DB gli allegati passati. Eseguito sincronamente
 /// dentro `send_chat_message` per garantire che il response contenga gli ID.
 /// Errori filesystem singoli non interrompono il batch: vengono loggati e
@@ -201,12 +284,11 @@ pub async fn persist_message_attachments(
         return Vec::new();
     }
 
-    let base_dir = project_root
-        .join(".nexus")
-        .join("attachments")
-        .join(message_id.to_string());
+    // Radice content-addressed: `.nexus/attachments`. Le singole directory
+    // `<safe_name>-<hash8>` vengono create per-file (non piu' per message_id).
+    let attachments_root = project_root.join(".nexus").join("attachments");
 
-    if let Err(e) = tokio::fs::create_dir_all(&base_dir).await {
+    if let Err(e) = tokio::fs::create_dir_all(&attachments_root).await {
         tracing::warn!(
             project_id = %project_id,
             message_id = %message_id,
@@ -228,17 +310,6 @@ pub async fn persist_message_attachments(
         let mime_type = attachment.mime_type.trim().to_string();
         let kind = classify_attachment_kind(&mime_type).to_string();
         let safe_name = sanitize_attachment_filename(original_name);
-        let final_path = base_dir.join(&safe_name);
-
-        if let Err(e) = ensure_path_within(&base_dir, &final_path) {
-            tracing::warn!(
-                message_id = %message_id,
-                file = %original_name,
-                "path allegato non sicuro: {}",
-                e.1["error"].as_str().unwrap_or("errore percorso")
-            );
-            continue;
-        }
 
         // Risolvi i bytes: priorita' base64 (immagini/binari) > text_content.
         let bytes_result: Result<Vec<u8>, String> = if let Some(b64) = &attachment.base64_content {
@@ -271,17 +342,76 @@ pub async fn persist_message_attachments(
             }
         };
 
-        if let Err(e) = tokio::fs::write(&final_path, &bytes).await {
+        let actual_size = bytes.len() as i64;
+        let content_hash = content_hash_hex(&bytes);
+
+        // Risolvi la directory content-addressed `<safe_name>-<hashN>`.
+        let resolved = match resolve_content_dir(
+            &attachments_root,
+            &safe_name,
+            &content_hash,
+            bytes.len() as u64,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    message_id = %message_id,
+                    file = %safe_name,
+                    error = %e,
+                    "risoluzione directory content-addressed fallita"
+                );
+                continue;
+            }
+        };
+        let final_path = resolved.final_path;
+        let dir_preexisting = resolved.preexisting;
+
+        // Path-safety: il path finale deve restare sotto attachments_root.
+        if let Err(e) = ensure_path_within(&attachments_root, &final_path) {
             tracing::warn!(
                 message_id = %message_id,
-                file = %safe_name,
-                error = %e,
-                "scrittura allegato su disco fallita"
+                file = %original_name,
+                "path allegato non sicuro: {}",
+                e.1["error"].as_str().unwrap_or("errore percorso")
             );
             continue;
         }
 
-        let actual_size = bytes.len() as i64;
+        // Dedup fisica: scrivi solo se il file non esiste gia' con la stessa
+        // dimensione (stesso contenuto -> stesso hash -> stesso path).
+        let file_already_present = match tokio::fs::metadata(&final_path).await {
+            Ok(meta) => meta.len() == bytes.len() as u64,
+            Err(_) => false,
+        };
+
+        if !file_already_present {
+            if let Err(e) = tokio::fs::create_dir_all(&resolved.dir).await {
+                tracing::warn!(
+                    message_id = %message_id,
+                    file = %safe_name,
+                    error = %e,
+                    "creazione directory content-addressed fallita"
+                );
+                continue;
+            }
+            if let Err(e) = tokio::fs::write(&final_path, &bytes).await {
+                tracing::warn!(
+                    message_id = %message_id,
+                    file = %safe_name,
+                    error = %e,
+                    "scrittura allegato su disco fallita"
+                );
+                continue;
+            }
+        }
+
+        // Vero se in questo giro abbiamo materialmente creato il file: solo in
+        // tal caso un rollback puo' rimuoverlo senza rischiare di cancellare un
+        // contenuto condiviso da altri record.
+        let created_in_this_run = !file_already_present && !dir_preexisting;
+
         let path_string = final_path.to_string_lossy().to_string();
         let attachment_id = Uuid::new_v4();
         let created_at = Utc::now();
@@ -290,9 +420,9 @@ pub async fn persist_message_attachments(
             r#"
             INSERT INTO chat_message_attachments (
                 id, message_id, project_id, file_name, file_path,
-                mime_type, size_bytes, kind, created_at
+                mime_type, size_bytes, kind, content_hash, created_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             "#,
         )
         .bind(attachment_id)
@@ -303,6 +433,7 @@ pub async fn persist_message_attachments(
         .bind(&mime_type)
         .bind(actual_size)
         .bind(&kind)
+        .bind(&content_hash)
         .bind(created_at)
         .execute(db)
         .await;
@@ -314,8 +445,27 @@ pub async fn persist_message_attachments(
                 error = %e,
                 "insert chat_message_attachments fallito"
             );
-            // Pulisci il file che abbiamo gia' scritto per non lasciare orfani.
-            let _ = tokio::fs::remove_file(&final_path).await;
+            // Rollback orfani: rimuovi il file SOLO se l'abbiamo creato noi in
+            // questo giro e nessun altro record (stesso project_id +
+            // content_hash) lo referenzia. Se il contenuto e' condiviso o la
+            // cartella era pre-esistente, non tocchiamo nulla.
+            if created_in_this_run {
+                let shared: i64 = sqlx::query_scalar(
+                    r#"
+                    SELECT COUNT(*) FROM chat_message_attachments
+                    WHERE project_id = $1 AND content_hash = $2
+                    "#,
+                )
+                .bind(project_id)
+                .bind(&content_hash)
+                .fetch_one(db)
+                .await
+                .unwrap_or(0);
+                if shared == 0 {
+                    let _ = tokio::fs::remove_file(&final_path).await;
+                    let _ = tokio::fs::remove_dir(&resolved.dir).await;
+                }
+            }
             continue;
         }
 
@@ -910,5 +1060,84 @@ mod tests {
         assert!(ensure_path_within(&base, &evil).is_err());
         let safe = base.join("file.txt");
         assert!(ensure_path_within(&base, &safe).is_ok());
+    }
+
+    #[test]
+    fn content_hash_is_deterministic_and_hex() {
+        let h1 = content_hash_hex(b"hello world");
+        let h2 = content_hash_hex(b"hello world");
+        let h3 = content_hash_hex(b"hello mars");
+        assert_eq!(h1, h2, "stesso contenuto -> stesso hash");
+        assert_ne!(h1, h3, "contenuti diversi -> hash diversi");
+        assert_eq!(h1.len(), 64, "sha256 esadecimale = 64 char");
+        assert!(
+            h1.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash deve essere esadecimale: {h1}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_dir_dedup_same_content() {
+        let tmp = std::env::temp_dir().join(format!("nexus-att-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&tmp).await.expect("mkdir tmp");
+
+        let bytes = b"contenuto allegato di test";
+        let hash = content_hash_hex(bytes);
+        let safe = "PL.make";
+
+        // Primo salvataggio: cartella non esiste, va creata.
+        let first = resolve_content_dir(&tmp, safe, &hash, bytes.len() as u64)
+            .await
+            .expect("resolve 1");
+        assert!(!first.preexisting, "prima volta non pre-esistente");
+        tokio::fs::create_dir_all(&first.dir).await.expect("mkdir dir");
+        tokio::fs::write(&first.final_path, bytes).await.expect("write");
+
+        // Path leggibile: contiene il safe_name e l'hash8, sotto la root.
+        let dir_name = first
+            .dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        assert_eq!(dir_name, format!("{safe}-{}", &hash[..8]));
+        assert!(first.final_path.starts_with(&tmp), "dentro base_dir");
+        assert!(ensure_path_within(&tmp, &first.final_path).is_ok());
+
+        // Secondo salvataggio dello stesso contenuto: dedup -> stesso path.
+        let second = resolve_content_dir(&tmp, safe, &hash, bytes.len() as u64)
+            .await
+            .expect("resolve 2");
+        assert!(second.preexisting, "seconda volta pre-esistente");
+        assert_eq!(first.final_path, second.final_path, "stesso path fisico");
+
+        tokio::fs::remove_dir_all(&tmp).await.ok();
+    }
+
+    #[tokio::test]
+    async fn resolve_dir_distinct_for_same_name_different_content() {
+        let tmp = std::env::temp_dir().join(format!("nexus-att-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&tmp).await.expect("mkdir tmp");
+
+        let safe = "config.json";
+        let bytes_a = b"{\"a\":1}";
+        let bytes_b = b"{\"a\":2}";
+        let hash_a = content_hash_hex(bytes_a);
+        let hash_b = content_hash_hex(bytes_b);
+
+        let ra = resolve_content_dir(&tmp, safe, &hash_a, bytes_a.len() as u64)
+            .await
+            .expect("resolve a");
+        let rb = resolve_content_dir(&tmp, safe, &hash_b, bytes_b.len() as u64)
+            .await
+            .expect("resolve b");
+
+        assert_ne!(
+            ra.dir, rb.dir,
+            "stesso nome ma contenuto diverso -> directory diverse"
+        );
+        assert!(ra.final_path.starts_with(&tmp));
+        assert!(rb.final_path.starts_with(&tmp));
+
+        tokio::fs::remove_dir_all(&tmp).await.ok();
     }
 }
