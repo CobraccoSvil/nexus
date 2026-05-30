@@ -59,10 +59,27 @@ class AgentProfile:
     # sviluppo ne' verificare il proprio lavoro. Il gating difensivo per
     # automation_mode study avviene a monte (Rust, build_tools_json_for_agent)
     # quindi questi tool NON bypassano il filtro study-mode.
+    # nexus_mcp_tool_search, nexus_mcp_tool_call: infrastruttura di tool
+    # discovery dinamico (lazy mode). Senza questi sul profilo, il modello
+    # NON puo' scoprire ne' invocare tool oltre quelli statici in allowed_tools
+    # (es. nexus_inspect_attachment per leggere allegati binari, nexus_extract_*
+    # per PDF/DOCX/Figma). Bug osservato 30/05/2026: profilo architect su prompt
+    # "Crea applicazione da .make" non aveva accesso a nexus_inspect_attachment
+    # — Vertex ha chiamato run_command, visto bytes binari e si e' arreso
+    # con risposta descrittiva (G1 cap). Soluzione: rendere always-on i tool
+    # di discovery cosi' lazy mode funziona davvero su ogni profilo.
+    # nexus_inspect_attachment: punto di ingresso obbligato per riconoscere
+    # il tipo reale di un allegato (magic byte detection) e ottenere il
+    # next_action_recommended. Senza questo, il modello tenta read_file e
+    # fallisce sui binari. Gli altri tool nexus_extract_* / nexus_read_*
+    # vengono invocati via nexus_mcp_tool_call con server_id="builtin",
+    # cosi' il toolset principale resta snello (sistema lazy discovery).
     _ALWAYS_ON_TOOLS = {
         "recall_context",
         "write_file", "edit_file", "delete_file", "rename_file",
         "run_command", "run_service",
+        "nexus_mcp_tool_search", "nexus_mcp_tool_call",
+        "nexus_inspect_attachment",
     }
 
     def filter_tools(self, tools_json: list[dict]) -> list[dict]:

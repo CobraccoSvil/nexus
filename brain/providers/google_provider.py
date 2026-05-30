@@ -396,11 +396,27 @@ class GoogleProvider(BaseProvider):
                     ))
                 google_tools = [types.Tool(function_declarations=func_decls)]
 
-            # I modelli "thinking" (gemini-2.0/2.5-flash-thinking-exp, gemini-2.5-pro-exp)
-            # ignorano temperature (usano il loro thinking budget interno) ma non danno errore.
-            # Settiamo None per i thinking model per evitare warning nell'API.
-            _is_thinking = "thinking" in model.lower() or "gemini-2.5-pro" in model.lower()
+            # I modelli "thinking" (gemini-2.0/2.5-flash-thinking-exp, gemini-2.5-pro-exp,
+            # gemini-2.5-flash, gemini-2.5-pro) usano un budget di reasoning interno.
+            # - Temperature ignorato dal provider: settiamo None per evitare warning.
+            # - include_thoughts=True espone i "thoughts" del modello insieme alla
+            #   risposta, cosi' il brain/UI puo' mostrare il ragionamento.
+            #   Senza questo, il reasoning resta interno e l'utente vede solo
+            #   la risposta finale ("non vedo extended thinking" feedback utente).
+            _is_thinking = (
+                "thinking" in model.lower()
+                or "gemini-2.5-pro" in model.lower()
+                or "gemini-2.5-flash" in model.lower()
+            )
             config_temperature = None if _is_thinking else temperature
+            thinking_config = None
+            if _is_thinking:
+                try:
+                    thinking_config = types.ThinkingConfig(include_thoughts=True)
+                except Exception:
+                    # SDK piu' vecchio senza ThinkingConfig: nessun include_thoughts,
+                    # il modello continua a funzionare ma senza esporre i thoughts.
+                    thinking_config = None
             # Anti-narration: al primo turno (nessun tool_result nella history),
             # forza il modello a fare almeno una tool call. Google Gemini usa
             # tool_config con FunctionCallingConfig(mode="ANY").
@@ -412,12 +428,15 @@ class GoogleProvider(BaseProvider):
                         function_calling_config=types.FunctionCallingConfig(mode="ANY")
                     )
 
-            config = types.GenerateContentConfig(
+            _cfg_kwargs = dict(
                 max_output_tokens=max_tokens,
                 temperature=config_temperature,
                 tools=google_tools,
                 tool_config=tool_config,
             )
+            if thinking_config is not None:
+                _cfg_kwargs["thinking_config"] = thinking_config
+            config = types.GenerateContentConfig(**_cfg_kwargs)
             if system_text:
                 config.system_instruction = system_text
 
@@ -429,6 +448,7 @@ class GoogleProvider(BaseProvider):
 
             # Normalizza risposta al formato Anthropic
             text_content = ""
+            thoughts_content = ""  # Reasoning interno del modello (include_thoughts=True).
             stop_reason = "end_turn"
             tool_use_blocks: list[dict] = []
             assistant_content: list[dict] = []
@@ -436,7 +456,14 @@ class GoogleProvider(BaseProvider):
             if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
                 for part in response.candidates[0].content.parts:
                     if part.text:
-                        text_content += part.text
+                        # I "thoughts" (reasoning interno dei modelli 2.5)
+                        # arrivano come part.text con part.thought=True.
+                        # Vanno separati dalla risposta utente cosi' la UI
+                        # puo' mostrarli in un blocco dedicato.
+                        if getattr(part, "thought", False):
+                            thoughts_content += part.text
+                        else:
+                            text_content += part.text
                     elif part.function_call:
                         stop_reason = "tool_use"
                         fc = part.function_call
@@ -459,16 +486,23 @@ class GoogleProvider(BaseProvider):
                     "output_tokens": response.usage_metadata.candidates_token_count or 0,
                 }
 
+            metadata = {
+                "stop_reason": stop_reason,
+                "tool_use_blocks": tool_use_blocks,
+                "assistant_content": assistant_content,
+                "usage": usage_data,
+            }
+            if thoughts_content:
+                # Espone i thoughts del modello cosi' il consumer (nodes.py /
+                # web-ide) possa visualizzarli in un blocco dedicato.
+                # Stesso pattern usato da anthropic_provider per extended_thinking.
+                metadata["thoughts"] = thoughts_content
+                metadata["thinking_content"] = thoughts_content
             return ProviderResult(
                 provider=self.name,
                 model=model,
                 content=text_content,
-                metadata={
-                    "stop_reason": stop_reason,
-                    "tool_use_blocks": tool_use_blocks,
-                    "assistant_content": assistant_content,
-                    "usage": usage_data,
-                },
+                metadata=metadata,
             )
         except Exception as e:
             meta = format_error_result(e, self.name, model)

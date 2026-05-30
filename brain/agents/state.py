@@ -172,6 +172,10 @@ class AgentState(TypedDict, total=False):
     # ogni giro mentre il contatore resta sopra soglia. Reset quando il
     # contatore viene azzerato da una call produttiva.
     exploration_nudge_sent: bool
+    # True dopo aver iniettato il nudge anti-loop-comando ripetuto (fix
+    # 30/05/2026): evita di ripetere il nudge ad ogni giro se il modello
+    # continua a chiamare lo stesso comando fallito.
+    repeated_cmd_nudge_sent: bool
 
     # M61 sticky cascade fallback: dopo un cascade riuscito, persisti il
     # provider/model effettivo cosi' le iter successive partono direttamente

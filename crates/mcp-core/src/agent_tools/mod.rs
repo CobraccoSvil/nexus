@@ -27,6 +27,7 @@ pub(crate) mod git;
 pub(crate) mod service;
 pub(crate) mod sandbox;
 pub(crate) mod command;
+pub(crate) mod command_hints;
 pub(crate) mod testing;
 pub(crate) mod ports;
 pub(crate) mod todos;
@@ -314,17 +315,22 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "dispatch_subagent",
-    "description": "PR-3 sub-agents pattern (Claude Code/Cursor style): delega un sotto-task a un sub-agent isolato con context window pulito, tool whitelist propria e modello dedicato. Il sub-agent ritorna SOLO un summary compatto al main (no bloat). Usa quando: (a) esplori grossi codebase senza riempire context, (b) deleghi task indipendenti in parallelo (puoi emettere piu' dispatch_subagent nello stesso turno), (c) vuoi isolare blast radius (kind con tool whitelist ristretta). Kinds pre-definiti: 'plan', 'explore', 'implement', 'verify', 'review'. La task_description deve essere AUTONOMA: il sub-agent non vede la tua conversazione.",
+    "description": "Delega un sotto-task a un sub-agent isolato con context window pulito e tool whitelist propria. Il sub-agent ritorna SOLO un summary compatto al main. SCEGLI IL `kind` GIUSTO PER L'AZIONE: usa kind implementativi (rust_implementer, python_implementer, frontend_implementer, db_architect, doc_writer, test_author) per task che richiedono SCRITTURA EFFETTIVA di codice/file/migrazioni. Usa kind generici (plan, explore, verify, review) solo per task analitici. NON usare 'explore' se devi creare/modificare file: usa 'implement' o il kind specifico per linguaggio/dominio.",
     "input_schema": {
       "type": "object",
       "properties": {
         "kind": {
           "type": "string",
-          "description": "Tipo di sub-agent. Pre-definiti: plan, explore, implement, verify, review. L'admin puo' aggiungere custom kinds in nexus_subagent_definitions."
+          "enum": [
+            "plan", "explore", "implement", "verify", "review",
+            "rust_implementer", "python_implementer", "frontend_implementer",
+            "db_architect", "doc_writer", "test_author"
+          ],
+          "description": "Tipo di sub-agent. SCEGLI implementativi (rust_implementer/python_implementer/frontend_implementer/db_architect/doc_writer/test_author) per creare/modificare file. SCEGLI explore solo per analisi senza scrittura. 'implement' e' il fallback generico se nessun specialista combacia."
         },
         "task": {
           "type": "string",
-          "description": "Descrizione COMPLETA e AUTONOMA del sotto-task. Il sub-agent non vede la conversation del main."
+          "description": "Descrizione COMPLETA e AUTONOMA del sotto-task. Il sub-agent non vede la conversation del main: includi obiettivo, file da toccare, vincoli, criteri di completamento."
         },
         "context": {
           "type": "string",
@@ -340,7 +346,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "dispatch_subagents",
-    "description": "Come dispatch_subagent ma esegue PIU' sub-agent IN PARALLELO (a ondate). Usalo quando hai piu' task INDIPENDENTI da svolgere contemporaneamente (es. rami indipendenti di un piano/DAG). Per un singolo task usa dispatch_subagent. Ogni task deve essere AUTONOMO (il sub-agent non vede la tua conversazione).",
+    "description": "Come dispatch_subagent ma esegue PIU' sub-agent IN PARALLELO (a ondate). Usalo quando hai piu' task INDIPENDENTI da svolgere contemporaneamente (es. rami indipendenti di un piano). Per un singolo task usa dispatch_subagent. STESSE REGOLE sui kind: usa implementativi (*_implementer/db_architect/doc_writer/test_author) per scrivere codice, explore solo per analisi.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -350,7 +356,15 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
           "items": {
             "type": "object",
             "properties": {
-              "kind": {"type": "string", "description": "Tipo di sub-agent (plan, explore, implement, verify, review, o custom)"},
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "plan", "explore", "implement", "verify", "review",
+                  "rust_implementer", "python_implementer", "frontend_implementer",
+                  "db_architect", "doc_writer", "test_author"
+                ],
+                "description": "Tipo di sub-agent (vedi dispatch_subagent per la guida)"
+              },
               "task": {"type": "string", "description": "Descrizione COMPLETA e AUTONOMA del task"},
               "context": {"type": "string", "description": "Contesto aggiuntivo opzionale"},
               "expected_output_format": {"type": "string", "description": "Forma del summary atteso (opzionale)"}
@@ -1074,7 +1088,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "nexus_mcp_tool_search",
-    "description": "Cerca tra tutti i tool MCP disponibili (builtin + plugin abilitati) usando ricerca semantica (Qdrant) o testuale (ILIKE fallback). Usa questo tool per scoprire quale tool invocare invece di ricevere tutte le definizioni: riduce drasticamente il payload token. Restituisce server_id, tool_name, description e input_schema.",
+    "description": "Cerca tra tutti i tool MCP disponibili (builtin Nexus + plugin esterni abilitati) usando ricerca semantica (Qdrant) o testuale (ILIKE fallback). I tool builtin (es. nexus_extract_figma_code, nexus_extract_pdf_text) sono restituiti con server_id=\"builtin\". Usa questo tool per scoprire quale tool invocare invece di ricevere tutte le definizioni: riduce drasticamente il payload token. Restituisce server_id, tool_name, description e input_schema.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -1092,13 +1106,13 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "nexus_mcp_tool_call",
-    "description": "Invoca un tool MCP specifico usando server_id e tool_name ottenuti da nexus_mcp_tool_search. Applica le policy di sicurezza del plugin. Non usare per tool builtin standard (read_file, git_*, ecc.) che sono già disponibili direttamente.",
+    "description": "Invoca un tool MCP specifico usando server_id e tool_name ottenuti da nexus_mcp_tool_search. Per i tool builtin Nexus (es. nexus_extract_figma_code, nexus_extract_pdf_text, nexus_extract_docx_text, suggeriti da next_action_recommended di nexus_inspect_attachment) passa server_id=\"builtin\". Per i plugin MCP esterni passa l'UUID del server. Applica le policy di sicurezza del plugin. Non usare per tool builtin standard (read_file, git_*, ecc.) che sono già disponibili direttamente nel toolspec.",
     "input_schema": {
       "type": "object",
       "properties": {
         "server_id": {
           "type": "string",
-          "description": "UUID del server MCP (ottenuto da nexus_mcp_tool_search)"
+          "description": "UUID del server MCP esterno, oppure la sentinella \"builtin\" per i tool interni Nexus (consigliato per i tool restituiti da next_action_recommended)"
         },
         "tool_name": {
           "type": "string",
@@ -1840,6 +1854,54 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         // ── Nexus Builtin tool (prefisso nexus_*) ──────────────────────────
         // Dispatch verso nexus_builtin::execute_with_neural per usare
         // la ricerca semantica quando neural è disponibile (Qdrant).
+        // Caso speciale: nexus_mcp_tool_call con server_id="builtin" reindirizza
+        // ricorsivamente a execute_agent_tool, consentendo al modello di
+        // invocare via mcp_tool_call qualsiasi tool builtin (es. quelli
+        // suggeriti da next_action_recommended di nexus_inspect_attachment)
+        // senza doverli avere in toolspec. Sistema lazy discovery preservato.
+        "nexus_mcp_tool_call" => {
+            let server_id = input
+                .get("server_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if server_id.eq_ignore_ascii_case("builtin")
+                || server_id == "00000000-0000-0000-0000-000000000000"
+            {
+                let inner_tool = input
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if inner_tool.is_empty() {
+                    return serde_json::json!({
+                        "error": "tool_name richiesto per nexus_mcp_tool_call con server_id=builtin"
+                    })
+                    .to_string();
+                }
+                if inner_tool == "nexus_mcp_tool_call" {
+                    return serde_json::json!({
+                        "error": "ricorsione builtin -> builtin non permessa"
+                    })
+                    .to_string();
+                }
+                let inner_args = input
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                return Box::pin(execute_agent_tool(ctx, inner_tool, &inner_args)).await;
+            }
+            crate::nexus_builtin::execute_with_neural(
+                &ctx.db,
+                ctx.user_id,
+                ctx.project_id,
+                &ctx.user_role,
+                &ctx.neural,
+                "nexus_mcp_tool_call",
+                input.clone(),
+            )
+            .await
+        }
         other if other.starts_with("nexus_") => {
             crate::nexus_builtin::execute_with_neural(
                 &ctx.db,

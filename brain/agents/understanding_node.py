@@ -71,6 +71,14 @@ async def understanding_node(state: AgentState) -> dict[str, Any]:
     cfg = orchestrator_config.get()
     if not bool(cfg.get("understanding_enabled")):
         return {}
+    # Depth guard (anti-esplosione esponenziale): l'understanding e' progettato
+    # per il main run (subagent_depth=0). Se siamo dentro un sub-agent ed e'
+    # attivo il fan-out, ogni sub-agent lancerebbe altri 3 sub-agent explore
+    # che a loro volta rilancerebbero... -> esplosione combinatoria osservata
+    # in produzione. I sub-agent hanno gia' un task focalizzato, non hanno
+    # bisogno di understanding pre-planning.
+    if int(state.get("subagent_depth") or 0) >= 1:
+        return {"understanding_active": False, "understanding_skip_reason": "skip_in_subagent"}
     # Gate hard: token budget minimo + complessita'.
     token_budget = int(state.get("token_budget") or 0)
     if token_budget < int(cfg.get("understanding_min_token_budget", 3000)):

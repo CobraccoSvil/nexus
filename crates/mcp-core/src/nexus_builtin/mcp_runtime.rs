@@ -372,15 +372,24 @@ async fn handle_mcp_tool_search_inner(
     }
     let limit = parse_i64(arguments.get("limit"), 10).clamp(1, 50) as i64;
 
+    // ── Tentativo 0: tool builtin Nexus (locale, ILIKE su AGENT_TOOLS_JSON) ──
+    // Senza questo i tool nexus_extract_* / nexus_read_attachment / ecc. non
+    // sarebbero scopribili e il modello finirebbe per chiamare mcp_tool_call
+    // con server_id inventato. I builtin hanno SEMPRE server_id="builtin",
+    // riconosciuto dal dispatcher in execute_agent_tool.
+    let builtin_matches = search_builtin_tools(&query, limit as usize);
+
     // ── Tentativo 1: ricerca semantica (se neural disponibile) ────────────────
     if let Some(neural) = neural {
         match semantic_search(db, neural, &query, user_id, project_id, limit).await {
-            Ok(results) if !results.is_empty() => {
+            Ok(results) if !results.is_empty() || !builtin_matches.is_empty() => {
+                let mut merged = builtin_matches.clone();
+                merged.extend(results.into_iter());
                 return format_json(&json!({
                     "query": query,
-                    "count": results.len(),
-                    "results": results,
-                    "search_type": "semantic",
+                    "count": merged.len(),
+                    "results": merged,
+                    "search_type": "semantic+builtin",
                 }));
             }
             Ok(_) => {
@@ -428,7 +437,7 @@ async fn handle_mcp_tool_search_inner(
     .await
     .unwrap_or_default();
 
-    let results: Vec<Value> = rows
+    let external_results: Vec<Value> = rows
         .iter()
         .map(|r| {
             let server_id: Uuid = r.try_get("server_id").unwrap_or(Uuid::nil());
@@ -447,12 +456,73 @@ async fn handle_mcp_tool_search_inner(
         })
         .collect();
 
+    // Merge builtin (gia' calcolati a inizio funzione) + esterni. I builtin
+    // appaiono per primi: spesso sono la risposta giusta per task di estrazione
+    // allegati / lettura risorse interne, e mettendoli in cima riduciamo il
+    // rischio che il modello cerchi un MCP esterno equivalente.
+    let mut merged = builtin_matches;
+    merged.extend(external_results.into_iter());
+
     format_json(&json!({
       "query": query,
-      "count": results.len(),
-      "results": results,
-      "search_type": "text",
+      "count": merged.len(),
+      "results": merged,
+      "search_type": "text+builtin",
     }))
+}
+
+/// Ricerca testuale (ILIKE) sui tool builtin esposti in AGENT_TOOLS_JSON.
+/// Restituisce risultati con `server_id="builtin"` e schema completo, pronti
+/// per essere invocati via `nexus_mcp_tool_call`. Il dispatcher in
+/// `agent_tools::execute_agent_tool` riconosce questo server_id sentinella
+/// e fa dispatch ricorsivo al tool builtin.
+///
+/// Match: substring case-insensitive su `name` e `description` (no regex,
+/// no boundary parsing). Sufficiente per query come "estrai codice figma" o
+/// "leggi pdf". L'ordine preserva quello di AGENT_TOOLS_JSON: i tool piu'
+/// fondamentali sono dichiarati per primi.
+fn search_builtin_tools(query: &str, limit: usize) -> Vec<Value> {
+    if query.trim().is_empty() {
+        return Vec::new();
+    }
+    let needle = query.to_ascii_lowercase();
+    let tools_json: Value =
+        match serde_json::from_str(crate::agent_tools::AGENT_TOOLS_JSON) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("search_builtin_tools: AGENT_TOOLS_JSON parse fallito: {}", e);
+                return Vec::new();
+            }
+        };
+    let arr = match tools_json.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(limit.min(arr.len()));
+    for t in arr.iter() {
+        let name = t.get("name").and_then(Value::as_str).unwrap_or("");
+        let description = t.get("description").and_then(Value::as_str).unwrap_or("");
+        let input_schema = t.get("input_schema").cloned().unwrap_or(json!({}));
+        if name.is_empty() {
+            continue;
+        }
+        let haystack = format!("{}\n{}", name.to_ascii_lowercase(), description.to_ascii_lowercase());
+        if !haystack.contains(&needle) {
+            continue;
+        }
+        out.push(json!({
+            "server_id": "builtin",
+            "server_name": "Nexus builtin",
+            "tool_name": name,
+            "description": description,
+            "input_schema": input_schema,
+            "match_type": "builtin",
+        }));
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
 }
 
 // ── Handler: nexus_mcp_tool_call ─────────────────────────────────────────────

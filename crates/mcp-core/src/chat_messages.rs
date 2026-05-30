@@ -902,6 +902,84 @@ fn normalize_attachments(input: &[ChatAttachmentRequest]) -> Vec<ChatAttachment>
         .collect()
 }
 
+/// Popola `ChatAttachment.id` con gli UUID ottenuti da `persist_message_attachments`.
+///
+/// Il matching avviene per nome file (case-sensitive, primo match). Mantenere il
+/// matching per nome — non per indice — perche' `normalize_attachments` filtra
+/// allegati vuoti che potrebbero non avere il corrispondente in `saved`.
+///
+/// Senza questo passaggio il blocco `<allegati>` nel prompt iniziale mostra solo
+/// "- file.ext (mime, N byte)" senza `[ID: <uuid>]`, costringendo il modello a
+/// guessare l'attachment_id quando chiama `nexus_inspect_attachment` (osservato
+/// 30/05/2026: Vertex passa il filename come id e il tool ritorna "Allegato
+/// {filename} non trovato" — G1 cap chiude il turn).
+fn enrich_attachments_with_ids(
+    mut atts: Vec<ChatAttachment>,
+    saved: &[crate::chat_attachments::SavedAttachment],
+) -> Vec<ChatAttachment> {
+    for att in atts.iter_mut() {
+        if att.id.is_some() {
+            continue;
+        }
+        if let Some(s) = saved.iter().find(|s| s.file_name == att.name) {
+            att.id = Uuid::parse_str(&s.id).ok();
+        }
+    }
+    atts
+}
+
+/// Variante di `enrich_attachments_with_ids` che fetcha gli ID dal DB per gli
+/// allegati gia' persistiti in `chat_message_attachments`. Usato dai code path
+/// di resend/regenerate dove la persistenza e' avvenuta in un turno precedente
+/// e non e' disponibile il `Vec<SavedAttachment>`.
+async fn enrich_attachments_with_ids_from_db(
+    db: &PgPool,
+    atts: Vec<ChatAttachment>,
+    message_id: Uuid,
+) -> Vec<ChatAttachment> {
+    if atts.is_empty() {
+        return atts;
+    }
+    let rows = match sqlx::query(
+        r#"SELECT id, file_name FROM chat_message_attachments
+           WHERE message_id = $1 ORDER BY created_at ASC"#,
+    )
+    .bind(message_id)
+    .fetch_all(db)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                message_id = %message_id,
+                error = %e,
+                "enrich_attachments_with_ids_from_db: query fallita"
+            );
+            return atts;
+        }
+    };
+    let mut by_name: std::collections::HashMap<String, Uuid> =
+        std::collections::HashMap::new();
+    for row in rows.iter() {
+        let id: Uuid = match row.try_get("id") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let name: String = row.try_get("file_name").unwrap_or_default();
+        by_name.entry(name).or_insert(id);
+    }
+    atts.into_iter()
+        .map(|mut a| {
+            if a.id.is_none() {
+                if let Some(id) = by_name.get(&a.name) {
+                    a.id = Some(*id);
+                }
+            }
+            a
+        })
+        .collect()
+}
+
 /// Carica gli ultimi `limit` messaggi della sessione come turn LLM strutturati.
 /// Restituisce un Vec di { "role": "user"|"assistant", "content": "..." }
 /// pronti da passare come history iniziale all'agent loop.
@@ -3491,6 +3569,10 @@ pub async fn send_chat_message(
     // agent_run, run_turn) restituiscono `savedAttachments` al frontend.
     // Errori filesystem singoli vengono loggati come WARN ma NON bloccano il
     // turno: l'utente riceve la lista degli allegati effettivamente persistiti.
+    // Estraggo `saved_attachments_list` come variabile esplicita per riusarlo
+    // nei successivi `enrich_attachments_with_ids` (necessari per popolare gli
+    // UUID nel blocco <allegati> del prompt iniziale).
+    let mut saved_attachments_list: Vec<crate::chat_attachments::SavedAttachment> = Vec::new();
     let saved_attachments_json: Value = if body.attachments.is_empty() {
         json!([])
     } else {
@@ -3504,7 +3586,9 @@ pub async fn send_chat_message(
                     &body.attachments,
                 )
                 .await;
-                crate::chat_attachments::attachments_to_json(&saved)
+                let json_view = crate::chat_attachments::attachments_to_json(&saved);
+                saved_attachments_list = saved;
+                json_view
             }
             Err(e) => {
                 tracing::warn!(
@@ -3995,7 +4079,10 @@ pub async fn send_chat_message(
             model_override: effective_model_override.clone(),
             profile_provider: profile_provider.clone(),
             profile_model: profile_model.clone(),
-            attachments: normalize_attachments(&body.attachments),
+            attachments: enrich_attachments_with_ids(
+                normalize_attachments(&body.attachments),
+                &saved_attachments_list,
+            ),
             user_role: claims.role.clone(),
             nexus_agent_type_hint: body.agent_type_hint.clone(),
         }).await {
@@ -4029,7 +4116,10 @@ pub async fn send_chat_message(
         effective_provider_override,
         effective_model_override,
         automation_mode,
-        normalize_attachments(&body.attachments),
+        enrich_attachments_with_ids(
+            normalize_attachments(&body.attachments),
+            &saved_attachments_list,
+        ),
     )
     .await;
 
@@ -4256,7 +4346,7 @@ pub async fn resend_chat_message(
                 .and_then(Value::as_str),
         )
     };
-    let attachments = if body.attachments.is_empty() {
+    let attachments_raw = if body.attachments.is_empty() {
         serde_json::from_value::<Vec<ChatAttachmentRequest>>(
             source_metadata
                 .get("attachments")
@@ -4268,6 +4358,17 @@ pub async fn resend_chat_message(
     } else {
         normalize_attachments(&body.attachments)
     };
+    // Resend: gli allegati sono gia' persistiti nel turno originale, recupero
+    // gli UUID dal DB per il source_user_message_id. Senza questo il blocco
+    // <allegati> nel prompt iniziale del retry non avrebbe gli ID e il modello
+    // re-incappa nel bug del fallback al filename (vedi
+    // enrich_attachments_with_ids_from_db).
+    let attachments = enrich_attachments_with_ids_from_db(
+        &state.db,
+        attachments_raw,
+        source_user_message_id,
+    )
+    .await;
     let attachments_metadata = if body.attachments.is_empty() {
         source_metadata
             .get("attachments")

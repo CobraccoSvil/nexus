@@ -88,6 +88,14 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
         return super::safety::format_blocked_result(&command, &reason);
     }
 
+    // ── Command hints (migration 0230) ──────────────────────────────────────
+    // Lookup pattern noti in nexus_command_hints (cache 60s). Se match, l'hint
+    // viene prependato al risultato finale del comando — guida il modello
+    // verso correzioni note (es. shadcn-ui rebrand, create-react-app deprecato)
+    // PRIMA che entri in loop di errori. DB-driven, nuovi pattern senza deploy.
+    let command_hints = super::command_hints::match_hints(&ctx.db, &command).await;
+    let hints_prefix = super::command_hints::format_hints_prefix(&command_hints);
+
     if strict_migration_only_project(ctx).await
         && !shell_command_bypasses_migration_policy(&command)
         && shell_looks_like_sql_cli_with_ddl(&command)
@@ -234,8 +242,8 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
             }
 
             let combined = format!(
-                "EXIT CODE: {}\nSTDOUT:\n{}\nSTDERR:\n{}{}",
-                exit_code, stdout, stderr, hint
+                "{}EXIT CODE: {}\nSTDOUT:\n{}\nSTDERR:\n{}{}",
+                hints_prefix, exit_code, stdout, stderr, hint
             );
             if combined.chars().count() > 8000 {
                 format!("{}\n[OUTPUT TRONCATO A 8000 CARATTERI]", combined.chars().take(8000).collect::<String>())

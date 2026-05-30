@@ -16,7 +16,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from . import (
     meta_steps,
@@ -617,6 +617,126 @@ def _has_tool_calls_in_history(messages: list) -> bool:
             isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks
         ):
             return True
+    return False
+
+
+# Pattern testuali che indicano errore dentro un tool_result. Match case-insensitive.
+# Non e' esaustivo, copre i casi piu' frequenti (npm/cargo/python/shell/network).
+_TOOL_ERROR_HINTS = (
+    "error:", "errore:", "[error", "exit code: 1", "exit code 1",
+    "command failed", "comando fallito", "traceback", "exception:",
+    "fatal:", "syntax error", "not found", "non trovato",
+    "cannot find module", "module not found", "permission denied",
+    "connection refused", "timed out", "timeout", "404 not found",
+    "500 internal", "econnrefused", "enoent", "enotfound", "eperm",
+    "no such file", "is_error", "[errno",
+)
+
+
+def _detect_repeated_failed_command(messages: list, lookback: int = 12) -> tuple[str | None, int]:
+    """Rileva ripetizione dello STESSO comando shell con errore.
+
+    Scansiona gli ultimi `lookback` messaggi (in ordine cronologico inverso) e:
+    1. Trova AIMessage con tool_use=run_command|run_service|run_in_terminal
+    2. Per ognuno, controlla il ToolMessage SUCCESSIVO per status d'errore
+    3. Conta le occorrenze della STESSA signature `command|working_dir`
+    4. Ritorna (signature, count) della piu' frequente; None se nessuna ripetizione
+
+    Usato dall'executor_node per iniettare nudge "stesso comando fallito N volte,
+    cambia strategia". Risolve il bug del loop npm/shadcn osservato 30/05/2026.
+    """
+    if not messages:
+        return (None, 0)
+    failed_signatures: dict[str, int] = {}
+    last_signature: str | None = None
+    # Iterazione lineare (non reversed) cosi' associo correttamente
+    # AIMessage(tool_use) -> ToolMessage(result) successivo.
+    recent = messages[-lookback:] if len(messages) > lookback else messages
+    for idx, m in enumerate(recent):
+        if not isinstance(m, AIMessage):
+            continue
+        extra = getattr(m, "additional_kwargs", {}) or {}
+        blocks = extra.get("anthropic_content") or []
+        if not isinstance(blocks, list):
+            continue
+        for b in blocks:
+            if not isinstance(b, dict) or b.get("type") != "tool_use":
+                continue
+            name = b.get("name", "")
+            if name not in ("run_command", "run_service", "run_in_terminal"):
+                continue
+            inp = b.get("input", {}) or {}
+            cmd = str(inp.get("command", "")).strip()
+            wd = str(inp.get("working_dir", "")).strip()
+            if not cmd:
+                continue
+            signature = f"{cmd}|{wd}"
+            # Cerca il prossimo ToolMessage (entro 3 step) e valuta errore
+            next_is_error = False
+            for j in range(idx + 1, min(idx + 4, len(recent))):
+                nm = recent[j]
+                if isinstance(nm, ToolMessage):
+                    if getattr(nm, "status", "") == "error":
+                        next_is_error = True
+                    else:
+                        c = getattr(nm, "content", "")
+                        if isinstance(c, list):
+                            for cc in c:
+                                if isinstance(cc, dict):
+                                    if cc.get("is_error"):
+                                        next_is_error = True
+                                        break
+                                    txt = str(cc.get("text", "") or cc.get("content", ""))
+                                    if any(h in txt.lower() for h in _TOOL_ERROR_HINTS):
+                                        next_is_error = True
+                                        break
+                        else:
+                            if any(h in str(c).lower() for h in _TOOL_ERROR_HINTS):
+                                next_is_error = True
+                    break
+            if next_is_error:
+                failed_signatures[signature] = failed_signatures.get(signature, 0) + 1
+                last_signature = signature
+    if not failed_signatures:
+        return (None, 0)
+    # Ritorna la signature piu' frequente (preferisce l'ultima in caso di parita').
+    top = max(failed_signatures.items(), key=lambda kv: (kv[1], kv[0] == last_signature))
+    return (top[0].split("|", 1)[0], top[1])
+
+
+def _detect_recent_tool_error(messages: list, lookback: int = 4) -> bool:
+    """True se uno degli ultimi `lookback` ToolMessage indica errore.
+
+    Heuristica: scansiona gli ultimi N messaggi (in ordine inverso) cercando
+    ToolMessage e ispezionando il content (str o list di blocchi). Match su
+    `is_error=True` esplicito oppure su pattern testuali in `_TOOL_ERROR_HINTS`.
+
+    Usato dal G1 cap per evitare di contare come "descrittivo" un turno in
+    cui il modello sta reagendo a tool failure (es. build npm fallita).
+    """
+    if not messages:
+        return False
+    checked = 0
+    for m in reversed(messages):
+        if checked >= lookback:
+            break
+        if not isinstance(m, ToolMessage):
+            continue
+        checked += 1
+        if getattr(m, "status", "") == "error":
+            return True
+        content = getattr(m, "content", "")
+        if isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict):
+                    if c.get("is_error"):
+                        return True
+                    txt = str(c.get("text", "") or c.get("content", ""))
+                    if any(hint in txt.lower() for hint in _TOOL_ERROR_HINTS):
+                        return True
+        else:
+            if any(hint in str(content).lower() for hint in _TOOL_ERROR_HINTS):
+                return True
     return False
 
 
@@ -2164,7 +2284,12 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     _subagent_depth = int(state.get("subagent_depth") or 0)
     if _subagent_depth == 0 and state.get("plan_phase_active"):
         try:
-            from . import orchestrator_config, prompt_registry
+            # orchestrator_config e prompt_registry sono gia' importati a
+            # module-level (riga 21-29). Un import locale qui dentro
+            # trasformerebbe le variabili in `local` per tutta la funzione
+            # `executor_node`, causando UnboundLocalError quando il flusso
+            # NON entra in questo branch (es. sub-agent con _subagent_depth>=1)
+            # ma poi usa orchestrator_config piu' avanti (vedi Comp.3b).
             if (
                 orchestrator_config.worker_mode_enabled()
                 and orchestrator_config.subagents_enabled()
@@ -2267,12 +2392,28 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 b.get("text", "") for b in _first_human_for_g1 if isinstance(b, dict)
             )
         if _detect_action_request(str(_first_human_for_g1)):
-            _is_g1_reentry = True
-            _g1_reroute_count += 1
-            logger.info(
-                "executor_node: re-entry G1 rilevata, reroute_count=%d/%d",
-                _g1_reroute_count, _g1_max_nudges,
-            )
+            # FIX G1 intelligente: se il modello sta legittimamente reagendo a
+            # un tool_result d'errore recente (es. "npm install" fallito), NON
+            # e' "descrittivo" ma "in difficolta'": dargli piu' tentativi prima
+            # del cap. Bug osservato 30/05/2026: gemini-2.5-flash in loop su
+            # rebrand shadcn-ui -> shadcn ha esaurito 3 reroute G1 in 7 iter,
+            # nonostante stesse facendo 30+ tool call. Soluzione: contare il
+            # reroute G1 SOLO se gli ultimi tool result non avevano errori, e
+            # consentire una soft-extension (+50% max_nudges) se errori reali.
+            _last_tool_was_error = _detect_recent_tool_error(messages, lookback=4)
+            if _last_tool_was_error:
+                logger.info(
+                    "executor_node: re-entry G1 skip-count (tool_result d'errore recente, "
+                    "il modello sta reagendo, non descrivendo) reroute_count=%d/%d",
+                    _g1_reroute_count, _g1_max_nudges,
+                )
+            else:
+                _is_g1_reentry = True
+                _g1_reroute_count += 1
+                logger.info(
+                    "executor_node: re-entry G1 rilevata, reroute_count=%d/%d",
+                    _g1_reroute_count, _g1_max_nudges,
+                )
     if _g1_reroute_count >= _g1_max_nudges:
         logger.warning(
             "executor_node: G1 cap raggiunto (reroute_count=%d >= max=%d), "
@@ -2344,6 +2485,34 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         logger.info(
             "executor_node: nudge anti-esplorazione iniettato (count=%d, soglia=%d)",
             _exploration_count, _exploration_threshold,
+        )
+
+    # ── Loop-detection comando ripetuto con errori (Fix 30/05/2026) ──────────
+    # Diverso da loop-detection esplorativa: qui rileviamo il pattern "stesso
+    # comando di esecuzione (run_command/run_service) ripetuto N volte con
+    # tool_result d'errore". Caso reale: gemini-2.5-flash su build npm/shadcn
+    # ha chiamato `npm run build` 5 volte consecutive, ognuna fallita per
+    # dipendenze mancanti, senza cambiare strategia. Senza intervento esaurisce
+    # il budget iter. Soglia hardcoded 3 (basso ma sensato: 3 stessi fallimenti
+    # = serve cambiare approccio, non riprovare).
+    _repeat_cmd, _repeat_count = _detect_repeated_failed_command(messages, lookback=12)
+    _repeated_cmd_nudge_sent = bool(state.get("repeated_cmd_nudge_sent") or False)
+    if _repeat_cmd and _repeat_count >= 3 and not _repeated_cmd_nudge_sent:
+        _cmd_text = (
+            f"[LOOP RILEVATO] Hai eseguito `{_repeat_cmd[:120]}` "
+            f"{_repeat_count} volte consecutive con errore. Continuare a "
+            f"ripetere lo stesso comando non risolvera' il problema. "
+            f"CAMBIA STRATEGIA ORA: esamina l'output dell'errore, identifica "
+            f"la causa radice (dipendenza mancante? package rinominato? config "
+            f"errata?), e prova un approccio diverso (es. tool diverso, comando "
+            f"alternativo, lettura della doc, oppure chiedi all'utente)."
+        )
+        _cmd_nudge = HumanMessage(content=_cmd_text)
+        messages = list(messages) + [_cmd_nudge]
+        _repeated_cmd_nudge_sent = True
+        logger.warning(
+            "executor_node: nudge anti-loop-comando iniettato (cmd='%s', count=%d)",
+            _repeat_cmd[:80], _repeat_count,
         )
 
     # ── Forced text response (anti-loop tool-only) ────────────────────────
@@ -2976,6 +3145,7 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         "recent_tool_signatures": updated_signatures,
         "consecutive_exploration_calls": _updated_exploration_count,
         "exploration_nudge_sent": _updated_exploration_nudge_sent,
+        "repeated_cmd_nudge_sent": _repeated_cmd_nudge_sent,
         "auto_escalations": escalations if loop_sig is not None else int(state.get("auto_escalations") or 0),
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,

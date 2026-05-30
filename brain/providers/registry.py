@@ -546,42 +546,13 @@ class ProviderRegistry:
         effective_provider = provider
         effective_model = model
 
-        # Google non supporta tool_use nativo: cerca nella chain il primo provider
-        # con default model valido E coerente. INVARIANTE: provider e model devono
-        # appartenere allo stesso provider; un provider senza default model viene
-        # SKIPPATO, mai accoppiato al model di Google. Vedi ADR 0016.
-        if provider == "google":
-            chosen = None
-            chosen_model = None
-            for cand in self._provider_fallback_chain(exclude=provider):
-                cand_model = self._default_model_or_none(cand)
-                if cand_model is None:
-                    logger.warning(
-                        "Skip fallback da Google verso %s: nessun default model in nexus_provider_default_model",
-                        cand,
-                    )
-                    continue
-                if not self._model_belongs_to_provider(cand, cand_model):
-                    logger.error(
-                        "Skip fallback da Google verso %s: coppia incoerente con model %s",
-                        cand, cand_model,
-                    )
-                    continue
-                chosen, chosen_model = cand, cand_model
-                break
-            if chosen:
-                logger.warning(
-                    "Google provider non supporta tool_use nativo, fallback a %s/%s",
-                    chosen, chosen_model
-                )
-                effective_provider = chosen
-                effective_model = chosen_model
-            else:
-                return ProviderResult(
-                    provider=provider, model=model,
-                    content="[Nessun provider compatibile con tool_use disponibile per fallback da Google]",
-                    metadata={"error": "no_fallback_available", "stop_reason": "error"},
-                )
+        # NB: Google/Vertex supporta tool_use nativo (function calling) per i
+        # modelli Gemini 1.5+ e 2.x via FunctionDeclaration, vedi
+        # google_provider.py:generate_agent_turn. Il vecchio fallback forzato
+        # da `provider == "google"` era una assunzione legacy ormai falsa che
+        # produceva cascade rotti quando anthropic era in cooldown billing.
+        # Il flusso ora prosegue al check `is_enabled` standard e, in caso di
+        # errore reale dal provider, al cascade fallback alla fine della funzione.
 
         # Se il provider effettivo e' disabilitato, cerca nella chain il primo
         # provider con default model valido E coerente. Un provider senza default

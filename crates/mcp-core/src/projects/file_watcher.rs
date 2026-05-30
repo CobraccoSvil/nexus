@@ -19,8 +19,30 @@ use uuid::Uuid;
 
 use crate::AppState;
 
-/// Estensioni monitorate (stessa lista di `reindex_single_file`).
+/// Estensioni monitorate per la RE-INDICIZZAZIONE semantica (stessa lista di
+/// `reindex_single_file`): solo file di codice "pesante" che vale la pena
+/// rievaluare nell'indice vettoriale.
 const CODE_EXTENSIONS: &[&str] = &["tsx", "jsx", "ts", "js", "rs", "py", "cs", "go", "vue"];
+
+/// Estensioni che, oltre al codice, vanno NOTIFICATE al frontend tramite
+/// `FileChanged` per far refreshare il pannello explorer. Lista piu' larga
+/// perche' include manifest/config/markup/docs che NON serve indicizzare nel
+/// vector store ma servono visibilita' immediata nella UI (es. README.md,
+/// package.json, Cargo.toml creati da un sub-agent implementer).
+const NOTIFY_EXTENSIONS: &[&str] = &[
+    // codice (gia' in CODE_EXTENSIONS, ripetuto per chiarezza)
+    "tsx", "jsx", "ts", "js", "rs", "py", "cs", "go", "vue",
+    // markup / styling
+    "html", "htm", "css", "scss", "sass", "less", "svg",
+    // dati / config
+    "json", "yaml", "yml", "toml", "xml", "ini", "env",
+    // documentazione / testo
+    "md", "mdx", "txt", "rst", "adoc",
+    // shell / db / docker
+    "sh", "bash", "zsh", "ps1", "sql", "dockerfile", "lock",
+    // build / package manager
+    "cjs", "mjs", "d.ts",
+];
 
 /// Directory da ignorare.
 const EXCLUDED_DIRS: &[&str] = &[
@@ -163,7 +185,10 @@ fn enqueue_paths(pending: &mut Vec<PathBuf>, event: &Event, root: &Path) {
     }
 
     for path in &event.paths {
-        if !is_code_file(path) {
+        // Filtro NOTIFY_EXTENSIONS (lista larga): include manifest/markup/docs
+        // necessari per il refresh del pannello explorer. La reindex semantica
+        // resta limitata a CODE_EXTENSIONS via `is_code_file` in flush_pending.
+        if !is_notify_file(path) {
             continue;
         }
         if is_in_excluded_dir(path, root) {
@@ -173,6 +198,29 @@ fn enqueue_paths(pending: &mut Vec<PathBuf>, event: &Event, root: &Path) {
             pending.push(path.clone());
         }
     }
+}
+
+fn is_notify_file(path: &Path) -> bool {
+    // Match per estensione case-insensitive.
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase());
+    if let Some(ext) = ext {
+        if NOTIFY_EXTENSIONS.iter().any(|e| *e == ext.as_str()) {
+            return true;
+        }
+    }
+    // File senza estensione comuni in progetti (Dockerfile, Makefile, README).
+    let name_lower = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    matches!(
+        name_lower.as_str(),
+        "dockerfile" | "makefile" | "readme" | "license" | "changelog" | "authors" | "contributing"
+    )
 }
 
 /// Re-indicizza tutti i path in coda e svuota il vettore.
@@ -192,7 +240,12 @@ async fn flush_pending(
         "spawn_file_watcher: re-indicizzazione {} file project={project_id}",
         files.len()
     );
+    // La reindex semantica vale solo per file di codice. Manifest/markup/docs
+    // vanno notificati al frontend ma NON indicizzati nel vector store.
     for path in &files {
+        if !is_code_file(path) {
+            continue;
+        }
         match crate::projects::reindex_single_file(db, neural, project_id, root, path).await {
             Ok(chunks) if chunks > 0 => {
                 tracing::info!(

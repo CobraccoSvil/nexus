@@ -42,6 +42,56 @@ pub(super) struct AttachmentRecord {
     pub size_bytes: i64,
 }
 
+/// Risolve un attachment_id passato come **nome file** (fallback per il bug
+/// dei checkpoint pre-fix `enrich_attachments_with_ids`).
+///
+/// Strategia:
+/// 1. Prima cerca tra gli allegati della SESSIONE corrente (`session_id` JOIN).
+/// 2. Se non trovato e session_id non disponibile, cerca tra tutti gli allegati
+///    del progetto, prendendo il piu' recente.
+/// 3. Match case-sensitive sul nome esatto. Match parziale rifiutato per evitare
+///    ambiguita' (es. "report.pdf" non risolve a "weekly_report.pdf").
+pub(super) async fn resolve_attachment_id_by_name(
+    db: &PgPool,
+    file_name: &str,
+    project_id: Uuid,
+    session_id: Option<Uuid>,
+) -> Result<Uuid, String> {
+    if let Some(sid) = session_id {
+        let row = sqlx::query(
+            "SELECT cma.id FROM chat_message_attachments cma \
+             JOIN chat_messages cm ON cma.message_id = cm.id \
+             WHERE cma.file_name = $1 AND cma.project_id = $2 AND cm.session_id = $3 \
+             ORDER BY cma.created_at DESC LIMIT 1",
+        )
+        .bind(file_name)
+        .bind(project_id)
+        .bind(sid)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| format!("query lookup by name fallita: {e}"))?;
+        if let Some(r) = row {
+            let id: Uuid = r.try_get("id").map_err(|e| e.to_string())?;
+            return Ok(id);
+        }
+    }
+    let row = sqlx::query(
+        "SELECT id FROM chat_message_attachments \
+         WHERE file_name = $1 AND project_id = $2 \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(file_name)
+    .bind(project_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("query lookup by name fallback fallita: {e}"))?;
+    let row = row.ok_or_else(|| {
+        format!("nessun allegato con file_name='{file_name}' nel progetto corrente")
+    })?;
+    let id: Uuid = row.try_get("id").map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
 pub(super) async fn load_attachment(
     db: &PgPool,
     attachment_id: Uuid,
@@ -329,25 +379,46 @@ fn kind_is_text(kind: &str) -> bool {
 }
 
 /// Tool `nexus_inspect_attachment`.
+///
+/// Accetta `attachment_id` in due forme:
+/// 1. UUID (canonico)
+/// 2. nome file (fallback) — risolto con lookup `file_name = $1 AND project_id = $2`
+///    sulla sessione corrente. Indispensabile per i checkpoint LangGraph dei thread
+///    pre-fix `enrich_attachments_with_ids` dove il blocco `<allegati>` non
+///    esponeva l'UUID e il modello e' costretto a guessare (osservato 30/05/2026:
+///    Vertex passava sia il filename "PL.make" sia un UUID allucinato).
 pub(super) async fn tool_nexus_inspect_attachment(
     ctx: &AgentToolContext,
     input: &Value,
 ) -> String {
-    let attachment_id = match input
-        .get("attachment_id")
-        .and_then(Value::as_str)
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) => id,
-        None => {
+    let raw_id = match input.get("attachment_id").and_then(Value::as_str) {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => {
             return json!({
-                "error": "Parametro 'attachment_id' obbligatorio (UUID valido)."
+                "error": "Parametro 'attachment_id' obbligatorio (UUID valido o nome file)."
             })
             .to_string();
         }
     };
 
-    let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
+    let resolved_id = if let Ok(uuid) = Uuid::parse_str(raw_id) {
+        uuid
+    } else {
+        match resolve_attachment_id_by_name(&ctx.db, raw_id, ctx.project_id, ctx.session_id).await {
+            Ok(uuid) => uuid,
+            Err(e) => {
+                return json!({
+                    "error": format!(
+                        "Impossibile risolvere attachment '{raw_id}': {e}. Passa l'UUID dell'allegato \
+                         (visibile nel blocco <allegati>) oppure il nome esatto del file."
+                    )
+                })
+                .to_string();
+            }
+        }
+    };
+
+    let record = match load_attachment(&ctx.db, resolved_id, ctx.project_id).await {
         Ok(r) => r,
         Err(e) => return json!({ "error": e }).to_string(),
     };
@@ -463,76 +534,103 @@ fn memchr_contains(haystack: &[u8], needle: &[u8]) -> bool {
 ///
 /// Ritorna `Value::Null` se il kind non ha un'azione strutturata sensata
 /// (es. binary opaco): in quel caso il modello deve chiedere all'utente.
+///
+/// Il payload e' ottimizzato per chiamata diretta via `nexus_mcp_tool_call`
+/// con `server_id="builtin"` (sistema lazy discovery): il modello non deve
+/// avere il tool nel toolspec, basta che abbia `nexus_mcp_tool_call`. Vedi
+/// dispatch in `execute_agent_tool`.
 fn next_action_recommended(kind: &str, attachment_id: &Uuid, figma_has_code: bool) -> Value {
     let id_s = attachment_id.to_string();
+    let id_arg = json!({ "attachment_id": id_s.clone() });
+    let builtin = |tool_name: &str, args: Value, rationale: &str, expected: u32| -> Value {
+        json!({
+            "via": "nexus_mcp_tool_call",
+            "input": {
+                "server_id": "builtin",
+                "tool_name": tool_name,
+                "arguments": args,
+            },
+            "tool": tool_name,
+            "rationale": rationale,
+            "expected_tokens_output": expected,
+        })
+    };
     match kind {
-        "figma" if figma_has_code => json!({
-            "tool": "nexus_extract_figma_code",
-            "input": { "attachment_id": id_s },
-            "rationale": "Il .make contiene gia' il codice React/TypeScript completo \
-                          dell'app (scritture fast_apply_tool dentro ai_chat.json): \
-                          estrailo su disco con nexus_extract_figma_code invece di \
-                          rigenerarlo da zero. Mantiene il design fedele. Il tool \
-                          scrive i file e ritorna solo un manifest (niente bloat di \
-                          contesto). Poi leggi i file con read_file.",
-            "expected_tokens_output": 2000,
-        }),
-        "figma" => json!({
-            "tool": "nexus_extract_figma_structure",
-            "input": { "attachment_id": id_s },
-            "rationale": "Archivio contiene canvas.fig (Figma design). \n                          Letture raw del binario sono inutili: usa l'estrattore \n                          strutturato che ritorna strings + metadata.",
-            "expected_tokens_output": 5000,
-        }),
-        "zip" => json!({
-            "tool": "nexus_list_archive_entries",
-            "input": { "attachment_id": id_s },
-            "rationale": "Esplora prima i contenuti dell'archivio per decidere \n                          cosa leggere. Solo dopo aver visto la lista, scegli \n                          una entry specifica con nexus_read_archive_entry.",
-            "expected_tokens_output": 2000,
-        }),
-        "tar" | "gzip" => json!({
-            "tool": "nexus_list_archive_entries",
-            "input": { "attachment_id": id_s },
-            "rationale": "Esplora prima i contenuti dell'archivio TAR per decidere cosa leggere.",
-            "expected_tokens_output": 2000,
-        }),
-        "pdf" => json!({
-            "tool": "nexus_extract_pdf_text",
-            "input": { "attachment_id": id_s, "page_start": 1, "page_end": 10 },
-            "rationale": "Estrai testo della prima decina di pagine. \n                          Successivamente puoi richiedere pagine specifiche.",
-            "expected_tokens_output": 25000,
-        }),
-        "docx" => json!({
-            "tool": "nexus_extract_docx_text",
-            "input": { "attachment_id": id_s },
-            "rationale": "Documento Word: usa l'estrattore strutturato per ottenere \n                          paragrafi puliti, non il raw XML dello zip.",
-            "expected_tokens_output": 15000,
-        }),
-        "xlsx" => json!({
-            "tool": "nexus_extract_xlsx_data",
-            "input": { "attachment_id": id_s },
-            "rationale": "Foglio Excel: usa l'estrattore per ottenere righe e celle \n                          gia' risolte dalle sharedStrings.",
-            "expected_tokens_output": 10000,
-        }),
-        "pptx" => json!({
-            "tool": "nexus_list_archive_entries",
-            "input": { "attachment_id": id_s },
-            "rationale": "PPTX e' uno zip di slide XML: esplora ppt/slides/ con \n                          nexus_list_archive_entries prima di leggere una slide.",
-            "expected_tokens_output": 2000,
-        }),
-        "png" | "jpeg" | "gif" | "webp" | "svg" | "image" => json!({
-            "tool": "nexus_describe_image_attachment",
-            "input": { "attachment_id": id_s },
-            "rationale": "Immagine: usa il tool vision dedicato. Non leggere base64 \n                          raw: e' inutile e satura il context window.",
-            "expected_tokens_output": 1500,
-        }),
+        "figma" if figma_has_code => builtin(
+            "nexus_extract_figma_code",
+            id_arg.clone(),
+            "Il .make contiene gia' il codice React/TypeScript completo dell'app \
+             (scritture fast_apply_tool dentro ai_chat.json): estrailo su disco con \
+             nexus_extract_figma_code invece di rigenerarlo da zero. Mantiene il design \
+             fedele. Il tool scrive i file e ritorna solo un manifest (niente bloat di \
+             contesto). Poi leggi i file con read_file.",
+            2000,
+        ),
+        "figma" => builtin(
+            "nexus_extract_figma_structure",
+            id_arg.clone(),
+            "Archivio contiene canvas.fig (Figma design). Letture raw del binario sono \
+             inutili: usa l'estrattore strutturato che ritorna strings + metadata.",
+            5000,
+        ),
+        "zip" => builtin(
+            "nexus_list_archive_entries",
+            id_arg.clone(),
+            "Esplora prima i contenuti dell'archivio per decidere cosa leggere. \
+             Solo dopo aver visto la lista, scegli una entry specifica con \
+             nexus_read_archive_entry.",
+            2000,
+        ),
+        "tar" | "gzip" => builtin(
+            "nexus_list_archive_entries",
+            id_arg.clone(),
+            "Esplora prima i contenuti dell'archivio TAR per decidere cosa leggere.",
+            2000,
+        ),
+        "pdf" => builtin(
+            "nexus_extract_pdf_text",
+            json!({ "attachment_id": id_s.clone(), "page_start": 1, "page_end": 10 }),
+            "Estrai testo della prima decina di pagine. Successivamente puoi richiedere \
+             pagine specifiche.",
+            25000,
+        ),
+        "docx" => builtin(
+            "nexus_extract_docx_text",
+            id_arg.clone(),
+            "Documento Word: usa l'estrattore strutturato per ottenere paragrafi puliti, \
+             non il raw XML dello zip.",
+            15000,
+        ),
+        "xlsx" => builtin(
+            "nexus_extract_xlsx_data",
+            id_arg.clone(),
+            "Foglio Excel: usa l'estrattore per ottenere righe e celle gia' risolte \
+             dalle sharedStrings.",
+            10000,
+        ),
+        "pptx" => builtin(
+            "nexus_list_archive_entries",
+            id_arg.clone(),
+            "PPTX e' uno zip di slide XML: esplora ppt/slides/ con \
+             nexus_list_archive_entries prima di leggere una slide.",
+            2000,
+        ),
+        "png" | "jpeg" | "gif" | "webp" | "svg" | "image" => builtin(
+            "nexus_describe_image_attachment",
+            id_arg.clone(),
+            "Immagine: usa il tool vision dedicato. Non leggere base64 raw: e' inutile \
+             e satura il context window.",
+            1500,
+        ),
         "json" | "xml" | "markdown" | "html" | "css" | "javascript" | "typescript"
         | "python" | "rust" | "go" | "java" | "c" | "cpp" | "sql" | "toml" | "yaml"
-        | "csv" | "text" => json!({
-            "tool": "nexus_read_attachment",
-            "input": { "attachment_id": id_s, "encoding": "text" },
-            "rationale": "Contenuto testuale: leggi come testo (encoding=text). \n                          Se vuoi una porzione specifica usa offset/length.",
-            "expected_tokens_output": 15000,
-        }),
+        | "csv" | "text" => builtin(
+            "nexus_read_attachment",
+            json!({ "attachment_id": id_s, "encoding": "text" }),
+            "Contenuto testuale: leggi come testo (encoding=text). Se vuoi una porzione \
+             specifica usa offset/length.",
+            15000,
+        ),
         // binary opaco: niente raccomandazione automatica.
         _ => Value::Null,
     }
