@@ -162,6 +162,56 @@ def _load_g1_max_nudges() -> int:
     return value
 
 
+# ── Loop-detection semantica: tool di sola esplorazione ─────────────────────
+# Tool che leggono/ispezionano allegati e file senza produrre codice o
+# side-effect. Quando il modello ne incatena troppi di fila (variando
+# entry/offset, cosi' la loop-detection per signature identica non scatta) e'
+# bloccato in esplorazione e va spinto a scrivere. I nomi sono quelli usati in
+# _estimate_tool_result_size_bytes (read_file e' il tool di lettura sorgente).
+_EXPLORATION_ONLY_TOOLS: frozenset[str] = frozenset({
+    "nexus_list_archive_entries", "nexus_read_archive_entry",
+    "nexus_inspect_attachment", "nexus_extract_figma_structure",
+    "nexus_list_attachments", "nexus_read_attachment",
+    "nexus_extract_docx_text", "nexus_extract_xlsx_data",
+    "nexus_extract_pdf_text", "nexus_describe_image_attachment",
+    "read_file",
+})
+
+# ── Cache soglia loop esplorativo (TTL 60s) ─────────────────────────────────
+# Numero di chiamate esplorative consecutive oltre il quale iniettiamo un
+# nudge forte verso la scrittura. A 2x la soglia abortiamo. Letta dal DB via
+# settings_db.get_int_setting con default 6 (regola G: niente hardcode).
+_EXPLORATION_LOOP_CACHE: dict[str, Any] = {"loaded_at": 0.0, "threshold": None}
+_EXPLORATION_LOOP_TTL_SEC = 60.0
+_EXPLORATION_LOOP_DEFAULT = 6
+
+
+def _load_exploration_loop_threshold() -> int:
+    """Legge agent.exploration_loop_threshold dal DB con cache 60s.
+
+    Ritorna il default sicuro (6) se il DB e' irraggiungibile o la chiave non
+    esiste: get_int_setting non solleva mai.
+    """
+    now = time.time()
+    cached = _EXPLORATION_LOOP_CACHE["threshold"]
+    if cached is not None and (now - _EXPLORATION_LOOP_CACHE["loaded_at"]) < _EXPLORATION_LOOP_TTL_SEC:
+        return int(cached)
+    try:
+        from brain.utils.settings_db import get_int_setting
+        value = int(get_int_setting("agent.exploration_loop_threshold", _EXPLORATION_LOOP_DEFAULT))
+        if value < 1:
+            value = _EXPLORATION_LOOP_DEFAULT
+    except Exception as exc:
+        logger.warning(
+            "exploration_loop_threshold: load DB fallito, uso default %d (%s)",
+            _EXPLORATION_LOOP_DEFAULT, exc,
+        )
+        value = _EXPLORATION_LOOP_DEFAULT
+    _EXPLORATION_LOOP_CACHE["threshold"] = value
+    _EXPLORATION_LOOP_CACHE["loaded_at"] = now
+    return value
+
+
 def estimate_prompt_complexity(prompt: str, config: dict[str, Any] | None = None) -> int:
     """Stima la complessita' del task come score 0-100.
 
@@ -260,6 +310,12 @@ def _nexus_thinking_enabled() -> bool:
     return enabled
 
 
+# Diagnostica FIX 3 (streaming live thinking): contatore one-shot per loggare
+# WARNING la prima volta che get_stream_writer() non e' disponibile, senza
+# spammare i log a ogni riga di thinking.
+_STREAM_WRITER_DIAG: dict[str, bool] = {"warned_none": False, "warned_exc": False}
+
+
 def _stream_thinking_live(line: str) -> None:
     """Pusha immediatamente un evento `nexus_thinking` sul custom stream
     di LangGraph (visibile a stream_mode="custom" nell endpoint SSE).
@@ -279,12 +335,32 @@ def _stream_thinking_live(line: str) -> None:
         from langgraph.config import get_stream_writer  # type: ignore[import-untyped]
         writer = get_stream_writer()
         if writer is None:
+            # Diagnostica FIX 3: il writer e' None solo se il nodo gira fuori
+            # da un astream(stream_mode che include "custom") — es. ainvoke()
+            # o subagent dispatch. Logghiamo WARNING la PRIMA volta per non
+            # restare ciechi, poi degradiamo a debug per non spammare.
+            if not _STREAM_WRITER_DIAG["warned_none"]:
+                _STREAM_WRITER_DIAG["warned_none"] = True
+                logger.warning(
+                    "_stream_thinking_live: get_stream_writer() ha ritornato None — "
+                    "il thinking live NON parte. Il nodo gira fuori da astream(stream_mode "
+                    "che include 'custom')? (questo WARNING e' emesso una sola volta)"
+                )
+            else:
+                logger.debug("_stream_thinking_live: writer None (gia' diagnosticato)")
             return
         writer({"kind": "nexus_thinking", "text": str(line).strip()})
     except Exception as exc:
         # Niente raise: il thinking live e' best-effort, non deve
         # rompere l esecuzione del nodo.
-        logger.debug("_stream_thinking_live: writer non disponibile: %s", exc)
+        if not _STREAM_WRITER_DIAG["warned_exc"]:
+            _STREAM_WRITER_DIAG["warned_exc"] = True
+            logger.warning(
+                "_stream_thinking_live: writer non disponibile (%s) — thinking live "
+                "non emesso. (questo WARNING e' emesso una sola volta)", exc
+            )
+        else:
+            logger.debug("_stream_thinking_live: writer non disponibile: %s", exc)
 
 
 def _emit_thinking(updates: dict[str, Any], *lines: str) -> None:
@@ -313,6 +389,59 @@ def _emit_thinking(updates: dict[str, Any], *lines: str) -> None:
         existing.extend(cleaned)
     else:
         updates["nexus_thinking"] = cleaned
+
+
+def _describe_tool_call(name: str, args: dict[str, Any] | None) -> str:
+    """Traduce una tool call in una frase italiana leggibile per il thinking.
+
+    Deriva contesto utile dagli `args` quando disponibile (path del file,
+    label della porta, comando, ecc.). Fallback generico se il tool non e'
+    mappato. Mai solleva: input malformati ricadono sul fallback.
+    """
+    nm = (name or "sconosciuto").strip()
+    a = args if isinstance(args, dict) else {}
+
+    def _s(key: str, default: str = "") -> str:
+        try:
+            v = a.get(key)
+            return str(v).strip() if v is not None else default
+        except Exception:
+            return default
+
+    if nm in ("write_file", "create_file"):
+        p = _s("path") or _s("file_path") or _s("filename")
+        return f"Scrivo il file {p}" if p else "Scrivo un file"
+    if nm in ("edit_file", "apply_patch", "str_replace"):
+        p = _s("path") or _s("file_path")
+        return f"Modifico il file {p}" if p else "Modifico un file"
+    if nm in ("read_file", "nexus_read_attachment"):
+        p = _s("path") or _s("file_path") or _s("attachment_id")
+        return f"Leggo {p}" if p else "Leggo un file"
+    if nm in ("list_dir", "list_files", "nexus_list_attachments"):
+        p = _s("path") or _s("dir")
+        return f"Elenco il contenuto di {p}" if p else "Elenco i file"
+    if nm == "request_port":
+        lbl = _s("label")
+        return f"Richiedo una porta per {lbl}" if lbl else "Richiedo una porta"
+    if nm in ("run_command", "shell_exec", "execute_command", "bash"):
+        cmd = _s("command") or _s("cmd")
+        return f"Eseguo: {cmd[:80]}" if cmd else "Eseguo un comando shell"
+    if nm == "nexus_extract_figma_structure":
+        return "Estraggo la specifica dal file Figma allegato"
+    if nm == "nexus_extract_pdf_text":
+        return "Estraggo il testo dal PDF allegato"
+    if nm in ("nexus_extract_docx_text", "nexus_extract_xlsx_data"):
+        return "Estraggo i dati dal documento allegato"
+    if nm == "nexus_inspect_attachment":
+        return "Ispeziono l'allegato per capire come elaborarlo"
+    if nm == "nexus_describe_image_attachment":
+        return "Analizzo l'immagine allegata con il modello vision"
+    if nm in ("nexus_list_archive_entries", "nexus_read_archive_entry"):
+        return "Esploro il contenuto dell'archivio allegato"
+    if nm in ("web_search", "search"):
+        q = _s("query") or _s("q")
+        return f"Cerco sul web: {q[:80]}" if q else "Cerco sul web"
+    return f"Chiamo tool: {nm}"
 
 
 # ── G1 Python: rilevamento richieste d'azione ─────────────────────────────
@@ -370,6 +499,63 @@ def _has_tool_calls_in_history(messages: list) -> bool:
         ):
             return True
     return False
+
+
+# ── Override deterministico: scaffolding applicativo ───────────────────────
+# Famiglia di intent "crea un'applicazione / fai una app per X / implementa
+# l'app dal file". L'embedding classifier (e l'adaptive LLM quando spento)
+# possono sbagliare questa classe e mandarla su `code_read` per vicinanza al
+# token "file" ("crea l'app descritta NEL FILE allegato"). Questo override
+# replica strutturalmente la regola gia' presente nel prompt dell'agentic
+# classifier (brain/router/agentic_classifier.py) ma in modo deterministico,
+# robusto anche con embedding/adaptive OFF. Vince sempre il verbo di creazione.
+#
+# Verbi di creazione (italiano + inglese), con varianti pronominali.
+_SCAFFOLD_VERBS: tuple[str, ...] = (
+    "crea", "creami", "fai", "fammi", "costruisci", "costruiscimi",
+    "realizza", "sviluppa", "implementa", "genera",
+    "build", "create", "make", "develop", "scaffold", "generate",
+)
+# Oggetti applicativi: il target da scaffoldare.
+_SCAFFOLD_OBJECTS: tuple[str, ...] = (
+    "app", "application", "applicazione", "applicativo",
+    "sistema", "system", "sito", "site", "web app", "webapp",
+    "piattaforma", "platform", "servizio", "service",
+    "gestionale", "software", "programma", "progetto", "project",
+    "e-commerce", "ecommerce", "dashboard", "portale", "portal", "booking",
+)
+
+# Verbo seguito (anche non immediatamente, entro la frase) da un oggetto
+# applicativo. Gestisce articoli/apostrofi ("un'app", "l'applicazione",
+# "una app") perche' l'oggetto e' cercato come parola intera in una finestra
+# successiva al verbo. La regex e' costruita una sola volta a import-time.
+_SCAFFOLD_VERB_RE = _re_budget.compile(
+    r"\b(?:" + "|".join(_re_budget.escape(v) for v in _SCAFFOLD_VERBS) + r")\b",
+    _re_budget.IGNORECASE,
+)
+_SCAFFOLD_OBJ_RE = _re_budget.compile(
+    r"\b(?:" + "|".join(_re_budget.escape(o) for o in _SCAFFOLD_OBJECTS) + r")\b",
+    _re_budget.IGNORECASE,
+)
+
+
+def _detect_scaffolding_intent(text: str) -> bool:
+    """True quando il testo chiede di creare un'applicazione/progetto.
+
+    Matcha la famiglia VERBO_di_creazione ... OGGETTO_applicativo nella stessa
+    frase (oggetto cercato in una finestra che segue il primo verbo). Robusto
+    con articoli e apostrofi ("crea un'app", "fai una app per X"). La presenza
+    di "nel file allegato" NON declassa il match: vince il verbo di creazione.
+    """
+    if not text or not text.strip():
+        return False
+    # Normalizza apostrofi tipografici per uniformare i confini di parola.
+    normalized = text.replace("’", "'")
+    verb_match = _SCAFFOLD_VERB_RE.search(normalized)
+    if verb_match is None:
+        return False
+    # Cerca un oggetto applicativo a partire dalla posizione del verbo.
+    return _SCAFFOLD_OBJ_RE.search(normalized, verb_match.end()) is not None
 
 
 # ── Lookup prezzi modelli da ai_price_catalog ──────────────────────────────
@@ -762,6 +948,22 @@ async def router_node(state: AgentState) -> dict[str, Any]:
         )
         intent = "chat"
         intent_confidence = 1.0
+
+    # ── Override deterministico: scaffolding applicativo ─────────────────────
+    # Se il messaggio chiede di CREARE un'applicazione/progetto (famiglia
+    # verbo+oggetto), forziamo intent="architecture" anche quando l'embedding
+    # classifier l'ha mandato su code_read/docs. Questo evita che il profilo di
+    # sola lettura blocchi lo scaffolding (il modello esplora invece di
+    # scrivere). Non sovrascriviamo gli intent gia' "attivi" (architecture,
+    # system_admin, file_ops): se siamo gia' su uno di quelli il routing e'
+    # corretto. Speculare alla regola dell'agentic classifier, ma deterministico.
+    if intent not in ("architecture", "system_admin", "file_ops") and _detect_scaffolding_intent(str(text)):
+        logger.info(
+            "router_node: override scaffolding deterministico, intent %s -> architecture (msg=%r)",
+            intent, str(text)[:60],
+        )
+        intent = "architecture"
+        intent_confidence = 0.9
 
     # ── PR-D: classifier agentico per il gating adattivo del planner forte ────
     # Solo se adaptive_classifier_enabled. Produce complexity/agentic_score/
@@ -1828,6 +2030,58 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             "action_nudge_count": int(state.get("action_nudge_count") or 0),
         }
 
+    # ── Loop-detection semantica: esplorazione allegati senza scrittura ───────
+    # Il contatore accumulato dai turni precedenti conta le chiamate a tool di
+    # SOLA esplorazione (lettura/ispezione allegati e file). Se il modello varia
+    # entry/offset la loop-detection per signature identica non scatta mai e si
+    # arriva a 50+ iterazioni esplorative. Qui agiamo sulla FAMIGLIA di tool:
+    #   - >= soglia: iniettiamo UN nudge forte verso la scrittura (una sola volta)
+    #   - >= 2x soglia: abortiamo (il modello ha ignorato il nudge)
+    # La soglia e' DB-driven (agent.exploration_loop_threshold, default 6).
+    _exploration_count = int(state.get("consecutive_exploration_calls") or 0)
+    _exploration_threshold = _load_exploration_loop_threshold()
+    _exploration_nudge_sent = bool(state.get("exploration_nudge_sent") or False)
+    _exploration_nudge_injected = False
+    if _exploration_count >= 2 * _exploration_threshold:
+        logger.warning(
+            "executor_node: LOOP esplorativo (%d chiamate >= 2x soglia %d) senza "
+            "scrittura. Abort.",
+            _exploration_count, _exploration_threshold,
+        )
+        _expl_text = (
+            f"[LOOP RILEVATO] Il modello ha eseguito {_exploration_count} esplorazioni "
+            f"consecutive dell'allegato/file senza scrivere nulla, ignorando il "
+            f"sollecito a procedere. Esecuzione interrotta per evitare stallo. "
+            f"La specifica e' gia' disponibile nel contesto: riformula la richiesta "
+            f"o usa un modello piu' capace per lo scaffolding."
+        )
+        return {
+            "messages": [AIMessage(content=_expl_text)],
+            "result": _expl_text,
+            "pending_tool_uses": [],
+            "stop_reason": "loop_detected",
+            "iterations": int(state.get("iterations") or 0) + 1,
+            "consecutive_exploration_calls": _exploration_count,
+            "exploration_nudge_sent": _exploration_nudge_sent,
+        }
+    if _exploration_count >= _exploration_threshold and not _exploration_nudge_sent:
+        _expl_nudge = HumanMessage(
+            content=(
+                f"Hai gia' raccolto sufficiente contesto dall'allegato "
+                f"({_exploration_count} esplorazioni). La specifica e' gia' "
+                f"disponibile nel contesto. NON esplorare ulteriormente "
+                f"l'archivio/i file: procedi ORA a creare i file dell'applicazione "
+                f"con write_file e richiedi le porte con request_port."
+            )
+        )
+        messages = list(messages) + [_expl_nudge]
+        _exploration_nudge_sent = True
+        _exploration_nudge_injected = True
+        logger.info(
+            "executor_node: nudge anti-esplorazione iniettato (count=%d, soglia=%d)",
+            _exploration_count, _exploration_threshold,
+        )
+
     # ── Forced text response (anti-loop tool-only) ────────────────────────
     # Se il loop ha gia' consumato la maggior parte delle iterazioni concesse
     # (>= MAX_AGENT_ITERATIONS - 5) e il modello sta ancora facendo tool calls
@@ -1892,10 +2146,35 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         provider, model, intent, len(tools_json),
     )
     # Nexus thinking: lista locale, popolata lungo l'executor; emessa nel
-    # return finale solo se non vuota (e solo se il flag DB e' on).
-    _executor_thinking: list[str] = [
+    # return finale (backward-compat / final state) E in tempo reale via
+    # _stream_thinking_live (custom stream LangGraph) cosi' l'utente vede i
+    # ragionamenti SCORRERE durante l'attesa, non tutti insieme a fine nodo.
+    _executor_thinking: list[str] = []
+    _thinking_on = _nexus_thinking_enabled()
+
+    def _think(line: str) -> None:
+        """Accoda una riga di thinking E la emette live sul custom stream.
+
+        Unico punto di emissione thinking dell'executor: garantisce che ogni
+        ragionamento esca immediatamente (live) e resti anche nel return finale
+        per il delta di fine nodo (consumer SSE storico).
+        """
+        if not line:
+            return
+        txt = str(line).strip()
+        if not txt:
+            return
+        _executor_thinking.append(txt)
+        if _thinking_on:
+            _stream_thinking_live(txt)
+
+    _think(
         f"Routing modello: {provider}/{model} (intent {intent}, tools disponibili {len(tools_json)})."
-    ]
+    )
+    # FIX 2: ragionamento d'ingresso prima della chiamata LLM, emesso live.
+    _think(
+        f"Iterazione {_current_iterations}: consulto il modello {provider}/{model}..."
+    )
 
     # ── G1 Python: nudge anti-descrittivo ─────────────────────────────────────
     # Se il modello ha già risposto almeno una volta (iterations >= 1) senza
@@ -2348,6 +2627,28 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     # Mantieni solo le ultime ~12 signature per non gonfiare lo state.
     updated_signatures = (recent + new_signatures)[-12:]
 
+    # ── Aggiorna contatore loop-detection semantica ───────────────────────────
+    # Conta le tool call di SOLA esplorazione del turno corrente. Se TUTTE le
+    # call pending sono esplorative, accumula (il modello sta ancora leggendo).
+    # Se almeno una e' PRODUTTIVA (qualunque tool NON in _EXPLORATION_ONLY_TOOLS,
+    # es. write_file/edit_file/run_command/request_port), azzera contatore e
+    # flag nudge: il modello ha iniziato a produrre. Senza tool call (risposta
+    # testuale) il contatore resta invariato.
+    _updated_exploration_count = int(state.get("consecutive_exploration_calls") or 0)
+    _updated_exploration_nudge_sent = (
+        _exploration_nudge_sent if _exploration_nudge_injected
+        else bool(state.get("exploration_nudge_sent") or False)
+    )
+    if pending_tool_uses:
+        _pending_names = [str(tu.get("name", "")) for tu in pending_tool_uses]
+        _all_exploration = all(n in _EXPLORATION_ONLY_TOOLS for n in _pending_names)
+        if _all_exploration:
+            _updated_exploration_count += len(_pending_names)
+        else:
+            # Almeno una call produttiva: il modello sta scrivendo, reset.
+            _updated_exploration_count = 0
+            _updated_exploration_nudge_sent = False
+
     # Calcola cache hit rate
     total_tokens = prompt_tokens + completion_tokens + cache_creation_tokens + cache_read_tokens
     cache_hit_rate = cache_read_tokens / total_tokens if total_tokens > 0 else 0.0
@@ -2360,18 +2661,33 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         "sticky_model": model if (locals().get("cascade_did_fallback") or state.get("sticky_model")) else state.get("sticky_model"),
     }
 
-    # Nexus thinking: descrivi azioni decise da questo turno.
+    # Nexus thinking: descrivi azioni decise da questo turno, emesse LIVE.
     try:
+        # FIX 2: testo intermedio del modello (il ragionamento che accompagna
+        # le tool call). Se presente, emettiamo le prime ~200 char come thinking
+        # cosi' l'utente vede il "perche'" dietro le azioni mentre scorrono.
+        if result_text and pending_tool_uses:
+            _intermediate = str(result_text).strip()
+            if _intermediate:
+                _snippet = _intermediate[:200]
+                if len(_intermediate) > 200:
+                    _snippet += "..."
+                _think(_snippet)
+        # FIX 2: per ogni tool, frase italiana leggibile derivata dagli args.
         for _tu in (pending_tool_uses or []):
-            _tu_name = (_tu.get("name") if isinstance(_tu, dict) else None) or "sconosciuto"
-            _executor_thinking.append(f"Chiamo tool: {_tu_name}")
+            if isinstance(_tu, dict):
+                _tu_name = _tu.get("name") or "sconosciuto"
+                _tu_args = _tu.get("input") if isinstance(_tu.get("input"), dict) else _tu.get("args")
+            else:
+                _tu_name, _tu_args = "sconosciuto", None
+            _think(_describe_tool_call(str(_tu_name), _tu_args))
         if stop_reason == "end_turn" and not pending_tool_uses:
-            _executor_thinking.append("Risposta finale generata (end_turn).")
+            _think("Risposta finale generata (end_turn).")
     except Exception as _thinking_exc:
         logger.debug("executor_node: thinking append fallito: %s", _thinking_exc)
 
     _thinking_payload: dict[str, Any] = {}
-    if _executor_thinking and _nexus_thinking_enabled():
+    if _executor_thinking and _thinking_on:
         _thinking_payload["nexus_thinking"] = list(_executor_thinking)
 
     return {
@@ -2385,6 +2701,8 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         "pending_tool_uses": pending_tool_uses,
         "stop_reason": stop_reason,
         "recent_tool_signatures": updated_signatures,
+        "consecutive_exploration_calls": _updated_exploration_count,
+        "exploration_nudge_sent": _updated_exploration_nudge_sent,
         "auto_escalations": escalations if loop_sig is not None else int(state.get("auto_escalations") or 0),
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,

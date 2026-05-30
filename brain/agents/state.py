@@ -147,6 +147,17 @@ class AgentState(TypedDict, total=False):
     # (es. history contiene gia' tool call). Reset a 0 ad ogni nuovo run.
     g1_reroute_count: int
 
+    # Loop-detection semantica: numero di chiamate a tool di SOLA esplorazione
+    # (lettura/ispezione allegati e file) consecutive, senza tool produttivi in
+    # mezzo. Una sola call produttiva (write_file, edit_file, run_command, ...)
+    # azzera il contatore. Oltre la soglia (agent.exploration_loop_threshold)
+    # iniettiamo un nudge; a 2x la soglia abortiamo. Reset a 0 ad ogni nuovo run.
+    consecutive_exploration_calls: int
+    # True dopo aver iniettato il nudge anti-esplorazione, per non ripeterlo a
+    # ogni giro mentre il contatore resta sopra soglia. Reset quando il
+    # contatore viene azzerato da una call produttiva.
+    exploration_nudge_sent: bool
+
     # M61 sticky cascade fallback: dopo un cascade riuscito, persisti il
     # provider/model effettivo cosi' le iter successive partono direttamente
     # da li' invece di ri-tentare il primario fallito ad ogni round.

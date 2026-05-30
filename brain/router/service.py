@@ -58,9 +58,25 @@ _INTENT_EXEMPLARS: dict[str, list[str]] = {
         "conta le righe", "quante funzioni", "cosa fa questa classe",
         "elenco dei file", "struttura del progetto", "tree della cartella",
     ],
+    # ── architecture: design di sistema E scaffolding applicativo ────────────
+    # Oltre al design "puro" (architettura, migrazione, valutazione approcci),
+    # questo intent copre lo SCAFFOLDING applicativo: "crea un'applicazione",
+    # "fai una app per X", "implementa l'app dal file". Senza questi exemplar
+    # la frase "crea l'app descritta nel file allegato" cadeva su `code_read`
+    # (vicinanza semantica al token "file") -> profilo di sola lettura -> il
+    # modello esplorava l'allegato invece di scrivere i file.
     "architecture": [
         "design the system", "create the architecture", "plan the migration",
         "evaluate approaches", "review the design", "system design",
+        # Scaffolding applicativo (italiano) — famiglia verbo+oggetto
+        "crea un'applicazione", "crea l'applicazione", "fai una app per",
+        "costruisci un sistema gestionale", "sviluppa un sito web",
+        "realizza una piattaforma", "implementa l'applicazione descritta nel file",
+        "crea l'app dal mockup figma", "genera un progetto fullstack",
+        "crea un gestionale", "crea un e-commerce", "crea una dashboard",
+        # Scaffolding applicativo (inglese)
+        "scaffold a fullstack application", "build a web app for",
+        "create an application for", "develop a booking system",
     ],
     "chat": [
         "hello", "how are you", "help me", "what is", "explain",
