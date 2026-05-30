@@ -158,13 +158,14 @@ pub async fn index_attachment(
     let mime = mime_type.to_lowercase();
     let lower = name_hint.to_lowercase();
 
-    const EXTRACT_BUDGET: usize = 5_000_000;
+    // Politica "mai troncare-e-buttare": le funzioni inline estraggono l'INTERO
+    // contenuto, che viene poi chunked e indicizzato integralmente nel RAG.
     let text: Option<String> = if mime == "application/pdf" || lower.ends_with(".pdf") {
-        crate::agent_tools::document_tools::extract_pdf_text_inline(&file_path, EXTRACT_BUDGET)
+        crate::agent_tools::document_tools::extract_pdf_text_inline(&file_path)
             .await
             .ok()
     } else if mime.contains("wordprocessingml") || lower.ends_with(".docx") {
-        crate::agent_tools::document_tools::extract_docx_text_inline(&file_path, EXTRACT_BUDGET)
+        crate::agent_tools::document_tools::extract_docx_text_inline(&file_path)
             .await
             .ok()
     } else if mime == "application/zip"
@@ -172,7 +173,7 @@ pub async fn index_attachment(
         || lower.ends_with(".fig")
         || lower.ends_with(".make")
     {
-        crate::agent_tools::figma_tools::extract_figma_strings_inline(&file_path, EXTRACT_BUDGET)
+        crate::agent_tools::figma_tools::extract_figma_strings_inline(&file_path)
             .await
             .ok()
     } else if mime.starts_with("text/")

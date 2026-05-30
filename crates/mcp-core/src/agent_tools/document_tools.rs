@@ -10,21 +10,20 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::attachment_inspector::load_attachment;
-use super::attachment_settings;
 use super::AgentToolContext;
 
 // ──────────────────────────────────────────────────────────────────────────
-// Helper inline (FIX 3 ADR 0012)
+// Helper inline (estrazione per indicizzazione RAG)
 // ──────────────────────────────────────────────────────────────────────────
-// Usati dalla pre-extraction automatica in chat_messages.rs. Non sono tool
-// agente: ritornano direttamente la stringa estratta (truncata a max_chars)
-// o un Err con il motivo. Riusano la logica dei tool ma senza il wrapping JSON.
+// Usati dall'indexer RAG (rag/indexer.rs): ritornano direttamente la stringa
+// estratta INTEGRALE (politica "mai troncare-e-buttare": il chunking lato RAG
+// indicizza tutto il contenuto) o un Err con il motivo. Riusano la logica dei
+// tool ma senza il wrapping JSON.
 
-/// Pre-extract testo da un PDF gia' su filesystem (path assoluto). Tronca a
-/// `max_chars` caratteri. Usa spawn_blocking perche' pdf-extract e' sync.
-pub async fn extract_pdf_text_inline(file_path: &std::path::Path, max_chars: usize)
-    -> Result<String, String>
-{
+/// Pre-extract testo da un PDF gia' su filesystem (path assoluto). Estrae
+/// l'INTERO testo, nessun troncamento. Usa spawn_blocking perche' pdf-extract
+/// e' sync.
+pub async fn extract_pdf_text_inline(file_path: &std::path::Path) -> Result<String, String> {
     let bytes = tokio::fs::read(file_path).await
         .map_err(|e| format!("read PDF '{}' fallita: {e}", file_path.display()))?;
     let result = tokio::task::spawn_blocking(move || {
@@ -33,13 +32,12 @@ pub async fn extract_pdf_text_inline(file_path: &std::path::Path, max_chars: usi
     })
     .await
     .map_err(|e| format!("spawn_blocking fallita: {e}"))??;
-    Ok(truncate_chars(result, max_chars))
+    Ok(result)
 }
 
-/// Pre-extract testo da un DOCX (ZIP + word/document.xml). Tronca a `max_chars`.
-pub async fn extract_docx_text_inline(file_path: &std::path::Path, max_chars: usize)
-    -> Result<String, String>
-{
+/// Pre-extract testo da un DOCX (ZIP + word/document.xml). Estrae l'INTERO
+/// testo, nessun troncamento.
+pub async fn extract_docx_text_inline(file_path: &std::path::Path) -> Result<String, String> {
     let bytes = tokio::fs::read(file_path).await
         .map_err(|e| format!("read DOCX '{}' fallita: {e}", file_path.display()))?;
     let result = tokio::task::spawn_blocking(move || extract_docx(&bytes)).await
@@ -48,21 +46,7 @@ pub async fn extract_docx_text_inline(file_path: &std::path::Path, max_chars: us
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    Ok(truncate_chars(text, max_chars))
-}
-
-fn truncate_chars(mut s: String, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s;
-    }
-    // Tronca su char boundary.
-    let end_byte = s.char_indices()
-        .nth(max_chars)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len());
-    s.truncate(end_byte);
-    s.push_str("\n[... contenuto pre-extracted troncato ...]");
-    s
+    Ok(text)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -89,15 +73,13 @@ pub(super) async fn tool_nexus_extract_pdf_text(
         Ok(r) => r,
         Err(e) => return json!({ "error": e }).to_string(),
     };
-    let limits = attachment_settings::current(&ctx.db).await;
-    let max_text = limits.pdf_max_text_bytes;
 
     let bytes = match tokio::fs::read(&record.file_path).await {
         Ok(b) => b,
         Err(e) => return json!({ "error": format!("read fallita: {e}") }).to_string(),
     };
 
-    let result = tokio::task::spawn_blocking(move || extract_pdf(&bytes, page_start, page_end, max_text)).await;
+    let result = tokio::task::spawn_blocking(move || extract_pdf(&bytes, page_start, page_end)).await;
 
     match result {
         Ok(Ok(v)) => v.to_string(),
@@ -110,11 +92,10 @@ fn extract_pdf(
     bytes: &[u8],
     page_start: Option<u64>,
     page_end: Option<u64>,
-    max_text: usize,
 ) -> Result<Value, String> {
     // pdf-extract espone `extract_text_from_mem` — utile ma non gestisce range.
-    // Per il MVP estraiamo tutto poi tagliamo: la maggioranza dei PDF utente
-    // sta sotto qualche centinaio di KB di testo.
+    // Estraiamo tutto e, se richiesto, restituiamo solo il range di pagine.
+    // Politica "mai troncare-e-buttare": nessun cap sul testo estratto.
     let text = pdf_extract::extract_text_from_mem(bytes)
         .map_err(|e| format!("estrazione PDF fallita: {e}"))?;
 
@@ -135,17 +116,11 @@ fn extract_pdf(
         ));
     }
 
+    // Estraiamo l'INTERO testo del range richiesto, senza alcun cap.
     let mut extracted = String::new();
     for page in &pages[start_idx..end_idx] {
-        if extracted.len() >= max_text {
-            break;
-        }
         extracted.push_str(page);
         extracted.push('\n');
-    }
-    let truncated_size = extracted.len() > max_text;
-    if truncated_size {
-        extracted.truncate(max_text);
     }
 
     // Heuristica PDF scansionato: pochissimo testo / pagina.
@@ -154,7 +129,6 @@ fn extract_pdf(
     let mut out = json!({
         "total_pages": total_pages,
         "pages_extracted": end_idx - start_idx,
-        "truncated_by_size": truncated_size,
         "text": extracted,
     });
     if is_scanned {
@@ -284,14 +258,12 @@ pub(super) async fn tool_nexus_extract_xlsx_data(
         Ok(r) => r,
         Err(e) => return json!({ "error": e }).to_string(),
     };
-    let limits = attachment_settings::current(&ctx.db).await;
-    let max_rows = limits.xlsx_max_rows;
 
     let bytes = match tokio::fs::read(&record.file_path).await {
         Ok(b) => b,
         Err(e) => return json!({ "error": format!("read fallita: {e}") }).to_string(),
     };
-    let result = tokio::task::spawn_blocking(move || extract_xlsx(&bytes, sheet_name, max_rows)).await;
+    let result = tokio::task::spawn_blocking(move || extract_xlsx(&bytes, sheet_name)).await;
     match result {
         Ok(Ok(v)) => v.to_string(),
         Ok(Err(e)) => json!({ "error": e }).to_string(),
@@ -299,7 +271,7 @@ pub(super) async fn tool_nexus_extract_xlsx_data(
     }
 }
 
-fn extract_xlsx(bytes: &[u8], sheet_name: Option<String>, max_rows: usize) -> Result<Value, String> {
+fn extract_xlsx(bytes: &[u8], sheet_name: Option<String>) -> Result<Value, String> {
     let reader = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|e| format!("apertura XLSX fallita: {e}"))?;
@@ -330,12 +302,12 @@ fn extract_xlsx(bytes: &[u8], sheet_name: Option<String>, max_rows: usize) -> Re
             .read_to_end(&mut sheet_xml)
             .map_err(|e| format!("read sheet fallita: {e}"))?;
     }
-    let rows = parse_worksheet(&sheet_xml, &shared_strings, max_rows)?;
+    // Politica "mai troncare-e-buttare": estraiamo TUTTE le righe, nessun cap.
+    let rows = parse_worksheet(&sheet_xml, &shared_strings)?;
     Ok(json!({
         "sheet": sheet_path,
         "rows_count": rows.len(),
         "rows": rows,
-        "truncated": rows.len() >= max_rows,
     }))
 }
 
@@ -374,7 +346,6 @@ fn parse_shared_strings(bytes: &[u8]) -> Result<Vec<String>, String> {
 fn parse_worksheet(
     bytes: &[u8],
     shared_strings: &[String],
-    max_rows: usize,
 ) -> Result<Vec<Vec<String>>, String> {
     let mut xml = Reader::from_reader(bytes);
     xml.config_mut().trim_text(false);
@@ -422,13 +393,8 @@ fn parse_worksheet(
                     current_row.push(resolved);
                 }
                 b"row" => {
-                    if rows.len() >= max_rows {
-                        // Continua a parsare senza accumulare per non perdere
-                        // il conteggio totale (non strettamente necessario qui,
-                        // ma e' utile per il client).
-                    } else {
-                        rows.push(std::mem::take(&mut current_row));
-                    }
+                    // Politica "mai troncare-e-buttare": accumuliamo TUTTE le righe.
+                    rows.push(std::mem::take(&mut current_row));
                 }
                 _ => {}
             },

@@ -41,6 +41,7 @@ pub(crate) mod archive_tools;
 pub(crate) mod document_tools;
 pub(crate) mod figma_tools;
 pub(crate) mod vision_tools;
+pub(crate) mod visual_compare;
 pub(crate) mod attachment_settings;
 pub(crate) mod read_cache;
 pub(crate) mod rag_search;
@@ -48,10 +49,15 @@ pub(crate) mod rag_search;
 // Re-export per uso interno crate (tool_run_tests è chiamato da agent_loop, in teoria).
 pub(crate) use command::tool_run_tests;
 
-/// Numero massimo di righe restituite da read_file prima di troncare.
-pub(super) const READ_FILE_MAX_LINES: usize = 300;
+/// Soglia oltre la quale `read_file` antepone una mappa strutturale del file
+/// per orientare l'agente. NON tronca mai: il file viene comunque restituito
+/// INTEGRALE (politica "mai troncare-e-buttare").
+pub(super) const READ_FILE_STRUCTURE_HINT_LINES: usize = 300;
 /// Numero massimo di righe leggibili con read_file_lines in una singola chiamata.
-pub(super) const READ_FILE_LINES_MAX: usize = 400;
+/// read_file_lines e' un tool a RANGE esplicito (start/end), quindi non perde
+/// dati: il chiamante itera i range. Valore molto alto per non spezzare
+/// inutilmente letture ampie volute.
+pub(super) const READ_FILE_LINES_MAX: usize = 100_000;
 
 /// File e pattern che l'agente non può mai modificare, indipendentemente dai permessi.
 /// Proteggono secrets, configurazioni ambiente e il binario in produzione.
@@ -1160,7 +1166,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "nexus_list_archive_entries",
-    "description": "Lista le entries di un archivio ZIP, TAR o TAR.GZ allegato. Rileva il formato automaticamente dai magic bytes. Restituisce nome, dimensione, dimensione compressa, flag is_dir per ogni entry. Limite massimo 1000 entries (configurabile via setting agent.attachment.archive_max_entries).",
+    "description": "Lista TUTTE le entries di un archivio ZIP, TAR o TAR.GZ allegato. Rileva il formato automaticamente dai magic bytes. Restituisce nome, dimensione, dimensione compressa, flag is_dir per ogni entry. Nessun limite sul numero di entry: l'elenco e' sempre completo.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -1174,7 +1180,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "nexus_read_archive_entry",
-    "description": "Estrae e legge il contenuto di una singola entry da un archivio (ZIP/TAR/TAR.GZ). Max 200KB letti per chiamata (configurabile via agent.attachment.archive_entry_max_bytes). encoding 'auto' decide text/base64 in base ai byte effettivamente estratti.",
+    "description": "Estrae e legge il contenuto INTEGRALE di una singola entry da un archivio (ZIP/TAR/TAR.GZ). Nessun cap sui byte letti: la entry e' restituita per intero. encoding 'auto' decide text/base64 in base ai byte effettivamente estratti.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -1187,7 +1193,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "nexus_extract_pdf_text",
-    "description": "Estrae il testo da un allegato PDF, opzionalmente limitato a un range di pagine. Restituisce {total_pages, pages_extracted, text}. Max 100KB di testo totale (configurabile via agent.attachment.pdf_max_text_bytes). Se il PDF e' scansionato (immagini, niente testo) ritorna is_scanned_pdf=true e un hint per richiedere OCR.",
+    "description": "Estrae il testo INTEGRALE da un allegato PDF, opzionalmente limitato a un range di pagine. Restituisce {total_pages, pages_extracted, text}. Nessun cap sul testo estratto: il contenuto delle pagine richieste e' completo. Se il PDF e' scansionato (immagini, niente testo) ritorna is_scanned_pdf=true e un hint per richiedere OCR.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -1211,7 +1217,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "nexus_extract_xlsx_data",
-    "description": "Estrae dati tabellari da un allegato XLSX (Excel). Restituisce array di righe (ognuna array di celle stringa). Default primo sheet (sheet1). Max 1000 righe (configurabile via agent.attachment.xlsx_max_rows).",
+    "description": "Estrae TUTTI i dati tabellari da un allegato XLSX (Excel). Restituisce array di righe (ognuna array di celle stringa). Default primo sheet (sheet1). Nessun cap sul numero di righe: il foglio e' estratto per intero.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -1233,6 +1239,18 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     }
   },
   {
+    "name": "nexus_extract_figma_code",
+    "description": "FASE 1 resa Figma Make. Estrae il code-snapshot React/TypeScript/Tailwind GIA' PRESENTE dentro un .make Figma e lo SCRIVE SU DISCO sotto la project_root (default sottocartella 'figma_export/'). Un .make non contiene solo la specifica: dentro ai_chat.json ci sono tutte le scritture file dell'app salvate come chiamate-tool (fast_apply_tool/write_tool). Questo tool ricostruisce l'ultima versione di ogni file e la materializza. NON ritorna il contenuto dei file (per non saturare il contesto): ritorna solo un MANIFEST {format:'figma_make_code', files_written:[{path,bytes}], total_files, total_bytes, target_dir, entrypoints, detected_dependencies, partial, notes}. Usalo al posto di rigenerare l'app da zero quando l'inspector segnala che il .make contiene fast_apply. Dopo l'estrazione leggi i singoli file con read_file e genera package.json da detected_dependencies.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "attachment_id": {"type": "string", "description": "UUID dell'allegato .make."},
+        "target_subdir": {"type": "string", "description": "Sottocartella relativa alla project_root dove scrivere i file estratti. Default 'figma_export'."}
+      },
+      "required": ["attachment_id"]
+    }
+  },
+  {
     "name": "nexus_describe_image_attachment",
     "description": "Descrive un'immagine allegata alla chat usando un modello vision. Restituisce description testuale e ocr_text (se l'immagine contiene testo leggibile). Usalo quando l'inspector ha rilevato kind=image_* e devi capire il contenuto visivo (mockup UI, screenshot, foto, diagrammi).",
     "input_schema": {
@@ -1242,6 +1260,20 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         "question": {"type": "string", "description": "Domanda opzionale al modello vision (es. 'estrai i testi UI', 'descrivi il layout')."}
       },
       "required": ["attachment_id"]
+    }
+  },
+  {
+    "name": "nexus_visual_compare",
+    "description": "FASE 2 resa Figma Make: verifica visiva. Screenshotta l'URL locale dell'app avviata e la confronta col design di riferimento Figma usando un modello vision. Ritorna {similarity_score (0-100), differences:[{category:'colore|tipografia|layout|spaziatura|componente', severity:'alta|media|bassa', description, suggested_fix}], screenshot_path (su disco), reference_source:'thumbnail|attachment', model_used}. Le immagini NON sono incluse nella risposta: lo screenshot e' salvato su disco. Usalo dopo aver avviato il dev server per misurare la distanza dal design e, in modalita' Continuo, iterare correggendo stile/layout finche' similarity_score supera la soglia (default 85) e non restano differenze di severita' alta. Se ritorna un errore strutturato (Playwright assente, url irraggiungibile, vision non configurata) non insistere in loop.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "url": {"type": "string", "description": "URL locale dell'app avviata da screenshottare (es. 'http://localhost:29348/' o una route specifica). Obbligatorio."},
+        "reference": {"type": "string", "description": "attachment_id del design di riferimento: se e' un .make Figma viene usato il suo thumbnail.png, se e' un'immagine viene usata direttamente. Ometti per ottenere solo lo screenshot senza confronto."},
+        "viewport": {"type": "object", "description": "Dimensioni viewport {width, height}. Default 1280x800 (configurabile in settings agent.visual_compare.viewport_*).", "properties": {"width": {"type": "integer"}, "height": {"type": "integer"}}},
+        "wait_ms": {"type": "integer", "description": "Attesa (ms) dopo il load prima dello scatto. Default da settings (agent.visual_compare.wait_ms)."}
+      },
+      "required": ["url"]
     }
   },
   {
@@ -1701,7 +1733,10 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "nexus_extract_docx_text" => document_tools::tool_nexus_extract_docx_text(ctx, input).await,
         "nexus_extract_xlsx_data" => document_tools::tool_nexus_extract_xlsx_data(ctx, input).await,
         "nexus_extract_figma_structure" => figma_tools::tool_nexus_extract_figma_structure(ctx, input).await,
+        "nexus_extract_figma_code" => figma_tools::tool_nexus_extract_figma_code(ctx, input).await,
         "nexus_describe_image_attachment" => vision_tools::tool_nexus_describe_image_attachment(ctx, input).await,
+        // FASE 2 "resa Figma Make": verifica visiva (screenshot vs design).
+        "nexus_visual_compare" => visual_compare::tool_nexus_visual_compare(ctx, input).await,
         "nexus_search_semantic" => rag_search::tool_nexus_search_semantic(ctx, input).await,
         // ── Nexus Builtin tool (prefisso nexus_*) ──────────────────────────
         // Dispatch verso nexus_builtin::execute_with_neural per usare

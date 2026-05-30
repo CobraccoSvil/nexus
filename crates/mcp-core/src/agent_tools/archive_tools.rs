@@ -11,7 +11,6 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::attachment_inspector::load_attachment;
-use super::attachment_settings;
 use super::read_cache::{self, ReadCacheKey, ReadKind};
 use super::AgentToolContext;
 
@@ -55,20 +54,18 @@ pub(super) async fn tool_nexus_list_archive_entries(
         Err(e) => return json!({ "error": e }).to_string(),
     };
 
-    let limits = attachment_settings::current(&ctx.db).await;
-    let max_entries = limits.archive_max_entries;
-
     let bytes = match tokio::fs::read(&record.file_path).await {
         Ok(b) => b,
         Err(e) => return json!({ "error": format!("read fallita: {e}") }).to_string(),
     };
 
+    // Politica "mai troncare-e-buttare": elenca SEMPRE tutte le entry, nessun cap.
     // Operazione potenzialmente CPU-bound -> spawn_blocking.
     let format = detect_format(&bytes);
     let result = tokio::task::spawn_blocking(move || match format {
-        ArchiveFormat::Zip => list_zip_entries(&bytes, max_entries),
-        ArchiveFormat::Tar => list_tar_entries(&bytes, max_entries, /*gz=*/ false),
-        ArchiveFormat::TarGz => list_tar_entries(&bytes, max_entries, /*gz=*/ true),
+        ArchiveFormat::Zip => list_zip_entries(&bytes),
+        ArchiveFormat::Tar => list_tar_entries(&bytes, /*gz=*/ false),
+        ArchiveFormat::TarGz => list_tar_entries(&bytes, /*gz=*/ true),
         ArchiveFormat::Unknown => Err("formato archivio non riconosciuto (atteso ZIP/TAR/TAR.GZ)".into()),
     })
     .await;
@@ -80,13 +77,14 @@ pub(super) async fn tool_nexus_list_archive_entries(
     }
 }
 
-fn list_zip_entries(bytes: &[u8], max_entries: usize) -> Result<Value, String> {
+fn list_zip_entries(bytes: &[u8]) -> Result<Value, String> {
     let reader = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|e| format!("apertura ZIP fallita: {e}"))?;
     let total = archive.len();
-    let mut entries: Vec<Value> = Vec::with_capacity(total.min(max_entries));
-    for i in 0..total.min(max_entries) {
+    // Politica "mai troncare-e-buttare": elenca TUTTE le entry, nessun cap.
+    let mut entries: Vec<Value> = Vec::with_capacity(total);
+    for i in 0..total {
         let entry = archive
             .by_index(i)
             .map_err(|e| format!("entry {i} non leggibile: {e}"))?;
@@ -97,35 +95,27 @@ fn list_zip_entries(bytes: &[u8], max_entries: usize) -> Result<Value, String> {
             "is_dir": entry.is_dir(),
         }));
     }
-    let mut out = json!({
+    Ok(json!({
         "format": "zip",
         "total_entries": total,
         "shown": entries.len(),
         "entries": entries,
-    });
-    if total > max_entries {
-        out["truncated_message"] = json!(format!(
-            "archivio molto grande: mostro le prime {max_entries} entries su {total}"
-        ));
-    }
-    Ok(out)
+    }))
 }
 
-fn list_tar_entries(bytes: &[u8], max_entries: usize, gz: bool) -> Result<Value, String> {
+fn list_tar_entries(bytes: &[u8], gz: bool) -> Result<Value, String> {
     let inner: Box<dyn Read> = if gz {
         Box::new(flate2::read::GzDecoder::new(Cursor::new(bytes)))
     } else {
         Box::new(Cursor::new(bytes))
     };
     let mut ar = tar::Archive::new(inner);
+    // Politica "mai troncare-e-buttare": elenca TUTTE le entry, nessun cap.
     let mut entries: Vec<Value> = Vec::new();
     let mut total = 0usize;
     for entry in ar.entries().map_err(|e| format!("apertura TAR fallita: {e}"))? {
         let entry = entry.map_err(|e| format!("entry non leggibile: {e}"))?;
         total += 1;
-        if entries.len() >= max_entries {
-            continue;
-        }
         let header = entry.header();
         let path = entry
             .path()
@@ -139,18 +129,12 @@ fn list_tar_entries(bytes: &[u8], max_entries: usize, gz: bool) -> Result<Value,
             "is_dir": is_dir,
         }));
     }
-    let mut out = json!({
+    Ok(json!({
         "format": if gz { "tar.gz" } else { "tar" },
         "total_entries": total,
         "shown": entries.len(),
         "entries": entries,
-    });
-    if total > max_entries {
-        out["truncated_message"] = json!(format!(
-            "archivio molto grande: mostro le prime {max_entries} entries su {total}"
-        ));
-    }
-    Ok(out)
+    }))
 }
 
 /// `nexus_read_archive_entry(attachment_id, entry_path, encoding?)`.
@@ -184,23 +168,20 @@ pub(super) async fn tool_nexus_read_archive_entry(
         Err(e) => return json!({ "error": e }).to_string(),
     };
 
-    let limits = attachment_settings::current(&ctx.db).await;
-    let max_bytes = limits.archive_entry_max_bytes;
-
     let bytes = match tokio::fs::read(&record.file_path).await {
         Ok(b) => b,
         Err(e) => return json!({ "error": format!("read fallita: {e}") }).to_string(),
     };
-    // FIX 2 (ADR 0012): deduplica via read_cache. La chiave include
-    // attachment_id, entry_path, encoding e una lunghezza fissa (max_bytes
-    // applicato dopo). Se la stessa identica richiesta arriva > 1 volta,
-    // la cache aggiunge `from_cache`+`hint` per suggerire di cambiare strategia.
+    // Politica "mai troncare-e-buttare": leggiamo l'INTERA entry, nessun cap.
+    // FIX 2 (ADR 0012): deduplica via read_cache. La chiave usa una lunghezza
+    // sentinella (u64::MAX = "tutto") cosi' la stessa identica richiesta e'
+    // servita dalla cache con `from_cache`+`hint` per cambiare strategia.
     let cache_key = ReadCacheKey {
         attachment_id,
         kind: ReadKind::ArchiveEntry,
         entry_path: Some(entry_path.clone()),
         offset: 0,
-        length: max_bytes as u64,
+        length: u64::MAX,
         encoding: encoding_req.clone(),
     };
     let db = ctx.db.clone();
@@ -210,9 +191,9 @@ pub(super) async fn tool_nexus_read_archive_entry(
         let format = detect_format(&bytes);
         let entry_clone = entry_path_for_compute.clone();
         let result = tokio::task::spawn_blocking(move || match format {
-            ArchiveFormat::Zip => extract_zip_entry(&bytes, &entry_clone, max_bytes),
-            ArchiveFormat::Tar => extract_tar_entry(&bytes, &entry_clone, max_bytes, false),
-            ArchiveFormat::TarGz => extract_tar_entry(&bytes, &entry_clone, max_bytes, true),
+            ArchiveFormat::Zip => extract_zip_entry(&bytes, &entry_clone),
+            ArchiveFormat::Tar => extract_tar_entry(&bytes, &entry_clone, false),
+            ArchiveFormat::TarGz => extract_tar_entry(&bytes, &entry_clone, true),
             ArchiveFormat::Unknown => Err("formato archivio non riconosciuto".into()),
         })
         .await;
@@ -229,11 +210,7 @@ pub(super) async fn tool_nexus_read_archive_entry(
     .await
 }
 
-fn extract_zip_entry(
-    bytes: &[u8],
-    entry_path: &str,
-    max_bytes: usize,
-) -> Result<(Vec<u8>, u64), String> {
+fn extract_zip_entry(bytes: &[u8], entry_path: &str) -> Result<(Vec<u8>, u64), String> {
     let reader = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|e| format!("apertura ZIP fallita: {e}"))?;
@@ -241,20 +218,15 @@ fn extract_zip_entry(
         .by_name(entry_path)
         .map_err(|e| format!("entry '{entry_path}' non trovata: {e}"))?;
     let total = entry.size();
-    let mut buf = Vec::with_capacity(max_bytes.min(total as usize + 1));
-    let mut reader = (&mut entry).take(max_bytes as u64);
-    reader
+    // Politica "mai troncare-e-buttare": leggiamo l'INTERA entry.
+    let mut buf = Vec::with_capacity(total as usize + 1);
+    entry
         .read_to_end(&mut buf)
         .map_err(|e| format!("read entry fallita: {e}"))?;
     Ok((buf, total))
 }
 
-fn extract_tar_entry(
-    bytes: &[u8],
-    entry_path: &str,
-    max_bytes: usize,
-    gz: bool,
-) -> Result<(Vec<u8>, u64), String> {
+fn extract_tar_entry(bytes: &[u8], entry_path: &str, gz: bool) -> Result<(Vec<u8>, u64), String> {
     let inner: Box<dyn Read> = if gz {
         Box::new(flate2::read::GzDecoder::new(Cursor::new(bytes)))
     } else {
@@ -269,9 +241,9 @@ fn extract_tar_entry(
             .unwrap_or_default();
         if path == entry_path {
             let total = entry.header().size().unwrap_or(0);
-            let mut buf = Vec::with_capacity(max_bytes.min(total as usize + 1));
-            let mut reader = (&mut entry).take(max_bytes as u64);
-            reader
+            // Politica "mai troncare-e-buttare": leggiamo l'INTERA entry.
+            let mut buf = Vec::with_capacity(total as usize + 1);
+            entry
                 .read_to_end(&mut buf)
                 .map_err(|e| format!("read entry fallita: {e}"))?;
             return Ok((buf, total));

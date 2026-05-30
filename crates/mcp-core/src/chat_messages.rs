@@ -1840,9 +1840,13 @@ fn trunc_chars(s: String, max: usize) -> String {
 /// per allucinare o generare un Hello World. Qui pre-estraiamo il contenuto
 /// autoritativo (Figma/PDF/DOCX/testo) e lo iniettiamo in un blocco `<allegati>`.
 ///
-/// Budget totale condiviso tra gli allegati: setting `agent.attachment.preextract_max_chars`
-/// (default safe 50000, niente fallback hardcoded subdolo — regola G). Estrazioni
-/// fallite degradano con metadata + nota, mai panic.
+/// Politica "mai troncare-e-buttare" (mig 0216): il contenuto completo degli
+/// allegati e' indicizzato in RAG (vedi `rag::index_attachment`) e recuperato
+/// semanticamente qui (`rag::search_semantic`), senza budget arbitrario che
+/// tagli dati. Gli estratti iniettati nel prompt sono i chunk piu' rilevanti
+/// (cap difensivo per-chunk `CHUNK_INJECT_CAP`, non un budget di sessione); il
+/// resto resta accessibile via `nexus_search_semantic`. Estrazioni fallite
+/// degradano con metadata + nota, mai panic.
 async fn build_initial_msg_with_attachments(
     db: &PgPool,
     content: &str,

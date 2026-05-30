@@ -738,6 +738,37 @@ def _smart_truncate(text: str, max_chars: int = MAX_TOOL_RESULT_CHARS) -> str:
     )
 
 
+def _smart_truncate_lossless(
+    text: str,
+    max_chars: int = MAX_TOOL_RESULT_CHARS,
+    *,
+    source_kind: str = "tool_result",
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Variante LOSSLESS di _smart_truncate: prima di tagliare offloada in RAG.
+
+    Se il testo supera `max_chars`, il contenuto COMPLETO viene indicizzato in
+    Qdrant (collection tool_results_chunks) via context_offload, poi nel prompt
+    resta testa+coda + un puntatore esplicito a `nexus_search_semantic`. Cosi'
+    il dato non viene MAI perso a livello di sistema (regola H: niente
+    troncamento distruttivo).
+
+    Best-effort: se l'offload non e' disponibile (Qdrant down), degrada al
+    troncamento classico ma con puntatore che lo segnala (build_pointer).
+    """
+    if len(text) <= max_chars:
+        return text
+    from . import context_offload
+
+    offload = context_offload.offload_to_rag(
+        _embeddings, text, source_kind=source_kind, metadata=metadata,
+    )
+    head_size = max_chars // 5
+    tail_size = max(200, max_chars - head_size - 200)
+    pointer = context_offload.build_pointer(len(text), offload)
+    return text[:head_size] + pointer + text[-tail_size:]
+
+
 def _estimate_context_chars(messages: list) -> int:
     """Stima il numero totale di caratteri nel contesto messaggi."""
     total = 0
@@ -866,11 +897,28 @@ _RAG_INTENTS = {"code", "code_edit", "code_read", "refactor", "analyze",
 # Sotto questa soglia il match non e' significativo e introdurrebbe rumore.
 _RAG_MIN_SCORE = 0.5
 
-# Numero massimo di interazioni recuperate per turno.
-_RAG_TOP_K = 5
 
-# Limite caratteri per ogni snippet incluso (per non gonfiare il system prompt).
-_RAG_SNIPPET_MAX_CHARS = 400
+def _rag_top_k() -> int:
+    """Numero massimo di interazioni recuperate per turno (DB-driven, mig 0217).
+
+    Default alzato a 12 (era hardcoded 5): con l'offload lossless il RAG e' la
+    fonte di verita' del contenuto troncato, quindi il recupero non deve essere
+    artificialmente stretto. Fallback safe se DB down.
+    """
+    from . import context_offload
+
+    return int(context_offload._load_offload_config()["rag_top_k"])
+
+
+def _rag_snippet_max_chars() -> int:
+    """Limite caratteri per snippet RAG incluso (DB-driven, mig 0217).
+
+    Default alzato a 4000 (era hardcoded 400): snippet piu' ampi riducono la
+    necessita' di round-trip e non perdono il cuore del match. Fallback safe.
+    """
+    from . import context_offload
+
+    return int(context_offload._load_offload_config()["rag_snippet_max_chars"])
 
 
 def _build_rag_context(intent: str, query_text: str) -> str:
@@ -884,9 +932,11 @@ def _build_rag_context(intent: str, query_text: str) -> str:
         return ""
     if not query_text or len(query_text.strip()) < 10:
         return ""
+    _topk = _rag_top_k()
+    _snippet_cap = _rag_snippet_max_chars()
     try:
         hits = _retriever.get_similar_interactions(
-            query_text=query_text, task_type=None, limit=_RAG_TOP_K,
+            query_text=query_text, task_type=None, limit=_topk,
         )
     except Exception as exc:
         logger.debug("RAG retrieval fallito: %s", exc)
@@ -901,8 +951,8 @@ def _build_rag_context(intent: str, query_text: str) -> str:
         text = str(h.get("text") or h.get("user_input") or "").strip()
         if not text:
             continue
-        if len(text) > _RAG_SNIPPET_MAX_CHARS:
-            text = text[: _RAG_SNIPPET_MAX_CHARS - 3] + "..."
+        if len(text) > _snippet_cap:
+            text = text[: _snippet_cap - 3] + "..."
         score = float(h.get("score", 0))
         snippets.append(f'  <interazione score="{score:.2f}">{text}</interazione>')
     if not snippets:
@@ -939,6 +989,7 @@ def _build_kb_rag_context(intent: str, project_id: str, query_text: str) -> str:
         return ""
     if not query_text or len(query_text.strip()) < 10:
         return ""
+    _snippet_cap = _rag_snippet_max_chars()
     try:
         import requests  # noqa: PLC0415 (import lazy)
         resp = requests.post(
@@ -946,7 +997,7 @@ def _build_kb_rag_context(intent: str, project_id: str, query_text: str) -> str:
             json={
                 "project_id": project_id,
                 "query": query_text,
-                "top_k": _RAG_TOP_K,
+                "top_k": _rag_top_k(),
                 "min_score": _RAG_MIN_SCORE,
             },
             timeout=5,
@@ -971,8 +1022,8 @@ def _build_kb_rag_context(intent: str, project_id: str, query_text: str) -> str:
             continue
         intent_attr = r.get("intent") or "chat"
         score = float(r.get("score") or 0)
-        if len(snippet_text) > _RAG_SNIPPET_MAX_CHARS:
-            snippet_text = snippet_text[: _RAG_SNIPPET_MAX_CHARS - 3] + "..."
+        if len(snippet_text) > _snippet_cap:
+            snippet_text = snippet_text[: _snippet_cap - 3] + "..."
         snippets.append(
             f'  <nota intent="{intent_attr}" score="{score:.2f}">\n'
             f'    <titolo>{title}</titolo>\n'
@@ -1436,6 +1487,30 @@ def _dedup_tool_results(messages: list[Any]) -> list[Any]:
     return new_messages
 
 
+def _compress_marker(content: str) -> str:
+    """Offload LOSSLESS del contenuto completo + marker da appendere al placeholder.
+
+    Chiamato da _compress_old_tool_results PRIMA di sostituire un tool_result
+    vecchio con la sua versione compressa. Indicizza il contenuto intero in RAG
+    (idempotente per hash) cosi' il dato resta recuperabile via
+    `nexus_search_semantic` anche dopo la compressione nel prompt.
+
+    Best-effort: se l'offload non e' disponibile, il marker segnala comunque la
+    compressione (degraded). Non solleva mai.
+    """
+    from . import context_offload
+
+    offload = context_offload.offload_to_rag(
+        _embeddings, content, source_kind="tool_result_compressed",
+    )
+    if offload is not None:
+        return (
+            f"\n[... compresso: {len(content)} char originali INDICIZZATI in RAG "
+            f"(ref={offload['ref'][:12]}). Recupera con nexus_search_semantic ...]"
+        )
+    return f"\n[... compresso: {len(content)} char originali ...]"
+
+
 def _compress_old_tool_results(
     messages: list[Any],
     keep_recent: int = 6,
@@ -1484,7 +1559,7 @@ def _compress_old_tool_results(
                     kept = max(recent_threshold // 2, 200)
                     new_blocks.append({
                         **block,
-                        "content": content[:kept] + f"\n[... compresso: {len(content)} char originali ...]",
+                        "content": content[:kept] + _compress_marker(content),
                     })
                     changed = True
                 else:
@@ -1516,7 +1591,7 @@ def _compress_old_tool_results(
                 kept = max(max_content_chars // 2, 100)
                 new_blocks.append({
                     **block,
-                    "content": content[:kept] + f"\n[... compresso: {len(content)} char originali ...]",
+                    "content": content[:kept] + _compress_marker(content),
                 })
                 changed = True
             else:
@@ -3086,7 +3161,15 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
                 session_id=session_id,
                 tool_use_id=tool_use_id,
             )
-            content = _smart_truncate(result.result_json)
+            content = _smart_truncate_lossless(
+                result.result_json,
+                source_kind="tool_result",
+                metadata={
+                    "tool_name": _t_name,
+                    "session_id": session_id,
+                    "thread_id": str(state.get("thread_id") or ""),
+                },
+            )
             return {
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
@@ -3157,7 +3240,19 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     if ctx_chars + new_chars > MAX_CONTEXT_CHARS:
         budget_per_tool = max(1500, (MAX_CONTEXT_CHARS - ctx_chars) // max(len(results), 1))
         results = [
-            {**r, "content": _smart_truncate(r["content"], budget_per_tool)}
+            {
+                **r,
+                "content": _smart_truncate_lossless(
+                    r["content"],
+                    budget_per_tool,
+                    source_kind="tool_result",
+                    metadata={
+                        "session_id": session_id,
+                        "thread_id": str(state.get("thread_id") or ""),
+                        "reason": "context_budget_cap",
+                    },
+                ),
+            }
             for r in results
         ]
         logger.warning(

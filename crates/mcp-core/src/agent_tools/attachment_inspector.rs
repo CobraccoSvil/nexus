@@ -333,8 +333,18 @@ pub(super) async fn tool_nexus_inspect_attachment(
 
     let (kind, mime_reale, ext_reale) =
         detect_kind(&header, &record.file_name, &record.mime_type);
+
+    // FASE 1 resa Figma Make: se e' un Figma .make il cui ai_chat.json contiene
+    // scritture file (fast_apply_tool), il code-snapshot React e' gia' dentro:
+    // l'azione raccomandata diventa nexus_extract_figma_code, non solo structure.
+    let figma_has_code = if kind == "figma" {
+        figma_make_has_fast_apply(&record.file_path).await
+    } else {
+        false
+    };
+
     let (tools, hint) = extraction_tools_for_kind(&kind);
-    let next_action = next_action_recommended(&kind, &record.id);
+    let next_action = next_action_recommended(&kind, &record.id, figma_has_code);
 
     json!({
         "id": record.id.to_string(),
@@ -352,6 +362,70 @@ pub(super) async fn tool_nexus_inspect_attachment(
     .to_string()
 }
 
+/// Byte massimi letti dall'inizio di ai_chat.json per rilevare la presenza di
+/// scritture file (fast_apply_tool). 4 MB e' ampiamente sufficiente: le prime
+/// scritture compaiono nei primissimi messaggi del thread.
+const FIGMA_FAST_APPLY_PROBE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Rileva a buon mercato se un .make Figma contiene un code-snapshot
+/// (scritture `fast_apply_tool`/`write_tool`) dentro ai_chat.json. Apre lo ZIP
+/// e legge un prefisso decompresso di ai_chat.json cercando la sottostringa.
+/// Tollerante: qualunque errore I/O o ZIP ritorna `false` (nessun routing
+/// speciale, fallback a structure).
+async fn figma_make_has_fast_apply(path: &std::path::Path) -> bool {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let Ok(file) = std::fs::File::open(&path) else {
+            return false;
+        };
+        let Ok(mut archive) = zip::ZipArchive::new(file) else {
+            return false;
+        };
+        // Trova l'indice di ai_chat.json.
+        let mut ai_idx: Option<usize> = None;
+        for i in 0..archive.len() {
+            if let Ok(entry) = archive.by_index(i) {
+                let name = entry.name().to_lowercase();
+                if name == "ai_chat.json" || name.ends_with("/ai_chat.json") {
+                    ai_idx = Some(i);
+                    break;
+                }
+            }
+        }
+        let Some(idx) = ai_idx else {
+            return false;
+        };
+        let Ok(entry) = archive.by_index(idx) else {
+            return false;
+        };
+        let mut buf = Vec::new();
+        if entry
+            .take(FIGMA_FAST_APPLY_PROBE_BYTES)
+            .read_to_end(&mut buf)
+            .is_err()
+        {
+            return false;
+        }
+        // I toolName compaiono come stringhe (eventualmente escaped) nel JSON.
+        memchr_contains(&buf, b"fast_apply_tool")
+            || memchr_contains(&buf, b"write_tool")
+            || memchr_contains(&buf, b"create_file_tool")
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Ricerca di sottostringa byte-wise senza dipendenze extra.
+fn memchr_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|w| w == needle)
+}
+
 /// FIX 1 (ADR 0012): decide il tool che il modello DEVE chiamare subito dopo
 /// `nexus_inspect_attachment`, con parametri concreti gia' pronti.
 ///
@@ -363,9 +437,20 @@ pub(super) async fn tool_nexus_inspect_attachment(
 ///
 /// Ritorna `Value::Null` se il kind non ha un'azione strutturata sensata
 /// (es. binary opaco): in quel caso il modello deve chiedere all'utente.
-fn next_action_recommended(kind: &str, attachment_id: &Uuid) -> Value {
+fn next_action_recommended(kind: &str, attachment_id: &Uuid, figma_has_code: bool) -> Value {
     let id_s = attachment_id.to_string();
     match kind {
+        "figma" if figma_has_code => json!({
+            "tool": "nexus_extract_figma_code",
+            "input": { "attachment_id": id_s },
+            "rationale": "Il .make contiene gia' il codice React/TypeScript completo \
+                          dell'app (scritture fast_apply_tool dentro ai_chat.json): \
+                          estrailo su disco con nexus_extract_figma_code invece di \
+                          rigenerarlo da zero. Mantiene il design fedele. Il tool \
+                          scrive i file e ritorna solo un manifest (niente bloat di \
+                          contesto). Poi leggi i file con read_file.",
+            "expected_tokens_output": 2000,
+        }),
         "figma" => json!({
             "tool": "nexus_extract_figma_structure",
             "input": { "attachment_id": id_s },

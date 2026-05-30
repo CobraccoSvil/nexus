@@ -17,19 +17,15 @@ pub(super) async fn tool_read_file(ctx: &AgentToolContext, input: &Value) -> Str
     };
 
     let total_lines = content.lines().count();
-    if total_lines <= READ_FILE_MAX_LINES {
+    if total_lines <= READ_FILE_STRUCTURE_HINT_LINES {
         // File piccolo: restituisci tutto
         return content;
     }
 
-    // File grande: restituisci la mappa strutturale + prime 80 righe (import/dichiarazioni)
-    let header: String = content
-        .lines()
-        .take(80)
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    // Costruisci mappa strutturale (funzioni/classi con numeri di riga)
+    // File grande: anteponiamo una mappa strutturale per orientare l'agente,
+    // MA restituiamo SEMPRE il contenuto INTEGRALE subito dopo (politica "mai
+    // troncare-e-buttare": nessuna riga viene persa, nessun rimando obbligato a
+    // read_file_lines).
     let structure = extract_file_structure(&content);
     let structure_map: String = if structure.is_empty() {
         "  (nessuna struttura rilevata automaticamente)".to_string()
@@ -42,21 +38,20 @@ pub(super) async fn tool_read_file(ctx: &AgentToolContext, input: &Value) -> Str
     };
 
     format!(
-        "[FILE GRANDE — {total_lines} righe totali]\n\
-        ⚠ NON richiamare read_file su questo file.\n\
-        → Per trovare informazioni specifiche: usa search_file_semantic(\"{path_str}\", \"cosa stai cercando\")\n\
-        → Per leggere una sezione nota: usa read_file_lines(\"{path_str}\", start_line, end_line) (max 400 righe per chiamata)\n\
+        "[FILE GRANDE — {total_lines} righe totali — contenuto integrale incluso sotto]\n\
+        → Per saltare a una sezione nota usa la mappa strutturale qui sotto.\n\
+        → Per una ricerca mirata: search_file_semantic(\"{path_str}\", \"cosa stai cercando\").\n\
         \n\
         === STRUTTURA DEL FILE ({struct_count} definizioni trovate) ===\n\
         {structure_map}\n\
         \n\
-        === PRIME 80 RIGHE (import e dichiarazioni) ===\n\
-        {header}",
+        === CONTENUTO INTEGRALE ({total_lines} righe) ===\n\
+        {content}",
         total_lines = total_lines,
         path_str = path_str,
         struct_count = structure.len(),
         structure_map = structure_map,
-        header = header,
+        content = content,
     )
 }
 

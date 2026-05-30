@@ -30,12 +30,11 @@ use uuid::Uuid;
 use super::attachment_inspector::load_attachment;
 use super::attachment_settings::{self, AttachmentLimits};
 use super::AgentToolContext;
+use crate::projects::resolve_workspace_target;
 
 /// Lunghezza minima di una stringa leggibile considerata "interessante"
 /// nel fallback `figma_binary_legacy`.
 const MIN_STRING_LEN: usize = 4;
-/// Numero massimo di stringhe ritornate nel fallback.
-const MAX_STRINGS: usize = 200;
 
 /// `nexus_extract_figma_structure(attachment_id)`.
 pub(super) async fn tool_nexus_extract_figma_structure(
@@ -70,6 +69,305 @@ pub(super) async fn tool_nexus_extract_figma_structure(
     }
 }
 
+/// Subdir di default sotto la project_root dove scrivere il code-snapshot
+/// estratto. Tenuta separata da eventuale scaffold per non collidere.
+const DEFAULT_FIGMA_EXPORT_SUBDIR: &str = "figma_export";
+
+/// `nexus_extract_figma_code(attachment_id, target_subdir?)`.
+///
+/// Estrae il code-snapshot finale dal .make e lo scrive su disco sotto la
+/// project_root (default `figma_export/`). Ritorna SOLO un manifest JSON con
+/// metadati: niente contenuto file, per non saturare il contesto del modello.
+pub(super) async fn tool_nexus_extract_figma_code(
+    ctx: &AgentToolContext,
+    input: &Value,
+) -> String {
+    if !ctx.can_write {
+        return json!({
+            "error": "Permesso di scrittura non concesso su questo progetto: \
+                      impossibile estrarre il code-snapshot Figma su disco."
+        })
+        .to_string();
+    }
+
+    let attachment_id = match input
+        .get("attachment_id")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        Some(id) => id,
+        None => return json!({ "error": "Parametro 'attachment_id' obbligatorio." }).to_string(),
+    };
+
+    let target_subdir = input
+        .get("target_subdir")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_FIGMA_EXPORT_SUBDIR)
+        .trim_matches('/')
+        .to_string();
+
+    let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
+        Ok(r) => r,
+        Err(e) => return json!({ "error": e }).to_string(),
+    };
+    let limits = attachment_settings::current(&ctx.db).await;
+
+    let bytes = match tokio::fs::read(&record.file_path).await {
+        Ok(b) => b,
+        Err(e) => return json!({ "error": format!("read fallita: {e}") }).to_string(),
+    };
+
+    // Parsing pesante in spawn_blocking: produce la mappa path->content.
+    let snapshot = match tokio::task::spawn_blocking(move || extract_code_from_make(&bytes, limits))
+        .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return json!({ "error": e }).to_string(),
+        Err(e) => return json!({ "error": format!("spawn_blocking fallita: {e}") }).to_string(),
+    };
+
+    if snapshot.files.is_empty() {
+        return json!({
+            "format": "figma_make_code",
+            "total_files": 0,
+            "files_written": [],
+            "target_dir": target_subdir,
+            "partial": snapshot.partial,
+            "notes": "Nessuna scrittura file (fast_apply_tool/write_tool) trovata nel \
+                      thread ai_chat.json: questo .make non contiene un code-snapshot \
+                      ricostruibile. Usa nexus_extract_figma_structure per la specifica \
+                      chat e implementa l'app dalla descrizione.",
+        })
+        .to_string();
+    }
+
+    // Calcolo dipendenze ed entrypoint prima di scrivere (sui content in RAM).
+    let detected_dependencies = detect_dependencies(&snapshot.files);
+    let entrypoints = detect_entrypoints(&snapshot.files);
+
+    // Scrittura su disco con guardia path-safety del workspace.
+    // Politica "mai troncare-e-buttare": scriviamo TUTTI i file estratti,
+    // qualunque sia la dimensione totale (nessun cap sui byte scritti).
+    let mut files_written: Vec<Value> = Vec::new();
+    let mut total_bytes: usize = 0;
+    let mut rejected_paths = false;
+
+    for (rel_path, content) in &snapshot.files {
+        let content_len = content.len();
+
+        let joined = format!("{target_subdir}/{rel_path}");
+        let (clean_rel, abs_target) = match resolve_workspace_target(&ctx.root_path, &joined) {
+            Ok(p) => p,
+            Err(_) => {
+                // Path rifiutato dalla guardia path-safety: lo salto e segnalo
+                // il risultato come parziale.
+                rejected_paths = true;
+                continue;
+            }
+        };
+
+        if let Some(parent) = abs_target.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return json!({
+                    "error": format!("creazione directory '{}' fallita: {e}", parent.display())
+                })
+                .to_string();
+            }
+        }
+
+        if let Err(e) = tokio::fs::write(&abs_target, content).await {
+            return json!({
+                "error": format!("scrittura '{clean_rel}' fallita: {e}")
+            })
+            .to_string();
+        }
+
+        nexus_events::dispatcher::emit(
+            &ctx.project_channels,
+            ctx.project_id,
+            nexus_events::event::ProjectEvent::FileChanged {
+                path: clean_rel.clone(),
+                op: "created".to_string(),
+            },
+        );
+
+        total_bytes += content_len;
+        files_written.push(json!({ "path": clean_rel, "bytes": content_len }));
+    }
+
+    let partial = snapshot.partial || rejected_paths;
+    let mut notes = String::from(
+        "Code-snapshot React/TS estratto dal .make e scritto su disco: NON e' \
+         incluso nel contesto (solo metadati qui). Leggi i file con read_file \
+         quando ti servono. Genera package.json da detected_dependencies.",
+    );
+    if rejected_paths {
+        notes.push_str(
+            " ATTENZIONE: alcuni path sono stati rifiutati dalla guardia di \
+             path-safety del workspace e non sono stati scritti.",
+        );
+    }
+    if snapshot.partial {
+        notes.push_str(
+            " ai_chat.json ha superato la guardia anti-OOM al load (file \
+             patologico): il code-snapshot potrebbe essere incompleto.",
+        );
+    }
+
+    json!({
+        "format": "figma_make_code",
+        "files_written": files_written,
+        "total_files": files_written.len(),
+        "total_bytes": total_bytes,
+        "target_dir": target_subdir,
+        "entrypoints": entrypoints,
+        "detected_dependencies": detected_dependencies,
+        "partial": partial,
+        "notes": notes,
+    })
+    .to_string()
+}
+
+/// Apre il .make, carica `ai_chat.json` (rispettando il limite di load),
+/// e ricostruisce il code-snapshot. Errori ZIP/entry sono propagati.
+fn extract_code_from_make(bytes: &[u8], limits: AttachmentLimits) -> Result<CodeSnapshot, String> {
+    if bytes.len() < 4 || &bytes[0..4] != b"PK\x03\x04" {
+        return Err(
+            "Il file non e' uno ZIP: un .make Figma valido e' un archivio ZIP che \
+             contiene ai_chat.json."
+                .into(),
+        );
+    }
+    let reader = Cursor::new(bytes);
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("apertura ZIP fallita: {e}"))?;
+    let index = scan_archive(&mut archive);
+
+    let ai_chat_idx = index.ai_chat_idx.ok_or_else(|| {
+        "Archivio Figma senza ai_chat.json: nessun code-snapshot estraibile.".to_string()
+    })?;
+
+    let loaded = read_entry_to_bytes(
+        &mut archive,
+        ai_chat_idx,
+        limits.figma_make_ai_chat_max_load_bytes,
+    )?;
+
+    // Parsing tollerante: se il JSON e' troncato (load cap raggiunto),
+    // serde fallisce sul documento intero. In quel caso tentiamo comunque di
+    // estrarre i file gia' completi prima del troncamento via parsing parziale.
+    match serde_json::from_slice::<Value>(&loaded.bytes) {
+        Ok(root) => Ok(extract_make_code_snapshot(&root, loaded.truncated)),
+        Err(_) if loaded.truncated => {
+            // JSON troncato: estrazione best-effort dai contentJson trovabili.
+            Ok(extract_snapshot_from_truncated(&loaded.bytes))
+        }
+        Err(e) => Err(format!("parse ai_chat.json fallito: {e}")),
+    }
+}
+
+/// Estrazione best-effort da un `ai_chat.json` troncato (non JSON-valido nel
+/// suo complesso). Non potendo parsare il documento, isoliamo i singoli
+/// `contentJson` di tipo scrittura file cercando i marcatori dei tool noti e
+/// ricostruiamo i file che riusciamo a leggere interamente. Sempre `partial`.
+fn extract_snapshot_from_truncated(bytes: &[u8]) -> CodeSnapshot {
+    let mut snap = CodeSnapshot {
+        partial: true,
+        ..Default::default()
+    };
+    let text = String::from_utf8_lossy(bytes);
+
+    // Avvolgiamo i frammenti riconoscibili: ogni messaggio di scrittura ha la
+    // forma escaped {\"toolName\":\"fast_apply_tool\",...,\"resultJson\":\"...\"}.
+    // Cerchiamo le occorrenze di resultJson e proviamo a parsare il singolo
+    // oggetto outer che le contiene. Strategia conservativa: se non riusciamo,
+    // semplicemente lasciamo i file gia' raccolti.
+    for tool in FILE_WRITE_TOOL_NAMES {
+        let marker = format!("\\\"toolName\\\":\\\"{tool}\\\"");
+        let mut search_from = 0;
+        while let Some(rel) = text[search_from..].find(&marker) {
+            let abs = search_from + rel;
+            // Cerca l'inizio dell'oggetto outer (la graffa escaped precedente).
+            // I contentJson sono stringhe escaped: tentiamo un un-escape locale
+            // di una finestra ampia e un parse dell'oggetto.
+            let window_start = text[..abs].rfind("\"{").map(|p| p + 1).unwrap_or(abs);
+            let window_end = (abs + 200_000).min(text.len());
+            let window = &text[window_start..window_end];
+            if let Some(content_json) = recover_content_json(window) {
+                if let Ok(outer) = serde_json::from_str::<Value>(&content_json) {
+                    apply_outer_tool_write(&mut snap, &outer);
+                }
+            }
+            search_from = abs + marker.len();
+        }
+    }
+    snap
+}
+
+/// Tenta di isolare e un-escapare una stringa `contentJson` da una finestra di
+/// testo grezzo. Ritorna il JSON interno (gia' un-escaped) se la finestra
+/// contiene una stringa JSON completa terminata correttamente.
+fn recover_content_json(window: &str) -> Option<String> {
+    // La finestra parte (idealmente) da `{\"toolCallId\...}` escaped dentro una
+    // stringa JSON. Troviamo la prima `{` e ricostruiamo bilanciando le graffe
+    // tenendo conto dell'escaping. Approccio semplice: un-escape `\"`->`"` e
+    // `\\`->`\`, poi bilanciamo le graffe sul testo un-escaped.
+    let start = window.find('{')?;
+    let candidate = &window[start..];
+    let unescaped = candidate.replace("\\\"", "\"").replace("\\\\", "\\");
+
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut prev_escape = false;
+    for (i, ch) in unescaped.char_indices() {
+        match ch {
+            '"' if !prev_escape => in_str = !in_str,
+            '{' if !in_str => depth += 1,
+            '}' if !in_str => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(unescaped[..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+        prev_escape = ch == '\\' && !prev_escape;
+    }
+    None
+}
+
+/// Applica un oggetto outer (gia' parsato) di tipo scrittura file allo
+/// snapshot, condividendo la logica con `extract_make_code_snapshot`.
+fn apply_outer_tool_write(snap: &mut CodeSnapshot, outer: &Value) {
+    let tool_name = outer.get("toolName").and_then(Value::as_str).unwrap_or("");
+    if !FILE_WRITE_TOOL_NAMES.contains(&tool_name) {
+        return;
+    }
+    let Some(result_str) = outer.get("resultJson").and_then(Value::as_str) else {
+        return;
+    };
+    let Ok(result) = serde_json::from_str::<Value>(result_str) else {
+        return;
+    };
+    if let Some(false) = result.get("success").and_then(Value::as_bool) {
+        return;
+    }
+    let content = result.get("content").and_then(Value::as_str).unwrap_or("");
+    if content.trim().is_empty() {
+        return;
+    }
+    let message = result.get("message").and_then(Value::as_str).unwrap_or("");
+    let Some(raw_path) = parse_path_from_message(message) else {
+        return;
+    };
+    let Some(norm_path) = normalize_snapshot_path(&raw_path) else {
+        return;
+    };
+    snap.files.insert(norm_path, content.to_string());
+}
+
 /// Risultato della pipeline ZIP scan: indici delle entry chiave.
 #[derive(Default)]
 struct ArchiveIndex {
@@ -83,10 +381,9 @@ struct ArchiveIndex {
 /// Punto di ingresso pipeline (vedi modulo doc).
 fn extract_figma(bytes: &[u8], limits: AttachmentLimits) -> Result<Value, String> {
     // Caso 1: non-ZIP → fallback diretto su payload binario (file `.fig` raw).
+    // Politica "mai troncare-e-buttare": processiamo l'INTERO payload.
     if bytes.len() < 4 || &bytes[0..4] != b"PK\x03\x04" {
-        let payload_max = limits.figma_max_bytes;
-        let payload = &bytes[..bytes.len().min(payload_max)];
-        return Ok(build_legacy_binary_result(payload));
+        return Ok(build_legacy_binary_result(bytes));
     }
 
     // Caso 2: ZIP. Apri e indicizza entry note.
@@ -109,7 +406,7 @@ fn extract_figma(bytes: &[u8], limits: AttachmentLimits) -> Result<Value, String
         )?;
         let ai_chat_truncated = ai_chat_bytes.truncated;
 
-        let chat_result = parse_ai_chat(&ai_chat_bytes.bytes, &limits)?;
+        let chat_result = parse_ai_chat(&ai_chat_bytes.bytes)?;
 
         let meta_summary = meta.as_ref().map(summarize_meta).unwrap_or(json!(null));
         let thumbnail_available = index.thumbnail_idx.is_some();
@@ -142,8 +439,11 @@ fn extract_figma(bytes: &[u8], limits: AttachmentLimits) -> Result<Value, String
         }))
     } else if let Some(canvas_idx) = index.canvas_idx {
         // Caso 2b: solo canvas.fig → legacy binary fallback.
+        // Politica "mai troncare-e-buttare": leggiamo l'INTERA entry; il cap
+        // passato e' solo la guardia anti-OOM estrema (non un cap di contenuto).
         let payload =
-            read_entry_to_bytes(&mut archive, canvas_idx, limits.figma_max_bytes)?.bytes;
+            read_entry_to_bytes(&mut archive, canvas_idx, limits.figma_make_ai_chat_max_load_bytes)?
+                .bytes;
         let mut v = build_legacy_binary_result(&payload);
         if let Some(obj) = v.as_object_mut() {
             obj.insert("extracted_strings_fallback".into(), Value::Bool(true));
@@ -250,20 +550,13 @@ struct ChatParseResult {
 /// `{ "threads": [ { "messages": [ { "role": "user|assistant",
 ///    "parts": [ { "partType": "text", "contentJson": "{\"text\":\"...\"}" } ] } ] } ] }`.
 /// Tutti i livelli sono tollerati a mancare; un parse error top-level e' propagato.
-fn parse_ai_chat(
-    bytes: &[u8],
-    limits: &AttachmentLimits,
-) -> Result<ChatParseResult, String> {
+fn parse_ai_chat(bytes: &[u8]) -> Result<ChatParseResult, String> {
     let root: Value = serde_json::from_slice(bytes)
         .map_err(|e| format!("parse ai_chat.json fallito: {e}"))?;
 
-    let max_count = limits.figma_make_chat_messages_max_count;
-    let max_chars = limits.figma_make_chat_messages_max_chars;
-    let assistant_cap = limits.figma_make_assistant_message_max_chars;
-
+    // Politica "mai troncare-e-buttare": estraiamo TUTTI i messaggi (user +
+    // assistant) per intero, nessun cap su numero/caratteri.
     let mut out: Vec<ChatMessage> = Vec::new();
-    let mut cumulative_chars: usize = 0;
-    let mut truncated = false;
 
     let threads = root
         .get("threads")
@@ -271,7 +564,7 @@ fn parse_ai_chat(
         .cloned()
         .unwrap_or_default();
 
-    'outer: for thread in threads {
+    for thread in threads {
         let messages = thread
             .get("messages")
             .and_then(Value::as_array)
@@ -323,25 +616,8 @@ fn parse_ai_chat(
                 continue;
             }
 
-            // Truncatura per-messaggio: solo assistant (i user prompt sono
-            // la sorgente autoritativa, non vanno mai persi a meta').
-            if role == "assistant" && buf.chars().count() > assistant_cap {
-                let truncated_text: String = buf.chars().take(assistant_cap).collect();
-                buf = format!("{truncated_text}\n[... messaggio assistant troncato ...]");
-            }
-
-            let added = buf.len();
-            if cumulative_chars.saturating_add(added) > max_chars {
-                truncated = true;
-                break 'outer;
-            }
-            cumulative_chars += added;
+            // Nessun cap: il messaggio (user o assistant) viene preso per intero.
             out.push(ChatMessage { role, text: buf });
-
-            if out.len() >= max_count {
-                truncated = true;
-                break 'outer;
-            }
         }
     }
 
@@ -349,13 +625,265 @@ fn parse_ai_chat(
     Ok(ChatParseResult {
         messages: out,
         count,
-        truncated,
+        // Politica "mai troncare-e-buttare": il thread non viene mai troncato.
+        truncated: false,
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FASE 1 "resa Figma Make" — estrazione del code-snapshot finale.
+//
+// Un .make NON contiene solo la specifica chat: dentro `ai_chat.json` ci sono
+// gia' tutte le scritture file dell'app React/TS/Tailwind, salvate come
+// sequenza di chiamate-tool nei messaggi (`fast_apply_tool`, `write_tool`,
+// ecc.). Ricostruendo l'ultima versione per ogni path si ottiene il
+// filesystem finale dell'app. Lo scriviamo su disco (non nel contesto del
+// modello) per non saturare la context window con ~289 KB di codice.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Code-snapshot ricostruito dal thread: path relativo -> contenuto finale.
+/// L'ordine dei messaggi nel JSON e' cronologico, quindi l'ultima scrittura
+/// per ogni path vince (edit log incrementale).
+#[derive(Default)]
+struct CodeSnapshot {
+    /// path normalizzato (senza leading "/") -> contenuto.
+    files: std::collections::BTreeMap<String, String>,
+    /// true se il parsing si e' fermato perche' ai_chat era troncato al load
+    /// o per limiti: il manifest segnala il risultato come parziale.
+    partial: bool,
+}
+
+/// `toolName` noti che rappresentano una scrittura file con `resultJson.content`.
+const FILE_WRITE_TOOL_NAMES: &[&str] = &[
+    "fast_apply_tool",
+    "edit_tool",
+    "write_tool",
+    "create_file_tool",
+    "write_file_tool",
+    "edit_file_tool",
+];
+
+/// Estrae il path dal campo `message` tipo
+/// "Successfully updated the file at /src/app/X.tsx." -> "/src/app/X.tsx".
+/// Ritorna `None` se il pattern non c'e' o il path appare sporco.
+fn parse_path_from_message(message: &str) -> Option<String> {
+    // Cerca "file at " (case-insensitive sul prefisso comune).
+    let lower = message.to_lowercase();
+    let marker = "file at ";
+    let pos = lower.find(marker)?;
+    let after = &message[pos + marker.len()..];
+    // Il path termina al primo newline; togliamo eventuale punto finale e spazi.
+    let raw = after.lines().next().unwrap_or(after).trim();
+    let raw = raw.trim_end_matches('.').trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Scarta path sporchi: spazi interni (i path validi non ne hanno), frasi
+    // di fallback note, caratteri di controllo.
+    if raw.contains(' ')
+        || raw.contains('\t')
+        || raw.to_lowercase().contains("make sure")
+        || raw.to_lowercase().contains("fall back")
+        || raw.chars().any(|c| c.is_control())
+    {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// Normalizza un path: rimuove leading "/" e backslash, mantiene la struttura
+/// relativa. Ritorna `None` se diventa vuoto o tenta path traversal.
+fn normalize_snapshot_path(raw: &str) -> Option<String> {
+    let cleaned = raw.replace('\\', "/");
+    let cleaned = cleaned.trim_start_matches('/').trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    // Rifiuta traversal: la guardia di scrittura lo bloccherebbe comunque, ma
+    // scartarlo qui tiene il manifest pulito.
+    if cleaned.split('/').any(|seg| seg == ".." || seg == ".") {
+        return None;
+    }
+    Some(cleaned.to_string())
+}
+
+/// Itera i messaggi del thread e ricostruisce il filesystem finale.
+/// Tollerante a JSON parziale: ogni livello mancante viene saltato senza
+/// errore (un `ai_chat.json` troncato al load produce comunque i file
+/// completi gia' incontrati prima del troncamento).
+fn extract_make_code_snapshot(ai_chat: &Value, ai_chat_truncated: bool) -> CodeSnapshot {
+    let mut snap = CodeSnapshot {
+        partial: ai_chat_truncated,
+        ..Default::default()
+    };
+
+    let Some(threads) = ai_chat.get("threads").and_then(Value::as_array) else {
+        return snap;
+    };
+
+    for thread in threads {
+        let Some(messages) = thread.get("messages").and_then(Value::as_array) else {
+            continue;
+        };
+        for msg in messages {
+            let Some(parts) = msg.get("parts").and_then(Value::as_array) else {
+                continue;
+            };
+            for part in parts {
+                let Some(content_json) = part.get("contentJson").and_then(Value::as_str) else {
+                    continue;
+                };
+                // contentJson e' una STRINGA che contiene JSON.
+                let Ok(outer) = serde_json::from_str::<Value>(content_json) else {
+                    continue;
+                };
+                let tool_name = outer.get("toolName").and_then(Value::as_str).unwrap_or("");
+                if !FILE_WRITE_TOOL_NAMES.contains(&tool_name) {
+                    continue;
+                }
+                // resultJson e' anch'esso una STRINGA con JSON dentro.
+                let Some(result_str) = outer.get("resultJson").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Ok(result) = serde_json::from_str::<Value>(result_str) else {
+                    continue;
+                };
+                // success: se presente deve essere true; se assente, tolleriamo.
+                if let Some(false) = result.get("success").and_then(Value::as_bool) {
+                    continue;
+                }
+                let content = result.get("content").and_then(Value::as_str).unwrap_or("");
+                if content.trim().is_empty() {
+                    continue;
+                }
+                let message = result.get("message").and_then(Value::as_str).unwrap_or("");
+                let Some(raw_path) = parse_path_from_message(message) else {
+                    continue;
+                };
+                let Some(norm_path) = normalize_snapshot_path(&raw_path) else {
+                    continue;
+                };
+                // L'ultima occorrenza vince (insert sovrascrive).
+                snap.files.insert(norm_path, content.to_string());
+            }
+        }
+    }
+
+    snap
+}
+
+/// Scansiona i `content` estratti per individuare i package npm esterni
+/// importati. Esclude import relativi (`./`, `../`) e bare path locali.
+fn detect_dependencies(files: &std::collections::BTreeMap<String, String>) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut deps: BTreeSet<String> = BTreeSet::new();
+
+    for content in files.values() {
+        for line in content.lines() {
+            let trimmed = line.trim_start();
+            // Match grezzo ma robusto su `from "<pkg>"` / `from '<pkg>'`.
+            if let Some(pkg) = extract_import_source(trimmed) {
+                if pkg.starts_with('.') || pkg.starts_with('/') {
+                    continue;
+                }
+                if let Some(name) = package_root_name(&pkg) {
+                    deps.insert(name);
+                }
+            }
+        }
+    }
+    deps.into_iter().collect()
+}
+
+/// Estrae la sorgente di un import/require da una riga: il contenuto tra
+/// virgolette dopo `from` o dentro `require(...)` / `import(...)`.
+fn extract_import_source(line: &str) -> Option<String> {
+    let needle = if line.contains(" from ") {
+        " from "
+    } else if line.starts_with("import ") && line.contains('"') || line.contains('\'') {
+        // forme `import "pkg"` / dynamic import / require
+        ""
+    } else {
+        return None;
+    };
+
+    let rest = if needle.is_empty() {
+        line
+    } else {
+        line.split(needle).nth(1)?
+    };
+    // Trova la prima stringa tra ' o ".
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '"' || c == '\'' {
+            let quote = c;
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] as char != quote {
+                j += 1;
+            }
+            if j <= bytes.len() {
+                return Some(rest[start..j].to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Riduce un import specifier al nome del package npm radice.
+/// `lucide-react/icons` -> `lucide-react`; `@scope/pkg/sub` -> `@scope/pkg`.
+fn package_root_name(spec: &str) -> Option<String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = spec.split('/').collect();
+    let name = if spec.starts_with('@') {
+        if parts.len() >= 2 {
+            format!("{}/{}", parts[0], parts[1])
+        } else {
+            parts[0].to_string()
+        }
+    } else {
+        parts[0].to_string()
+    };
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Individua gli entrypoint noti tra i path estratti.
+fn detect_entrypoints(files: &std::collections::BTreeMap<String, String>) -> Vec<String> {
+    const ENTRY_BASENAMES: &[&str] = &[
+        "app.tsx",
+        "app.jsx",
+        "main.tsx",
+        "main.jsx",
+        "index.tsx",
+        "index.jsx",
+        "routes.tsx",
+        "routes.jsx",
+        "index.html",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for path in files.keys() {
+        let base = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+        if ENTRY_BASENAMES.contains(&base.as_str()) {
+            out.push(path.clone());
+        }
+    }
+    out
 }
 
 /// Output JSON per fallback `figma_binary_legacy`.
 fn build_legacy_binary_result(payload: &[u8]) -> Value {
-    let strings = extract_readable_strings(payload, MIN_STRING_LEN, MAX_STRINGS);
+    // Politica "mai troncare-e-buttare": estraiamo TUTTE le stringhe leggibili.
+    let strings = extract_readable_strings(payload, MIN_STRING_LEN);
     json!({
         "format": "figma_binary_legacy",
         "size_bytes": payload.len(),
@@ -369,33 +897,30 @@ fn build_legacy_binary_result(payload: &[u8]) -> Value {
     })
 }
 
-/// Pre-extract inline (FIX 3 ADR 0012): produce un testo formattato da
-/// includere nel prompt iniziale, gia' tradotto in markdown leggibile.
-/// La firma e' invariata per backward-compat con `chat_messages.rs`.
+/// Estrazione inline per indicizzazione RAG: produce un testo formattato in
+/// markdown leggibile dal contenuto Figma.
 ///
 /// Per Figma Make: emette il thread chat (priorita' assoluta).
 /// Per Figma legacy: emette le strings estratte.
+///
+/// Politica "mai troncare-e-buttare": restituisce il render INTEGRALE; il
+/// chunking lato RAG indicizza tutto il contenuto.
 pub async fn extract_figma_strings_inline(
     file_path: &std::path::Path,
-    max_chars: usize,
 ) -> Result<String, String> {
     let bytes = tokio::fs::read(file_path)
         .await
         .map_err(|e| format!("read figma '{}' fallita: {e}", file_path.display()))?;
 
-    // Limiti safe per la pre-extract: indipendenti dal DB (la pre-extract
-    // gira in hot path al primo messaggio, non vogliamo aggiungere round-trip
-    // a settings). Usiamo i safe_defaults della cache: valori identici a
-    // quanto la cache servirebbe se il DB e' down.
+    // Parametri safe indipendenti dal DB (hot path al primo messaggio): usiamo i
+    // safe_defaults, che contengono solo la guardia anti-OOM (non cap contenuto).
     let limits = AttachmentLimits::safe_defaults();
 
-    let result =
-        tokio::task::spawn_blocking(move || extract_figma(&bytes, limits))
-            .await
-            .map_err(|e| format!("spawn_blocking fallita: {e}"))??;
+    let result = tokio::task::spawn_blocking(move || extract_figma(&bytes, limits))
+        .await
+        .map_err(|e| format!("spawn_blocking fallita: {e}"))??;
 
-    let text = render_inline(&result);
-    Ok(truncate_to(text, max_chars))
+    Ok(render_inline(&result))
 }
 
 /// Render testuale del result JSON per inclusione nel prompt.
@@ -492,22 +1017,10 @@ fn render_inline(value: &Value) -> String {
     out
 }
 
-fn truncate_to(mut s: String, max_chars: usize) -> String {
-    if s.len() <= max_chars {
-        return s;
-    }
-    // Trunca a confine UTF-8.
-    let mut cut = max_chars;
-    while !s.is_char_boundary(cut) && cut > 0 {
-        cut -= 1;
-    }
-    s.truncate(cut);
-    s.push_str("\n[... pre-extract Figma troncata ...]");
-    s
-}
-
 /// Estrae sequenze di byte ASCII stampabili (>= `min_len`).
-fn extract_readable_strings(bytes: &[u8], min_len: usize, max: usize) -> Vec<String> {
+/// Politica "mai troncare-e-buttare": restituisce TUTTE le stringhe leggibili,
+/// nessun cap sul numero.
+fn extract_readable_strings(bytes: &[u8], min_len: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
     for &b in bytes {
@@ -516,14 +1029,11 @@ fn extract_readable_strings(bytes: &[u8], min_len: usize, max: usize) -> Vec<Str
             current.push(b as char);
         } else if current.len() >= min_len {
             out.push(std::mem::take(&mut current));
-            if out.len() >= max {
-                break;
-            }
         } else {
             current.clear();
         }
     }
-    if current.len() >= min_len && out.len() < max {
+    if current.len() >= min_len {
         out.push(current);
     }
     out
@@ -594,7 +1104,9 @@ mod tests {
     }
 
     #[test]
-    fn figma_make_truncates_by_count() {
+    fn figma_make_extracts_all_messages_no_count_cap() {
+        // Politica "mai troncare-e-buttare": tutti i 40 messaggi devono uscire,
+        // mai un cap di conteggio.
         let mut msgs = String::new();
         for i in 0..40 {
             msgs.push_str(&format!(
@@ -604,15 +1116,15 @@ mod tests {
         msgs.pop();
         let body = format!(r#"{{"threads":[{{"messages":[{msgs}]}}]}}"#);
         let zip = make_ai_chat_zip(&body, false, false);
-        let mut l = limits();
-        l.figma_make_chat_messages_max_count = 5;
-        let v = extract_figma(&zip, l).expect("extract");
-        assert_eq!(v["chat_messages_count"], 5);
-        assert_eq!(v["chat_messages_truncated"], true);
+        let v = extract_figma(&zip, limits()).expect("extract");
+        assert_eq!(v["chat_messages_count"], 40);
+        assert_eq!(v["chat_messages_truncated"], false);
     }
 
     #[test]
-    fn figma_make_assistant_message_capped() {
+    fn figma_make_assistant_message_not_capped() {
+        // Politica "mai troncare-e-buttare": il messaggio assistant lungo deve
+        // uscire INTEGRALE, nessuna truncatura per-messaggio.
         let long = "x".repeat(5000);
         let body = format!(
             r#"{{"threads":[{{"messages":[
@@ -620,12 +1132,10 @@ mod tests {
             ]}}]}}"#
         );
         let zip = make_ai_chat_zip(&body, false, false);
-        let mut l = limits();
-        l.figma_make_assistant_message_max_chars = 100;
-        let v = extract_figma(&zip, l).expect("extract");
+        let v = extract_figma(&zip, limits()).expect("extract");
         let text = v["chat_messages"][0]["text"].as_str().unwrap();
-        assert!(text.len() < 500, "assistant truncated, got {} chars", text.len());
-        assert!(text.contains("troncato"));
+        assert_eq!(text.chars().count(), 5000, "assistant integrale, niente cap");
+        assert!(!text.contains("troncato"));
     }
 
     #[test]
@@ -669,6 +1179,129 @@ mod tests {
         }
         let err = extract_figma(&buf, limits()).unwrap_err();
         assert!(err.contains("Archivio Figma non riconosciuto"));
+    }
+
+    // ── FASE 1: estrazione code-snapshot ──────────────────────────────────
+
+    /// Costruisce il `contentJson` (stringa JSON) di una scrittura file
+    /// fast_apply_tool, con `resultJson` (stringa JSON) annidata.
+    fn file_write_part(tool: &str, path: &str, content: &str, success: bool) -> String {
+        let result = serde_json::json!({
+            "success": success,
+            "message": format!("Successfully updated the file at {path}."),
+            "content": content,
+        })
+        .to_string();
+        let outer = serde_json::json!({
+            "toolCallId": "tc-1",
+            "toolName": tool,
+            "resultJson": result,
+        })
+        .to_string();
+        // Il part wrappa contentJson come stringa.
+        serde_json::json!({ "contentJson": outer }).to_string()
+    }
+
+    fn make_code_ai_chat() -> String {
+        // Ordine cronologico: v1 di App.tsx, poi BookingPage, poi v2 di App.tsx
+        // (deve vincere), poi un path sporco (da scartare), poi content vuoto.
+        let p1 = file_write_part(
+            "fast_apply_tool",
+            "/src/app/App.tsx",
+            "export default function App(){ return null }",
+            true,
+        );
+        let p2 = file_write_part(
+            "fast_apply_tool",
+            "/src/app/pages/BookingPage.tsx",
+            "import { useState } from \"react\";\nimport { toast } from \"sonner\";\nexport function BookingPage(){}",
+            true,
+        );
+        let p3 = file_write_part(
+            "write_tool",
+            "/src/app/App.tsx",
+            "import React from \"react\";\nimport { Routes } from \"./routes\";\nexport default function App(){ return <Routes/> }",
+            true,
+        );
+        let dirty = file_write_part(
+            "fast_apply_tool",
+            "/src/app/Bad.tsx Make sure to fall back",
+            "should be discarded",
+            true,
+        );
+        let empty = file_write_part("fast_apply_tool", "/src/app/Empty.tsx", "   ", true);
+        format!(
+            r#"{{"threads":[{{"messages":[
+                {{"parts":[{p1}]}},
+                {{"parts":[{p2}]}},
+                {{"parts":[{p3}]}},
+                {{"parts":[{dirty}]}},
+                {{"parts":[{empty}]}}
+            ]}}]}}"#
+        )
+    }
+
+    #[test]
+    fn extract_snapshot_keeps_last_version_and_discards_dirty() {
+        let body = make_code_ai_chat();
+        let root: Value = serde_json::from_str(&body).expect("ai_chat valido");
+        let snap = extract_make_code_snapshot(&root, false);
+
+        // App.tsx presente con la SECONDA versione (write_tool), BookingPage
+        // presente, path sporco e content vuoto scartati.
+        assert_eq!(snap.files.len(), 2, "attesi 2 file, trovati {:?}", snap.files.keys().collect::<Vec<_>>());
+        let app = snap.files.get("src/app/App.tsx").expect("App.tsx presente");
+        assert!(app.contains("Routes"), "deve vincere la v2 (write_tool)");
+        assert!(snap.files.contains_key("src/app/pages/BookingPage.tsx"));
+        assert!(!snap.partial);
+    }
+
+    #[test]
+    fn detect_dependencies_excludes_relative() {
+        let body = make_code_ai_chat();
+        let root: Value = serde_json::from_str(&body).expect("ai_chat valido");
+        let snap = extract_make_code_snapshot(&root, false);
+        let deps = detect_dependencies(&snap.files);
+        // react e sonner sono esterni; "./routes" e' relativo -> escluso.
+        assert!(deps.contains(&"react".to_string()), "deps={deps:?}");
+        assert!(deps.contains(&"sonner".to_string()), "deps={deps:?}");
+        assert!(!deps.iter().any(|d| d.starts_with('.')), "deps={deps:?}");
+    }
+
+    #[test]
+    fn detect_entrypoints_finds_app() {
+        let body = make_code_ai_chat();
+        let root: Value = serde_json::from_str(&body).expect("ai_chat valido");
+        let snap = extract_make_code_snapshot(&root, false);
+        let entry = detect_entrypoints(&snap.files);
+        assert!(entry.contains(&"src/app/App.tsx".to_string()), "entry={entry:?}");
+    }
+
+    #[test]
+    fn extract_code_from_make_zip_roundtrip() {
+        // ai_chat con code-snapshot dentro uno ZIP .make sintetico.
+        let body = make_code_ai_chat();
+        let zip = make_ai_chat_zip(&body, true, true);
+        let snap = extract_code_from_make(&zip, limits()).expect("estrazione code");
+        assert_eq!(snap.files.len(), 2);
+        assert!(snap.files.contains_key("src/app/App.tsx"));
+    }
+
+    #[test]
+    fn package_root_name_handles_scoped() {
+        assert_eq!(package_root_name("lucide-react/icons").as_deref(), Some("lucide-react"));
+        assert_eq!(package_root_name("@radix-ui/react-dialog/sub").as_deref(), Some("@radix-ui/react-dialog"));
+        assert_eq!(package_root_name("react").as_deref(), Some("react"));
+    }
+
+    #[test]
+    fn parse_path_from_message_rejects_dirty() {
+        assert_eq!(
+            parse_path_from_message("Successfully updated the file at /src/app/X.tsx.").as_deref(),
+            Some("/src/app/X.tsx")
+        );
+        assert!(parse_path_from_message("Successfully updated the file at /src/X.tsx Make sure to fall back").is_none());
+        assert!(parse_path_from_message("nothing here").is_none());
     }
 
     #[test]
