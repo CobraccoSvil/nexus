@@ -6,12 +6,12 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: cdd1589822b0955e72efeec44499813a32ad2602
+source_commit: 8ce41156da2df56495aaed76d7c9cf53937f9e38
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-30T06:47:33Z
+updated_at: 2026-05-30T08:27:19Z
 nexus_meta_version: 1
 ---
 
@@ -137,6 +137,7 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0117_loop_fallback_purpose_model.sql` | Purpose model usato per auto-escalation quando il brain rileva loop tool-use. |
 | `0118_more_mcp_stdio_catalog.sql` | Estende il catalogo curato con MCP stdio standard @modelcontextprotocol/server-*. |
 | `0119_conversation_summaries.sql` | 0119_conversation_summaries.sql |
+| `0120_exploration_loop_threshold.sql` | Migrazione 0120: settings.agent.exploration_loop_threshold |
 | `0120_routing_token_threshold.sql` | 0120_routing_token_threshold.sql |
 | `0121_anthropic_batches.sql` | 0121_anthropic_batches.sql |
 | `0122_mcp_tools_embedding.sql` | 0122_mcp_tools_embedding.sql |
@@ -219,7 +220,10 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0200_rag_unified.sql` | Migrazione 0200: RAG strutturale unificato (ADR 0015). |
 | `0201_anthropic_default_model.sql` | 0201_anthropic_default_model.sql |
 | `0202_intent_deterministic_fallback_thresholds.sql` | 0202: soglie per il classificatore deterministico di fallback intent |
+| `0203_purpose_model_tier.sql` | Migrazione 0203: risoluzione tier-based per nexus_purpose_model. |
+| `0204_orchestrator_worker_prompts.sql` | Migrazione 0204: prompt per la modalita' "orchestrator-worker". |
+| `0205_orchestrator_adaptive_settings.sql` | Migrazione 0205: settings per worker-mode (PR-C) e attivazione adattiva (PR-D). |
 
-**Totale**: 198 migrazioni.
+**Totale**: 202 migrazioni.
 
-Ultima migrazione: `0202_intent_deterministic_fallback_thresholds.sql`.
+Ultima migrazione: `0205_orchestrator_adaptive_settings.sql`.

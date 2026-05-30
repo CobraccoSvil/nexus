@@ -19,6 +19,7 @@ from .nodes import (
 )
 from .planner_node import planner_node, configure as _configure_planner
 from .verifier_node import verifier_node, configure as _configure_verifier
+from .understanding_node import understanding_node, configure as _configure_understanding
 from .clarify_or_expand_node import (
     clarify_or_expand_node,
     configure as _configure_clarify,
@@ -121,8 +122,9 @@ def create_agent_graph(
         logger.warning("create_agent_graph: routing_client non disponibile (planner sara' inattivo): %s", exc)
         _routing_client = None
     _configure_planner(providers=providers, tool_runner=tool_runner, routing_client=_routing_client)
-    _configure_verifier(tool_runner=tool_runner)
+    _configure_verifier(tool_runner=tool_runner, providers=providers, routing_client=_routing_client)
     _configure_clarify(providers=providers, routing_client=_routing_client)
+    _configure_understanding(providers=providers, tool_runner=tool_runner, routing_client=_routing_client)
 
     # Crea il grafo con lo schema di stato
     workflow: StateGraph = StateGraph(AgentState)
@@ -130,6 +132,7 @@ def create_agent_graph(
     # Aggiunge nodi
     workflow.add_node("router", router_node)  # type: ignore[arg-type]
     workflow.add_node("clarify_or_expand", clarify_or_expand_node)  # type: ignore[arg-type]
+    workflow.add_node("understanding", understanding_node)  # type: ignore[arg-type]
     workflow.add_node("planner", planner_node)  # type: ignore[arg-type]
     workflow.add_node("executor", executor_node)  # type: ignore[arg-type]
     workflow.add_node("tool_dispatch", tool_dispatch_node)  # type: ignore[arg-type]
@@ -144,18 +147,25 @@ def create_agent_graph(
     workflow.add_edge("router", "clarify_or_expand")
 
     # Dopo clarify_or_expand:
-    #   - se ha emesso una richiesta di chiarimento → END (turno si ferma,
-    #     l'utente risponde nel turno successivo).
-    #   - altrimenti → route_after_router (planner o executor).
+    #   - se ha emesso una richiesta di chiarimento → END (turno si ferma).
+    #   - altrimenti → understanding (Cluster 2). Il nodo understanding e'
+    #     pass-through se disabilitato/non complesso: in quel caso il routing
+    #     verso planner/executor avviene comunque dopo, via route_after_router.
     def _route_after_clarify_or_expand(state: AgentState) -> str:
         if state.get("pending_clarify"):
             return "end"
-        return route_after_router(state)
+        return "understanding"
 
     workflow.add_conditional_edges(
         "clarify_or_expand",
         _route_after_clarify_or_expand,
-        {"end": END, "planner": "planner", "executor": "executor"},
+        {"end": END, "understanding": "understanding"},
+    )
+    # Dopo understanding (pass-through se OFF): routing standard planner/executor.
+    workflow.add_conditional_edges(
+        "understanding",
+        route_after_router,
+        {"planner": "planner", "executor": "executor"},
     )
     # Il planner emette il piano e poi passa il controllo all'executor.
     workflow.add_edge("planner", "executor")

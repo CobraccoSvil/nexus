@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from typing import Any
 
@@ -33,6 +34,12 @@ from . import meta_steps, orchestrator_config, prompt_registry, todo_store
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
+
+# Stesso endpoint interno no-auth gia' usato da nodes._build_kb_rag_context:
+# riusiamo il servizio di ricerca vettoriale esistente (regola di integrazione),
+# niente client Qdrant nuovo.
+_MCP_CORE_INTERNAL_URL = os.environ.get("MCP_CORE_INTERNAL_URL", "http://localhost:4000")
+_RATIONALE_SNIPPET_MAX = 400
 
 # Servizi iniettati al configure_services() — riusiamo gli stessi singletoni
 # del resto del package (vedi nodes.py:configure_services).
@@ -207,6 +214,27 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
                         },
                     },
                     "planner_model": {"type": "string"},
+                    # Cluster 1: contesto decisionale tramandato all'executor.
+                    "rationale": {
+                        "type": "string",
+                        "description": "Razionale/strategia del piano: perche' questi todos in quest'ordine, assunzioni chiave.",
+                    },
+                    "constraints": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Vincoli/non-goal che hanno guidato il design del piano.",
+                    },
+                    "alternatives": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "option": {"type": "string"},
+                                "rejected_because": {"type": "string"},
+                            },
+                        },
+                        "description": "Approcci alternativi considerati e perche' scartati.",
+                    },
                 },
                 "required": ["action", "run_id", "todos"],
             },
@@ -221,6 +249,32 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
         system_text
         + f"\n\nRUN_ID corrente: {run_id} (usalo come parametro run_id nel tool nexus_todo_write)"
     )
+    # Cluster 2: inietta il context_brief del nodo understanding (se prodotto).
+    _brief = str(state.get("context_brief") or "").strip()
+    if _brief:
+        hinted_system += (
+            "\n\n<comprensione_preliminare>\n"
+            "Contesto raccolto prima di pianificare (grounding sul codebase + "
+            "esplorazioni). Usalo per un piano fondato, non assunzioni alla cieca.\n"
+            + _brief
+            + "\n</comprensione_preliminare>"
+        )
+
+    # Cluster 1: inietta decisioni passate (RAG) per coerenza + chiede il razionale.
+    decision_ctx = _retrieve_decision_context(state)
+    if decision_ctx:
+        hinted_system += (
+            "\n\n" + decision_ctx
+            + "\n\nNel tool nexus_todo_write popola anche i campi rationale, "
+            "constraints e alternatives: spiega perche' questo piano, quali "
+            "vincoli/non-goal, e quali approcci hai scartato e perche'."
+        )
+    elif orchestrator_config.plan_rationale_enabled():
+        hinted_system += (
+            "\n\nNel tool nexus_todo_write popola anche i campi rationale, "
+            "constraints e alternatives (razionale del piano, vincoli, "
+            "alternative scartate)."
+        )
 
     # ── LLM call attraverso registry sync (riusa cascade M60) ───────────────
     import asyncio as _asyncio
@@ -316,6 +370,25 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
     if plan_meta:
         meta_steps.persist_async(run_id, plan_meta)
 
+    # ── Cluster 1: estrai rationale/constraints/alternatives dal tool_input ──
+    plan_rationale = ""
+    plan_constraints: list = []
+    plan_alternatives: list = []
+    if orchestrator_config.plan_rationale_enabled():
+        plan_rationale = str(tool_input.get("rationale") or "").strip()
+        raw_constraints = tool_input.get("constraints") or []
+        if isinstance(raw_constraints, list):
+            plan_constraints = [str(c).strip() for c in raw_constraints if str(c).strip()]
+        raw_alts = tool_input.get("alternatives") or []
+        if isinstance(raw_alts, list):
+            plan_alternatives = [a for a in raw_alts if isinstance(a, dict)]
+        # Ri-vettorializza come nota decision (chiude il ciclo RAG). Best-effort.
+        if plan_rationale:
+            await _persist_rationale_as_note(
+                state, run_id, str(session_id),
+                plan_rationale, plan_constraints, plan_alternatives,
+            )
+
     # Costruzione assistant message + tool_result message per continuity
     # della conversazione (cosi' il prossimo turno dell'executor vede il plan).
     assistant_content = meta.get("assistant_content")
@@ -350,7 +423,121 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
         "planner_sticky_provider": used_provider,
         "planner_sticky_model": used_model,
         "meta_steps": plan_meta_list,
+        # Cluster 1: contesto decisionale per l'executor (vuoto se flag OFF).
+        "plan_rationale": plan_rationale or None,
+        "plan_constraints": plan_constraints,
+        "plan_alternatives": plan_alternatives,
     }
+
+
+def _retrieve_decision_context(state: AgentState) -> str:
+    """Cluster 1: recupera decisioni passate (note intent=decision) via il
+    servizio di ricerca vettoriale esistente (/api/internal/knowledge/search),
+    per informare il razionale del planner. Best-effort, mai solleva.
+
+    Riusa lo stesso endpoint di nodes._build_kb_rag_context (regola di
+    integrazione: nessun client embedding/Qdrant nuovo).
+    """
+    if not orchestrator_config.plan_rationale_enabled():
+        return ""
+    project_id = str(state.get("project_id") or "").strip()
+    if not project_id:
+        return ""
+    # Testo query = ultimo messaggio utente.
+    messages = state.get("messages") or []
+    query_text = ""
+    for m in reversed(messages):
+        content = getattr(m, "content", None)
+        if isinstance(content, str) and content.strip():
+            query_text = content.strip()
+            break
+    if len(query_text) < 10:
+        return ""
+    try:
+        import requests  # noqa: PLC0415
+        resp = requests.post(
+            f"{_MCP_CORE_INTERNAL_URL}/api/internal/knowledge/search",
+            json={
+                "project_id": project_id,
+                "query": query_text,
+                "top_k": orchestrator_config.plan_rationale_rag_topk(),
+                "min_score": orchestrator_config.plan_rationale_min_score(),
+            },
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return ""
+        results = resp.json().get("results", []) or []
+    except Exception as exc:
+        logger.debug("planner_node: decision RAG fallito: %s", exc)
+        return ""
+
+    # Privilegia note intent=decision; se assenti, usa comunque i top match.
+    decisions = [r for r in results if (r.get("intent") or "") == "decision"]
+    chosen = decisions or results
+    if not chosen:
+        return ""
+    lines: list[str] = []
+    for r in chosen:
+        title = str(r.get("title") or "").strip()
+        snippet = str(r.get("snippet") or "").strip()
+        if len(snippet) > _RATIONALE_SNIPPET_MAX:
+            snippet = snippet[: _RATIONALE_SNIPPET_MAX - 3] + "..."
+        score = float(r.get("score") or 0)
+        lines.append(
+            f'  <decisione score="{score:.2f}">\n'
+            f'    <titolo>{title}</titolo>\n'
+            f'    <contenuto>{snippet}</contenuto>\n'
+            f'  </decisione>'
+        )
+    logger.info("planner_node: decision RAG iniettato (%d note)", len(lines))
+    return (
+        "<decisioni_passate>\n"
+        "  <!-- Decisioni/contesto gia' presi in passato su task simili.\n"
+        "       Usali per coerenza: non ri-decidere cio' che e' gia' deciso. -->\n"
+        + "\n".join(lines)
+        + "\n</decisioni_passate>"
+    )
+
+
+async def _persist_rationale_as_note(
+    state: AgentState, run_id: str, session_id: str,
+    rationale: str, constraints: list, alternatives: list,
+) -> None:
+    """Cluster 1: ri-vettorializza il razionale come nota intent=decision via il
+    tool MCP knowledge_create_note (che fa embed+upsert Qdrant lato Rust).
+    Chiude il ciclo RAG. Gated + best-effort.
+    """
+    if not orchestrator_config.plan_rationale_persist_as_note():
+        return
+    if not rationale or _tool_runner is None:
+        return
+    body_parts = [rationale.strip()]
+    if constraints:
+        body_parts.append("\n\n## Vincoli\n" + "\n".join(f"- {c}" for c in constraints))
+    if alternatives:
+        alt_lines = []
+        for a in alternatives:
+            if isinstance(a, dict):
+                alt_lines.append(f"- {a.get('option','?')}: scartata perche' {a.get('rejected_because','?')}")
+        if alt_lines:
+            body_parts.append("\n\n## Alternative scartate\n" + "\n".join(alt_lines))
+    title = f"Decisione di piano (run {str(run_id)[:8]})"
+    try:
+        await _tool_runner.execute_tool(
+            tool_name="knowledge_create_note",
+            tool_input={
+                "title": title[:200],
+                "body_md": "".join(body_parts),
+                "intent": "decision",
+                "tags": ["plan", "auto", "rationale"],
+            },
+            session_id=str(session_id),
+            tool_use_id=str(uuid.uuid4()),
+        )
+        logger.info("planner_node: rationale persistito come nota decision (run=%s)", str(run_id)[:8])
+    except Exception as exc:
+        logger.debug("planner_node: persist rationale come nota fallito: %s", exc)
 
 
 async def _detect_clarifications(state: AgentState, cfg: dict) -> dict[str, Any] | None:

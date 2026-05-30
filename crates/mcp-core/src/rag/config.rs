@@ -34,6 +34,11 @@ impl RagConfig {
             SourceKind::ChatHistory => &self.collection_chat_history,
             SourceKind::ToolResult => &self.collection_tool_results,
             SourceKind::Code => "code_embeddings",
+            // Collection legacy (nomi fissi, come Code): popolate da
+            // vector_memory.rs, payload eterogeneo gestito in search.rs.
+            SourceKind::MetaDoc => "nexus_meta_docs",
+            SourceKind::Conversation => "conversation_context",
+            SourceKind::PromptCorrection => "prompt_corrections",
         }
     }
 }

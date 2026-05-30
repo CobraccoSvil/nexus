@@ -1937,6 +1937,29 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     tools_json = state.get("tools_json") or []
     system_text = state.get("system_text") or ""
 
+    # ── Cluster 1: iniezione plan_rationale nel system_text ───────────────────
+    # Se il planner ha prodotto un razionale (gated plan_rationale_enabled),
+    # lo prependiamo al system_text dell'executor: cosi' chi esegue conosce il
+    # "perche'" del piano, i vincoli e le alternative scartate (continuita'
+    # semantica planner->executor). Vuoto/flag OFF => nessun effetto.
+    if state.get("plan_rationale"):
+        _rat = str(state.get("plan_rationale") or "").strip()
+        _constraints = state.get("plan_constraints") or []
+        _alternatives = state.get("plan_alternatives") or []
+        _block = ["<piano_razionale>", _rat]
+        if _constraints:
+            _block.append("Vincoli/non-goal: " + "; ".join(str(c) for c in _constraints))
+        if _alternatives:
+            _alts = [
+                f"{a.get('option','?')} (scartata: {a.get('rejected_because','?')})"
+                for a in _alternatives if isinstance(a, dict)
+            ]
+            if _alts:
+                _block.append("Alternative scartate: " + "; ".join(_alts))
+        _block.append("</piano_razionale>")
+        system_text = "\n".join(_block) + "\n\n" + system_text
+        logger.info("executor_node: plan_rationale iniettato (%d char)", len(_rat))
+
     # ── PR-C: worker-mode (orchestrator-worker puro) ──────────────────────────
     # Solo nel run PRINCIPALE (subagent_depth 0/None): dentro un worker
     # (subagent_depth >= 1) NON si applica restrizione, altrimenti il worker

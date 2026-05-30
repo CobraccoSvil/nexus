@@ -102,6 +102,21 @@ async fn create_plan(
         .cloned()
         .unwrap_or_else(|| json!([]));
 
+    // Cluster 1: contesto decisionale del planner (mig 0206). Best-effort:
+    // colonne nullable con default, se assenti dal payload restano vuote.
+    let plan_rationale = input
+        .get("rationale")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let plan_constraints = input
+        .get("constraints")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let plan_alternatives = input
+        .get("alternatives")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+
     let mut tx = match ctx.db.begin().await {
         Ok(t) => t,
         Err(e) => return err(&format!("begin tx fallita: {e}")),
@@ -109,11 +124,16 @@ async fn create_plan(
 
     // Upsert del plan (PRIMARY KEY = run_id, quindi ON CONFLICT su run_id).
     let plan_res = sqlx::query(
-        r#"INSERT INTO nexus_agent_plans (run_id, project_id, thread_id, acceptance_criteria, planner_model)
-           VALUES ($1, $2, $3, $4, $5)
+        r#"INSERT INTO nexus_agent_plans
+             (run_id, project_id, thread_id, acceptance_criteria, planner_model,
+              rationale, constraints, alternatives)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
            ON CONFLICT (run_id) DO UPDATE SET
              acceptance_criteria = EXCLUDED.acceptance_criteria,
              planner_model = EXCLUDED.planner_model,
+             rationale = EXCLUDED.rationale,
+             constraints = EXCLUDED.constraints,
+             alternatives = EXCLUDED.alternatives,
              plan_revisions = nexus_agent_plans.plan_revisions"#,
     )
     .bind(run_id)
@@ -121,6 +141,9 @@ async fn create_plan(
     .bind(&thread_id)
     .bind(&plan_acceptance)
     .bind(planner_model)
+    .bind(plan_rationale)
+    .bind(&plan_constraints)
+    .bind(&plan_alternatives)
     .execute(&mut *tx)
     .await;
     if let Err(e) = plan_res {

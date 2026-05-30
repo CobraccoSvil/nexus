@@ -102,11 +102,15 @@ pub async fn search_semantic(
     for kind in kinds {
         let collection = cfg.collection_for(kind).to_string();
         let mut filters: Vec<(String, Value)> = Vec::new();
+        // Filtri per-kind: alcune collection legacy non hanno project_id
+        // (Conversation usa session_id; MetaDoc e' globale).
         if let Some(p) = project_id {
-            filters.push(("project_id".to_string(), json!(p.to_string())));
+            if kind.supports_project_filter() {
+                filters.push(("project_id".to_string(), json!(p.to_string())));
+            }
         }
         if let Some(s) = session_id {
-            if matches!(kind, SourceKind::ChatHistory) {
+            if kind.uses_session_filter() {
                 filters.push(("session_id".to_string(), json!(s.to_string())));
             }
         }
@@ -135,14 +139,26 @@ pub async fn search_semantic(
         };
         for h in hits {
             let p = h.payload;
+            // Estrazione testo flessibile: il RAG framework usa `chunk_text`,
+            // ma le collection legacy hanno schemi diversi (conversation_context
+            // -> `content`, nexus_meta_docs -> `body_md`/`title`,
+            // prompt_corrections -> `correction`/`text`). Proviamo in ordine.
             let chunk_text = p
                 .get("chunk_text")
+                .or_else(|| p.get("content"))
+                .or_else(|| p.get("body_md"))
+                .or_else(|| p.get("correction"))
+                .or_else(|| p.get("text"))
+                .or_else(|| p.get("title"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
             let chunk_index = p.get("chunk_index").and_then(|v| v.as_i64()).unwrap_or(0);
+            // source_id: prova source_id, poi note_id/id specifici delle legacy.
             let source_id = p
                 .get("source_id")
+                .or_else(|| p.get("note_id"))
+                .or_else(|| p.get("doc_id"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();

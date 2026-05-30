@@ -65,6 +65,23 @@ _KEYS = (
     "subagents_enabled",
     "auto_delegation_enabled",
     "max_parallel_subagents",
+    # Cluster 1: plan_rationale + RAG
+    "plan_rationale_enabled",
+    "plan_rationale_rag_topk",
+    "plan_rationale_min_score",
+    "plan_rationale_persist_as_note",
+    # Cluster 3: verifica esplorativa RAG-informed
+    "exploratory_verify_enabled",
+    "exploratory_verify_max_cycles",
+    "exploratory_verify_topk",
+    "exploratory_verify_min_score",
+    # Cluster 2: nodo understanding
+    "understanding_enabled",
+    "understanding_fanout_enabled",
+    "understanding_synthesize_enabled",
+    "understanding_topk",
+    "understanding_min_token_budget",
+    "understanding_max_explore",
 )
 
 # Default conservativi: feature OFF se DB irraggiungibile.
@@ -96,6 +113,23 @@ _SAFE_DEFAULTS: dict[str, Any] = {
     "subagents_enabled": True,
     "auto_delegation_enabled": True,
     "max_parallel_subagents": 3,
+    # Cluster 1: plan_rationale + RAG (OFF di default)
+    "plan_rationale_enabled": False,
+    "plan_rationale_rag_topk": 5,
+    "plan_rationale_min_score": 0.55,
+    "plan_rationale_persist_as_note": False,
+    # Cluster 3: verifica esplorativa (OFF di default)
+    "exploratory_verify_enabled": False,
+    "exploratory_verify_max_cycles": 1,
+    "exploratory_verify_topk": 5,
+    "exploratory_verify_min_score": 0.5,
+    # Cluster 2: nodo understanding (OFF di default)
+    "understanding_enabled": False,
+    "understanding_fanout_enabled": False,
+    "understanding_synthesize_enabled": False,
+    "understanding_topk": 8,
+    "understanding_min_token_budget": 3000,
+    "understanding_max_explore": 3,
 }
 
 _lock = threading.RLock()
@@ -252,6 +286,22 @@ def adaptive_gating_enabled() -> bool:
 
 def subagents_enabled() -> bool:
     return bool(get()["subagents_enabled"])
+
+
+def plan_rationale_enabled() -> bool:
+    return bool(get()["plan_rationale_enabled"])
+
+
+def plan_rationale_rag_topk() -> int:
+    return int(get()["plan_rationale_rag_topk"])
+
+
+def plan_rationale_min_score() -> float:
+    return float(get()["plan_rationale_min_score"])
+
+
+def plan_rationale_persist_as_note() -> bool:
+    return bool(get()["plan_rationale_persist_as_note"])
 
 
 def auto_delegation_enabled() -> bool:

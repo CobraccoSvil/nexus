@@ -30,12 +30,17 @@ logger = logging.getLogger(__name__)
 
 # Servizi iniettati
 _tool_runner = None
+_providers = None
+_routing_client = None
 
 
-def configure(tool_runner: Any) -> None:
-    """Inject del ToolRunnerClient gRPC."""
-    global _tool_runner
+def configure(tool_runner: Any, providers: Any = None, routing_client: Any = None) -> None:
+    """Inject del ToolRunnerClient gRPC + (Cluster 3) provider registry e
+    routing client per la verifica esplorativa LLM economica."""
+    global _tool_runner, _providers, _routing_client
     _tool_runner = tool_runner
+    _providers = providers
+    _routing_client = routing_client
 
 
 async def verifier_node(state: AgentState) -> dict[str, Any]:
@@ -114,11 +119,40 @@ async def verifier_node(state: AgentState) -> dict[str, Any]:
         active_todo_id, cycle, all_passed, len(results), duration_ms,
     )
 
+    # ── Cluster 3: verifica esplorativa RAG-informed (additiva, gated) ───────
+    # Solo se i criteri deterministici sono passati: un passo LLM economico
+    # cerca anomalie NON coperte dai criterion pre-definiti, informato dai
+    # pattern di fallimento passati (RAG). Il deterministico resta primario:
+    # al cap si promuove comunque.
+    if all_passed and bool(cfg.get("exploratory_verify_enabled")):
+        expl_cap = int(cfg.get("exploratory_verify_max_cycles", 1) or 1)
+        expl_cycle = int(state.get("exploratory_verify_cycle", 0) or 0)
+        if expl_cycle < expl_cap:
+            expl_ok, expl_finding = await _run_exploratory_check(state, todo, results, ctx, cfg)
+            if not expl_ok and expl_finding:
+                logger.info("verifier_node: verifica esplorativa ha trovato un'anomalia non coperta")
+                hint = (
+                    f"<verifica_esplorativa cycle=\"{expl_cycle + 1}/{expl_cap}\">\n"
+                    f"I criteri deterministici passano, ma un controllo aggiuntivo ha "
+                    f"rilevato un possibile problema non coperto:\n{expl_finding}\n"
+                    f"Valuta se correggerlo prima di considerare il todo completato.\n"
+                    f"</verifica_esplorativa>"
+                )
+                return {
+                    "messages": [HumanMessage(content=hint)],
+                    "verify_cycle": cycle,
+                    "exploratory_verify_cycle": expl_cycle + 1,
+                    "stop_reason": "tool_use",
+                    "pending_tool_uses": [],
+                }
+            # passato o niente finding: prosegui come completato.
+
     # ── Branch su esito ───────────────────────────────────────────────────
     if all_passed:
         _mark_todo_status(active_todo_id, "completed")
         advance = _advance_or_end(run_id)
         advance["verify_cycle"] = 0
+        advance["exploratory_verify_cycle"] = 0
         return advance
 
     max_cycles = int(cfg["max_verify_cycles"])
@@ -166,6 +200,90 @@ async def verifier_node(state: AgentState) -> dict[str, Any]:
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────
+
+
+async def _run_exploratory_check(
+    state: AgentState, todo: dict, results: list[dict], ctx: dict, cfg: dict,
+) -> tuple[bool, str]:
+    """Cluster 3: verifica esplorativa LLM economica RAG-informed.
+
+    Ritorna (ok, finding): ok=True se nessun problema; ok=False + finding se
+    rileva un'anomalia non coperta dai criteri deterministici. Best-effort:
+    su qualunque errore ritorna (True, "") per non bloccare (deterministico
+    primario). Usa SOLO servizi Nexus esistenti: nexus_search_semantic (RAG
+    fallimenti) + purpose_model('exploratory_verify') + provider registry.
+    """
+    if _providers is None or _routing_client is None:
+        return True, ""
+    todo_content = str(todo.get("content") or "").strip()
+    if not todo_content:
+        return True, ""
+
+    # 1. RAG dei fallimenti passati via il tool semantico esistente (kb +
+    #    chat_history catturano correzioni/problemi gia' incontrati). Niente
+    #    client Qdrant nuovo (condizione di integrazione).
+    past_failures = ""
+    try:
+        if _tool_runner is not None:
+            topk = int(cfg.get("exploratory_verify_topk", 5) or 5)
+            res = await _tool_runner.execute_tool(
+                tool_name="nexus_search_semantic",
+                tool_input={
+                    "query": f"problemi o errori ricorrenti su: {todo_content}",
+                    "source_kinds": ["kb", "chat_history"],
+                    "top_k": topk,
+                },
+                session_id=str(ctx.get("session_id") or ""),
+                tool_use_id=str(uuid.uuid4()),
+            )
+            raw = getattr(res, "result_json", None) or "{}"
+            hits = (json.loads(raw).get("hits") or [])[:topk]
+            past_failures = "\n".join(
+                f"- {str(h.get('chunk_text') or '')[:200]}" for h in hits if h.get("chunk_text")
+            )
+    except Exception as exc:
+        logger.debug("verifier_node: RAG fallimenti skip (%s)", exc)
+
+    # 2. Risolvi il modello economico via purpose model (regola G).
+    try:
+        decision = _routing_client.purpose_model(purpose="exploratory_verify")
+        provider, model = decision.provider, decision.model
+        if not provider or provider.startswith("__"):
+            return True, ""
+    except Exception as exc:
+        logger.debug("verifier_node: purpose_model(exploratory_verify) fallito (%s)", exc)
+        return True, ""
+
+    # 3. Chiamata LLM economica: ispeziona l'esito e segnala SOLO problemi
+    #    concreti non gia' coperti dai criteri deterministici (gia' passati).
+    crit_summary = "; ".join(str(r.get("type")) for r in results) or "(nessuno)"
+    prompt = (
+        "Sei un revisore di qualita'. Un task e' stato completato e i controlli "
+        "automatici deterministici sono PASSATI.\n\n"
+        f"Task: {todo_content}\n"
+        f"Controlli gia' verificati (NON ripeterli): {crit_summary}\n"
+    )
+    if past_failures:
+        prompt += f"\nProblemi ricorrenti su task simili (dalla memoria):\n{past_failures}\n"
+    prompt += (
+        "\nEsiste un problema CONCRETO non coperto dai controlli sopra "
+        "(es. effetto collaterale, caso limite ignorato, incoerenza)? "
+        "Rispondi in una riga: se tutto ok scrivi esattamente 'OK'. "
+        "Altrimenti scrivi 'PROBLEMA: <descrizione sintetica>'."
+    )
+    try:
+        result = await __import__("asyncio").to_thread(
+            _providers.generate_completion, provider, model, prompt
+        )
+        text = (getattr(result, "content", "") or "").strip()
+    except Exception as exc:
+        logger.debug("verifier_node: LLM esplorativo fallito (%s)", exc)
+        return True, ""
+
+    if text.upper().startswith("PROBLEMA"):
+        finding = text.split(":", 1)[1].strip() if ":" in text else text
+        return False, finding[:500]
+    return True, ""
 
 
 def _advance_or_end(run_id: str) -> dict[str, Any]:

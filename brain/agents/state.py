@@ -112,11 +112,26 @@ class AgentState(TypedDict, total=False):
     acceptance_criteria: list[dict]
     # ID del todo "attivo" (in_progress o primo pending). Aggiornato dal verifier in PR-2.
     active_todo_id: str | None
+    # ── Cluster 1 (plan_rationale): contesto decisionale del planner forte ──
+    # Popolati dal planner_node (gated plan_rationale_enabled); iniettati
+    # dall'executor nel system_text per non perdere il "perche'" tra le fasi.
+    plan_rationale: str | None
+    plan_constraints: list[str] | None
+    plan_alternatives: list[dict] | None
+    # Contesto RAG (decisioni/interazioni passate) recuperato PRIMA di pianificare.
+    plan_rationale_context: str | None
+    # ── Cluster 2 (nodo understanding): comprensione pre-planning ──
+    # context_brief: grounding semantico + esplorazioni, iniettato nel planner.
+    context_brief: str | None
+    understanding_active: bool
+    understanding_skip_reason: str | None
     # Contatore per il reminder injection: incrementato in tool_dispatch_node,
     # reset post-injection. Soglia in orchestrator.todo_reminder_every_n_steps.
     since_last_todo_reminder: int
     # PR-2: ciclo verifier corrente per active_todo (reset a 0 ad ogni todo).
     verify_cycle: int
+    # Cluster 3: ciclo della verifica esplorativa LLM (cap dedicato, reset per todo).
+    exploratory_verify_cycle: int
     # PR-2: ultimo risultato del verifier (criteria_results).
     verifier_last_result: dict | None
     # PR-2: contatore revisioni strutturali del plan (cap max_plan_revisions).

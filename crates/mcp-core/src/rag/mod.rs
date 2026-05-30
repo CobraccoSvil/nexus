@@ -24,6 +24,11 @@ pub enum SourceKind {
     ChatHistory,
     ToolResult,
     Code,
+    // Mini-PR: collection legacy esposte tramite il canale unico
+    // nexus_search_semantic. Payload eterogeneo gestito in search.rs.
+    MetaDoc,
+    Conversation,
+    PromptCorrection,
 }
 
 impl SourceKind {
@@ -34,6 +39,9 @@ impl SourceKind {
             SourceKind::ChatHistory => "chat_history",
             SourceKind::ToolResult => "tool_result",
             SourceKind::Code => "code",
+            SourceKind::MetaDoc => "meta_doc",
+            SourceKind::Conversation => "conversation",
+            SourceKind::PromptCorrection => "prompt_correction",
         }
     }
 
@@ -44,8 +52,22 @@ impl SourceKind {
             "chat_history" => Some(SourceKind::ChatHistory),
             "tool_result" => Some(SourceKind::ToolResult),
             "code" => Some(SourceKind::Code),
+            "meta_doc" => Some(SourceKind::MetaDoc),
+            "conversation" => Some(SourceKind::Conversation),
+            "prompt_correction" => Some(SourceKind::PromptCorrection),
             _ => None,
         }
+    }
+
+    /// True se la collection del kind ha `project_id` nel payload (filtrabile).
+    /// Conversation usa session_id; MetaDoc e' globale (nessun filtro project).
+    pub fn supports_project_filter(&self) -> bool {
+        !matches!(self, SourceKind::Conversation | SourceKind::MetaDoc)
+    }
+
+    /// True se il kind filtra per session_id (chat conversazionali).
+    pub fn uses_session_filter(&self) -> bool {
+        matches!(self, SourceKind::ChatHistory | SourceKind::Conversation)
     }
 }
 

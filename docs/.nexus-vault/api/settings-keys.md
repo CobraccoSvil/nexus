@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: cdd1589822b0955e72efeec44499813a32ad2602
+source_commit: 8ce41156da2df56495aaed76d7c9cf53937f9e38
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-30T06:47:35Z
+updated_at: 2026-05-30T08:27:20Z
 nexus_meta_version: 1
 ---
 
@@ -50,6 +50,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.context.drop_unused_base64_age` | `3` | Soglia (n messaggi successivi) entro la quale verificare se un blob base64 di un tool_result vecchio viene citato testualmente. Se non viene citato, il body base64 viene sostituito con un placeholder. FIX C. |
 | `agent.context.predictive_cap_ratio` | `0.5` | Soglia (0.3-0.9) sul context_window del modello: se context_attuale + stima_tool_result supera ratio*context_window, la chiamata al tool viene intercettata e sostituita da tool_result sintetico di errore. FIX D. |
 | `agent.enforce_port_allocation` | `true` | Se true, write_file/edit_file rifiutano sorgenti con porte TCP hardcoded fuori dal bucket Nexus 20000-39999 (vedi ADR 0010). |
+| `agent.exploration_loop_threshold` | `6` | Numero di chiamate consecutive a tool di sola esplorazione (lettura/ispezione allegati e file) oltre il quale l'executor inietta un nudge verso la scrittura; a 2x la soglia abortisce. Una call produttiva (write_file, edit_file, run_command, request_port, ...) azzera il contatore. Intero >= 1. |
 | `agent.iteration_budget.base` | `60` | Numero base iterazioni LangGraph per ogni run agente. Sommato a per_complexity_point*complexity_score. |
 | `agent.iteration_budget.max` | `300` | Tetto massimo iterazioni anche per task molto complessi. Safety net runaway. |
 | `agent.iteration_budget.per_complexity_point` | `4` | Iterazioni aggiuntive per ogni punto di complessita del prompt (score 0-100). |
@@ -257,6 +258,10 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 | Chiave | Valore default | Descrizione |
 |---|---|---|
+| `orchestrator.adaptive_agentic_score_min` | `0.7` | Soglia di agentic_score sopra la quale attivare il planner forte. |
+| `orchestrator.adaptive_classifier_enabled` | `false` | Se true, router_node invoca il classifier agentico LLM e scrive complexity/agentic_score/is_ambiguous nello state. |
+| `orchestrator.adaptive_gating_enabled` | `false` | Se true, is_eligible_adaptive usa i segnali del classifier per gate-are il planner forte (oltre ai gate hard budget/behavior). |
+| `orchestrator.adaptive_low_confidence_max` | `0.5` | Soglia di confidence sotto la quale (incertezza) attivare il planner forte. |
 | `orchestrator.clarify.confidence_threshold` | `0.6` | Soglia di confidence sotto cui il nodo si attiva. Sopra -> bypass. |
 | `orchestrator.clarify.enabled` | `true` | Feature flag globale per il clarify_or_expand_node. Off -> nodo no-op. |
 | `orchestrator.clarify.max_question_chars` | `280` | Cap di lunghezza della domanda di chiarimento prima del troncamento. |
@@ -285,6 +290,8 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `orchestrator.todo_reminder_min_todos` | `3` | Sotto questa soglia di todos pending nessun reminder iniettato (anti-spam chat brevi). |
 | `orchestrator.verifier_enabled` | `true` | Feature flag globale per il verifier_node (PR-2). Indipendente dal planner. |
 | `orchestrator.verifier_timeout_s` | `30.0` | Timeout singolo criterion check (PR-2). |
+| `orchestrator.worker_mode_enabled` | `false` | Se true, nel run principale (subagent_depth=0) dopo il planner l'executor usa il prompt agent.orchestrator.base e tool ridotti: delega ai worker invece di implementare inline. |
+| `orchestrator.worker_mode_tool_whitelist` | `list_files,read_file,search_in_files,recall_context,searc...` | Tool consentiti all'orchestratore in worker-mode (CSV). Solo lettura/coordinamento + delega; niente write/exec (li fanno i worker). |
 
 ## `project`
 
@@ -346,7 +353,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `default_model` | `claude-sonnet-4-6` | Default model for chat |
 | `default_provider` | `anthropic` | Default LLM provider |
 | `max_token_budget` | `32000` | Maximum token budget allowed |
-| `model_catalog_last_sync` | `2026-05-30T06:37:30.859398113+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
+| `model_catalog_last_sync` | `2026-05-30T07:23:35.367696169+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
 | `nexus_active_routing_pct` | `50` | Percentuale di richieste chat gestite dal router Q-Learning Nexus (0=off, 100=tutto). A/B testing: imposta 10-50 per un rollout graduale. |
 | `nexus_behavior_mode` | `dinamico` | Modalità comportamento Nexus: veloce|economica|bilanciata|approfondita |
 | `provider_hierarchy` | `anthropic,openai,google,deepseek,mistral` | Ordered fallback chain for chat providers |
@@ -401,4 +408,4 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 ---
 
-**Totale chiavi**: 254
+**Totale chiavi**: 261
