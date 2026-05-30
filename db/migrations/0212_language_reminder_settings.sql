@@ -1,4 +1,4 @@
--- Migrazione 0114: reminder lingua resiliente al contesto/profilo (bug #88)
+-- Migrazione 0212: reminder lingua resiliente al contesto/profilo (bug #88)
 --
 -- Bug #88: a contesto saturo (es. 747% ctx, 400K-1M token) i modelli small
 -- (es. openai/gpt-4o-mini) rispondono in cinese invece che in italiano e

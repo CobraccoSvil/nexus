@@ -1,4 +1,4 @@
--- Migrazione 0120: settings.agent.exploration_loop_threshold
+-- Migrazione 0213: settings.agent.exploration_loop_threshold
 --
 -- Soglia DB-driven per la loop-detection SEMANTICA dell'executor (Python:
 -- brain/agents/nodes.py, _load_exploration_loop_threshold).
