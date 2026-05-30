@@ -73,6 +73,17 @@ export function ProjectExplorer({
   const tc = useThemeColors();
   const [nodesByPath, setNodesByPath] = useState<TreeMap>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  // Ref sempre aggiornato a `expanded`: serve a `refreshAll` (useCallback con
+  // deps stabili) per leggere lo stato corrente delle directory espanse senza
+  // incorrere in stale closure ne' ricreare la callback ad ogni toggle.
+  const expandedRef = useRef<Record<string, boolean>>(expanded);
+  expandedRef.current = expanded;
+  // Traccia l'id del progetto applicato all'ultimo reset dell'albero: il reset
+  // di `expanded`/`nodesByPath` deve avvenire SOLO quando cambia davvero il
+  // progetto, non ad ogni nuova reference di `initialNodes` (che il parent
+  // rigenera dopo ogni op file via onFileTreeChanged). Senza questo guard,
+  // ogni delete/create/rename collassava l'albero appena ricaricato.
+  const appliedProjectIdRef = useRef<string | undefined>(undefined);
   const [loadingPaths, setLoadingPaths] = useState<Record<string, boolean>>({});
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const [modal, setModal] = useState<ModalState>(null);
@@ -116,10 +127,19 @@ export function ProjectExplorer({
     if (!project) {
       setNodesByPath({});
       setExpanded({});
+      appliedProjectIdRef.current = undefined;
       return;
     }
-    setNodesByPath({ "": initialNodes ?? [] });
-    setExpanded({ "": true });
+    if (appliedProjectIdRef.current !== project.id) {
+      // Cambio progetto reale: reset completo dell'albero.
+      appliedProjectIdRef.current = project.id;
+      setNodesByPath({ "": initialNodes ?? [] });
+      setExpanded({ "": true });
+    } else {
+      // Stesso progetto, `initialNodes` aggiornato (es. dopo un'op file):
+      // aggiorna solo i nodi root, preservando `expanded` e le subdir caricate.
+      setNodesByPath((prev) => ({ ...prev, "": initialNodes ?? prev[""] ?? [] }));
+    }
   }, [project, project?.id, initialNodes]);
 
   // Fix M36: polling lieve sulla root ogni 8s per rilevare nuovi file/dir
@@ -139,9 +159,9 @@ export function ProjectExplorer({
             current.length !== response.nodes.length ||
             current.some((n, i) => n.path !== response.nodes[i]?.path);
           if (!changed) return prev;
-          // Invalida le subdir per forzare reload al prossimo expand
-          const next: TreeMap = { "": response.nodes };
-          return next;
+          // Aggiorna solo la root preservando le subdir gia' caricate, cosi'
+          // le cartelle espanse non si svuotano durante il polling.
+          return { ...prev, "": response.nodes };
         });
       } catch {
         // Best-effort: ignora errori transitori (auth/network)
@@ -165,12 +185,67 @@ export function ProjectExplorer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project?.id]);
 
-  const refreshAll = useCallback(async () => {
+  // Ricarica la root E tutte le directory attualmente espanse, preservando lo
+  // stato visivo dell'albero (le cartelle aperte restano aperte e mostrano i
+  // contenuti aggiornati). Sostituisce il vecchio comportamento che azzerava
+  // `nodesByPath` alla sola root: cosi' le subdir espanse perdevano i nodi e
+  // l'albero sembrava contrarsi dopo delete/create/rename.
+  //
+  // `deletedPath` (opzionale): path appena eliminato. Se era una directory
+  // espansa va rimosso da `expanded`/`nodesByPath`; se la chiamata di reload
+  // per un path fallisce (path non piu' esistente dopo il delete) lo escludiamo
+  // e lo togliamo da `expanded`.
+  //
+  // Stale closure: leggiamo le directory espande da `expandedRef.current`
+  // (aggiornato ad ogni render) invece che dalla closure, mantenendo le deps
+  // della callback stabili per non rompere gli altri consumer (polling root,
+  // evento `nexus:explorer:refresh`).
+  const refreshAll = useCallback(async (deletedPath?: string) => {
     if (!project?.id) return;
     try {
-      const response = await getProjectTree(project.id, "");
-      // Invalida tutte le subdir gia' caricate: il prossimo expand le ricaricava.
-      setNodesByPath({ "": response.nodes });
+      const currentExpanded = expandedRef.current;
+      // Path da ricaricare: root + ogni directory espansa, escluso il path
+      // eliminato (e i suoi discendenti) se passato.
+      const expandedPaths = Object.keys(currentExpanded).filter((p) => {
+        if (!currentExpanded[p]) return false;
+        if (!deletedPath) return true;
+        return p !== deletedPath && !p.startsWith(`${deletedPath}/`);
+      });
+      const pathsToLoad = Array.from(new Set<string>(["", ...expandedPaths]));
+
+      const results = await Promise.all(
+        pathsToLoad.map(async (p) => {
+          try {
+            const response = await getProjectTree(project.id, p);
+            return { path: p, nodes: response.nodes, ok: true as const };
+          } catch {
+            // Path non piu' esistente (es. dir eliminata) o errore transitorio.
+            return { path: p, nodes: [] as WorkspaceTreeNode[], ok: false as const };
+          }
+        }),
+      );
+
+      const nextNodes: TreeMap = {};
+      const failedPaths = new Set<string>();
+      for (const r of results) {
+        if (r.ok) nextNodes[r.path] = r.nodes;
+        else if (r.path !== "") failedPaths.add(r.path);
+      }
+      setNodesByPath(nextNodes);
+
+      // Pulisci `expanded` dai path non piu' esistenti (delete o reload fallito).
+      if (failedPaths.size > 0 || deletedPath) {
+        setExpanded((prev) => {
+          const next: Record<string, boolean> = {};
+          for (const [p, v] of Object.entries(prev)) {
+            if (failedPaths.has(p)) continue;
+            if (deletedPath && (p === deletedPath || p.startsWith(`${deletedPath}/`))) continue;
+            next[p] = v;
+          }
+          return next;
+        });
+      }
+
       onFileTreeChanged?.();
     } catch {
       // ignora
@@ -321,7 +396,9 @@ export function ProjectExplorer({
     try {
       await deleteProjectEntry(project.id, node.path);
       onFileDeleted?.(node.path);
-      await refreshAll();
+      // Passa il path eliminato: se era una directory espansa va rimosso da
+      // expanded/nodesByPath; se era un file la cartella padre resta espansa.
+      await refreshAll(node.path);
     } catch (err) {
       await alertDialog({
         title: "Cancellazione fallita",
