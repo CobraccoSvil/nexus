@@ -154,6 +154,7 @@ def create_agent_graph(
             "tool_dispatch": "tool_dispatch",
             "verifier": "verifier",
             "learner": "reflection",
+            "executor": "executor",
         },
     )
     # tool_dispatch rientra nell'executor per un'altra iterazione.

@@ -50,6 +50,18 @@ async-trait = "0.1"
 once_cell = "1.20"
 tiberius = { version = "0.12", features = ["rustls", "tds73"], default-features = false }
 tokio-util = { version = "0.7", features = ["compat"] }
+# Ingestion intelligente allegati (ADR 0011): magic byte detection + parser
+# archivi/documenti. Usati dai tool nexus_inspect_attachment,
+# nexus_list_archive_entries, nexus_extract_pdf_text, ecc.
+infer = "0.16"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = "1"
+pdf-extract = "0.7"
+quick-xml = "0.36"
+# LRU cache per deduplica letture allegati (read_cache, vedi ADR 0012).
+# 256 entry, TTL 5 min configurabile via setting agent.attachment.read_cache_ttl_seconds.
+lru = "0.12"
 
 [dev-dependencies]
 tempfile = "3"

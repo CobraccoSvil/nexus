@@ -13,6 +13,7 @@ import { SimilarRequestBanner } from "./knowledge/similar-request-banner";
 import { fallbackContextWindow } from "../lib/context-window";
 import { useThemeColors } from "../lib/theme";
 import { useI18n } from "../lib/i18n";
+import { ModalPortal } from "./modal-portal";
 import { useGlobalDialog } from "./global-dialog-provider";
 import { FeedbackErrorDialog } from "./feedback-error-dialog";
 import { IconButton } from "./icon-button";
@@ -118,6 +119,104 @@ function AgentPreparingBubble({ tc }: { tc: Record<string, string> }) {
       <span style={{ color: tc.textMuted, fontSize: 11, opacity: 0.7 }}>
         {seconds}s
       </span>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* ThinkingBlock  — ragionamento intermedio del modello                 */
+/* ------------------------------------------------------------------ */
+
+function ThinkingBlock({ text, tc }: { text: string; tc: Record<string, string> }) {
+  const [expanded, setExpanded] = useState(false);
+  // Scroll automatico a fondo quando arriva una nuova riga di thinking.
+  // Garantisce che il pannello mostri sempre l-ultimo pensiero, sia con il
+  // blocco collassato (preview limitato) sia espanso.
+  const preRef = useRef<HTMLPreElement | null>(null);
+  useEffect(() => {
+    const el = preRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [text, expanded]);
+
+  /* Mostra solo le ultime 4 righe se collassato */
+  const lines = text.split("\n");
+  const preview = lines.length > 4 ? lines.slice(-4).join("\n") : text;
+
+  return (
+    <div
+      style={{
+        padding: "10px 14px",
+        borderRadius: 10,
+        background: tc.bgCard,
+        border: `1px solid ${tc.border}`,
+        alignSelf: "flex-start",
+        maxWidth: "80%",
+        fontSize: 13,
+        lineHeight: 1.5,
+      }}
+    >
+      {/* Intestazione cliccabile */}
+      <div
+        onClick={() => setExpanded((e) => !e)}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          cursor: "pointer",
+          userSelect: "none",
+          marginBottom: 6,
+        }}
+      >
+        <span
+          style={{
+            width: 8,
+            height: 8,
+            borderRadius: "50%",
+            background: "#a78bfa",
+            animation: "pulse 1.4s ease-in-out infinite",
+            flexShrink: 0,
+          }}
+        />
+        <span style={{ color: tc.textMuted, fontSize: 12, fontWeight: 600 }}>
+          Ragionamento Nexus
+        </span>
+        <span style={{ color: tc.textMuted, fontSize: 11, opacity: 0.6 }}>
+          {expanded ? "▲" : "▼"}
+        </span>
+      </div>
+
+      {/* Contenuto */}
+      <pre
+        ref={preRef}
+        style={{
+          margin: 0,
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+          color: tc.textMuted,
+          fontSize: 12,
+          fontFamily: "inherit",
+          maxHeight: expanded ? "none" : 100,
+          overflow: expanded ? "visible" : "hidden",
+          opacity: 0.85,
+        }}
+      >
+        {expanded ? text : preview}
+      </pre>
+
+      {!expanded && lines.length > 4 && (
+        <span
+          onClick={() => setExpanded(true)}
+          style={{
+            color: "#a78bfa",
+            fontSize: 11,
+            cursor: "pointer",
+            marginTop: 4,
+            display: "inline-block",
+          }}
+        >
+          Mostra tutto ({lines.length} righe)
+        </span>
+      )}
     </div>
   );
 }
@@ -341,7 +440,7 @@ export function ChatPanel({
   const {
     messages, isLoading, isReady, isReconnecting, error, busyByMessage,
     agentRun, agentSteps, agentRuns, agentStepsMap, metaStepsMap,
-    tokenUsage, traces, streamingToken,
+    tokenUsage, traces, streamingToken, thinkingText,
     attachmentIndexProposal, clearAttachmentIndexProposal, applyAttachmentsIndexed,
     send, resend, remove, feedbackError, feedbackPositive, positiveFeedback,
     confirmAgent, cancelRun,
@@ -796,7 +895,7 @@ export function ChatPanel({
         continue;
       }
       // Classifica binario: mime-type "binary" tipico (zip/pdf/exe/audio/video)
-      // O file.text() che contiene NULL bytes ( ) — incompatibili con
+      // O file.text() che contiene NULL bytes (U+0000) — incompatibili con
       // jsonb di Postgres che li rifiuta con "unsupported Unicode escape
       // sequence". I file binari vanno inviati come base64; testo come UTF-8.
       const mt = (file.type || "").toLowerCase();
@@ -826,7 +925,7 @@ export function ChatPanel({
         // Detect NULL bytes nei primi 8KB — segnale chiaro che e' binario
         // anche se mime e' generico (es. application/octet-stream o vuoto).
         const sample = textContent.slice(0, 8192);
-        if (sample.indexOf(" ") !== -1) {
+        if (sample.indexOf("\0") !== -1) {
           isBinary = true;
         }
       }
@@ -1309,6 +1408,14 @@ export function ChatPanel({
           {/* P3: Indicatore progresso inline — visibile durante esecuzione con step */}
           {isAgentRunning && agentSteps.length > 0 && (
             <AgentProgressInline tc={tc} steps={agentSteps} />
+          )}
+
+          {/* Blocco thinking Nexus: ragionamento interno (router, executor,
+              tool decisions, reasoning provider). Visibile sia durante
+              run agent sia durante chat semplice; mostrato in append,
+              scroll automatico. Si svuota su nuovo invio o fine run. */}
+          {thinkingText && (
+            <ThinkingBlock text={thinkingText} tc={tc} />
           )}
 
           {agentRun && (agentRun.status === "running" || agentRun.status === "awaiting_confirmation") && (
@@ -1899,6 +2006,7 @@ function AttachmentIndexDialog({
   };
 
   return (
+    <ModalPortal>
     <div
       role="dialog"
       aria-modal="true"
@@ -2056,5 +2164,6 @@ function AttachmentIndexDialog({
         </div>
       </div>
     </div>
+    </ModalPortal>
   );
 }

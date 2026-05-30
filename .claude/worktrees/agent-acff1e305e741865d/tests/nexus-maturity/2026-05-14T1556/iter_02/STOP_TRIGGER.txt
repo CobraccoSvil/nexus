@@ -1,0 +1,12 @@
+[2026-05-14T17:49:08+02:00] VIOLATION_EMOJI
+
+/home/administrator/ideai/projects/nexus-maturity-rental-2026-05-14T1556/backend/node_modules/ts-jest/node_modules/type-fest/source/replace.d.ts:45:replace('hello ?', '?', '🦄');
+/home/administrator/ideai/projects/nexus-maturity-rental-2026-05-14T1556/backend/node_modules/ts-jest/node_modules/type-fest/source/replace.d.ts:46://=> 'hello 🦄'
+/home/administrator/ideai/projects/nexus-maturity-rental-2026-05-14T1556/backend/node_modules/ts-jest/node_modules/type-fest/source/replace.d.ts:48:replace('hello ??', '?', '❓');
+/home/administrator/ideai/projects/nexus-maturity-rental-2026-05-14T1556/backend/node_modules/ts-jest/node_modules/type-fest/source/replace.d.ts:49://=> 'hello ❓?'
+/home/administrator/ideai/projects/nexus-maturity-rental-2026-05-14T1556/backend/node_modules/ts-jest/node_modules/type-fest/source/iterable-element.d.ts:51:const fruits = new Set(['🍎', '🍌', '🍉'] as const);
+/home/administrator/ideai/projects/nexus-maturity-rental-2026-05-14T1556/backend/node_modules/ts-jest/node_modules/type-fest/source/iterable-element.d.ts:54://=> '🍎' | '🍌' | '🍉'
+/home/administrator/ideai/projects/nexus-maturity-rental-2026-05-14T1556/backend/node_modules/ts-jest/node_modules/type-fest/source/partial-on-undefined-deep.d.ts:44:	// 👉 optionB is now optional and can be omitted
+/home/administrator/ideai/projects/nexus-maturity-rental-2026-05-14T1556/backend/node_modules/ts-jest/node_modules/type-fest/source/partial-on-undefined-deep.d.ts:47:		// 👉 subOptionB is now optional as well and can be omitted
+/home/administrator/ideai/projects/nexus-maturity-rental-2026-05-14T1556/backend/node_modules/ts-jest/node_modules/type-fest/source/omit-index-signature.d.ts:26:	? '✅ `{}` is assignable to `Record<string, unknown>`'
+/home/administrator/ideai/projects/nexus-maturity-rental-2026-05-14T1556/backend/node_modules/ts-jest/node_modules/type-fest/source/omit-index-signature.d.ts:27:	: '❌ `{}` is NOT assignable to `Record<string, unknown>`';

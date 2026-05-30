@@ -75,10 +75,21 @@ describe("4.2 — marker PII redatto prima del dispatch (direttiva #31)", () => 
 
 // ─── 4.3 Feature flag allow_cloud_tier2/tier3 (direttiva #32) ────────────────
 
-describe("4.3 — feature flag: tier 2 bloccato by default nel profilo cloud (direttiva #32)", () => {
-  it("profilo cloud default: tier 2 bloccato (blocked: true nel routing)", () => {
+describe("4.3 — feature flag: gate cloud per-tier dai flag DLP (direttiva #32 + regola G)", () => {
+  it("profilo cloud default: tier 2 permesso (features.allow_cloud_tier2=true e' la fonte di verita')", () => {
+    // Regola G: la fonte di verita' del blocco cloud per tier e' il flag DLP
+    // (settings DB `dlp_allow_cloud_tierN`, fallback YAML `features.allow_cloud_tierN`),
+    // NON il campo struttura `routing.tier_N.blocked`. Con allow_cloud_tier2=true
+    // il tier 2 raggiunge i provider cloud.
     const engine = new PolicyEngine("config/policies/default.yaml");
-    expect(engine.decide(2, "").blocked).toBe(true);
+    expect(engine.decide(2, "").blocked).toBe(false);
+  });
+
+  it("profilo cloud default: tier 3 bloccato verso il cloud (features.allow_cloud_tier3=false)", () => {
+    const engine = new PolicyEngine("config/policies/default.yaml");
+    // allow_cloud_tier3=false -> provider cloud esclusi; nessun provider locale
+    // configurato nel profilo cloud -> decisione bloccata.
+    expect(engine.decide(3, "").blocked).toBe(true);
   });
 
   it("profilo onprem: tier 2 instradato su vllm, non bloccato", () => {

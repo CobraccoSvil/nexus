@@ -303,6 +303,40 @@ pub async fn tool_knowledge_create_note(ctx: &AgentToolContext, input: &Value) -
         "knowledge_create_note: nota creata via MCP tool"
     );
 
+    // RAG (ADR 0015): indicizza la nota anche nella collection unificata
+    // `kb_chunks` per renderla cercabile via `nexus_search_semantic`.
+    // Fire-and-forget: errori sono solo loggati.
+    {
+        let db_clone = ctx.db.clone();
+        let pid = ctx.project_id;
+        let nid = note_id;
+        let body_clone = body_md.clone();
+        let title_clone = title.clone();
+        let intent_clone = intent.clone();
+        tokio::spawn(async move {
+            let metadata = serde_json::json!({
+                "title": title_clone,
+                "intent": intent_clone,
+            });
+            let combined = format!("{title_clone}
+
+{body_clone}");
+            if let Err(e) = crate::rag::index_text(
+                &db_clone,
+                crate::rag::SourceKind::Kb,
+                &nid.to_string(),
+                Some(pid),
+                None,
+                &combined,
+                metadata,
+            )
+            .await
+            {
+                tracing::warn!("rag: indicizzazione KB note {} fallita: {}", nid, e);
+            }
+        });
+    }
+
     json!({
         "ok": true,
         "note_id": note_id.to_string(),

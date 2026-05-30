@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { ModalPortal } from "../modal-portal";
 import {
   useProjectStore,
   selectMemoryChangedAt,
@@ -56,7 +57,8 @@ export function MemoryPanel({ projectId, onClose }: MemoryPanelProps) {
   const activeCount = memories.filter((m) => m.active).length;
 
   return (
-    /* Overlay backdrop */
+    <ModalPortal>
+    {/* Overlay backdrop */}
     <div
       style={{
         position: "fixed", inset: 0, zIndex: 8000,
@@ -213,5 +215,6 @@ export function MemoryPanel({ projectId, onClose }: MemoryPanelProps) {
         </div>
       </div>
     </div>
+    </ModalPortal>
   );
 }

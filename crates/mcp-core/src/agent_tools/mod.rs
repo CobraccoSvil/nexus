@@ -34,6 +34,16 @@ pub(crate) mod subagent;
 pub(crate) mod safety;
 pub(crate) mod dispatcher;
 pub(crate) mod knowledge;
+pub(crate) mod port_scanner;
+pub(crate) mod attachments;
+pub(crate) mod attachment_inspector;
+pub(crate) mod archive_tools;
+pub(crate) mod document_tools;
+pub(crate) mod figma_tools;
+pub(crate) mod vision_tools;
+pub(crate) mod attachment_settings;
+pub(crate) mod read_cache;
+pub(crate) mod rag_search;
 
 // Re-export per uso interno crate (tool_run_tests è chiamato da agent_loop, in teoria).
 pub(crate) use command::tool_run_tests;
@@ -1095,6 +1105,146 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     }
   },
   {
+    "name": "nexus_list_attachments",
+    "description": "Lista gli allegati caricati dall'utente nella sessione chat corrente (o in un'altra sessione specificata). Restituisce per ciascun allegato: id, file_name, mime_type, size_bytes, kind, created_at. Usalo quando il blocco <allegati> nel prompt iniziale e' stato troncato per limite di dimensione (vedi <attachment_access>) e devi scoprire quali file ci sono. Dopo aver scelto un id, leggi il contenuto con nexus_read_attachment.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "description": "UUID della sessione chat. Ometti per usare la sessione corrente."
+        }
+      }
+    }
+  },
+  {
+    "name": "nexus_read_attachment",
+    "description": "Legge il contenuto (o una porzione) di un allegato caricato dall'utente, identificato da attachment_id (ottenuto da nexus_list_attachments). Supporta offset+length per lettura streaming. Max 100KB per chiamata: per file piu' grandi chiama piu' volte con offset crescente. Encoding 'auto' decide testo o base64 in base al MIME; forza 'text' o 'base64' se necessario. Restituisce JSON con content, encoding, offset, length, total_size, truncated.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "attachment_id": {
+          "type": "string",
+          "description": "UUID dell'allegato (da nexus_list_attachments). Obbligatorio."
+        },
+        "encoding": {
+          "type": "string",
+          "enum": ["auto", "text", "base64"],
+          "description": "Forma del contenuto restituito. Default 'auto' (text per mime testuali, altrimenti base64)."
+        },
+        "offset": {
+          "type": "integer",
+          "description": "Byte offset da cui iniziare la lettura (default 0)."
+        },
+        "length": {
+          "type": "integer",
+          "description": "Byte massimi da leggere (default 102400, hard cap 102400)."
+        }
+      },
+      "required": ["attachment_id"]
+    }
+  },
+  {
+    "name": "nexus_inspect_attachment",
+    "description": "Investiga il vero formato di un allegato usando la magic byte detection. Da chiamare SEMPRE prima di rinunciare quando il MIME e' application/octet-stream o l'estensione e' sospetta (.make, .dat, .bin, .pkg, .fig). Ritorna {kind, mime_reale, extension_reale, is_text, extraction_tools, hint, next_action_recommended}. REGOLA OBBLIGATORIA (ADR 0012): dopo aver chiamato questo tool, chiama IL TOOL indicato in `next_action_recommended.tool` con i parametri `next_action_recommended.input` cosi' come sono. NON chiamare `nexus_read_attachment` o `nexus_read_archive_entry` con offset crescenti su file binari: e' inefficiente e satura il context window. Per i kind binari opachi `next_action_recommended` puo' essere null: in quel caso chiedi all'utente come procedere.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "attachment_id": {
+          "type": "string",
+          "description": "UUID dell'allegato (ottenuto da nexus_list_attachments)."
+        }
+      },
+      "required": ["attachment_id"]
+    }
+  },
+  {
+    "name": "nexus_list_archive_entries",
+    "description": "Lista le entries di un archivio ZIP, TAR o TAR.GZ allegato. Rileva il formato automaticamente dai magic bytes. Restituisce nome, dimensione, dimensione compressa, flag is_dir per ogni entry. Limite massimo 1000 entries (configurabile via setting agent.attachment.archive_max_entries).",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "attachment_id": {
+          "type": "string",
+          "description": "UUID dell'allegato."
+        }
+      },
+      "required": ["attachment_id"]
+    }
+  },
+  {
+    "name": "nexus_read_archive_entry",
+    "description": "Estrae e legge il contenuto di una singola entry da un archivio (ZIP/TAR/TAR.GZ). Max 200KB letti per chiamata (configurabile via agent.attachment.archive_entry_max_bytes). encoding 'auto' decide text/base64 in base ai byte effettivamente estratti.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "attachment_id": {"type": "string", "description": "UUID dell'allegato archivio."},
+        "entry_path": {"type": "string", "description": "Percorso esatto della entry dentro l'archivio (es. 'word/document.xml', 'src/main.rs')."},
+        "encoding": {"type": "string", "enum": ["auto", "text", "base64"], "description": "Forma del contenuto. Default 'auto'."}
+      },
+      "required": ["attachment_id", "entry_path"]
+    }
+  },
+  {
+    "name": "nexus_extract_pdf_text",
+    "description": "Estrae il testo da un allegato PDF, opzionalmente limitato a un range di pagine. Restituisce {total_pages, pages_extracted, text}. Max 100KB di testo totale (configurabile via agent.attachment.pdf_max_text_bytes). Se il PDF e' scansionato (immagini, niente testo) ritorna is_scanned_pdf=true e un hint per richiedere OCR.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "attachment_id": {"type": "string"},
+        "page_start": {"type": "integer", "description": "Pagina di inizio 1-based (default 1)."},
+        "page_end": {"type": "integer", "description": "Pagina di fine inclusa (default ultima pagina)."}
+      },
+      "required": ["attachment_id"]
+    }
+  },
+  {
+    "name": "nexus_extract_docx_text",
+    "description": "Estrae il testo dei paragrafi da un allegato DOCX (Word). Parser interno: spacchetta lo ZIP, parsea word/document.xml. Restituisce {paragraphs_count, text} con paragrafi separati da doppia newline.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "attachment_id": {"type": "string"}
+      },
+      "required": ["attachment_id"]
+    }
+  },
+  {
+    "name": "nexus_extract_xlsx_data",
+    "description": "Estrae dati tabellari da un allegato XLSX (Excel). Restituisce array di righe (ognuna array di celle stringa). Default primo sheet (sheet1). Max 1000 righe (configurabile via agent.attachment.xlsx_max_rows).",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "attachment_id": {"type": "string"},
+        "sheet_name": {"type": "string", "description": "Nome del foglio (es. 'sheet1', 'sheet2'). Default 'sheet1'."}
+      },
+      "required": ["attachment_id"]
+    }
+  },
+  {
+    "name": "nexus_extract_figma_structure",
+    "description": "MVP estrazione file Figma (.fig). I file Figma sono archivi che contengono un payload binario proprietario canvas.fig. Questo tool estrae il payload, ne restituisce dimensione + le stringhe ASCII leggibili (utili per inferire nomi di layer/stili) + un hint per ottenere la struttura completa via Figma API o plugin 'Figma to Code'. Per ora NON ricostruisce frame/componenti.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "attachment_id": {"type": "string"}
+      },
+      "required": ["attachment_id"]
+    }
+  },
+  {
+    "name": "nexus_describe_image_attachment",
+    "description": "Descrive un'immagine allegata alla chat usando un modello vision. Restituisce description testuale e ocr_text (se l'immagine contiene testo leggibile). Usalo quando l'inspector ha rilevato kind=image_* e devi capire il contenuto visivo (mockup UI, screenshot, foto, diagrammi).",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "attachment_id": {"type": "string"},
+        "question": {"type": "string", "description": "Domanda opzionale al modello vision (es. 'estrai i testi UI', 'descrivi il layout')."}
+      },
+      "required": ["attachment_id"]
+    }
+  },
+  {
     "name": "knowledge_search",
     "description": "Cerca note rilevanti nella Knowledge Base del progetto corrente. Usalo quando devi verificare se una richiesta simile e' gia' stata affrontata, se ci sono decisioni precedenti, o se ci sono requirement/feature gia' documentati. Restituisce top-K note ordinate per rilevanza semantica.",
     "input_schema": {
@@ -1161,6 +1311,22 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         }
       },
       "required": ["title", "body_md"]
+    }
+  }
+  ,
+  {
+    "name": "nexus_search_semantic",
+    "description": "Cerca semanticamente nel contesto del progetto: allegati indicizzati, knowledge base, chat history passate, tool result cached. Usalo per recuperare informazioni rilevanti senza dover ri-leggere file interi. Restituisce chunk testuali ordinati per score di similarita' coseno.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "query": {"type": "string", "description": "Testo da cercare (es. 'cosa fa il bottone Send nel chat input?'). Max 2000 char."},
+        "source_kinds": {"type": "array", "items": {"type": "string", "enum": ["attachment", "kb", "chat_history", "tool_result", "code"]}, "description": "Filtra per tipologia. Default: tutte tranne 'code'."},
+        "top_k": {"type": "integer", "description": "Numero hit (default da settings agent.rag.top_k_default, max 100)."},
+        "filter_attachment_id": {"type": "string", "description": "Restringe a un singolo attachment_id."},
+        "filter_session_id": {"type": "string", "description": "Restringe a una session_id (rilevante per chat_history)."}
+      },
+      "required": ["query"]
     }
   }
 ]"#;
@@ -1524,6 +1690,19 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "knowledge_search" => knowledge::tool_knowledge_search(ctx, input).await,
         "knowledge_get_note" => knowledge::tool_knowledge_get_note(ctx, input).await,
         "knowledge_create_note" => knowledge::tool_knowledge_create_note(ctx, input).await,
+        // ── Allegati chat (ADR 0010) ───────────────────────────────────────
+        "nexus_list_attachments" => attachments::tool_nexus_list_attachments(ctx, input).await,
+        "nexus_read_attachment" => attachments::tool_nexus_read_attachment(ctx, input).await,
+        // ── Ingestion intelligente allegati (ADR 0011) ─────────────────────
+        "nexus_inspect_attachment" => attachment_inspector::tool_nexus_inspect_attachment(ctx, input).await,
+        "nexus_list_archive_entries" => archive_tools::tool_nexus_list_archive_entries(ctx, input).await,
+        "nexus_read_archive_entry" => archive_tools::tool_nexus_read_archive_entry(ctx, input).await,
+        "nexus_extract_pdf_text" => document_tools::tool_nexus_extract_pdf_text(ctx, input).await,
+        "nexus_extract_docx_text" => document_tools::tool_nexus_extract_docx_text(ctx, input).await,
+        "nexus_extract_xlsx_data" => document_tools::tool_nexus_extract_xlsx_data(ctx, input).await,
+        "nexus_extract_figma_structure" => figma_tools::tool_nexus_extract_figma_structure(ctx, input).await,
+        "nexus_describe_image_attachment" => vision_tools::tool_nexus_describe_image_attachment(ctx, input).await,
+        "nexus_search_semantic" => rag_search::tool_nexus_search_semantic(ctx, input).await,
         // ── Nexus Builtin tool (prefisso nexus_*) ──────────────────────────
         // Dispatch verso nexus_builtin::execute_with_neural per usare
         // la ricerca semantica quando neural è disponibile (Qdrant).

@@ -10,15 +10,29 @@ type DialogRequest = {
   title?: string;
   message: string;
   defaultValue?: string;
+  /** Stile danger: bottone rosso per azioni distruttive (elimina, reset). */
+  danger?: boolean;
+  /** Label personalizzata per il bottone di conferma (default: "OK"). */
+  confirmLabel?: string;
+  /** Label personalizzata per il bottone di annullamento (default: "Annulla"). */
+  cancelLabel?: string;
 };
 
 type DialogState = DialogRequest & {
   resolve: (value: string | boolean | null | void) => void;
 };
 
+export interface ConfirmDialogOptions {
+  message: string;
+  title?: string;
+  danger?: boolean;
+  confirmLabel?: string;
+  cancelLabel?: string;
+}
+
 type DialogApi = {
   alertDialog: (message: string, title?: string) => Promise<void>;
-  confirmDialog: (message: string, title?: string) => Promise<boolean>;
+  confirmDialog: (messageOrOpts: string | ConfirmDialogOptions, title?: string) => Promise<boolean>;
   promptDialog: (message: string, defaultValue?: string, title?: string) => Promise<string | null>;
 };
 
@@ -49,8 +63,19 @@ export function GlobalDialogProvider({ children }: { children: ReactNode }) {
   );
 
   const confirmDialog = useCallback(
-    (message: string, title?: string) =>
-      openDialog<boolean>({ kind: "confirm", message, title }),
+    (messageOrOpts: string | ConfirmDialogOptions, title?: string) => {
+      if (typeof messageOrOpts === "string") {
+        return openDialog<boolean>({ kind: "confirm", message: messageOrOpts, title });
+      }
+      return openDialog<boolean>({
+        kind: "confirm",
+        message: messageOrOpts.message,
+        title: messageOrOpts.title,
+        danger: messageOrOpts.danger,
+        confirmLabel: messageOrOpts.confirmLabel,
+        cancelLabel: messageOrOpts.cancelLabel,
+      });
+    },
     [openDialog],
   );
 
@@ -144,16 +169,17 @@ export function GlobalDialogProvider({ children }: { children: ReactNode }) {
                   }
                   style={dialogButton(tc)}
                 >
-                  Annulla
+                  {dialog.cancelLabel ?? "Annulla"}
                 </button>
               )}
               <button
                 type="button"
                 autoFocus={dialog.kind !== "prompt"}
                 onClick={() => close(dialog.kind === "prompt" ? promptValue : true)}
-                style={dialogButton(tc, true)}
+                data-testid="confirm-dialog-ok"
+                style={dialogButton(tc, true, dialog.danger)}
               >
-                OK
+                {dialog.confirmLabel ?? "OK"}
               </button>
             </div>
           </div>
@@ -171,15 +197,17 @@ export function useGlobalDialog() {
   return ctx;
 }
 
-function dialogButton(tc: ReturnType<typeof useThemeColors>, primary = false) {
+function dialogButton(tc: ReturnType<typeof useThemeColors>, primary = false, danger = false) {
+  const dangerColor = "#dc2626";
   return {
-    border: `1px solid ${primary ? tc.accent : tc.border}`,
-    background: primary ? tc.accentBg : tc.bgInput,
-    color: primary ? tc.accent : tc.text,
+    border: `1px solid ${danger ? dangerColor : primary ? tc.accent : tc.border}`,
+    background: danger ? dangerColor : primary ? tc.accentBg : tc.bgInput,
+    color: danger ? "#ffffff" : primary ? tc.accent : tc.text,
     borderRadius: 8,
     padding: "6px 12px",
     fontSize: 12,
     cursor: "pointer",
     fontFamily: "inherit",
+    fontWeight: danger ? 600 : undefined,
   } as const;
 }

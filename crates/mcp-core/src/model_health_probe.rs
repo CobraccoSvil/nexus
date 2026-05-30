@@ -40,7 +40,9 @@ use sqlx::{PgPool, Row};
 use tokio::time::sleep;
 
 use crate::orchestrator::Orchestrator;
-use crate::provider_cooldown::is_provider_in_cooldown;
+use crate::provider_cooldown::{
+    is_provider_in_cooldown, put_provider_in_long_cooldown, put_provider_in_short_cooldown,
+};
 
 /// Prompt minimale. Stesso usato da `provider_health_probe`.
 const PROBE_PROMPT: &str = "ping";
@@ -287,8 +289,22 @@ async fn probe_one_model(
             }
             ProbeOutcome::Ok
         }
-        Classification::ProviderWide(_, _) => {
-            // Errore di provider, non del modello: counter invariato.
+        Classification::ProviderWide(kind, _) => {
+            // Errore di provider, non del modello: counter del modello invariato.
+            //
+            // Bug architetturale corretto qui: prima il branch ritornava
+            // soltanto `ProbeOutcome::ProviderWide` per il conteggio statistico
+            // ma NON propagava il problema al modulo `provider_cooldown`. In
+            // produzione cio' significava che, ad es. con OpenAI in
+            // `insufficient_quota` (HTTP 429), il probe classificava ogni
+            // singolo modello del catalog come "provider-wide error" senza
+            // mai mettere il provider in cooldown — risultato: i prossimi
+            // round del probe (e i chiamanti runtime) continuavano a tentare
+            // tutti i modelli OpenAI uno per uno, ognuno con 429.
+            //
+            // Fix definitivo: mappare il `kind` rilevato dal classifier
+            // direttamente sul cooldown di provider piu' appropriato.
+            apply_provider_wide_cooldown(provider, model, &kind);
             ProbeOutcome::ProviderWide
         }
         Classification::ModelSpecific(kind, _msg) => {
@@ -330,6 +346,68 @@ async fn probe_one_model(
                 );
                 ProbeOutcome::ModelSpecificCounted
             }
+        }
+    }
+}
+
+/// Applica il cooldown di provider corrispondente al `kind` rilevato dal
+/// classificatore per un errore "provider-wide". Centralizzata qui per
+/// evitare duplicazione e per garantire mapping consistente fra
+/// `provider_health_probe` e `model_health_probe`.
+///
+/// Mappatura (allineata alle policy in `provider_cooldown`):
+/// - `quota_exceeded` / `credit_balance_too_low` / `billing_required` /
+///   `auth_error` -> cooldown lungo (6h, persistito su Redis): servono
+///   intervento manuale (ricarica credito, fix billing, rotazione chiave)
+///   e ritentare ogni pochi minuti e' inutile spreco di chiamate.
+/// - `rate_limit` -> cooldown breve (60s): il provider torna disponibile
+///   quasi subito; allinea il behaviour ai retry-after tipici di OpenAI.
+/// - `connection_error` -> cooldown breve (5 min): rete/DNS transient,
+///   non vale la pena escludere il provider per ore.
+/// - altri `kind` -> nessun cooldown: lasciamo che il chiamante decida
+///   (default conservativo per non sopprimere provider per cause ignote).
+fn apply_provider_wide_cooldown(provider: &str, model: &str, kind: &str) {
+    match kind {
+        "quota_exceeded" => {
+            tracing::info!(
+                "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
+            );
+            put_provider_in_long_cooldown(provider, "Quota provider esaurita (HTTP 429)");
+        }
+        "credit_balance_too_low" => {
+            tracing::info!(
+                "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
+            );
+            put_provider_in_long_cooldown(provider, "Credito provider insufficiente");
+        }
+        "billing_required" => {
+            tracing::info!(
+                "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
+            );
+            put_provider_in_long_cooldown(provider, "Billing provider non configurato");
+        }
+        "auth_error" => {
+            tracing::info!(
+                "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
+            );
+            put_provider_in_long_cooldown(provider, "API key non valida");
+        }
+        "rate_limit" => {
+            tracing::info!(
+                "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
+            );
+            put_provider_in_short_cooldown(provider, "Rate limit raggiunto", 60);
+        }
+        "connection_error" => {
+            tracing::info!(
+                "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
+            );
+            put_provider_in_short_cooldown(provider, "Provider non raggiungibile", 300);
+        }
+        _ => {
+            tracing::debug!(
+                "model_health_probe: provider {provider} errore provider-wide '{kind}' senza cooldown automatico (rilevato in probe model {model})"
+            );
         }
     }
 }

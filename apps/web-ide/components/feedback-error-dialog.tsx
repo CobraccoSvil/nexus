@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useThemeColors } from "../lib/theme";
 import { feedbackAssist } from "../lib/api-client";
+import { ModalPortal } from "./modal-portal";
 
 interface FeedbackErrorDialogProps {
   /** Contenuto della risposta AI problematica */
@@ -70,6 +71,7 @@ export function FeedbackErrorDialog({
   const hasPreview = contentPreview.length > 0;
 
   return (
+    <ModalPortal>
     <div
       style={{
         position: "fixed",
@@ -246,6 +248,7 @@ export function FeedbackErrorDialog({
         </div>
       </div>
     </div>
+    </ModalPortal>
   );
 }
 

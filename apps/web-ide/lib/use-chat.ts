@@ -285,6 +285,11 @@ export function useChat(
   const [traces, setTraces] = useState<AITraceEvent[]>([]);
   const [streamingToken, setStreamingToken] = useState<string>("");
   const streamingTokenRef = useRef<string>("");
+  // Ragionamento intermedio del modello (testo che accompagna le tool calls
+  // durante le iterazioni dell'agent loop). Sostituito ad ogni iterazione,
+  // svuotato quando il run termina. Mostrato nel chat-panel come blocco
+  // collassabile per dare feedback visivo durante l'elaborazione.
+  const [thinkingText, setThinkingText] = useState<string>("");
 
   // ── Proposta di indicizzazione allegati nella Knowledge Base ──
   // Dopo l'invio di un messaggio con allegati persistiti, il backend
@@ -715,6 +720,7 @@ export function useChat(
             setIsLoading(false);
             setStreamingToken("");
             streamingTokenRef.current = "";
+            setThinkingText("");
           }
         },
         (trace) => {
@@ -774,6 +780,16 @@ export function useChat(
             });
           }
         },
+        isPrimary ? (text: string) => {
+          // Modalita append: accumula tutte le righe di ragionamento (router,
+          // executor, tool decisions) in un buffer multi-linea. Il ThinkingBlock
+          // le mostra in tempo reale con scroll automatico. Reset su onDone.
+          setThinkingText((prev) => {
+            const trimmed = text.trim();
+            if (!trimmed) return prev;
+            return prev ? prev + "\n" + trimmed : trimmed;
+          });
+        } : undefined,
       );
     },
     [projectId],
@@ -791,6 +807,8 @@ export function useChat(
 
       setIsLoading(true);
       setError(null);
+      // Reset thinking buffer: il prossimo run partira pulito
+      setThinkingText("");
       let isAgentMode = false;
       try {
         const response = await sendChatMessage(sessionId, content.trim(), {
@@ -1158,6 +1176,7 @@ export function useChat(
     tokenUsage,
     traces,
     streamingToken,
+    thinkingText,
     attachmentIndexProposal,
     clearAttachmentIndexProposal,
     applyAttachmentsIndexed,

@@ -54,10 +54,20 @@ routing:
     tertiary: google
     fallback: mistral
   tier_2:
+    # Dev locale: cloud abilitato per tier 2 (features.allow_cloud_tier2=true).
+    # In sviluppo i contenuti "sensibili" sono menzioni in spec (es. email
+    # d'esempio), non dati reali di clienti. In prod usare profilo hybrid/onprem.
     primary: openai
-    blocked: true  # tier 2 non raggiunge mai il cloud senza explicit override
+    secondary: deepseek
+    tertiary: google
+    fallback: mistral
   tier_3:
-    blocked: true  # tier 3 sempre rifiutato — sarà supportato in fase hybrid/onprem
+    # Dev locale: cloud abilitato per tier 3 (scelta esplicita operatore).
+    # In prod usare profilo hybrid/onprem con provider on-premise.
+    primary: anthropic
+    secondary: openai
+    tertiary: google
+    fallback: deepseek
 
 # Gestione database e migrazioni per i progetti utente importati in Nexus.
 # Queste policy si applicano ai DB dei progetti (NON al DB interno di Nexus).

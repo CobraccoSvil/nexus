@@ -11,6 +11,7 @@ import {
 } from "../lib/api-client";
 import { useThemeColors } from "../lib/theme";
 import { shortenAbsolutePath } from "../lib/format";
+import { ModalPortal } from "./modal-portal";
 
 type TreeMap = Record<string, WorkspaceTreeNode[]>;
 
@@ -796,6 +797,7 @@ function ExplorerModal({
 
   // Overlay click = cancel (escluso quando click sul dialog box)
   return (
+    <ModalPortal>
     <div
       role="presentation"
       onMouseDown={(ev) => {
@@ -926,6 +928,7 @@ function ExplorerModal({
         </div>
       </div>
     </div>
+    </ModalPortal>
   );
 }
 

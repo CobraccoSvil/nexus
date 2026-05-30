@@ -23,9 +23,15 @@ _MCP_CORE_URL: str | None = None
 
 
 def _get_mcp_core_url() -> str:
+    """URL mcp-core: env var (override emergenza) > DB (canonico) > hardcoded."""
     global _MCP_CORE_URL
     if _MCP_CORE_URL is None:
-        _MCP_CORE_URL = os.environ.get("MCP_CORE_URL", "http://localhost:4000").rstrip("/")
+        env = os.environ.get("MCP_CORE_URL")
+        if env:
+            _MCP_CORE_URL = env.rstrip("/")
+        else:
+            from brain.utils.settings_db import get_setting
+            _MCP_CORE_URL = get_setting("mcp_core_url", "http://127.0.0.1:4000").rstrip("/")
     return _MCP_CORE_URL
 
 

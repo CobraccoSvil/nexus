@@ -1,0 +1,67 @@
+{
+  "session_ts": "2026-05-14T1556",
+  "ideai_branch": "test/nexus-maturity-2026-05-14T1556",
+  "ideai_baseline_sha": "77dd0929503f1b57cd627195c839f0d33cf95219",
+  "ideai_head_T0": "77dd0929503f1b57cd627195c839f0d33cf95219",
+  "project_target_path": "/home/administrator/ideai/projects/nexus-maturity-rental-2026-05-14T1556",
+  "project_target_baseline_sha": "58a74b5208423041f32e56624eb386668e00bc67",
+  "project_id": "8e697e82-1524-4c53-9634-a3ea11ac69e9",
+  "user_id": "b005ec9a-7eb9-4487-8e37-72096dc20e5f",
+  "workspace_id": null,
+  "t0_iso": "2026-05-14T16:36:50+02:00",
+  "quota_cap_eur": 100.0,
+  "n_max_iterations": 5,
+  "deploy_completed_at": "2026-05-14T16:10:05+02:00",
+  "services": {
+    "web-ide": "http://localhost:3000",
+    "mcp-core": "http://localhost:4000",
+    "brain": "http://localhost:8001",
+    "nexus-gateway": "http://localhost:4060"
+  },
+  "auth_strategy": "JWT cookie 'token' (mcp-core accetta sia cookie sia bearer; web-ide solo cookie)",
+  "prompt_seed_path": "tests/nexus-maturity/2026-05-14T1556/prompt_seed.md",
+  "automation_mode": "automatic",
+  "automation_note": "Il piano dice 'Continuo' ma il codice mcp-core supporta study/automatic/confirm. 'Automatic' = autonomia massima (alias accettati: 'auto','automatico').",
+  "validation_completed_at": "2026-05-14T16:19:16+02:00",
+  "validation_result": "pipeline OK: session creata, agent_run completato in ~50s con mistral-small-latest, brain LangGraph contattato, risposta generata, ai_usage_ledger aggiornato",
+  "service_log_paths": {
+    "mcp-core": "/tmp/nexus-mcp-core.log",
+    "brain": "/tmp/nexus-neural.log",
+    "web-ide": "/tmp/nexus-webide.log",
+    "nexus-gateway": "/tmp/nexus-gateway.log",
+    "admin-service": "/tmp/nexus-admin-service.log",
+    "chat-service": "/tmp/nexus-chat-service.log (stub abbandonato, non in uso)"
+  },
+  "chat_pipeline": {
+    "send_url": "http://localhost:3000/api/chat/sessions/<sid>/messages (next.js rewrite -> mcp-core:4000)",
+    "create_session": "POST /api/chat/sessions {projectId, title}",
+    "stream": "GET /api/chat/sessions/<sid>/agent-stream (SSE)",
+    "cancel": "POST /api/chat/agent-runs/<rid>/cancel"
+  },
+  "project_setup_status": "OK — creato via UI col fix #1 (bottone 'Importa cartella locale...')",
+  "project_setup_method": "UI ProjectImportWizard cablato dal Fix #1 (cat G)",
+  "t0_will_be_recorded_after": "creazione progetto UI + invio primo prompt",
+  "ui_automation_mode_label": "Continuo (UI label) — mapping atteso verso backend ",
+  "ideai_post_fixes_sha": "61b1e45fb1efd10a356c9f5ac8b61fd5fe1597bf",
+  "ideai_monitor_baseline_sha": "61b1e45fb1efd10a356c9f5ac8b61fd5fe1597bf",
+  "ideai_baseline_after_m4m2": "16fec82f028df87437dde3d486f55d12b4fc34b1",
+  "iter_02_start": "2026-05-14T17:13:30.499965+02:00",
+  "iter_02_baseline_sha_ideai": "16fec82f028df87437dde3d486f55d12b4fc34b1",
+  "iter_02_baseline_sha_target": "c1f573a803204f80fbcc5be11ca169895eeeda80",
+  "fixes_applied_before_iter2": [
+    "Fix #3 (M4) — autonomia MODALITA AUTOMATICA rinforzata in chat_messages.rs",
+    "Fix #4 (M2) — hook write_file -> project_documents in agent_tools/files.rs"
+  ],
+  "iter_02_strategy": "Uso pulsanti 'Risolvi con Nexus' sui pannelli (Problemi/Porte/Console Debug/Run&Debug/Source Control) per ogni errore residuo, invece di re-inviare prompt liberi nella chat.",
+  "ideai_baseline_after_fix5": "cb589f877532c12e912bc8dd66dcf71aae94a803",
+  "iter_03_start": "2026-05-14T18:07:27.860016+02:00",
+  "iter_03_baseline_sha_ideai": "cb589f877532c12e912bc8dd66dcf71aae94a803",
+  "iter_03_strategy": "Continua il lavoro di iter_02 (filesystem MANTENUTO). Obiettivo: avviare backend+frontend e verificare via HTTP. Fix #5 attivo nel system prompt rinforza il criterio di accettazione.",
+  "fixes_active_in_iter3": [
+    "Fix #1 cabling ProjectImportWizard (UI utente)",
+    "Fix #2 backdrop overlay wizard (UI utente)",
+    "Fix #3 (M4) autonomia MODALITA AUTOMATICA",
+    "Fix #4 (M2) hook write_file -> project_documents",
+    "Fix #5 criterio accettazione include avvio HTTP"
+  ]
+}

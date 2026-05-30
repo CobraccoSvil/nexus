@@ -6,12 +6,12 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: ba9fc87e7ec6685d8fc38dbcf6f88c6202ebe9f1
+source_commit: 73c57b761a39d3489cef7f23ff7df54866360875
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T15:32:18Z
+updated_at: 2026-05-28T11:39:02Z
 nexus_meta_version: 1
 ---
 
@@ -197,7 +197,14 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0178_obsidian_vault_name.sql` | Migrazione: registra il nome del vault Obsidian per il meta-vault Nexus e per |
 | `0179_kb_context_injection.sql` | Knowledge Base context injection nel system prompt agente. |
 | `0180_project_kb_kind.sql` | Aggiunge colonna `kind` a project_knowledge_notes per supportare note |
+| `0181_adaptive_agent_budget.sql` | Adaptive agent budget: sposta MAX_AGENT_ITERATIONS e affini dalle costanti hardcoded |
+| `0182_model_catalog_auto_sync.sql` | Bug 7 (audit 26/05/2026): worker auto-sync ai_price_catalog dai provider. |
+| `0183_google_vertex_backend.sql` | Mig 0183: Backend dual per Google provider. |
+| `0184_google_vertex_db_only.sql` | Mig 0184: Vertex DB-only credentials. |
+| `0185_catalog_sync_google.sql` | Mig 0185: aggiungi 'google' al default catalog_sync.providers. |
+| `0186_chat_message_attachments.sql` | 0186_chat_message_attachments.sql |
+| `0187_catalog_chat_only_filter.sql` | 0187_catalog_chat_only_filter.sql |
 
-**Totale**: 176 migrazioni.
+**Totale**: 183 migrazioni.
 
-Ultima migrazione: `0180_project_kb_kind.sql`.
+Ultima migrazione: `0187_catalog_chat_only_filter.sql`.

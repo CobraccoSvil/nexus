@@ -50,6 +50,14 @@ pub struct RoutingThresholds {
     /// L3 / Heartbeat SSE: secondi di silenzio stream brain→mcp-core prima
     /// di considerare il run bloccato. Sorgente: `settings.routing.sse_heartbeat_max_silence_secs` (mig 0132).
     pub sse_heartbeat_max_silence_secs: u64,
+    /// Soglia di confidence del classificatore deterministico keyword sopra
+    /// la quale si SALTA l'LLM (match ad altissima confidenza, piu' veloce e
+    /// robusto). Sorgente: `settings.routing.intent_deterministic_high`.
+    pub intent_deterministic_high: f32,
+    /// Soglia minima di confidence del classificatore deterministico sotto la
+    /// quale NON lo si usa nemmeno come fallback quando l'LLM fallisce.
+    /// Sorgente: `settings.routing.intent_deterministic_min`.
+    pub intent_deterministic_min: f32,
     pub loaded_at: Instant,
 }
 
@@ -75,6 +83,8 @@ impl RoutingThresholds {
             ambiguity_min_confidence: 0.70,
             ambiguity_min_margin: 0.15,
             sse_heartbeat_max_silence_secs: 120,
+            intent_deterministic_high: 0.85,
+            intent_deterministic_min: 0.60,
             loaded_at: Instant::now(),
         }
     }
@@ -156,6 +166,8 @@ async fn fetch_thresholds_from_db(db: &PgPool) -> Result<RoutingThresholds, Stri
         ambiguity_min_confidence: parse_f32("routing.ambiguity_min_confidence", 0.70),
         ambiguity_min_margin: parse_f32("routing.ambiguity_min_margin", 0.15),
         sse_heartbeat_max_silence_secs: parse_u64("routing.sse_heartbeat_max_silence_secs", 120),
+        intent_deterministic_high: parse_f32("routing.intent_deterministic_high", 0.85),
+        intent_deterministic_min: parse_f32("routing.intent_deterministic_min", 0.60),
         loaded_at: Instant::now(),
     })
 }
@@ -513,5 +525,7 @@ mod tests {
         assert_eq!(d.token_threshold_chat_media, 1_500);
         assert_eq!(d.token_threshold_complex_fix, 3_000);
         assert_eq!(d.token_threshold_long_context, 6_000);
+        assert!((d.intent_deterministic_high - 0.85).abs() < 1e-6);
+        assert!((d.intent_deterministic_min - 0.60).abs() < 1e-6);
     }
 }

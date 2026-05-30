@@ -61,9 +61,16 @@ class ToolRunnerClient:
     """
 
     def __init__(self, address: str | None = None) -> None:
-        self.address = address or os.environ.get(
-            "TOOL_RUNNER_ADDR", "127.0.0.1:50071"
-        )
+        if address:
+            self.address = address
+        else:
+            # Gerarchia: env var (override emergenza) > DB (canonico) > hardcoded.
+            env_addr = os.environ.get("TOOL_RUNNER_ADDR")
+            if env_addr:
+                self.address = env_addr
+            else:
+                from brain.utils.settings_db import get_setting
+                self.address = get_setting("tool_runner_addr", "127.0.0.1:50071")
         self._channel: grpc.aio.Channel | None = None
         self._stub: tool_runner_pb2_grpc.ToolRunnerStub | None = None
 

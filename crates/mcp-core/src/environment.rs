@@ -89,11 +89,21 @@ async fn check_playwright_browser() -> EnvironmentCheck {
     }
 }
 
-/// Verifica che il gRPC ToolRunner sia in ascolto su 127.0.0.1:50071.
-/// Senza questo gRPC il brain Python non può invocare i tool MCP (read_file,
+/// Verifica che il gRPC ToolRunner sia in ascolto sulla porta configurata.
+/// Indirizzo letto da: env var TOOL_RUNNER_ADDR (override) > DB settings
+/// (canonico) > hardcoded 127.0.0.1:50071.
+/// Senza questo gRPC il brain Python non puo' invocare i tool MCP (read_file,
 /// str_replace, ecc.) e l'AI fallisce con "0 step" o "tool gRPC unreachable".
-async fn check_tool_runner() -> EnvironmentCheck {
-    let addr = std::env::var("TOOL_RUNNER_ADDR").unwrap_or_else(|_| "127.0.0.1:50071".into());
+async fn check_tool_runner(db: &sqlx::PgPool) -> EnvironmentCheck {
+    let db_addr = crate::settings::get_setting(db, "tool_runner_addr")
+        .await
+        .ok()
+        .flatten()
+        .map(|v| v.trim().to_string());
+    let addr = std::env::var("TOOL_RUNNER_ADDR")
+        .ok()
+        .or(db_addr)
+        .unwrap_or_else(|| "127.0.0.1:50071".into());
     let host_port: Vec<&str> = addr.split(':').collect();
     let port = host_port.get(1).and_then(|p| p.parse::<u16>().ok()).unwrap_or(50071);
     // Tentativo di TCP connect non bloccante (timeout 1s)
@@ -312,7 +322,7 @@ pub async fn get_environment_status(
         check_playwright_libs(),
         check_playwright_browser(),
         check_brain_service(),
-        check_tool_runner(),
+        check_tool_runner(&state.db),
         check_frontend_process(),
         check_migrations(&db_url),
         check_ai_providers(&state.db),

@@ -629,6 +629,187 @@ async def complete(body: CompletionRequest) -> dict[str, object]:
     }
 
 
+class VisionDescribeRequest(BaseModel):
+    """Body per POST /vision/describe.
+
+    Usato dal tool agente nexus_describe_image_attachment (crates/mcp-core/
+    src/agent_tools/vision_tools.rs). Provider/modello risolti via
+    nexus_purpose_model.vision_describe (mig 0194). Niente fallback
+    hardcoded: se il purpose non e configurato l endpoint ritorna 503.
+    """
+    image_base64: str
+    mime_type: str
+    question: str | None = None
+
+
+_VISION_DEFAULT_PROMPT = (
+    "Descrivi il contenuto visivo dell immagine in italiano. "
+    "Se contiene testo leggibile riporta tutti i testi nella sezione OCR. "
+    "Formato risposta esatto: DESCRIZIONE: ...\nOCR: ... "
+    "(riporta sezione OCR vuota se non ce testo)."
+)
+# Limite hard sulla decoded payload: stesso default del tool agente (2 MB).
+# Il limite finale e quello agente (Rust legge agent.attachment.image_max_bytes
+# prima di chiamare); questa e rete safety.
+_VISION_MAX_DECODED_BYTES = 2 * 1024 * 1024
+
+
+def _parse_vision_response(text: str) -> tuple[str, str | None]:
+    """Separa il payload DESCRIZIONE/OCR in (descrizione, ocr).
+
+    Se il modello non rispetta il formato ritorna l intero testo come
+    descrizione e ocr=None.
+    """
+    if not text:
+        return "", None
+    upper = text.upper()
+    desc_idx = upper.find("DESCRIZIONE:")
+    ocr_idx = upper.find("OCR:")
+    if desc_idx == -1:
+        return text.strip(), None
+    desc_start = desc_idx + len("DESCRIZIONE:")
+    if ocr_idx == -1 or ocr_idx < desc_idx:
+        return text[desc_start:].strip(), None
+    description = text[desc_start:ocr_idx].strip()
+    ocr_text = text[ocr_idx + len("OCR:"):].strip()
+    if not ocr_text:
+        ocr_value: str | None = None
+    else:
+        ocr_value = ocr_text
+    return description, ocr_value
+
+
+@app.post("/vision/describe")
+async def vision_describe(body: VisionDescribeRequest) -> dict[str, object]:
+    """Descrive un immagine usando il modello configurato in
+    nexus_purpose_model.vision_describe.
+
+    Errori espliciti (no fallback nascosti):
+      - 503 se purpose non configurato o mcp-core irraggiungibile;
+      - 413 se la dimensione decoded supera 2 MB;
+      - 400 se il base64 non e decodificabile;
+      - 502 se il provider vision risponde con errore.
+    """
+    import base64 as _b64
+    import time as _time
+
+    from fastapi import HTTPException
+
+    from brain.router.service import _routing_client_singleton
+
+    t0 = _time.perf_counter()
+
+    # 1) Decoded payload + size guard.
+    try:
+        image_bytes = _b64.b64decode(body.image_base64, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"image_base64 non decodificabile: {exc}")
+    if len(image_bytes) > _VISION_MAX_DECODED_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"immagine troppo grande ({len(image_bytes)} byte), "
+                f"limite {_VISION_MAX_DECODED_BYTES} byte"
+            ),
+        )
+    mime = (body.mime_type or "application/octet-stream").strip().lower()
+    if not mime.startswith("image/"):
+        raise HTTPException(status_code=400, detail=f"mime_type non e image/*: {mime}")
+
+    # 2) Risolvi provider/model via purpose. No fallback hardcoded.
+    try:
+        decision = _routing_client_singleton().purpose_model(purpose="vision_describe")
+    except Exception as exc:
+        logger.error("vision_describe: purpose_model lookup fallito: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail=f"nexus_purpose_model.vision_describe non risolvibile: {exc}",
+        )
+    provider_name = (decision.provider or "").strip()
+    model = (decision.model or "").strip()
+    if not provider_name or not model or provider_name.startswith("__"):
+        logger.error(
+            "vision_describe: purpose non configurato (provider=%r model=%r). Applica mig 0194.",
+            provider_name, model,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "nexus_purpose_model.vision_describe non configurato. "
+                "Applica db/migrations/0194_vision_describe_purpose.sql."
+            ),
+        )
+
+    prompt_text = (body.question or "").strip() or _VISION_DEFAULT_PROMPT
+
+    # 3) Esegui call multimodale per provider.
+    if provider_name == "google":
+        try:
+            from brain.providers.google_provider import GoogleProvider
+            from google.genai import types as _genai_types  # type: ignore[import]
+        except Exception as exc:
+            logger.error("vision_describe: import Google SDK fallito: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Google SDK non disponibile: {exc}",
+            )
+        gp = providers.get_provider("google")
+        if gp is None or not isinstance(gp, GoogleProvider):
+            raise HTTPException(
+                status_code=503,
+                detail="Provider google non istanziato nel registry.",
+            )
+        ok, reason = gp._is_configured()
+        if not ok:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Provider google non configurato: {reason}",
+            )
+        try:
+            client = gp._get_client()
+            part = _genai_types.Part.from_bytes(data=image_bytes, mime_type=mime)
+            response = await client.aio.models.generate_content(
+                model=model,
+                contents=[part, prompt_text],
+                config=_genai_types.GenerateContentConfig(
+                    max_output_tokens=2048,
+                    temperature=0.2,
+                ),
+            )
+            text = response.text or ""
+        except Exception as exc:
+            logger.error("vision_describe: provider google ha fallito: %s", exc)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Provider google vision fallito: {exc}",
+            )
+    else:
+        logger.error("vision_describe: provider %r non supportato.", provider_name)
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                f"Provider {provider_name!r} non ancora supportato dall endpoint vision. "
+                "Configura google in nexus_purpose_model.vision_describe oppure estendi "
+                "brain/grpc_server/main.py per il provider scelto."
+            ),
+        )
+
+    description, ocr_text = _parse_vision_response(text)
+    elapsed_ms = int((_time.perf_counter() - t0) * 1000)
+    logger.info(
+        "vision_describe: provider=%s model=%s elapsed_ms=%d bytes=%d ocr=%s",
+        provider_name, model, elapsed_ms, len(image_bytes), bool(ocr_text),
+    )
+    payload: dict[str, object] = {
+        "description": description,
+        "model_used": f"{provider_name}/{model}",
+        "elapsed_ms": elapsed_ms,
+    }
+    if ocr_text:
+        payload["ocr_text"] = ocr_text
+    return payload
+
+
 class ReloadSettingsRequest(BaseModel):
     mcp_core_url: str = "http://localhost:4000"
 
@@ -1511,24 +1692,52 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
             # a mcp-core Rust che il run e' ancora attivo.
             # Cosi' mcp-core puo' usare un timeout per-silence (120s) invece del
             # timeout monolitico fisso sulla connessione SSE.
+            # stream_mode=["updates","custom"]: riceviamo sia i delta
+            # finali dei nodi (mode="updates") che gli eventi push emessi
+            # in tempo reale da _stream_thinking_live (mode="custom").
+            # Quando stream_mode e una lista, ogni evento e una tupla
+            # (mode, payload). Vedi nodes.py::_stream_thinking_live e
+            # ADR 0013 per il razionale (streaming live thinking).
             _aiter = graph.astream(  # type: ignore[union-attr]
-                initial_state, config=config, stream_mode="updates"
+                initial_state,
+                config=config,
+                stream_mode=["updates", "custom"],
             ).__aiter__()
             while True:
                 try:
-                    event = await asyncio.wait_for(_aiter.__anext__(), timeout=30.0)
+                    raw_event = await asyncio.wait_for(_aiter.__anext__(), timeout=30.0)
                 except asyncio.TimeoutError:
-                    # Brain in elaborazione, nessun evento negli ultimi 30s.
-                    # Emetti ping per segnalare attivita' a mcp-core.
                     yield 'data: {"type":"ping"}\n\n'
                     continue
                 except StopAsyncIteration:
                     break
-                # event = {"<node_name>": <delta_dict>}
-                # Flag per rilevare se questo evento e' il `learner_node`
-                # (terminale del graph). In tal caso, dopo aver processato
-                # tutti i delta emettiamo immediatamente `done` invece di
-                # affidarci a StopAsyncIteration che a volte tarda.
+
+                # Quando stream_mode e lista, l evento e (mode, payload).
+                # Fallback difensivo se per qualche motivo arriva il dict
+                # nudo (es. versioni vecchie di LangGraph): trattalo come updates.
+                if isinstance(raw_event, tuple) and len(raw_event) == 2:
+                    _mode, _payload = raw_event
+                else:
+                    _mode, _payload = "updates", raw_event
+
+                # Mode "custom": eventi push emessi da _stream_thinking_live
+                # (e in futuro da altri helper). Convertiamo immediatamente
+                # in SSE thinking_delta senza aspettare il return del nodo.
+                if _mode == "custom":
+                    if isinstance(_payload, dict) and _payload.get("kind") == "nexus_thinking":
+                        _txt = str(_payload.get("text") or "").strip()
+                        if _txt:
+                            yield (
+                                "data: "
+                                + _json.dumps({"type": "thinking_delta", "text": _txt})
+                                + "\n\n"
+                            )
+                    continue
+
+                # Mode "updates": delta dict per nodo finito (comportamento storico).
+                event = _payload
+                if not isinstance(event, dict):
+                    continue
                 _learner_seen = False
                 for node, delta in event.items():
                     if node == "learner":
@@ -1554,6 +1763,31 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                         if ms.get("correlation_id"):
                             ms_payload["correlation_id"] = ms["correlation_id"]
                         yield "data: " + _json.dumps(ms_payload) + "\n\n"
+                    # Nexus thinking: i nodi possono popolare `nexus_thinking`
+                    # come list[str] (preferito) o singola str. Lo convertiamo
+                    # in eventi SSE `thinking_delta` che mcp-core inoltra al
+                    # frontend per visualizzare il ragionamento dell'agente.
+                    _thinking = delta.get("nexus_thinking")
+                    if _thinking:
+                        logger.info("SSE thinking_delta emit: node=%s n=%s", node, len(_thinking) if isinstance(_thinking, list) else 1)
+                    if isinstance(_thinking, list):
+                        for _line in _thinking:
+                            if not _line:
+                                continue
+                            _txt = str(_line).strip()
+                            if not _txt:
+                                continue
+                            yield (
+                                "data: "
+                                + _json.dumps({"type": "thinking_delta", "text": _txt})
+                                + "\n\n"
+                            )
+                    elif isinstance(_thinking, str) and _thinking.strip():
+                        yield (
+                            "data: "
+                            + _json.dumps({"type": "thinking_delta", "text": _thinking.strip()})
+                            + "\n\n"
+                        )
                     if node == "router":
                         # Cattura metadata routing (B5 fix: propagazione nexus_task_type/agent_type)
                         if delta.get("user_intent"):

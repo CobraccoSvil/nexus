@@ -136,7 +136,12 @@ class _RoutingClient:
 
     def __init__(self, base_url: str | None = None) -> None:
         import os
-        self._base = (base_url or os.getenv("MCP_CORE_URL", "http://localhost:4000")).rstrip("/")
+        from brain.utils.settings_db import get_setting
+        self._base = (
+            base_url
+            or os.getenv("MCP_CORE_URL")
+            or get_setting("mcp_core_url", "http://127.0.0.1:4000")
+        ).rstrip("/")
         self._cache: dict[tuple[str, str], tuple[float, RoutingDecision]] = {}
 
     def decide(self, *, message: str, behavior_mode: str) -> RoutingDecision:
@@ -305,6 +310,110 @@ def _routing_client_singleton() -> _RoutingClient:
     if _ROUTING_CLIENT_INSTANCE is None:
         _ROUTING_CLIENT_INSTANCE = _RoutingClient()
     return _ROUTING_CLIENT_INSTANCE
+
+
+# ── Smart routing vision (allegati image/*) ────────────────────────────────
+# Quando il messaggio utente porta allegati immagine, se il modello scelto
+# dalla routing matrix NON e vision-capable preferiamo il vision-capable
+# piu economico configurato in ai_price_catalog. Niente fallback hardcoded:
+# se la lookup fallisce o nessun modello vision e disponibile, la decisione
+# originale viene mantenuta con un marker nel rationale per la UI.
+
+def _model_has_vision_capability(provider: str, model: str) -> bool | None:
+    """Ritorna True/False se sappiamo dal catalog, None se DB irraggiungibile."""
+    if not provider or not model:
+        return False
+    try:
+        import os
+        import psycopg2
+        database_url = os.environ.get("DATABASE_URL", "")
+        if not database_url:
+            return None
+        conn = psycopg2.connect(database_url, connect_timeout=2)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT (capabilities->>'vision')::bool "
+                "FROM ai_price_catalog "
+                "WHERE provider = %s AND model = %s AND is_enabled = true LIMIT 1",
+                (provider, model),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            return bool(row[0])
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("vision_routing: catalog lookup fallita per %s/%s: %s", provider, model, exc)
+        return None
+
+
+def _select_cheapest_vision_model() -> tuple[str, str] | None:
+    """Ritorna (provider, model) del piu economico vision-capable in catalog."""
+    try:
+        import os
+        import psycopg2
+        database_url = os.environ.get("DATABASE_URL", "")
+        if not database_url:
+            return None
+        conn = psycopg2.connect(database_url, connect_timeout=2)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT provider, model FROM ai_price_catalog "
+                "WHERE (capabilities->>'vision')::bool = true AND is_enabled = true "
+                "ORDER BY input_cost_per_million_tokens ASC NULLS LAST LIMIT 1"
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return (str(row[0]), str(row[1]))
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("vision_routing: select_cheapest fallito: %s", exc)
+        return None
+
+
+def _apply_vision_override(decision: "RoutingDecision") -> "RoutingDecision":
+    """Sostituisce la decisione se il modello scelto non ha vision.
+
+    Aggiunge nel rationale il marker vision_routing per audit. Se NESSUN
+    vision-capable e disponibile, mantiene la decisione e marca
+    vision_unavailable=true cosi il caller puo avvisare l utente.
+    """
+    cap = _model_has_vision_capability(decision.provider, decision.model)
+    if cap is True:
+        return decision
+    chosen = _select_cheapest_vision_model()
+    if chosen is None:
+        logger.warning(
+            "vision_routing: nessun modello vision-capable disponibile; mantengo %s/%s ma marco vision_unavailable",
+            decision.provider, decision.model,
+        )
+        return RoutingDecision(
+            provider=decision.provider,
+            model=decision.model,
+            rationale=(decision.rationale or "") + " | vision_unavailable=true",
+            confidence=decision.confidence,
+        )
+    new_provider, new_model = chosen
+    if new_provider == decision.provider and new_model == decision.model:
+        return decision
+    logger.info(
+        "vision_routing: override %s/%s -> %s/%s (motivo: allegati image/* presenti)",
+        decision.provider, decision.model, new_provider, new_model,
+    )
+    return RoutingDecision(
+        provider=new_provider,
+        model=new_model,
+        rationale=(
+            (decision.rationale or "") +
+            f" | vision_routing: override {decision.provider}/{decision.model} -> {new_provider}/{new_model}"
+        ),
+        confidence=max(decision.confidence, 0.8),
+    )
 
 
 class SemanticRouter:
@@ -503,6 +612,7 @@ class SemanticRouter:
         token_budget: int,
         behavior_mode: str = "bilanciata",
         message: str | None = None,
+        has_image_attachments: bool = False,
     ) -> RoutingDecision:
         """Decide provider/model consultando l'orchestrator Rust via REST.
 
@@ -521,7 +631,10 @@ class SemanticRouter:
         + behavior_mode, per evitare RTT su decisioni ripetute durante un
         singolo turno agente.
         """
-        return _routing_client_singleton().decide(
+        decision = _routing_client_singleton().decide(
             message=message or "",
             behavior_mode=behavior_mode,
         )
+        if has_image_attachments and not decision.provider.startswith("__"):
+            return _apply_vision_override(decision)
+        return decision

@@ -6,12 +6,12 @@ slug: postgres-tables
 tags:
   - schema
   - postgres
-source_commit: ba9fc87e7ec6685d8fc38dbcf6f88c6202ebe9f1
+source_commit: 73c57b761a39d3489cef7f23ff7df54866360875
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T15:32:18Z
+updated_at: 2026-05-28T11:39:02Z
 nexus_meta_version: 1
 ---
 
@@ -126,6 +126,17 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `auto_disabled_at` | timestamp with time zone | YES | `—` |
 | `auto_disabled_reason` | text | YES | `—` |
 
+## `ai_price_catalog_audit`
+
+| Colonna | Tipo | Nullable | Default |
+|---|---|---|---|
+| `id` | uuid | NO | `gen_random_uuid()` |
+| `occurred_at` | timestamp with time zone | NO | `now()` |
+| `provider` | text | NO | `—` |
+| `model` | text | NO | `—` |
+| `action` | text | NO | `—` |
+| `details` | jsonb | NO | `'{}'::jsonb` |
+
 ## `ai_quota_policies`
 
 | Colonna | Tipo | Nullable | Default |
@@ -239,6 +250,22 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `related_commit_sha` | text | YES | `—` |
 | `created_at` | timestamp with time zone | NO | `now()` |
 | `updated_at` | timestamp with time zone | NO | `now()` |
+
+## `chat_message_attachments`
+
+| Colonna | Tipo | Nullable | Default |
+|---|---|---|---|
+| `id` | uuid | NO | `gen_random_uuid()` |
+| `message_id` | uuid | NO | `—` |
+| `project_id` | uuid | NO | `—` |
+| `file_name` | text | NO | `—` |
+| `file_path` | text | NO | `—` |
+| `mime_type` | text | NO | `—` |
+| `size_bytes` | bigint | NO | `—` |
+| `kind` | text | NO | `—` |
+| `kb_note_id` | uuid | YES | `—` |
+| `indexed_at` | timestamp with time zone | YES | `—` |
+| `created_at` | timestamp with time zone | NO | `now()` |
 
 ## `chat_messages`
 

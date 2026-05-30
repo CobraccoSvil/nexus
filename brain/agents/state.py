@@ -122,9 +122,24 @@ class AgentState(TypedDict, total=False):
     active_subagent_runs: list[str]
     subagent_cost_cumulative_usd: float
 
+    # FIX 4 (ADR 0012): byte cumulativi letti via nexus_read_attachment /
+    # nexus_read_archive_entry nella sessione. Confrontato con il setting
+    # agent.attachment.session_read_budget_bytes per bloccare letture seriali
+    # che saturano il context window (caso reale: 4 chunk binari di canvas.fig).
+    attachment_read_bytes: int
+
     # G1: contatore nudge iniettati per richieste d'azione senza tool call.
     # Reset a 0 ad ogni nuovo run. Cap a 2 (evita loop di nudge).
     action_nudge_count: int
+
+    # G1: contatore di re-routing eseguiti da route_after_executor verso
+    # executor per motivo "risposta descrittiva su action request".
+    # Indipendente da action_nudge_count (che e' alzato solo se il nudge
+    # viene effettivamente iniettato): conta i giri di re-execution G1,
+    # serve per il cap configurabile via settings DB (agent.g1_max_nudges)
+    # ed evita loop infiniti quando il nudge non puo' essere iniettato
+    # (es. history contiene gia' tool call). Reset a 0 ad ogni nuovo run.
+    g1_reroute_count: int
 
     # M61 sticky cascade fallback: dopo un cascade riuscito, persisti il
     # provider/model effettivo cosi' le iter successive partono direttamente

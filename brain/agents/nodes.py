@@ -130,6 +130,38 @@ def _load_adaptive_budget_config() -> dict[str, Any]:
     return config
 
 
+# ── Cache G1 nudge cap (TTL 60s) ────────────────────────────────────────────
+# Numero massimo di re-execution G1 ("risposta descrittiva su action request")
+# per singolo run prima di forzare chiusura con messaggio assistant esplicito.
+# Letto dal DB via settings_db.get_int_setting con default 3.
+_G1_NUDGE_CACHE: dict[str, Any] = {"loaded_at": 0.0, "max_nudges": None}
+_G1_NUDGE_TTL_SEC = 60.0
+_G1_NUDGE_DEFAULT_MAX = 3
+
+
+def _load_g1_max_nudges() -> int:
+    """Legge agent.g1_max_nudges dal DB con cache 60s.
+
+    Ritorna il default sicuro (3) se il DB e' irraggiungibile o la chiave
+    non esiste: la funzione `get_int_setting` non solleva mai.
+    """
+    now = time.time()
+    cached = _G1_NUDGE_CACHE["max_nudges"]
+    if cached is not None and (now - _G1_NUDGE_CACHE["loaded_at"]) < _G1_NUDGE_TTL_SEC:
+        return int(cached)
+    try:
+        from brain.utils.settings_db import get_int_setting
+        value = int(get_int_setting("agent.g1_max_nudges", _G1_NUDGE_DEFAULT_MAX))
+        if value < 1:
+            value = _G1_NUDGE_DEFAULT_MAX
+    except Exception as exc:
+        logger.warning("g1_max_nudges: load DB fallito, uso default %d (%s)", _G1_NUDGE_DEFAULT_MAX, exc)
+        value = _G1_NUDGE_DEFAULT_MAX
+    _G1_NUDGE_CACHE["max_nudges"] = value
+    _G1_NUDGE_CACHE["loaded_at"] = now
+    return value
+
+
 def estimate_prompt_complexity(prompt: str, config: dict[str, Any] | None = None) -> int:
     """Stima la complessita' del task come score 0-100.
 
@@ -180,6 +212,108 @@ def compute_iteration_budget(prompt: str, model: str | None = None) -> tuple[int
     if model and any(hint in model.lower() for hint in _WEAK_MODELS_HINT):
         budget = int(budget * float(config["weak_model_multiplier"]))
     return min(budget, int(config["iteration_budget_max"])), score
+
+# ── Nexus thinking: stream pensieri agente verso UI ──────────────────────
+# Espone un'opzione "mostra ragionamento Nexus" leggibile dal flag DB
+# `chat_show_nexus_thinking` (settings). Quando attivo (default true), i
+# nodi router/executor possono accodare righe in `nexus_thinking` (list[str])
+# dentro il delta che il graph ritorna; il bridge SSE in brain/grpc_server
+# le converte in eventi `thinking_delta`.
+_NEXUS_THINKING_CACHE: dict[str, Any] = {"loaded_at": 0.0, "enabled": True}
+_NEXUS_THINKING_TTL_SEC = 60.0
+
+
+def _nexus_thinking_enabled() -> bool:
+    """True se il flag DB `chat_show_nexus_thinking` e' attivo.
+
+    Cache TTL 60s per evitare query al DB ad ogni emissione. Se il DB e'
+    irraggiungibile o il flag e' assente, fallback al default True (UX
+    visibile per scoperta della feature; l'utente puo' disattivare).
+    """
+    now = time.time()
+    cached_at = float(_NEXUS_THINKING_CACHE.get("loaded_at") or 0.0)
+    if now - cached_at < _NEXUS_THINKING_TTL_SEC:
+        return bool(_NEXUS_THINKING_CACHE.get("enabled", True))
+    enabled = True
+    try:
+        import os as _os
+        import psycopg2  # type: ignore[import-untyped]
+        dburl = _os.environ.get("DATABASE_URL", "")
+        if dburl:
+            conn = psycopg2.connect(dburl)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT value FROM settings WHERE key = %s",
+                        ("chat_show_nexus_thinking",),
+                    )
+                    row = cur.fetchone()
+                    if row and row[0] is not None:
+                        raw = str(row[0]).strip().lower().strip('"')
+                        enabled = raw not in ("false", "0", "off", "no")
+            finally:
+                conn.close()
+    except Exception as exc:
+        logger.debug("_nexus_thinking_enabled: lettura DB fallita: %s", exc)
+    _NEXUS_THINKING_CACHE["loaded_at"] = now
+    _NEXUS_THINKING_CACHE["enabled"] = enabled
+    return enabled
+
+
+def _stream_thinking_live(line: str) -> None:
+    """Pusha immediatamente un evento `nexus_thinking` sul custom stream
+    di LangGraph (visibile a stream_mode="custom" nell endpoint SSE).
+
+    LangGraph 0.2+ espone `get_stream_writer()`: se la chiamata e'
+    eseguita dentro un nodo del grafo, il writer permette di emettere
+    eventi custom che il consumer riceve immediatamente, senza aspettare
+    il return del nodo. Cosi' la UI mostra il thinking in tempo reale
+    anche se il nodo dura 30-60 secondi.
+
+    Best-effort: se non siamo dentro un grafo (test, codice riusato) o
+    la versione di LangGraph installata non espone l API, no-op.
+    """
+    if not line:
+        return
+    try:
+        from langgraph.config import get_stream_writer  # type: ignore[import-untyped]
+        writer = get_stream_writer()
+        if writer is None:
+            return
+        writer({"kind": "nexus_thinking", "text": str(line).strip()})
+    except Exception as exc:
+        # Niente raise: il thinking live e' best-effort, non deve
+        # rompere l esecuzione del nodo.
+        logger.debug("_stream_thinking_live: writer non disponibile: %s", exc)
+
+
+def _emit_thinking(updates: dict[str, Any], *lines: str) -> None:
+    """Accoda `lines` non vuote nel campo `nexus_thinking` di `updates`
+    E le pusha in tempo reale via stream_writer (fix streaming live).
+
+    No-op se il flag DB e' disabilitato o se nessuna riga e' significativa.
+    Crea il campo come `list[str]` se assente, altrimenti append in-place.
+    L append e' mantenuto per backward-compat (final state) ed e' come il
+    consumer SSE riceve gia' oggi gli eventi di fine nodo.
+    """
+    if not lines:
+        return
+    cleaned = [str(x).strip() for x in lines if x is not None and str(x).strip()]
+    if not cleaned:
+        return
+    if not _nexus_thinking_enabled():
+        return
+    # 1) Stream live (LangGraph custom events): l utente vede subito le
+    #    righe di thinking, senza attendere il return del nodo.
+    for ln in cleaned:
+        _stream_thinking_live(ln)
+    # 2) Backward-compat: accoda in updates per il delta finale del nodo.
+    existing = updates.get("nexus_thinking")
+    if isinstance(existing, list):
+        existing.extend(cleaned)
+    else:
+        updates["nexus_thinking"] = cleaned
+
 
 # ── G1 Python: rilevamento richieste d'azione ─────────────────────────────
 _ACTION_PATTERNS: tuple[str, ...] = (
@@ -814,6 +948,26 @@ async def router_node(state: AgentState) -> dict[str, Any]:
             updates["meta_steps"] = [routing_meta]
             meta_steps.persist_async(state.get("thread_id"), routing_meta)
 
+    # ── Nexus thinking (visibilita' processo decisionale) ──────────────────
+    try:
+        _profile_name = profile.name if profile is not None else None
+        _thinking_lines: list[str] = []
+        _thinking_lines.append(
+            f"Classificato intent '{intent}' (confidence {intent_confidence:.2f})."
+        )
+        _thinking_lines.append(
+            f"Modalita' comportamento: {behavior_mode}, token budget stimato {token_budget}."
+        )
+        if complexity_score:
+            _thinking_lines.append(
+                f"Complessita' stimata del task: {complexity_score} punti, budget iterazioni {iter_budget}."
+            )
+        if _profile_name:
+            _thinking_lines.append(f"Profilo agente selezionato: {_profile_name}.")
+        _emit_thinking(updates, *_thinking_lines)
+    except Exception as _thinking_exc:
+        logger.debug("router_node: thinking emit fallito: %s", _thinking_exc)
+
     return updates
 
 
@@ -1016,6 +1170,486 @@ def _compress_old_tool_results(
     return compressed
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# FIX A-D (ADR 0014) — Context size management
+# ────────────────────────────────────────────────────────────────────────────
+# Settings DB (mig 0199), cache 60s. Fallback safe se DB down.
+
+_CTX_MGMT_CACHE: dict[str, Any] = {"loaded_at": 0.0, "config": None}
+_CTX_MGMT_TTL_SEC = 60.0
+_CTX_MGMT_DEFAULTS: dict[str, Any] = {
+    "compress_start_iter": 5,
+    "compress_phase_boundaries": [5, 10, 20, 50],
+    "compress_phase_keep_recent": [8, 5, 3, 2],
+    "compress_phase_max_chars": [2000, 1000, 500, 150],
+    "dedup_tool_results_enabled": True,
+    "drop_unused_base64_age": 3,
+    "predictive_cap_ratio": 0.5,
+}
+
+
+def _load_ctx_mgmt_config() -> dict[str, Any]:
+    """Carica i settings agent.context.* dal DB con cache 60s.
+
+    Fallback ai defaults safe se il DB e' down (mai solleva).
+    """
+    now = time.time()
+    cached = _CTX_MGMT_CACHE["config"]
+    if cached is not None and (now - _CTX_MGMT_CACHE["loaded_at"]) < _CTX_MGMT_TTL_SEC:
+        return cached  # type: ignore[return-value]
+
+    config = {
+        "compress_start_iter": int(_CTX_MGMT_DEFAULTS["compress_start_iter"]),
+        "compress_phase_boundaries": list(_CTX_MGMT_DEFAULTS["compress_phase_boundaries"]),
+        "compress_phase_keep_recent": list(_CTX_MGMT_DEFAULTS["compress_phase_keep_recent"]),
+        "compress_phase_max_chars": list(_CTX_MGMT_DEFAULTS["compress_phase_max_chars"]),
+        "dedup_tool_results_enabled": bool(_CTX_MGMT_DEFAULTS["dedup_tool_results_enabled"]),
+        "drop_unused_base64_age": int(_CTX_MGMT_DEFAULTS["drop_unused_base64_age"]),
+        "predictive_cap_ratio": float(_CTX_MGMT_DEFAULTS["predictive_cap_ratio"]),
+    }
+    try:
+        import os as _os
+        import psycopg2  # type: ignore[import-untyped]
+        db_url = _os.environ.get("DATABASE_URL") or "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable"
+        with psycopg2.connect(db_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT key, value FROM settings WHERE key LIKE 'agent.context.%%'"
+                )
+                rows = cur.fetchall()
+        for key, value in rows:
+            sval = str(value).strip().strip('"')
+            try:
+                if key == "agent.context.compress_start_iter":
+                    config["compress_start_iter"] = max(1, int(sval))
+                elif key == "agent.context.compress_phase_boundaries":
+                    config["compress_phase_boundaries"] = [int(x) for x in sval.split(",") if x.strip()]
+                elif key == "agent.context.compress_phase_keep_recent":
+                    config["compress_phase_keep_recent"] = [int(x) for x in sval.split(",") if x.strip()]
+                elif key == "agent.context.compress_phase_max_chars":
+                    config["compress_phase_max_chars"] = [int(x) for x in sval.split(",") if x.strip()]
+                elif key == "agent.context.dedup_tool_results_enabled":
+                    config["dedup_tool_results_enabled"] = sval.lower() not in ("false", "0", "off", "no")
+                elif key == "agent.context.drop_unused_base64_age":
+                    config["drop_unused_base64_age"] = max(0, int(sval))
+                elif key == "agent.context.predictive_cap_ratio":
+                    r = float(sval)
+                    if 0.3 <= r <= 0.9:
+                        config["predictive_cap_ratio"] = r
+            except Exception as parse_exc:
+                logger.warning("ctx_mgmt: parse setting %s fallito: %s", key, parse_exc)
+    except Exception as exc:
+        logger.warning("ctx_mgmt: load DB fallito, uso defaults (%s)", exc)
+
+    # Sanity check coerenza fasi.
+    lens = (
+        len(config["compress_phase_boundaries"]),
+        len(config["compress_phase_keep_recent"]),
+        len(config["compress_phase_max_chars"]),
+    )
+    if len(set(lens)) != 1 or lens[0] == 0:
+        logger.warning(
+            "ctx_mgmt: fasi compressione incoerenti (%s), fallback ai defaults", lens
+        )
+        config["compress_phase_boundaries"] = list(_CTX_MGMT_DEFAULTS["compress_phase_boundaries"])
+        config["compress_phase_keep_recent"] = list(_CTX_MGMT_DEFAULTS["compress_phase_keep_recent"])
+        config["compress_phase_max_chars"] = list(_CTX_MGMT_DEFAULTS["compress_phase_max_chars"])
+
+    _CTX_MGMT_CACHE["config"] = config
+    _CTX_MGMT_CACHE["loaded_at"] = now
+    return config
+
+
+# ── FIX A: compressione anticipata escalante ────────────────────────────────
+
+def _should_compress_now(iteration: int, settings: dict[str, Any] | None = None) -> tuple[bool, dict[str, int]]:
+    """Decide se comprimere in base all'iterazione corrente e con quali parametri.
+
+    Ritorna (compress, params) dove params = {"keep_recent": int, "max_content_chars": int}.
+
+    Logica (default): iter < 5 -> no. 5-9 -> (8, 2000). 10-19 -> (5, 1000).
+    20-49 -> (3, 500). >= 50 -> (2, 150). I boundary sono DB-driven (mig 0199).
+    """
+    cfg = settings or _load_ctx_mgmt_config()
+    start = int(cfg["compress_start_iter"])
+    if iteration < start:
+        return False, {"keep_recent": 0, "max_content_chars": 0}
+    boundaries = list(cfg["compress_phase_boundaries"])
+    keeps = list(cfg["compress_phase_keep_recent"])
+    chars = list(cfg["compress_phase_max_chars"])
+    # Sceglie la fase la cui boundary e' la massima <= iteration.
+    idx = 0
+    for i, b in enumerate(boundaries):
+        if iteration >= b:
+            idx = i
+        else:
+            break
+    return True, {
+        "keep_recent": int(keeps[idx]),
+        "max_content_chars": int(chars[idx]),
+    }
+
+
+# ── FIX B: deduplicazione tool_result identici per signature ────────────────
+
+def _tool_use_signature(tool_name: str, args: Any) -> str:
+    """Signature stabile: sha256(tool_name + json(args, sort_keys=True))[:16]."""
+    try:
+        args_json = json.dumps(args, sort_keys=True, default=str, ensure_ascii=False)
+    except Exception:
+        args_json = str(args)
+    payload = f"{tool_name}|{args_json}".encode("utf-8", errors="ignore")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _dedup_tool_results_history(messages: list[Any]) -> list[Any]:
+    """Per ogni signature (tool_name+args) tiene solo l'ULTIMO tool_result.
+
+    Le occorrenze precedenti vengono sostituite con un placeholder che cita la
+    presenza di una versione piu' recente piu' avanti nella history. Il
+    tool_use_id viene preservato per non rompere l'accoppiamento Anthropic.
+
+    Diverso da `_dedup_tool_results` (BP11) che hashea il CONTENT: qui hashiamo
+    la CHIAMATA. Cosi' coglie il caso "stesso file letto 24 volte con stessi
+    args" anche se il content differisce per timestamp/metadata.
+    """
+    # Step 1: indice signature -> (mi_tool_use, tool_use_id) -> ultima occorrenza tool_result.
+    # Mappiamo tool_use_id -> signature (tool_use sta in messaggi AI precedenti).
+    tool_use_id_to_sig: dict[str, str] = {}
+    for m in messages:
+        content = getattr(m, "content", None)
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tid = str(block.get("id", "") or "")
+                    if tid:
+                        tool_use_id_to_sig[tid] = _tool_use_signature(
+                            str(block.get("name", "") or ""),
+                            block.get("input", {}) or {},
+                        )
+        extra = getattr(m, "additional_kwargs", {}) or {}
+        anth = extra.get("anthropic_content")
+        if isinstance(anth, list):
+            for block in anth:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tid = str(block.get("id", "") or "")
+                    if tid:
+                        tool_use_id_to_sig[tid] = _tool_use_signature(
+                            str(block.get("name", "") or ""),
+                            block.get("input", {}) or {},
+                        )
+
+    # Step 2: scorri history e individua ultimo tool_result per signature.
+    last_pos_for_sig: dict[str, tuple[int, int]] = {}
+    for mi, m in enumerate(messages):
+        extra = getattr(m, "additional_kwargs", {}) or {}
+        blocks = extra.get("anthropic_content")
+        if not isinstance(blocks, list):
+            continue
+        for bi, block in enumerate(blocks):
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tid = str(block.get("tool_use_id", "") or "")
+            sig = tool_use_id_to_sig.get(tid)
+            if not sig:
+                continue
+            last_pos_for_sig[sig] = (mi, bi)
+
+    # Step 3: sostituisci tool_result non-ultimi con placeholder.
+    dedup_count = 0
+    new_messages: list[Any] = []
+    for mi, m in enumerate(messages):
+        extra = getattr(m, "additional_kwargs", {}) or {}
+        blocks = extra.get("anthropic_content")
+        if not isinstance(blocks, list):
+            new_messages.append(m)
+            continue
+        changed = False
+        new_blocks = []
+        for bi, block in enumerate(blocks):
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                new_blocks.append(block)
+                continue
+            tid = str(block.get("tool_use_id", "") or "")
+            sig = tool_use_id_to_sig.get(tid)
+            if sig is None:
+                new_blocks.append(block)
+                continue
+            last = last_pos_for_sig.get(sig)
+            if last is None or last == (mi, bi):
+                new_blocks.append(block)
+                continue
+            new_blocks.append({
+                "type": "tool_result",
+                "tool_use_id": tid,
+                "content": (
+                    "[dedup: stesso tool con stessi args, vedi risultato "
+                    f"piu' recente in msg #{last[0]}]"
+                ),
+            })
+            changed = True
+            dedup_count += 1
+        if changed:
+            new_messages.append(HumanMessage(
+                content=getattr(m, "content", ""),
+                additional_kwargs={"anthropic_content": new_blocks},
+            ))
+        else:
+            new_messages.append(m)
+
+    if dedup_count > 0:
+        logger.info(
+            "dedup_tool_results_history: rimossi %d tool_result duplicati per signature",
+            dedup_count,
+        )
+    return new_messages
+
+
+# ── FIX C: drop body base64 da tool_result vecchi non citati ────────────────
+
+_BASE64_RE = _re_budget.compile(r"[A-Za-z0-9+/=]")
+
+
+def _looks_like_base64(s: str, min_len: int = 200) -> bool:
+    """Heuristic: stringa lunga senza newline composta al 90%+ di char base64."""
+    if not isinstance(s, str) or len(s) < min_len:
+        return False
+    if "\n" in s[:min_len]:
+        return False
+    # Conta su un campione per evitare scan completo su blob grandi.
+    sample = s if len(s) <= 4096 else s[:4096]
+    valid = sum(1 for c in sample if _BASE64_RE.match(c))
+    return valid / max(len(sample), 1) >= 0.9
+
+
+def _drop_unused_base64_payloads(messages: list[Any], max_age: int | None = None, keep_recent: int = 2) -> list[Any]:
+    """Sostituisce body base64 di tool_result vecchi non citati con placeholder.
+
+    Per ogni tool_result che ha content base64 (heuristic):
+      - se nei `max_age` messaggi successivi i primi 16 char del base64
+        NON appaiono testualmente, il body viene rimpiazzato con un placeholder.
+      - gli ultimi `keep_recent` messaggi sono sempre preservati intatti.
+    """
+    cfg = _load_ctx_mgmt_config()
+    if max_age is None:
+        max_age = int(cfg["drop_unused_base64_age"])
+    if max_age <= 0 or len(messages) <= keep_recent:
+        return messages
+
+    boundary = len(messages) - keep_recent
+    dropped = 0
+    new_messages: list[Any] = []
+
+    # Pre-calcola testo cumulativo per ogni indice (only-text) per ricerca veloce.
+    text_per_msg: list[str] = []
+    for m in messages:
+        parts: list[str] = []
+        c = getattr(m, "content", "")
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    parts.append(str(b.get("text", "")))
+        extra = getattr(m, "additional_kwargs", {}) or {}
+        anth = extra.get("anthropic_content")
+        if isinstance(anth, list):
+            for b in anth:
+                if isinstance(b, dict):
+                    bc = b.get("content")
+                    if isinstance(bc, str):
+                        parts.append(bc)
+        text_per_msg.append(" ".join(parts))
+
+    for mi, m in enumerate(messages):
+        if mi >= boundary:
+            new_messages.append(m)
+            continue
+        extra = getattr(m, "additional_kwargs", {}) or {}
+        blocks = extra.get("anthropic_content")
+        if not isinstance(blocks, list):
+            new_messages.append(m)
+            continue
+        changed = False
+        new_blocks = []
+        for block in blocks:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                new_blocks.append(block)
+                continue
+            content = block.get("content", "")
+            if not isinstance(content, str) or not _looks_like_base64(content):
+                new_blocks.append(block)
+                continue
+            prefix = content[:16]
+            window_hi = min(len(messages), mi + 1 + max_age)
+            cited = False
+            for j in range(mi + 1, window_hi):
+                if prefix in text_per_msg[j]:
+                    cited = True
+                    break
+            if cited:
+                new_blocks.append(block)
+                continue
+            orig_len = len(content)
+            new_blocks.append({
+                **block,
+                "content": (
+                    f"[contenuto base64 originale di {orig_len} byte rimosso "
+                    f"dalla history per ottimizzazione context. Se serve "
+                    f"rileggilo con il tool originale.]"
+                ),
+            })
+            changed = True
+            dropped += 1
+        if changed:
+            new_messages.append(HumanMessage(
+                content=getattr(m, "content", ""),
+                additional_kwargs={"anthropic_content": new_blocks},
+            ))
+        else:
+            new_messages.append(m)
+
+    if dropped > 0:
+        logger.info(
+            "drop_unused_base64_payloads: rimossi %d body base64 inutilizzati",
+            dropped,
+        )
+    return new_messages
+
+
+# ── FIX D: predictive context cap pre-tool ──────────────────────────────────
+
+_CONTEXT_WINDOW_CACHE: dict[str, tuple[float, int]] = {}
+_CONTEXT_WINDOW_TTL_SEC = 120.0
+
+
+def _model_context_window(model: str) -> int:
+    """Legge ai_price_catalog.context_window per il modello. Cache 120s.
+
+    Fallback safe 128_000 se DB down o modello non in catalogo.
+    """
+    if not model:
+        return 128_000
+    now = time.time()
+    entry = _CONTEXT_WINDOW_CACHE.get(model)
+    if entry and (now - entry[0]) < _CONTEXT_WINDOW_TTL_SEC:
+        return entry[1]
+    window = 128_000
+    try:
+        import os as _os
+        import psycopg2  # type: ignore[import-untyped]
+        db_url = _os.environ.get("DATABASE_URL") or "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable"
+        with psycopg2.connect(db_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT context_window FROM ai_price_catalog "
+                    "WHERE model = %s AND is_enabled = true "
+                    "ORDER BY effective_from DESC LIMIT 1",
+                    (model,),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    window = int(row[0])
+    except Exception as exc:
+        logger.debug("_model_context_window: lookup DB fallito per %s: %s", model, exc)
+    _CONTEXT_WINDOW_CACHE[model] = (now, window)
+    return window
+
+
+def _estimate_tool_result_size_bytes(tool_name: str, args: dict[str, Any]) -> int:
+    """Stima upper-bound dei byte attesi nel tool_result.
+
+    Heuristiche per i tool noti, con overhead 1.4× per espansione base64.
+    """
+    if not isinstance(args, dict):
+        args = {}
+    if tool_name in ("nexus_read_attachment", "nexus_read_archive_entry"):
+        length = args.get("length")
+        try:
+            length_i = int(length) if length is not None else 102_400
+        except Exception:
+            length_i = 102_400
+        encoding = str(args.get("encoding", "auto") or "auto").lower()
+        overhead = 1.4 if encoding in ("auto", "base64") else 1.05
+        return int(length_i * overhead)
+    if tool_name == "nexus_extract_pdf_text":
+        return 100_000
+    if tool_name in ("nexus_extract_docx_text", "nexus_extract_xlsx_data", "nexus_extract_figma_structure"):
+        return 80_000
+    if tool_name in ("nexus_list_archive_entries", "nexus_list_attachments", "nexus_inspect_attachment"):
+        return 4_000
+    if tool_name == "nexus_describe_image_attachment":
+        return 8_000
+    return 5_000
+
+
+def _current_context_token_estimate(messages: list[Any], system_text: str = "") -> int:
+    """Stima token totali del context attuale (~ chars/3.5)."""
+    total_chars = len(system_text or "")
+    for m in messages:
+        c = getattr(m, "content", "")
+        if isinstance(c, str):
+            total_chars += len(c)
+        elif isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict):
+                    for v in b.values():
+                        if isinstance(v, str):
+                            total_chars += len(v)
+        extra = getattr(m, "additional_kwargs", {}) or {}
+        anth = extra.get("anthropic_content")
+        if isinstance(anth, list):
+            for b in anth:
+                if isinstance(b, dict):
+                    for v in b.values():
+                        if isinstance(v, str):
+                            total_chars += len(v)
+        elif isinstance(anth, str):
+            total_chars += len(anth)
+    return int(total_chars / 3.5)
+
+
+def _predictive_cap_check(
+    tool_name: str,
+    args: dict[str, Any],
+    messages: list[Any],
+    model: str,
+    system_text: str = "",
+) -> str | None:
+    """Decide se la chiamata al tool farebbe superare il ratio*context_window.
+
+    Ritorna None se OK, altrimenti messaggio user-facing da iniettare come
+    tool_result error.
+    """
+    cfg = _load_ctx_mgmt_config()
+    ratio = float(cfg["predictive_cap_ratio"])
+    window = _model_context_window(model)
+    cap_tokens = int(window * ratio)
+    current = _current_context_token_estimate(messages, system_text)
+    expected_bytes = _estimate_tool_result_size_bytes(tool_name, args)
+    expected_tokens = int(expected_bytes / 3.5)
+    projected = current + expected_tokens
+    if projected <= cap_tokens:
+        return None
+    pct = int(current / max(window, 1) * 100)
+    logger.warning(
+        "predictive_cap: tool=%s bloccato (current=%d tok, expected=+%d tok, "
+        "projected=%d tok, cap=%d tok = %.0f%% di %d)",
+        tool_name, current, expected_tokens, projected, cap_tokens, ratio * 100, window,
+    )
+    return (
+        "[ERROR: chiamata bloccata da predictive context cap]\n"
+        f"Il context attuale e' a {current} token ({pct}% del budget {window}). "
+        f"Il risultato atteso del tool aggiungerebbe ~{expected_tokens} token "
+        f"portandolo oltre il {int(ratio*100)}% (cap={cap_tokens}).\n"
+        "Suggerimenti:\n"
+        "- Riduci i parametri (es. length piu' piccolo).\n"
+        "- Usa estrazione strutturata (nexus_extract_figma_structure, "
+        "nexus_extract_pdf_text, nexus_extract_docx_text).\n"
+        "- Chiedi all'utente di fornire una versione testuale."
+    )
+
+
 def _langchain_to_anthropic_messages(messages: list[Any]) -> list[dict]:
     """Converte la lista di BaseMessage LangChain in messaggi Anthropic-compatible.
 
@@ -1057,6 +1691,63 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     token_budget = state.get("token_budget", 400)
     tools_json = state.get("tools_json") or []
     system_text = state.get("system_text") or ""
+
+    # ── G1 cap: max re-execution per "risposta descrittiva su action request" ─
+    # Se route_after_executor ci ha gia' re-mandato qui >= max_nudges volte
+    # senza produrre tool call, fermiamo l'esecuzione con un messaggio
+    # assistant esplicito (non si tenta neppure la chiamata al modello).
+    # Questo evita loop infiniti quando il modello non rispetta il nudge G1
+    # (anche perche' il nudge stesso puo' non essere iniettato, es. la
+    # history contiene gia' tool call -> _has_tool_calls_in_history filtra).
+    _g1_reroute_count = int(state.get("g1_reroute_count") or 0)
+    _g1_max_nudges = _load_g1_max_nudges()
+    # Rileva se questa entry e' una re-execution G1: il turno precedente
+    # ha chiuso senza tool call (end_turn/stop/None) e abbiamo gia' almeno
+    # un'iterazione alle spalle. Verifica anche action_request sul primo
+    # messaggio umano per evitare di contare entry non-G1.
+    _prev_stop_for_g1 = state.get("stop_reason")
+    _prev_iterations_for_g1 = int(state.get("iterations") or 0)
+    _is_g1_reentry = False
+    if (
+        _prev_iterations_for_g1 >= 1
+        and _prev_stop_for_g1 in ("end_turn", "stop", None)
+        and not (state.get("pending_tool_uses") or [])
+    ):
+        _first_human_for_g1 = next(
+            (getattr(m, "content", "") for m in messages if hasattr(m, "type") and m.type == "human"),
+            "",
+        )
+        if isinstance(_first_human_for_g1, list):
+            _first_human_for_g1 = " ".join(
+                b.get("text", "") for b in _first_human_for_g1 if isinstance(b, dict)
+            )
+        if _detect_action_request(str(_first_human_for_g1)):
+            _is_g1_reentry = True
+            _g1_reroute_count += 1
+            logger.info(
+                "executor_node: re-entry G1 rilevata, reroute_count=%d/%d",
+                _g1_reroute_count, _g1_max_nudges,
+            )
+    if _g1_reroute_count >= _g1_max_nudges:
+        logger.warning(
+            "executor_node: G1 cap raggiunto (reroute_count=%d >= max=%d), "
+            "interrompo esecuzione con messaggio assistant esplicito",
+            _g1_reroute_count, _g1_max_nudges,
+        )
+        _cap_text = (
+            f"Modello non risponde con azione dopo {_g1_max_nudges} tentativi, "
+            f"fermo l'esecuzione. Riformula la richiesta in modo piu' specifico "
+            f"oppure prova con un modello piu' capace."
+        )
+        return {
+            "messages": [AIMessage(content=_cap_text)],
+            "result": _cap_text,
+            "pending_tool_uses": [],
+            "stop_reason": "g1_cap_reached",
+            "iterations": int(state.get("iterations") or 0) + 1,
+            "g1_reroute_count": _g1_reroute_count,
+            "action_nudge_count": int(state.get("action_nudge_count") or 0),
+        }
 
     # ── Forced text response (anti-loop tool-only) ────────────────────────
     # Se il loop ha gia' consumato la maggior parte delle iterazioni concesse
@@ -1121,6 +1812,11 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         "executor_node: provider=%s model=%s intent=%s tools=%d",
         provider, model, intent, len(tools_json),
     )
+    # Nexus thinking: lista locale, popolata lungo l'executor; emessa nel
+    # return finale solo se non vuota (e solo se il flag DB e' on).
+    _executor_thinking: list[str] = [
+        f"Routing modello: {provider}/{model} (intent {intent}, tools disponibili {len(tools_json)})."
+    ]
 
     # ── G1 Python: nudge anti-descrittivo ─────────────────────────────────────
     # Se il modello ha già risposto almeno una volta (iterations >= 1) senza
@@ -1224,37 +1920,62 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                     ctx_size = new_size
             except Exception as exc:
                 logger.warning("executor_node: summarizer fallito: %s", exc)
-        # ── Compressione escalante (BP4 esteso) ─────────────────────────────
-        # La compressione si attiva se:
-        # a) il contesto supera il 50% di MAX_CONTEXT_CHARS (soglia classica), oppure
-        # b) le iterazioni salgono (loop): keep_recent e max_content_chars decrescono
-        #    progressivamente per limitare l'accumulo di tool_result nella history.
-        #
-        # Calcolo keep_recent escalante:
-        #   iter < 8  → keep_recent=6, max_content_chars=500 (default)
-        #   iter 8-11 → keep_recent=5, max_content_chars=350
-        #   iter 12-15→ keep_recent=4, max_content_chars=250
-        #   iter 16-19→ keep_recent=3, max_content_chars=200
-        #   iter >= 20→ keep_recent=2, max_content_chars=150
-        _compress_iter = _current_iterations  # _current_iterations letto sopra
-        if _compress_iter >= 8:
-            _keep_recent = max(2, 6 - (_compress_iter - 8) // 4)
-            _max_chars = max(150, 500 - (_compress_iter - 8) * 25)
+        # ── FIX A-C (ADR 0014): context size management ──────────────────────
+        # Pipeline ordinata:
+        #   1) FIX B: dedup tool_result identici per signature (tool_name+args).
+        #   2) FIX C: drop body base64 vecchi non citati dalla history.
+        #   3) FIX A: compressione escalante anticipata da iter compress_start_iter
+        #      (default 5). I parametri keep_recent / max_content_chars sono
+        #      DB-driven (mig 0199).
+        # Tutto in cache 60s via _load_ctx_mgmt_config().
+        _ctx_cfg = _load_ctx_mgmt_config()
+        _compress_iter = _current_iterations
+
+        # FIX B: dedup tool_result identici per signature.
+        if _ctx_cfg.get("dedup_tool_results_enabled", True):
+            _pre_dedup_size = ctx_size
+            messages = _dedup_tool_results_history(messages)
+            _post_dedup = _estimate_context_chars(messages)
+            if _post_dedup != _pre_dedup_size:
+                logger.info(
+                    "executor_node: FIX B dedup signature iter=%d: %d -> %d char",
+                    _compress_iter, _pre_dedup_size, _post_dedup,
+                )
+                ctx_size = _post_dedup
+
+        # FIX C: drop base64 vecchi non citati.
+        _pre_drop = ctx_size
+        messages = _drop_unused_base64_payloads(messages)
+        _post_drop = _estimate_context_chars(messages)
+        if _post_drop != _pre_drop:
+            logger.info(
+                "executor_node: FIX C drop base64 iter=%d: %d -> %d char",
+                _compress_iter, _pre_drop, _post_drop,
+            )
+            ctx_size = _post_drop
+
+        # FIX A: compressione escalante anticipata.
+        _compress, _params = _should_compress_now(_compress_iter, _ctx_cfg)
+        if _compress:
             messages = _compress_old_tool_results(
-                messages, keep_recent=_keep_recent, max_content_chars=_max_chars,
+                messages,
+                keep_recent=_params["keep_recent"],
+                max_content_chars=_params["max_content_chars"],
             )
             new_size = _estimate_context_chars(messages)
             logger.info(
-                "executor_node: compressione escalante iter=%d keep_recent=%d "
+                "executor_node: FIX A compressione iter=%d keep_recent=%d "
                 "max_content_chars=%d: %d -> %d char",
-                _compress_iter, _keep_recent, _max_chars, ctx_size, new_size,
+                _compress_iter, _params["keep_recent"], _params["max_content_chars"],
+                ctx_size, new_size,
             )
             ctx_size = new_size
         elif ctx_size > MAX_CONTEXT_CHARS // 2:
+            # Safety net storica: contesto >50% MAX anche pre-iter=start.
             messages = _compress_old_tool_results(messages, keep_recent=6)
             new_size = _estimate_context_chars(messages)
             logger.info(
-                "executor_node: contesto compresso %d -> %d char",
+                "executor_node: contesto compresso (safety net) %d -> %d char",
                 ctx_size, new_size,
             )
         anth_messages = _langchain_to_anthropic_messages(messages)
@@ -1560,6 +2281,20 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         "sticky_model": model if (locals().get("cascade_did_fallback") or state.get("sticky_model")) else state.get("sticky_model"),
     }
 
+    # Nexus thinking: descrivi azioni decise da questo turno.
+    try:
+        for _tu in (pending_tool_uses or []):
+            _tu_name = (_tu.get("name") if isinstance(_tu, dict) else None) or "sconosciuto"
+            _executor_thinking.append(f"Chiamo tool: {_tu_name}")
+        if stop_reason == "end_turn" and not pending_tool_uses:
+            _executor_thinking.append("Risposta finale generata (end_turn).")
+    except Exception as _thinking_exc:
+        logger.debug("executor_node: thinking append fallito: %s", _thinking_exc)
+
+    _thinking_payload: dict[str, Any] = {}
+    if _executor_thinking and _nexus_thinking_enabled():
+        _thinking_payload["nexus_thinking"] = list(_executor_thinking)
+
     return {
         "messages": [assistant_msg],
         "result": result_text,
@@ -1598,11 +2333,77 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             )
             else _nudge_count
         ),
+        # G1: persisti il counter di re-execution G1 (incrementato sopra
+        # all'inizio dell'executor se questa entry e' una re-entry G1).
+        # Indipendente da action_nudge_count: viene alzato ANCHE quando il
+        # nudge non puo' essere iniettato (es. history con tool call),
+        # garantendo che il cap configurabile (agent.g1_max_nudges) scatti
+        # in ogni scenario ed eviti loop infiniti.
+        "g1_reroute_count": _g1_reroute_count,
         **sticky_out,
+        **_thinking_payload,
     }
 
 
 # ─── Nodo: tool_dispatch ─────────────────────────────────────────────────────
+
+
+
+# ── FIX 4 (ADR 0012): budget letture allegati ──────────────────────────────
+# Legge agent.attachment.session_read_budget_bytes da settings (cache 60s).
+# Default 500000 = 500 KB cumulativi per sessione. Tool intercettati:
+# nexus_read_attachment, nexus_read_archive_entry.
+_ATTACHMENT_BUDGET_CACHE: dict = {"value": None, "loaded_at": 0.0}
+_ATTACHMENT_BUDGET_TTL = 60.0
+
+def _attachment_budget_bytes() -> int:
+    import os as _os, time as _time
+    now = _time.time()
+    if _ATTACHMENT_BUDGET_CACHE.get("value") is not None        and now - _ATTACHMENT_BUDGET_CACHE.get("loaded_at", 0.0) < _ATTACHMENT_BUDGET_TTL:
+        return _ATTACHMENT_BUDGET_CACHE["value"]
+    value = 500_000
+    try:
+        import psycopg2  # type: ignore[import-untyped]
+        dburl = _os.environ.get("DATABASE_URL", "")
+        if dburl:
+            conn = psycopg2.connect(dburl)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT value FROM settings WHERE key = %s",
+                        ("agent.attachment.session_read_budget_bytes",),
+                    )
+                    row = cur.fetchone()
+                    if row and row[0] is not None:
+                        try:
+                            value = int(str(row[0]).strip().strip('"'))
+                        except ValueError:
+                            pass
+            finally:
+                conn.close()
+    except Exception as exc:
+        logger.debug("_attachment_budget_bytes: lettura DB fallita: %s", exc)
+    _ATTACHMENT_BUDGET_CACHE["value"] = value
+    _ATTACHMENT_BUDGET_CACHE["loaded_at"] = now
+    return value
+
+
+_ATTACHMENT_READ_TOOLS = {"nexus_read_attachment", "nexus_read_archive_entry"}
+
+
+def _extract_returned_bytes(result_content: str) -> int:
+    """Stima i byte effettivamente letti dal tool_result (campo )."""
+    try:
+        import json as _json
+        data = _json.loads(result_content) if result_content else {}
+        if isinstance(data, dict):
+            v = data.get("length")
+            if isinstance(v, int):
+                return max(0, v)
+    except Exception:
+        pass
+    return 0
+
 
 async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     """Esegue i tool_use richiesti dall'LLM tramite ToolRunner gRPC e
@@ -1656,6 +2457,70 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
 
     ctx_chars = _estimate_context_chars(list(state.get("messages") or []))
 
+    # FIX 4 (ADR 0012): budget letture allegati. Se la prossima chiamata a
+    # nexus_read_attachment / nexus_read_archive_entry farebbe superare il
+    # budget cumulativo della sessione, sostituisco il tool_use con un
+    # tool_result sintetico che istruisce il modello a usare i tool di
+    # estrazione strutturata.
+    current_bytes = int(state.get("attachment_read_bytes") or 0)
+    budget_total = _attachment_budget_bytes()
+    synthetic_results: list[dict] = []
+    pending_kept: list[dict] = []
+    pending_kept_indices: list[int] = []
+    # FIX D (ADR 0014): predictive context cap. Modello + system_text + history
+    # corrente vengono usati per stimare se la chiamata sforerebbe ratio*window.
+    _predictive_model = (
+        state.get("sticky_model")
+        or state.get("model_override")
+        or ""
+    )
+    _predictive_messages = list(state.get("messages") or [])
+    _predictive_system = state.get("system_text") or ""
+    for _i, b in enumerate(pending):
+        name = b.get("name", "")
+        # FIX D: predictive cap (ha priorita' sul budget allegati: se passa di qui,
+        # poi viene comunque verificato anche il budget).
+        _cap_msg = _predictive_cap_check(
+            tool_name=str(name or ""),
+            args=b.get("input", {}) or {},
+            messages=_predictive_messages,
+            model=str(_predictive_model or ""),
+            system_text=str(_predictive_system or ""),
+        )
+        if _cap_msg is not None:
+            synthetic_results.append({
+                "type": "tool_result",
+                "tool_use_id": b.get("id", ""),
+                "content": _cap_msg,
+                "is_error": True,
+            })
+            continue
+        if name in _ATTACHMENT_READ_TOOLS and current_bytes >= budget_total:
+            err_payload = {
+                "error": (
+                    f"budget letture allegati esaurito ({current_bytes} byte gia' "
+                    f"letti su {budget_total} budget). Usa un tool di estrazione "
+                    f"strutturata (nexus_extract_pdf_text, nexus_extract_figma_structure, "
+                    f"nexus_extract_docx_text, nexus_extract_xlsx_data) oppure chiedi "
+                    f"all'utente una versione testuale del file."
+                ),
+                "budget_bytes": budget_total,
+                "already_read": current_bytes,
+            }
+            logger.warning(
+                "tool_dispatch_node: budget letture allegati esaurito (%d/%d), tool=%s bloccato",
+                current_bytes, budget_total, name,
+            )
+            synthetic_results.append({
+                "type": "tool_result",
+                "tool_use_id": b.get("id", ""),
+                "content": json.dumps(err_payload, ensure_ascii=False),
+                "is_error": True,
+            })
+        else:
+            pending_kept.append(b)
+            pending_kept_indices.append(_i)
+
     async def _run(block: dict) -> dict:
         tool_use_id = block.get("id", "")
         _t_name = block.get("name", "")
@@ -1689,7 +2554,24 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
                 "is_error": True,
             }
 
-    results = await asyncio.gather(*[_run(b) for b in pending])
+    results_kept = await asyncio.gather(*[_run(b) for b in pending_kept]) if pending_kept else []
+    # Ricompongo results nell'ordine originale di pending.
+    results: list[dict] = []
+    _kept_iter = iter(results_kept)
+    _synth_iter = iter(synthetic_results)
+    for _i, b in enumerate(pending):
+        if _i in pending_kept_indices:
+            results.append(next(_kept_iter))
+        else:
+            results.append(next(_synth_iter))
+
+    # Aggiorna byte cumulativi sommando i length dei tool_result attachment_read.
+    added_bytes = 0
+    for b, r in zip(pending, results):
+        if b.get("name", "") in _ATTACHMENT_READ_TOOLS and not r.get("is_error"):
+            added_bytes += _extract_returned_bytes(r.get("content", ""))
+    new_attachment_read_bytes = current_bytes + added_bytes
+
 
     # M68: persisti gli step in agent_steps INCREMENTALMENTE durante il run.
     # Prima il batch finale era in chat_messages.rs:2350 (Rust) a fine run.
@@ -1772,6 +2654,7 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
         "pending_tool_uses": [],
         "stop_reason": "tool_use",
         "since_last_todo_reminder": new_reminder_counter,
+        "attachment_read_bytes": new_attachment_read_bytes,
     }
 
 
@@ -1795,6 +2678,12 @@ def route_after_executor(state: AgentState) -> str:
     if stop_reason == "loop_detected":
         logger.warning("route_after_executor: loop detected, chiusura forzata")
         return "learner"
+    # G1 cap: l'executor stesso ha gia' segnalato di aver raggiunto il
+    # numero massimo di re-execution G1 e ha emesso il messaggio assistant
+    # esplicativo. Andiamo direttamente al learner senza altri giri.
+    if stop_reason == "g1_cap_reached":
+        logger.warning("route_after_executor: G1 cap raggiunto, chiusura forzata")
+        return "learner"
     if iterations >= iter_cap:
         logger.warning(
             "route_after_executor: cap iterazioni adattivo raggiunto (iter=%d cap=%d complexity=%d)",
@@ -1811,10 +2700,21 @@ def route_after_executor(state: AgentState) -> str:
     # G1: risposta puramente descrittiva su richiesta action-oriented.
     # Se il modello ha risposto senza tool call (end_turn, no pending) e
     # la richiesta originale era un'azione concreta, ri-manda all'executor
-    # cosi' il nudge puo' attivarsi (max 2 volte, poi learner normale).
+    # cosi' il nudge puo' attivarsi. Cap dal DB (agent.g1_max_nudges,
+    # default 3): superato il cap NON si ri-manda piu' a executor; il cap
+    # effettivo viene applicato dall'executor stesso che produce il
+    # messaggio di stop esplicito (stop_reason="g1_cap_reached") gestito
+    # dal ramo apposito sopra.
+    #
+    # Il contatore canonico per il routing G1 e' `g1_reroute_count`
+    # (incrementato nell'executor a ogni re-entry G1) — usarlo qui invece
+    # di `action_nudge_count` evita il loop infinito quando il nudge non
+    # viene effettivamente iniettato (es. history contiene gia' tool call,
+    # _has_tool_calls_in_history filtra) e action_nudge_count resta a 0.
     if not pending and stop_reason in ("end_turn", "stop", None):
-        _nudge_count = int(state.get("action_nudge_count") or 0)
-        if _nudge_count < 2:
+        _reroute_count = int(state.get("g1_reroute_count") or 0)
+        _max_nudges = _load_g1_max_nudges()
+        if _reroute_count < _max_nudges:
             _msgs = state.get("messages") or []
             _first_human = next(
                 (getattr(m, "content", "") for m in _msgs if hasattr(m, "type") and m.type == "human"),
@@ -1825,12 +2725,19 @@ def route_after_executor(state: AgentState) -> str:
                     b.get("text", "") for b in _first_human if isinstance(b, dict)
                 )
             if _detect_action_request(str(_first_human)):
+                _nudge_count_log = int(state.get("action_nudge_count") or 0)
                 logger.warning(
                     "route_after_executor: G1 risposta descrittiva su action request "
-                    "(iter=%d nudge=%d) → re-executor con nudge",
-                    iterations, _nudge_count,
+                    "(iter=%d reroute=%d/%d nudge=%d) -> re-executor",
+                    iterations, _reroute_count, _max_nudges, _nudge_count_log,
                 )
                 return "executor"
+        else:
+            logger.warning(
+                "route_after_executor: G1 cap reroute raggiunto "
+                "(iter=%d reroute=%d/%d) -> chiusura forzata via learner",
+                iterations, _reroute_count, _max_nudges,
+            )
     return "learner"
 
 

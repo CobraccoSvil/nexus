@@ -650,6 +650,40 @@ fn parse_provider_hierarchy(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Guard-rail anti-mismatch: verifica che model appartenga a provider.
+///
+/// La fonte di verita della coppia provider/model resta
+/// nexus_provider_default_model + nexus_routing_matrix (regola G CLAUDE.md):
+/// questi prefix sono solo detection difensiva per impedire una coppia
+/// impossibile (es. anthropic + gemini-2.5-pro) che fallirebbe con 404. ADR 0016.
+fn model_belongs_to_provider(provider: &str, model: &str) -> bool {
+    let p = provider.trim().to_lowercase();
+    let m = model.trim().to_lowercase();
+    match p.as_str() {
+        "anthropic" => m.starts_with("claude"),
+        "google" => m.starts_with("gemini"),
+        "openai" => {
+            m.starts_with("gpt")
+                || m.starts_with("o1")
+                || m.starts_with("o3")
+                || m.starts_with("o4")
+                || m
+                    .strip_prefix('o')
+                    .and_then(|rest| rest.chars().next())
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+        }
+        "deepseek" => m.starts_with("deepseek"),
+        "mistral" => {
+            m.starts_with("mistral")
+                || m.starts_with("codestral")
+                || m.starts_with("ministral")
+                || m.starts_with("pixtral")
+        }
+        _ => true,
+    }
+}
+
 // default_model_for_provider e load_agent_provider_defaults rimossi dopo refactor 0101.
 // Erano duplicati di logica in orchestrator.rs e marcati #[allow(dead_code)].
 // Per leggere il default per provider usare:
@@ -855,6 +889,9 @@ fn normalize_attachments(input: &[ChatAttachmentRequest]) -> Vec<ChatAttachment>
                 return None;
             }
             Some(ChatAttachment {
+                // id propagato successivamente da enrich_attachments_with_ids
+                // dopo la persistenza (qui l'UUID non e' ancora disponibile).
+                id: None,
                 name: name.to_string(),
                 mime_type: attachment.mime_type.trim().to_string(),
                 size_bytes: attachment.size_bytes.max(0),
@@ -1785,6 +1822,278 @@ struct SpawnAgentResult {
     model: String,
 }
 
+/// Troncamento per caratteri (mai per byte: evita di spezzare sequenze UTF-8).
+fn trunc_chars(s: String, max: usize) -> String {
+    if s.chars().count() <= max {
+        s
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
+/// Costruisce il messaggio iniziale per il brain arricchendolo con il contenuto
+/// reale degli allegati (pre-extraction nel prompt — ADR 0010/0011/0012).
+///
+/// ROOT CAUSE storico: senza questo arricchimento, quando l'utente allega un
+/// file (es. un `.make` Figma con la specifica di un'app) il modello riceve solo
+/// il testo "crea l'app descritta nel file" SENZA il contenuto del file, e finisce
+/// per allucinare o generare un Hello World. Qui pre-estraiamo il contenuto
+/// autoritativo (Figma/PDF/DOCX/testo) e lo iniettiamo in un blocco `<allegati>`.
+///
+/// Budget totale condiviso tra gli allegati: setting `agent.attachment.preextract_max_chars`
+/// (default safe 50000, niente fallback hardcoded subdolo — regola G). Estrazioni
+/// fallite degradano con metadata + nota, mai panic.
+async fn build_initial_msg_with_attachments(
+    db: &PgPool,
+    content: &str,
+    attachments: &[crate::orchestrator::ChatAttachment],
+    user_message_id: Uuid,
+    project_id: Uuid,
+    session_id: Uuid,
+) -> String {
+    if attachments.is_empty() {
+        return content.to_string();
+    }
+
+    let n = attachments.len();
+
+    // Cap difensivo per singolo chunk iniettato: i chunk RAG sono gia' limitati
+    // da chunk_size, ma evitiamo che un chunk patologico gonfi il prompt.
+    const CHUNK_INJECT_CAP: usize = 8_000;
+
+    // Risolvo path fisici e stato di indicizzazione leggendo direttamente
+    // chat_message_attachments: serve file_path (per index sincrono di
+    // fallback), mime/kind e chunk_count.
+    struct AttRow {
+        id: String,
+        file_name: String,
+        file_path: String,
+        mime_type: String,
+        chunk_count: i64,
+    }
+    let saved_rows: Vec<AttRow> = match sqlx::query(
+        r#"SELECT id, file_name, file_path, mime_type, chunk_count
+           FROM chat_message_attachments WHERE message_id = $1 ORDER BY created_at ASC"#,
+    )
+    .bind(user_message_id)
+    .fetch_all(db)
+    .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|r| AttRow {
+                id: r
+                    .try_get::<Uuid, _>("id")
+                    .map(|u| u.to_string())
+                    .unwrap_or_default(),
+                file_name: r.try_get("file_name").unwrap_or_default(),
+                file_path: r.try_get("file_path").unwrap_or_default(),
+                mime_type: r.try_get("mime_type").unwrap_or_default(),
+                chunk_count: r.try_get("chunk_count").unwrap_or(0),
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                user_message_id = %user_message_id,
+                error = %e,
+                "initial_msg: lettura chat_message_attachments fallita, fallback metadata"
+            );
+            Vec::new()
+        }
+    };
+
+    // Blocco di fallback con soli metadata + istruzione tool, usato quando il
+    // RAG e' disabilitato o non produce hit. Mai contenuto inventato.
+    let metadata_block = |reason: &str| -> String {
+        let mut b = String::new();
+        b.push_str("<allegati>\n");
+        b.push_str(&format!(
+            "L'utente ha allegato {} file. Il contenuto integrale non e' inline qui ({}). \
+             DEVI investigarlo prima di rispondere.\n\n## File allegati:\n",
+            n, reason
+        ));
+        for att in attachments.iter() {
+            let id_label = att.id.map(|u| format!(" [ID: {}]", u)).unwrap_or_default();
+            b.push_str(&format!(
+                "- {} ({}, {} byte){}\n",
+                att.name, att.mime_type, att.size_bytes, id_label
+            ));
+        }
+        b.push_str(
+            "\nISTRUZIONE: per ogni allegato chiama nexus_inspect_attachment(id) e poi il tool \
+             di estrazione consigliato (nexus_extract_pdf_text / nexus_extract_docx_text / \
+             nexus_extract_figma_structure / nexus_read_attachment), oppure \
+             nexus_search_semantic(query, filter_attachment_id) sul contenuto vettorializzato. \
+             NON generare un placeholder, NON un Hello World, NON inventare un dominio diverso.\n",
+        );
+        b.push_str("</allegati>");
+        b
+    };
+
+    // RAG abilitato? Se no o config non disponibile, fallback metadata.
+    let cfg = match crate::rag::current_config(db).await {
+        Ok(c) if c.enabled => c,
+        Ok(_) => {
+            tracing::info!("initial_msg: RAG disabilitato, fallback metadata + tool");
+            return format!("{}\n\n{}", content, metadata_block("RAG disabilitato"));
+        }
+        Err(e) => {
+            tracing::warn!("initial_msg: config RAG non disponibile ({e}), fallback metadata");
+            return format!(
+                "{}\n\n{}",
+                content,
+                metadata_block("configurazione RAG non disponibile")
+            );
+        }
+    };
+
+    // Index sincrono di fallback: l'auto-index al persist e' fire-and-forget,
+    // quindi i chunk potrebbero non essere pronti. Per ogni allegato non ancora
+    // indicizzato (chunk_count=0) indicizziamo ORA, sincrono, prima della search.
+    let mut current_ids: Vec<String> = Vec::with_capacity(n);
+    for att in attachments.iter() {
+        let row = att
+            .id
+            .map(|id| id.to_string())
+            .and_then(|id_str| saved_rows.iter().find(|r| r.id == id_str))
+            .or_else(|| saved_rows.iter().find(|r| r.file_name == att.name));
+        let Some(row) = row else {
+            continue;
+        };
+        current_ids.push(row.id.clone());
+
+        if row.chunk_count <= 0 {
+            let Ok(att_uuid) = Uuid::parse_str(&row.id) else {
+                continue;
+            };
+            match crate::rag::index_attachment(
+                db,
+                att_uuid,
+                std::path::PathBuf::from(&row.file_path),
+                row.mime_type.clone(),
+                row.file_name.clone(),
+                Some(project_id),
+                Some(session_id),
+            )
+            .await
+            {
+                Ok(nc) => tracing::info!(
+                    "initial_msg: index sincrono allegato {} -> {} chunks",
+                    row.id,
+                    nc
+                ),
+                Err(e) => tracing::warn!(
+                    "initial_msg: index sincrono allegato {} fallito: {}",
+                    row.id,
+                    e
+                ),
+            }
+        }
+    }
+
+    // RAG retrieval: cerca i chunk piu' rilevanti tra i soli allegati.
+    let hits = match crate::rag::search_semantic(
+        db,
+        content,
+        vec![crate::rag::SourceKind::Attachment],
+        Some(project_id),
+        Some(session_id),
+        Some(cfg.top_k_default),
+        Vec::new(),
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("initial_msg RAG: search fallita ({e}), fallback metadata");
+            return format!(
+                "{}\n\n{}",
+                content,
+                metadata_block("recupero semantico non disponibile")
+            );
+        }
+    };
+
+    // Tieni solo gli hit appartenenti agli allegati di QUESTO messaggio.
+    let relevant: Vec<_> = hits
+        .into_iter()
+        .filter(|h| current_ids.iter().any(|id| id == &h.source_id))
+        .collect();
+
+    if relevant.is_empty() {
+        tracing::info!("initial_msg RAG: 0 hit rilevanti, fallback metadata + tool");
+        return format!(
+            "{}\n\n{}",
+            content,
+            metadata_block("nessun estratto rilevante recuperato dal contenuto vettorializzato")
+        );
+    }
+
+    let name_for = |source_id: &str| -> String {
+        attachments
+            .iter()
+            .find(|a| a.id.map(|u| u.to_string()).as_deref() == Some(source_id))
+            .map(|a| a.name.clone())
+            .or_else(|| {
+                saved_rows
+                    .iter()
+                    .find(|r| r.id == source_id)
+                    .map(|r| r.file_name.clone())
+            })
+            .unwrap_or_else(|| source_id.to_string())
+    };
+
+    let mut block = String::new();
+    block.push_str("<allegati>\n");
+    block.push_str(&format!(
+        "L'utente ha allegato {} file. Sotto trovi gli estratti piu' rilevanti rispetto alla tua \
+         richiesta, recuperati semanticamente dal contenuto completo dei file (vettorializzato). \
+         Il contenuto completo e' disponibile via il tool nexus_search_semantic(query, \
+         filter_attachment_id) per approfondire qualsiasi aspetto.\n\n## File allegati:\n",
+        n
+    ));
+    for att in attachments.iter() {
+        let id_label = att.id.map(|u| format!(" [ID: {}]", u)).unwrap_or_default();
+        block.push_str(&format!(
+            "- {} ({}, {} byte){}\n",
+            att.name, att.mime_type, att.size_bytes, id_label
+        ));
+    }
+
+    block.push_str("\n## Estratti rilevanti:\n");
+    let n_hits = relevant.len();
+    for h in relevant.iter() {
+        let chunk = trunc_chars(h.chunk_text.clone(), CHUNK_INJECT_CAP);
+        block.push_str(&format!(
+            "\n[score {:.2}, da {}]\n{}\n",
+            h.score,
+            name_for(&h.source_id),
+            chunk
+        ));
+    }
+
+    block.push_str(
+        "\nISTRUZIONE: il contenuto sopra e' la specifica reale fornita dall'utente. Implementa \
+         ESATTAMENTE quanto descritto, con le funzionalita' specifiche indicate. Se ti serve piu' \
+         contesto chiama nexus_search_semantic(query=\"...\", filter_attachment_id=\"<id>\"). NON \
+         generare un placeholder, NON un Hello World, NON inventare un dominio diverso da quello \
+         descritto.\n",
+    );
+    block.push_str("</allegati>");
+
+    tracing::info!(
+        attachments = n,
+        chunks_retrieved = n_hits,
+        block_chars = block.len(),
+        "initial_msg RAG: {} allegati, {} chunk recuperati, blocco {} chars",
+        n,
+        n_hits,
+        block.len()
+    );
+
+    format!("{}\n\n{}", content, block)
+}
+
 /// Logica condivisa: carica progetto, costruisce contesto, avvia AgentLoop in background.
 /// Ritorna `None` se il progetto non è caricabile (fallback al singolo turn).
 async fn spawn_agent_run(
@@ -1996,6 +2305,7 @@ async fn spawn_agent_run(
             trace: None,
             is_final: true,
             token_delta: None,
+            thinking_delta: None,
             meta_step: None,
         });
         return Some(SpawnAgentResult {
@@ -2268,9 +2578,29 @@ async fn spawn_agent_run(
         automation_instructions, o_series_instructions, test_instructions,
         params.profile_prompt_block, params.system_context, self_ref_hint
     );
-    // Il messaggio iniziale è solo il contenuto corrente (senza prefisso testuale)
-    // La history recente viene passata come turns strutturati via resume_history
-    let initial_msg = params.content.clone();
+    // Costruzione del messaggio iniziale arricchito con il contenuto reale
+    // degli allegati (ADR 0010/0011/0012 — pre-extraction nel prompt).
+    //
+    // ROOT CAUSE storico: senza questo blocco, quando l'utente allega un file
+    // (es. un .make Figma con la specifica di un'app) il modello riceve solo il
+    // testo "crea l'app descritta nel file" SENZA il contenuto del file, e
+    // finisce per allucinare o generare un Hello World. Qui pre-estraiamo il
+    // contenuto autoritativo e lo iniettiamo in un blocco <allegati>.
+    //
+    // La history recente viene passata come turns strutturati via resume_history.
+    // La costruzione del blocco <allegati> e' estratta in build_initial_msg_with_attachments
+    // (funzione dedicata) per non gonfiare ulteriormente spawn_agent_run, che e'
+    // gia' enorme: una closure complessa inline qui faceva degenerare il typeck
+    // del compilatore (ICE).
+    let initial_msg = build_initial_msg_with_attachments(
+        &state.db,
+        &params.content,
+        &params.attachments,
+        params.user_message_id,
+        params.project_id,
+        params.session_id,
+    )
+    .await;
 
     tracing::warn!(
         "TOKEN_OPT: system_text_len={} initial_msg_len={} recent_ctx_len={} history_turns={}",
@@ -2679,36 +3009,76 @@ async fn spawn_agent_run(
             let (chosen_provider, chosen_model) = if let Some(pair) = next_pair {
                 pair
             } else {
-                // Cerca il prossimo provider nella gerarchia, non gia' provato e non in cooldown
-                let next = provider_hierarchy.iter().find(|p| {
-                    !tried.contains(*p) && !crate::provider_cooldown::is_provider_in_cooldown(p)
-                });
-                let Some(next_provider) = next else {
-                    tracing::warn!("agent_run {}: nessun provider alternativo disponibile, mantengo risultato", run_id);
-                    break;
-                };
-                let new_provider = next_provider.clone();
-                // Modello di default per il nuovo provider, letto da DB (registry routing).
-                let new_model = match routing_matrix_for_loop.current_async().await {
-                    Ok(matrix_arc) => matrix_arc
-                        .default_model(&new_provider)
-                        .unwrap_or_else(|| {
-                            tracing::warn!(
-                                "agent_run {}: provider '{}' non configurato in nexus_provider_default_model, mantengo modello corrente",
-                                run_id, new_provider
-                            );
-                            current_model.clone()
-                        }),
+                // Cerca il prossimo provider nella gerarchia che sia:
+                //   - non gia' provato in questo run
+                //   - non in cooldown billing/quota
+                //   - dotato di un default model in nexus_provider_default_model
+                //   - con coppia (provider, model) coerente (guard-rail anti-mismatch)
+                //
+                // INVARIANTE: provider e model devono SEMPRE appartenere allo
+                // stesso provider. Un provider senza default model viene SKIPPATO
+                // nel fallback, mai accoppiato al model del provider precedente.
+                // Fonte di verita: nexus_provider_default_model (regola G); i
+                // prefix in model_belongs_to_provider sono detection. Vedi ADR 0016.
+                //
+                // Se la routing_matrix non e disponibile non si puo decidere un
+                // model coerente -> break (manteniamo il result corrente).
+                let matrix_arc = match routing_matrix_for_loop.current_async().await {
+                    Ok(m) => m,
                     Err(e) => {
                         tracing::error!(
-                            "agent_run {}: routing_matrix non disponibile ({}), mantengo modello corrente",
+                            "agent_run {}: routing_matrix non disponibile ({}), interrompo fallback e mantengo risultato",
                             run_id, e
                         );
-                        current_model.clone()
+                        break;
                     }
                 };
-                (new_provider, new_model)
+                let mut chosen: Option<(String, String)> = None;
+                for candidate in provider_hierarchy.iter() {
+                    if tried.contains(candidate)
+                        || crate::provider_cooldown::is_provider_in_cooldown(candidate)
+                    {
+                        continue;
+                    }
+                    let Some(candidate_model) = matrix_arc.default_model(candidate) else {
+                        tracing::warn!(
+                            "agent_run {}: provider '{}' senza default model in nexus_provider_default_model, skip nel fallback",
+                            run_id, candidate
+                        );
+                        continue;
+                    };
+                    // Guard-rail: la coppia (provider, model) deve essere coerente.
+                    // Previene QUALSIASI mismatch: se il default model non
+                    // appartiene al provider, NON tentiamo la chiamata (404).
+                    if !model_belongs_to_provider(candidate, &candidate_model) {
+                        tracing::error!(
+                            "agent_run {}: coppia incoerente provider='{}' model='{}' in nexus_provider_default_model, skip nel fallback",
+                            run_id, candidate, candidate_model
+                        );
+                        continue;
+                    }
+                    chosen = Some((candidate.clone(), candidate_model));
+                    break;
+                }
+                let Some(pair) = chosen else {
+                    tracing::warn!(
+                        "agent_run {}: nessun provider alternativo con default model coerente disponibile, mantengo risultato",
+                        run_id
+                    );
+                    break;
+                };
+                pair
             };
+            // Invariante difensiva finale: anche i candidati da escalation
+            // hollow (next_pair) passano per il guard-rail. Una coppia
+            // incoerente non deve mai diventare current_provider/model.
+            if !model_belongs_to_provider(&chosen_provider, &chosen_model) {
+                tracing::error!(
+                    "agent_run {}: coppia incoerente scelta provider='{}' model='{}', interrompo fallback (guard-rail)",
+                    run_id, chosen_provider, chosen_model
+                );
+                break;
+            }
             current_provider = chosen_provider;
             current_model = chosen_model;
             fallback_attempt += 1;
@@ -2727,6 +3097,7 @@ async fn spawn_agent_run(
                 trace: None,
                 is_final: false,
                 token_delta: None,
+                thinking_delta: None,
                 meta_step: Some(crate::agent_types::AgentMetaStep {
                     kind: "fallback".to_string(),
                     title: format!("Fallback su {}/{}", current_provider, current_model),
@@ -2750,6 +3121,7 @@ async fn spawn_agent_run(
             trace: None,
             is_final: true,
             token_delta: None,
+            thinking_delta: None,
             meta_step: None,
         });
         channels_clone.remove(&run_id);
@@ -3024,6 +3396,7 @@ async fn spawn_agent_run(
                 trace: None,
                 is_final: true,
                 token_delta: None,
+                thinking_delta: None,
                 meta_step: None,
             });
             panic_channels.remove(&panic_run_id);

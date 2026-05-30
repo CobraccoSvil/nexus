@@ -101,6 +101,8 @@ vi.mock("../src/router/policy-engine.js", () => ({
       }),
       validateTierClaim: vi.fn(),
       getProfile: vi.fn().mockReturnValue(profile),
+      refreshDbOverrides: vi.fn().mockResolvedValue(undefined),
+      isDlpDisabled: vi.fn().mockReturnValue(false),
     };
   }),
 }));

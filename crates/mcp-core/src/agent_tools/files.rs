@@ -155,6 +155,18 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
         None => return "[Errore: parametro 'content' mancante]".to_string(),
     };
 
+    // Enforcement porte hardcoded (ADR 0010). Se il setting
+    // `agent.enforce_port_allocation` e' true (default) e il content
+    // contiene una porta TCP fuori dal bucket Nexus 20000-39999, blocca
+    // la scrittura e istruisci l'agente a chiamare request_port.
+    if super::port_scanner::is_enforcement_enabled(&ctx.db).await {
+        if let super::port_scanner::PortScanOutcome::Reject(findings) =
+            super::port_scanner::scan_content(path_str, content)
+        {
+            return super::port_scanner::format_reject_message(path_str, &findings);
+        }
+    }
+
     // Calcola il path assoluto con sicurezza path-traversal
     let clean = path_str.trim().trim_start_matches(['\\', '/']);
     let target = ctx.root_path.join(clean);
@@ -506,6 +518,15 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
         Some(s) => s,
         None => return "[Errore: parametro 'new_string' mancante]".to_string(),
     };
+
+    // Enforcement porte hardcoded (ADR 0010): scansiona la nuova porzione.
+    if super::port_scanner::is_enforcement_enabled(&ctx.db).await {
+        if let super::port_scanner::PortScanOutcome::Reject(findings) =
+            super::port_scanner::scan_content(path_str, new_string)
+        {
+            return super::port_scanner::format_reject_message(path_str, &findings);
+        }
+    }
 
     let target = match resolve_relative_path(&ctx.root_path, path_str) {
         Ok(p) => p,

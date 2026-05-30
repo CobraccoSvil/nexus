@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: 5e78f4566b1dabad67e2e8669f8b2c91dc9b7130
+source_commit: 18980a650f946bcca8b7a30588a3f775ec6d6b42
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T18:11:15Z
+updated_at: 2026-05-28T12:16:09Z
 nexus_meta_version: 1
 ---
 
@@ -24,12 +24,24 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 | Chiave | Valore default | Descrizione |
 |---|---|---|
+| `agent.complexity.file_path_points` | `2` | Punti per ogni path o file menzionato nel prompt (es. /home/, src/, *.json). |
+| `agent.complexity.keyword_weights` | `{"create":3,"write_file":2,"install":2,"build":2,"systemc...` | Mappa keyword->punti complessita rilevati nel prompt. Match case-insensitive, somma capped a 100. |
+| `agent.complexity.step_marker_points` | `5` | Punti per ogni marker di step esplicito (1., 2., step, task, phase) nel prompt. |
+| `agent.complexity.weak_model_multiplier` | `1.5` | Moltiplicatore budget se il modello iniziale e gpt-4o-mini / haiku / nano (necessita piu iter per G1 nudge). |
+| `agent.iteration_budget.base` | `60` | Numero base iterazioni LangGraph per ogni run agente. Sommato a per_complexity_point*complexity_score. |
+| `agent.iteration_budget.max` | `300` | Tetto massimo iterazioni anche per task molto complessi. Safety net runaway. |
+| `agent.iteration_budget.per_complexity_point` | `4` | Iterazioni aggiuntive per ogni punto di complessita del prompt (score 0-100). |
 | `agent_narration_warn_after_chars` | `1500` | Caratteri di testo streamed senza tool call dopo i quali il badge UI passa in stato warning. |
 | `agent_narration_warn_after_ms` | `30000` | Millisecondi di run senza tool call dopo i quali il badge UI passa in stato warning (possibile loop di narrazione). |
 | `agent_parallel_enabled` | `true` | Abilita l'esecuzione parallela di piu' agenti contemporaneamente per accelerare task complessi |
 | `agent_parallel_max` | `5` | Numero massimo di agenti paralleli per sessione (1-5) |
 | `agent_router_enabled` | `true` | Abilita il server gRPC AgentRouter (porta 50072) che espone il router Q-Learning di nexus-orchestrator al brain Python. Quando attivo, il router_node consulta il Q-Learning per scegliere il profilo agente ottimale (es. coder, cloud_architect, tech_writer) in base alla cronologia dei reward osservati. Se disabilitato il brain usa il routing di fallback basato solo sull'intent. Richiede riavvio di mcp-core per applicare la modifica. |
 | `anthropic_system_cache_ttl` | `1h` | TTL della cache prompt di sistema per Anthropic: 5m (default Anthropic) o 1h (extended-cache-ttl-2025-04-11). Il valore 1h massimizza il cache hit rate fra turni distanti (il system prompt cambia raramente). Override: NEXUS_ANTHROPIC_SYSTEM_CACHE_TTL. Richiede riavvio del brain. |
+| `catalog_sync.disable_missing` | `true` | Se TRUE, disabilita i modelli del catalog non piu esposti dall API. Se FALSE solo log. |
+| `catalog_sync.enabled` | `true` | Attiva/disattiva il worker periodico di sync catalog modelli dai provider. |
+| `catalog_sync.insert_new_disabled` | `true` | Se TRUE, modelli nuovi vengono inseriti con is_enabled=false (admin verifica prezzi prima di abilitare). |
+| `catalog_sync.interval_hours` | `6` | Intervallo (ore) tra i tick del worker. Default 6 = 4 sync al giorno. |
+| `catalog_sync.providers` | `anthropic,openai,mistral,deepseek,google` | Provider per cui eseguire l'auto-discovery dei modelli (CSV). Google passa per brain REST /providers/google/models/live (Vertex SDK). |
 | `extended_thinking_budget_tokens` | `8000` | Budget massimo di token interni di ragionamento per turno quando extended_thinking_enabled=true. Range consigliato: 2000-16000. Valori piu' alti migliorano la qualita' ma aumentano i costi. |
 | `extended_thinking_enabled` | `false` | Abilita il ragionamento interno esteso (Extended Thinking) di Anthropic sui modelli Sonnet/Opus. Genera token di ragionamento interni billati al prezzo output. Disabilitato di default per contenere i costi. Attivare solo per task che richiedono ragionamento profondo. |
 | `llm_classifier_enabled` | `true` | Abilita il classificatore LLM degli intent (chiamata REST /classify-intent-agentic al brain Python). Se false usa solo keyword matching locale: piu' veloce ma meno preciso. Override di emergenza: NEXUS_LLM_CLASSIFIER_ENABLED=false. Richiede riavvio di mcp-core. |
@@ -193,7 +205,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 | Chiave | Valore default | Descrizione |
 |---|---|---|
-| `mcp_tool_search_hard_limit` | `20` | Numero minimo di tool nel catalogo oltre il quale il prompt usa solo nexus_mcp_tool_search (discovery mode, riduzione token). Default 20. |
+| `mcp_tool_search_hard_limit` | `200` | Numero minimo di tool nel catalogo oltre il quale il prompt usa solo nexus_mcp_tool_search (discovery mode, riduzione token). Default 20. |
 | `optimizer_auto_promote` | `true` | Se true, il worker promuove automaticamente le varianti che superano il test statistico (Wilson score, p<0.05). Default false = dry-run. |
 | `optimizer_canary_traffic_pct` | `10` | Percentuale di traffico inviata alla variante sperimentale durante il canary test (1-50). Default 10%. |
 | `optimizer_enabled` | `true` | Abilita il PromptOptimizerWorker. Con auto_promote_enabled=false genera varianti ma non le promuove (dry-run). Kill switch globale. |
@@ -262,6 +274,10 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `google_batch_model` | `gemini-2.5-flash` | Modello Gemini per batch job |
 | `google_batch_threshold` | `3` | Numero minimo di file per usare Batch API (altrimenti chiamate sincrone) |
 | `google_enabled` | `true` | Abilita il provider Google (Gemini) |
+| `google_provider_backend` | `vertex` | Backend Google provider: 'gemini' (Gemini API direct, API key) oppure 'vertex' (Vertex AI, Service Account dal DB). Default 'gemini'. Tutte le credenziali Vertex devono essere nel DB — niente env var. |
+| `google_vertex_credentials_json` | `{   "type": "service_account",   "project_id": "nexus-492...` | Service Account JSON per Vertex AI (sensitive, contenuto del file di chiavi GCP). OBBLIGATORIO se backend=vertex: il brain NON eredita credenziali da env GOOGLE_APPLICATION_CREDENTIALS o ADC. Incolla qui l'intero contenuto del file JSON SA. |
+| `google_vertex_location` | `europe-west4` | Region GCP per Vertex AI (es. europe-west4, europe-west8, us-central1). OBBLIGATORIO se backend=vertex. Consigliato europe-west4/europe-west8 per compliance EU/GDPR. Default: europe-west4. |
+| `google_vertex_project` | `nexus-492307` | ID progetto GCP per Vertex AI (es. nexus-prod-123456). OBBLIGATORIO se backend=vertex. |
 | `mistral_api_key` | `NXgtEYMVv5JGCeFHZlviOi8w40cdw1k7` | Mistral API Key |
 | `mistral_enabled` | `true` | Abilita il provider Mistral |
 | `openai_api_key` | `sk-proj-vrrZB-k1qfd9oZ8iBevLYPE7maRu4RREcP6MjCYVTHML_ZeJ_...` | OpenAI API Key |
@@ -293,7 +309,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `default_model` | `claude-sonnet-4-6` | Default model for chat |
 | `default_provider` | `anthropic` | Default LLM provider |
 | `max_token_budget` | `32000` | Maximum token budget allowed |
-| `model_catalog_last_sync` | `2026-05-23T17:42:31.928629628+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
+| `model_catalog_last_sync` | `2026-05-28T11:41:37.092296425+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
 | `nexus_active_routing_pct` | `50` | Percentuale di richieste chat gestite dal router Q-Learning Nexus (0=off, 100=tutto). A/B testing: imposta 10-50 per un rollout graduale. |
 | `nexus_behavior_mode` | `dinamico` | Modalità comportamento Nexus: veloce|economica|bilanciata|approfondita |
 | `provider_hierarchy` | `anthropic,openai,google,deepseek,mistral` | Ordered fallback chain for chat providers |
@@ -313,7 +329,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `routing_docs_providers` | `anthropic,openai,google,deepseek,mistral` | Provider order for documentation requests |
 | `routing_fix_providers` | `anthropic,openai,google,deepseek,mistral` | Provider order for fix requests |
 | `routing.llm_classifier_min_confidence` | `0.60` | Soglia confidence sotto cui il risultato del classifier LLM viene scartato e si usa il fallback keyword. Valore [0.0, 1.0]. |
-| `routing.llm_classifier_timeout_seconds` | `5.0` | Timeout in secondi per la chiamata HTTP al classifier LLM (POST /classify-intent-agentic). Su timeout, fallback keyword. |
+| `routing.llm_classifier_timeout_seconds` | `8.0` | Timeout in secondi per la chiamata HTTP al classifier LLM (POST /classify-intent-agentic). Su timeout, fallback keyword. |
 | `routing_refactor_providers` | `anthropic,openai,google,deepseek,mistral` | Provider order for refactor requests |
 | `routing.sse_heartbeat_max_silence_secs` | `120` | Secondi di silenzio sullo stream SSE brain→mcp-core prima di considerare il run bloccato. Il brain emette ping ogni 30s, quindi valore tipico 90-180. |
 | `routing_test_providers` | `anthropic,openai,google,deepseek,mistral` | Provider order for test requests |
@@ -346,4 +362,4 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 ---
 
-**Totale chiavi**: 199
+**Totale chiavi**: 215

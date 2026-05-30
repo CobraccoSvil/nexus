@@ -42,8 +42,15 @@ const PATTERNS: PatternDef[] = [
     tier: 3,
   },
   {
+    // Una AWS secret key e' una stringa di 40 char base64. Matchare QUALSIASI
+    // sequenza di 40 char produce falsi positivi su hash SHA, UUID, blob id,
+    // contenuti base64 (es. payload Figma ai_chat.json) -> tier 3 spurio ->
+    // blocco DLP del prompt. Richiediamo quindi il CONTESTO di un nome campo
+    // AWS (aws_secret_access_key / secret_access_key / aws_access...) prima
+    // del valore: i veri secret appaiono sempre in quel contesto, gli hash
+    // generici no. Fix classifier "meno aggressivo".
     type: "aws_secret",
-    pattern: /(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])/,
+    pattern: /(?:aws_?secret_?access_?key|secret_?access_?key|aws_?secret)["'\s:=]{0,12}[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])/i,
     tier: 3,
   },
   {

@@ -6,18 +6,18 @@ slug: rest-endpoints
 tags:
   - api
   - rest
-source_commit: 5e78f4566b1dabad67e2e8669f8b2c91dc9b7130
+source_commit: 18980a650f946bcca8b7a30588a3f775ec6d6b42
 source_files:
   - crates/mcp-core/src/main.rs
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-23T18:11:15Z
+updated_at: 2026-05-28T12:16:09Z
 nexus_meta_version: 1
 ---
 
 Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src/main.rs`.
 
-**Totale endpoint**: 254
+**Totale endpoint**: 256
 
 Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]].
 
@@ -109,6 +109,7 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 |---|---|---|
 | `DELETE` | `/api/chat/messages/:id` | `chat_messages::delete_chat_message` |
 | `GET` | `/api/chat/agent-runs/:run_id` | `chat_agent::get_agent_run` |
+| `GET` | `/api/chat/attachments/:attachment_id/raw` | `chat_attachments::get_attachment_raw` |
 | `GET` | `/api/chat/sessions` | `chat_sessions::list_chat_sessions` |
 | `GET` | `/api/chat/sessions/:id/agent-stream` | `chat_agent::agent_stream` |
 | `GET` | `/api/chat/sessions/:id/messages` | `chat_messages::list_chat_messages` |
@@ -117,6 +118,7 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 | `POST` | `/api/chat/agent-runs/:run_id/cancel` | `chat_agent::cancel_agent_run` |
 | `POST` | `/api/chat/agent-runs/:run_id/confirm` | `chat_agent::confirm_agent_run` |
 | `POST` | `/api/chat/feedback-assist` | `chat_messages::feedback_assist_handler` |
+| `POST` | `/api/chat/messages/:id/attachments/index` | `chat_attachments::index_attachments_to_kb` |
 | `POST` | `/api/chat/messages/:id/feedback-error` | `chat_messages::feedback_error` |
 | `POST` | `/api/chat/messages/:id/feedback-positive` | `chat_messages::feedback_positive` |
 | `POST` | `/api/chat/messages/:id/resend` | `chat_messages::resend_chat_message` |

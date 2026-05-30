@@ -53,14 +53,20 @@ class AgentRouterClient:
         address: str | None = None,
         mcp_core_url: str | None = None,
     ) -> None:
+        # Gerarchia: parametro esplicito > env var (override) > DB (canonico) > hardcoded.
+        from brain.utils.settings_db import get_setting
         # gRPC address (per select_agent — read-only Q-table query, mantenuto)
-        self.address = address or os.environ.get(
-            "AGENT_ROUTER_ADDR", "127.0.0.1:50072"
+        self.address = (
+            address
+            or os.environ.get("AGENT_ROUTER_ADDR")
+            or get_setting("agent_router_addr", "127.0.0.1:50501")
         )
         # REST URL (per submit_feedback — Fase C consolidamento)
-        self.mcp_core_url = (mcp_core_url or os.environ.get(
-            "MCP_CORE_URL", "http://localhost:4000"
-        )).rstrip("/")
+        self.mcp_core_url = (
+            mcp_core_url
+            or os.environ.get("MCP_CORE_URL")
+            or get_setting("mcp_core_url", "http://127.0.0.1:4000")
+        ).rstrip("/")
         self._channel: grpc.aio.Channel | None = None
         self._stub: agent_router_pb2_grpc.AgentRouterStub | None = None
 

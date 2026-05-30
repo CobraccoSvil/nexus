@@ -37,7 +37,15 @@ class EmbeddingService:
         qdrant_collection: str = "code_embeddings",
     ) -> None:
         self._default_model = default_model
-        self._qdrant_url = qdrant_url or os.getenv("QDRANT_URL", "http://localhost:6333")
+        if qdrant_url:
+            self._qdrant_url = qdrant_url
+        else:
+            env = os.getenv("QDRANT_URL")
+            if env:
+                self._qdrant_url = env
+            else:
+                from brain.utils.settings_db import get_setting
+                self._qdrant_url = get_setting("qdrant_url", "http://localhost:6333")
         self._collection = qdrant_collection
         self._qdrant_client: Any | None = None
         self._dimension = 384  # all-MiniLM-L6-v2 outputs 384-dim vectors

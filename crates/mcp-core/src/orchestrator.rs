@@ -298,6 +298,125 @@ fn classify_intent_with_agentic_promotion(message: &str) -> (&'static str, f32) 
     (intent, confidence)
 }
 
+/// Classificatore DETERMINISTICO di fallback (keyword/pattern based, IT+EN).
+///
+/// Esiste per rendere la classificazione intent **indipendente da un LLM che
+/// puo' fallire** (overload, quota, timeout). Viene usato in due punti di
+/// `classify_intent_full`:
+///   (a) come **pre-check** prima di chiamare l'LLM: se un pattern agentico ad
+///       altissima confidenza matcha, si salta del tutto la chiamata HTTP
+///       (piu' veloce e robusto);
+///   (b) come **fallback** quando l'LLM fallisce: invece di degradare a
+///       `chat` (che NON attiva il path agent + tool), si usa il risultato
+///       deterministico se disponibile.
+///
+/// Ritorna `Some((intent_static, confidence))` con un intent **ammesso dalla
+/// routing matrix** (vedi `intent_str_to_static` + le promozioni
+/// `system_admin` / `fix_complesso`). Ritorna `None` quando nessun pattern
+/// matcha, lasciando decidere all'LLM o al default `chat`.
+///
+/// I pattern sono prefissi/sottostringhe lasche per coprire le forme verbali
+/// italiane (crea/creare/crei, implementa/implementare, ecc.) e gli
+/// equivalenti inglesi. Falsi positivi sono accettabili: al peggio si attiva
+/// il path agent quando non strettamente necessario, che e' molto meno grave
+/// del falso negativo opposto (task agentico trattato come chat).
+fn deterministic_intent_fallback(message: &str) -> Option<(&'static str, f32)> {
+    let lc = message.to_lowercase();
+    if lc.trim().is_empty() {
+        return None;
+    }
+
+    // Escludi le richieste puramente informative ("cos'e'", "che cosa", ...):
+    // non sono task agentici anche se contengono verbi che altrimenti
+    // matcherebbero. Coerente con `is_agentic_request`.
+    let purely_informational = lc.starts_with("cos'e")
+        || lc.starts_with("cosa e")
+        || lc.starts_with("che cosa")
+        || lc.starts_with("what is")
+        || lc.starts_with("spiegami");
+
+    // ── 0. Pattern DOCS: valutati PRIMA dell'agentico generico perche'
+    // "scrivi readme per il progetto" matcherebbe altrimenti il blocco
+    // agentico (verbo "scrivi" + contesto "progetto"). DOCS e' piu' specifico.
+    const DOCS_PATTERNS: &[&str] = &[
+        "documenta", "genera doc", "genera la doc", "genera documentazione",
+        "crea documentazione", "crea la documentazione",
+        "scrivi readme", "scrivi il readme", "genera readme",
+        "write docs", "generate docs", "write readme",
+    ];
+    if DOCS_PATTERNS.iter().any(|p| lc.contains(*p)) {
+        return Some(("docs", 0.70));
+    }
+
+    // ── 1. Pattern AGENTICI forti: creazione/modifica codice e infra. ──────
+    // Verbi imperativi/infinitivi di azione su artefatti software. Match ad
+    // ALTA confidenza (0.85): attiva il path agent (intent != "chat").
+    // L'intent scelto e' `system_admin`, gia' mappato a modelli capable con
+    // tool use solido in `nexus_routing_matrix` (stesso target della
+    // promozione agentic esistente).
+    const AGENTIC_VERBS: &[&str] = &[
+        "crea ", "creare", "crei ",
+        "implementa", "implementare",
+        "sviluppa", "sviluppare",
+        "costruisci", "costruire",
+        "genera ", "generare",
+        "scrivi ", "scrivere",
+        "aggiung", "add ",
+        "modific", "modify ",
+        "corregg", "fixa", "fix ",
+        "refactor",
+        "installa", "install ",
+        "configur",
+        "avvia", "esegui ", "lancia ",
+        "build", "deploy",
+        "scaffold",
+    ];
+    // Contesto che qualifica il verbo come task software (evita falsi positivi
+    // tipo "crea un account sul sito X" che non e' un task di codice).
+    const SOFTWARE_CONTEXT: &[&str] = &[
+        "app", "applicazione", "progetto", "project",
+        "file", "funzione", "function", "componente", "component",
+        "servizio", "service", "endpoint", "server", "api",
+        "script", "test", "codice", "code", "feature",
+        "modulo", "module", "classe", "class", "container",
+        "docker", "database", "schema", "migrazione", "migration",
+        "pagina", "page", "form", "route",
+    ];
+    if !purely_informational {
+        let has_verb = AGENTIC_VERBS.iter().any(|v| lc.contains(*v));
+        let has_ctx = SOFTWARE_CONTEXT.iter().any(|c| lc.contains(*c));
+        if has_verb && has_ctx {
+            return Some(("system_admin", 0.85));
+        }
+    }
+
+    // ── 2. Pattern di LETTURA / ANALISI: confidence media. ─────────────────
+    // Richieste di ispezione del codice/stato che attivano comunque tool di
+    // lettura (intent != "chat"). Mappa a `debug` (intent ammesso con tool
+    // use) — non esiste `code_read`/`analyze` nella matrix: `debug` e'
+    // l'intent piu' vicino che instrada a modelli capaci di leggere file.
+    const READ_VERBS: &[&str] = &[
+        "leggi ", "mostra", "analizza", "analizzare",
+        "cosa fa", "che cosa fa", "quanti ", "quante ",
+        "elenca", "lista ", "trova ", "cerca ", "individua",
+        "ispeziona", "esamina",
+    ];
+    const READ_CONTEXT: &[&str] = &[
+        "file", "src/", "codice", "code", "funzione", "function",
+        "classe", "class", "modulo", "module", "errore", "error",
+        "log", "endpoint", "test", "progetto", "repository", "repo",
+    ];
+    if !purely_informational {
+        let has_read_verb = READ_VERBS.iter().any(|v| lc.contains(*v));
+        let has_read_ctx = READ_CONTEXT.iter().any(|c| lc.contains(*c));
+        if has_read_verb && has_read_ctx {
+            return Some(("debug", 0.65));
+        }
+    }
+
+    None
+}
+
 /// Risultato del classifier LLM (Fase 2). Specchia il JSON dell'endpoint
 /// `POST /classify-intent-agentic` esposto da `brain/grpc_server/main.py`.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -359,6 +478,17 @@ pub struct ClassifiedIntent {
 /// caricato in `RoutingThresholds`. Questa costante e' usata solo dal path che
 /// non passa per `Orchestrator` (es. test isolati).
 const LLM_CLASSIFIER_MIN_CONFIDENCE_DEFAULT: f32 = 0.60;
+
+/// Soglia (default) sopra la quale il classificatore deterministico keyword
+/// viene usato come pre-check saltando l'LLM. Override DB:
+/// `settings.routing.intent_deterministic_high`. Usata solo quando la cache
+/// `RoutingThresholds` non e' disponibile.
+const INTENT_DETERMINISTIC_HIGH_DEFAULT: f32 = 0.85;
+
+/// Soglia (default) minima sotto la quale il deterministico NON viene usato
+/// nemmeno come fallback quando l'LLM ricade su `chat`. Override DB:
+/// `settings.routing.intent_deterministic_min`.
+const INTENT_DETERMINISTIC_MIN_DEFAULT: f32 = 0.60;
 
 // ── Telemetria routing (mig 0112) ───────────────────────────────────────────
 
@@ -1164,6 +1294,12 @@ impl RoutingConfig {
 
 #[derive(Debug, Clone)]
 pub struct ChatAttachment {
+    /// UUID dell'allegato in `chat_message_attachments`. Popolato dopo
+    /// `persist_message_attachments` per consentire al prompt iniziale di
+    /// stampare un suggerimento `nexus_inspect_attachment(attachment_id=...)`.
+    /// `None` quando l'allegato non e' ancora stato persistito (caso non
+    /// raggiunto in produzione, mantenuto Option per backward compat).
+    pub id: Option<Uuid>,
     pub name: String,
     pub mime_type: String,
     pub size_bytes: i64,
@@ -1579,11 +1715,82 @@ impl Orchestrator {
     /// ambiguita'. Usata da `spawn_agent_run` per decidere se chiedere
     /// disambiguazione all'utente (best practice NLU).
     pub async fn classify_intent_full(&self, message: &str) -> ClassifiedIntent {
-        let (min_conf, timeout_s) = match self.routing_thresholds.current_async().await {
-            Ok(t) => (t.llm_classifier_min_confidence, t.llm_classifier_timeout_seconds),
-            Err(_) => (LLM_CLASSIFIER_MIN_CONFIDENCE_DEFAULT, 5.0),
-        };
-        classify_intent_async_full_with_threshold(message, min_conf, timeout_s).await
+        let (min_conf, timeout_s, det_high, det_min) =
+            match self.routing_thresholds.current_async().await {
+                Ok(t) => (
+                    t.llm_classifier_min_confidence,
+                    t.llm_classifier_timeout_seconds,
+                    t.intent_deterministic_high,
+                    t.intent_deterministic_min,
+                ),
+                Err(_) => (
+                    LLM_CLASSIFIER_MIN_CONFIDENCE_DEFAULT,
+                    5.0,
+                    INTENT_DETERMINISTIC_HIGH_DEFAULT,
+                    INTENT_DETERMINISTIC_MIN_DEFAULT,
+                ),
+            };
+
+        // Classificatore deterministico (keyword/pattern). Calcolato una volta
+        // e riusato sia come pre-check sia come fallback se l'LLM fallisce.
+        let deterministic = deterministic_intent_fallback(message);
+
+        // (a) PRE-CHECK: se il deterministico e' confidente >= soglia alta,
+        // saltiamo del tutto l'LLM. E' piu' veloce e, soprattutto, robusto:
+        // un task agentico evidente ("Crea l'applicazione descritta nel file")
+        // viene instradato al path agent anche se il classifier LLM e' down.
+        if let Some((det_intent, det_conf)) = deterministic {
+            if det_conf >= det_high {
+                tracing::info!(
+                    "classify_intent: deterministic match intent={} conf={:.2} (pre-check, LLM saltato)",
+                    det_intent, det_conf
+                );
+                return ClassifiedIntent {
+                    intent: det_intent,
+                    confidence: det_conf,
+                    candidates: vec![IntentCandidate {
+                        intent: det_intent.to_string(),
+                        confidence: det_conf,
+                    }],
+                    is_ambiguous: false,
+                    slots: crate::routing_slots::ActionSlots::default(),
+                };
+            }
+        }
+
+        // (b) Path normale: prova l'LLM. Se ritorna un risultato valido lo usa.
+        let llm_result =
+            classify_intent_async_full_with_threshold(message, min_conf, timeout_s).await;
+
+        // L'LLM e' considerato "non utile" quando ricade su `chat` con
+        // confidence sotto la soglia minima del deterministico: in quel caso
+        // un eventuale match deterministico (anche a confidence media) e' piu'
+        // affidabile per non perdere il path agent. Questo copre sia il caso
+        // di vero fallimento HTTP (gia' degradato a keyword internamente) sia
+        // il caso di LLM che risponde "chat" su un task chiaramente agentico.
+        let llm_degraded_to_chat = llm_result.intent == "chat";
+        if llm_degraded_to_chat {
+            if let Some((det_intent, det_conf)) = deterministic {
+                if det_intent != "chat" && det_conf >= det_min {
+                    tracing::warn!(
+                        "classify_intent: LLM ha prodotto chat (conf={:.2}), uso fallback deterministico intent={} conf={:.2}",
+                        llm_result.confidence, det_intent, det_conf
+                    );
+                    return ClassifiedIntent {
+                        intent: det_intent,
+                        confidence: det_conf,
+                        candidates: vec![IntentCandidate {
+                            intent: det_intent.to_string(),
+                            confidence: det_conf,
+                        }],
+                        is_ambiguous: false,
+                        slots: crate::routing_slots::ActionSlots::default(),
+                    };
+                }
+            }
+        }
+
+        llm_result
     }
 
     /// Routing slot-first (Livello 4 NLU): se il classifier ha estratto slot
@@ -3134,6 +3341,54 @@ mod tests {
             is_ambiguous: ambig,
             slots: crate::routing_slots::ActionSlots::default(),
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Test: deterministic_intent_fallback (classificatore robusto)
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn deterministic_fallback_task_agentico_creazione_app() {
+        // Caso reale dell'incidente: questo messaggio NON deve degradare a
+        // chat. Deve ritornare un intent agentico ad alta confidenza cosi'
+        // il pre-check salta l'LLM e il path agent parte anche se l'LLM e' down.
+        let (intent, conf) =
+            deterministic_intent_fallback("Crea l'applicazione completa descritta nel file allegato. Implementala e avviala.")
+                .expect("atteso match agentico");
+        assert_ne!(intent, "chat");
+        assert_eq!(intent, "system_admin");
+        assert!(conf >= 0.85, "confidence attesa alta, got {conf}");
+    }
+
+    #[test]
+    fn deterministic_fallback_chat_pura_e_none() {
+        // Conversazione pura: nessun verbo+contesto software -> None,
+        // lascia decidere all'LLM o al default chat.
+        assert!(deterministic_intent_fallback("ciao come stai").is_none());
+        assert!(deterministic_intent_fallback("grazie mille, ottimo lavoro").is_none());
+    }
+
+    #[test]
+    fn deterministic_fallback_lettura_codice() {
+        // "leggi src/app.js" -> intent di lettura/analisi (debug), non chat.
+        let (intent, conf) = deterministic_intent_fallback("leggi src/app.js e dimmi cosa fa")
+            .expect("atteso match lettura");
+        assert_eq!(intent, "debug");
+        assert!(conf > 0.0 && conf < 0.85, "confidence media attesa, got {conf}");
+    }
+
+    #[test]
+    fn deterministic_fallback_docs() {
+        let (intent, _) = deterministic_intent_fallback("scrivi readme per questo progetto")
+            .expect("atteso match docs");
+        assert_eq!(intent, "docs");
+    }
+
+    #[test]
+    fn deterministic_fallback_richiesta_informativa_non_agentica() {
+        // "cos'e' un endpoint?" contiene "endpoint" ma e' una domanda
+        // informativa: non deve essere classificata come agentica.
+        assert!(deterministic_intent_fallback("cos'e' un endpoint REST?").is_none());
     }
 
     #[test]

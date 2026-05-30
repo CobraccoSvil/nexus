@@ -2616,6 +2616,7 @@ export function subscribeAgentStream(
   onReconnecting?: (isReconnecting: boolean) => void,
   onToken?: (delta: string) => void,
   onMetaStep?: (meta: AgentMetaStepPayload) => void,
+  onThinking?: (text: string) => void,
 ): () => void {
   const url = `${API_BASE}/api/chat/sessions/${sessionId}/agent-stream?run_id=${runId}`;
   const es = new EventSource(url, { withCredentials: true });
@@ -2648,6 +2649,13 @@ export function subscribeAgentStream(
       if (data?.metaStep?.kind) {
         onMetaStep?.(data);
       }
+    } catch {}
+  });
+
+  es.addEventListener("agent_thinking", (e) => {
+    try {
+      const data = JSON.parse((e as MessageEvent).data);
+      onThinking?.(data.text as string);
     } catch {}
   });
 

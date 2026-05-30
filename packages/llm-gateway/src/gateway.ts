@@ -18,6 +18,7 @@ import { ModelAliasResolver } from "./router/model-alias-resolver.js";
 import { FallbackChain } from "./router/fallback-chain.js";
 import { SensitivityClassifier } from "./router/sensitivity-classifier.js";
 import { PolicyEngine } from "./router/policy-engine.js";
+import type { SettingsDb } from "./router/policy-engine.js";
 import { RateLimiter } from "./router/rate-limiter.js";
 import { RedactionPipeline } from "./redaction/redaction-pipeline.js";
 import { ProviderError } from "@nexus/shared";
@@ -34,6 +35,11 @@ interface GatewayConfig {
   config: Config;
   aliasesFile: string;
   policyFile: string;
+  /**
+   * Client `postgres` per leggere i flag DLP dai settings DB (regola G).
+   * Opzionale: se assente, il PolicyEngine usa solo i default YAML.
+   */
+  settingsDb?: SettingsDb | null;
 }
 
 export class LLMGateway {
@@ -241,6 +247,9 @@ export class LLMGateway {
    * Nota: non applica rate limit per evitare doppio conteggio; il rate limit resta in `complete/stream`.
    */
   async preview(req: LLMRequest): Promise<{ primaryName: ProviderName; resolvedModel: string; effectiveTier: SensitivityTier }> {
+    // Refresh lazy dei flag DLP dal DB (cache TTL 60s interna)
+    await this.refreshPolicyOverrides(this.opts.settingsDb);
+
     // Classificazione sensitivity (stessa logica di `complete`)
     const classification = await this.classifier.classify(req.messages);
     this.policy.validateTierClaim(req.metadata.sensitivity_tier, classification.tier);
@@ -264,6 +273,9 @@ export class LLMGateway {
   }
 
   async complete(req: LLMRequest): Promise<LLMResponse> {
+    // 0. Refresh lazy dei flag DLP dal DB (cache TTL 60s interna)
+    await this.refreshPolicyOverrides(this.opts.settingsDb);
+
     // 1. Rate limit
     this.rateLimiter.checkTenant(req.metadata.tenant_id);
 
@@ -377,6 +389,9 @@ export class LLMGateway {
   }
 
   async *stream(req: LLMRequest): AsyncIterable<LLMStreamChunk> {
+    // Refresh lazy dei flag DLP dal DB (cache TTL 60s interna)
+    await this.refreshPolicyOverrides(this.opts.settingsDb);
+
     this.rateLimiter.checkTenant(req.metadata.tenant_id);
 
     // Classificazione sincrona per lo streaming (bassa latency path)
@@ -459,6 +474,19 @@ export class LLMGateway {
       }
     }, intervalMs);
     this.healthCheckInterval.unref?.();
+  }
+
+  /**
+   * Ricarica i flag DLP per-tier (`dlp_allow_cloud_tier2/3`, `dlp_enabled`) dai
+   * settings DB nel PolicyEngine. Cache TTL 60s gestita internamente: chiamabile
+   * a ogni richiesta senza costo DB ripetuto. Fallback graceful se DB down.
+   *
+   * Il gateway non possiede una connessione DB propria: il client `postgres`
+   * viene iniettato dal chiamante (nexus-gateway), coerentemente con l'iniezione
+   * di config/aliasesFile/policyFile.
+   */
+  async refreshPolicyOverrides(db: SettingsDb | null | undefined, force = false): Promise<void> {
+    await this.policy.refreshDbOverrides(db, force);
   }
 
   stopHealthChecks() {

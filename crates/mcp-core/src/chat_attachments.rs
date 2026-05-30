@@ -319,6 +319,9 @@ pub async fn persist_message_attachments(
             continue;
         }
 
+        // Cloni per spawn RAG (sopravvivono al move dentro SavedAttachment).
+        let mime_type_for_rag = mime_type.clone();
+        let original_name_for_rag = safe_name.clone();
         saved.push(SavedAttachment {
             id: attachment_id.to_string(),
             message_id: message_id.to_string(),
@@ -332,6 +335,36 @@ pub async fn persist_message_attachments(
             indexed_at: None,
             created_at: created_at.to_rfc3339(),
         });
+
+        // RAG (ADR 0015): indicizzazione fire-and-forget dell'allegato
+        // appena persistito. Non blocca la response. Il fallimento e' loggato.
+        {
+            let db_clone = db.clone();
+            let file_path_clone = final_path.clone();
+            let mime_clone = mime_type_for_rag.clone();
+            let name_clone = original_name_for_rag.clone();
+            let pid = project_id;
+            tokio::spawn(async move {
+                if let Err(e) = crate::rag::index_attachment(
+                    &db_clone,
+                    attachment_id,
+                    file_path_clone,
+                    mime_clone,
+                    name_clone,
+                    Some(pid),
+                    None,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "rag: indicizzazione allegato {} fallita: {}",
+                        attachment_id,
+                        e
+                    );
+                }
+            });
+        }
+
     }
 
     saved

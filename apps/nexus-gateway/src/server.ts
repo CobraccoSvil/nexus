@@ -92,7 +92,17 @@ process.env.NEXUS_MODEL_ALIASES_FILE = ALIASES_FILE;
 await loadApiKeysFromDb();
 
 let config = await loadConfig();
-let gateway = new LLMGateway({ config, aliasesFile: ALIASES_FILE, policyFile: POLICY_FILE });
+
+// Client DB per i settings (flag DLP per-tier letti dal PolicyEngine, regola G).
+// Pool dedicato e long-lived: il PolicyEngine vi accede con cache TTL 60s.
+const SETTINGS_DB_URL = config.database.url ?? process.env.POSTGRES_URL ?? process.env.DATABASE_URL;
+const settingsSql = SETTINGS_DB_URL ? postgres(SETTINGS_DB_URL, { max: 2, idle_timeout: 10, connect_timeout: 5 }) : null;
+
+let gateway = new LLMGateway({ config, aliasesFile: ALIASES_FILE, policyFile: POLICY_FILE, settingsDb: settingsSql });
+// Refresh iniziale forzato dei flag DLP dal DB (best-effort, fallback YAML se DB down)
+await gateway.refreshPolicyOverrides(settingsSql, true).catch((err) => {
+  app.log.warn(`[gateway] refresh iniziale flag DLP fallito: ${(err as Error).message}. Uso default YAML.`);
+});
 gateway.startHealthChecks(config.gateway.health_check_interval_ms);
 
 // ── Billing / Accounting (DB ledger) ───────────────────────────────────────────
@@ -265,7 +275,8 @@ async function reloadGateway(): Promise<{ reloaded: boolean; providers: string[]
   await loadApiKeysFromDb();
   config = await loadConfig();
   gateway.stopHealthChecks();
-  gateway = new LLMGateway({ config, aliasesFile: ALIASES_FILE, policyFile: POLICY_FILE });
+  gateway = new LLMGateway({ config, aliasesFile: ALIASES_FILE, policyFile: POLICY_FILE, settingsDb: settingsSql });
+  await gateway.refreshPolicyOverrides(settingsSql, true).catch(() => {});
   gateway.startHealthChecks(config.gateway.health_check_interval_ms);
   const providers = gateway.getProviderStatuses().map(p => p.name);
   return { reloaded: true, providers };

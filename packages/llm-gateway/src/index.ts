@@ -7,6 +7,7 @@ export { ModelAliasResolver } from "./router/model-alias-resolver.js";
 export { SensitivityClassifier } from "./router/sensitivity-classifier.js";
 export { SecretScanner } from "./router/secret-scanner.js";
 export { PolicyEngine } from "./router/policy-engine.js";
+export type { SettingsDb } from "./router/policy-engine.js";
 export { RateLimiter } from "./router/rate-limiter.js";
 export { RedactionPipeline } from "./redaction/redaction-pipeline.js";
 export { RedactionMap } from "./redaction/redaction-map.js";

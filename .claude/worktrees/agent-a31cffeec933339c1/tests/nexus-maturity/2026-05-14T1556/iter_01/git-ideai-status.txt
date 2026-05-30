@@ -1,0 +1,37 @@
+ M apps/web-ide/tsconfig.tsbuildinfo
+ M brain/nexus_memory/learning.db
+ M pnpm-lock.yaml
+ M tests/nexus-maturity/2026-05-14T1556/iter_01/monitor.jsonl
+ M tests/nexus-maturity/2026-05-14T1556/iter_01/monitor.log
+ M tests/nexus-maturity/2026-05-14T1556/journal_fix.md
+ M tests/nexus-maturity/2026-05-14T1556/meta.json
+ M tests/nexus-maturity/monitor.sh
+?? .claude/projects/
+?? .cursor/
+?? backups/db_backup_20260514_0956.dump
+?? backups/nexus-db-backup-2026-05-12-2258.dump
+?? backups/nexus-db-backup-2026-05-12.dump
+?? backups/nexus-db-backup-2026-05-13.dump
+?? check_tables.txt
+?? devnull
+?? test-results/
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/STOP_TRIGGER.txt
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/agent_processes.csv
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/agent_processes.err
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/agent_runs.csv
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/agent_runs.err
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/agent_steps.csv
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/agent_steps.err
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/ai_usage_ledger.csv
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/ai_usage_ledger.err
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/cost_by_model.csv
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/git-ideai-status.txt
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/git-target-diff.patch
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/git-target-log.txt
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/git-target-status.txt
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-brain-1.log
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-mcp-core-1.log
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-postgres-nexus-1.log
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-postgres-nexus-1.log.stderr
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-web-ide-1.log
+?? tests/nexus-maturity/2026-05-14T1556/iter_01/tool_name_frequency.csv

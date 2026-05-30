@@ -1,0 +1,20 @@
+2026-05-14 14:40:22.811 UTC [103974] ERROR:  column "status" does not exist at character 45
+2026-05-14 14:40:22.811 UTC [103974] STATEMENT:  SELECT COUNT(*) FROM quality_findings WHERE status = 'open'
+2026-05-14 14:40:22.814 UTC [104405] ERROR:  column "job_type" does not exist at character 31
+2026-05-14 14:40:22.814 UTC [104405] STATEMENT:  SELECT status FROM jobs WHERE job_type = 'shadow_db_validation' ORDER BY created_at DESC LIMIT 1
+2026-05-14 14:40:52.231 UTC [27] LOG:  checkpoint starting: time
+2026-05-14 14:40:58.114 UTC [27] LOG:  checkpoint complete: wrote 59 buffers (0.4%); 0 WAL file(s) added, 0 removed, 0 recycled; write=5.836 s, sync=0.030 s, total=5.883 s; sync files=39, longest=0.008 s, average=0.001 s; distance=271 kB, estimate=5448 kB; lsn=0/3E077C08, redo lsn=0/3E06E890
+2026-05-14 14:41:18.433 UTC [103974] ERROR:  column "status" does not exist at character 45
+2026-05-14 14:41:18.433 UTC [103974] STATEMENT:  SELECT COUNT(*) FROM quality_findings WHERE status = 'open'
+2026-05-14 14:41:18.435 UTC [103973] ERROR:  column "job_type" does not exist at character 31
+2026-05-14 14:41:18.435 UTC [103973] STATEMENT:  SELECT status FROM jobs WHERE job_type = 'shadow_db_validation' ORDER BY created_at DESC LIMIT 1
+2026-05-14 14:45:52.121 UTC [27] LOG:  checkpoint starting: time
+2026-05-14 14:45:56.770 UTC [27] LOG:  checkpoint complete: wrote 47 buffers (0.3%); 0 WAL file(s) added, 0 removed, 0 recycled; write=4.625 s, sync=0.012 s, total=4.650 s; sync files=29, longest=0.003 s, average=0.001 s; distance=225 kB, estimate=4925 kB; lsn=0/3E0B2178, redo lsn=0/3E0A6F68
+2026-05-14 14:49:58.646 UTC [105971] ERROR:  relation "project_services" does not exist at character 15
+2026-05-14 14:49:58.646 UTC [105971] STATEMENT:  SELECT * FROM project_services WHERE project_id='8e697e82-1524-4c53-9634-a3ea11ac69e9';
+2026-05-14 14:50:52.845 UTC [27] LOG:  checkpoint starting: time
+2026-05-14 14:51:05.033 UTC [106148] ERROR:  column "content" does not exist at character 34
+2026-05-14 14:51:05.033 UTC [106148] STATEMENT:  SELECT id, title, doc_type, LEFT(content,80) AS preview FROM project_documents WHERE project_id='8e697e82-1524-4c53-9634-a3ea11ac69e9' LIMIT 10;
+2026-05-14 14:51:39.106 UTC [27] LOG:  checkpoint complete: wrote 464 buffers (2.8%); 0 WAL file(s) added, 0 removed, 0 recycled; write=46.232 s, sync=0.014 s, total=46.261 s; sync files=77, longest=0.002 s, average=0.001 s; distance=3247 kB, estimate=4758 kB; lsn=0/3E40A9F0, redo lsn=0/3E3D2F40
+2026-05-14 14:55:52.713 UTC [27] LOG:  checkpoint starting: time
+2026-05-14 14:56:13.731 UTC [27] LOG:  checkpoint complete: wrote 214 buffers (1.3%); 0 WAL file(s) added, 0 removed, 0 recycled; write=20.972 s, sync=0.037 s, total=21.018 s; sync files=59, longest=0.007 s, average=0.001 s; distance=1313 kB, estimate=4413 kB; lsn=0/3E5EBB78, redo lsn=0/3E51B588

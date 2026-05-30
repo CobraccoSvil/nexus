@@ -128,6 +128,8 @@ pub async fn agent_stream(
                         Ok(event) => {
                             let event_type = if event.token_delta.is_some() {
                                 "agent_token"
+                            } else if event.thinking_delta.is_some() {
+                                "agent_thinking"
                             } else if event.meta_step.is_some() {
                                 "agent_meta_step"
                             } else if event.is_final {
@@ -139,6 +141,8 @@ pub async fn agent_stream(
                             };
                             let data = if event_type == "agent_token" {
                                 serde_json::json!({ "delta": event.token_delta }).to_string()
+                            } else if event_type == "agent_thinking" {
+                                serde_json::json!({ "text": event.thinking_delta }).to_string()
                             } else {
                                 serde_json::to_string(&event).unwrap_or_default()
                             };
@@ -501,6 +505,7 @@ pub async fn cancel_agent_run(
             trace: None,
             is_final: true,
             token_delta: None,
+            thinking_delta: None,
             meta_step: None,
         });
     }

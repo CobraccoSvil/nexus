@@ -171,6 +171,12 @@ pub struct AgentRunResult {
     pub completion_tokens: u32,
     pub total_tokens: u32,
     pub total_cost: f64,
+    /// Token di prompt dell'ULTIMA iterazione dell'agent loop.
+    /// Usato dal frontend per calcolare il context ratio (% di occupazione
+    /// della context_window del modello). `prompt_tokens` resta il valore
+    /// cumulativo di tutte le iterazioni, corretto per il billing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_prompt_tokens: Option<u32>,
     /// Classe errore propagata dal brain (es. "billing_error", "rate_limit",
     /// "overloaded", "provider_error"). Permette al chiamante in chat_messages.rs
     /// di decidere se ritentare con altro provider e di applicare il cooldown
@@ -240,6 +246,11 @@ pub struct AgentStepEvent {
     /// Token parziale durante la generazione (streaming). Se presente, è evento `agent_token`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_delta: Option<String>,
+    /// Ragionamento intermedio del modello (testo che accompagna le tool calls
+    /// durante le iterazioni dell'agent loop). Mostrato nella chat come blocco
+    /// collassabile "Ragionamento" per dare feedback visivo durante il lavoro.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_delta: Option<String>,
     /// Meta-step (plan/routing/clarify/fallback/reflection). Mutuamente
     /// esclusivo con `step`/`trace`/`token_delta` ma non vincolato.
     #[serde(skip_serializing_if = "Option::is_none")]

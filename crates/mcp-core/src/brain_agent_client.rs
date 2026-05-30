@@ -23,8 +23,14 @@ use crate::agent_types::{
 use crate::agent_tools::AGENT_TOOLS_JSON;
 
 /// URL REST del brain (FastAPI). Default allineato al port di `--rest` del brain.
+/// Gerarchia: env var BRAIN_REST_URL (override emergenza) > hardcoded.
+/// Nota: il valore canonico e' in DB (settings.brain_rest_url), ma questa
+/// funzione non ha accesso al PgPool. I call-site con accesso al DB dovrebbero
+/// preferire `settings::get_setting(db, "brain_rest_url")`.
 fn brain_rest_url() -> String {
-    std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string())
+    std::env::var("BRAIN_REST_URL")
+        .or_else(|_| std::env::var("NEURAL_CORE_REST_URL"))
+        .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string())
 }
 
 /// Costruisce il JSON tools da inviare al brain applicando la discovery mode.
@@ -519,6 +525,8 @@ pub async fn run_via_brain(
     let mut acc_completion_tokens: u32 = 0;
     let mut acc_total_tokens: u32 = 0;
     let mut acc_total_cost: f64 = 0.0;
+    // Token prompt dell'ultima iterazione (per context ratio UI, non billing)
+    let mut last_prompt_tokens: Option<u32> = None;
     // B5: metadata routing propagati dal brain Python nell'evento end_turn
     let mut nexus_task_type: Option<String> = None;
     let mut nexus_agent_type: Option<String> = None;
@@ -611,6 +619,7 @@ pub async fn run_via_brain(
                             trace: None,
                             is_final: false,
                             token_delta: Some(text),
+                            thinking_delta: None,
                             meta_step: None,
                         });
                     }
@@ -639,9 +648,28 @@ pub async fn run_via_brain(
                         trace: None,
                         is_final: false,
                         token_delta: None,
+                        thinking_delta: None,
                         meta_step: None,
                     });
                     steps.push(step);
+                }
+                "thinking_delta" => {
+                    let text = evt
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !text.is_empty() {
+                        let _ = step_tx.send(AgentStepEvent {
+                            run_id: run_id_str.clone(),
+                            step: None,
+                            trace: None,
+                            is_final: false,
+                            token_delta: None,
+                            thinking_delta: Some(text),
+                            meta_step: None,
+                        });
+                    }
                 }
                 "tool_result" => {
                     let tool_use_id = evt
@@ -676,6 +704,7 @@ pub async fn run_via_brain(
                             trace: None,
                             is_final: false,
                             token_delta: None,
+                            thinking_delta: None,
                             meta_step: None,
                         });
                     } else {
@@ -691,6 +720,8 @@ pub async fn run_via_brain(
                     acc_completion_tokens = evt.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                     acc_total_tokens = evt.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                     acc_total_cost = evt.get("total_cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    // Token prompt dell'ultima iterazione (per context ratio UI)
+                    last_prompt_tokens = evt.get("last_prompt_tokens").and_then(|v| v.as_u64()).map(|v| v as u32);
                     // B5: legge metadata routing propagati dal brain Python
                     if let Some(tt) = evt.get("nexus_task_type").and_then(|v| v.as_str()) {
                         nexus_task_type = Some(tt.to_string());
@@ -788,6 +819,7 @@ pub async fn run_via_brain(
                         trace: None,
                         is_final: false,
                         token_delta: None,
+                        thinking_delta: None,
                         meta_step: Some(AgentMetaStep {
                             kind,
                             title,
@@ -938,6 +970,7 @@ pub async fn run_via_brain(
             trace: None,
             is_final: true,
             token_delta: None,
+            thinking_delta: None,
             meta_step: None,
         });
     }
@@ -1007,6 +1040,7 @@ pub async fn run_via_brain(
         completion_tokens: acc_completion_tokens,
         total_tokens: acc_total_tokens,
         total_cost: acc_total_cost,
+        last_prompt_tokens,
         error_class: last_error_class,
         stop_reason: last_stop_reason,
         hollow_completion,
@@ -1132,6 +1166,7 @@ fn fail_result(
         completion_tokens: 0,
         total_tokens: 0,
         total_cost: 0.0,
+        last_prompt_tokens: None,
         error_class: None,
         stop_reason: Some("error".to_string()),
         hollow_completion: false,

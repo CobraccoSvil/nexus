@@ -71,6 +71,7 @@ mod meta_docs_watcher;
 mod meta_docs_workers;
 mod change_drafts;
 mod nexus_autofix_worker;
+mod rag;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -630,6 +631,7 @@ async fn main() -> anyhow::Result<()> {
         s_health_probe_enabled,
         s_health_probe_interval,
         s_tool_runner,
+        s_tool_runner_addr,
         s_http_timeout,
         s_http_pool,
         s_model_health_enabled,
@@ -642,6 +644,7 @@ async fn main() -> anyhow::Result<()> {
         settings::get_setting(&state.db, "provider_health_probe_enabled"),
         settings::get_setting(&state.db, "provider_health_probe_interval_s"),
         settings::get_setting(&state.db, "tool_runner_enabled"),
+        settings::get_setting(&state.db, "tool_runner_addr"),
         settings::get_setting(&state.db, "http_timeout_secs"),
         settings::get_setting(&state.db, "http_pool_max"),
         settings::get_setting(&state.db, "model_health_probe_enabled"),
@@ -650,6 +653,12 @@ async fn main() -> anyhow::Result<()> {
         settings::get_setting(&state.db, "model_catalog_sync_enabled"),
         settings::get_setting(&state.db, "model_catalog_sync_interval_s"),
     );
+
+    // Indirizzo ToolRunner: env var (override emergenza) > DB > hardcoded.
+    let tool_runner_addr_str = std::env::var("TOOL_RUNNER_ADDR")
+        .ok()
+        .or_else(|| s_tool_runner_addr.ok().flatten().map(|v| v.trim().to_string()))
+        .unwrap_or_else(|| "127.0.0.1:50071".to_string());
 
     // Inizializza il flag AtomicBool per il classificatore LLM.
     let llm_classifier_db = s_llm_classifier.ok().flatten()
@@ -808,10 +817,8 @@ async fn main() -> anyhow::Result<()> {
             .map(|v| v.trim().eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         if env_override || db_enabled {
-            let addr: SocketAddr = std::env::var("TOOL_RUNNER_ADDR")
-                .unwrap_or_else(|_| "127.0.0.1:50071".to_string())
-                .parse()
-                .expect("TOOL_RUNNER_ADDR non valido");
+            let addr: SocketAddr = tool_runner_addr_str.parse()
+                .expect("tool_runner_addr (DB o env TOOL_RUNNER_ADDR) non valido");
             let deps = tool_runner_server::ToolRunnerDeps {
                 db: state.db.clone(),
                 neural: state.orchestrator.neural.clone(),
@@ -845,10 +852,15 @@ async fn main() -> anyhow::Result<()> {
             .map(|v| v.trim().eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         if env_override || db_enabled {
-            let addr: SocketAddr = std::env::var("AGENT_ROUTER_ADDR")
-                .unwrap_or_else(|_| "127.0.0.1:50072".to_string())
-                .parse()
-                .expect("AGENT_ROUTER_ADDR non valido");
+            // Indirizzo: env var (override emergenza) > DB (canonico) > hardcoded.
+            let db_agent_addr = settings::get_setting(&state.db, "agent_router_addr")
+                .await.ok().flatten().map(|v| v.trim().to_string());
+            let agent_router_addr_str = std::env::var("AGENT_ROUTER_ADDR")
+                .ok()
+                .or(db_agent_addr)
+                .unwrap_or_else(|| "127.0.0.1:50501".to_string());
+            let addr: SocketAddr = agent_router_addr_str.parse()
+                .expect("agent_router_addr (DB o env AGENT_ROUTER_ADDR) non valido");
             if let Err(e) = agent_router_server::spawn_agent_router_server(addr).await {
                 tracing::error!("AgentRouter server: avvio fallito: {e}");
             }
@@ -2738,8 +2750,17 @@ async fn health(State(state): State<AppState>) -> Json<HealthSummary> {
 
     // Verifica TCP connect rapido al ToolRunner gRPC: senza questo l'AI non può
     // invocare tool (read_file, str_replace…) e fallisce silenziosamente.
+    // Indirizzo: env var (override emergenza) > DB (canonico) > hardcoded.
     let tools_grpc_ok = {
-        let addr = std::env::var("TOOL_RUNNER_ADDR").unwrap_or_else(|_| "127.0.0.1:50071".into());
+        let db_addr = settings::get_setting(&state.db, "tool_runner_addr")
+            .await
+            .ok()
+            .flatten()
+            .map(|v| v.trim().to_string());
+        let addr = std::env::var("TOOL_RUNNER_ADDR")
+            .ok()
+            .or(db_addr)
+            .unwrap_or_else(|| "127.0.0.1:50071".into());
         tokio::time::timeout(
             std::time::Duration::from_millis(500),
             tokio::net::TcpStream::connect(&addr),
@@ -2751,9 +2772,25 @@ async fn health(State(state): State<AppState>) -> Json<HealthSummary> {
 
     // Verifica TCP connect rapido al Brain REST (porta 8001): gli agent run
     // usano POST /agent/run/stream su questa porta. neural_core (gRPC 50051)
-    // può essere online mentre il server REST è giù.
+    // puo' essere online mentre il server REST e' giu'.
+    // Indirizzo: env var (override) > DB (canonico) > hardcoded.
     let brain_rest_ok = {
-        let addr = std::env::var("BRAIN_REST_ADDR").unwrap_or_else(|_| "127.0.0.1:8001".into());
+        let db_url = settings::get_setting(&state.db, "brain_rest_url")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                // Estrae host:port da URL come "http://127.0.0.1:8001"
+                v.trim().trim_start_matches("http://")
+                    .trim_start_matches("https://")
+                    .split('/')
+                    .next()
+                    .map(|s| s.to_string())
+            });
+        let addr = std::env::var("BRAIN_REST_ADDR")
+            .ok()
+            .or(db_url)
+            .unwrap_or_else(|| "127.0.0.1:8001".into());
         tokio::time::timeout(
             std::time::Duration::from_millis(500),
             tokio::net::TcpStream::connect(&addr),

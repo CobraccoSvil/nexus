@@ -155,6 +155,60 @@ Prima di proporre un fix, chiediti:
 
 Se la risposta a una delle due è "no, ma intanto sblocca l'utente", **fermarsi e ripartire dalla causa**. Comunicare onestamente all'utente: "il fix richiede N minuti/ore in più, procedo lo stesso al fix definitivo perché un workaround creerebbe debito tecnico". Solo se l'utente esplicitamente preferisce sbloccarsi subito, applicare workaround temporaneo seguendo le regole sopra.
 
+## I. Allocazione porte e accesso allegati
+
+Vedi [ADR 0010](docs/.nexus-vault/adr/0010-port-and-attachment-enforcement.md)
+per il razionale completo. Punti operativi:
+
+- **Porte hardcoded vietate nei sorgenti**: `write_file`/`edit_file` su file
+  che NON siano `.env*` / `docker-compose*.yml` / `Dockerfile*` vengono
+  rifiutati se contengono `app.listen(NNNN)`, `bind("...:NNNN")`, `listen=NNNN`
+  o `PORT = NNNN` con porte fuori dal bucket 20000-39999 e diverse da quelle
+  riservate (<1024). Eccezione: righe che leggono la porta da env
+  (`process.env.PORT`, `os.environ.get("PORT")`, `env::var("PORT")`,
+  `getenv("PORT")`, `PORT=$`, `PORT=${`). Il flusso corretto e' sempre
+  `request_port(label=...)` -> usa il valore ritornato.
+- **Flag enforcement**: `settings.key = 'agent.enforce_port_allocation'`
+  (default `'true'`). Disattivabile per debug locale, mai per produzione.
+  Cache 60s lato Rust, niente env var (regola G).
+- **Allegati grandi**: il blocco `<allegati>` nel prompt iniziale ha budget
+  inline 50KB totali (30KB per singolo file). Sopra soglia mostra solo metadata
+  e impone all'agente di chiamare `nexus_list_attachments` ->
+  `nexus_read_attachment(attachment_id, offset?, length?)` (max 100KB per
+  chiamata, encoding `auto|text|base64`).
+- **Mai inventare contenuti di allegati non letti**: la direttiva
+  `<attachment_access>` nei system prompt `system.nexus_base` /
+  `agent.coder.base` (mig 0192) lo ricorda esplicitamente.
+
+
+### Investigazione allegati e vision routing
+
+Quando un agente vede un allegato, NON deve assumere che il contenuto sia gia
+nel prompt. Workflow:
+
+1. `nexus_inspect_attachment(attachment_id)` — magic byte detection. Ritorna `kind`, `mime_reale`, `extraction_tools`.
+2. Usa il tool appropriato in base al kind:
+   - `zip|tar|gzip` -> `nexus_list_archive_entries` + `nexus_read_archive_entry`
+   - `pdf` -> `nexus_extract_pdf_text`
+   - `docx|xlsx|pptx` -> `nexus_extract_docx_text` / `nexus_extract_xlsx_data`
+   - `figma` -> `nexus_extract_figma_structure`
+   - `image_*` -> `nexus_describe_image_attachment` (chiama modello vision configurato in `nexus_purpose_model.vision_describe`)
+   - `text|json|markdown|...` -> `nexus_read_attachment` con encoding=text
+   - `binary` opaco -> ultimo resort `nexus_read_attachment` con encoding=base64
+
+Smart routing vision: se il messaggio utente contiene allegati `image/*` il brain router preferisce automaticamente un modello con `capabilities.vision=true` (override sulla routing matrix). Configurabile via `nexus_purpose_model` chiave `vision_describe`. Modello di default: `google/gemini-2.0-flash-exp` (mig 0194).
+
+
+## I. Pipeline allegati robusta (ADR 0012)
+
+Quando l'utente carica un allegato (PDF, DOCX, Figma, ZIP, immagine, ecc.) l'agente deve seguire la pipeline definita in ADR 0010 + 0011 + **0012** senza scorciatoie.
+
+- **Pre-extraction automatica** (FIX 3): per PDF/DOCX/ZIP-con-canvas.fig il blocco <allegati> del primo messaggio gia' contiene un sub-blocco ### Pre-extracted content. Il modello NON deve chiamare nexus_inspect_attachment / nexus_extract_* per ottenere informazioni che sono gia' visibili.
+- **`nexus_inspect_attachment` quando serve**: il tool ora ritorna `next_action_recommended` con `{tool, input, rationale, expected_tokens_output}`. **Dopo** averlo chiamato, l'agente deve chiamare ESATTAMENTE quel tool con quegli input. Vietato chiamare `nexus_read_attachment` / `nexus_read_archive_entry` con offset crescenti su file binari.
+- **Cache deduplica** (FIX 2): chiamate identiche a read_attachment / read_archive_entry vengono servite dalla cache. Se il payload include `from_cache: true` + `hint`, l'agente deve cambiare strategia (passare a un tool di estrazione strutturata o a una entry diversa).
+- **Budget letture per sessione** (FIX 4): max 500 KB cumulativi (default DB) per nexus_read_attachment + nexus_read_archive_entry. Oltre la soglia il brain ritorna un tool_result sintetico che invita a usare gli estrattori strutturati.
+- **Tuning DB-driven**: i 4 setting in `agent.attachment.*` (preextract_enabled, preextract_max_chars, session_read_budget_bytes, read_cache_ttl_seconds) governano l'intera pipeline. Niente fallback hardcoded nel codice (regola G).
+
 ## Esecuzione locale canonica
 
 - Ambiente di sviluppo: **solo WSL**, percorso `/home/administrator/ideai`. Non modificare mai `D:\Sviluppo\IDEAI` dall'host Windows.

@@ -502,6 +502,32 @@ class ProviderRegistry:
             logger.warning("default_model lookup fallito per '%s': %s", provider, e)
             return None
 
+    @staticmethod
+    def _model_belongs_to_provider(provider: str, model: str) -> bool:
+        """Guard-rail anti-mismatch: verifica che model appartenga a provider.
+
+        Fonte di verita della coppia provider/model: nexus_provider_default_model
+        (regola G CLAUDE.md). Questi prefix sono solo detection difensiva per
+        impedire una coppia impossibile (es. anthropic + gemini-2.5-pro) che
+        fallirebbe con 404 invalid_model. Vedi ADR 0016.
+        """
+        p = (provider or "").strip().lower()
+        m = (model or "").strip().lower()
+        if p == "anthropic":
+            return m.startswith("claude")
+        if p == "google":
+            return m.startswith("gemini")
+        if p == "openai":
+            if m.startswith(("gpt", "o1", "o3", "o4")):
+                return True
+            return len(m) >= 2 and m[0] == "o" and m[1].isdigit()
+        if p == "deepseek":
+            return m.startswith("deepseek")
+        if p == "mistral":
+            return m.startswith(("mistral", "codestral", "ministral", "pixtral"))
+        # Provider non riconosciuto: non blocchiamo (la verita resta il DB).
+        return True
+
     def generate_agent_turn_sync(
         self,
         provider: str,
@@ -520,18 +546,36 @@ class ProviderRegistry:
         effective_provider = provider
         effective_model = model
 
-        # Google non supporta tool_use nativo: cerca il primo provider della chain compatibile
+        # Google non supporta tool_use nativo: cerca nella chain il primo provider
+        # con default model valido E coerente. INVARIANTE: provider e model devono
+        # appartenere allo stesso provider; un provider senza default model viene
+        # SKIPPATO, mai accoppiato al model di Google. Vedi ADR 0016.
         if provider == "google":
-            chain = self._provider_fallback_chain(exclude=provider)
-            chosen = chain[0] if chain else None
+            chosen = None
+            chosen_model = None
+            for cand in self._provider_fallback_chain(exclude=provider):
+                cand_model = self._default_model_or_none(cand)
+                if cand_model is None:
+                    logger.warning(
+                        "Skip fallback da Google verso %s: nessun default model in nexus_provider_default_model",
+                        cand,
+                    )
+                    continue
+                if not self._model_belongs_to_provider(cand, cand_model):
+                    logger.error(
+                        "Skip fallback da Google verso %s: coppia incoerente con model %s",
+                        cand, cand_model,
+                    )
+                    continue
+                chosen, chosen_model = cand, cand_model
+                break
             if chosen:
-                fb_model = self._default_model_or_none(chosen) or model
                 logger.warning(
                     "Google provider non supporta tool_use nativo, fallback a %s/%s",
-                    chosen, fb_model
+                    chosen, chosen_model
                 )
                 effective_provider = chosen
-                effective_model = fb_model
+                effective_model = chosen_model
             else:
                 return ProviderResult(
                     provider=provider, model=model,
@@ -539,12 +583,29 @@ class ProviderRegistry:
                     metadata={"error": "no_fallback_available", "stop_reason": "error"},
                 )
 
-        # Se il provider effettivo e' disabilitato, cerca un fallback tra quelli abilitati
+        # Se il provider effettivo e' disabilitato, cerca nella chain il primo
+        # provider con default model valido E coerente. Un provider senza default
+        # model viene SKIPPATO, mai accoppiato al model originale. Vedi ADR 0016.
         if not self.is_enabled(effective_provider):
-            chain = self._provider_fallback_chain(exclude=effective_provider)
-            if chain:
-                fb_provider = chain[0]
-                fb_model = self._default_model_or_none(fb_provider) or model
+            fb_provider = None
+            fb_model = None
+            for cand in self._provider_fallback_chain(exclude=effective_provider):
+                cand_model = self._default_model_or_none(cand)
+                if cand_model is None:
+                    logger.warning(
+                        "Skip fallback %s: nessun default model in nexus_provider_default_model",
+                        cand,
+                    )
+                    continue
+                if not self._model_belongs_to_provider(cand, cand_model):
+                    logger.error(
+                        "Skip fallback %s: coppia incoerente con model %s",
+                        cand, cand_model,
+                    )
+                    continue
+                fb_provider, fb_model = cand, cand_model
+                break
+            if fb_provider:
                 logger.warning(
                     "Provider %s disabilitato, fallback a %s/%s",
                     effective_provider, fb_provider, fb_model
@@ -676,6 +737,14 @@ class ProviderRegistry:
                     logger.warning(
                         "Skip fallback %s: nessun default model in nexus_provider_default_model",
                         fb_prov,
+                    )
+                    continue
+                # Guard-rail anti-mismatch: la coppia (provider, model) deve essere
+                # coerente, altrimenti la chiamata fallirebbe con 404. Vedi ADR 0016.
+                if not self._model_belongs_to_provider(fb_prov, fb_model):
+                    logger.error(
+                        "Skip fallback %s: coppia incoerente con model %s",
+                        fb_prov, fb_model,
                     )
                     continue
                 logger.warning(
