@@ -412,7 +412,7 @@ fn apply_provider_wide_cooldown(provider: &str, model: &str, kind: &str) {
     }
 }
 
-enum Classification {
+pub(crate) enum Classification {
     Ok,
     /// Errore che riguarda il provider intero (non punisce il modello).
     ProviderWide(String, Option<String>),
@@ -420,7 +420,74 @@ enum Classification {
     ModelSpecific(String, Option<String>),
 }
 
-fn classify_model_error(msg: &str) -> Classification {
+/// Risultato sintetico del probe per uso in `catalog_sync::probe_on_insert`
+/// (decide se abilitare un modello appena scoperto dall'API discovery).
+/// Non ha side-effects sul DB — il chiamante decide cosa fare.
+pub(crate) enum ProbeOnInsertResult {
+    /// Modello risponde correttamente — `is_enabled=true` sicuro.
+    Healthy,
+    /// Errore specifico del modello (404/invalid/hollow) — `is_enabled=false`
+    /// con `auto_disabled_reason='failed_initial_probe:<kind>'`.
+    ModelBroken(String),
+    /// Errore provider-wide (quota/billing/auth/rate_limit) — non sappiamo
+    /// se il modello e' broken o solo il provider. Inseriamo `is_enabled=false`
+    /// con motivazione, sara' il `model_health_probe` worker a riabilitarlo
+    /// quando il provider torna up E il probe passa.
+    ProviderDown(String),
+    /// Probe non eseguibile (timeout, exception client) — `is_enabled=false`
+    /// conservativo, sara' rivalutato al prossimo round del worker probe.
+    Inconclusive(String),
+}
+
+/// Probe sincrono di un singolo modello, usato da `catalog_sync` al momento
+/// dell'INSERT per decidere se abilitare il modello appena scoperto.
+/// A differenza di `probe_one_model`, NON aggiorna contatori ne' fa cooldown:
+/// decide solo se il modello risponde e ritorna il risultato.
+pub(crate) async fn probe_model_on_insert(
+    orchestrator: &Orchestrator,
+    provider: &str,
+    model: &str,
+) -> ProbeOnInsertResult {
+    let result = tokio::time::timeout(
+        Duration::from_secs(PROBE_TIMEOUT_S),
+        orchestrator.neural.generate_completion(provider, model, PROBE_PROMPT),
+    )
+    .await;
+    match result {
+        Ok(Ok(response)) => {
+            let trimmed = extract_content_text(&response).trim().to_string();
+            if trimmed.is_empty() {
+                return ProbeOnInsertResult::ModelBroken("hollow_completion".to_string());
+            }
+            if trimmed.starts_with("[Error:") || trimmed.starts_with("[error:") {
+                let inner = trimmed
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .trim_start_matches("Error:")
+                    .trim_start_matches("error:")
+                    .trim();
+                match classify_model_error(inner) {
+                    Classification::Ok => ProbeOnInsertResult::Healthy,
+                    Classification::ProviderWide(kind, _) => ProbeOnInsertResult::ProviderDown(kind),
+                    Classification::ModelSpecific(kind, _) => ProbeOnInsertResult::ModelBroken(kind),
+                }
+            } else {
+                ProbeOnInsertResult::Healthy
+            }
+        }
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            match classify_model_error(&msg) {
+                Classification::Ok => ProbeOnInsertResult::Healthy,
+                Classification::ProviderWide(kind, _) => ProbeOnInsertResult::ProviderDown(kind),
+                Classification::ModelSpecific(kind, _) => ProbeOnInsertResult::ModelBroken(kind),
+            }
+        }
+        Err(_timeout) => ProbeOnInsertResult::Inconclusive(format!("timeout {PROBE_TIMEOUT_S}s")),
+    }
+}
+
+pub(crate) fn classify_model_error(msg: &str) -> Classification {
     let lc = msg.to_lowercase();
 
     // Provider-wide: NON puniamo il singolo modello.

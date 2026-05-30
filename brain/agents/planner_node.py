@@ -30,7 +30,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from . import meta_steps, orchestrator_config, prompt_registry, todo_store
+from . import dag_kb, meta_steps, orchestrator_config, prompt_registry, todo_store
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -209,6 +209,15 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
                                         },
                                     },
                                 },
+                                "node_key": {
+                                    "type": "string",
+                                    "description": "Comp.3a (DAG): chiave logica univoca del todo (es. 'schema_db', 'api', 'frontend'), per referenziarlo come dipendenza.",
+                                },
+                                "dep_keys": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Comp.3a (DAG): node_key dei todo che devono COMPLETARSI prima di questo (dipendenze di esecuzione). Vuoto se indipendente.",
+                                },
                             },
                             "required": ["content"],
                         },
@@ -275,6 +284,21 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
             "constraints e alternatives (razionale del piano, vincoli, "
             "alternative scartate)."
         )
+
+    # Comp.3a: inietta le dipendenze dal grafo KB (gated). Il planner le usa per
+    # assegnare node_key/dep_keys ai todo -> esecuzione in ordine topologico.
+    if orchestrator_config.get().get("dag_topological_enabled"):
+        try:
+            dep_ctx = await dag_kb.build_dependency_context(state, _tool_runner)
+        except Exception as exc:
+            logger.debug("planner_node: dag_kb fallito (%s)", exc)
+            dep_ctx = ""
+        if dep_ctx:
+            hinted_system += (
+                "\n\n" + dep_ctx
+                + "\n\nAssegna node_key a ogni todo e dep_keys ai todo che "
+                "dipendono da altri, coerentemente con le dipendenze sopra."
+            )
 
     # ── LLM call attraverso registry sync (riusa cascade M60) ───────────────
     import asyncio as _asyncio

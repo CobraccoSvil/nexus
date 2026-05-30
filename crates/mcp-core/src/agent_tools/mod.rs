@@ -339,6 +339,31 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     }
   },
   {
+    "name": "dispatch_subagents",
+    "description": "Come dispatch_subagent ma esegue PIU' sub-agent IN PARALLELO (a ondate). Usalo quando hai piu' task INDIPENDENTI da svolgere contemporaneamente (es. rami indipendenti di un piano/DAG). Per un singolo task usa dispatch_subagent. Ogni task deve essere AUTONOMO (il sub-agent non vede la tua conversazione).",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "tasks": {
+          "type": "array",
+          "description": "Task indipendenti (1-8) eseguiti in parallelo",
+          "items": {
+            "type": "object",
+            "properties": {
+              "kind": {"type": "string", "description": "Tipo di sub-agent (plan, explore, implement, verify, review, o custom)"},
+              "task": {"type": "string", "description": "Descrizione COMPLETA e AUTONOMA del task"},
+              "context": {"type": "string", "description": "Contesto aggiuntivo opzionale"},
+              "expected_output_format": {"type": "string", "description": "Forma del summary atteso (opzionale)"}
+            },
+            "required": ["kind", "task"]
+          }
+        },
+        "max_parallel": {"type": "integer", "description": "Ampiezza ondata concorrente (default 2, max 4)"}
+      },
+      "required": ["tasks"]
+    }
+  },
+  {
     "name": "nexus_subagent_poll",
     "description": "PR-3: poll dello stato di un sub-agent in background. Usa con il subagent_run_id ritornato da dispatch_subagent quando il kind ha is_background=true (il main riceve subito status=running, poi fa polling). Ritorna lo stato corrente + summary se completed.",
     "input_schema": {
@@ -1344,6 +1369,71 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
       },
       "required": ["title", "body_md"]
     }
+  },
+  {
+    "name": "knowledge_get_links",
+    "description": "Restituisce i link entranti e uscenti di una nota della KB (relazioni del grafo: followup/correction/refinement/duplicate/blocks/blocked_by/relates). Usalo per capire da cosa dipende una nota o cosa la referenzia. Le note off_topic sono escluse.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "note_id": {"type": "string", "description": "UUID della nota di cui leggere i link"}
+      },
+      "required": ["note_id"]
+    }
+  },
+  {
+    "name": "knowledge_get_subgraph",
+    "description": "Estrae un sottografo della KB del progetto da un seed (testo 'query' che trova le note radice per similarita', oppure 'note_id' esplicito) espandendo i link fino a 'depth'. Filtra per 'rel_types' (per le sole dipendenze di esecuzione passa [\"blocks\",\"blocked_by\"]). Restituisce nodi e archi. E' la base per derivare l'ordine delle azioni dal grafo.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "query": {"type": "string", "description": "Testo seed: trova le note radice per similarita' semantica. Alternativo a note_id."},
+        "note_id": {"type": "string", "description": "UUID di una nota radice. Alternativo a query."},
+        "rel_types": {"type": "array", "items": {"type": "string", "enum": ["followup","correction","refinement","duplicate","blocks","blocked_by","relates"]}, "description": "Filtra le relazioni. Default: tutte. Per le dipendenze di esecuzione usa [\"blocks\",\"blocked_by\"]."},
+        "depth": {"type": "integer", "description": "Profondita' espansione BFS (default 2, max 4)"},
+        "max_nodes": {"type": "integer", "description": "Numero massimo di nodi (default 30, max 100)"}
+      }
+    }
+  },
+  {
+    "name": "knowledge_create_link",
+    "description": "Crea o aggiorna un link diretto tra due note della KB. Usa 'blocks'/'blocked_by' per dipendenze di esecuzione (A blocked_by B => B prima di A), 'duplicate' per richieste gia' elaborate, 'correction' per contraddizioni, 'refinement' per ampliamenti, 'relates' per contesto correlato. Idempotente sulla tripla (from,to,rel_type).",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "from_note_id": {"type": "string", "description": "UUID nota sorgente"},
+        "to_note_id": {"type": "string", "description": "UUID nota destinazione"},
+        "rel_type": {"type": "string", "enum": ["followup","correction","refinement","duplicate","blocks","blocked_by","relates"], "description": "Tipo di relazione"},
+        "confidence": {"type": "number", "description": "Confidenza 0-1 (default 1.0)"}
+      },
+      "required": ["from_note_id", "to_note_id", "rel_type"]
+    }
+  },
+  {
+    "name": "knowledge_set_relevance",
+    "description": "Marca una nota come on/off-topic rispetto allo scopo del progetto. Una nota off_topic resta in KB ma viene esclusa dal grafo, dal RAG e dal coordinamento delle azioni. Usalo per togliere dal grafo le richieste non pertinenti al progetto.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "note_id": {"type": "string", "description": "UUID della nota"},
+        "off_topic": {"type": "boolean", "description": "true = fuori tema (esclusa dal grafo), false = pertinente"},
+        "relevance_score": {"type": "number", "description": "Punteggio di pertinenza 0-1 (opzionale)"}
+      },
+      "required": ["note_id", "off_topic"]
+    }
+  },
+  {
+    "name": "knowledge_import_graph",
+    "description": "Importa un grafo esterno (architettura, dipendenze moduli, knowledge di dominio) nella KB del progetto. I nodi diventano note, gli archi diventano relazioni: le dipendenze diventano blocks/blocked_by e alimentano il coordinamento delle azioni (DAG). Usalo per integrare grafi prodotti da altri strumenti.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "format": {"type": "string", "enum": ["json", "mermaid", "dot"], "description": "Formato: json (node-link {nodes,edges}), mermaid (flowchart), dot (graphviz)"},
+        "content": {"type": "string", "description": "Contenuto del grafo nel formato indicato"},
+        "source_id": {"type": "string", "description": "Identificatore della sorgente (opzionale, per tracciare l'origine)"}
+      },
+      "required": ["format", "content"]
+    }
   }
   ,
   {
@@ -1664,6 +1754,8 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "nexus_todo_write" => todos::tool_nexus_todo_write(ctx, input).await,
         // PR-3 sub-agents: delega a un sub-agent isolato (riabilita ex M55).
         "dispatch_subagent" => subagent::tool_dispatch_subagent(ctx, input).await,
+        // Comp.0/3b: batch parallelo di sub-agent (base del DAG scheduler).
+        "dispatch_subagents" => subagent::tool_dispatch_subagents(ctx, input).await,
         // PR-3 sub-agents: poll + resume per background runs.
         "nexus_subagent_poll" => subagent::tool_nexus_subagent_poll(ctx, input).await,
         "nexus_subagent_resume" => subagent::tool_nexus_subagent_resume(ctx, input).await,
@@ -1722,6 +1814,13 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "knowledge_search" => knowledge::tool_knowledge_search(ctx, input).await,
         "knowledge_get_note" => knowledge::tool_knowledge_get_note(ctx, input).await,
         "knowledge_create_note" => knowledge::tool_knowledge_create_note(ctx, input).await,
+        // Comp.0: navigazione/modifica del grafo KB (link, sottografo, pertinenza)
+        "knowledge_get_links" => knowledge::tool_knowledge_get_links(ctx, input).await,
+        "knowledge_get_subgraph" => knowledge::tool_knowledge_get_subgraph(ctx, input).await,
+        "knowledge_create_link" => knowledge::tool_knowledge_create_link(ctx, input).await,
+        "knowledge_set_relevance" => knowledge::tool_knowledge_set_relevance(ctx, input).await,
+        // Comp.2: import di grafi esterni nella KB (JSON node-link / Mermaid / DOT)
+        "knowledge_import_graph" => knowledge::tool_knowledge_import_graph(ctx, input).await,
         // ── Allegati chat (ADR 0010) ───────────────────────────────────────
         "nexus_list_attachments" => attachments::tool_nexus_list_attachments(ctx, input).await,
         "nexus_read_attachment" => attachments::tool_nexus_read_attachment(ctx, input).await,

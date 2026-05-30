@@ -2190,6 +2190,53 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         except Exception as exc:
             logger.debug("executor_node: worker-mode skip (%s)", exc)
 
+    # ── Comp.3b: DAG scheduler parallelo (opt-in, mutuamente esclusivo) ────────
+    # Forma strutturata del worker-mode: se il piano ha dipendenze (depends_on)
+    # e dag_parallel_enabled e' ON, esegue i todo "ready" in parallelo a ondate
+    # via dispatch_subagents. Tutto il parallelismo e' confinato in QUESTA
+    # invocazione del nodo (loop interno), niente fan-out LangGraph: lo state
+    # resta serializzabile. Early-return: salta la chiamata LLM dell'executor.
+    _dag_cfg = orchestrator_config.get()
+    if (
+        _subagent_depth == 0
+        and state.get("plan_phase_active")
+        and bool(_dag_cfg.get("dag_parallel_enabled"))
+    ):
+        try:
+            from . import dag_scheduler, todo_store as _ts
+            _run_id = state.get("thread_id")
+            _todos_now = _ts.list_todos(_run_id) if _run_id else []
+            _has_deps = any(t.get("depends_on") for t in _todos_now)
+            if _has_deps and dag_scheduler.compute_ready_layer(_todos_now):
+                total_done = 0
+                waves = 0
+                # Safety cap sul numero di ondate: non puo' superare il numero
+                # di todo (ogni ondata ne completa almeno uno, o si ferma).
+                max_waves = len(_todos_now) + 1
+                while waves < max_waves:
+                    updates = await dag_scheduler.run_dag_layer(state, _tool_runner, _dag_cfg)
+                    waves += 1
+                    if not updates or not updates.get("active_todo_ids"):
+                        break
+                    total_done += int(updates.get("completed") or 0)
+                    if int(updates.get("completed") or 0) == 0:
+                        # Ondata senza completamenti (tutti falliti): stop per
+                        # non ciclare a vuoto; i discendenti sono gia' skipped.
+                        break
+                logger.info(
+                    "executor_node: DAG parallelo eseguito (%d ondate, %d todo completati, run_id=%s)",
+                    waves, total_done, _run_id,
+                )
+                # end_turn: route_after_executor -> verifier (se ON, trova tutti
+                # terminali e chiude) oppure -> learner. Niente chiamata LLM.
+                return {
+                    "stop_reason": "end_turn",
+                    "pending_tool_uses": [],
+                    "iterations": iterations,
+                }
+        except Exception as exc:
+            logger.warning("executor_node: DAG scheduler skip (%s)", exc)
+
     # ── G1 cap: max re-execution per "risposta descrittiva su action request" ─
     # Se route_after_executor ci ha gia' re-mandato qui >= max_nudges volte
     # senza produrre tool call, fermiamo l'esecuzione con un messaggio

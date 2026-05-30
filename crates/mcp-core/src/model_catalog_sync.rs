@@ -24,12 +24,15 @@
 //!
 //! Provider locali (ollama/vllm): skipped, catalog manuale per setup custom.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
+use crate::model_health_probe::{probe_model_on_insert, ProbeOnInsertResult};
+use crate::orchestrator::Orchestrator;
 use crate::settings::get_setting;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -69,19 +72,31 @@ fn is_chat_compatible_model(model: &str) -> bool {
     for bad in SUFFIX_BLACKLIST {
         if lower.ends_with(bad) { return false; }
     }
-    if lower == "gemini-3.5-flash" { return false; }
-    if lower.starts_with("gemini-1.0") { return false; }
+    // Nota: NESSUNA blacklist per nome modello/famiglia (es. ex-blacklist
+    // hardcoded di gemini-3.x). I modelli "fantasma" (esposti dall'API
+    // discovery ma rispondono 404/hollow in inference) sono ora rilevati
+    // dinamicamente dal `probe_model_on_insert` chiamato qui sotto al primo
+    // discovery. Self-healing: quando un modello placeholder viene poi davvero
+    // rilasciato dal provider, il probe successivo passa e il modello viene
+    // riabilitato automaticamente dal worker `model_health_probe`. La blacklist
+    // strutturale qui sopra (TTS/embedding/realtime/instruct/imagen) resta:
+    // sono modelli che per design NON sono chat completion, il probe sarebbe
+    // solo rumore.
     true
 }
 
 /// Loop principale: chiamato da `main.rs` startup via `tokio::spawn(...)`.
-pub async fn catalog_sync_loop(db: PgPool) {
+/// `orchestrator` (Option) e' usato per il probe-on-insert dei nuovi modelli
+/// scoperti dall'API discovery — se None, i nuovi modelli vengono inseriti
+/// con `is_enabled=false` (comportamento legacy, sicuro ma richiede admin
+/// per abilitare). In produzione e' sempre Some.
+pub async fn catalog_sync_loop(db: PgPool, orchestrator: Option<Arc<Orchestrator>>) {
     // Boot: aspetta 30s per dare priorita' agli altri worker.
     tokio::time::sleep(Duration::from_secs(30)).await;
     tracing::info!("catalog_sync worker avviato");
 
     loop {
-        match sync_tick(&db).await {
+        match sync_tick(&db, orchestrator.as_deref()).await {
             Ok(stats) => {
                 if stats.inserted > 0 || stats.disabled > 0 || stats.reenabled > 0 {
                     tracing::info!(
@@ -127,8 +142,11 @@ async fn load_interval_hours(db: &PgPool) -> u64 {
 }
 
 /// Trigger manuale sync (endpoint admin / test E2E).
-pub async fn trigger_sync_now(db: &PgPool) -> Result<SyncSummary, String> {
-    let stats = sync_tick(db).await.map_err(|e| e.to_string())?;
+pub async fn trigger_sync_now(
+    db: &PgPool,
+    orchestrator: Option<&Orchestrator>,
+) -> Result<SyncSummary, String> {
+    let stats = sync_tick(db, orchestrator).await.map_err(|e| e.to_string())?;
     Ok(SyncSummary {
         providers_ok: stats.providers_ok,
         providers_skipped: stats.providers_skipped,
@@ -147,7 +165,7 @@ pub struct SyncSummary {
     pub reenabled: u32,
 }
 
-async fn sync_tick(db: &PgPool) -> anyhow::Result<SyncStats> {
+async fn sync_tick(db: &PgPool, orchestrator: Option<&Orchestrator>) -> anyhow::Result<SyncStats> {
     // Honor enable flag.
     let enabled = get_setting(db, "catalog_sync.enabled")
         .await?
@@ -176,7 +194,7 @@ async fn sync_tick(db: &PgPool) -> anyhow::Result<SyncStats> {
         if provider.is_empty() {
             continue;
         }
-        match sync_provider(db, provider, disable_missing, insert_new_disabled).await {
+        match sync_provider(db, provider, disable_missing, insert_new_disabled, orchestrator).await {
             Ok((ins, dis, re)) => {
                 stats.providers_ok += 1;
                 stats.inserted += ins;
@@ -197,6 +215,7 @@ async fn sync_provider(
     provider: &str,
     disable_missing: bool,
     insert_new_disabled: bool,
+    orchestrator: Option<&Orchestrator>,
 ) -> anyhow::Result<(u32, u32, u32)> {
     // Caso Google: il sync passa per il brain (Vertex SDK con Service Account
     // dal DB). Non serve api_key qui — il brain risolve autonomamente backend
@@ -270,6 +289,90 @@ async fn sync_provider(
                             inserted += 1;
                             audit_log(db, provider, api_model, "inserted", json!({"source":"api_discovery"})).await;
                             tracing::info!("catalog_sync[{}]: + nuovo modello rilevato '{}'", provider, api_model);
+
+                            // Probe-on-insert: subito dopo l'INSERT (modello e'
+                            // is_enabled=false di default), prova una chiamata
+                            // di test al provider. Se passa, abilita; se fallisce
+                            // con model_not_found/hollow, marca esplicitamente
+                            // il motivo cosi' l'admin sa che NON va abilitato
+                            // manualmente. Cosi' i modelli "fantasma" (es. la
+                            // famiglia gemini-3.x al 05/2026) non possono mai
+                            // entrare enabled via auto-discovery.
+                            if let Some(orch) = orchestrator {
+                                match probe_model_on_insert(orch, provider, api_model).await {
+                                    ProbeOnInsertResult::Healthy => {
+                                        let _ = sqlx::query(
+                                            "UPDATE ai_price_catalog \
+                                             SET is_enabled = true, auto_disabled_at = NULL, \
+                                                 auto_disabled_reason = NULL, updated_at = NOW() \
+                                             WHERE provider = $1 AND model = $2 AND is_enabled = false",
+                                        )
+                                        .bind(provider)
+                                        .bind(api_model)
+                                        .execute(db)
+                                        .await;
+                                        audit_log(
+                                            db, provider, api_model, "probe_ok_on_insert",
+                                            json!({"action":"auto_enabled"}),
+                                        )
+                                        .await;
+                                        tracing::info!(
+                                            "catalog_sync[{}]: probe OK su nuovo modello '{}' -> abilitato",
+                                            provider, api_model
+                                        );
+                                    }
+                                    ProbeOnInsertResult::ModelBroken(kind) => {
+                                        let reason = format!("failed_initial_probe:{}", kind);
+                                        let _ = sqlx::query(
+                                            "UPDATE ai_price_catalog \
+                                             SET auto_disabled_at = NOW(), \
+                                                 auto_disabled_reason = $3, updated_at = NOW() \
+                                             WHERE provider = $1 AND model = $2",
+                                        )
+                                        .bind(provider)
+                                        .bind(api_model)
+                                        .bind(&reason)
+                                        .execute(db)
+                                        .await;
+                                        audit_log(
+                                            db, provider, api_model, "probe_failed_on_insert",
+                                            json!({"reason": reason}),
+                                        )
+                                        .await;
+                                        tracing::warn!(
+                                            "catalog_sync[{}]: probe FAIL su nuovo modello '{}' (reason={}) -> resta disabled",
+                                            provider, api_model, kind
+                                        );
+                                    }
+                                    ProbeOnInsertResult::ProviderDown(kind) => {
+                                        // Provider giu' (quota/billing/auth): non possiamo
+                                        // sapere se il modello e' valido. Lasciamo disabled
+                                        // con motivazione esplicita: il model_health_probe
+                                        // worker (run periodico) lo riabilitera' quando il
+                                        // provider torna up E il probe passa.
+                                        let reason = format!("provider_down_on_insert:{}", kind);
+                                        let _ = sqlx::query(
+                                            "UPDATE ai_price_catalog SET auto_disabled_reason = $3, updated_at = NOW() \
+                                             WHERE provider = $1 AND model = $2",
+                                        )
+                                        .bind(provider)
+                                        .bind(api_model)
+                                        .bind(&reason)
+                                        .execute(db)
+                                        .await;
+                                        tracing::info!(
+                                            "catalog_sync[{}]: probe inconclusive (provider down: {}) su '{}' -> resta disabled, model_health_probe lo rivedra'",
+                                            provider, kind, api_model
+                                        );
+                                    }
+                                    ProbeOnInsertResult::Inconclusive(reason) => {
+                                        tracing::debug!(
+                                            "catalog_sync[{}]: probe inconclusive su '{}': {} -> resta disabled (default)",
+                                            provider, api_model, reason
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -298,6 +401,41 @@ async fn sync_provider(
                     tracing::debug!(
                         "catalog_sync[{}]: skip re-enable '{}' (manual_locked)",
                         provider, api_model
+                    );
+                }
+            }
+        }
+    }
+
+    // 1bis. Modelli gia' nel catalog (is_enabled=true) che NON passano la
+    // blacklist `is_chat_compatible_model`: vanno auto-disabilitati. Senza
+    // questo passo, l'unico controllo di compatibility e' all'INSERT (riga
+    // sopra), quindi un modello entrato in catalog prima dell'aggiornamento
+    // della blacklist (es. gemini-3.5-flash, regola H CLAUDE.md) resta ON
+    // per sempre. `manual_locked` viene rispettato: se l'admin ha deciso di
+    // tenerlo abilitato a mano, non lo tocchiamo.
+    for (catalog_model, (is_enabled, manual_locked)) in &catalog_models {
+        if *is_enabled && !manual_locked && !is_chat_compatible_model(catalog_model) {
+            let res = sqlx::query(
+                "UPDATE ai_price_catalog SET is_enabled = false, \
+                 auto_disabled_at = NOW(), auto_disabled_reason = 'not_chat_compatible' \
+                 WHERE provider = $1 AND model = $2",
+            )
+            .bind(provider)
+            .bind(catalog_model)
+            .execute(db)
+            .await;
+            if let Ok(r) = res {
+                if r.rows_affected() > 0 {
+                    disabled += 1;
+                    audit_log(
+                        db, provider, catalog_model, "disabled",
+                        json!({"reason":"not_chat_compatible"}),
+                    )
+                    .await;
+                    tracing::warn!(
+                        "catalog_sync[{}]: disabled '{}' (non chat-compatible per blacklist aggiornata)",
+                        provider, catalog_model,
                     );
                 }
             }
@@ -457,6 +595,35 @@ struct ModelEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_chat_compatible_no_per_name_blacklist() {
+        // La blacklist hardcoded per famiglia gemini-3.x e' stata RIMOSSA:
+        // il filtraggio dei modelli fantasma e' ora fatto dal probe attivo
+        // (probe_model_on_insert) al primo discovery. La blacklist semantica
+        // qui sotto resta solo per i modelli che per DESIGN non sono chat
+        // completion (TTS, embedding, realtime, instruct legacy).
+        // Quindi questi devono passare la blacklist (e poi il probe deciderà):
+        assert!(is_chat_compatible_model("gemini-3.5-flash"));
+        assert!(is_chat_compatible_model("gemini-3-pro-preview"));
+        assert!(is_chat_compatible_model("gemini-1.0-pro"));
+        assert!(is_chat_compatible_model("gemini-2.5-pro"));
+        assert!(is_chat_compatible_model("gpt-5-future"));
+        assert!(is_chat_compatible_model("claude-5-sonnet"));
+    }
+
+    #[test]
+    fn test_is_chat_compatible_blacklist_other_providers() {
+        // Smoke test: la blacklist storica continua a funzionare.
+        assert!(!is_chat_compatible_model("tts-1"));
+        assert!(!is_chat_compatible_model("text-embedding-3-small"));
+        assert!(!is_chat_compatible_model("gpt-4o-realtime-preview"));
+        assert!(!is_chat_compatible_model("whisper-1"));
+        // Modelli chat veri restano OK.
+        assert!(is_chat_compatible_model("claude-sonnet-4-6"));
+        assert!(is_chat_compatible_model("gpt-4o"));
+        assert!(is_chat_compatible_model("mistral-large-latest"));
+    }
 
     #[test]
     fn test_strip_date_suffix() {

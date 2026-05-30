@@ -345,3 +345,575 @@ pub async fn tool_knowledge_create_note(ctx: &AgentToolContext, input: &Value) -
     })
     .to_string()
 }
+
+/// rel_type ammessi dal CHECK di `project_knowledge_links` (mig 0175).
+/// Semantica per il coordinamento: `blocks`/`blocked_by` = dipendenze HARD
+/// (A blocked_by B => B prima di A); `relates` = contesto correlato (non
+/// dipendenza); `duplicate`/`correction`/`refinement`/`followup` = relazioni
+/// di intake (vedi Componente 1).
+pub(crate) const KNOWLEDGE_REL_TYPES: [&str; 7] = [
+    "followup", "correction", "refinement", "duplicate", "blocks", "blocked_by", "relates",
+];
+
+/// `knowledge_get_links` — link entranti e uscenti di una nota.
+///
+/// Input: `note_id` (UUID). Output: {outgoing[], incoming[]} con rel_type,
+/// created_by, confidence e titolo/intent della nota all'altro capo.
+/// Note off_topic escluse. Scoped al progetto corrente.
+pub async fn tool_knowledge_get_links(ctx: &AgentToolContext, input: &Value) -> String {
+    let note_id = match input
+        .get("note_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        Some(id) => id,
+        None => return json!({"error": "note_id mancante o non UUID valido"}).to_string(),
+    };
+
+    let in_proj = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM project_knowledge_notes WHERE id = $1 AND project_id = $2",
+    )
+    .bind(note_id)
+    .bind(ctx.project_id)
+    .fetch_one(&*ctx.db)
+    .await
+    .unwrap_or(0);
+    if in_proj == 0 {
+        return json!({"error": "nota non trovata nel progetto corrente"}).to_string();
+    }
+
+    // project_knowledge_links non ha project_id: l'isolamento passa dal JOIN
+    // sulle note (n.project_id) e dal filtro off_topic.
+    let outgoing = sqlx::query(
+        r#"
+        SELECT l.id AS link_id, l.to_note_id AS other_id, l.rel_type, l.created_by, l.confidence,
+               n.title, n.intent
+        FROM project_knowledge_links l
+        JOIN project_knowledge_notes n ON n.id = l.to_note_id
+        WHERE l.from_note_id = $1 AND n.project_id = $2 AND n.off_topic = false
+        ORDER BY l.confidence DESC
+        "#,
+    )
+    .bind(note_id)
+    .bind(ctx.project_id)
+    .fetch_all(&*ctx.db)
+    .await
+    .unwrap_or_default();
+
+    let incoming = sqlx::query(
+        r#"
+        SELECT l.id AS link_id, l.from_note_id AS other_id, l.rel_type, l.created_by, l.confidence,
+               n.title, n.intent
+        FROM project_knowledge_links l
+        JOIN project_knowledge_notes n ON n.id = l.from_note_id
+        WHERE l.to_note_id = $1 AND n.project_id = $2 AND n.off_topic = false
+        ORDER BY l.confidence DESC
+        "#,
+    )
+    .bind(note_id)
+    .bind(ctx.project_id)
+    .fetch_all(&*ctx.db)
+    .await
+    .unwrap_or_default();
+
+    let to_json = |rows: &[sqlx::postgres::PgRow]| -> Vec<Value> {
+        rows.iter()
+            .filter_map(|r| {
+                let other = r.try_get::<Uuid, _>("other_id").ok()?;
+                Some(json!({
+                    "link_id": r.try_get::<Uuid, _>("link_id").ok().map(|u| u.to_string()),
+                    "note_id": other.to_string(),
+                    "title": r.try_get::<String, _>("title").unwrap_or_default(),
+                    "intent": r.try_get::<Option<String>, _>("intent").ok().flatten(),
+                    "rel_type": r.try_get::<String, _>("rel_type").unwrap_or_default(),
+                    "created_by": r.try_get::<String, _>("created_by").unwrap_or_default(),
+                    "confidence": r.try_get::<f32, _>("confidence").unwrap_or(1.0),
+                }))
+            })
+            .collect()
+    };
+
+    let out = to_json(&outgoing);
+    let inc = to_json(&incoming);
+    json!({
+        "note_id": note_id.to_string(),
+        "outgoing": out,
+        "incoming": inc,
+        "outgoing_count": out.len(),
+        "incoming_count": inc.len(),
+    })
+    .to_string()
+}
+
+/// `knowledge_get_subgraph` — sottografo del progetto da un seed (query o nota).
+///
+/// Input:
+///   - `query`: testo seed (cerca le note rilevanti come radici) OPPURE
+///   - `note_id`: UUID di una nota radice
+///   - `rel_types`: filtro relazioni (default: tutte). Per le sole dipendenze
+///     passare ["blocks","blocked_by"].
+///   - `depth`: profondita' di espansione BFS (default 2, max 4)
+///   - `max_nodes`: tetto nodi (default 30, max 100)
+///
+/// Output: {nodes:[{note_id,title,intent,status}], edges:[{from,to,rel_type,confidence}]}.
+/// Note off_topic escluse. E' la base che alimenta il DAG (build_dependency_context).
+pub async fn tool_knowledge_get_subgraph(ctx: &AgentToolContext, input: &Value) -> String {
+    let max_nodes = input
+        .get("max_nodes")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30)
+        .clamp(1, 100) as usize;
+    let depth = input
+        .get("depth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2)
+        .clamp(1, 4) as usize;
+    let rel_filter: Vec<String> = input
+        .get("rel_types")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| KNOWLEDGE_REL_TYPES.contains(s))
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| KNOWLEDGE_REL_TYPES.iter().map(|s| s.to_string()).collect());
+
+    // 1. Determina i nodi seed (da query semantica o da nota esplicita).
+    let mut nodes: Vec<Uuid> = Vec::new();
+    if let Some(q) = input
+        .get("query")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let embed_text = if q.len() > 2000 { &q[..2000] } else { q };
+        let vector = match ctx.neural.embed_text("", embed_text).await {
+            Ok(v) => v,
+            Err(e) => return json!({"error": format!("embed fallito: {e}")}).to_string(),
+        };
+        let hits =
+            crate::vector_memory::search_knowledge_points(&ctx.db, vector, ctx.project_id, max_nodes)
+                .await
+                .unwrap_or_default();
+        for h in hits.iter() {
+            if let Some(id) = h
+                .payload
+                .get("note_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<Uuid>().ok())
+            {
+                if !nodes.contains(&id) {
+                    nodes.push(id);
+                }
+            }
+        }
+    } else if let Some(id) = input
+        .get("note_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        nodes.push(id);
+    } else {
+        return json!({"error": "serve 'query' (testo) oppure 'note_id' (UUID) come seed"})
+            .to_string();
+    }
+    if nodes.is_empty() {
+        return json!({"nodes": [], "edges": [], "message": "nessun nodo seed trovato"}).to_string();
+    }
+
+    // 2. Espansione BFS via link (project_knowledge_links non ha project_id;
+    //    l'isolamento e' garantito dal filtro finale sulle note del progetto).
+    let mut frontier = nodes.clone();
+    for _ in 0..depth {
+        if nodes.len() >= max_nodes {
+            break;
+        }
+        let neigh = sqlx::query(
+            r#"
+            SELECT from_note_id, to_note_id FROM project_knowledge_links
+            WHERE rel_type = ANY($1) AND (from_note_id = ANY($2) OR to_note_id = ANY($2))
+            "#,
+        )
+        .bind(&rel_filter)
+        .bind(&frontier)
+        .fetch_all(&*ctx.db)
+        .await
+        .unwrap_or_default();
+        let mut next: Vec<Uuid> = Vec::new();
+        for r in &neigh {
+            for col in ["from_note_id", "to_note_id"] {
+                if let Ok(id) = r.try_get::<Uuid, _>(col) {
+                    if !nodes.contains(&id) && !next.contains(&id) {
+                        next.push(id);
+                    }
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        for id in next.iter() {
+            if nodes.len() < max_nodes {
+                nodes.push(*id);
+            }
+        }
+        frontier = next;
+    }
+
+    // 3. Dettagli nodi (filtra progetto + off_topic): i nodi validi finali.
+    let rows = sqlx::query(
+        r#"
+        SELECT id, title, intent, status FROM project_knowledge_notes
+        WHERE id = ANY($1) AND project_id = $2 AND off_topic = false
+        "#,
+    )
+    .bind(&nodes)
+    .bind(ctx.project_id)
+    .fetch_all(&*ctx.db)
+    .await
+    .unwrap_or_default();
+    let valid_ids: Vec<Uuid> = rows
+        .iter()
+        .filter_map(|r| r.try_get::<Uuid, _>("id").ok())
+        .collect();
+    let node_json: Vec<Value> = rows
+        .iter()
+        .filter_map(|r| {
+            let id = r.try_get::<Uuid, _>("id").ok()?;
+            Some(json!({
+                "note_id": id.to_string(),
+                "title": r.try_get::<String, _>("title").unwrap_or_default(),
+                "intent": r.try_get::<Option<String>, _>("intent").ok().flatten(),
+                "status": r.try_get::<String, _>("status").unwrap_or_default(),
+            }))
+        })
+        .collect();
+
+    // 4. Archi tra i soli nodi validi (intra-sottografo).
+    let edges = sqlx::query(
+        r#"
+        SELECT from_note_id, to_note_id, rel_type, confidence FROM project_knowledge_links
+        WHERE rel_type = ANY($1) AND from_note_id = ANY($2) AND to_note_id = ANY($2)
+        "#,
+    )
+    .bind(&rel_filter)
+    .bind(&valid_ids)
+    .fetch_all(&*ctx.db)
+    .await
+    .unwrap_or_default();
+    let edge_json: Vec<Value> = edges
+        .iter()
+        .filter_map(|r| {
+            let f = r.try_get::<Uuid, _>("from_note_id").ok()?;
+            let t = r.try_get::<Uuid, _>("to_note_id").ok()?;
+            Some(json!({
+                "from": f.to_string(),
+                "to": t.to_string(),
+                "rel_type": r.try_get::<String, _>("rel_type").unwrap_or_default(),
+                "confidence": r.try_get::<f32, _>("confidence").unwrap_or(1.0),
+            }))
+        })
+        .collect();
+
+    json!({
+        "nodes": node_json,
+        "edges": edge_json,
+        "node_count": node_json.len(),
+        "edge_count": edge_json.len(),
+    })
+    .to_string()
+}
+
+/// `knowledge_create_link` — crea un link diretto tra due note (created_by='agent').
+///
+/// Input: `from_note_id`, `to_note_id` (UUID), `rel_type` (uno di KNOWLEDGE_REL_TYPES),
+/// `confidence` (0-1, default 1.0). Idempotente sulla tripla (from,to,rel_type).
+pub async fn tool_knowledge_create_link(ctx: &AgentToolContext, input: &Value) -> String {
+    let from = match input
+        .get("from_note_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        Some(id) => id,
+        None => return json!({"error": "from_note_id mancante o non UUID valido"}).to_string(),
+    };
+    let to = match input
+        .get("to_note_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        Some(id) => id,
+        None => return json!({"error": "to_note_id mancante o non UUID valido"}).to_string(),
+    };
+    if from == to {
+        return json!({"error": "self-link non ammesso (from == to)"}).to_string();
+    }
+    let rel_type = match input.get("rel_type").and_then(|v| v.as_str()) {
+        Some(r) if KNOWLEDGE_REL_TYPES.contains(&r) => r.to_string(),
+        Some(r) => {
+            return json!({"error": format!("rel_type '{r}' non valido; ammessi: {KNOWLEDGE_REL_TYPES:?}")})
+                .to_string()
+        }
+        None => return json!({"error": "rel_type mancante"}).to_string(),
+    };
+    let confidence = input
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0) as f32;
+
+    let cnt = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM project_knowledge_notes WHERE id = ANY($1) AND project_id = $2",
+    )
+    .bind(vec![from, to])
+    .bind(ctx.project_id)
+    .fetch_one(&*ctx.db)
+    .await
+    .unwrap_or(0);
+    if cnt != 2 {
+        return json!({"error": "una o entrambe le note non esistono nel progetto corrente"})
+            .to_string();
+    }
+
+    let link_id: Result<Uuid, _> = sqlx::query_scalar(
+        r#"
+        INSERT INTO project_knowledge_links (from_note_id, to_note_id, rel_type, created_by, confidence)
+        VALUES ($1, $2, $3, 'agent', $4)
+        ON CONFLICT (from_note_id, to_note_id, rel_type)
+        DO UPDATE SET confidence = EXCLUDED.confidence
+        RETURNING id
+        "#,
+    )
+    .bind(from)
+    .bind(to)
+    .bind(&rel_type)
+    .bind(confidence)
+    .fetch_one(&*ctx.db)
+    .await;
+
+    match link_id {
+        Ok(id) => json!({
+            "ok": true,
+            "link_id": id.to_string(),
+            "from_note_id": from.to_string(),
+            "to_note_id": to.to_string(),
+            "rel_type": rel_type,
+        })
+        .to_string(),
+        Err(e) => json!({"error": format!("INSERT link: {e}")}).to_string(),
+    }
+}
+
+/// `knowledge_set_relevance` — marca una nota come on/off-topic.
+///
+/// Input: `note_id` (UUID), `off_topic` (bool), `relevance_score` (0-1, opz.).
+/// Una nota off_topic resta in KB ma e' esclusa da grafo/RAG/DAG.
+pub async fn tool_knowledge_set_relevance(ctx: &AgentToolContext, input: &Value) -> String {
+    let note_id = match input
+        .get("note_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        Some(id) => id,
+        None => return json!({"error": "note_id mancante o non UUID valido"}).to_string(),
+    };
+    let off_topic = match input.get("off_topic").and_then(|v| v.as_bool()) {
+        Some(b) => b,
+        None => return json!({"error": "off_topic (bool) mancante"}).to_string(),
+    };
+    let score = input
+        .get("relevance_score")
+        .and_then(|v| v.as_f64())
+        .map(|s| s.clamp(0.0, 1.0) as f32);
+
+    let res = sqlx::query(
+        r#"
+        UPDATE project_knowledge_notes
+        SET off_topic = $2, relevance_score = COALESCE($3, relevance_score)
+        WHERE id = $1 AND project_id = $4
+        "#,
+    )
+    .bind(note_id)
+    .bind(off_topic)
+    .bind(score)
+    .bind(ctx.project_id)
+    .execute(&*ctx.db)
+    .await;
+
+    match res {
+        Ok(r) if r.rows_affected() > 0 => json!({
+            "ok": true,
+            "note_id": note_id.to_string(),
+            "off_topic": off_topic,
+        })
+        .to_string(),
+        Ok(_) => json!({"error": "nota non trovata nel progetto corrente"}).to_string(),
+        Err(e) => json!({"error": format!("UPDATE relevance: {e}")}).to_string(),
+    }
+}
+
+async fn read_graph_import_settings(db: &sqlx::PgPool) -> (bool, usize) {
+    let mut enabled = true;
+    let mut max_nodes = 2000usize;
+    let rows = sqlx::query(
+        "SELECT key, value FROM settings WHERE key IN ('knowledge.graph_import_enabled','knowledge.graph_import_max_nodes')",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    for r in &rows {
+        let k: String = r.try_get("key").unwrap_or_default();
+        let v: String = r.try_get("value").unwrap_or_default();
+        match k.as_str() {
+            "knowledge.graph_import_enabled" => {
+                enabled = !matches!(v.trim().to_lowercase().as_str(), "false" | "0" | "off")
+            }
+            "knowledge.graph_import_max_nodes" => max_nodes = v.trim().parse().unwrap_or(2000),
+            _ => {}
+        }
+    }
+    (enabled, max_nodes)
+}
+
+/// `knowledge_import_graph` — importa un grafo esterno (JSON node-link, Mermaid,
+/// DOT) nella KB del progetto: i nodi diventano note (source_kind='external'),
+/// gli archi diventano link (created_by='external'). I tipi di dipendenza
+/// diventano relazioni `blocks`/`blocked_by` che alimentano il DAG.
+pub async fn tool_knowledge_import_graph(ctx: &AgentToolContext, input: &Value) -> String {
+    let format = match input.get("format").and_then(|v| v.as_str()) {
+        Some(f) if !f.trim().is_empty() => f.trim().to_string(),
+        _ => return json!({"error": "parametro 'format' obbligatorio (json|mermaid|dot)"}).to_string(),
+    };
+    let content = match input.get("content").and_then(|v| v.as_str()) {
+        Some(c) if !c.trim().is_empty() => c.to_string(),
+        _ => return json!({"error": "parametro 'content' obbligatorio"}).to_string(),
+    };
+    let source_id = input
+        .get("source_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("import")
+        .to_string();
+
+    let (enabled, max_nodes) = read_graph_import_settings(&ctx.db).await;
+    if !enabled {
+        return json!({"error": "import grafi disabilitato (knowledge.graph_import_enabled=false)"})
+            .to_string();
+    }
+
+    let graph = match crate::knowledge::graph_import::parse_graph(&format, &content) {
+        Ok(g) => g,
+        Err(e) => return json!({"error": format!("parsing fallito: {e}")}).to_string(),
+    };
+    if graph.nodes.is_empty() {
+        return json!({"error": "nessun nodo trovato nel grafo"}).to_string();
+    }
+    if graph.nodes.len() > max_nodes {
+        return json!({"error": format!("troppi nodi: {} > max {}", graph.nodes.len(), max_nodes)})
+            .to_string();
+    }
+
+    let mut id_map: std::collections::HashMap<String, Uuid> = std::collections::HashMap::new();
+    let mut nodes_created = 0usize;
+
+    for node in &graph.nodes {
+        let note_id = Uuid::new_v4();
+        let title: String = {
+            let t: String = node.label.chars().take(200).collect();
+            if t.trim().is_empty() {
+                node.ext_id.chars().take(200).collect()
+            } else {
+                t
+            }
+        };
+        let body_md = node.content.clone().unwrap_or_else(|| node.label.clone());
+        let tags: Vec<String> = node.node_type.clone().into_iter().collect();
+
+        let embed_src = format!("{title}\n{body_md}");
+        let embed_text = if embed_src.len() > 2000 { &embed_src[..2000] } else { &embed_src };
+        let qdrant_point_id = match ctx.neural.embed_text("", embed_text).await {
+            Ok(vector) => {
+                let point_id = Uuid::new_v4().to_string();
+                let payload = json!({
+                    "project_id": ctx.project_id.to_string(),
+                    "note_id": note_id.to_string(),
+                    "intent": "domain",
+                    "status": "active",
+                });
+                match crate::vector_memory::upsert_knowledge_point(&ctx.db, &point_id, vector, payload).await {
+                    Ok(_) => Some(point_id),
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        };
+
+        let res = sqlx::query(
+            r#"
+            INSERT INTO project_knowledge_notes
+                (id, project_id, intent, title, body_md, status, qdrant_point_id, tags, file_paths, source_kind, external_source_id)
+            VALUES ($1, $2, 'domain', $3, $4, 'active', $5, $6, $7, 'external', $8)
+            "#,
+        )
+        .bind(note_id)
+        .bind(ctx.project_id)
+        .bind(&title)
+        .bind(&body_md)
+        .bind(qdrant_point_id.as_deref())
+        .bind(&tags)
+        .bind(Vec::<String>::new())
+        .bind(&source_id)
+        .execute(&*ctx.db)
+        .await;
+        if res.is_ok() {
+            id_map.insert(node.ext_id.clone(), note_id);
+            nodes_created += 1;
+        }
+    }
+
+    let mut edges_created = 0usize;
+    for edge in &graph.edges {
+        if let (Some(&f), Some(&t)) = (id_map.get(&edge.source), id_map.get(&edge.target)) {
+            if f == t {
+                continue;
+            }
+            let rel = crate::knowledge::graph_import::edge_type_to_rel(edge.edge_type.as_deref());
+            let r = sqlx::query(
+                r#"
+                INSERT INTO project_knowledge_links (from_note_id, to_note_id, rel_type, created_by, confidence)
+                VALUES ($1, $2, $3, 'external', 1.0)
+                ON CONFLICT (from_note_id, to_note_id, rel_type) DO NOTHING
+                "#,
+            )
+            .bind(f)
+            .bind(t)
+            .bind(rel)
+            .execute(&*ctx.db)
+            .await;
+            if r.is_ok() {
+                edges_created += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        project_id = %ctx.project_id,
+        format = %format,
+        nodes_created,
+        edges_created,
+        "knowledge_import_graph: grafo esterno importato"
+    );
+
+    json!({
+        "ok": true,
+        "format": format,
+        "nodes_created": nodes_created,
+        "edges_created": edges_created,
+        "source_id": source_id,
+    })
+    .to_string()
+}

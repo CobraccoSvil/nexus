@@ -25,6 +25,7 @@
 
 use serde_json::{json, Value};
 use sqlx::Row;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::AgentToolContext;
@@ -159,8 +160,12 @@ async fn create_plan(
         return err(&format!("DELETE precedenti todos fallita: {e}"));
     }
 
-    // Insert dei nuovi todos.
+    // Insert dei nuovi todos. Comp.3a: raccogliamo node_key->uuid e i dep_keys
+    // logici per risolvere le dipendenze del DAG in un secondo passaggio (il
+    // planner non conosce gli UUID generati, ragiona su chiavi logiche).
     let mut inserted_ids: Vec<String> = Vec::with_capacity(todos_in.len());
+    let mut key_to_id: HashMap<String, Uuid> = HashMap::new();
+    let mut todo_deps: Vec<(Uuid, Vec<String>)> = Vec::with_capacity(todos_in.len());
     for (idx, t) in todos_in.iter().enumerate() {
         let content = match t.get("content").and_then(Value::as_str) {
             Some(c) if !c.trim().is_empty() => c,
@@ -182,11 +187,18 @@ async fn create_plan(
             .get("acceptance_criteria")
             .cloned()
             .unwrap_or_else(|| json!([]));
+        // Comp.3a: chiave logica del nodo + chiavi delle dipendenze.
+        let node_key = t.get("node_key").and_then(Value::as_str).filter(|s| !s.is_empty());
+        let dep_keys: Vec<String> = t
+            .get("dep_keys")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
 
         let row = sqlx::query(
             r#"INSERT INTO nexus_agent_todos
-               (run_id, project_id, seq, content, status, priority, acceptance_criteria)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               (run_id, project_id, seq, content, status, priority, acceptance_criteria, node_key, dep_keys)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                RETURNING id"#,
         )
         .bind(run_id)
@@ -196,16 +208,28 @@ async fn create_plan(
         .bind(status)
         .bind(priority)
         .bind(&acceptance)
+        .bind(node_key)
+        .bind(&dep_keys)
         .fetch_one(&mut *tx)
         .await;
         match row {
             Ok(r) => {
                 let id: Uuid = r.get("id");
+                if let Some(k) = node_key {
+                    key_to_id.insert(k.to_string(), id);
+                }
+                todo_deps.push((id, dep_keys));
                 inserted_ids.push(id.to_string());
             }
             Err(e) => return err(&format!("INSERT todo[{idx}] fallita: {e}")),
         }
     }
+
+    // Comp.3a: risolvi dep_keys -> depends_on (UUID[]) con cycle detection.
+    let deps_set = match resolve_and_persist_deps(&mut tx, &key_to_id, &todo_deps).await {
+        Ok(n) => n,
+        Err(e) => return err(&format!("risoluzione dipendenze DAG fallita: {e}")),
+    };
 
     if let Err(e) = tx.commit().await {
         return err(&format!("commit tx fallita: {e}"));
@@ -214,6 +238,7 @@ async fn create_plan(
     json!({
         "ok": true,
         "action": "create",
+        "dag_deps_resolved": deps_set,
         "affected": inserted_ids.len(),
         "plan_id": run_id.to_string(),
         "todo_ids": inserted_ids,
@@ -371,6 +396,89 @@ fn err(msg: &str) -> String {
     format!("\u{274C} [nexus_todo_write] {msg}")
 }
 
+/// Comp.3a: risolve i dep_keys logici in depends_on (UUID[]) e li scrive sui
+/// todo, dentro la transazione corrente. Scarta i dep_keys che non
+/// corrispondono a nessun node_key del piano (riferimenti fantasma) e i
+/// self-link. Se il grafo risultante contiene un ciclo, azzera tutte le
+/// dipendenze (fallback all'esecuzione lineare per seq) invece di rischiare un
+/// deadlock dello scheduler. Ritorna il numero di todo con almeno una dipendenza.
+async fn resolve_and_persist_deps(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key_to_id: &HashMap<String, Uuid>,
+    todo_deps: &[(Uuid, Vec<String>)],
+) -> Result<usize, sqlx::Error> {
+    let mut resolved: Vec<(Uuid, Vec<Uuid>)> = Vec::with_capacity(todo_deps.len());
+    for (id, dep_keys) in todo_deps {
+        let mut deps: Vec<Uuid> = Vec::new();
+        for k in dep_keys {
+            if let Some(dep_id) = key_to_id.get(k) {
+                if dep_id != id && !deps.contains(dep_id) {
+                    deps.push(*dep_id);
+                }
+            }
+        }
+        resolved.push((*id, deps));
+    }
+
+    if detect_cycle(&resolved) {
+        tracing::warn!(
+            "nexus_todo_write: ciclo rilevato nel DAG dei todo, fallback lineare (depends_on non applicati)"
+        );
+        return Ok(0);
+    }
+
+    let mut updated = 0usize;
+    for (id, deps) in &resolved {
+        if deps.is_empty() {
+            continue;
+        }
+        sqlx::query("UPDATE nexus_agent_todos SET depends_on = $1 WHERE id = $2")
+            .bind(deps.as_slice())
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+        updated += 1;
+    }
+    Ok(updated)
+}
+
+/// Kahn topological sort: ritorna true se il grafo (id -> depends_on) contiene
+/// un ciclo. depends_on[n] = nodi che devono precedere n.
+fn detect_cycle(nodes: &[(Uuid, Vec<Uuid>)]) -> bool {
+    let ids: std::collections::HashSet<Uuid> = nodes.iter().map(|(id, _)| *id).collect();
+    let mut in_degree: HashMap<Uuid, usize> = HashMap::new();
+    let mut adj: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for (id, deps) in nodes {
+        in_degree.entry(*id).or_insert(0);
+        for d in deps {
+            if ids.contains(d) {
+                *in_degree.entry(*id).or_insert(0) += 1;
+                adj.entry(*d).or_default().push(*id);
+            }
+        }
+    }
+    let mut queue: Vec<Uuid> = in_degree
+        .iter()
+        .filter(|(_, &v)| v == 0)
+        .map(|(k, _)| *k)
+        .collect();
+    let mut visited = 0usize;
+    while let Some(n) = queue.pop() {
+        visited += 1;
+        if let Some(children) = adj.get(&n).cloned() {
+            for c in children {
+                if let Some(v) = in_degree.get_mut(&c) {
+                    *v -= 1;
+                    if *v == 0 {
+                        queue.push(c);
+                    }
+                }
+            }
+        }
+    }
+    visited < nodes.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +503,35 @@ mod tests {
         assert!(m.starts_with('\u{274C}'));
         assert!(m.contains("[nexus_todo_write]"));
         assert!(m.contains("boom"));
+    }
+
+    #[test]
+    fn detect_cycle_acyclic_chain() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        // c depends_on b, b depends_on a: catena lineare, niente ciclo.
+        let nodes = vec![(a, vec![]), (b, vec![a]), (c, vec![b])];
+        assert!(!detect_cycle(&nodes));
+    }
+
+    #[test]
+    fn detect_cycle_with_cycle() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        // a depends_on b e b depends_on a: ciclo.
+        let nodes = vec![(a, vec![b]), (b, vec![a])];
+        assert!(detect_cycle(&nodes));
+    }
+
+    #[test]
+    fn detect_cycle_diamond_is_acyclic() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let d = Uuid::new_v4();
+        // d <- b,c <- a (diamante): nessun ciclo.
+        let nodes = vec![(a, vec![]), (b, vec![a]), (c, vec![a]), (d, vec![b, c])];
+        assert!(!detect_cycle(&nodes));
     }
 }

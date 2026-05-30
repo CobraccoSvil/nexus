@@ -364,9 +364,19 @@ pub async fn auto_upgrade_models_and_routing(db: &sqlx::PgPool) -> Result<(), St
                 continue;
             }
         };
-        // Carica tutti i modelli del provider che matchano la famiglia
+        // Carica tutti i modelli del provider che matchano la famiglia.
+        // IMPORTANTE (chiusura residuo probe attivo): escludiamo i modelli con
+        // `auto_disabled_reason` esplicito (es. `failed_initial_probe:model_not_found`
+        // settato dal probe-on-insert in `model_catalog_sync.rs`, oppure
+        // `model_not_found`/`hollow_completion` dal `model_health_probe` worker,
+        // oppure `manual:*` impostato dall'admin). Senza questo filtro, la
+        // riabilitazione di massa alla riga sottostante annulla qualsiasi
+        // decisione del probe e i modelli "fantasma" tornerebbero enabled +
+        // verrebbero promossi come "top family" -> default_provider_model.
         let candidates: Vec<String> = sqlx::query_scalar(
-            "SELECT model FROM ai_price_catalog WHERE provider = $1",
+            "SELECT model FROM ai_price_catalog \
+             WHERE provider = $1 \
+               AND (auto_disabled_reason IS NULL OR auto_disabled_reason = '')",
         )
         .bind(provider)
         .fetch_all(db)

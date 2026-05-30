@@ -286,13 +286,43 @@ async def _run_exploratory_check(
     return True, ""
 
 
+def _pick_next_todo(todos: list[dict], cfg: dict) -> dict | None:
+    """Comp.3a: sceglie il prossimo todo da eseguire.
+
+    Default (dag_topological_enabled=False o nessun depends_on): primo pending
+    per seq (i todos arrivano gia' ordinati da list_todos), comportamento
+    storico. Con DAG attivo e dipendenze presenti: primo pending (per seq, come
+    tie-break deterministico) che ha TUTTE le depends_on gia' completed/skipped.
+    Se nessun pending e' eseguibile (dipendenza blocked o ciclo residuo),
+    fallback al primo pending per non bloccare il loop.
+    """
+    pending = [t for t in todos if t.get("status") == "pending"]
+    if not pending:
+        return None
+    dag_enabled = bool(cfg.get("dag_topological_enabled"))
+    has_deps = any(t.get("depends_on") for t in todos)
+    if not dag_enabled or not has_deps:
+        return pending[0]
+    done = {str(t.get("id")) for t in todos if t.get("status") in ("completed", "skipped")}
+    for t in pending:
+        deps = t.get("depends_on") or []
+        if all(str(d) in done for d in deps):
+            return t
+    logger.warning(
+        "dag: nessun todo pending con dipendenze soddisfatte (deadlock/blocked), "
+        "fallback al primo pending per seq"
+    )
+    return pending[0]
+
+
 def _advance_or_end(run_id: str) -> dict[str, Any]:
-    """Sceglie il prossimo todo pending e aggiorna lo state.
+    """Sceglie il prossimo todo (DAG-aware, Comp.3a) e aggiorna lo state.
 
     Se nessun todo pending: ritorna end_turn (il loop terminera').
     """
     todos = todo_store.list_todos(run_id)
-    next_pending = next((t for t in todos if t.get("status") == "pending"), None)
+    cfg = orchestrator_config.get()
+    next_pending = _pick_next_todo(todos, cfg)
     if next_pending is None:
         all_done = all(t.get("status") in ("completed", "skipped") for t in todos)
         logger.info(

@@ -602,8 +602,9 @@ async fn main() -> anyhow::Result<()> {
     // matrix punti a modelli deprecati (es. DeepSeek v3 ora rimosso dall'API).
     {
         let db_sync = state.db.clone();
+        let orch_sync = std::sync::Arc::new(state.orchestrator.clone());
         tokio::spawn(async move {
-            model_catalog_sync::catalog_sync_loop(db_sync).await;
+            model_catalog_sync::catalog_sync_loop(db_sync, Some(orch_sync)).await;
         });
     }
 
@@ -2270,7 +2271,7 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/admin/catalog-sync",
                 axum::routing::post(|axum::extract::State(s): axum::extract::State<AppState>| async move {
-                    match model_catalog_sync::trigger_sync_now(&s.db).await {
+                    match model_catalog_sync::trigger_sync_now(&s.db, Some(&s.orchestrator)).await {
                         Ok(summary) => axum::Json(serde_json::json!({"ok": true, "summary": summary})),
                         Err(e) => axum::Json(serde_json::json!({"ok": false, "error": e})),
                     }

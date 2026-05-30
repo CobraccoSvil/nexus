@@ -101,6 +101,32 @@ pub(super) async fn read_header(path: &std::path::Path) -> Result<Vec<u8>, Strin
 ///
 /// Ritorna `(kind, mime_reale, ext_reale)`.
 pub fn detect_kind(header: &[u8], file_name: &str, declared_mime: &str) -> (String, String, String) {
+    // 0) Fast-path ZIP-based: se inizia con PK\x03\x04, il sub-type lo decide
+    //    `detect_zip_subtype` via string-search nelle entries (es. word/document.xml
+    //    -> docx, canvas.fig -> figma). Più affidabile di `infer`, che richiede
+    //    entries office-specific complete per riconoscere docx/xlsx/pptx e con
+    //    header minimali (test/streaming) cade in "binary" perdendo il sub-type.
+    if header.starts_with(b"PK\x03\x04") {
+        let sub = detect_zip_subtype(header);
+        let (mime, ext) = match sub {
+            "docx" => (
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "docx",
+            ),
+            "xlsx" => (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "xlsx",
+            ),
+            "pptx" => (
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "pptx",
+            ),
+            "figma" => ("application/octet-stream", "fig"),
+            _ => ("application/zip", "zip"),
+        };
+        return (sub.to_string(), mime.to_string(), ext.to_string());
+    }
+
     // 1) Magic bytes con `infer`.
     if let Some(kind) = infer::get(header) {
         let mt = kind.mime_type().to_string();

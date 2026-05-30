@@ -68,7 +68,8 @@ def list_todos(run_id: str) -> list[dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT id::text, seq, content, status, priority, acceptance_criteria,
-                          verify_failures, iteration_seen, updated_at
+                          verify_failures, iteration_seen, updated_at,
+                          depends_on, node_key, dag_layer
                    FROM nexus_agent_todos
                    WHERE run_id = %s
                    ORDER BY seq ASC""",

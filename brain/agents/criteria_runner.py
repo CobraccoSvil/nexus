@@ -39,8 +39,32 @@ async def run_criterion(criterion: dict[str, Any], ctx: dict[str, Any]) -> tuple
     """
     started = time.monotonic()
     c_type = (criterion.get("type") or "").lower().strip()
-    spec = criterion.get("spec") or {}
-    expected = criterion.get("expected") or {}
+    # Difesa: il planner LLM puo' generare `spec`/`expected` come STRINGA
+    # invece che come dict (es. `"spec": "ls README.md"`). Senza questo check
+    # il `spec.get(...)` negli handler sottostanti crasha con
+    # `'str' object has no attribute 'get'` e il verifier marca cycle fallito
+    # in loop fino a `blocked` (osservato nel run f14696bc). Normalizziamo a
+    # dict cosi' gli handler ritornano "spec.command obbligatorio" leggibile.
+    spec_raw = criterion.get("spec")
+    if isinstance(spec_raw, dict):
+        spec = spec_raw
+    else:
+        if spec_raw not in (None, "", {}):
+            logger.warning(
+                "criterion type=%s ha spec non-dict (%s): %r — normalizzo a {}",
+                c_type, type(spec_raw).__name__, str(spec_raw)[:200],
+            )
+        spec = {}
+    expected_raw = criterion.get("expected")
+    if isinstance(expected_raw, dict):
+        expected = expected_raw
+    else:
+        if expected_raw not in (None, "", {}):
+            logger.warning(
+                "criterion type=%s ha expected non-dict (%s): %r — normalizzo a {}",
+                c_type, type(expected_raw).__name__, str(expected_raw)[:200],
+            )
+        expected = {}
     timeout_s = float(criterion.get("timeout_s") or ctx.get("timeout_s") or 30.0)
 
     if c_type == "run_command":

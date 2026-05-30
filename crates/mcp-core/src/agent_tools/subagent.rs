@@ -30,20 +30,39 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
     let context_blob = input.get("context").and_then(Value::as_str).unwrap_or("").to_string();
     let expected_format = input.get("expected_output_format").and_then(Value::as_str).unwrap_or("").to_string();
 
+    run_single_subagent(ctx, &kind, &task, &context_blob, &expected_format)
+        .await
+        .to_string()
+}
+
+/// Esegue UNA singola sub-run. Logica condivisa fra `dispatch_subagent`
+/// (singolo) e `dispatch_subagents` (batch parallelo, Comp.0/3b).
+///
+/// Ritorna sempre un `Value`: l'oggetto risultato in caso di successo, oppure
+/// `{"error": "..."}`. I guard (enabled/whitelist/depth/cost) sono valutati
+/// per ogni sub-run; nel batch il cost cap e' best-effort (race tollerata
+/// dato il cap conservativo sul parallelismo).
+async fn run_single_subagent(
+    ctx: &AgentToolContext,
+    kind: &str,
+    task: &str,
+    context_blob: &str,
+    expected_format: &str,
+) -> Value {
     let project_id = ctx.project_id;
 
     // 2. Setting guards (lettura diretta da DB via ctx.db)
     let (enabled, whitelist_csv, max_depth, cost_cap_usd, default_timeout): (bool, String, i64, f64, i64) = match read_subagent_settings(ctx).await {
         Ok(v) => v,
-        Err(e) => return err(&format!("lettura settings fallita: {e}")),
+        Err(e) => return json!({"error": format!("lettura settings fallita: {e}")}),
     };
 
     if !enabled {
-        return err("sub-agents disabilitati (orchestrator.subagents_enabled=false)");
+        return json!({"error": "sub-agents disabilitati (orchestrator.subagents_enabled=false)"});
     }
     let whitelist: Vec<&str> = whitelist_csv.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-    if !whitelist.contains(&kind.as_str()) {
-        return err(&format!("kind '{kind}' non in whitelist: {whitelist:?}"));
+    if !whitelist.contains(&kind) {
+        return json!({"error": format!("kind '{kind}' non in whitelist: {whitelist:?}")});
     }
 
     // 3. Carica definition kind
@@ -51,18 +70,18 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
         "SELECT prompt_key, tool_whitelist, model_purpose, max_iterations, timeout_s, is_background, is_enabled
          FROM nexus_subagent_definitions WHERE kind = $1 LIMIT 1",
     )
-    .bind(&kind)
+    .bind(kind)
     .fetch_optional(&*ctx.db)
     .await
     .map_err(|e| format!("query definition: {e}"));
     let row = match row {
         Ok(Some(r)) => r,
-        Ok(None) => return err(&format!("kind '{kind}' non trovato in nexus_subagent_definitions")),
-        Err(e) => return err(&e),
+        Ok(None) => return json!({"error": format!("kind '{kind}' non trovato in nexus_subagent_definitions")}),
+        Err(e) => return json!({"error": e}),
     };
     let is_enabled: bool = row.get::<bool, _>("is_enabled");
     if !is_enabled {
-        return err(&format!("kind '{kind}' disabilitato"));
+        return json!({"error": format!("kind '{kind}' disabilitato")});
     }
     let timeout_s: i64 = row.get::<i32, _>("timeout_s") as i64;
     let timeout_s = if timeout_s > 0 { timeout_s } else { default_timeout };
@@ -73,7 +92,7 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
     let parent_run_id = ctx.parent_run_id.unwrap_or_else(|| ctx.session_id.unwrap_or(Uuid::nil()));
     let current_depth = if ctx.parent_run_id.is_some() { 2_i64 } else { 1_i64 };
     if current_depth > max_depth {
-        return err(&format!("depth {current_depth} > max {max_depth}: sub-agent annidamento eccessivo"));
+        return json!({"error": format!("depth {current_depth} > max {max_depth}: sub-agent annidamento eccessivo")});
     }
 
     // 5. Cost guard cumulativo per parent (cast NUMERIC -> double precision via SQL)
@@ -85,7 +104,7 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
     .await
     .unwrap_or(0.0);
     if cumulative >= cost_cap_usd {
-        return err(&format!("cost cap parent_run_id={parent_run_id} raggiunto ({cumulative:.4} >= {cost_cap_usd:.4})"));
+        return json!({"error": format!("cost cap parent_run_id={parent_run_id} raggiunto ({cumulative:.4} >= {cost_cap_usd:.4})")});
     }
 
     // 6. Crea row in nexus_subagent_runs con status='pending'
@@ -98,17 +117,17 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
     )
     .bind(parent_run_id)
     .bind(project_id)
-    .bind(&kind)
-    .bind(&task)
-    .bind(&context_blob)
-    .bind(&expected_format)
+    .bind(kind)
+    .bind(task)
+    .bind(context_blob)
+    .bind(expected_format)
     .bind(is_background)
     .bind(current_depth as i32)
     .fetch_one(&*ctx.db)
     .await
     {
         Ok(id) => id,
-        Err(e) => return err(&format!("INSERT nexus_subagent_runs: {e}")),
+        Err(e) => return json!({"error": format!("INSERT nexus_subagent_runs: {e}")}),
     };
 
     // 7. Chiama il brain endpoint /agent/subagent-run per attivare la sub-run.
@@ -147,7 +166,7 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
             let status = body.get("status").and_then(Value::as_str).unwrap_or("completed");
             json!({
                 "subagent_run_id": subagent_run_id.to_string(),
-                "kind": body.get("kind").cloned().unwrap_or(json!(null)),
+                "kind": body.get("kind").cloned().unwrap_or(json!(kind)),
                 "status": status,
                 "summary": summary,
                 "artifacts": body.get("artifacts").cloned().unwrap_or(json!([])),
@@ -155,7 +174,6 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
                 "cost_usd": body.get("cost_usd").cloned().unwrap_or(json!(0)),
                 "tokens": body.get("tokens").cloned().unwrap_or(json!({})),
             })
-            .to_string()
         }
         Ok(r) => {
             let status = r.status();
@@ -166,7 +184,7 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
                 .bind(subagent_run_id)
                 .execute(&*ctx.db)
                 .await;
-            err(&format!("brain endpoint HTTP {status}: {}", body.chars().take(200).collect::<String>()))
+            json!({"error": format!("brain endpoint HTTP {status}: {}", body.chars().take(200).collect::<String>()), "subagent_run_id": subagent_run_id.to_string()})
         }
         Err(e) => {
             let _ = sqlx::query("UPDATE nexus_subagent_runs SET status = 'failed', completed_at = NOW(), final_summary = $1 WHERE id = $2")
@@ -174,9 +192,69 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
                 .bind(subagent_run_id)
                 .execute(&*ctx.db)
                 .await;
-            err(&format!("brain endpoint unreachable: {e}"))
+            json!({"error": format!("brain endpoint unreachable: {e}"), "subagent_run_id": subagent_run_id.to_string()})
         }
     }
+}
+
+/// `dispatch_subagents` — esegue PIU' sub-run in parallelo (Comp.0/3b).
+///
+/// Input:
+///   - `tasks`: array di {kind, task, context?, expected_output_format?} (1-8)
+///   - `max_parallel`: ampiezza dell'ondata concorrente (default 2, max 4)
+///
+/// Esegue a ondate di `max_parallel` via join_all (I/O-bound verso il brain).
+/// E' la base del DAG scheduler parallelo (Comp.3b); i guard per-sub e il
+/// cost cap restano quelli di `run_single_subagent`.
+pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> String {
+    let tasks = match input.get("tasks").and_then(|v| v.as_array()) {
+        Some(a) if !a.is_empty() => a.clone(),
+        _ => return err("parametro 'tasks' (array non vuoto) obbligatorio"),
+    };
+    if tasks.len() > 8 {
+        return err("troppi task in un batch (max 8)");
+    }
+    let max_parallel = input
+        .get("max_parallel")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2)
+        .clamp(1, 4) as usize;
+
+    // Valida e normalizza ogni task prima di eseguire.
+    let mut parsed: Vec<(String, String, String, String)> = Vec::with_capacity(tasks.len());
+    for (i, t) in tasks.iter().enumerate() {
+        let kind = t.get("kind").and_then(Value::as_str).unwrap_or("").to_string();
+        let task = t.get("task").and_then(Value::as_str).unwrap_or("").to_string();
+        if kind.is_empty() || task.trim().is_empty() {
+            return err(&format!("task[{i}]: 'kind' e 'task' sono obbligatori"));
+        }
+        let context_blob = t.get("context").and_then(Value::as_str).unwrap_or("").to_string();
+        let expected = t
+            .get("expected_output_format")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        parsed.push((kind, task, context_blob, expected));
+    }
+
+    // Esegui a ondate concorrenti (cap conservativo).
+    let mut results: Vec<Value> = Vec::with_capacity(parsed.len());
+    for wave in parsed.chunks(max_parallel) {
+        let futs = wave
+            .iter()
+            .map(|(k, ta, c, e)| run_single_subagent(ctx, k, ta, c, e));
+        let wave_res = futures::future::join_all(futs).await;
+        results.extend(wave_res);
+    }
+
+    let ok = results.iter().filter(|r| r.get("error").is_none()).count();
+    json!({
+        "count": results.len(),
+        "ok": ok,
+        "failed": results.len() - ok,
+        "results": results,
+    })
+    .to_string()
 }
 
 async fn read_subagent_settings(ctx: &AgentToolContext) -> Result<(bool, String, i64, f64, i64), String> {

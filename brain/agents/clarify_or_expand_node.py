@@ -64,6 +64,10 @@ def _load_config() -> dict[str, Any]:
         "decision_min_score": 0.7,
         "decision_topk": 5,
         "confirm_irreversible_in_auto": False,
+        # Comp.1: Intake Gate multi-asse (assorbe il decision-lookup quando ON).
+        "intake_gate_enabled": False,
+        "intake_match_min_score": 0.7,
+        "intake_topk": 5,
     }
     url = os.environ.get("DATABASE_URL", "")
     if not url:
@@ -108,6 +112,18 @@ def _load_config() -> dict[str, Any]:
                             pass
                     elif short == "confirm_irreversible_in_auto":
                         defaults["confirm_irreversible_in_auto"] = str(value).lower() not in ("false", "0", "off")
+                    elif short == "intake_gate_enabled":
+                        defaults["intake_gate_enabled"] = str(value).lower() not in ("false", "0", "off")
+                    elif short == "intake_match_min_score":
+                        try:
+                            defaults["intake_match_min_score"] = float(value)
+                        except (TypeError, ValueError):
+                            pass
+                    elif short == "intake_topk":
+                        try:
+                            defaults["intake_topk"] = int(value)
+                        except (TypeError, ValueError):
+                            pass
     except Exception as exc:
         logger.debug("clarify_or_expand: _load_config fallback (%s)", exc)
     return defaults
@@ -158,6 +174,234 @@ def _lookup_existing_decision(state: AgentState, user_msg: str, cfg: dict) -> di
     return decisions[0] if decisions else None
 
 
+def _intake_gate(state: AgentState, user_msg: str, cfg: dict) -> dict | None:
+    """Comp.1: gate di intake multi-asse. UNA ricerca KB (servizio esistente) +
+    UNA classificazione LLM della RELAZIONE della richiesta con la knowledge:
+    nuova | duplicate | refinement | correction. Assorbe il decision-lookup del
+    Cluster 4. Sincrona (chiamata via asyncio.to_thread dal nodo). Best-effort:
+    in caso di errore o nessun match ritorna {"relation": "nuova"} per non
+    bloccare il run.
+    """
+    if not cfg.get("intake_gate_enabled"):
+        return None
+    project_id = str(state.get("project_id") or "").strip()
+    if not project_id or len(user_msg) < 10:
+        return None
+    # 1. Ricerca KB tramite l'endpoint interno esistente (niente client nuovo).
+    try:
+        import requests  # noqa: PLC0415
+        resp = requests.post(
+            f"{_MCP_CORE_INTERNAL_URL}/api/internal/knowledge/search",
+            json={
+                "project_id": project_id,
+                "query": user_msg,
+                "top_k": int(cfg.get("intake_topk", 5)),
+                "min_score": float(cfg.get("intake_match_min_score", 0.7)),
+            },
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return {"relation": "nuova", "related": None, "candidates": []}
+        results = resp.json().get("results", []) or []
+    except Exception as exc:
+        logger.debug("intake_gate: ricerca KB fallita (%s)", exc)
+        return {"relation": "nuova", "related": None, "candidates": []}
+    if not results:
+        return {"relation": "nuova", "related": None, "candidates": []}
+
+    # 2. Classificazione LLM multi-asse (UNA call) sul set di candidati.
+    if _providers is None or _routing_client is None:
+        return {"relation": "nuova", "related": None, "candidates": results}
+    try:
+        decision = _routing_client.purpose_model(purpose="intake_gate")
+        provider, model = decision.provider, decision.model
+    except Exception as exc:
+        logger.debug("intake_gate: purpose_model fallito (%s)", exc)
+        return {"relation": "nuova", "related": None, "candidates": results}
+
+    cand_lines = []
+    for i, r in enumerate(results[:5]):
+        snippet = (r.get("snippet") or "")[:200]
+        cand_lines.append(f"[{i}] ({r.get('intent', '?')}) {r.get('title', '')}: {snippet}")
+    cand_text = "\n".join(cand_lines)
+    system_text = (
+        "Sei un classificatore di intake per un progetto software. Data una NUOVA "
+        "richiesta dell'utente e le note ESISTENTI nella knowledge base del progetto, "
+        "determina la RELAZIONE della richiesta con quanto gia' presente:\n"
+        "- nuova: argomento non coperto dalle note esistenti.\n"
+        "- duplicate: gia' fatto/elaborato (la richiesta ripete qualcosa di presente).\n"
+        "- refinement: amplia o estende una nota esistente (stesso tema, piu' dettaglio).\n"
+        "- correction: contraddice o cambia una decisione/feature esistente.\n"
+        "Imposta related_index all'indice [n] della nota piu' pertinente (-1 se nuova). "
+        "Imposta off_topic=true se la richiesta NON riguarda lo scopo del progetto. "
+        "Rispondi SOLO chiamando il tool intake_classify."
+    )
+    tools_json = [{
+        "name": "intake_classify",
+        "description": "Classifica la relazione della richiesta con la knowledge base esistente.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "relation": {"type": "string", "enum": ["nuova", "duplicate", "refinement", "correction"]},
+                "related_index": {"type": "integer", "description": "Indice [n] della nota piu' pertinente, -1 se nuova"},
+                "off_topic": {"type": "boolean", "description": "True se la richiesta non e' pertinente allo scopo del progetto."},
+                "rationale": {"type": "string"},
+            },
+            "required": ["relation"],
+        },
+    }]
+    user_block = f"NUOVA RICHIESTA:\n{user_msg}\n\nNOTE ESISTENTI:\n{cand_text}"
+    try:
+        result = _providers.generate_agent_turn_sync(
+            provider, model, [{"role": "user", "content": user_block}], tools_json,
+            max_tokens=400, system_text=system_text,
+        )
+    except Exception as exc:
+        logger.warning("intake_gate: LLM call fallita (%s)", exc)
+        return {"relation": "nuova", "related": None, "candidates": results}
+
+    meta = result.metadata or {}
+    blocks = meta.get("tool_use_blocks") or []
+    block = next((b for b in blocks if b.get("name") == "intake_classify"), None)
+    if block is None:
+        return {"relation": "nuova", "related": None, "candidates": results}
+    inp = block.get("input") or {}
+    relation = str(inp.get("relation") or "nuova").lower()
+    if relation not in ("nuova", "duplicate", "refinement", "correction"):
+        relation = "nuova"
+    related = None
+    idx = inp.get("related_index")
+    try:
+        if idx is not None and 0 <= int(idx) < len(results):
+            related = results[int(idx)]
+    except (TypeError, ValueError):
+        related = None
+    if related is None and relation != "nuova":
+        related = results[0]
+    return {
+        "relation": relation,
+        "related": related,
+        "candidates": results,
+        "off_topic": bool(inp.get("off_topic", False)),
+        "rationale": str(inp.get("rationale") or ""),
+    }
+
+
+def _apply_intake_verdict(state: AgentState, intake: dict, cfg: dict) -> dict[str, Any] | None:
+    """Comp.1: traduce il verdetto del gate in azioni di flusso (riusa il
+    meccanismo clarify/meta_step, niente nuovo HITL). Ritorna gli updates da
+    propagare e, se necessario, ferma il turno (pending_clarify). Ritorna None
+    quando la richiesta e' 'nuova' e il flusso deve proseguire normalmente.
+    """
+    relation = str(intake.get("relation") or "nuova")
+    related = intake.get("related") or {}
+    rationale = intake.get("rationale") or ""
+    run_id = state.get("thread_id")
+    automation = (state.get("automation_mode") or "").strip().lower()
+    is_auto = automation in ("automatic", "automatico", "auto", "continuous", "continuo")
+
+    # Pertinenza: richiesta fuori tema rispetto allo scopo del progetto. Segnala
+    # (meta_step) e prosegue: la nota resta in KB, l'agente puo' marcarla
+    # off_topic con knowledge_set_relevance per escluderla dal grafo/DAG.
+    if intake.get("off_topic"):
+        ms = meta_steps.make(
+            kind="clarify",
+            title="Richiesta fuori tema rispetto al progetto",
+            payload={"mode": "intake_off_topic", "rationale": rationale},
+        )
+        updates: dict[str, Any] = {}
+        if ms:
+            updates["meta_steps"] = [ms]
+            meta_steps.persist_async(run_id, ms)
+        logger.info("intake_gate: richiesta off-topic segnalata")
+        return updates
+
+    if relation == "nuova":
+        return None
+
+    if relation == "duplicate":
+        ms = meta_steps.make(
+            kind="clarify",
+            title="Richiesta gia' elaborata",
+            payload={
+                "mode": "intake_duplicate",
+                "relation": relation,
+                "source_note_id": related.get("note_id"),
+                "source_title": related.get("title"),
+                "score": related.get("score"),
+                "rationale": rationale,
+            },
+        )
+        updates: dict[str, Any] = {}
+        if ms:
+            updates["meta_steps"] = [ms]
+            meta_steps.persist_async(run_id, ms)
+        # Interattivo: ferma per conferma riuso. Automatico: segnala e prosegue.
+        if not is_auto:
+            updates["pending_clarify"] = True
+        logger.info("intake_gate: duplicate di '%s' (auto=%s)", related.get("title"), is_auto)
+        return updates
+
+    if relation == "correction":
+        # Auto senza conferma irreversibili: segnala e prosegue (non blocca).
+        if is_auto and not cfg.get("confirm_irreversible_in_auto"):
+            ms = meta_steps.make(
+                kind="clarify",
+                title="Possibile contraddizione (procedo)",
+                payload={
+                    "mode": "intake_correction_auto",
+                    "source_note_id": related.get("note_id"),
+                    "source_title": related.get("title"),
+                    "rationale": rationale,
+                },
+            )
+            updates = {}
+            if ms:
+                updates["meta_steps"] = [ms]
+                meta_steps.persist_async(run_id, ms)
+            return updates
+        # Altrimenti ferma per conferma esplicita.
+        question = (
+            f"Questa richiesta sembra contraddire una scelta esistente: "
+            f"'{related.get('title', '')}'. Confermi il cambiamento?"
+        )
+        ms = meta_steps.make(
+            kind="clarify",
+            title="La richiesta contraddice una scelta esistente",
+            payload={
+                "mode": "intake_correction",
+                "source_note_id": related.get("note_id"),
+                "source_title": related.get("title"),
+                "rationale": rationale,
+                "question": question,
+            },
+        )
+        updates = {"pending_clarify": True}
+        if ms:
+            updates["meta_steps"] = [ms]
+            meta_steps.persist_async(run_id, ms)
+        logger.info("intake_gate: correction vs '%s' -> conferma", related.get("title"))
+        return updates
+
+    # refinement: emette meta_step e prosegue (non blocca).
+    ms = meta_steps.make(
+        kind="clarify",
+        title="Ampliamento di una nota esistente",
+        payload={
+            "mode": "intake_refinement",
+            "source_note_id": related.get("note_id"),
+            "source_title": related.get("title"),
+            "rationale": rationale,
+        },
+    )
+    updates = {}
+    if ms:
+        updates["meta_steps"] = [ms]
+        meta_steps.persist_async(run_id, ms)
+    logger.info("intake_gate: refinement di '%s' -> prosegue", related.get("title"))
+    return updates
+
+
 async def clarify_or_expand_node(state: AgentState) -> dict[str, Any]:
     """Decide se chiedere chiarimento o arricchire la query per il retrieve.
 
@@ -174,10 +418,24 @@ async def clarify_or_expand_node(state: AgentState) -> dict[str, Any]:
 
     user_msg_preview = _last_user_message(state).strip()
 
+    # ── Comp.1: Intake Gate multi-asse (gated). Assorbe il decision-lookup. ───
+    if cfg.get("intake_gate_enabled"):
+        import asyncio as _aio_gate
+        intake = await _aio_gate.to_thread(_intake_gate, state, user_msg_preview, cfg)
+        if intake is not None:
+            verdict = _apply_intake_verdict(state, intake, cfg)
+            if verdict is not None:
+                return verdict
+        # 'nuova' -> prosegue il flusso clarify standard sotto.
+
     # ── Cluster 4: la decisione e' GIA' stata presa? (RAG, gated) ────────────
     # Cerca decisioni passate; se ne trova una con score alto, la applica
-    # (meta_step resolved_from_memory) e prosegue SENZA chiedere.
-    existing_decision = _lookup_existing_decision(state, user_msg_preview, cfg)
+    # (meta_step resolved_from_memory) e prosegue SENZA chiedere. Saltato quando
+    # il gate intake e' attivo (lo assorbe, evita la doppia ricerca).
+    existing_decision = (
+        None if cfg.get("intake_gate_enabled")
+        else _lookup_existing_decision(state, user_msg_preview, cfg)
+    )
     if existing_decision is not None:
         run_id = state.get("thread_id")
         ms = meta_steps.make(

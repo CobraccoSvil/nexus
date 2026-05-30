@@ -88,6 +88,11 @@ _KEYS = (
     "subagent_rag_grounding_min_score",
     "subagent_rag_grounding_snippet_max",
     "subagent_inherit_plan_rationale",
+    # Comp.3a/3b: coordinamento azioni via DAG
+    "dag_topological_enabled",
+    "dag_parallel_enabled",
+    "dag_max_parallel",
+    "dag_verify_layer",
 )
 
 # Default conservativi: feature OFF se DB irraggiungibile.
@@ -142,6 +147,11 @@ _SAFE_DEFAULTS: dict[str, Any] = {
     "subagent_rag_grounding_min_score": 0.55,
     "subagent_rag_grounding_snippet_max": 800,
     "subagent_inherit_plan_rationale": False,
+    # Comp.3a/3b: coordinamento azioni via DAG (OFF di default)
+    "dag_topological_enabled": False,
+    "dag_parallel_enabled": False,
+    "dag_max_parallel": 2,
+    "dag_verify_layer": True,
 }
 
 _lock = threading.RLock()

@@ -44,15 +44,22 @@ pub fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> 
         if real_end >= chars.len() {
             break;
         }
-        start = real_end.saturating_sub(overlap);
-        if start == 0 || start >= chars.len() {
+        // Garantisce progresso di almeno `step` rispetto allo start CORRENTE
+        // (prev_start), non al next_start: la condizione precedente
+        // (`real_end < start + step` dopo `start = real_end - overlap`)
+        // confrontava il next_start con se stesso e su testi senza whitespace
+        // forzava `start = next_start + step` annullando l'overlap (bug
+        // visibile su input "aaa...": chunk_size=1000, overlap=200 produceva
+        // 4 chunk di 1000 a step=1600 invece di 6 a step=800).
+        let prev_start = start;
+        let mut next_start = real_end.saturating_sub(overlap);
+        if next_start < prev_start + step {
+            next_start = prev_start + step;
+        }
+        if next_start >= chars.len() {
             break;
         }
-        // Avanza almeno di `step` per garantire progresso minimo.
-        // (real_end potrebbe essere arretrato di molto per boundary).
-        if real_end < start + step {
-            start = start + step;
-        }
+        start = next_start;
     }
     out
 }
