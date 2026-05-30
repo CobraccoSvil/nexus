@@ -212,6 +212,125 @@ def _load_exploration_loop_threshold() -> int:
     return value
 
 
+# ── Cache reminder lingua resiliente (TTL 60s) ──────────────────────────────
+# Bug #88: a contesto saturo (>400K token) i modelli small con forte recency
+# bias ignorano la direttiva di lingua presente solo in testa al system prompt
+# e rispondono in cinese, allucinando l'identita'. Iniettiamo SEMPRE un reminder
+# di lingua in coda al system_text e in coda all'ultimo HumanMessage (recency),
+# coprendo cosi' anche i profili custom e gli 82 template senza direttiva.
+# I default valgono SOLO se il DB e' down (regola G: niente hardcode sparso).
+_LANG_REMINDER_MARKER = "[[NEXUS_LANG_REMINDER]]"
+_LANG_REMINDER_CACHE: dict[str, Any] = {
+    "loaded_at": 0.0,
+    "enabled": None,
+    "text": None,
+}
+_LANG_REMINDER_TTL_SEC = 60.0
+_LANG_REMINDER_DEFAULT_ENABLED = True
+_LANG_REMINDER_DEFAULT_TEXT = (
+    "Rispondi SEMPRE e SOLO in italiano. Mai cinese, giapponese o altre "
+    "lingue, qualunque sia la lingua del contesto o degli allegati."
+)
+
+
+def _load_language_reminder() -> tuple[bool, str]:
+    """Legge agent.language_reminder_enabled / _text dal DB con cache 60s.
+
+    Ritorna (enabled, text). I default sicuri (True, testo italiano) valgono
+    SOLO se il DB e' irraggiungibile o la chiave non esiste: get_bool_setting /
+    get_setting non sollevano mai. Quando enabled e' False l'iniezione del
+    reminder non avviene affatto (vedi _inject_language_reminder).
+    """
+    now = time.time()
+    cached_enabled = _LANG_REMINDER_CACHE["enabled"]
+    if cached_enabled is not None and (
+        now - _LANG_REMINDER_CACHE["loaded_at"]
+    ) < _LANG_REMINDER_TTL_SEC:
+        return bool(cached_enabled), str(_LANG_REMINDER_CACHE["text"])
+    enabled = _LANG_REMINDER_DEFAULT_ENABLED
+    text = _LANG_REMINDER_DEFAULT_TEXT
+    try:
+        from brain.utils.settings_db import get_bool_setting, get_setting
+        enabled = get_bool_setting(
+            "agent.language_reminder_enabled", _LANG_REMINDER_DEFAULT_ENABLED
+        )
+        text = get_setting(
+            "agent.language_reminder_text", _LANG_REMINDER_DEFAULT_TEXT
+        ).strip() or _LANG_REMINDER_DEFAULT_TEXT
+    except Exception as exc:
+        logger.warning(
+            "language_reminder: load DB fallito, uso default (enabled=%s) (%s)",
+            _LANG_REMINDER_DEFAULT_ENABLED, exc,
+        )
+        enabled = _LANG_REMINDER_DEFAULT_ENABLED
+        text = _LANG_REMINDER_DEFAULT_TEXT
+    _LANG_REMINDER_CACHE["enabled"] = enabled
+    _LANG_REMINDER_CACHE["text"] = text
+    _LANG_REMINDER_CACHE["loaded_at"] = now
+    return enabled, text
+
+
+def _inject_language_reminder(
+    messages: list[Any],
+    system_text: str,
+    enabled: bool,
+    reminder_text: str,
+) -> tuple[list[Any], str]:
+    """Inietta il reminder di lingua nel system_text e nell'ultimo HumanMessage.
+
+    Funzione pura e idempotente (testabile senza far girare executor_node):
+
+      1. GARANZIA NEL SYSTEM: appende il reminder in coda a system_text con
+         marcatore univoco _LANG_REMINDER_MARKER. Copre profili/template senza
+         direttiva di lingua.
+      2. RECENCY NEI MESSAGGI: appende il reminder al content dell'ULTIMO
+         HumanMessage con content stringa (recency bias dei modelli small).
+         NON aggiunge un nuovo messaggio (l'alternanza user/assistant richiesta
+         da Anthropic resterebbe rotta). Crea una COPIA del messaggio, non muta
+         l'oggetto originale dello stato condiviso. Se l'ultimo HumanMessage ha
+         content non-stringa (lista di blocchi) il punto 2 viene saltato: il
+         punto 1 garantisce comunque la copertura.
+
+    Ritorna (messages, system_text) eventualmente modificati. Se enabled e'
+    False ritorna gli input invariati. Idempotente: il marcatore e il testo
+    gia' presenti non vengono riappesi.
+    """
+    if not enabled or not reminder_text:
+        return messages, system_text
+
+    # Punto 1: garanzia nel system_text (idempotente via marcatore).
+    base_system = system_text or ""
+    if _LANG_REMINDER_MARKER not in base_system:
+        new_system = (
+            f"{base_system}\n\n{_LANG_REMINDER_MARKER}\n"
+            f"### LINGUA RISPOSTA OBBLIGATORIA ###\n{reminder_text}"
+        )
+    else:
+        new_system = system_text
+
+    # Punto 2: recency sull'ultimo HumanMessage con content stringa.
+    new_messages = messages
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if not isinstance(msg, HumanMessage):
+            continue
+        content = getattr(msg, "content", None)
+        if not isinstance(content, str):
+            # Ultimo HumanMessage ha content non-stringa (lista blocchi):
+            # salta il punto 2, il punto 1 copre comunque.
+            break
+        if reminder_text in content:
+            # Gia' presente: idempotenza, niente riappensione.
+            break
+        new_content = f"{content}\n\n{reminder_text}"
+        new_msg = msg.model_copy(update={"content": new_content})
+        new_messages = list(messages)
+        new_messages[idx] = new_msg
+        break
+
+    return new_messages, new_system
+
+
 def estimate_prompt_complexity(prompt: str, config: dict[str, Any] | None = None) -> int:
     """Stima la complessita' del task come score 0-100.
 
@@ -2359,6 +2478,15 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 "executor_node: contesto compresso (safety net) %d -> %d char",
                 ctx_size, new_size,
             )
+        # Bug #88: reminder lingua resiliente al contesto/profilo. Iniettato qui
+        # cosi' copre sia la chiamata principale (generate_agent_turn_sync con
+        # system_text) sia il fallback anti-loop (system_text2 = system_text +
+        # anti_loop_hint, che eredita il reminder dal system_text base). Doppia
+        # iniezione: garanzia nel system + recency sull'ultimo HumanMessage.
+        _lang_enabled, _lang_text = _load_language_reminder()
+        messages, system_text = _inject_language_reminder(
+            messages, system_text, _lang_enabled, _lang_text
+        )
         anth_messages = _langchain_to_anthropic_messages(messages)
         try:
             # max_tokens dinamico: almeno 8192 per turni con tool, capped a 16384.
