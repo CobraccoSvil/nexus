@@ -53,6 +53,18 @@ _KEYS = (
     "max_verify_cycles",
     "max_plan_revisions",
     "verifier_timeout_s",
+    # PR-C: worker-mode (orchestrator-worker puro)
+    "worker_mode_enabled",
+    "worker_mode_tool_whitelist",
+    # PR-D: attivazione adattiva da confidence
+    "adaptive_classifier_enabled",
+    "adaptive_gating_enabled",
+    "adaptive_agentic_score_min",
+    "adaptive_low_confidence_max",
+    # gia' presenti in DB ma usati anche qui: subagents_enabled / auto_delegation
+    "subagents_enabled",
+    "auto_delegation_enabled",
+    "max_parallel_subagents",
 )
 
 # Default conservativi: feature OFF se DB irraggiungibile.
@@ -68,6 +80,22 @@ _SAFE_DEFAULTS: dict[str, Any] = {
     "max_verify_cycles": 3,
     "max_plan_revisions": 2,
     "verifier_timeout_s": 30.0,
+    # PR-C: worker-mode OFF di default (sistema attuale invariato).
+    "worker_mode_enabled": False,
+    "worker_mode_tool_whitelist": [
+        "list_files", "read_file", "search_in_files", "recall_context",
+        "search_codebase_semantic", "nexus_todo_write", "dispatch_subagent",
+        "nexus_subagent_poll", "nexus_subagent_resume",
+    ],
+    # PR-D: attivazione adattiva OFF di default.
+    "adaptive_classifier_enabled": False,
+    "adaptive_gating_enabled": False,
+    "adaptive_agentic_score_min": 0.7,
+    "adaptive_low_confidence_max": 0.5,
+    # delega/subagent (default coerenti con DB attuale)
+    "subagents_enabled": True,
+    "auto_delegation_enabled": True,
+    "max_parallel_subagents": 3,
 }
 
 _lock = threading.RLock()
@@ -206,6 +234,30 @@ def verifier_timeout_s() -> float:
     return float(get()["verifier_timeout_s"])
 
 
+def worker_mode_enabled() -> bool:
+    return bool(get()["worker_mode_enabled"])
+
+
+def worker_mode_tool_whitelist() -> list[str]:
+    return list(get()["worker_mode_tool_whitelist"])
+
+
+def adaptive_classifier_enabled() -> bool:
+    return bool(get()["adaptive_classifier_enabled"])
+
+
+def adaptive_gating_enabled() -> bool:
+    return bool(get()["adaptive_gating_enabled"])
+
+
+def subagents_enabled() -> bool:
+    return bool(get()["subagents_enabled"])
+
+
+def auto_delegation_enabled() -> bool:
+    return bool(get()["auto_delegation_enabled"])
+
+
 def is_eligible(behavior_mode: str | None, intent: str | None, token_budget: int) -> bool:
     """Helper booleano: il run corrente puo' attivare il planner?
 
@@ -225,6 +277,61 @@ def is_eligible(behavior_mode: str | None, intent: str | None, token_budget: int
     if int(token_budget or 0) < int(cfg["plan_min_token_budget"]):
         return False
     return True
+
+
+def is_eligible_adaptive(
+    behavior_mode: str | None,
+    intent: str | None,
+    token_budget: int,
+    *,
+    complexity: str | None = None,
+    confidence: float | None = None,
+    agentic_score: float | None = None,
+    is_ambiguous: bool | None = None,
+) -> bool:
+    """Variante adattiva di is_eligible (PR-D).
+
+    Gate HARD sempre applicati (come is_eligible ma SENZA il filtro intent quando
+    il gating adattivo e' attivo):
+      1. plan_phase_enabled
+      2. behavior_mode in plan_behavior_modes
+      3. token_budget >= plan_min_token_budget
+
+    Se adaptive_gating_enabled e' OFF -> comportamento legacy (richiede anche
+    intent in plan_intents): identico a is_eligible.
+
+    Se ON -> il planner forte si attiva quando i segnali del classifier
+    indicano complessita'/incertezza:
+      - complexity == 'high', OPPURE
+      - is_ambiguous, OPPURE
+      - agentic_score >= adaptive_agentic_score_min, OPPURE
+      - confidence < adaptive_low_confidence_max
+    Altrimenti (task semplice + alta confidence) -> flusso economico diretto.
+    """
+    cfg = get()
+    if not cfg["plan_phase_enabled"]:
+        return False
+    if behavior_mode and behavior_mode.lower() not in [m.lower() for m in cfg["plan_behavior_modes"]]:
+        return False
+    if int(token_budget or 0) < int(cfg["plan_min_token_budget"]):
+        return False
+
+    if not cfg.get("adaptive_gating_enabled"):
+        # Legacy: richiede anche intent in plan_intents.
+        if intent and intent.lower() not in [i.lower() for i in cfg["plan_intents"]]:
+            return False
+        return True
+
+    # Gating adattivo: decide dai segnali del classifier.
+    if complexity and str(complexity).lower() == "high":
+        return True
+    if is_ambiguous:
+        return True
+    if agentic_score is not None and float(agentic_score) >= float(cfg["adaptive_agentic_score_min"]):
+        return True
+    if confidence is not None and float(confidence) < float(cfg["adaptive_low_confidence_max"]):
+        return True
+    return False
 
 
 def force_reload() -> None:

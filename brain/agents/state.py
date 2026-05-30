@@ -26,6 +26,12 @@ class AgentState(TypedDict, total=False):
     # Confidence della classificazione intent (0..1). Popolato da router_node.
     # Consumato da clarify_or_expand_node per decidere se attivarsi.
     intent_confidence: float
+    # PR-D: segnali del classifier agentico per il gating adattivo del planner
+    # forte (popolati da router_node solo se adaptive_classifier_enabled).
+    # task_complexity: 'low'|'medium'|'high'; agentic_score 0..1; is_ambiguous bool.
+    task_complexity: str | None
+    agentic_score: float | None
+    is_ambiguous: bool | None
     # Query arricchita prodotta dal clarify_or_expand_node (mode=expand).
     # USATA solo dal retrieve RAG, NON sostituisce il prompt utente al modello.
     expanded_query: str | None

@@ -459,6 +459,8 @@ _storage: LocalLearningStorage | None = None
 _retriever: InteractionRetriever | None = None
 _tool_runner: ToolRunnerClient | None = None
 _agent_router: AgentRouterClient | None = None
+# PR-D: classifier agentico LLM per il gating adattivo del planner forte.
+_agentic_classifier: Any = None
 
 # ── Learning config (DB-backed, cache 60s) ───────────────────────────────────
 # Letti dalla tabella `settings`: learning_auto_extract e learning_min_confidence.
@@ -533,10 +535,11 @@ def configure_services(
     retriever: Any,
     tool_runner: Any = None,
     agent_router: Any = None,
+    agentic_classifier: Any = None,
 ) -> None:
     """Inietta i servizi globali nei nodi. Chiamato da create_agent_graph()."""
     global _providers, _router, _embeddings, _storage, _retriever
-    global _tool_runner, _agent_router
+    global _tool_runner, _agent_router, _agentic_classifier
     _providers = providers
     _router = router
     _embeddings = embeddings
@@ -544,6 +547,7 @@ def configure_services(
     _retriever = retriever
     _tool_runner = tool_runner
     _agent_router = agent_router
+    _agentic_classifier = agentic_classifier
 
 
 # ─── RAG helper (BP7) ───────────────────────────────────────────────────────
@@ -759,6 +763,38 @@ async def router_node(state: AgentState) -> dict[str, Any]:
         intent = "chat"
         intent_confidence = 1.0
 
+    # ── PR-D: classifier agentico per il gating adattivo del planner forte ────
+    # Solo se adaptive_classifier_enabled. Produce complexity/agentic_score/
+    # is_ambiguous che route_after_router usa per decidere se attivare il
+    # planner forte. Su fallback/timeout/non-conversazionale resta il path
+    # keyword (zero regressioni). Cache TTL 24h + timeout interni al classifier.
+    task_complexity: str | None = None
+    agentic_score_val: float | None = None
+    is_ambiguous_val: bool | None = None
+    if not is_conversational and _agentic_classifier is not None:
+        try:
+            from . import orchestrator_config
+            if orchestrator_config.adaptive_classifier_enabled():
+                ag = await _agentic_classifier.classify(str(text))
+                if ag is not None and not getattr(ag, "fallback_used", False):
+                    task_complexity = getattr(ag, "complexity", None)
+                    agentic_score_val = getattr(ag, "agentic_score", None)
+                    is_ambiguous_val = getattr(ag, "is_ambiguous", None)
+                    # L'intent LLM rimpiazza il keyword solo se valido.
+                    _ag_intent = getattr(ag, "intent", None)
+                    if _ag_intent:
+                        intent = _ag_intent
+                    _ag_conf = getattr(ag, "confidence", None)
+                    if _ag_conf is not None:
+                        intent_confidence = float(_ag_conf)
+                    logger.info(
+                        "router_node: adaptive classifier -> intent=%s complexity=%s "
+                        "agentic=%.2f ambiguous=%s",
+                        intent, task_complexity, agentic_score_val or 0.0, is_ambiguous_val,
+                    )
+        except Exception as _ag_exc:
+            logger.debug("router_node: adaptive classifier skip (%s)", _ag_exc)
+
     behavior_mode = state.get("behavior_mode", "bilanciata")
 
     # Boost token_budget per intent complessi che richiedono piu' output
@@ -850,6 +886,13 @@ async def router_node(state: AgentState) -> dict[str, Any]:
         "iteration_budget": iter_budget,
         "complexity_score": complexity_score,
     }
+    # PR-D: segnali del classifier agentico per il gating adattivo (se prodotti).
+    if task_complexity is not None:
+        updates["task_complexity"] = task_complexity
+    if agentic_score_val is not None:
+        updates["agentic_score"] = agentic_score_val
+    if is_ambiguous_val is not None:
+        updates["is_ambiguous"] = is_ambiguous_val
 
     if profile is not None:
         updates["profile_name"] = profile.name
@@ -1691,6 +1734,42 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     token_budget = state.get("token_budget", 400)
     tools_json = state.get("tools_json") or []
     system_text = state.get("system_text") or ""
+
+    # ── PR-C: worker-mode (orchestrator-worker puro) ──────────────────────────
+    # Solo nel run PRINCIPALE (subagent_depth 0/None): dentro un worker
+    # (subagent_depth >= 1) NON si applica restrizione, altrimenti il worker
+    # 'implement' non potrebbe scrivere. Quando attivo + plan_phase_active +
+    # subagents_enabled, l'executor diventa un ORCHESTRATORE: usa il prompt
+    # agent.orchestrator.base e filtra i tool sulla whitelist (read-only +
+    # delega), forzando la delega ai worker economici.
+    _subagent_depth = int(state.get("subagent_depth") or 0)
+    if _subagent_depth == 0 and state.get("plan_phase_active"):
+        try:
+            from . import orchestrator_config, prompt_registry
+            if (
+                orchestrator_config.worker_mode_enabled()
+                and orchestrator_config.subagents_enabled()
+            ):
+                orch_prompt = prompt_registry.get_prompt("agent.orchestrator.base")
+                if orch_prompt:
+                    system_text = orch_prompt
+                    whitelist = set(orchestrator_config.worker_mode_tool_whitelist())
+                    if whitelist and tools_json:
+                        filtered = [
+                            t for t in tools_json
+                            if (t.get("name") if isinstance(t, dict) else getattr(t, "name", None)) in whitelist
+                        ]
+                        # Non azzerare i tool: se il filtro svuota tutto (es.
+                        # whitelist disallineata), lascia i tool originali per
+                        # non bloccare il run.
+                        if filtered:
+                            tools_json = filtered
+                    logger.info(
+                        "executor_node: worker-mode attivo (orchestratore), tools=%d",
+                        len(tools_json),
+                    )
+        except Exception as exc:
+            logger.debug("executor_node: worker-mode skip (%s)", exc)
 
     # ── G1 cap: max re-execution per "risposta descrittiva su action request" ─
     # Se route_after_executor ci ha gia' re-mandato qui >= max_nudges volte

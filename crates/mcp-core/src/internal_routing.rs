@@ -124,6 +124,40 @@ pub async fn resolve_purpose(
                 .into_response();
         }
     };
+
+    // Risoluzione tier-based (mig 0203): se il purpose ha un tier configurato,
+    // scegliamo dinamicamente il miglior modello del catalog per quel tier +
+    // capability. Se il catalog non ha candidati (es. tutti in cooldown), si
+    // cade sul (provider, model_id) statico come ultimo fallback. Nessun nome
+    // modello hardcoded: tutto deriva da DB.
+    if let Some(rule) = matrix.purpose_tier(purpose) {
+        if let Some((provider, model)) = crate::orchestrator::best_model_for_tier(
+            &state.db,
+            &rule.tier,
+            rule.capability.as_deref(),
+            rule.requires_tool_use,
+        )
+        .await
+        {
+            return (
+                StatusCode::OK,
+                Json(PurposeResolveResponse {
+                    purpose: purpose.to_string(),
+                    provider,
+                    model,
+                    rationale: format!("purpose_model:tier={}:auto", rule.tier),
+                }),
+            )
+                .into_response();
+        }
+        tracing::warn!(
+            purpose = %purpose,
+            tier = %rule.tier,
+            "resolve_purpose: nessun modello catalog per il tier — fallback statico"
+        );
+        // prosegue al fallback statico sotto.
+    }
+
     match matrix.purpose_model(purpose) {
         Some((provider, model)) => (
             StatusCode::OK,

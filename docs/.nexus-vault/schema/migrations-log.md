@@ -6,12 +6,12 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: 73c57b761a39d3489cef7f23ff7df54866360875
+source_commit: cdd1589822b0955e72efeec44499813a32ad2602
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-28T11:39:02Z
+updated_at: 2026-05-30T06:47:33Z
 nexus_meta_version: 1
 ---
 
@@ -204,7 +204,22 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0185_catalog_sync_google.sql` | Mig 0185: aggiungi 'google' al default catalog_sync.providers. |
 | `0186_chat_message_attachments.sql` | 0186_chat_message_attachments.sql |
 | `0187_catalog_chat_only_filter.sql` | 0187_catalog_chat_only_filter.sql |
+| `0188_context_budget_keywords.sql` | 0188: Aggiunge keyword italiane mancanti ai pesi di complessita' del budget |
+| `0189_tool_runner_addr_setting.sql` | Migrazione 0189: aggiunge tool_runner_addr alla tabella settings |
+| `0190_service_urls_to_settings.sql` | Migrazione 0190: centralizza URL dei servizi interni nella tabella settings |
+| `0191_agent_port_registry_directive.sql` | Migrazione 0191: direttiva esplicita port_registry nei system prompt agente. |
+| `0192_agent_attachment_tool_directive.sql` | Migrazione 0192: direttiva esplicita per accesso allegati + flag |
+| `0193_attachment_inspection_directive.sql` | Migrazione 0193: ingestion intelligente allegati (ADR 0011). |
+| `0194_vision_describe_purpose.sql` | Migrazione 0194: configurazione vision_describe per nexus_describe_image_attachment. |
+| `0195_attachment_robustness_settings.sql` | Mig 0195 — Robustezza pipeline allegati (FIX 1-4 ADR 0012). |
+| `0196_figma_make_pipeline_settings.sql` | Mig 0196 - Settings pipeline Figma Make (ADR 0011 sezione "Figma Make handling"). |
+| `0197_language_directive.sql` | Migrazione 0197: direttiva esplicita di lingua italiana nei system prompt agente. |
+| `0198_language_directive_at_head.sql` | Migrazione 0198: sposta <language_directive> dalla coda alla testa |
+| `0199_context_management_settings.sql` | Mig 0199 — Context size management (FIX A-D ADR 0014). |
+| `0200_rag_unified.sql` | Migrazione 0200: RAG strutturale unificato (ADR 0015). |
+| `0201_anthropic_default_model.sql` | 0201_anthropic_default_model.sql |
+| `0202_intent_deterministic_fallback_thresholds.sql` | 0202: soglie per il classificatore deterministico di fallback intent |
 
-**Totale**: 183 migrazioni.
+**Totale**: 198 migrazioni.
 
-Ultima migrazione: `0187_catalog_chat_only_filter.sql`.
+Ultima migrazione: `0202_intent_deterministic_fallback_thresholds.sql`.

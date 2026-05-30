@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: 18980a650f946bcca8b7a30588a3f775ec6d6b42
+source_commit: cdd1589822b0955e72efeec44499813a32ad2602
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-28T12:16:09Z
+updated_at: 2026-05-30T06:47:35Z
 nexus_meta_version: 1
 ---
 
@@ -24,10 +24,32 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 | Chiave | Valore default | Descrizione |
 |---|---|---|
+| `agent.attachment.archive_entry_max_bytes` | `204800` | Max byte letti da una singola entry di archivio (nexus_read_archive_entry). Default 200KB. |
+| `agent.attachment.archive_max_entries` | `1000` | Max entries elencate da nexus_list_archive_entries prima della troncatura. Default 1000. |
+| `agent.attachment.figma_make_ai_chat_max_load_bytes` | `26214400` | Max byte caricati in RAM dal file ai_chat.json di un archivio Figma Make prima del parsing. Default 5 MB. Se il file e' piu' grande viene troncato (segnalato con ai_chat_truncated_at_load=true nella risposta del tool). |
+| `agent.attachment.figma_make_assistant_message_max_chars` | `2000` | Max caratteri di un singolo messaggio assistant prima della truncatura. I messaggi user (prompt originale) non vengono mai troncati singolarmente. Default 2000. |
+| `agent.attachment.figma_make_chat_messages_max_chars` | `51200` | Max caratteri cumulativi del testo estratto dai messaggi user+assistant del thread chat Figma Make. Default 50 KB. Oltre la soglia i messaggi residui vengono scartati (chat_messages_truncated=true). |
+| `agent.attachment.figma_make_chat_messages_max_count` | `20` | Max numero di messaggi (user + assistant) restituiti dal thread chat Figma Make. Default 20. |
+| `agent.attachment.figma_max_bytes` | `51200` | Max byte del payload canvas.fig estratti da nexus_extract_figma_structure. Default 50KB. |
+| `agent.attachment.image_max_bytes` | `2097152` | Massima dimensione (byte) di un immagine processabile dal tool nexus_describe_image_attachment. Default 2 MB. Oltre il limite il tool ritorna errore esplicito al modello. |
+| `agent.attachment.pdf_max_text_bytes` | `102400` | Max byte di testo estratto da nexus_extract_pdf_text in totale (su tutte le pagine richieste). Default 100KB. |
+| `agent.attachment.preextract_enabled` | `true` | Pre-extraction automatica del contenuto strutturato di PDF/DOCX/Figma allegati. Default true. Disattivare se causa latenza eccessiva all'invio del primo messaggio. |
+| `agent.attachment.preextract_max_chars` | `50000` | Limite totale (in caratteri) del contenuto pre-extracted sommando tutti gli allegati del turno. Se eccede, gli ultimi allegati non vengono pre-extracted. |
+| `agent.attachment.read_cache_ttl_seconds` | `300` | TTL (secondi) della cache LRU read_cache che deduplica chiamate identiche a nexus_read_attachment / nexus_read_archive_entry. Default 5 minuti. |
+| `agent.attachment.session_read_budget_bytes` | `500000` | Cap cumulativo (byte) delle letture nexus_read_attachment + nexus_read_archive_entry per sessione. Oltre la soglia, il brain risponde con tool_result sintetico che invita a usare gli estrattori strutturati. |
+| `agent.attachment.xlsx_max_rows` | `1000` | Max righe restituite da nexus_extract_xlsx_data. Default 1000. |
 | `agent.complexity.file_path_points` | `2` | Punti per ogni path o file menzionato nel prompt (es. /home/, src/, *.json). |
-| `agent.complexity.keyword_weights` | `{"create":3,"write_file":2,"install":2,"build":2,"systemc...` | Mappa keyword->punti complessita rilevati nel prompt. Match case-insensitive, somma capped a 100. |
+| `agent.complexity.keyword_weights` | `{"create":3,"write_file":2,"install":2,"build":2,"systemc...` | Pesi keyword per stima complessita' task agente (budget iterazioni adattivo). Chiave: substring da cercare nel prompt, valore: punti complessita'. Aggiornamento: aggiunti verbi italiani (implementa, sviluppa, costruisci, genera, scaffold) e sostantivi (progetto, applicazione). |
 | `agent.complexity.step_marker_points` | `5` | Punti per ogni marker di step esplicito (1., 2., step, task, phase) nel prompt. |
 | `agent.complexity.weak_model_multiplier` | `1.5` | Moltiplicatore budget se il modello iniziale e gpt-4o-mini / haiku / nano (necessita piu iter per G1 nudge). |
+| `agent.context.compress_phase_boundaries` | `5,10,20,50` | CSV crescente dei boundary di fase per compressione escalante. iter < primo = no compressione. Tra phase[i] e phase[i+1] = applica keep_recent[i] e max_chars[i]. Le tre liste boundaries/keep_recent/max_chars devono avere stessa lunghezza. |
+| `agent.context.compress_phase_keep_recent` | `8,5,3,2` | CSV keep_recent per ogni fase di compressione (allineato a compress_phase_boundaries). |
+| `agent.context.compress_phase_max_chars` | `2000,1000,500,150` | CSV max_content_chars per ogni fase di compressione (allineato a compress_phase_boundaries). |
+| `agent.context.compress_start_iter` | `5` | Iterazione di executor a partire dalla quale attivare la compressione escalante dei tool_result. Prima viene applicata solo la dedup. Default 5 (FIX A). |
+| `agent.context.dedup_tool_results_enabled` | `true` | Se true (default) ogni iter executor applica _dedup_tool_results_history: tool_result vecchi con stessa signature (sha256(tool_name+args_json)) vengono sostituiti con placeholder, tenendo solo l ultimo. FIX B. |
+| `agent.context.drop_unused_base64_age` | `3` | Soglia (n messaggi successivi) entro la quale verificare se un blob base64 di un tool_result vecchio viene citato testualmente. Se non viene citato, il body base64 viene sostituito con un placeholder. FIX C. |
+| `agent.context.predictive_cap_ratio` | `0.5` | Soglia (0.3-0.9) sul context_window del modello: se context_attuale + stima_tool_result supera ratio*context_window, la chiamata al tool viene intercettata e sostituita da tool_result sintetico di errore. FIX D. |
+| `agent.enforce_port_allocation` | `true` | Se true, write_file/edit_file rifiutano sorgenti con porte TCP hardcoded fuori dal bucket Nexus 20000-39999 (vedi ADR 0010). |
 | `agent.iteration_budget.base` | `60` | Numero base iterazioni LangGraph per ogni run agente. Sommato a per_complexity_point*complexity_score. |
 | `agent.iteration_budget.max` | `300` | Tetto massimo iterazioni anche per task molto complessi. Safety net runaway. |
 | `agent.iteration_budget.per_complexity_point` | `4` | Iterazioni aggiuntive per ogni punto di complessita del prompt (score 0-100). |
@@ -35,6 +57,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent_narration_warn_after_ms` | `30000` | Millisecondi di run senza tool call dopo i quali il badge UI passa in stato warning (possibile loop di narrazione). |
 | `agent_parallel_enabled` | `true` | Abilita l'esecuzione parallela di piu' agenti contemporaneamente per accelerare task complessi |
 | `agent_parallel_max` | `5` | Numero massimo di agenti paralleli per sessione (1-5) |
+| `agent_router_addr` | `127.0.0.1:50501` | Indirizzo host:porta del server gRPC AgentRouter esposto da mcp-core e usato dal brain Python per consultare il Q-Learning router. Override di emergenza: AGENT_ROUTER_ADDR. Richiede riavvio di mcp-core e del brain. |
 | `agent_router_enabled` | `true` | Abilita il server gRPC AgentRouter (porta 50072) che espone il router Q-Learning di nexus-orchestrator al brain Python. Quando attivo, il router_node consulta il Q-Learning per scegliere il profilo agente ottimale (es. coder, cloud_architect, tech_writer) in base alla cronologia dei reward osservati. Se disabilitato il brain usa il routing di fallback basato solo sull'intent. Richiede riavvio di mcp-core per applicare la modifica. |
 | `anthropic_system_cache_ttl` | `1h` | TTL della cache prompt di sistema per Anthropic: 5m (default Anthropic) o 1h (extended-cache-ttl-2025-04-11). Il valore 1h massimizza il cache hit rate fra turni distanti (il system prompt cambia raramente). Override: NEXUS_ANTHROPIC_SYSTEM_CACHE_TTL. Richiede riavvio del brain. |
 | `catalog_sync.disable_missing` | `true` | Se TRUE, disabilita i modelli del catalog non piu esposti dall API. Se FALSE solo log. |
@@ -46,6 +69,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `extended_thinking_enabled` | `false` | Abilita il ragionamento interno esteso (Extended Thinking) di Anthropic sui modelli Sonnet/Opus. Genera token di ragionamento interni billati al prezzo output. Disabilitato di default per contenere i costi. Attivare solo per task che richiedono ragionamento profondo. |
 | `llm_classifier_enabled` | `true` | Abilita il classificatore LLM degli intent (chiamata REST /classify-intent-agentic al brain Python). Se false usa solo keyword matching locale: piu' veloce ma meno preciso. Override di emergenza: NEXUS_LLM_CLASSIFIER_ENABLED=false. Richiede riavvio di mcp-core. |
 | `terminal_default_shell` | `bash` | Shell di default per i terminali agente: bash, zsh, fish. Su Windows: powershell.exe. Override di emergenza: TERMINAL_SHELL. Richiede riavvio del brain e di mcp-core. |
+| `tool_runner_addr` | `127.0.0.1:50071` | Indirizzo host:porta del server gRPC ToolRunner esposto da mcp-core e usato dal brain Python per eseguire i tool MCP (read_file, write_file, run_command, ecc.). Entrambi i servizi leggono questo valore. Override di emergenza: TOOL_RUNNER_ADDR. Richiede riavvio di mcp-core e del brain. |
 | `tool_runner_enabled` | `true` | Abilita il server gRPC ToolRunner (porta 50071) usato dal brain LangGraph per eseguire i tool Nexus builtin. Override di emergenza: ENABLE_TOOL_RUNNER=1. Richiede riavvio di mcp-core per applicare la modifica. |
 
 ## `ai`
@@ -125,6 +149,17 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 | Chiave | Valore default | Descrizione |
 |---|---|---|
+| `agent.rag.chunk_overlap` | `200` | Overlap caratteri fra chunk consecutivi per la pipeline RAG. |
+| `agent.rag.chunk_size` | `1000` | Dimensione caratteri di un chunk per la pipeline RAG. |
+| `agent.rag.collection_attachments` | `attachment_chunks` | Nome collection Qdrant per chunks allegati. |
+| `agent.rag.collection_chat_history` | `chat_history_chunks` | Nome collection Qdrant per chunks history chat. |
+| `agent.rag.collection_kb` | `kb_chunks` | Nome collection Qdrant per chunks knowledge base. |
+| `agent.rag.collection_tool_results` | `tool_results_chunks` | Nome collection Qdrant per chunks tool results di grandi dimensioni. |
+| `agent.rag.embedding_dim` | `384` | Dimensione vettori embedding (all-MiniLM-L6-v2 = 384). |
+| `agent.rag.embedding_endpoint` | `/embed` | Path REST sul brain per ottenere embeddings batch. Canonico /embed (riusa EmbeddingService). |
+| `agent.rag.enabled` | `true` | Abilita la pipeline RAG strutturale per allegati/KB/chat-history/tool-results. |
+| `agent.rag.qdrant_url` | `http://localhost:6333` | URL Qdrant per le collection RAG (attachment_chunks, kb_chunks, ecc.). |
+| `agent.rag.top_k_default` | `8` | Numero default di hit ritornati da search_semantic se top_k non specificato. |
 | `automation.o_series_essential_tools` | `read_file,read_file_lines,list_files,search_in_files,writ...` | Tool essenziali esposti ai modelli o-series (o1/o3/o4-mini). Gli altri tool sono disponibili via nexus_mcp_tool_search. CSV. |
 | `knowledge.autolink_threshold` | `0.45` |  |
 | `knowledge.cleanup_draft_days` | `30` |  |
@@ -153,6 +188,8 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 | Chiave | Valore default | Descrizione |
 |---|---|---|
+| `brain_rest_url` | `http://127.0.0.1:8001` | URL del server REST del brain Python (FastAPI su porta 8001). Usato da mcp-core per chiamare /agent/run/stream, /classify-intent-agentic, /catalog/sync e altri endpoint REST del brain. Override di emergenza: BRAIN_REST_URL o NEURAL_CORE_REST_URL. Richiede riavvio di mcp-core. |
+| `mcp_core_url` | `http://127.0.0.1:4000` | URL del server HTTP mcp-core (porta 4000). Usato dal brain Python per leggere settings via _get_core_setting(), dal router semantico, dal cooldown bridge e dall'agent router client. Override di emergenza: MCP_CORE_URL. Richiede riavvio del brain. |
 | `network_dns_servers` | `1.1.1.1,8.8.8.8 ` | Server DNS personalizzati separati da virgola (es. 8.8.8.8,1.1.1.1). Usato dal Neural Core per risolvere i nomi host verso API AI esterne. |
 | `neural_core_url` | `http://localhost:50051` | Neural Core gRPC URL |
 | `nexus_external_proxy` | `` | Proxy HTTP/HTTPS per le chiamate verso API esterne (es. http://localhost:8002). Usato da tutti i backend Nexus tramite NEXUS_PROXY. Lascia vuoto per connessione diretta. |
@@ -309,7 +346,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `default_model` | `claude-sonnet-4-6` | Default model for chat |
 | `default_provider` | `anthropic` | Default LLM provider |
 | `max_token_budget` | `32000` | Maximum token budget allowed |
-| `model_catalog_last_sync` | `2026-05-28T11:41:37.092296425+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
+| `model_catalog_last_sync` | `2026-05-30T06:37:30.859398113+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
 | `nexus_active_routing_pct` | `50` | Percentuale di richieste chat gestite dal router Q-Learning Nexus (0=off, 100=tutto). A/B testing: imposta 10-50 per un rollout graduale. |
 | `nexus_behavior_mode` | `dinamico` | Modalità comportamento Nexus: veloce|economica|bilanciata|approfondita |
 | `provider_hierarchy` | `anthropic,openai,google,deepseek,mistral` | Ordered fallback chain for chat providers |
@@ -328,6 +365,8 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `routing.classifier_provider` | `google` | Provider per il classifier intent agentic (deve esistere in nexus_provider_default_model). |
 | `routing_docs_providers` | `anthropic,openai,google,deepseek,mistral` | Provider order for documentation requests |
 | `routing_fix_providers` | `anthropic,openai,google,deepseek,mistral` | Provider order for fix requests |
+| `routing.intent_deterministic_high` | `0.85` | Confidence del classificatore deterministico keyword sopra la quale si SALTA l'LLM (pre-check robusto per task agentici evidenti). Range [0.0, 1.0]. |
+| `routing.intent_deterministic_min` | `0.60` | Confidence minima del classificatore deterministico sotto la quale NON lo si usa nemmeno come fallback quando l'LLM degrada a chat. Range [0.0, 1.0]. |
 | `routing.llm_classifier_min_confidence` | `0.60` | Soglia confidence sotto cui il risultato del classifier LLM viene scartato e si usa il fallback keyword. Valore [0.0, 1.0]. |
 | `routing.llm_classifier_timeout_seconds` | `8.0` | Timeout in secondi per la chiamata HTTP al classifier LLM (POST /classify-intent-agentic). Su timeout, fallback keyword. |
 | `routing_refactor_providers` | `anthropic,openai,google,deepseek,mistral` | Provider order for refactor requests |
@@ -344,7 +383,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | Chiave | Valore default | Descrizione |
 |---|---|---|
 | `dlp_allow_cloud_tier2` | `true` | Se true, consente di inviare Tier 2 (sensibili) verso provider cloud. |
-| `dlp_allow_cloud_tier3` | `false` | Se true, consente di inviare Tier 3 (critici) verso provider cloud (sconsigliato). |
+| `dlp_allow_cloud_tier3` | `true` | Se true, consente di inviare Tier 3 (critici) verso provider cloud (sconsigliato). |
 | `dlp_enabled` | `true` | Abilita/disabilita il Data Loss Prevention (classificazione sensibilità Tier). |
 
 ## `system`
@@ -362,4 +401,4 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 ---
 
-**Totale chiavi**: 215
+**Totale chiavi**: 254

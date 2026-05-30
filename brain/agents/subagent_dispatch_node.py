@@ -111,6 +111,40 @@ async def run_subagent(
     tool_whitelist = list(definition.get("tool_whitelist") or [])
     tools_json = _filter_tools_by_whitelist(tool_whitelist)
 
+    # 4b. Risolvi il modello del worker dal model_purpose della definition.
+    # Senza questo, il worker risolverebbe un intent inesistente
+    # ("subagent_<kind>") cadendo su un fallback generico: i worker NON
+    # userebbero i modelli economici/specifici previsti. Iniettiamo
+    # provider_override/model_override (l'executor li rispetta per primi,
+    # vedi nodes.py executor_node). Tutto DB-driven via nexus_purpose_model.
+    worker_provider: str | None = None
+    worker_model: str | None = None
+    model_purpose = (definition.get("model_purpose") or "").strip()
+    if model_purpose:
+        try:
+            from brain.router.service import _routing_client_singleton
+            decision = _routing_client_singleton().purpose_model(purpose=model_purpose)
+            # __router_unavailable__ / payload malformato: NON forziamo
+            # override, lasciamo che l'executor risolva via routing normale.
+            if decision.provider and not decision.provider.startswith("__"):
+                worker_provider = decision.provider
+                worker_model = decision.model
+                logger.info(
+                    "run_subagent: kind=%s model_purpose=%s -> %s/%s",
+                    kind, model_purpose, worker_provider, worker_model,
+                )
+            else:
+                logger.warning(
+                    "run_subagent: kind=%s model_purpose=%s non risolto (%s) — "
+                    "executor usera' il routing di default",
+                    kind, model_purpose, decision.rationale,
+                )
+        except Exception as exc:
+            logger.warning(
+                "run_subagent: risoluzione model_purpose=%s fallita (%s) — "
+                "executor usera' il routing di default", model_purpose, exc,
+            )
+
     # 5. Stato iniziale fresco (no history del main)
     initial_state: dict[str, Any] = {
         "messages": [HumanMessage(content=initial_text)],
@@ -129,6 +163,10 @@ async def run_subagent(
         "approved": True,  # auto-approvato (sub-agent)
         "plan_phase_active": False,  # sub-agent non rifa il planning
     }
+    # Inietta gli override solo se risolti (altrimenti routing di default).
+    if worker_provider and worker_model:
+        initial_state["provider_override"] = worker_provider
+        initial_state["model_override"] = worker_model
 
     # 6. Marca running
     subagent_store.update_run_start(subagent_run_id)

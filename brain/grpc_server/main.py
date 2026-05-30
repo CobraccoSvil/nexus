@@ -363,6 +363,7 @@ def _get_agent_graph() -> object:
             embeddings=embeddings,
             tool_runner=_get_tool_runner_client(),
             agent_router=_get_agent_router_client(),
+            agentic_classifier=agentic_classifier,
         )
         logger.info("Grafo LangGraph inizializzato")
     return _agent_graph

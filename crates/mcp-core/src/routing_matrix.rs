@@ -38,6 +38,20 @@ pub struct EscalationRule {
     pub model_id: String,
 }
 
+/// Regola di risoluzione tier-based per un purpose (mig 0203).
+/// Quando un purpose ha `tier` valorizzato, il modello NON e' fisso: viene
+/// selezionato a runtime dal catalog (il miglior modello di quel tier con la
+/// capability richiesta). Vedi `internal_routing.rs::resolve_purpose`.
+#[derive(Debug, Clone)]
+pub struct PurposeTierRule {
+    /// 'light' | 'medium' | 'heavy'
+    pub tier: String,
+    /// Capability richiesta (es. 'reasoning', 'code'); None = nessun filtro.
+    pub capability: Option<String>,
+    /// Se true, filtra solo modelli con supports_tool_use.
+    pub requires_tool_use: bool,
+}
+
 /// Matrice immutable con tutte le entry attive.
 #[derive(Debug, Clone)]
 pub struct RoutingMatrix {
@@ -49,6 +63,10 @@ pub struct RoutingMatrix {
     /// Vedi migrazione 0102: chat_title_generator, chat_feedback_generator,
     /// docs_generator, custom_instructions, admin_fallback_default, google_batch.
     pub purpose_models: HashMap<String, (String, String)>,
+    /// Regole tier-based per purpose (mig 0203): purpose -> tier/capability/tool.
+    /// Se un purpose e' qui, il suo modello e' risolto dinamicamente dal
+    /// catalog; `purpose_models` resta come ultimo fallback.
+    pub purpose_tiers: HashMap<String, PurposeTierRule>,
     /// Regole di escalation token-based per (intent, behavior_mode).
     /// NB: una entry esiste solo se l'admin ha configurato escalation per
     /// quella combinazione (mig 0120).
@@ -94,6 +112,13 @@ impl RoutingMatrix {
     /// Vedi migrazione 0102.
     pub fn purpose_model(&self, purpose: &str) -> Option<(String, String)> {
         self.purpose_models.get(purpose).cloned()
+    }
+
+    /// Regola tier-based per un purpose, se configurata (mig 0203).
+    /// Se ritorna Some, il chiamante deve risolvere il modello dinamicamente
+    /// dal catalog (tier+capability) invece di usare `purpose_model`.
+    pub fn purpose_tier(&self, purpose: &str) -> Option<PurposeTierRule> {
+        self.purpose_tiers.get(purpose).cloned()
     }
 
     /// Numero totale di entry attive in tutta la matrice.
@@ -159,6 +184,7 @@ impl RoutingMatrix {
             by_intent_mode,
             default_models,
             purpose_models: HashMap::new(),
+            purpose_tiers: HashMap::new(),
             escalations: HashMap::new(),
             loaded_at: Instant::now(),
         }
@@ -206,6 +232,24 @@ async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
     .await
     .map_err(|e| format!("query nexus_purpose_model fallita: {e}. Hai applicato la migrazione 0102?"))?;
 
+    // Regole tier-based per purpose (mig 0203). GRACEFUL: se le colonne non
+    // esistono (migrazione non ancora applicata) ignoriamo senza bloccare —
+    // i purpose si risolvono staticamente come prima.
+    let purpose_tier_rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, bool)>(
+        r#"SELECT purpose, tier, required_capability, requires_tool_use
+           FROM nexus_purpose_model
+           WHERE tier IS NOT NULL"#,
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_else(|e| {
+        warn!(
+            "routing_matrix: colonne tier di nexus_purpose_model non disponibili \
+             (mig 0203 non applicata?): {e}. Risoluzione purpose statica."
+        );
+        Vec::new()
+    });
+
     if matrix_rows.is_empty() {
         return Err(
             "nexus_routing_matrix vuota. Applica la migrazione 0101 o popola la tabella.".to_string(),
@@ -242,11 +286,27 @@ async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
         .into_iter()
         .map(|(purpose, provider, model)| (purpose, (provider, model)))
         .collect();
+    let purpose_tiers: HashMap<String, PurposeTierRule> = purpose_tier_rows
+        .into_iter()
+        .filter_map(|(purpose, tier, capability, requires_tool_use)| {
+            tier.map(|t| {
+                (
+                    purpose,
+                    PurposeTierRule {
+                        tier: t,
+                        capability,
+                        requires_tool_use,
+                    },
+                )
+            })
+        })
+        .collect();
 
     Ok(RoutingMatrix {
         by_intent_mode,
         default_models,
         purpose_models,
+        purpose_tiers,
         escalations,
         loaded_at: Instant::now(),
     })
@@ -407,6 +467,7 @@ mod tests {
             by_intent_mode,
             default_models,
             purpose_models,
+            purpose_tiers: HashMap::new(),
             escalations: HashMap::new(),
             loaded_at: Instant::now(),
         }
@@ -545,6 +606,27 @@ mod tests {
             Some(("openai".to_string(), "gpt-4.1-nano".to_string()))
         );
         assert_eq!(m.purpose_model("inesistente"), None);
+    }
+
+    #[test]
+    fn purpose_tier_ritorna_regola_quando_configurata() {
+        // mig 0203: un purpose con tier configurato deve esporre la regola
+        // tier-based; uno senza tier ritorna None (risoluzione statica).
+        let mut m = make_test_matrix();
+        m.purpose_tiers.insert(
+            "planner".to_string(),
+            PurposeTierRule {
+                tier: "heavy".to_string(),
+                capability: Some("reasoning".to_string()),
+                requires_tool_use: true,
+            },
+        );
+        let rule = m.purpose_tier("planner").expect("planner deve avere tier");
+        assert_eq!(rule.tier, "heavy");
+        assert_eq!(rule.capability.as_deref(), Some("reasoning"));
+        assert!(rule.requires_tool_use);
+        // purpose senza tier (solo statico)
+        assert!(m.purpose_tier("chat_title_generator").is_none());
     }
 
     #[test]

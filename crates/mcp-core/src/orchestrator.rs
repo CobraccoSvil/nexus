@@ -1004,6 +1004,63 @@ async fn route_model_from_catalog(
     None
 }
 
+/// Seleziona il miglior modello del catalog per un dato `tier`, opzionalmente
+/// filtrato per `capability` e `requires_tool_use`. Usato dalla risoluzione
+/// tier-based dei purpose (mig 0203): es. il purpose 'planner' -> tier 'heavy'
+/// + capability 'reasoning' sceglie dinamicamente il miglior modello heavy
+/// disponibile (esclusi i provider in cooldown), il piu' economico tra i
+/// featured. Ritorna None se nessun candidato soddisfa i criteri (il chiamante
+/// cade sul fallback statico del purpose).
+pub async fn best_model_for_tier(
+    db: &PgPool,
+    tier: &str,
+    capability: Option<&str>,
+    requires_tool_use: bool,
+) -> Option<(String, String)> {
+    let cooldown_providers: Vec<String> = crate::provider_cooldown::cooldown_snapshot()
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect();
+
+    // Costruzione dinamica dei placeholder: $1 = tier sempre presente.
+    // capability (se Some) e cooldown ottengono i numeri successivi in ordine,
+    // cosi' la posizione resta sempre coerente coi bind effettivi.
+    let mut idx = 1; // $1 = tier
+    let capability_json = capability.map(|c| format!("[\"{c}\"]"));
+    let capability_predicate = if capability_json.is_some() {
+        idx += 1;
+        format!("AND capabilities @> ${idx}::jsonb")
+    } else {
+        String::new()
+    };
+    let tool_use_predicate = if requires_tool_use {
+        "AND supports_tool_use = TRUE"
+    } else {
+        ""
+    };
+    idx += 1;
+    let cooldown_idx = idx; // ultimo placeholder
+
+    let query = format!(
+        r#"SELECT provider, model FROM ai_price_catalog
+           WHERE is_enabled = TRUE
+             AND performance_tier = $1
+             {capability_predicate}
+             {tool_use_predicate}
+             AND provider <> ALL(${cooldown_idx})
+           ORDER BY is_featured DESC, input_cost_per_million_tokens ASC
+           LIMIT 1"#
+    );
+
+    let mut q = sqlx::query_as::<_, (String, String)>(&query).bind(tier);
+    if let Some(cap) = capability_json.as_ref() {
+        q = q.bind(cap);
+    }
+    q = q.bind(&cooldown_providers);
+
+    q.fetch_optional(db).await.ok().flatten()
+}
+
 /// Route (intent, behavior_mode) -> (provider, model) consultando la matrice DB
 /// (cache 60s in-memory). Sostituisce la matrice hardcoded che era qui prima
 /// del refactor 0101 (vedi `crates/mcp-core/src/routing_matrix.rs`).
@@ -3278,6 +3335,7 @@ mod tests {
             by_intent_mode: HashMap::new(),
             default_models: HashMap::new(),
             purpose_models: HashMap::new(),
+            purpose_tiers: HashMap::new(),
             escalations: HashMap::new(),
             loaded_at: std::time::Instant::now(),
         };

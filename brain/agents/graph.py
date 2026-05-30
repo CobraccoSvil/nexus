@@ -45,10 +45,24 @@ def route_after_router(state: AgentState) -> str:
     intent = state.get("user_intent")
     token_budget = int(state.get("token_budget") or 0)
     cfg = orchestrator_config.get()
-    eligible = orchestrator_config.is_eligible(behavior_mode, intent, token_budget)
+    # PR-D: gating adattivo. is_eligible_adaptive integra i segnali del
+    # classifier (complexity/confidence/agentic/ambiguity) quando
+    # adaptive_gating_enabled e' ON; altrimenti si comporta come is_eligible.
+    eligible = orchestrator_config.is_eligible_adaptive(
+        behavior_mode,
+        intent,
+        token_budget,
+        complexity=state.get("task_complexity"),
+        confidence=state.get("intent_confidence"),
+        agentic_score=state.get("agentic_score"),
+        is_ambiguous=state.get("is_ambiguous"),
+    )
     logger.info(
-        "route_after_router: eligible=%s plan_enabled=%s mode=%r intent=%r budget=%d -> %s",
-        eligible, cfg.get("plan_phase_enabled"), behavior_mode, intent, token_budget,
+        "route_after_router: eligible=%s plan_enabled=%s adaptive=%s mode=%r intent=%r "
+        "budget=%d complexity=%r agentic=%r -> %s",
+        eligible, cfg.get("plan_phase_enabled"), cfg.get("adaptive_gating_enabled"),
+        behavior_mode, intent, token_budget,
+        state.get("task_complexity"), state.get("agentic_score"),
         "planner" if eligible else "executor",
     )
     return "planner" if eligible else "executor"
@@ -61,6 +75,7 @@ def create_agent_graph(
     checkpointer_path: str | None = None,
     tool_runner: Any = None,
     agent_router: Any = None,
+    agentic_classifier: Any = None,
 ) -> Any:
     """Crea e compila il grafo LangGraph con tutti i servizi Nexus.
 
@@ -93,6 +108,7 @@ def create_agent_graph(
         retriever=retriever,
         tool_runner=tool_runner,
         agent_router=agent_router,
+        agentic_classifier=agentic_classifier,
     )
 
     # PR-1: inject anche nel planner_node. routing_client deriva dal router

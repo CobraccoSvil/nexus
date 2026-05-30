@@ -6,12 +6,12 @@ slug: postgres-tables
 tags:
   - schema
   - postgres
-source_commit: 73c57b761a39d3489cef7f23ff7df54866360875
+source_commit: cdd1589822b0955e72efeec44499813a32ad2602
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-28T11:39:02Z
+updated_at: 2026-05-30T06:47:33Z
 nexus_meta_version: 1
 ---
 
@@ -266,6 +266,7 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `kb_note_id` | uuid | YES | `—` |
 | `indexed_at` | timestamp with time zone | YES | `—` |
 | `created_at` | timestamp with time zone | NO | `now()` |
+| `chunk_count` | integer | NO | `0` |
 
 ## `chat_messages`
 

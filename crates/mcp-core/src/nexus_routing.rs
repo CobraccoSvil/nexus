@@ -357,6 +357,7 @@ mod tests {
             by_intent_mode: HashMap::new(),
             default_models: HashMap::new(),
             purpose_models,
+            purpose_tiers: HashMap::new(),
             escalations: HashMap::new(),
             loaded_at: Instant::now(),
         }
@@ -481,6 +482,7 @@ mod tests {
             by_intent_mode: HashMap::new(),
             default_models: HashMap::new(),
             purpose_models: HashMap::new(),
+            purpose_tiers: HashMap::new(),
             escalations: HashMap::new(),
             loaded_at: Instant::now(),
         };

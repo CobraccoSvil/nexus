@@ -1,0 +1,448 @@
+---
+id: 24867e5a-f966-4f40-b7ba-7f4393d64fe0
+kind: changelog
+title: "@ feat: pipeline allegati robusta + RAG + routing/DLP fix definitivi"
+slug: feat-pipeline-allegati-robusta-rag-routingdlp-fix-definitivi
+tags:
+  - changelog
+source_commit: cdd1589822b0955e72efeec44499813a32ad2602
+source_files:
+  - .claude/worktrees/agent-a31cffeec933339c1/apps/web-ide/tsconfig.tsbuildinfo
+  - .claude/worktrees/agent-a31cffeec933339c1/backups/postgres/nexus_20260512_083800.sql.gz
+  - .claude/worktrees/agent-a31cffeec933339c1/brain/nexus_memory/learning.db
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/ideai_baseline.sha
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/ideai_head_T0.txt
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/STOP_TRIGGER.txt
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_processes.csv
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_processes.err
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_runs.csv
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_runs.err
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_steps.csv
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_steps.err
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/ai_usage_ledger.csv
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/ai_usage_ledger.err
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/cost_by_model.csv
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/git-ideai-commits-since-baseline.txt
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/git-ideai-diff.patch
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/git-ideai-status.txt
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/git-target-diff.patch
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/git-target-log.txt
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/git-target-status.txt
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-brain-1.log
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-mcp-core-1.log
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-postgres-nexus-1.log
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-postgres-nexus-1.log.stderr
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-web-ide-1.log
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/monitor.jsonl
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/monitor.log
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/tool_name_frequency.csv
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/violations.txt
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_02/STOP_TRIGGER.txt
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_02/monitor.jsonl
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_02/monitor.log
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_03/STOP_TRIGGER.txt
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_03/monitor.jsonl
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_03/monitor.log
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iterations_summary.csv
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/journal_fix.md
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/meta.json
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/prompt_seed.md
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/report.md
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/report_finale_consolidato.md
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/target_baseline.sha
+  - .claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/usage_T0.csv
+  - .claude/worktrees/agent-acff1e305e741865d/apps/web-ide/tsconfig.tsbuildinfo
+  - .claude/worktrees/agent-acff1e305e741865d/backups/postgres/nexus_20260512_083800.sql.gz
+  - .claude/worktrees/agent-acff1e305e741865d/brain/nexus_memory/learning.db
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/ideai_baseline.sha
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/ideai_head_T0.txt
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/STOP_TRIGGER.txt
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_processes.csv
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_processes.err
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_runs.csv
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_runs.err
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_steps.csv
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_steps.err
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/ai_usage_ledger.csv
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/ai_usage_ledger.err
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/cost_by_model.csv
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/git-ideai-commits-since-baseline.txt
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/git-ideai-diff.patch
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/git-ideai-status.txt
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/git-target-diff.patch
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/git-target-log.txt
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/git-target-status.txt
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-brain-1.log
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-mcp-core-1.log
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-postgres-nexus-1.log
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-postgres-nexus-1.log.stderr
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-web-ide-1.log
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/monitor.jsonl
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/monitor.log
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/tool_name_frequency.csv
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/violations.txt
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_02/STOP_TRIGGER.txt
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_02/monitor.jsonl
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_02/monitor.log
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_03/STOP_TRIGGER.txt
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_03/monitor.jsonl
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_03/monitor.log
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iterations_summary.csv
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/journal_fix.md
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/meta.json
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/prompt_seed.md
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/report.md
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/report_finale_consolidato.md
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/target_baseline.sha
+  - .claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/usage_T0.csv
+  - CLAUDE.md
+  - Cargo.lock
+  - apps/nexus-gateway/src/server.ts
+  - apps/web-ide/components/chat-panel.tsx
+  - apps/web-ide/components/chat/memory-panel.tsx
+  - apps/web-ide/components/feedback-error-dialog.tsx
+  - apps/web-ide/components/global-dialog-provider.tsx
+  - apps/web-ide/components/knowledge/notes-tab.tsx
+  - apps/web-ide/components/modal-portal.tsx
+  - apps/web-ide/components/project-explorer.tsx
+  - apps/web-ide/components/ui/confirm-dialog.tsx
+  - apps/web-ide/lib/api-client.ts
+  - apps/web-ide/lib/use-chat.ts
+  - brain/agents/graph.py
+  - brain/agents/nodes.py
+  - brain/agents/state.py
+  - brain/embeddings/service.py
+  - brain/grpc_clients/agent_router_client.py
+  - brain/grpc_clients/tool_runner_client.py
+  - brain/grpc_server/main.py
+  - brain/providers/cooldown_bridge.py
+  - brain/providers/registry.py
+  - brain/router/service.py
+  - brain/workers/__init__.py
+  - brain/workers/chat_indexer.py
+  - config/policies/default.yaml
+  - crates/mcp-core/Cargo.toml
+  - crates/mcp-core/src/agent_tools/archive_tools.rs
+  - crates/mcp-core/src/agent_tools/attachment_inspector.rs
+  - crates/mcp-core/src/agent_tools/attachment_settings.rs
+  - crates/mcp-core/src/agent_tools/attachments.rs
+  - crates/mcp-core/src/agent_tools/document_tools.rs
+  - crates/mcp-core/src/agent_tools/figma_tools.rs
+  - crates/mcp-core/src/agent_tools/files.rs
+  - crates/mcp-core/src/agent_tools/knowledge.rs
+  - crates/mcp-core/src/agent_tools/mod.rs
+  - crates/mcp-core/src/agent_tools/port_scanner.rs
+  - crates/mcp-core/src/agent_tools/rag_search.rs
+  - crates/mcp-core/src/agent_tools/read_cache.rs
+  - crates/mcp-core/src/agent_tools/vision_tools.rs
+  - crates/mcp-core/src/agent_types.rs
+  - crates/mcp-core/src/brain_agent_client.rs
+  - crates/mcp-core/src/chat_agent.rs
+  - crates/mcp-core/src/chat_attachments.rs
+  - crates/mcp-core/src/chat_messages.rs
+  - crates/mcp-core/src/environment.rs
+  - crates/mcp-core/src/main.rs
+  - crates/mcp-core/src/model_health_probe.rs
+  - crates/mcp-core/src/orchestrator.rs
+  - crates/mcp-core/src/rag/chunker.rs
+  - crates/mcp-core/src/rag/config.rs
+  - crates/mcp-core/src/rag/indexer.rs
+  - crates/mcp-core/src/rag/mod.rs
+  - crates/mcp-core/src/rag/qdrant_client.rs
+  - crates/mcp-core/src/rag/search.rs
+  - crates/mcp-core/src/routing_config.rs
+  - crates/mcp-core/src/task_watchdog.rs
+  - db/migrations/0187_chat_message_attachments.sql
+  - db/migrations/0188_context_budget_keywords.sql
+  - db/migrations/0189_tool_runner_addr_setting.sql
+  - db/migrations/0190_service_urls_to_settings.sql
+  - db/migrations/0191_agent_port_registry_directive.sql
+  - db/migrations/0192_agent_attachment_tool_directive.sql
+  - db/migrations/0193_attachment_inspection_directive.sql
+  - db/migrations/0194_vision_describe_purpose.sql
+  - db/migrations/0195_attachment_robustness_settings.sql
+  - db/migrations/0196_figma_make_pipeline_settings.sql
+  - db/migrations/0197_language_directive.sql
+  - db/migrations/0198_language_directive_at_head.sql
+  - db/migrations/0199_context_management_settings.sql
+  - db/migrations/0200_rag_unified.sql
+  - db/migrations/0201_anthropic_default_model.sql
+  - db/migrations/0202_intent_deterministic_fallback_thresholds.sql
+  - docs/.nexus-vault/adr/0010-port-and-attachment-enforcement.md
+  - docs/.nexus-vault/adr/0011-attachment-inspection-pipeline.md
+  - docs/.nexus-vault/adr/0012-attachment-robustness.md
+  - docs/.nexus-vault/adr/0013-language-and-live-thinking.md
+  - docs/.nexus-vault/adr/0014-context-size-management.md
+  - docs/.nexus-vault/adr/0015-rag-strutturale-unificato.md
+  - docs/.nexus-vault/api/rest-endpoints.md
+  - docs/.nexus-vault/api/settings-keys.md
+  - docs/.nexus-vault/architecture/brain-python.md
+  - docs/.nexus-vault/architecture/crates-rust.md
+  - docs/.nexus-vault/architecture/frontend-nextjs.md
+  - docs/.nexus-vault/changelog/2026/2026-05-28-featkb-cancellazione-note-dalla-knowledge-base-ui-backend.md
+  - docs/.nexus-vault/changelog/2026/2026-05-28-featrouting-fix-architetturali-77-78-79-safety-net-shutdown.md
+  - docs/.nexus-vault/changelog/2026/2026-05-28-featui-componente-condiviso-confirm-dialog-adoz-nota-kb.md
+  - docs/.nexus-vault/changelog/2026/2026-05-28-fixchat-file-binari-in-attachment-vanno-come-base64-no-in-jsonb.md
+  - docs/.nexus-vault/changelog/2026/2026-05-28-fixchat-preserva-inputallegati-se-la-send-fallisce-ripristino-automatico.md
+  - docs/.nexus-vault/concepts/auto-fix-workflow.md
+  - docs/.nexus-vault/concepts/change-drafter.md
+  - docs/.nexus-vault/concepts/glossario.md
+  - docs/.nexus-vault/concepts/isolamento-progetti.md
+  - docs/.nexus-vault/concepts/knowledge-base-funzionamento.md
+  - docs/.nexus-vault/concepts/meta-vault-architettura.md
+  - docs/.nexus-vault/concepts/multi-provider-routing.md
+  - docs/.nexus-vault/concepts/nexus-architetturale.md
+  - docs/.nexus-vault/concepts/nexus-funzionale.md
+  - docs/.nexus-vault/concepts/pattern-learning-worker.md
+  - docs/.nexus-vault/concepts/pattern-mcp-tool.md
+  - docs/.nexus-vault/concepts/routing-matrix.md
+  - docs/.nexus-vault/concepts/sub-agents-claude-code.md
+  - docs/.nexus-vault/schema/migrations-log.md
+  - docs/.nexus-vault/schema/postgres-tables.md
+  - docs/.nexus-vault/schema/qdrant-collections.md
+  - packages/llm-gateway/src/gateway.ts
+  - packages/llm-gateway/src/index.ts
+  - packages/llm-gateway/src/router/policy-engine.ts
+  - packages/llm-gateway/tests/cross-profile.test.ts
+  - packages/llm-gateway/tests/dogfood-directives.test.ts
+  - packages/llm-gateway/tests/gateway.test.ts
+  - packages/llm-gateway/tests/policy-engine.test.ts
+  - packages/shared/src/secret-scanner.ts
+  - scripts/e2e_figma_test.py
+auto_generated: true
+created_at: 2026-05-30T06:47:35Z
+updated_at: 2026-05-30T06:47:33Z
+nexus_meta_version: 1
+---
+
+# @ feat: pipeline allegati robusta + RAG + routing/DLP fix definitivi
+
+**Commit**: `cdd1589822b0955e72efeec44499813a32ad2602` (2026-05-30 06:47 UTC)
+
+**Significance**: 0.80
+
+## File toccati
+
+- `.claude/worktrees/agent-a31cffeec933339c1/apps/web-ide/tsconfig.tsbuildinfo`
+- `.claude/worktrees/agent-a31cffeec933339c1/backups/postgres/nexus_20260512_083800.sql.gz`
+- `.claude/worktrees/agent-a31cffeec933339c1/brain/nexus_memory/learning.db`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/ideai_baseline.sha`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/ideai_head_T0.txt`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/STOP_TRIGGER.txt`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_processes.csv`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_processes.err`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_runs.csv`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_runs.err`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_steps.csv`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_steps.err`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/ai_usage_ledger.csv`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/ai_usage_ledger.err`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/cost_by_model.csv`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/git-ideai-commits-since-baseline.txt`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/git-ideai-diff.patch`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/git-ideai-status.txt`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/git-target-diff.patch`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/git-target-log.txt`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/git-target-status.txt`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-brain-1.log`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-mcp-core-1.log`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-postgres-nexus-1.log`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-postgres-nexus-1.log.stderr`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-web-ide-1.log`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/monitor.jsonl`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/monitor.log`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/tool_name_frequency.csv`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_01/violations.txt`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_02/STOP_TRIGGER.txt`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_02/monitor.jsonl`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_02/monitor.log`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_03/STOP_TRIGGER.txt`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_03/monitor.jsonl`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iter_03/monitor.log`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/iterations_summary.csv`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/journal_fix.md`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/meta.json`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/prompt_seed.md`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/report.md`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/report_finale_consolidato.md`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/target_baseline.sha`
+- `.claude/worktrees/agent-a31cffeec933339c1/tests/nexus-maturity/2026-05-14T1556/usage_T0.csv`
+- `.claude/worktrees/agent-acff1e305e741865d/apps/web-ide/tsconfig.tsbuildinfo`
+- `.claude/worktrees/agent-acff1e305e741865d/backups/postgres/nexus_20260512_083800.sql.gz`
+- `.claude/worktrees/agent-acff1e305e741865d/brain/nexus_memory/learning.db`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/ideai_baseline.sha`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/ideai_head_T0.txt`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/STOP_TRIGGER.txt`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_processes.csv`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_processes.err`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_runs.csv`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_runs.err`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_steps.csv`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/agent_steps.err`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/ai_usage_ledger.csv`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/ai_usage_ledger.err`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/cost_by_model.csv`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/git-ideai-commits-since-baseline.txt`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/git-ideai-diff.patch`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/git-ideai-status.txt`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/git-target-diff.patch`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/git-target-log.txt`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/git-target-status.txt`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-brain-1.log`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-mcp-core-1.log`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-postgres-nexus-1.log`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-postgres-nexus-1.log.stderr`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/ideai-web-ide-1.log`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/monitor.jsonl`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/monitor.log`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/tool_name_frequency.csv`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_01/violations.txt`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_02/STOP_TRIGGER.txt`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_02/monitor.jsonl`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_02/monitor.log`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_03/STOP_TRIGGER.txt`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_03/monitor.jsonl`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iter_03/monitor.log`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/iterations_summary.csv`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/journal_fix.md`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/meta.json`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/prompt_seed.md`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/report.md`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/report_finale_consolidato.md`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/target_baseline.sha`
+- `.claude/worktrees/agent-acff1e305e741865d/tests/nexus-maturity/2026-05-14T1556/usage_T0.csv`
+- `CLAUDE.md`
+- `Cargo.lock`
+- `apps/nexus-gateway/src/server.ts`
+- `apps/web-ide/components/chat-panel.tsx`
+- `apps/web-ide/components/chat/memory-panel.tsx`
+- `apps/web-ide/components/feedback-error-dialog.tsx`
+- `apps/web-ide/components/global-dialog-provider.tsx`
+- `apps/web-ide/components/knowledge/notes-tab.tsx`
+- `apps/web-ide/components/modal-portal.tsx`
+- `apps/web-ide/components/project-explorer.tsx`
+- `apps/web-ide/components/ui/confirm-dialog.tsx`
+- `apps/web-ide/lib/api-client.ts`
+- `apps/web-ide/lib/use-chat.ts`
+- `brain/agents/graph.py`
+- `brain/agents/nodes.py`
+- `brain/agents/state.py`
+- `brain/embeddings/service.py`
+- `brain/grpc_clients/agent_router_client.py`
+- `brain/grpc_clients/tool_runner_client.py`
+- `brain/grpc_server/main.py`
+- `brain/providers/cooldown_bridge.py`
+- `brain/providers/registry.py`
+- `brain/router/service.py`
+- `brain/workers/__init__.py`
+- `brain/workers/chat_indexer.py`
+- `config/policies/default.yaml`
+- `crates/mcp-core/Cargo.toml`
+- `crates/mcp-core/src/agent_tools/archive_tools.rs`
+- `crates/mcp-core/src/agent_tools/attachment_inspector.rs`
+- `crates/mcp-core/src/agent_tools/attachment_settings.rs`
+- `crates/mcp-core/src/agent_tools/attachments.rs`
+- `crates/mcp-core/src/agent_tools/document_tools.rs`
+- `crates/mcp-core/src/agent_tools/figma_tools.rs`
+- `crates/mcp-core/src/agent_tools/files.rs`
+- `crates/mcp-core/src/agent_tools/knowledge.rs`
+- `crates/mcp-core/src/agent_tools/mod.rs`
+- `crates/mcp-core/src/agent_tools/port_scanner.rs`
+- `crates/mcp-core/src/agent_tools/rag_search.rs`
+- `crates/mcp-core/src/agent_tools/read_cache.rs`
+- `crates/mcp-core/src/agent_tools/vision_tools.rs`
+- `crates/mcp-core/src/agent_types.rs`
+- `crates/mcp-core/src/brain_agent_client.rs`
+- `crates/mcp-core/src/chat_agent.rs`
+- `crates/mcp-core/src/chat_attachments.rs`
+- `crates/mcp-core/src/chat_messages.rs`
+- `crates/mcp-core/src/environment.rs`
+- `crates/mcp-core/src/main.rs`
+- `crates/mcp-core/src/model_health_probe.rs`
+- `crates/mcp-core/src/orchestrator.rs`
+- `crates/mcp-core/src/rag/chunker.rs`
+- `crates/mcp-core/src/rag/config.rs`
+- `crates/mcp-core/src/rag/indexer.rs`
+- `crates/mcp-core/src/rag/mod.rs`
+- `crates/mcp-core/src/rag/qdrant_client.rs`
+- `crates/mcp-core/src/rag/search.rs`
+- `crates/mcp-core/src/routing_config.rs`
+- `crates/mcp-core/src/task_watchdog.rs`
+- `db/migrations/0187_chat_message_attachments.sql`
+- `db/migrations/0188_context_budget_keywords.sql`
+- `db/migrations/0189_tool_runner_addr_setting.sql`
+- `db/migrations/0190_service_urls_to_settings.sql`
+- `db/migrations/0191_agent_port_registry_directive.sql`
+- `db/migrations/0192_agent_attachment_tool_directive.sql`
+- `db/migrations/0193_attachment_inspection_directive.sql`
+- `db/migrations/0194_vision_describe_purpose.sql`
+- `db/migrations/0195_attachment_robustness_settings.sql`
+- `db/migrations/0196_figma_make_pipeline_settings.sql`
+- `db/migrations/0197_language_directive.sql`
+- `db/migrations/0198_language_directive_at_head.sql`
+- `db/migrations/0199_context_management_settings.sql`
+- `db/migrations/0200_rag_unified.sql`
+- `db/migrations/0201_anthropic_default_model.sql`
+- `db/migrations/0202_intent_deterministic_fallback_thresholds.sql`
+- `docs/.nexus-vault/adr/0010-port-and-attachment-enforcement.md`
+- `docs/.nexus-vault/adr/0011-attachment-inspection-pipeline.md`
+- `docs/.nexus-vault/adr/0012-attachment-robustness.md`
+- `docs/.nexus-vault/adr/0013-language-and-live-thinking.md`
+- `docs/.nexus-vault/adr/0014-context-size-management.md`
+- `docs/.nexus-vault/adr/0015-rag-strutturale-unificato.md`
+- `docs/.nexus-vault/api/rest-endpoints.md`
+- `docs/.nexus-vault/api/settings-keys.md`
+- `docs/.nexus-vault/architecture/brain-python.md`
+- `docs/.nexus-vault/architecture/crates-rust.md`
+- `docs/.nexus-vault/architecture/frontend-nextjs.md`
+- `docs/.nexus-vault/changelog/2026/2026-05-28-featkb-cancellazione-note-dalla-knowledge-base-ui-backend.md`
+- `docs/.nexus-vault/changelog/2026/2026-05-28-featrouting-fix-architetturali-77-78-79-safety-net-shutdown.md`
+- `docs/.nexus-vault/changelog/2026/2026-05-28-featui-componente-condiviso-confirm-dialog-adoz-nota-kb.md`
+- `docs/.nexus-vault/changelog/2026/2026-05-28-fixchat-file-binari-in-attachment-vanno-come-base64-no-in-jsonb.md`
+- `docs/.nexus-vault/changelog/2026/2026-05-28-fixchat-preserva-inputallegati-se-la-send-fallisce-ripristino-automatico.md`
+- `docs/.nexus-vault/concepts/auto-fix-workflow.md`
+- `docs/.nexus-vault/concepts/change-drafter.md`
+- `docs/.nexus-vault/concepts/glossario.md`
+- `docs/.nexus-vault/concepts/isolamento-progetti.md`
+- `docs/.nexus-vault/concepts/knowledge-base-funzionamento.md`
+- `docs/.nexus-vault/concepts/meta-vault-architettura.md`
+- `docs/.nexus-vault/concepts/multi-provider-routing.md`
+- `docs/.nexus-vault/concepts/nexus-architetturale.md`
+- `docs/.nexus-vault/concepts/nexus-funzionale.md`
+- `docs/.nexus-vault/concepts/pattern-learning-worker.md`
+- `docs/.nexus-vault/concepts/pattern-mcp-tool.md`
+- `docs/.nexus-vault/concepts/routing-matrix.md`
+- `docs/.nexus-vault/concepts/sub-agents-claude-code.md`
+- `docs/.nexus-vault/schema/migrations-log.md`
+- `docs/.nexus-vault/schema/postgres-tables.md`
+- `docs/.nexus-vault/schema/qdrant-collections.md`
+- `packages/llm-gateway/src/gateway.ts`
+- `packages/llm-gateway/src/index.ts`
+- `packages/llm-gateway/src/router/policy-engine.ts`
+- `packages/llm-gateway/tests/cross-profile.test.ts`
+- `packages/llm-gateway/tests/dogfood-directives.test.ts`
+- `packages/llm-gateway/tests/gateway.test.ts`
+- `packages/llm-gateway/tests/policy-engine.test.ts`
+- `packages/shared/src/secret-scanner.ts`
+- `scripts/e2e_figma_test.py`
+
+## Cosa cambia
+
+@ feat: pipeline allegati robusta + RAG + routing/DLP fix definitivi
+
+## Riferimenti
+
+- Vedi diff git: `git show cdd1589822b0955e72efeec44499813a32ad2602`
+
+## Documenti correlati
+
+- [[crates-rust]]
+- [[brain-python]]
+- [[frontend-nextjs]]
+- [[postgres-tables]]
+- [[migrations-log]]
+- [[rest-endpoints]]
+- [[qdrant-collections]]
+- [[knowledge-base-funzionamento]]
+- [[multi-provider-routing]]
+- [[routing-matrix]]
