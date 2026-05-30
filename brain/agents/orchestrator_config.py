@@ -82,6 +82,12 @@ _KEYS = (
     "understanding_topk",
     "understanding_min_token_budget",
     "understanding_max_explore",
+    # Allineamento Componente B: contesto continuo via RAG ai sub-agent
+    "subagent_rag_grounding_enabled",
+    "subagent_rag_grounding_topk",
+    "subagent_rag_grounding_min_score",
+    "subagent_rag_grounding_snippet_max",
+    "subagent_inherit_plan_rationale",
 )
 
 # Default conservativi: feature OFF se DB irraggiungibile.
@@ -130,6 +136,12 @@ _SAFE_DEFAULTS: dict[str, Any] = {
     "understanding_topk": 8,
     "understanding_min_token_budget": 3000,
     "understanding_max_explore": 3,
+    # Componente B: contesto continuo via RAG ai sub-agent (OFF di default)
+    "subagent_rag_grounding_enabled": False,
+    "subagent_rag_grounding_topk": 5,
+    "subagent_rag_grounding_min_score": 0.55,
+    "subagent_rag_grounding_snippet_max": 800,
+    "subagent_inherit_plan_rationale": False,
 }
 
 _lock = threading.RLock()

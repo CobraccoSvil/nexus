@@ -1,5 +1,6 @@
 mod agent_processes;
 mod agent_types;
+mod claude_agents;
 mod brain_agent_client;
 mod dlp;
 mod provider_cooldown;
@@ -1616,6 +1617,20 @@ async fn main() -> anyhow::Result<()> {
                     )),
             )
             // ── meta-docs (Nexus self-documentation vault) ────────
+            .route(
+                "/api/claude-agents/preview",
+                get(claude_agents::preview_handler).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/claude-agents/regenerate",
+                post(claude_agents::regenerate_handler).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
             .route(
                 "/api/meta-docs/list",
                 get(meta_docs::routes::list_meta_docs).layer(axum_mw::from_fn_with_state(

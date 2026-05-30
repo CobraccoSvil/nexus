@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: 8ce41156da2df56495aaed76d7c9cf53937f9e38
+source_commit: a046cc4fefc748578e7ff6aea827692831f5bd44
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-30T08:27:20Z
+updated_at: 2026-05-30T11:29:10Z
 nexus_meta_version: 1
 ---
 
@@ -24,20 +24,9 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 | Chiave | Valore default | Descrizione |
 |---|---|---|
-| `agent.attachment.archive_entry_max_bytes` | `204800` | Max byte letti da una singola entry di archivio (nexus_read_archive_entry). Default 200KB. |
-| `agent.attachment.archive_max_entries` | `1000` | Max entries elencate da nexus_list_archive_entries prima della troncatura. Default 1000. |
-| `agent.attachment.figma_make_ai_chat_max_load_bytes` | `26214400` | Max byte caricati in RAM dal file ai_chat.json di un archivio Figma Make prima del parsing. Default 5 MB. Se il file e' piu' grande viene troncato (segnalato con ai_chat_truncated_at_load=true nella risposta del tool). |
-| `agent.attachment.figma_make_assistant_message_max_chars` | `2000` | Max caratteri di un singolo messaggio assistant prima della truncatura. I messaggi user (prompt originale) non vengono mai troncati singolarmente. Default 2000. |
-| `agent.attachment.figma_make_chat_messages_max_chars` | `51200` | Max caratteri cumulativi del testo estratto dai messaggi user+assistant del thread chat Figma Make. Default 50 KB. Oltre la soglia i messaggi residui vengono scartati (chat_messages_truncated=true). |
-| `agent.attachment.figma_make_chat_messages_max_count` | `20` | Max numero di messaggi (user + assistant) restituiti dal thread chat Figma Make. Default 20. |
-| `agent.attachment.figma_max_bytes` | `51200` | Max byte del payload canvas.fig estratti da nexus_extract_figma_structure. Default 50KB. |
+| `agent.attachment.figma_make_ai_chat_max_load_bytes` | `536870912` | Guardia anti-OOM ESTREMA (NON un cap di contenuto) sul caricamento in RAM del file ai_chat.json di un archivio Figma Make prima del parsing. Default 512 MB: rete di sicurezza contro file patologici. I .make reali stanno nell'ordine dei MB. |
 | `agent.attachment.image_max_bytes` | `2097152` | Massima dimensione (byte) di un immagine processabile dal tool nexus_describe_image_attachment. Default 2 MB. Oltre il limite il tool ritorna errore esplicito al modello. |
-| `agent.attachment.pdf_max_text_bytes` | `102400` | Max byte di testo estratto da nexus_extract_pdf_text in totale (su tutte le pagine richieste). Default 100KB. |
-| `agent.attachment.preextract_enabled` | `true` | Pre-extraction automatica del contenuto strutturato di PDF/DOCX/Figma allegati. Default true. Disattivare se causa latenza eccessiva all'invio del primo messaggio. |
-| `agent.attachment.preextract_max_chars` | `50000` | Limite totale (in caratteri) del contenuto pre-extracted sommando tutti gli allegati del turno. Se eccede, gli ultimi allegati non vengono pre-extracted. |
 | `agent.attachment.read_cache_ttl_seconds` | `300` | TTL (secondi) della cache LRU read_cache che deduplica chiamate identiche a nexus_read_attachment / nexus_read_archive_entry. Default 5 minuti. |
-| `agent.attachment.session_read_budget_bytes` | `500000` | Cap cumulativo (byte) delle letture nexus_read_attachment + nexus_read_archive_entry per sessione. Oltre la soglia, il brain risponde con tool_result sintetico che invita a usare gli estrattori strutturati. |
-| `agent.attachment.xlsx_max_rows` | `1000` | Max righe restituite da nexus_extract_xlsx_data. Default 1000. |
 | `agent.complexity.file_path_points` | `2` | Punti per ogni path o file menzionato nel prompt (es. /home/, src/, *.json). |
 | `agent.complexity.keyword_weights` | `{"create":3,"write_file":2,"install":2,"build":2,"systemc...` | Pesi keyword per stima complessita' task agente (budget iterazioni adattivo). Chiave: substring da cercare nel prompt, valore: punti complessita'. Aggiornamento: aggiunti verbi italiani (implementa, sviluppa, costruisci, genera, scaffold) e sostantivi (progetto, applicazione). |
 | `agent.complexity.step_marker_points` | `5` | Punti per ogni marker di step esplicito (1., 2., step, task, phase) nel prompt. |
@@ -49,17 +38,29 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.context.dedup_tool_results_enabled` | `true` | Se true (default) ogni iter executor applica _dedup_tool_results_history: tool_result vecchi con stessa signature (sha256(tool_name+args_json)) vengono sostituiti con placeholder, tenendo solo l ultimo. FIX B. |
 | `agent.context.drop_unused_base64_age` | `3` | Soglia (n messaggi successivi) entro la quale verificare se un blob base64 di un tool_result vecchio viene citato testualmente. Se non viene citato, il body base64 viene sostituito con un placeholder. FIX C. |
 | `agent.context.predictive_cap_ratio` | `0.5` | Soglia (0.3-0.9) sul context_window del modello: se context_attuale + stima_tool_result supera ratio*context_window, la chiamata al tool viene intercettata e sostituita da tool_result sintetico di errore. FIX D. |
+| `agent.context.rag_offload.enabled` | `true` | Flag master offload RAG lossless. Se true (default), prima di troncare/comprimere/scartare un tool result o messaggio vecchio il brain indicizza il contenuto COMPLETO in Qdrant (tool_results_chunks) cosi' nessun dato viene perso e resta recuperabile via nexus_search_semantic. Se false, degrada al vecchio troncamento distruttivo. |
+| `agent.context.rag_offload.max_chunks_per_item` | `500` | Numero massimo di chunk indicizzati per singolo contenuto offloadato (anti-abuso: un file enorme non deve generare migliaia di point in un colpo). Oltre il cap il resto NON viene indicizzato e l'evento e' loggato come WARN. Default 500. |
+| `agent.context.rag_offload.min_chars` | `2000` | Soglia minima caratteri sotto la quale NON si indicizza un contenuto in RAG: sotto soglia il contenuto sta gia' intero nel prompt, nessuna perdita possibile. Default 2000. |
+| `agent.context.rag_offload.snippet_max_chars` | `4000` | Limite caratteri per ogni snippet RAG incluso nel contesto. Alzato da 400 (vecchio hardcoded) a 4000: snippet piu' ampi riducono i round-trip e non perdono il cuore del match. |
+| `agent.context.rag_offload.top_k` | `12` | Numero di interazioni/snippet recuperati dal RAG inline per turno. Alzato da 5 (vecchio hardcoded) a 12: con l'offload lossless il RAG e' la fonte di verita' del contenuto troncato, quindi il recupero non deve essere artificialmente stretto. |
 | `agent.enforce_port_allocation` | `true` | Se true, write_file/edit_file rifiutano sorgenti con porte TCP hardcoded fuori dal bucket Nexus 20000-39999 (vedi ADR 0010). |
 | `agent.exploration_loop_threshold` | `6` | Numero di chiamate consecutive a tool di sola esplorazione (lettura/ispezione allegati e file) oltre il quale l'executor inietta un nudge verso la scrittura; a 2x la soglia abortisce. Una call produttiva (write_file, edit_file, run_command, request_port, ...) azzera il contatore. Intero >= 1. |
 | `agent.iteration_budget.base` | `60` | Numero base iterazioni LangGraph per ogni run agente. Sommato a per_complexity_point*complexity_score. |
 | `agent.iteration_budget.max` | `300` | Tetto massimo iterazioni anche per task molto complessi. Safety net runaway. |
 | `agent.iteration_budget.per_complexity_point` | `4` | Iterazioni aggiuntive per ogni punto di complessita del prompt (score 0-100). |
+| `agent.language_reminder_enabled` | `true` | Abilita l'iniezione del reminder di lingua resiliente al contesto in coda al system prompt e all'ultimo messaggio utente (bug #88). Disabilita con "false" per rollback immediato senza rideploy. |
+| `agent.language_reminder_text` | `Rispondi SEMPRE e SOLO in italiano. Mai cinese, giappones...` | Testo del reminder di lingua iniettato in coda al system prompt e all'ultimo messaggio utente per vincere il recency bias dei modelli small a contesto saturo (bug #88). |
 | `agent_narration_warn_after_chars` | `1500` | Caratteri di testo streamed senza tool call dopo i quali il badge UI passa in stato warning. |
 | `agent_narration_warn_after_ms` | `30000` | Millisecondi di run senza tool call dopo i quali il badge UI passa in stato warning (possibile loop di narrazione). |
 | `agent_parallel_enabled` | `true` | Abilita l'esecuzione parallela di piu' agenti contemporaneamente per accelerare task complessi |
 | `agent_parallel_max` | `5` | Numero massimo di agenti paralleli per sessione (1-5) |
 | `agent_router_addr` | `127.0.0.1:50501` | Indirizzo host:porta del server gRPC AgentRouter esposto da mcp-core e usato dal brain Python per consultare il Q-Learning router. Override di emergenza: AGENT_ROUTER_ADDR. Richiede riavvio di mcp-core e del brain. |
 | `agent_router_enabled` | `true` | Abilita il server gRPC AgentRouter (porta 50072) che espone il router Q-Learning di nexus-orchestrator al brain Python. Quando attivo, il router_node consulta il Q-Learning per scegliere il profilo agente ottimale (es. coder, cloud_architect, tech_writer) in base alla cronologia dei reward osservati. Se disabilitato il brain usa il routing di fallback basato solo sull'intent. Richiede riavvio di mcp-core per applicare la modifica. |
+| `agent.visual_compare.screenshot_timeout_secs` | `45` | Timeout (secondi) per la cattura dello screenshot via Playwright in nexus_visual_compare (launch + goto + wait + scatto). Default 45. |
+| `agent.visual_compare.similarity_threshold` | `85` | Soglia di similarita' (0-100) raccomandata: sotto questa soglia, o in presenza di differenze severita' alta, l'agente in modalita' Continuo dovrebbe correggere stile/layout e ripetere nexus_visual_compare. Default 85. |
+| `agent.visual_compare.viewport_height` | `800` | Altezza (px) del viewport usato da nexus_visual_compare per lo screenshot quando il parametro viewport non e' passato. Default 800. |
+| `agent.visual_compare.viewport_width` | `1280` | Larghezza (px) del viewport usato da nexus_visual_compare per lo screenshot quando il parametro viewport non e' passato. Default 1280. |
+| `agent.visual_compare.wait_ms` | `1500` | Attesa (ms) dopo il load della pagina prima dello scatto in nexus_visual_compare, per dare tempo a render/animazioni/fetch. Default 1500. Override per chiamata via parametro wait_ms. |
 | `anthropic_system_cache_ttl` | `1h` | TTL della cache prompt di sistema per Anthropic: 5m (default Anthropic) o 1h (extended-cache-ttl-2025-04-11). Il valore 1h massimizza il cache hit rate fra turni distanti (il system prompt cambia raramente). Override: NEXUS_ANTHROPIC_SYSTEM_CACHE_TTL. Richiede riavvio del brain. |
 | `catalog_sync.disable_missing` | `true` | Se TRUE, disabilita i modelli del catalog non piu esposti dall API. Se FALSE solo log. |
 | `catalog_sync.enabled` | `true` | Attiva/disattiva il worker periodico di sync catalog modelli dai provider. |
@@ -258,6 +259,10 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 | Chiave | Valore default | Descrizione |
 |---|---|---|
+| `clarify.confirm_irreversible_in_auto` | `false` | Se true, le decisioni di prodotto/irreversibili chiedono conferma anche in modalita' automatica; le tecniche/reversibili proseguono autonome. |
+| `clarify.decision_lookup_enabled` | `false` | Se true, prima di chiedere un chiarimento cerca se la decisione e' gia' stata presa (note intent=decision) e la applica. |
+| `clarify.decision_min_score` | `0.7` | Soglia minima di similarita' per considerare una decisione passata come gia' presa. |
+| `clarify.decision_topk` | `5` | Quante note decision recuperare nel lookup. |
 | `orchestrator.adaptive_agentic_score_min` | `0.7` | Soglia di agentic_score sopra la quale attivare il planner forte. |
 | `orchestrator.adaptive_classifier_enabled` | `false` | Se true, router_node invoca il classifier agentico LLM e scrive complexity/agentic_score/is_ambiguous nello state. |
 | `orchestrator.adaptive_gating_enabled` | `false` | Se true, is_eligible_adaptive usa i segnali del classifier per gate-are il planner forte (oltre ai gate hard budget/behavior). |
@@ -267,6 +272,10 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `orchestrator.clarify.max_question_chars` | `280` | Cap di lunghezza della domanda di chiarimento prima del troncamento. |
 | `orchestrator.clarify.prompt_key` | `agent.clarify.base` | Indirezione per varianti A/B del prompt clarify. |
 | `orchestrator.clarify.require_llm_classifier` | `false` | Se true, attiva il clarify solo quando NEXUS_LLM_CLASSIFIER_ENABLED=true; altrimenti usa anche il fallback keyword/embedding. |
+| `orchestrator.exploratory_verify_enabled` | `false` | Se true, dopo i criteri deterministici passati il verifier esegue un controllo LLM esplorativo (RAG-informed) per anomalie non coperte. |
+| `orchestrator.exploratory_verify_max_cycles` | `1` | Cap di cicli della verifica esplorativa per todo (anti-loop). Al cap si promuove comunque (deterministico primario). |
+| `orchestrator.exploratory_verify_min_score` | `0.5` | Soglia minima di similarita' per i pattern di fallimento recuperati. |
+| `orchestrator.exploratory_verify_topk` | `5` | Quanti pattern di fallimento passati recuperare via ricerca semantica. |
 | `orchestrator.max_parallel_subagents` | `3` | Concorrenza max sub-agent in-flight per singolo parent run. |
 | `orchestrator.max_plan_revisions` | `2` | Cap replan strutturali ammessi dopo verifier exhaustion (PR-2). |
 | `orchestrator.max_verify_cycles` | `3` | Cap re-iterazioni executor<->verifier per singolo todo (PR-2). |
@@ -281,6 +290,10 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `orchestrator.plan_min_token_budget` | `50` | Sotto questa soglia di token_budget il planner viene saltato (chat brevi). |
 | `orchestrator.planner_prompt_key` | `agent.planner.base` | Indirezione per varianti A/B del prompt del planner. |
 | `orchestrator.plan_phase_enabled` | `true` | Feature flag globale per il planner_node (PR-1). Off -> grafo si comporta come oggi. |
+| `orchestrator.plan_rationale_enabled` | `false` | Se true, il planner recupera decisioni passate via RAG, produce rationale/constraints/alternatives e li tramanda all'executor. |
+| `orchestrator.plan_rationale_min_score` | `0.55` | Soglia minima di similarita' per includere una decisione passata nel contesto del planner. |
+| `orchestrator.plan_rationale_persist_as_note` | `false` | Se true, dopo la creazione del piano il razionale viene salvato come nota knowledge intent=decision (chiude il ciclo RAG). |
+| `orchestrator.plan_rationale_rag_topk` | `5` | Quante decisioni/interazioni passate recuperare per informare il razionale del planner. |
 | `orchestrator.subagent_cost_cap_per_run_usd` | `5.00` | Hard cap di spesa cumulativa sub-agents per singolo parent run. |
 | `orchestrator.subagent_default_timeout_s` | `300` | Timeout default per kind se non specificato in nexus_subagent_definitions. |
 | `orchestrator.subagent_kinds_whitelist` | `plan,explore,implement,verify,review` | CSV dei kind ammessi per dispatch_subagent (filtra anche custom kinds). |
@@ -288,6 +301,12 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `orchestrator.subagents_enabled` | `true` | Feature flag globale sub-agents pattern. Off -> dispatch_subagent ritorna errore al main. |
 | `orchestrator.todo_reminder_every_n_steps` | `5` | Iniezione system reminder TODO ogni N tool use. |
 | `orchestrator.todo_reminder_min_todos` | `3` | Sotto questa soglia di todos pending nessun reminder iniettato (anti-spam chat brevi). |
+| `orchestrator.understanding_enabled` | `false` | Se true, prima del planner un nodo understanding fa grounding semantico (+ fan-out explore opzionale) per task complessi. |
+| `orchestrator.understanding_fanout_enabled` | `false` | Se true (e subagents abilitati), l'understanding spawna sub-agent explore in parallelo via dispatch_subagent. |
+| `orchestrator.understanding_max_explore` | `3` | Massimo numero di sub-agent explore spawnati in parallelo dall'understanding. |
+| `orchestrator.understanding_min_token_budget` | `3000` | Gate hard: sotto questo budget il nodo understanding non si attiva (task piccoli). |
+| `orchestrator.understanding_synthesize_enabled` | `false` | Se true, il context_brief viene sintetizzato da un LLM economico; altrimenti concatenazione strutturata dei risultati RAG. |
+| `orchestrator.understanding_topk` | `8` | Numero di hit della ricerca semantica per il grounding. |
 | `orchestrator.verifier_enabled` | `true` | Feature flag globale per il verifier_node (PR-2). Indipendente dal planner. |
 | `orchestrator.verifier_timeout_s` | `30.0` | Timeout singolo criterion check (PR-2). |
 | `orchestrator.worker_mode_enabled` | `false` | Se true, nel run principale (subagent_depth=0) dopo il planner l'executor usa il prompt agent.orchestrator.base e tool ridotti: delega ai worker invece di implementare inline. |
@@ -353,7 +372,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `default_model` | `claude-sonnet-4-6` | Default model for chat |
 | `default_provider` | `anthropic` | Default LLM provider |
 | `max_token_budget` | `32000` | Maximum token budget allowed |
-| `model_catalog_last_sync` | `2026-05-30T07:23:35.367696169+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
+| `model_catalog_last_sync` | `2026-05-30T11:27:07.954048483+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
 | `nexus_active_routing_pct` | `50` | Percentuale di richieste chat gestite dal router Q-Learning Nexus (0=off, 100=tutto). A/B testing: imposta 10-50 per un rollout graduale. |
 | `nexus_behavior_mode` | `dinamico` | Modalità comportamento Nexus: veloce|economica|bilanciata|approfondita |
 | `provider_hierarchy` | `anthropic,openai,google,deepseek,mistral` | Ordered fallback chain for chat providers |
@@ -408,4 +427,4 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 ---
 
-**Totale chiavi**: 261
+**Totale chiavi**: 280

@@ -88,7 +88,7 @@ def load_from_db(database_url: Optional[str] = None) -> int:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT key, content FROM nexus_prompt_templates "
-                    "WHERE key LIKE 'agent.%%'"
+                    "WHERE key LIKE 'agent.%%' OR key LIKE 'subagent.%%'"
                 )
                 rows = cur.fetchall()
             _load_shared_directives(conn)

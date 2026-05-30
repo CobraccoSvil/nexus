@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from typing import Any
@@ -34,6 +35,11 @@ from langchain_core.messages import HumanMessage
 from . import prompt_registry, subagent_store
 
 logger = logging.getLogger(__name__)
+
+# Stesso endpoint interno no-auth gia' usato da planner_node._retrieve_decision_context:
+# riuso del servizio di ricerca vettoriale LOCALE (Qdrant+Postgres), niente
+# client nuovo, niente egress verso provider (vincolo riservatezza dati).
+_MCP_CORE_INTERNAL_URL = os.environ.get("MCP_CORE_INTERNAL_URL", "http://localhost:4000")
 
 
 async def run_subagent(
@@ -99,6 +105,24 @@ async def run_subagent(
             "status": "failed", "summary": summary,
             "iterations": 0, "cost_usd": 0, "tokens": {}, "artifacts": [],
         }
+
+    # 2b. Componente B: contesto continuo via memoria vettoriale (gated).
+    # Arricchisce il system_text con (a) grounding RAG locale sul task,
+    # (b) rationale del parent (da nexus_agent_plans). NIENTE dump del contesto
+    # del parent: solo snippet locali + rationale strutturato (riservatezza).
+    try:
+        from . import orchestrator_config
+        _ocfg = orchestrator_config.get()
+        if _ocfg.get("subagent_rag_grounding_enabled"):
+            grounding = _ground_subagent_context(project_id, task, _ocfg)
+            if grounding:
+                system_text = system_text + "\n\n" + grounding
+        if _ocfg.get("subagent_inherit_plan_rationale"):
+            parent_rat = _fetch_parent_rationale(parent_run_id)
+            if parent_rat:
+                system_text = system_text + "\n\n" + parent_rat
+    except Exception as exc:
+        logger.debug("run_subagent: arricchimento contesto (B) skip: %s", exc)
 
     # 3. Build messages iniziali. Embed il context come parte del task per il sub-agent.
     initial_text = task.strip()
@@ -242,6 +266,93 @@ async def run_subagent(
         "cost_usd": round(cost_usd, 6),
         "tokens": {"prompt": prompt_tokens, "completion": completion_tokens},
     }
+
+
+def _ground_subagent_context(project_id: str, task: str, cfg: dict) -> str:
+    """Componente B: grounding RAG locale sul task del sub-agent.
+
+    Riusa /api/internal/knowledge/search (Qdrant+Postgres locali). Best-effort,
+    mai solleva. Ritorna un blocco <memoria_progetto> o "".
+    """
+    pid = str(project_id or "").strip()
+    if not pid or len(task.strip()) < 10:
+        return ""
+    try:
+        import requests  # noqa: PLC0415
+        resp = requests.post(
+            f"{_MCP_CORE_INTERNAL_URL}/api/internal/knowledge/search",
+            json={
+                "project_id": pid,
+                "query": task.strip(),
+                "top_k": int(cfg.get("subagent_rag_grounding_topk", 5)),
+                "min_score": float(cfg.get("subagent_rag_grounding_min_score", 0.55)),
+            },
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return ""
+        results = resp.json().get("results", []) or []
+    except Exception as exc:
+        logger.debug("run_subagent: grounding RAG fallito: %s", exc)
+        return ""
+    if not results:
+        return ""
+    snippet_max = int(cfg.get("subagent_rag_grounding_snippet_max", 800))
+    lines = []
+    for r in results:
+        title = str(r.get("title") or "").strip()
+        snippet = str(r.get("snippet") or "").strip()
+        if len(snippet) > snippet_max:
+            snippet = snippet[: snippet_max - 3] + "..."
+        score = float(r.get("score") or 0)
+        if title or snippet:
+            lines.append(f'  <nota score="{score:.2f}"><titolo>{title}</titolo><contenuto>{snippet}</contenuto></nota>')
+    if not lines:
+        return ""
+    logger.info("run_subagent: grounding RAG iniettato (%d note)", len(lines))
+    return (
+        "<memoria_progetto>\n"
+        "  <!-- Contesto rilevante dalla memoria vettoriale del progetto. -->\n"
+        + "\n".join(lines)
+        + "\n</memoria_progetto>"
+    )
+
+
+def _fetch_parent_rationale(parent_run_id: str) -> str:
+    """Componente B: recupera il rationale del piano del parent (mig 0206).
+
+    SELECT su nexus_agent_plans, riusa subagent_store._conn(). Solo rationale
+    STRUTTURATO, nessun dump della conversazione del parent (riservatezza).
+    """
+    if not parent_run_id:
+        return ""
+    conn = subagent_store._conn()
+    if conn is None:
+        return ""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT rationale, constraints FROM nexus_agent_plans WHERE run_id = %s",
+                (parent_run_id,),
+            )
+            row = cur.fetchone()
+    except Exception as exc:
+        logger.debug("run_subagent: fetch rationale parent fallito: %s", exc)
+        return ""
+    finally:
+        conn.close()
+    if not row:
+        return ""
+    rationale = (row.get("rationale") if isinstance(row, dict) else row[0]) or ""
+    rationale = str(rationale).strip()
+    if not rationale:
+        return ""
+    return (
+        "<rationale_parent>\n"
+        "  <!-- Razionale del piano del parent: rispetta queste scelte. -->\n  "
+        + rationale[:1500]
+        + "\n</rationale_parent>"
+    )
 
 
 def _filter_tools_by_whitelist(whitelist: list[str]) -> list[dict]:

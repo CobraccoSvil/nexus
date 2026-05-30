@@ -6,12 +6,12 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: 8ce41156da2df56495aaed76d7c9cf53937f9e38
+source_commit: a046cc4fefc748578e7ff6aea827692831f5bd44
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-30T08:27:19Z
+updated_at: 2026-05-30T11:29:07Z
 nexus_meta_version: 1
 ---
 
@@ -137,7 +137,6 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0117_loop_fallback_purpose_model.sql` | Purpose model usato per auto-escalation quando il brain rileva loop tool-use. |
 | `0118_more_mcp_stdio_catalog.sql` | Estende il catalogo curato con MCP stdio standard @modelcontextprotocol/server-*. |
 | `0119_conversation_summaries.sql` | 0119_conversation_summaries.sql |
-| `0120_exploration_loop_threshold.sql` | Migrazione 0120: settings.agent.exploration_loop_threshold |
 | `0120_routing_token_threshold.sql` | 0120_routing_token_threshold.sql |
 | `0121_anthropic_batches.sql` | 0121_anthropic_batches.sql |
 | `0122_mcp_tools_embedding.sql` | 0122_mcp_tools_embedding.sql |
@@ -223,7 +222,19 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0203_purpose_model_tier.sql` | Migrazione 0203: risoluzione tier-based per nexus_purpose_model. |
 | `0204_orchestrator_worker_prompts.sql` | Migrazione 0204: prompt per la modalita' "orchestrator-worker". |
 | `0205_orchestrator_adaptive_settings.sql` | Migrazione 0205: settings per worker-mode (PR-C) e attivazione adattiva (PR-D). |
+| `0206_plan_rationale.sql` | Migrazione 0206: plan_rationale (Cluster 1 — avvicinamento orchestrator-worker). |
+| `0207_understanding_node.sql` | Migrazione 0207: nodo understanding dedicato (Cluster 2). |
+| `0208_exploratory_verify.sql` | Migrazione 0208: verifica esplorativa RAG-informed (Cluster 3). |
+| `0209_clarify_decision_rag.sql` | Migrazione 0209: clarify tecnico/prodotto RAG-informed (Cluster 4). |
+| `0210_figma_make_code_extraction.sql` | Mig 0210 - FASE 1 "resa Figma Make": estrazione code-snapshot su disco. |
+| `0211_figma_make_strategy_directive.sql` | Mig 0211 - FASE 3 "resa Figma Make": direttiva di strategia nei system prompt. |
+| `0212_language_reminder_settings.sql` | Migrazione 0212: reminder lingua resiliente al contesto/profilo (bug #88) |
+| `0213_exploration_loop_threshold.sql` | Migrazione 0213: settings.agent.exploration_loop_threshold |
+| `0214_visual_compare_settings.sql` | Mig 0214 - FASE 2 "resa Figma Make": verifica visiva (nexus_visual_compare). |
+| `0215_visual_compare_directive.sql` | Mig 0215 - FASE 2 "resa Figma Make": direttiva di verifica visiva nei prompt. |
+| `0216_remove_attachment_extraction_limits.sql` | Mig 0216 — Eliminazione dei limiti che TRONCANO/PERDONO dati durante |
+| `0217_context_no_loss_rag.sql` | Mig 0217 — Context no-loss via offload RAG (zero perdita dati nel contesto LLM). |
 
-**Totale**: 202 migrazioni.
+**Totale**: 213 migrazioni.
 
-Ultima migrazione: `0205_orchestrator_adaptive_settings.sql`.
+Ultima migrazione: `0217_context_no_loss_rag.sql`.
