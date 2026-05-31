@@ -70,7 +70,10 @@ class ToolRunnerClient:
                 self.address = env_addr
             else:
                 from brain.utils.settings_db import get_setting
-                self.address = get_setting("tool_runner_addr", "127.0.0.1:50071")
+                # Fallback allineato alla realta' di bind di mcp-core
+                # (env .env: TOOL_RUNNER_ADDR=127.0.0.1:50500). Mai impostare
+                # 50501 qui: e' la porta dell'AgentRouter, non del ToolRunner.
+                self.address = get_setting("tool_runner_addr", "127.0.0.1:50500")
         self._channel: grpc.aio.Channel | None = None
         self._stub: tool_runner_pb2_grpc.ToolRunnerStub | None = None
 
@@ -107,14 +110,53 @@ class ToolRunnerClient:
         tool_use_id: str,
         correlation_id: str | None = None,
         timeout: float | None = None,
+        canonical_tool: Any = None,
     ) -> ToolResult:
         """Esecuzione unaria.
 
         `tool_input` puo' essere un dict (serializzato) oppure una
         stringa JSON gia' pronta.
+
+        Se `canonical_tool` (istanza di `brain.providers._models.CanonicalTool`)
+        e' fornito, valida gli args contro l'`input_schema` PRIMA di chiamare
+        mcp-core (M2 del piano provider-unification): se la validazione
+        fallisce, ritorna immediatamente un ToolResult `is_error=True` con
+        feedback strutturato in italiano per l'LLM (sblocca il caso Gemini
+        che inventa attachment_id non esistenti).
         """
         if timeout is None:
             timeout = _TOOL_TIMEOUT_OVERRIDES.get(tool_name, _DEFAULT_TOOL_TIMEOUT)
+
+        # Args potrebbero essere JSON string: per validare servono dict.
+        validated_input = tool_input
+        if isinstance(tool_input, str):
+            try:
+                validated_input = json.loads(tool_input)
+            except json.JSONDecodeError:
+                validated_input = None
+
+        # M2 — validation pre-execution (opt-in via canonical_tool).
+        if canonical_tool is not None and isinstance(validated_input, dict):
+            try:
+                from brain.providers.tool_validator import validate_tool_args
+                vres = validate_tool_args(canonical_tool, validated_input)
+                if not vres.ok:
+                    logger.info(
+                        "tool_validator: rejected tool=%s args (path=%s): %s",
+                        tool_name, vres.error_path, vres.error_message,
+                    )
+                    return ToolResult(
+                        tool_use_id=tool_use_id,
+                        result_json=json.dumps(
+                            {"error": "tool_args_validation_failed", "feedback": vres.feedback or vres.error_message},
+                            ensure_ascii=False,
+                        ),
+                        is_error=True,
+                        duration_ms=0,
+                    )
+            except Exception as exc:
+                # Validator best-effort: errori interni non bloccano l'esecuzione.
+                logger.debug("tool_validator skip per tool=%s: %s", tool_name, exc)
 
         stub = await self._ensure_channel()
         if isinstance(tool_input, str):
