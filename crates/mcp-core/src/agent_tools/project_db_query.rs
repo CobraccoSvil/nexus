@@ -24,7 +24,8 @@ use sqlx::Row;
 
 use super::AgentToolContext;
 use crate::project_db::exec::{
-    self, execute_query, open_pool, outcome_to_json, resolve_project_conn, QueryExecError,
+    self, archive_ddl, execute_query, open_pool, outcome_to_json, resolve_project_conn,
+    QueryExecError,
 };
 
 /// Tool `nexus_db_query`. Thin wrapper sopra `crate::project_db::exec::execute_query`.
@@ -73,7 +74,26 @@ pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -
     )
     .await
     {
-        Ok(outcome) => outcome_to_json(&outcome).to_string(),
+        Ok(outcome) => {
+            // Simmetria con l'endpoint REST: archivio le DDL fatte
+            // dall'agente come nota KB + file migration, separate per
+            // connessione in caso di multi-DB. Best effort: errori solo
+            // loggati.
+            let archive =
+                archive_ddl(&ctx.db, ctx.project_id, &sql, &outcome, connection.as_deref()).await;
+            let mut payload = outcome_to_json(&outcome);
+            if let (Some(archived), Value::Object(ref mut map)) = (archive, &mut payload) {
+                map.insert(
+                    "archived_ddl".to_string(),
+                    json!({
+                        "note_id": archived.note_id.to_string(),
+                        "migration_filename": archived.migration_filename,
+                        "migration_abs_path": archived.migration_abs_path,
+                    }),
+                );
+            }
+            payload.to_string()
+        }
         Err(e) => match e {
             QueryExecError::ConnectionError(m) => json!({"error": m}).to_string(),
             QueryExecError::Timeout => {

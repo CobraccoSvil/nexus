@@ -801,6 +801,7 @@ pub async fn archive_ddl(
     project_id: Uuid,
     sql: &str,
     outcome: &QueryExecOutcome,
+    connection_name: Option<&str>,
 ) -> Option<DdlArchiveOutcome> {
     // Scatta se il LAST statement e' DDL oppure se il batch (multi-statement)
     // contiene almeno una DDL. Cosi' "CREATE TABLE ...; INSERT ...; SELECT ..."
@@ -815,16 +816,24 @@ pub async fn archive_ddl(
     let object = second_meaningful_token_upper(trimmed); // TABLE / INDEX / VIEW / ...
     let target = third_meaningful_identifier(trimmed); // <nome>
 
+    // Identifica la connessione effettiva risolta lato archive: stessa logica
+    // di resolve_project_conn (None / vuoto -> primary). Cosi' il titolo
+    // della nota KB e il tag riflettono il DB su cui la DDL e' atterrata.
+    let effective_conn = resolve_connection_name(db, project_id, connection_name)
+        .await
+        .unwrap_or_else(|| "primary".to_string());
+
     let title = match (action.as_str(), object.as_str(), target.as_deref()) {
-        (a, "", _) => format!("DDL {} - {}", a, timestamp.format("%Y-%m-%d %H:%M")),
-        (a, o, Some(t)) => format!("DDL {} {} {}", a, o, t),
-        (a, o, None) => format!("DDL {} {}", a, o),
+        (a, "", _) => format!("DDL {} on '{}' - {}", a, effective_conn, timestamp.format("%Y-%m-%d %H:%M")),
+        (a, o, Some(t)) => format!("DDL {} {} {} on '{}'", a, o, t, effective_conn),
+        (a, o, None) => format!("DDL {} {} on '{}'", a, o, effective_conn),
     };
 
     let body_md = format!(
-        "**DDL eseguita dal pannello SQL** ({} righe modificate, {} ms)\n\n\
+        "**DDL eseguita sul DB `{}`** ({} righe modificate, {} ms)\n\n\
          ```sql\n{}\n```\n\n\
          _Archiviata automaticamente il {}_",
+        effective_conn,
         outcome.rows_affected.unwrap_or(0),
         outcome.duration_ms,
         trimmed,
@@ -832,7 +841,10 @@ pub async fn archive_ddl(
     );
 
     let note_id = Uuid::new_v4();
-    let tags: Vec<String> = vec!["schema-change".to_string(), "ddl".to_string()];
+    let mut tags: Vec<String> = vec!["schema-change".to_string(), "ddl".to_string()];
+    // Tag aggiuntivo con il nome della connessione, cosi' nel pannello KB e'
+    // facile filtrare le DDL per DB di destinazione (utile in multi-DB).
+    tags.push(format!("db:{}", effective_conn));
     let file_paths: Vec<String> = Vec::new();
 
     let note_insert = sqlx::query(
@@ -878,13 +890,23 @@ pub async fn archive_ddl(
     }
 
     // File migration (best effort - se lo scrivi senza root, salta).
-    let (mig_filename, mig_abs) = match write_migration_file(db, project_id, trimmed, &title).await
+    // Passa la connection effettiva cosi' multi-DB scrive in cartelle
+    // separate (nexus_migrations/<conn_name>/).
+    let (mig_filename, mig_abs) = match write_migration_file(
+        db,
+        project_id,
+        trimmed,
+        &title,
+        &effective_conn,
+    )
+    .await
     {
         Ok((name, abs)) => (Some(name), Some(abs)),
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 %project_id,
+                connection = %effective_conn,
                 "archive_ddl: scrittura file migration fallita"
             );
             (None, None)
@@ -907,18 +929,28 @@ pub async fn archive_ddl(
 
 /// Scrive il file migration progressivo `<root>/<migration_path>/<NNNN>_<slug>.sql`.
 ///
-/// - `migration_path` viene letto da `project_database_config.migration_path`
-///   (relativo alla root). Default: `nexus_migrations/`.
-/// - `<NNNN>` = max(numero progressivo gia' presente) + 1 (4 cifre, zero-padded).
+/// Path scelto con priorita':
+///   1. Override esplicito: `project_database_config.migration_path` per
+///      la **connessione specifica** (lookup per name, non per is_primary).
+///      Se non-null/non-vuoto, viene usato as-is (relativo alla root).
+///   2. Multi-DB default: se la connessione e' diversa dalla `primary`,
+///      la cartella default e' `nexus_migrations/<connection_name_safe>/`
+///      cosi' DB diversi non si sovrappongono nello stesso storico.
+///   3. Single-DB default: `nexus_migrations/` (retrocompatibilita').
+///
+/// - `<NNNN>` = max(numero progressivo gia' presente nella cartella) + 1
+///   (4 cifre, zero-padded). Il counter e' **per cartella** quindi ogni
+///   connessione ha la sua sequenza indipendente.
 /// - `<slug>` = primi 6 token sanificati del SQL.
 ///
-/// Ritorna `(filename, absolute_path)` su successo. Errore se la root del
-/// progetto non e' determinabile.
+/// `connection_name` e' il nome effettivo gia' risolto da
+/// `resolve_connection_name` (es. "primary", "analytics"). Mai vuoto.
 async fn write_migration_file(
     db: &PgPool,
     project_id: Uuid,
     sql: &str,
     title: &str,
+    connection_name: &str,
 ) -> Result<(String, String), String> {
     // 1) Root del progetto.
     let root_row = sqlx::query("SELECT repository_root_path FROM projects WHERE id = $1")
@@ -933,21 +965,34 @@ async fn write_migration_file(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "repository_root_path non configurato per il progetto".to_string())?;
 
-    // 2) migration_path dal config (primary). Default nexus_migrations/.
+    // 2) migration_path: prima cerca override sulla connessione SPECIFICA
+    //    (LOWER name match). Se vuoto -> fallback multi-DB-aware.
     let cfg_row = sqlx::query(
         "SELECT migration_path FROM project_database_config \
-         WHERE project_id = $1 AND is_primary = true \
-         ORDER BY updated_at DESC LIMIT 1",
+         WHERE project_id = $1 AND LOWER(name) = LOWER($2) \
+         LIMIT 1",
     )
     .bind(project_id)
+    .bind(connection_name)
     .fetch_optional(db)
     .await
     .map_err(|e| format!("query project_database_config: {e}"))?;
-    let migration_subdir: String = cfg_row
+    let explicit_path: Option<String> = cfg_row
         .and_then(|r| r.try_get::<Option<String>, _>("migration_path").unwrap_or(None))
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "nexus_migrations".to_string());
+        .filter(|s| !s.is_empty());
+
+    let migration_subdir: String = match explicit_path {
+        Some(p) => p,
+        None => {
+            // Default: primary -> nexus_migrations/, altre -> nexus_migrations/<slug>/
+            if connection_name.eq_ignore_ascii_case("primary") {
+                "nexus_migrations".to_string()
+            } else {
+                format!("nexus_migrations/{}", safe_dir_segment(connection_name))
+            }
+        }
+    };
 
     let mig_dir = std::path::Path::new(&root).join(&migration_subdir);
     tokio::fs::create_dir_all(&mig_dir)
@@ -979,10 +1024,12 @@ async fn write_migration_file(
     let header = format!(
         "-- {} (auto-archived by Nexus SQL panel)\n\
          -- Generated: {}\n\
-         -- Project: {}\n\n",
+         -- Project: {}\n\
+         -- Connection: {}\n\n",
         title,
         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
         project_id,
+        connection_name,
     );
     let content = format!("{}{}\n", header, sql.trim_end());
     tokio::fs::write(&abs_path, content)
@@ -1029,6 +1076,68 @@ fn third_meaningful_identifier(sql: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Risolve il nome effettivo della connessione da usare per logging/path:
+///   - Se `connection_name` e' `Some(name)` non vuoto -> ritorna `Some(name)`
+///     se quella connessione esiste, altrimenti `None`.
+///   - Se `connection_name` e' `None`/vuoto -> ritorna il `name` della
+///     connessione `is_primary=true`, altrimenti `None`.
+///
+/// Best effort: i caller fanno fallback a "primary" se ritorna None.
+async fn resolve_connection_name(
+    db: &PgPool,
+    project_id: Uuid,
+    connection_name: Option<&str>,
+) -> Option<String> {
+    if let Some(name) = connection_name.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        sqlx::query(
+            "SELECT name FROM project_database_config \
+             WHERE project_id = $1 AND LOWER(name) = LOWER($2) \
+             LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(name)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get::<String, _>("name").ok())
+    } else {
+        sqlx::query(
+            "SELECT name FROM project_database_config \
+             WHERE project_id = $1 AND is_primary = true \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get::<String, _>("name").ok())
+    }
+}
+
+/// Sanifica un nome connessione per usarlo come segmento di path: tiene solo
+/// ASCII alfanumerico + underscore + trattino, tronca a 40 char, lowercase.
+/// Garantisce che `nexus_migrations/<segment>/` sia un path filesystem-safe.
+fn safe_dir_segment(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let truncated: String = cleaned.chars().take(40).collect();
+    if truncated.trim_matches('_').is_empty() {
+        "unnamed".to_string()
+    } else {
+        truncated
+    }
 }
 
 fn slugify_sql(sql: &str) -> String {

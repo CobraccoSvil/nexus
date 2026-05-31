@@ -1860,8 +1860,17 @@ pub async fn execute_project_db_query(
 
     // Archiviazione DDL automatica (best effort): nota KB + file migration
     // versionato. La logica scatta SOLO per statement_kind="ddl" e per
-    // esecuzioni riuscite. Vedi `crate::project_db::exec::archive_ddl`.
-    let archive = archive_ddl(&state.db, project_id, &sql, &outcome).await;
+    // esecuzioni riuscite. Multi-DB: passa body.connection cosi' le
+    // migration di non-primary finiscono in nexus_migrations/<conn>/
+    // separate. Vedi `crate::project_db::exec::archive_ddl`.
+    let archive = archive_ddl(
+        &state.db,
+        project_id,
+        &sql,
+        &outcome,
+        body.connection.as_deref(),
+    )
+    .await;
     if let Some(ref archived) = archive {
         // Emit evento KnowledgeNoteCreated cosi' il pannello KB si rinfresca.
         let _ = nexus_events::dispatcher::emit(
