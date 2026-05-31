@@ -199,17 +199,57 @@ pub async fn install_playwright(
     }
 
     // ── 3. npx playwright install chromium ───────────────────────────────
-    let browser_result = run_with_timeout(
-        "npx",
-        &["playwright", "install", "chromium"],
-        &target_dir,
-        INSTALL_TIMEOUT_SECS,
-    )
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("playwright install fallito: {}", e)))?;
+    // Strategia:
+    //   3a. Detect passwordless sudo (sudo -n true). Se OK, prova
+    //       `playwright install --with-deps chromium` per installare anche le
+    //       system libs (libnspr4, libnss3, ...).
+    //   3b. Altrimenti, fallback: `playwright install chromium` (solo browser).
+    //   3c. Post-check: ldd sull'eseguibile chrome-headless-shell per
+    //       scoprire libs runtime mancanti. Se trovate, ritorna nel response
+    //       una sezione `manual_install_required` con il comando apt esatto.
+    //
+    // Fix 31/05/2026: il pannello Nexus "Abilita Playwright" segnalava
+    // 'Failed to install browsers Error: exit code 1' senza spiegare cosa
+    // fare. Ora se sudo non e' passwordless e mancano libs sistema, l'UI
+    // ottiene istruzioni esecutive copy-paste.
+    let passwordless_sudo = run_with_timeout("sudo", &["-n", "true"], &target_dir, 5)
+        .await
+        .map(|(_, _, code)| code == 0)
+        .unwrap_or(false);
 
-    // Non blocchiamo se browser install fallisce parzialmente: chromium potrebbe gia esistere.
+    let browser_result = if passwordless_sudo {
+        run_with_timeout(
+            "sudo",
+            &["-n", "npx", "playwright", "install", "--with-deps", "chromium"],
+            &target_dir,
+            INSTALL_TIMEOUT_SECS,
+        )
+        .await
+    } else {
+        run_with_timeout(
+            "npx",
+            &["playwright", "install", "chromium"],
+            &target_dir,
+            INSTALL_TIMEOUT_SECS,
+        )
+        .await
+    };
+    let browser_result = browser_result
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("playwright install fallito: {}", e)))?;
+
     let browser_status = browser_result.2;
+
+    // Post-check: rileva libs sistema mancanti tramite ldd sull'eseguibile.
+    let missing_libs = detect_missing_chromium_libs().await;
+    let manual_install_required = !missing_libs.is_empty() && !passwordless_sudo;
+    let apt_command = if manual_install_required {
+        Some(format!(
+            "sudo apt-get update && sudo apt-get install -y {}",
+            chromium_apt_packages_for(&missing_libs).join(" ")
+        ))
+    } else {
+        None
+    };
 
     // ── 4. Leggi port allocations e scegli dev port ──────────────────────
     let port_rows = sqlx::query(
@@ -317,7 +357,7 @@ test('app root risponde senza errori console', async ({ page }) => {
         .unwrap_or_else(|_| target_dir.to_string_lossy().to_string());
 
     Ok(Json(json!({
-        "ok": true,
+        "ok": missing_libs.is_empty(),
         "target_dir": relative_target,
         "dev_port": dev_port,
         "base_url": base_url,
@@ -326,8 +366,117 @@ test('app root risponde senza errori console', async ({ page }) => {
         "smoke_already_existed": smoke_exists,
         "force_applied": force,
         "browser_install_exit_code": browser_status,
+        "passwordless_sudo_available": passwordless_sudo,
+        "missing_system_libs": missing_libs,
+        "manual_install_required": manual_install_required,
+        "apt_command": apt_command,
+        "manual_install_hint": if manual_install_required {
+            Some(format!(
+                "Le libs sistema per Chromium mancano e sudo non e' passwordless. \
+                 Esegui MANUALMENTE nel terminale WSL: '{}'  - poi riprova Abilita Playwright. \
+                 Alternativa: configura sudoers passwordless per i pacchetti apt.",
+                apt_command.as_deref().unwrap_or("")
+            ))
+        } else { None },
         "port_allocations_count": allocations.len(),
         "available_allocations": allocations.iter().map(|(p, l)| json!({"port": p, "label": l})).collect::<Vec<_>>(),
         "setting_key": setting_key,
     })))
+}
+
+/// Detect chromium runtime libs mancanti via `ldd` sul chrome-headless-shell.
+/// Restituisce vec di nomi `.so` non risolti (es. "libnspr4.so", "libnss3.so").
+/// Empty vec = tutto OK.
+async fn detect_missing_chromium_libs() -> Vec<String> {
+    let cache_root = match std::env::var("HOME") {
+        Ok(h) => format!("{}/.cache/ms-playwright", h),
+        Err(_) => return Vec::new(),
+    };
+    let glob_root = match tokio::fs::read_dir(&cache_root).await {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    // Trova qualsiasi chromium_headless_shell-* / chromium-*
+    let mut chromium_dir: Option<PathBuf> = None;
+    let mut iter = glob_root;
+    while let Ok(Some(entry)) = iter.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("chromium") {
+            chromium_dir = Some(entry.path());
+            break;
+        }
+    }
+    let chromium_dir = match chromium_dir {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    // Trova l'eseguibile (chrome-headless-shell o chrome)
+    let candidates = ["chrome-headless-shell-linux64/chrome-headless-shell", "chrome-linux/chrome"];
+    let exe = candidates.iter()
+        .map(|c| chromium_dir.join(c))
+        .find(|p| std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false));
+    let exe = match exe {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    // Esegui ldd
+    let output = match Command::new("ldd").arg(&exe).output().await {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr),
+        Err(_) => return Vec::new(),
+    };
+    let mut missing = Vec::new();
+    for line in output.lines() {
+        if line.contains("not found") {
+            // Es: "	libnspr4.so => not found" -> estrai libnspr4.so
+            if let Some(name) = line.trim().split("=>").next().map(str::trim) {
+                if name.ends_with(".so") || name.contains(".so.") {
+                    missing.push(name.to_string());
+                }
+            }
+        }
+    }
+    missing
+}
+
+/// Mappa i `.so` mancanti ai pacchetti apt corrispondenti (Ubuntu/Debian).
+/// La lista deriva dalla doc Playwright `playwright install-deps`.
+fn chromium_apt_packages_for(missing: &[String]) -> Vec<&'static str> {
+    let mut pkgs: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    for m in missing {
+        let lib = m.split('.').next().unwrap_or(m);
+        match lib {
+            "libnspr4" => { pkgs.insert("libnspr4"); }
+            "libnss3" | "libnssutil3" | "libsmime3" => { pkgs.insert("libnss3"); }
+            "libatk-bridge-2" | "libatk-1" => {
+                pkgs.insert("libatk-bridge2.0-0");
+                pkgs.insert("libatk1.0-0");
+            }
+            "libxkbcommon" => { pkgs.insert("libxkbcommon0"); }
+            "libxcomposite" => { pkgs.insert("libxcomposite1"); }
+            "libxdamage" => { pkgs.insert("libxdamage1"); }
+            "libxfixes" => { pkgs.insert("libxfixes3"); }
+            "libxrandr" => { pkgs.insert("libxrandr2"); }
+            "libgbm" => { pkgs.insert("libgbm1"); }
+            "libasound" => { pkgs.insert("libasound2t64"); }
+            "libcairo" => { pkgs.insert("libcairo2"); }
+            "libpango-1" => { pkgs.insert("libpango-1.0-0"); }
+            "libdrm" => { pkgs.insert("libdrm2"); }
+            "libcups" => { pkgs.insert("libcups2"); }
+            "libatspi" => { pkgs.insert("libatspi2.0-0"); }
+            _ => {}
+        }
+    }
+    // Default sicuro: se anche un singolo .so manca, aggiungo set completo
+    // (apt e' idempotent, costa poco).
+    if !missing.is_empty() {
+        for p in ["libnspr4", "libnss3", "libatk-bridge2.0-0", "libatk1.0-0",
+                  "libxkbcommon0", "libxcomposite1", "libxdamage1", "libxfixes3",
+                  "libxrandr2", "libgbm1", "libasound2t64", "libcairo2",
+                  "libpango-1.0-0", "libdrm2", "libcups2", "libatspi2.0-0"] {
+            pkgs.insert(p);
+        }
+    }
+    let mut v: Vec<&'static str> = pkgs.into_iter().collect();
+    v.sort();
+    v
 }

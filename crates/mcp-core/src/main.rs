@@ -1370,6 +1370,14 @@ async fn main() -> anyhow::Result<()> {
                 )),
             )
             .route(
+                "/api/projects/:id/services/install-playwright",
+                post(project_workspace::playwright_install::install_playwright)
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_auth,
+                    )),
+            )
+            .route(
                 "/api/projects/:id/workbench-state",
                 get(project_workspace::get_workbench_state)
                     .put(project_workspace::update_workbench_state)
