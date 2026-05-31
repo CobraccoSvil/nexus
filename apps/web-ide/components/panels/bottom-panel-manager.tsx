@@ -541,10 +541,19 @@ function PlaywrightLiveProgress({
   projectId: string;
   tc: ReturnType<typeof useThemeColors>;
 }) {
+  // Fix NaN counter (31/05/2026): run.progress puo' essere {} (truthy ma
+  // senza i campi numerici), in tal caso le somme producevano NaN nel display.
+  // Normalizzo ogni campo numerico a 0 di default.
+  const normalizeProgress = (p: Partial<PlaywrightProgress> | undefined): PlaywrightProgress => ({
+    passed: typeof p?.passed === "number" ? p.passed : 0,
+    failed: typeof p?.failed === "number" ? p.failed : 0,
+    skipped: typeof p?.skipped === "number" ? p.skipped : 0,
+    flaky: typeof p?.flaky === "number" ? p.flaky : 0,
+    total: typeof p?.total === "number" ? p.total : undefined,
+    current_spec: p?.current_spec,
+  });
   const [progress, setProgress] = useState<PlaywrightProgress>(
-    (run.progress as PlaywrightProgress) || {
-      passed: 0, failed: 0, skipped: 0, flaky: 0,
-    }
+    normalizeProgress(run.progress as Partial<PlaywrightProgress> | undefined)
   );
   const [tail, setTail] = useState<string[]>([]);
   const esRef = useRef<EventSource | null>(null);
