@@ -676,6 +676,65 @@ async fn ensure_project_db_url(ctx: &AgentToolContext) -> (String, String) {
     }
 
     let url = format!("postgresql://{user}:{pwd}@{host}:{port}/{db_name}");
+
+    // Registra/aggiorna in project_database_config cosi' il pannello DB del
+    // frontend rileva il database. Senza questa registrazione, il DB veniva
+    // creato sul container postgres-app e usato dall'agente (via env var
+    // NEXUS_PROJECT_DB_URL/DATABASE_URL), ma il pannello DB Nexus restava
+    // vuoto perche' legge solo da project_database_config.
+    //
+    // Idempotente via ON CONFLICT sul vincolo unique (project_id, lower(name)).
+    // connection_secret e' bytea contenente la URL raw (decifrato a runtime
+    // con ENCODE escape — vedi project_db_set_connection per il pattern).
+    let upsert_res = sqlx::query(
+        r#"INSERT INTO project_database_config
+            (id, project_id, name, engine, hosting_mode, connection_secret,
+             migration_tool, migration_path, is_primary, allow_ddl_override,
+             detection_metadata, created_at, updated_at)
+           VALUES (gen_random_uuid(), $1, 'primary', 'postgres', 'internal', $2::bytea,
+                   NULL, NULL, true, false, '{"source":"auto_provisioning"}'::jsonb,
+                   NOW(), NOW())
+           ON CONFLICT ON CONSTRAINT uq_project_database_config_project_name
+           DO UPDATE SET
+             connection_secret = EXCLUDED.connection_secret,
+             engine = EXCLUDED.engine,
+             hosting_mode = EXCLUDED.hosting_mode,
+             updated_at = NOW()"#,
+    )
+    .bind(ctx.project_id)
+    .bind(url.as_bytes())
+    .execute(&*ctx.db)
+    .await;
+
+    match upsert_res {
+        Ok(r) => {
+            if r.rows_affected() > 0 {
+                let action = if r.rows_affected() == 1 { "created_or_updated" } else { "updated" };
+                tracing::info!(
+                    "ensure_project_db_url: project_database_config registered \
+                     project_id={} db_name={} action={}",
+                    ctx.project_id, db_name, action
+                );
+                // Notifica il pannello DB frontend via dispatcher SSE.
+                nexus_events::dispatcher::emit_global(
+                    ctx.project_id,
+                    nexus_events::event::ProjectEvent::DbConfigUpdated {
+                        name: "primary".to_string(),
+                        engine: Some("postgres".to_string()),
+                        action: action.to_string(),
+                    },
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "ensure_project_db_url: UPSERT project_database_config fallita ({}). \
+                 URL iniettato comunque, ma pannello DB UI non vedra' la connessione.",
+                e
+            );
+        }
+    }
+
     (url, db_name)
 }
 
