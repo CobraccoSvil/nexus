@@ -166,10 +166,55 @@ fn hex_prefix(bytes: &[u8]) -> String {
     bytes.iter().take(16).map(|b| format!("{b:02x}")).collect()
 }
 
+/// Rimuove commenti riga (`-- ...\n`) e commenti blocco (`/* ... */`)
+/// iniziali, insieme allo whitespace, ritornando lo slice "significativo"
+/// che inizia con il primo token reale dello statement.
+///
+/// Necessario perche' il backend riceve dal pannello SQL statement come
+/// `-- Verifica\n SELECT * FROM users;` e `is_read_only`/`classify_statement`
+/// guardavano solo `sql.trim_start()` → leggevano `--` come primo token e
+/// classificavano la statement come `other` invece di `select`. Il bug
+/// faceva ritornare il payload come `mode=write` e nascondeva colonne/righe
+/// della SELECT finale nel pannello.
+fn skip_leading_noise(sql: &str) -> &str {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    loop {
+        // Salta whitespace.
+        while i < len && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if i >= len {
+            return "";
+        }
+        let c = bytes[i] as char;
+        // Commento riga `-- ...` fino a newline.
+        if c == '-' && i + 1 < len && bytes[i + 1] as char == '-' {
+            i += 2;
+            while i < len && bytes[i] as char != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Commento blocco `/* ... */` (NON nested — sufficiente per SQL utente).
+        if c == '/' && i + 1 < len && bytes[i + 1] as char == '*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] as char == '*' && bytes[i + 1] as char == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(len);
+            continue;
+        }
+        // Primo carattere significativo: ritorna lo slice.
+        return &sql[i..];
+    }
+}
+
 /// Determina se la query e' di sola lettura (SELECT / WITH ... SELECT / SHOW /
 /// EXPLAIN). Usato per scegliere fetch_all vs execute.
 pub fn is_read_only(sql: &str) -> bool {
-    let t = sql.trim_start().to_lowercase();
+    let t = skip_leading_noise(sql).to_lowercase();
     t.starts_with("select")
         || t.starts_with("show")
         || t.starts_with("explain")
@@ -181,7 +226,7 @@ pub fn is_read_only(sql: &str) -> bool {
 ///
 /// Valori: "select", "insert", "update", "delete", "ddl", "tx", "other".
 pub fn classify_statement(sql: &str) -> &'static str {
-    let t = sql.trim_start().to_lowercase();
+    let t = skip_leading_noise(sql).to_lowercase();
     if t.starts_with("select") || t.starts_with("with") || t.starts_with("show") || t.starts_with("explain") {
         "select"
     } else if t.starts_with("insert") {
