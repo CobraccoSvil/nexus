@@ -412,13 +412,17 @@ pub async fn list_project_db_connections(
         _ => {}
     }
 
+    // NB: NON filtriamo per hosting_mode. I DB 'internal' sono quelli
+    // auto-provisionati da Nexus (es. <slug>_app sul container postgres-app
+    // tramite ensure_project_db_url) e l'utente vuole vederli nel pannello.
+    // Bug osservato 31/05/2026: filtro `hosting_mode <> 'internal'` nascondeva
+    // il DB di Beauty-Book anche se registrato in project_database_config.
     let rows = sqlx::query(
         r#"
         SELECT id, name, engine, hosting_mode, migration_tool, migration_path,
                allow_ddl_override, is_primary, created_at, updated_at
         FROM project_database_config
         WHERE project_id = $1
-          AND (hosting_mode IS NULL OR hosting_mode <> 'internal')
         ORDER BY is_primary DESC, LOWER(name)
         "#,
     )

@@ -1279,7 +1279,7 @@ export function ProjectDbPanel({ project }: Props) {
         <div style={{ padding: 10, display: "flex", flexDirection: "column", gap: 6, borderBottom: `1px solid ${tc.border}` }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <div style={{ fontSize: 11, fontWeight: 600, color: tc.text }}>
-              DB del progetto ({connections.filter((c) => c.hosting_mode !== "internal").length})
+              DB del progetto ({connections.length})
             </div>
             <button
               type="button"
@@ -1299,7 +1299,7 @@ export function ProjectDbPanel({ project }: Props) {
               + Aggiungi DB
             </button>
           </div>
-          {connections.filter((c) => c.hosting_mode !== "internal").map((c) => (
+          {connections.map((c) => (
             <div
               key={c.id}
               style={{
