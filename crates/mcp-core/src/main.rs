@@ -1522,6 +1522,12 @@ async fn main() -> anyhow::Result<()> {
                     axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
                 ),
             )
+            .route(
+                "/api/projects/:id/db/query",
+                post(project_db_routes::execute_project_db_query).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
+            )
             // ── knowledge ─────────────────────────────────────────
             .route(
                 "/api/projects/:id/knowledge/notes",

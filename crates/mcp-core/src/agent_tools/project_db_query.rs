@@ -1,4 +1,4 @@
-//! Tool per gestione runtime del DB applicativo del progetto.
+//! Tool agente per gestione runtime del DB applicativo del progetto.
 //!
 //! Bug osservato 31/05/2026: l'utente chiede "inserisci un utente con email X"
 //! ma il modello (Vertex gemini-2.5-pro) tenta `psql` (non installato nel WSL
@@ -6,175 +6,36 @@
 //! applicativo del progetto: i tool `project_db_*` coprono solo le migration
 //! versionate, non query interattive.
 //!
-//! Questo modulo espone 3 tool builtin:
+//! Questo modulo espone 3 tool builtin (thin wrapper sopra
+//! `crate::project_db::exec` per non duplicare la logica con l'endpoint
+//! REST `POST /api/projects/:id/db/query`):
 //!   - `nexus_db_query`    : esegue SQL arbitrario (SELECT/INSERT/UPDATE/DELETE/DDL)
 //!   - `nexus_db_tables`   : lista le tabelle dello schema public
 //!   - `nexus_db_describe` : colonne/tipi/vincoli/indici di una tabella
 //!
 //! Sicurezza (regola E CLAUDE.md - isolamento progetti):
 //!   - La connessione viene SEMPRE risolta da `project_database_config` del
-//!     progetto attivo (via `load_primary_config`). Mai una connessione
-//!     arbitraria passata dal modello.
-//!   - Guard-rail anti-contaminazione: se la connection string punta al DB
-//!     infrastruttura Nexus (db `nexus` sulla porta 5433), la query viene
-//!     RIFIUTATA. Un tool applicativo non deve mai toccare il DB di sistema.
+//!     progetto attivo (via `crate::project_db::exec::resolve_project_conn`).
+//!   - Guard-rail anti-contaminazione verso il DB infrastruttura Nexus.
 //!   - Limiti: timeout query 30s, max 1000 righe ritornate.
 
 use serde_json::{json, Value};
-use sqlx::{Column, Row, TypeInfo};
-use sqlx::postgres::PgPoolOptions;
-use std::time::Duration;
+use sqlx::Row;
 
 use super::AgentToolContext;
+use crate::project_db::exec::{
+    self, execute_query, open_pool, outcome_to_json, resolve_project_conn, QueryExecError,
+};
 
-const QUERY_TIMEOUT_SECS: u64 = 30;
-const MAX_ROWS: usize = 1000;
-const MAX_CELL_CHARS: usize = 20_000;
-
-/// Risolve la connection string del DB primario del progetto, applicando il
-/// guard-rail anti-contaminazione verso il DB Nexus.
-///
-/// Legge `connection_secret` (bytea con la URL raw, scritta da
-/// ensure_project_db_url / project_db_set_connection) dal pool Nexus (ctx.db).
-async fn resolve_project_conn(ctx: &AgentToolContext) -> Result<String, String> {
-    let row = sqlx::query(
-        "SELECT connection_secret FROM project_database_config \
-         WHERE project_id = $1 AND is_primary = true \
-         ORDER BY updated_at DESC LIMIT 1",
-    )
-    .bind(ctx.project_id)
-    .fetch_optional(&*ctx.db)
-    .await
-    .map_err(|e| format!("query project_database_config fallita: {e}"))?
-    .ok_or_else(|| {
-        "Nessun database configurato per questo progetto. Usa il pannello \
-         Database del progetto per aggiungere una connessione, oppure esegui \
-         un comando che avvii il DB applicativo (auto-provisioning)."
-            .to_string()
-    })?;
-
-    let secret: Option<Vec<u8>> = row.try_get("connection_secret").unwrap_or(None);
-    let conn = secret
-        .and_then(|b| String::from_utf8(b).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "connection_secret vuoto o non decodificabile".to_string())?;
-
-    // Guard-rail: blocca connessioni verso il DB infrastruttura Nexus.
-    let lower = conn.to_lowercase();
-    let touches_nexus_db = (lower.contains("/nexus") || lower.contains("database=nexus"))
-        && (lower.contains(":5433") || lower.contains("postgres-nexus") || lower.contains("ideai-postgres-nexus"));
-    if touches_nexus_db {
-        return Err(
-            "SICUREZZA: la connessione del progetto punta al DB infrastruttura \
-             Nexus. Operazione rifiutata per isolamento. Configura un DB \
-             applicativo dedicato per il progetto."
-                .to_string(),
-        );
-    }
-    Ok(conn)
-}
-
-/// Apre un pool sqlx (max 2 conn) verso il DB del progetto.
-async fn open_pool(conn: &str) -> Result<sqlx::PgPool, String> {
-    PgPoolOptions::new()
-        .max_connections(2)
-        .acquire_timeout(Duration::from_secs(10))
-        .connect(conn)
-        .await
-        .map_err(|e| format!("connessione DB progetto fallita: {e}"))
-}
-
-/// Converte una cella di PgRow in serde_json::Value in base al tipo Postgres.
-/// I tipi non gestiti esplicitamente ricadono su String; se anche quella
-/// fallisce, ritorna null con un marcatore di tipo.
-fn cell_to_json(row: &sqlx::postgres::PgRow, idx: usize, type_name: &str) -> Value {
-    macro_rules! try_as {
-        ($t:ty) => {
-            row.try_get::<Option<$t>, _>(idx).ok().map(|o| o.map(Value::from))
-        };
-    }
-    let val: Option<Option<Value>> = match type_name {
-        "BOOL" => row.try_get::<Option<bool>, _>(idx).ok().map(|o| o.map(Value::from)),
-        "INT2" => row.try_get::<Option<i16>, _>(idx).ok().map(|o| o.map(|v| Value::from(v as i64))),
-        "INT4" => row.try_get::<Option<i32>, _>(idx).ok().map(|o| o.map(|v| Value::from(v as i64))),
-        "INT8" => row.try_get::<Option<i64>, _>(idx).ok().map(|o| o.map(Value::from)),
-        "FLOAT4" => row.try_get::<Option<f32>, _>(idx).ok().map(|o| o.map(|v| Value::from(v as f64))),
-        "FLOAT8" => try_as!(f64),
-        // NUMERIC: la feature bigdecimal/decimal di sqlx non e' attiva, quindi
-        // proviamo f64 (perdita precisione accettabile per display); se il
-        // Decode fallisce a runtime ricade nel fallback finale (marcatore).
-        "NUMERIC" => try_as!(f64),
-        "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" | "CHAR" | "CITEXT" => try_as!(String),
-        "UUID" => row.try_get::<Option<uuid::Uuid>, _>(idx).ok().map(|o| o.map(|v| Value::from(v.to_string()))),
-        "JSON" | "JSONB" => row.try_get::<Option<Value>, _>(idx).ok(),
-        "TIMESTAMPTZ" => row
-            .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(idx)
-            .ok()
-            .map(|o| o.map(|v| Value::from(v.to_rfc3339()))),
-        "TIMESTAMP" => row
-            .try_get::<Option<chrono::NaiveDateTime>, _>(idx)
-            .ok()
-            .map(|o| o.map(|v| Value::from(v.to_string()))),
-        "DATE" => row
-            .try_get::<Option<chrono::NaiveDate>, _>(idx)
-            .ok()
-            .map(|o| o.map(|v| Value::from(v.to_string()))),
-        "TIME" => row
-            .try_get::<Option<chrono::NaiveTime>, _>(idx)
-            .ok()
-            .map(|o| o.map(|v| Value::from(v.to_string()))),
-        "BYTEA" => row
-            .try_get::<Option<Vec<u8>>, _>(idx)
-            .ok()
-            .map(|o| o.map(|v| Value::from(format!("\\x{} ({} byte)", hex_prefix(&v), v.len())))),
-        _ => None,
-    };
-    match val {
-        Some(Some(v)) => clamp_cell(v),
-        Some(None) => Value::Null, // colonna NULL
-        None => {
-            // Tipo non gestito: prova String, poi marcatore.
-            match row.try_get::<Option<String>, _>(idx) {
-                Ok(Some(s)) => clamp_cell(Value::from(s)),
-                Ok(None) => Value::Null,
-                Err(_) => Value::from(format!("<tipo non serializzabile: {type_name}>")),
-            }
-        }
-    }
-}
-
-/// Tronca le celle stringa enormi per non saturare il context window.
-fn clamp_cell(v: Value) -> Value {
-    if let Value::String(s) = &v {
-        if s.chars().count() > MAX_CELL_CHARS {
-            let truncated: String = s.chars().take(MAX_CELL_CHARS).collect();
-            return Value::from(format!("{truncated}...[TRONCATO]"));
-        }
-    }
-    v
-}
-
-fn hex_prefix(bytes: &[u8]) -> String {
-    bytes.iter().take(16).map(|b| format!("{b:02x}")).collect()
-}
-
-/// Determina se la query e' di sola lettura (SELECT/WITH...SELECT/SHOW/EXPLAIN).
-fn is_read_only(sql: &str) -> bool {
-    let t = sql.trim_start().to_lowercase();
-    t.starts_with("select") || t.starts_with("show") || t.starts_with("explain") || t.starts_with("with")
-}
-
-/// Tool `nexus_db_query`.
+/// Tool `nexus_db_query`. Thin wrapper sopra `crate::project_db::exec::execute_query`.
 pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -> String {
     let sql = match input.get("sql").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => return json!({"error": "Parametro 'sql' obbligatorio (stringa non vuota)."}).to_string(),
+        _ => {
+            return json!({"error": "Parametro 'sql' obbligatorio (stringa non vuota)."}).to_string();
+        }
     };
 
-    // Parametri opzionali: array JSON. Ogni valore viene bindato come TEXT
-    // (NULL -> bind null). Il modello usa cast espliciti nel SQL quando serve
-    // un tipo non-testo: es. INSERT INTO t(qty) VALUES ($1::int).
     let params: Vec<Option<String>> = match input.get("params") {
         Some(Value::Array(arr)) => arr
             .iter()
@@ -190,109 +51,25 @@ pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -
     let max_rows = input
         .get("max_rows")
         .and_then(Value::as_u64)
-        .map(|n| (n as usize).min(MAX_ROWS))
-        .unwrap_or(MAX_ROWS);
+        .map(|n| n as usize);
 
-    let conn = match resolve_project_conn(ctx).await {
-        Ok(c) => c,
-        Err(e) => return json!({"error": e}).to_string(),
-    };
-    let pool = match open_pool(&conn).await {
-        Ok(p) => p,
-        Err(e) => return json!({"error": e}).to_string(),
-    };
-
-    let read_only = is_read_only(&sql);
-
-    // Costruisce la query con i bind.
-    let mut q = sqlx::query(&sql);
-    for p in &params {
-        q = q.bind(p.clone());
-    }
-
-    let started = std::time::Instant::now();
-
-    if read_only {
-        // fetch_all con timeout
-        let fetch = tokio::time::timeout(Duration::from_secs(QUERY_TIMEOUT_SECS), q.fetch_all(&pool)).await;
-        let rows = match fetch {
-            Err(_) => {
-                pool.close().await;
-                return json!({"error": format!("timeout query dopo {QUERY_TIMEOUT_SECS}s")}).to_string();
+    match execute_query(&ctx.db, ctx.project_id, &sql, &params, max_rows).await {
+        Ok(outcome) => outcome_to_json(&outcome).to_string(),
+        Err(e) => match e {
+            QueryExecError::ConnectionError(m) => json!({"error": m}).to_string(),
+            QueryExecError::Timeout => {
+                json!({"error": e.message()}).to_string()
             }
-            Ok(Err(e)) => {
-                pool.close().await;
-                return json!({"error": format!("errore SQL: {e}"), "sql_excerpt": sql.chars().take(200).collect::<String>()}).to_string();
-            }
-            Ok(Ok(r)) => r,
-        };
-        let duration_ms = started.elapsed().as_millis() as u64;
-
-        let truncated = rows.len() > max_rows;
-        let slice = &rows[..rows.len().min(max_rows)];
-
-        // Estrai nomi colonne dalla prima riga (se presente).
-        let columns: Vec<Value> = slice
-            .first()
-            .map(|r| {
-                r.columns()
-                    .iter()
-                    .map(|c| json!({"name": c.name(), "type": c.type_info().name()}))
-                    .collect()
+            QueryExecError::Sql(_) => json!({
+                "error": e.message(),
+                "sql_excerpt": sql.chars().take(200).collect::<String>(),
             })
-            .unwrap_or_default();
-
-        let out_rows: Vec<Value> = slice
-            .iter()
-            .map(|row| {
-                let mut obj = serde_json::Map::new();
-                for (i, col) in row.columns().iter().enumerate() {
-                    let type_name = col.type_info().name();
-                    obj.insert(col.name().to_string(), cell_to_json(row, i, type_name));
-                }
-                Value::Object(obj)
-            })
-            .collect();
-
-        pool.close().await;
-        json!({
-            "ok": true,
-            "mode": "read",
-            "columns": columns,
-            "row_count": out_rows.len(),
-            "rows": out_rows,
-            "truncated": truncated,
-            "duration_ms": duration_ms,
-        })
-        .to_string()
-    } else {
-        // DML/DDL: execute con timeout, ritorna rows_affected.
-        let exec = tokio::time::timeout(Duration::from_secs(QUERY_TIMEOUT_SECS), q.execute(&pool)).await;
-        let res = match exec {
-            Err(_) => {
-                pool.close().await;
-                return json!({"error": format!("timeout query dopo {QUERY_TIMEOUT_SECS}s")}).to_string();
-            }
-            Ok(Err(e)) => {
-                pool.close().await;
-                return json!({"error": format!("errore SQL: {e}"), "sql_excerpt": sql.chars().take(200).collect::<String>()}).to_string();
-            }
-            Ok(Ok(r)) => r,
-        };
-        let duration_ms = started.elapsed().as_millis() as u64;
-        pool.close().await;
-        json!({
-            "ok": true,
-            "mode": "write",
-            "rows_affected": res.rows_affected(),
-            "duration_ms": duration_ms,
-            "hint": "Per leggere i dati inseriti usa nexus_db_query con una SELECT, oppure aggiungi RETURNING alla INSERT.",
-        })
-        .to_string()
+            .to_string(),
+        },
     }
 }
 
-/// Tool `nexus_db_tables`: lista tabelle + righe stimate dello schema public.
+/// Tool `nexus_db_tables`: lista tabelle + righe stimate dello schema.
 pub(super) async fn tool_nexus_db_tables(ctx: &AgentToolContext, input: &Value) -> String {
     let schema = input
         .get("schema")
@@ -300,7 +77,7 @@ pub(super) async fn tool_nexus_db_tables(ctx: &AgentToolContext, input: &Value) 
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "public".to_string());
 
-    let conn = match resolve_project_conn(ctx).await {
+    let conn = match resolve_project_conn(&ctx.db, ctx.project_id).await {
         Ok(c) => c,
         Err(e) => return json!({"error": e}).to_string(),
     };
@@ -352,7 +129,7 @@ pub(super) async fn tool_nexus_db_describe(ctx: &AgentToolContext, input: &Value
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "public".to_string());
 
-    let conn = match resolve_project_conn(ctx).await {
+    let conn = match resolve_project_conn(&ctx.db, ctx.project_id).await {
         Ok(c) => c,
         Err(e) => return json!({"error": e}).to_string(),
     };
@@ -361,7 +138,6 @@ pub(super) async fn tool_nexus_db_describe(ctx: &AgentToolContext, input: &Value
         Err(e) => return json!({"error": e}).to_string(),
     };
 
-    // Colonne
     let col_rows = sqlx::query(
         r#"SELECT column_name, data_type, is_nullable, column_default,
                   character_maximum_length
@@ -402,7 +178,6 @@ pub(super) async fn tool_nexus_db_describe(ctx: &AgentToolContext, input: &Value
         .to_string();
     }
 
-    // Indici (incluse PK/unique)
     let idx_rows = sqlx::query(
         r#"SELECT indexname, indexdef
            FROM pg_indexes
@@ -432,6 +207,12 @@ pub(super) async fn tool_nexus_db_describe(ctx: &AgentToolContext, input: &Value
         "table": table,
         "columns": columns,
         "indexes": indexes,
+        // Costanti esposte per documentazione (riusate via exec module).
+        "_limits": {
+            "max_rows": exec::MAX_ROWS,
+            "query_timeout_secs": exec::QUERY_TIMEOUT_SECS,
+            "max_cell_chars": exec::MAX_CELL_CHARS,
+        }
     })
     .to_string()
 }

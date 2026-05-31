@@ -7,6 +7,10 @@
 //!   POST /api/projects/:id/db/migrations/apply   → apply_project_migrations
 //!   POST /api/projects/:id/db/migrations/rollback→ rollback_project_migration
 //!   POST /api/projects/:id/db/override-request   → request_ddl_override
+//!   POST /api/projects/:id/db/query              → execute_project_db_query
+//!                                                  (pannello SQL frontend; thin
+//!                                                  wrapper sopra
+//!                                                  crate::project_db::exec)
 
 use axum::{
     extract::{Extension, Path as AxumPath, State},
@@ -18,6 +22,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
 
+use crate::project_db::exec::{archive_ddl, execute_query, QueryExecError};
 use crate::{auth::Claims, AppState};
 
 type ApiError = (StatusCode, Json<Value>);
@@ -83,6 +88,19 @@ pub struct ApplyMigrationsBody {
 pub struct OverrideRequestBody {
     pub sql: String,
     pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExecuteQueryBody {
+    /// Statement SQL (SELECT/INSERT/UPDATE/DELETE/DDL). Obbligatorio.
+    pub sql: String,
+    /// Parametri opzionali (array JSON). Bindati come TEXT; usare cast nel SQL
+    /// per tipi non-stringa (es. `$1::int`).
+    #[serde(default)]
+    pub params: Vec<Value>,
+    /// Limite righe ritornate per query read. Default 1000 (MAX_ROWS).
+    #[serde(default)]
+    pub max_rows: Option<usize>,
 }
 
 // ── GET /api/projects/:id/db ─────────────────────────────────────────────────
@@ -1761,5 +1779,109 @@ fn build_sqlserver_config(conn_str: &str) -> anyhow::Result<tiberius::Config> {
     }
 
     Ok(config)
+}
+
+// ── POST /api/projects/:id/db/query ──────────────────────────────────────────
+//
+// Esegue una query SQL ad-hoc sul DB applicativo del progetto, invocata dal
+// pannello SQL del frontend (componente `sql-query-panel.tsx`). La logica
+// vera vive in `crate::project_db::exec::execute_query`, condivisa con il tool
+// MCP `nexus_db_query` (regola H: niente duplicazione).
+//
+// Sicurezza: la connessione viene risolta da `project_database_config` con
+// guard-rail anti-Nexus (vedi `crate::project_db::exec::resolve_project_conn`).
+// L'agente del frontend non puo' passare una connection string arbitraria.
+//
+// Dopo l'esecuzione emette un evento dispatcher `ProjectEvent::DbQueryRun`
+// per far ri-renderizzare lo store frontend (RecentQueriesSection ecc.).
+
+pub async fn execute_project_db_query(
+    State(state): State<AppState>,
+    Extension(_claims): Extension<Claims>,
+    AxumPath(project_id): AxumPath<Uuid>,
+    Json(body): Json<ExecuteQueryBody>,
+) -> ApiResult {
+    let sql = body.sql.trim().to_string();
+    if sql.is_empty() {
+        return Err(api_err(
+            StatusCode::BAD_REQUEST,
+            "Campo 'sql' obbligatorio (stringa non vuota).",
+        ));
+    }
+
+    // Normalizza params: array JSON -> Vec<Option<String>> (NULL -> None;
+    // ogni altro valore -> String). Stesso contratto del tool agente.
+    let params: Vec<Option<String>> = body
+        .params
+        .iter()
+        .map(|v| match v {
+            Value::Null => None,
+            Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        })
+        .collect();
+
+    let outcome = execute_query(&state.db, project_id, &sql, &params, body.max_rows)
+        .await
+        .map_err(|e| match e {
+            QueryExecError::ConnectionError(m) => api_err(StatusCode::BAD_REQUEST, m),
+            QueryExecError::Timeout => api_err(StatusCode::REQUEST_TIMEOUT, e.message()),
+            QueryExecError::Sql(_) => api_err(StatusCode::UNPROCESSABLE_ENTITY, e.message()),
+        })?;
+
+    // Emit dispatcher event: il frontend (store project-dispatcher) lo
+    // intercetta e aggiorna RecentQueriesSection nel pannello DB esistente.
+    let rows_for_event: i64 = match outcome.mode {
+        "read" => outcome.row_count as i64,
+        _ => outcome.rows_affected.unwrap_or(0) as i64,
+    };
+    let _ = nexus_events::dispatcher::emit(
+        &state.project_channels,
+        project_id,
+        nexus_events::ProjectEvent::DbQueryRun {
+            query_id: None,
+            duration_ms: outcome.duration_ms as i64,
+            rows: rows_for_event,
+            statement_kind: outcome.statement_kind.clone(),
+        },
+    );
+
+    // Archiviazione DDL automatica (best effort): nota KB + file migration
+    // versionato. La logica scatta SOLO per statement_kind="ddl" e per
+    // esecuzioni riuscite. Vedi `crate::project_db::exec::archive_ddl`.
+    let archive = archive_ddl(&state.db, project_id, &sql, &outcome).await;
+    if let Some(ref archived) = archive {
+        // Emit evento KnowledgeNoteCreated cosi' il pannello KB si rinfresca.
+        let _ = nexus_events::dispatcher::emit(
+            &state.project_channels,
+            project_id,
+            nexus_events::ProjectEvent::KnowledgeNoteCreated {
+                note_id: archived.note_id,
+                title: format!("DDL archiviata · {}", archived
+                    .migration_filename
+                    .clone()
+                    .unwrap_or_else(|| "(senza file)".into())),
+                intent: Some("database_migration".to_string()),
+            },
+        );
+    }
+
+    // Costruisce il payload di risposta. Stesso schema usato dal tool agente
+    // (serializzato da `crate::project_db::exec::outcome_to_json`), arricchito
+    // con il blocco `archived_ddl` quando rilevante.
+    let mut payload = crate::project_db::exec::outcome_to_json(&outcome);
+    if let Some(archived) = archive {
+        if let Value::Object(ref mut map) = payload {
+            map.insert(
+                "archived_ddl".to_string(),
+                json!({
+                    "note_id": archived.note_id.to_string(),
+                    "migration_filename": archived.migration_filename,
+                    "migration_abs_path": archived.migration_abs_path,
+                }),
+            );
+        }
+    }
+    Ok(Json(payload))
 }
 

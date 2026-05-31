@@ -18,6 +18,7 @@
 
 pub mod adapters;
 pub mod detector;
+pub mod exec;
 pub mod runner;
 
 use std::path::PathBuf;
