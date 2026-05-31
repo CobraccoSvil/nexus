@@ -87,6 +87,12 @@ class AgentProfile:
         "nexus_dev_server_diagnose",
         # Tool verify scaffolding post-extract: check completezza prima del run.
         "nexus_verify_scaffold",
+        # Tool gestione DB applicativo del progetto (31/05/2026): query ad-hoc,
+        # lista tabelle, describe. Sostituiscono psql (non installato) per
+        # SELECT/INSERT/DDL sul DB dedicato del progetto.
+        "nexus_db_query",
+        "nexus_db_tables",
+        "nexus_db_describe",
     }
 
     def filter_tools(self, tools_json: list[dict]) -> list[dict]:

@@ -31,6 +31,7 @@ pub(crate) mod command_hints;
 pub(crate) mod shadcn_setup;
 pub(crate) mod dev_diagnostics;
 pub(crate) mod scaffold_verifier;
+pub(crate) mod project_db_query;
 pub(crate) mod testing;
 pub(crate) mod ports;
 pub(crate) mod todos;
@@ -1352,6 +1353,42 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     }
   },
   {
+    "name": "nexus_db_query",
+    "description": "Esegue SQL arbitrario sul DATABASE APPLICATIVO del progetto attivo (SELECT/INSERT/UPDATE/DELETE/CREATE TABLE/ALTER/DROP). USA QUESTO per qualsiasi operazione sui dati del progetto: NON usare psql (non installato) ne run_command. La connessione e' risolta automaticamente da project_database_config (DB applicativo dedicato, isolato dal DB Nexus). SELECT ritorna {columns, rows, row_count, truncated}; INSERT/UPDATE/DELETE/DDL ritornano {rows_affected}. Per query parametrizzate usa $1,$2 in 'sql' e passa i valori in 'params' (es. INSERT INTO users(email) VALUES ($1) con params=['x@y.it']); per tipi non-testo usa cast nel SQL ($1::int). Aggiungi RETURNING per leggere il record inserito. Se la tabella non esiste, creala prima con CREATE TABLE.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "sql": {"type": "string", "description": "Statement SQL. Una sola statement per chiamata."},
+        "params": {"type": "array", "items": {}, "description": "Parametri posizionali per $1,$2,... Bindati come testo; usa cast nel SQL per tipi non-testo."},
+        "max_rows": {"type": "integer", "description": "Max righe ritornate da una SELECT (default e cap: 1000)."}
+      },
+      "required": ["sql"]
+    }
+  },
+  {
+    "name": "nexus_db_tables",
+    "description": "Lista le tabelle del DATABASE APPLICATIVO del progetto (schema public di default) con stima righe per tabella. Usalo per orientarti prima di scrivere query: scopri quali tabelle esistono. Se il DB e' vuoto (0 tabelle), creale con nexus_db_query CREATE TABLE.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "schema": {"type": "string", "description": "Schema da listare (default 'public')."}
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "nexus_db_describe",
+    "description": "Mostra colonne (nome, tipo, nullable, default), indici e vincoli di una tabella del DB applicativo del progetto. Usalo prima di una INSERT/UPDATE per conoscere le colonne esatte e i loro tipi.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "table": {"type": "string", "description": "Nome tabella."},
+        "schema": {"type": "string", "description": "Schema (default 'public')."}
+      },
+      "required": ["table"]
+    }
+  },
+  {
     "name": "nexus_describe_image_attachment",
     "description": "Descrive un'immagine allegata alla chat usando un modello vision. Restituisce description testuale e ocr_text (se l'immagine contiene testo leggibile). Usalo quando l'inspector ha rilevato kind=image_* e devi capire il contenuto visivo (mockup UI, screenshot, foto, diagrammi).",
     "input_schema": {
@@ -1585,12 +1622,6 @@ pub fn is_mutating_tool(name: &str) -> bool {
     )
     // run_in_terminal è intenzionalmente NON mutante: il comando appare nel terminale
     // ma l'agente non ha visibilità dell'output, quindi non blocca la conferma.
-}
-
-#[allow(dead_code)]
-pub(super) fn shell_escape(s: &str) -> String {
-    // Wraps in single quotes, escaping existing single quotes
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Controlla se il comando corrisponde a uno dei pattern long-running caricati dal DB.
@@ -1913,6 +1944,9 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "nexus_install_shadcn_components" => shadcn_setup::tool_nexus_install_shadcn_components(ctx, input).await,
         "nexus_dev_server_diagnose" => dev_diagnostics::tool_nexus_dev_server_diagnose(ctx, input).await,
         "nexus_verify_scaffold" => scaffold_verifier::tool_nexus_verify_scaffold(ctx, input).await,
+        "nexus_db_query" => project_db_query::tool_nexus_db_query(ctx, input).await,
+        "nexus_db_tables" => project_db_query::tool_nexus_db_tables(ctx, input).await,
+        "nexus_db_describe" => project_db_query::tool_nexus_db_describe(ctx, input).await,
         // FASE 2 "resa Figma Make": verifica visiva (screenshot vs design).
         "nexus_visual_compare" => visual_compare::tool_nexus_visual_compare(ctx, input).await,
         "nexus_search_semantic" => rag_search::tool_nexus_search_semantic(ctx, input).await,
