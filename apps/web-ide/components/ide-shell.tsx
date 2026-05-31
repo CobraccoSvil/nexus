@@ -82,6 +82,18 @@ const EditorArea = dynamic(() => import("./editor/editor-area.lazy"), {
   ssr: false,
 });
 
+const SqlQueryPanel = dynamic(
+  () => import("./sql/sql-query-panel").then((m) => m.SqlQueryPanel),
+  {
+    loading: () => (
+      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12 }}>
+        Caricamento pannello SQL…
+      </div>
+    ),
+    ssr: false,
+  },
+);
+
 const SidebarManager = dynamic(() => import("./sidebar/sidebar-manager.lazy"), {
   loading: () => <div style={{ width: 300 }} />,
   ssr: false,
@@ -457,6 +469,33 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     };
     window.addEventListener("nexus:editor:open-file", handler);
     return () => window.removeEventListener("nexus:editor:open-file", handler);
+  }, []);
+
+  // Bridge globale `nexus:sql:open` -> apri pannello SQL nella colonna destra.
+  // Permette al markdown renderer della chat (chip "Esegui" sui blocchi ```sql)
+  // di aprire il pannello SQL e pre-compilare l'editor.
+  // Detail atteso: { sql?: string, autoRun?: boolean }
+  // Il componente SqlQueryPanel ascolta a sua volta `nexus:sql:set-content`
+  // per ricevere il SQL: qui ci limitiamo a switchare la vista destra e
+  // rilanciare l'evento con il contenuto.
+  const [rightView, setRightView] = useState<"editor" | "sql">("editor");
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      const ce = ev as CustomEvent<{ sql?: string; autoRun?: boolean }>;
+      setRightView("sql");
+      // Defer per assicurare che il pannello sia montato prima di iniettare il SQL.
+      const sql = typeof ce.detail?.sql === "string" ? ce.detail.sql : undefined;
+      const autoRun = ce.detail?.autoRun === true;
+      if (sql !== undefined) {
+        setTimeout(() => {
+          window.dispatchEvent(
+            new CustomEvent("nexus:sql:set-content", { detail: { sql, autoRun } }),
+          );
+        }, 50);
+      }
+    };
+    window.addEventListener("nexus:sql:open", handler);
+    return () => window.removeEventListener("nexus:sql:open", handler);
   }, []);
   const [leftWidth, setLeftWidth] = useState(300);
   const [rightWidth, setRightWidth] = useState(430);
@@ -1788,19 +1827,37 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = "transparent"; }}
             />
           </div>
-          <div style={{ minWidth: 0, minHeight: 0, height: "100%", overflow: "hidden" }}>
-            <EditorArea
-              editorGroups={editorGroups}
-              activeEditorGroupId={activeEditorGroupId}
-              activeProject={activeProject}
-              problemItems={problemItems}
-              onSetActiveGroup={setActiveEditorGroupId}
-              onSetEditorGroups={setEditorGroups}
-              onSaveActive={() => void saveActiveEditor()}
-              onRenameActive={() => void handleRenameActive()}
-              onDeleteActive={() => void handleDeleteActive()}
-              onConfirmCloseTab={confirmCloseDirtyTab}
+          <div
+            style={{
+              minWidth: 0,
+              minHeight: 0,
+              height: "100%",
+              overflow: "hidden",
+              display: "grid",
+              gridTemplateRows: "26px minmax(0, 1fr)",
+            }}
+          >
+            <RightViewTabs
+              rightView={rightView}
+              setRightView={setRightView}
+              tc={tc}
             />
+            {rightView === "editor" ? (
+              <EditorArea
+                editorGroups={editorGroups}
+                activeEditorGroupId={activeEditorGroupId}
+                activeProject={activeProject}
+                problemItems={problemItems}
+                onSetActiveGroup={setActiveEditorGroupId}
+                onSetEditorGroups={setEditorGroups}
+                onSaveActive={() => void saveActiveEditor()}
+                onRenameActive={() => void handleRenameActive()}
+                onDeleteActive={() => void handleDeleteActive()}
+                onConfirmCloseTab={confirmCloseDirtyTab}
+              />
+            ) : (
+              <SqlQueryPanel project={activeProject} />
+            )}
           </div>
         </div>
       );
@@ -2668,5 +2725,61 @@ function PanelTabButton({
     >
       {tab.label}
     </button>
+  );
+}
+
+// ── Tab bar pannello destro: switcha tra Editor (file Monaco) e SQL (pannello
+// gestore query). Vedi listener `nexus:sql:open` in ide-shell che imposta
+// rightView="sql" su richiesta dalla chat.
+function RightViewTabs({
+  rightView,
+  setRightView,
+  tc,
+}: {
+  rightView: "editor" | "sql";
+  setRightView: (v: "editor" | "sql") => void;
+  tc: ReturnType<typeof useThemeColors>;
+}) {
+  const Tab = ({
+    label,
+    active,
+    onClick,
+  }: {
+    label: string;
+    active: boolean;
+    onClick: () => void;
+  }) => (
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        padding: "0 12px",
+        height: "100%",
+        background: active ? tc.bgActive : "transparent",
+        color: active ? tc.text : tc.textMuted,
+        border: "none",
+        borderRight: `1px solid ${tc.border}`,
+        cursor: "pointer",
+        fontSize: 12,
+        fontWeight: active ? 600 : 400,
+        whiteSpace: "nowrap",
+      }}
+    >
+      {label}
+    </button>
+  );
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "stretch",
+        borderBottom: `1px solid ${tc.border}`,
+        background: tc.bgSidebar,
+        fontSize: 12,
+      }}
+    >
+      <Tab label="Editor" active={rightView === "editor"} onClick={() => setRightView("editor")} />
+      <Tab label="SQL" active={rightView === "sql"} onClick={() => setRightView("sql")} />
+    </div>
   );
 }

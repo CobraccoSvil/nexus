@@ -3381,6 +3381,47 @@ export async function listProjectMigrations(projectId: string): Promise<{ migrat
   return fetchJson(`${API_BASE}/api/projects/${projectId}/db/migrations`);
 }
 
+// ── SQL panel: esecuzione ad-hoc query sul DB applicativo del progetto ──────
+
+export type SqlExecuteResult =
+  | {
+      ok: true;
+      mode: "read";
+      statement_kind: string;
+      columns: Array<{ name: string; type: string }>;
+      row_count: number;
+      rows: Array<Record<string, unknown>>;
+      truncated: boolean;
+      duration_ms: number;
+    }
+  | {
+      ok: true;
+      mode: "write";
+      statement_kind: string;
+      rows_affected: number;
+      duration_ms: number;
+      hint?: string;
+    };
+
+/**
+ * Esegue una query SQL ad-hoc sul DB applicativo del progetto.
+ * Backend: `POST /api/projects/:id/db/query` (vedi
+ * crates/mcp-core/src/project_db_routes.rs::execute_project_db_query).
+ * La connessione e' risolta server-side da project_database_config
+ * (guard-rail anti-Nexus presente). Limiti: timeout 30s, max 1000 righe.
+ */
+export async function executeProjectDbQuery(
+  projectId: string,
+  sql: string,
+  params?: unknown[],
+  maxRows?: number
+): Promise<SqlExecuteResult> {
+  return fetchJson(`${API_BASE}/api/projects/${projectId}/db/query`, {
+    method: "POST",
+    body: JSON.stringify({ sql, params: params ?? [], max_rows: maxRows }),
+  });
+}
+
 export async function createProjectMigration(
   projectId: string,
   name: string,

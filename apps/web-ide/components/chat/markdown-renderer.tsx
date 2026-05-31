@@ -207,6 +207,13 @@ export const MarkdownBlock = React.memo(function MarkdownBlock({
                   />
                 );
               }
+              // Blocchi SQL → chip "Esegui nel pannello SQL" che apre il
+              // pannello destro pre-compilato. Vedi listener `nexus:sql:open`
+              // in ide-shell.tsx + SqlQueryPanel.
+              if (langMatch && langMatch[1].toLowerCase() === "sql") {
+                const code = extractText(childEl.props?.children).replace(/\n$/, "");
+                return <SqlChatBlock code={code} tc={tc} />;
+              }
             }
             // Fallback: rendering pre standard
             return (
@@ -307,3 +314,123 @@ export const MarkdownBlock = React.memo(function MarkdownBlock({
     </div>
   );
 });
+
+// ── SqlChatBlock: blocco SQL della chat con pulsante "Esegui nel pannello SQL"
+// che dispatcha `nexus:sql:open` con il contenuto. Il listener in ide-shell
+// apre il pannello SQL destro e pre-compila l'editor (vedi anche
+// `nexus:sql:set-content` ascoltato da SqlQueryPanel).
+//
+// Niente esecuzione inline: per le query DDL serve l'archiviazione automatica
+// in Knowledge Base + file migration, gestita dall'endpoint REST chiamato
+// SOLO dal pannello SQL. Mostrare il risultato qui scavalcherebbe quella
+// logica.
+function SqlChatBlock({ code, tc }: { code: string; tc: ReturnType<typeof useThemeColors> }) {
+  const trimmed = code.trim();
+  const isDdl = React.useMemo(() => {
+    const t = trimmed.toLowerCase();
+    return (
+      t.startsWith("create") ||
+      t.startsWith("alter") ||
+      t.startsWith("drop") ||
+      t.startsWith("truncate") ||
+      t.startsWith("rename")
+    );
+  }, [trimmed]);
+
+  const open = React.useCallback(
+    (autoRun: boolean) => {
+      window.dispatchEvent(
+        new CustomEvent("nexus:sql:open", { detail: { sql: trimmed, autoRun } }),
+      );
+    },
+    [trimmed],
+  );
+
+  return (
+    <div
+      style={{
+        margin: "12px 0",
+        border: `1px solid ${tc.border}`,
+        borderRadius: 6,
+        overflow: "hidden",
+        background: tc.bgInput,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "4px 10px",
+          background: tc.bgCard,
+          borderBottom: `1px solid ${tc.border}`,
+          fontSize: 11,
+          color: tc.textMuted,
+        }}
+      >
+        <span style={{ fontWeight: 600, color: tc.accent }}>SQL</span>
+        {isDdl && (
+          <span
+            title="DDL: dopo l'esecuzione viene archiviata in Knowledge Base e come file migration."
+            style={{
+              padding: "1px 6px",
+              background: "#7a5b00",
+              color: "#fff8d6",
+              borderRadius: 3,
+              fontSize: 10,
+            }}
+          >
+            schema-change
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={() => open(false)}
+          style={{
+            marginLeft: "auto",
+            padding: "2px 10px",
+            background: "transparent",
+            color: tc.accent,
+            border: `1px solid ${tc.accent}`,
+            borderRadius: 4,
+            cursor: "pointer",
+            fontSize: 11,
+          }}
+          title="Apri nel pannello SQL (non esegue automaticamente)"
+        >
+          Apri nel pannello SQL
+        </button>
+        <button
+          type="button"
+          onClick={() => open(true)}
+          style={{
+            padding: "2px 10px",
+            background: tc.accent,
+            color: "#fff",
+            border: "none",
+            borderRadius: 4,
+            cursor: "pointer",
+            fontSize: 11,
+          }}
+          title="Apre il pannello SQL ed esegue subito la query"
+        >
+          Esegui
+        </button>
+      </div>
+      <pre
+        style={{
+          margin: 0,
+          padding: "8px 12px",
+          overflowX: "auto",
+          fontFamily: '"JetBrains Mono", "Consolas", monospace',
+          fontSize: 12,
+          lineHeight: 1.5,
+          color: tc.text,
+          whiteSpace: "pre",
+        }}
+      >
+        {trimmed}
+      </pre>
+    </div>
+  );
+}
