@@ -28,6 +28,7 @@ pub(crate) mod service;
 pub(crate) mod sandbox;
 pub(crate) mod command;
 pub(crate) mod command_hints;
+pub(crate) mod shadcn_setup;
 pub(crate) mod testing;
 pub(crate) mod ports;
 pub(crate) mod todos;
@@ -1290,6 +1291,29 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     }
   },
   {
+    "name": "nexus_install_shadcn_components",
+    "description": "Crea stub TSX dei componenti shadcn/ui piu' usati (button, input, label, card, alert, tabs, table, badge, separator, sonner, dialog, dropdown-menu, select, popover, textarea) senza richiedere 'npx shadcn add'. Risolve il problema dei loop di errore quando il modello tenta shadcn-ui (rebrand a shadcn), peer dep rotte, o cache npx corrotta. Gli stub usano Tailwind classes e bastano a far buildare un'app React+TS+Vite scaffolded da Figma. Per UI ricca, sostituiscili poi con shadcn ufficiale.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "components": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Lista nomi componenti da creare (es. ['button','input','card']). Se omesso, installa il set base: button/input/label/card/alert/tabs/sonner."
+        },
+        "target_dir": {
+          "type": "string",
+          "description": "Path relativo alla project root dove creare gli stub. Default: 'src/components/ui'. Per progetti con struttura figma_export usa 'figma_export/src/app/components/ui'."
+        },
+        "overwrite": {
+          "type": "boolean",
+          "description": "Se true, sovrascrive file esistenti. Default false (skip se esiste)."
+        }
+      },
+      "required": []
+    }
+  },
+  {
     "name": "nexus_describe_image_attachment",
     "description": "Descrive un'immagine allegata alla chat usando un modello vision. Restituisce description testuale e ocr_text (se l'immagine contiene testo leggibile). Usalo quando l'inspector ha rilevato kind=image_* e devi capire il contenuto visivo (mockup UI, screenshot, foto, diagrammi).",
     "input_schema": {
@@ -1848,6 +1872,7 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "nexus_extract_figma_structure" => figma_tools::tool_nexus_extract_figma_structure(ctx, input).await,
         "nexus_extract_figma_code" => figma_tools::tool_nexus_extract_figma_code(ctx, input).await,
         "nexus_describe_image_attachment" => vision_tools::tool_nexus_describe_image_attachment(ctx, input).await,
+        "nexus_install_shadcn_components" => shadcn_setup::tool_nexus_install_shadcn_components(ctx, input).await,
         // FASE 2 "resa Figma Make": verifica visiva (screenshot vs design).
         "nexus_visual_compare" => visual_compare::tool_nexus_visual_compare(ctx, input).await,
         "nexus_search_semantic" => rag_search::tool_nexus_search_semantic(ctx, input).await,

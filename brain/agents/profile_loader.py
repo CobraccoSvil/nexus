@@ -80,6 +80,9 @@ class AgentProfile:
         "run_command", "run_service",
         "nexus_mcp_tool_search", "nexus_mcp_tool_call",
         "nexus_inspect_attachment",
+        # Tool scaffolding shadcn (mig 0231): risolve loop su 'npx shadcn add'
+        # creando stub funzionali in src/components/ui/ senza npm.
+        "nexus_install_shadcn_components",
     }
 
     def filter_tools(self, tools_json: list[dict]) -> list[dict]:
