@@ -85,6 +85,92 @@ fn is_chat_compatible_model(model: &str) -> bool {
     true
 }
 
+/// Inferisce le capabilities di un modello dal nome quando l'API discovery
+/// non le ritorna esplicite (caso comune per Google Vertex). Restituisce una
+/// lista pronta per `capabilities` JSONB di ai_price_catalog.
+///
+/// Bug osservato 30/05/2026: `gemini-3.1-pro-preview-customtools` passa il
+/// probe-on-insert (HTTP 200) ma resta con capabilities=[]. Il routing filtra
+/// per capability matching e quel modello (potenzialmente il piu' capable di
+/// Vertex per tool use) non viene mai scelto. Soluzione: dopo il probe OK,
+/// se capabilities e' vuoto, popolare con una stima euristica basata sul nome.
+///
+/// Regole (in ordine di specificita'):
+///   - *-pro / *-pro-preview / *-pro-* (es. customtools)  -> reasoning/code/long-context
+///   - *-flash-lite                                        -> chat/simple
+///   - *-flash / *-flash-preview                           -> code/chat/fix
+///   - *-opus / *-sonnet                                   -> reasoning/code/long-context
+///   - *-haiku                                             -> chat/simple
+///   - *-codex / *-codestral / *-devstral                  -> code
+///   - default                                             -> chat (sempre safe)
+///
+/// Restituisce sempre almeno `["chat"]`. Non infersce vision/image/audio
+/// (queste richiedono detection esplicita lato provider).
+pub(crate) fn infer_capabilities_from_name(provider: &str, model: &str) -> Vec<&'static str> {
+    let m = model.to_ascii_lowercase();
+    // Aggiungi marker tool_use_optimized per modelli con suffisso "customtools".
+    let mut caps: Vec<&'static str> = Vec::new();
+    if m.contains("customtools") {
+        caps.push("tool_use_optimized");
+    }
+    let base: &[&str] = match provider {
+        "google" => {
+            if m.contains("pro") {
+                &["reasoning", "code", "long-context", "chat"]
+            } else if m.contains("flash-lite") {
+                &["chat", "simple"]
+            } else if m.contains("flash") {
+                &["code", "chat", "fix"]
+            } else {
+                &["chat"]
+            }
+        }
+        "anthropic" => {
+            if m.contains("opus") || m.contains("sonnet") {
+                &["reasoning", "code", "long-context", "chat"]
+            } else if m.contains("haiku") {
+                &["chat", "simple"]
+            } else {
+                &["chat"]
+            }
+        }
+        "openai" => {
+            if m.contains("codex") {
+                &["code", "chat"]
+            } else if m.contains("nano") || m.contains("mini") {
+                &["chat", "simple"]
+            } else {
+                &["reasoning", "code", "chat"]
+            }
+        }
+        "mistral" => {
+            if m.contains("codestral") || m.contains("devstral") {
+                &["code", "chat"]
+            } else if m.contains("large") || m.contains("magistral") {
+                &["reasoning", "code", "chat"]
+            } else if m.contains("medium") {
+                &["code", "chat"]
+            } else {
+                &["chat"]
+            }
+        }
+        "deepseek" => {
+            if m.contains("pro") || m.contains("reasoner") {
+                &["reasoning", "code", "chat"]
+            } else {
+                &["code", "chat"]
+            }
+        }
+        _ => &["chat"],
+    };
+    for c in base {
+        if !caps.contains(c) {
+            caps.push(c);
+        }
+    }
+    caps
+}
+
 /// Loop principale: chiamato da `main.rs` startup via `tokio::spawn(...)`.
 /// `orchestrator` (Option) e' usato per il probe-on-insert dei nuovi modelli
 /// scoperti dall'API discovery — se None, i nuovi modelli vengono inseriti
@@ -114,6 +200,15 @@ pub async fn catalog_sync_loop(db: PgPool, orchestrator: Option<Arc<Orchestrator
             Err(e) => {
                 tracing::warn!("catalog_sync: tick fallito: {}", e);
             }
+        }
+
+        // Dopo OGNI tick (anche se non ha trovato nuovi modelli), esegui
+        // auto-upgrade della routing matrix + auto-populate escalation.
+        // Senza questo i campi escalation_* della routing matrix restavano
+        // NULL per i nuovi intent/modelli, e `lookup_with_budget` non
+        // escalava mai a un modello piu' capable per task lunghi.
+        if let Err(e) = crate::models::auto_upgrade_models_and_routing(&db).await {
+            tracing::warn!("catalog_sync: auto_upgrade_models_and_routing fallito: {e}");
         }
 
         // Sleep fino al prossimo tick (interval dinamico dalle settings).
@@ -301,24 +396,37 @@ async fn sync_provider(
                             if let Some(orch) = orchestrator {
                                 match probe_model_on_insert(orch, provider, api_model).await {
                                     ProbeOnInsertResult::Healthy => {
+                                        // Infer capabilities dal nome: il modello e'
+                                        // ora utilizzabile, ma il routing filtra per
+                                        // capability matching e capabilities=[] lo
+                                        // renderebbe invisibile. Popoliamo SOLO se
+                                        // attualmente vuoto (rispetta override admin).
+                                        let inferred_caps = infer_capabilities_from_name(provider, api_model);
+                                        let caps_json = json!(inferred_caps);
                                         let _ = sqlx::query(
                                             "UPDATE ai_price_catalog \
                                              SET is_enabled = true, auto_disabled_at = NULL, \
-                                                 auto_disabled_reason = NULL, updated_at = NOW() \
+                                                 auto_disabled_reason = NULL, updated_at = NOW(), \
+                                                 capabilities = CASE \
+                                                     WHEN capabilities IS NULL OR capabilities = '[]'::jsonb \
+                                                         THEN $3::jsonb \
+                                                     ELSE capabilities \
+                                                 END \
                                              WHERE provider = $1 AND model = $2 AND is_enabled = false",
                                         )
                                         .bind(provider)
                                         .bind(api_model)
+                                        .bind(&caps_json)
                                         .execute(db)
                                         .await;
                                         audit_log(
                                             db, provider, api_model, "probe_ok_on_insert",
-                                            json!({"action":"auto_enabled"}),
+                                            json!({"action":"auto_enabled", "inferred_capabilities": inferred_caps}),
                                         )
                                         .await;
                                         tracing::info!(
-                                            "catalog_sync[{}]: probe OK su nuovo modello '{}' -> abilitato",
-                                            provider, api_model
+                                            "catalog_sync[{}]: probe OK su nuovo modello '{}' -> abilitato (caps inferred: {:?})",
+                                            provider, api_model, inferred_caps
                                         );
                                     }
                                     ProbeOnInsertResult::ModelBroken(kind) => {

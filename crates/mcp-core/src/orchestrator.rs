@@ -1099,14 +1099,20 @@ fn route_model_with_mode(
     };
 
     // Routing matrix: (intent_key, mode) → (provider, model)
-    let _ = estimated_tokens; // placeholder: usato in fix branch sopra per scegliere fix_semplice vs fix_complesso
+    // Budget-aware lookup: usa `lookup_with_budget` che applica le regole
+    // escalation (mig 0120) quando `estimated_tokens >= threshold`. Cosi'
+    // task lunghi/complessi prendono automaticamente il modello escalation
+    // (es. google: 2.5-pro -> 3.1-pro-preview-customtools sopra soglia).
+    // Senza questo (bug 30/05/2026) i campi escalation_* del DB erano popolati
+    // ma mai usati — il routing prendeva sempre il modello base.
+    let est_i32: i32 = estimated_tokens.try_into().unwrap_or(i32::MAX);
 
     // Helper: skip provider in cooldown — chiamarli produrrebbe billing/rate-limit
     // error che farebbe fallire l'intera richiesta utente.
     let in_cooldown = |p: &str| crate::provider_cooldown::is_provider_in_cooldown(p);
 
-    // 1. Lookup diretto (intent_key, mode) nella matrice DB
-    if let Some((provider, model)) = matrix.lookup(intent_key, mode) {
+    // 1. Lookup diretto (intent_key, mode) nella matrice DB con escalation
+    if let Some((provider, model)) = matrix.lookup_with_budget(intent_key, mode, est_i32) {
         if !in_cooldown(&provider) {
             return RoutingDecision {
                 provider,
@@ -1117,9 +1123,9 @@ fn route_model_with_mode(
         tracing::warn!("route_model_with_mode: skip provider {} (in cooldown)", provider);
     }
 
-    // 2. Fallback: prova lo stesso intent con mode 'bilanciata'
+    // 2. Fallback: prova lo stesso intent con mode 'bilanciata' (budget-aware)
     if mode != "bilanciata" {
-        if let Some((provider, model)) = matrix.lookup(intent_key, "bilanciata") {
+        if let Some((provider, model)) = matrix.lookup_with_budget(intent_key, "bilanciata", est_i32) {
             if !in_cooldown(&provider) {
                 return RoutingDecision {
                     provider,
@@ -1133,7 +1139,7 @@ fn route_model_with_mode(
 
     // 2b. Fallback: cerca QUALSIASI mode per lo stesso intent_key con un provider non in cooldown
     for try_mode in &["bilanciata", "approfondita", "veloce", "economica"] {
-        if let Some((provider, model)) = matrix.lookup(intent_key, try_mode) {
+        if let Some((provider, model)) = matrix.lookup_with_budget(intent_key, try_mode, est_i32) {
             if !in_cooldown(&provider) {
                 return RoutingDecision {
                     provider,

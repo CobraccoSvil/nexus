@@ -278,9 +278,21 @@ const FAMILY_RULES: &[(&str /* provider */, &str /* regex */, &str /* label */)]
     ("anthropic", r"^claude-sonnet-\d+-\d+$",                 "claude-sonnet"),
     ("anthropic", r"^claude-haiku-\d+-\d+$",                  "claude-haiku"),
     // Google
-    ("google",    r"^gemini-\d+(\.\d+)?-flash$",              "gemini-flash"),
-    ("google",    r"^gemini-\d+(\.\d+)?-flash-lite$",         "gemini-flash-lite"),
-    ("google",    r"^gemini-\d+(\.\d+)?-pro$",                "gemini-pro"),
+    // Famiglie stable (suffisso vuoto). I preview/customtools sono famiglie
+    // separate: tipicamente piu' capable ma instabili (possono sparire),
+    // quindi vengono promossi solo all'interno della propria famiglia, mai
+    // sovrascrivono lo stable a parita' di versione major.
+    ("google",    r"^gemini-\d+(\.\d+)?-flash$",                            "gemini-flash"),
+    ("google",    r"^gemini-\d+(\.\d+)?-flash-lite$",                       "gemini-flash-lite"),
+    ("google",    r"^gemini-\d+(\.\d+)?-pro$",                              "gemini-pro"),
+    // Preview families: includono -preview / -preview-customtools / -preview-NN-YYYY
+    ("google",    r"^gemini-\d+(\.\d+)?-pro-preview(-[a-z0-9-]+)?$",        "gemini-pro-preview"),
+    ("google",    r"^gemini-\d+(\.\d+)?-flash-preview(-[a-z0-9-]+)?$",      "gemini-flash-preview"),
+    ("google",    r"^gemini-\d+(\.\d+)?-flash-lite-preview(-[a-z0-9-]+)?$", "gemini-flash-lite-preview"),
+    // Latest aliases (Google rolling alias)
+    ("google",    r"^gemini-pro-latest$",                                   "gemini-pro-latest-alias"),
+    ("google",    r"^gemini-flash-latest$",                                 "gemini-flash-latest-alias"),
+    ("google",    r"^gemini-flash-lite-latest$",                            "gemini-flash-lite-latest-alias"),
     // Mistral: matcha sia il formato data abbreviata (large-2411) sia
     // la nuova nomenclatura semantica (large-3). parse_version skippa
     // i YYMM date, quindi "large-3" [3] vince su "large-2411" [].
@@ -388,14 +400,33 @@ pub async fn auto_upgrade_models_and_routing(db: &sqlx::PgPool) -> Result<(), St
         if candidates.is_empty() {
             continue;
         }
-        // Ordina semanticamente per parse_version desc, con tiebreaker
-        // sulla lunghezza: a parita di versione preferisco il nome piu
-        // corto (alias non-dated, es. claude-opus-4-7 < claude-opus-4-7-20260416).
+        // Ordina semanticamente:
+        // 1) parse_version desc (versione semantica)
+        // 2) presenza 'customtools' → vince (Google: tool_use_optimized variant)
+        // 3) nome piu' corto (alias non-dated, es. claude-opus-4-7 < claude-opus-4-7-20260416)
+        //
+        // Il punto 2 e' necessario per la famiglia gemini-pro-preview: la
+        // variant `-customtools` ha lo STESSO numero di versione del base
+        // `gemini-3.1-pro-preview` ma e' la versione tool-use-optimized, da
+        // preferire quando serve l'escalation per task tool-heavy.
         let mut sorted = candidates.clone();
         sorted.sort_by(|a, b| {
             let va = parse_version(a);
             let vb = parse_version(b);
-            vb.cmp(&va).then(a.len().cmp(&b.len()))
+            let cmp_ver = vb.cmp(&va);
+            if cmp_ver != std::cmp::Ordering::Equal {
+                return cmp_ver;
+            }
+            // Tiebreaker: customtools vince
+            let a_ct = a.contains("customtools");
+            let b_ct = b.contains("customtools");
+            match (a_ct, b_ct) {
+                (true, false) => return std::cmp::Ordering::Less,   // a vince
+                (false, true) => return std::cmp::Ordering::Greater, // b vince
+                _ => {}
+            }
+            // Tiebreaker finale: nome piu' corto
+            a.len().cmp(&b.len())
         });
         let top = sorted[0].clone();
         promotions.push((provider.to_string(), family_label.to_string(), top.clone()));
@@ -420,6 +451,11 @@ pub async fn auto_upgrade_models_and_routing(db: &sqlx::PgPool) -> Result<(), St
         // Aggiorna routing_matrix: per ogni record con stesso provider e
         // model "vecchio" della famiglia (model che matcha la regex ma e
         // diverso dal top), sostituisci con top.
+        // RISPETTA `manual_override`: i record con manual_override=true sono
+        // pinned dall'admin (es. ha scelto esplicitamente un preview) e NON
+        // vengono toccati dall'auto-upgrade. Bug osservato 30/05/2026: senza
+        // questo, ogni restart di mcp-core ri-sostituiva il preview scelto a
+        // mano con lo stable top family.
         let to_replace: Vec<String> = candidates
             .iter()
             .filter(|m| **m != top)
@@ -429,7 +465,8 @@ pub async fn auto_upgrade_models_and_routing(db: &sqlx::PgPool) -> Result<(), St
             let res = sqlx::query(
                 "UPDATE nexus_routing_matrix \
                  SET model_id = $1, updated_at = NOW() \
-                 WHERE provider = $2 AND model_id = ANY($3)",
+                 WHERE provider = $2 AND model_id = ANY($3) \
+                   AND (manual_override IS NULL OR manual_override = false)",
             )
             .bind(&top)
             .bind(provider)
@@ -444,11 +481,16 @@ pub async fn auto_upgrade_models_and_routing(db: &sqlx::PgPool) -> Result<(), St
                     );
                 }
             }
-            // Idem per default_model_for_provider (se il default e vecchio della stessa famiglia)
+            // Idem per default_model_for_provider (se il default e vecchio
+            // della stessa famiglia). NB: la tabella nexus_provider_default_model
+            // non ha un campo manual_override; come heuristica, rispettiamo
+            // le note che iniziano con "manual fix" o "pin:" come marker
+            // admin (utente puo' impostarlo con UPDATE in console SQL admin).
             let _ = sqlx::query(
                 "UPDATE nexus_provider_default_model \
                  SET model_id = $1, updated_at = NOW(), notes = COALESCE(notes,'') || ' | auto-upgrade ' || $2 \
-                 WHERE provider = $3 AND model_id = ANY($4)",
+                 WHERE provider = $3 AND model_id = ANY($4) \
+                   AND COALESCE(notes,'') !~* '(manual fix|^pin:|admin-pinned)'",
             )
             .bind(&top)
             .bind(family_label.to_string())
@@ -467,6 +509,96 @@ pub async fn auto_upgrade_models_and_routing(db: &sqlx::PgPool) -> Result<(), St
         tracing::debug!("  {} / {} -> top = {}", p, fam, top);
     }
 
+    // ── Auto-popolamento escalation_* (fix 30/05/2026) ────────────────────
+    // Mig 0120 popolo' solo alcuni intent legacy con threshold 100k. I nuovi
+    // modelli scoperti via catalog_sync e i nuovi intent non avevano mai
+    // escalation valorizzata, quindi `lookup_with_budget` non escalava mai.
+    // Qui scopriamo dinamicamente le coppie (base_stable, upgrade) per ogni
+    // provider e popoliamo le righe routing con escalation_* dove sono NULL.
+    if let Err(e) = auto_populate_escalations(db, &promotions).await {
+        tracing::warn!("auto_populate_escalations failed: {e}");
+    }
+
+    Ok(())
+}
+
+/// Popola `escalation_*` nella routing matrix per le righe dove sono NULL.
+///
+/// Strategia: per ogni provider che ha BOTH una famiglia "stable" e una
+/// famiglia "preview/upgrade" (es. google: gemini-pro stable + gemini-pro-preview),
+/// aggiorna le routing entries con base_model nella stable famiglia per
+/// puntare l'escalation al top della famiglia upgrade.
+///
+/// Coppie supportate (provider, base_label, escalation_label, threshold):
+///   - google: gemini-pro -> gemini-pro-preview (threshold 8000)
+///   - google: gemini-flash -> gemini-pro (threshold 6000)
+///   - anthropic: claude-sonnet -> claude-opus (threshold 50000)
+///   - anthropic: claude-haiku -> claude-sonnet (threshold 30000)
+///
+/// Threshold ragionevoli per default: prompt grandi/tool count alto. L'admin
+/// puo' override via UPDATE manuale (rispettato grazie a manual_override).
+async fn auto_populate_escalations(
+    db: &sqlx::PgPool,
+    promotions: &[(String, String, String)],
+) -> Result<(), String> {
+    // (provider, base_family_label, upgrade_family_label, threshold)
+    const ESCALATION_PAIRS: &[(&str, &str, &str, i32)] = &[
+        ("google",    "gemini-pro",      "gemini-pro-preview", 8000),
+        ("google",    "gemini-flash",    "gemini-pro",         6000),
+        ("anthropic", "claude-sonnet",   "claude-opus",        50000),
+        ("anthropic", "claude-haiku",    "claude-sonnet",      30000),
+        ("openai",    "gpt-mini",        "gpt-frontier",       20000),
+    ];
+    let mut populated = 0_usize;
+    for (provider, base_label, upgrade_label, threshold) in ESCALATION_PAIRS {
+        // Trova il top model per la famiglia base e per la famiglia upgrade
+        // (dai promotions appena calcolati).
+        let base_top = promotions
+            .iter()
+            .find(|(p, fam, _)| p == provider && fam == base_label)
+            .map(|(_, _, top)| top.clone());
+        let upgrade_top = promotions
+            .iter()
+            .find(|(p, fam, _)| p == provider && fam == upgrade_label)
+            .map(|(_, _, top)| top.clone());
+        let (Some(base_top), Some(upgrade_top)) = (base_top, upgrade_top) else {
+            // Famiglia upgrade non disponibile (es. preview non sbloccato sul
+            // progetto Vertex). Niente escalation auto: ammesso.
+            continue;
+        };
+        if base_top == upgrade_top {
+            continue;
+        }
+        // Popola escalation solo per le righe con model_id=base_top dove
+        // escalation_* e' NULL. Rispetta manual_override (admin pin).
+        let res = sqlx::query(
+            "UPDATE nexus_routing_matrix \
+             SET escalation_threshold_tokens = $1, \
+                 escalation_provider = $2, \
+                 escalation_model_id = $3, \
+                 updated_at = NOW() \
+             WHERE provider = $2 AND model_id = $4 \
+               AND escalation_model_id IS NULL \
+               AND (manual_override IS NULL OR manual_override = false)",
+        )
+        .bind(threshold)
+        .bind(provider)
+        .bind(&upgrade_top)
+        .bind(&base_top)
+        .execute(db)
+        .await
+        .map_err(|e| format!("auto_populate_escalations UPDATE: {e}"))?;
+        if res.rows_affected() > 0 {
+            populated += res.rows_affected() as usize;
+            tracing::info!(
+                "auto_populate_escalations: [{}] {} -> {} ({}+) | {} righe",
+                provider, base_top, upgrade_top, threshold, res.rows_affected()
+            );
+        }
+    }
+    if populated > 0 {
+        tracing::info!("auto_populate_escalations: {} righe popolate", populated);
+    }
     Ok(())
 }
 
