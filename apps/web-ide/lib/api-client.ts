@@ -3409,16 +3409,26 @@ export type SqlExecuteResult =
  * crates/mcp-core/src/project_db_routes.rs::execute_project_db_query).
  * La connessione e' risolta server-side da project_database_config
  * (guard-rail anti-Nexus presente). Limiti: timeout 30s, max 1000 righe.
+ *
+ * `connection` (opzionale): nome della connessione del progetto
+ * (es. "primary", "analytics", "legacy_replica"). Se omesso o vuoto,
+ * usa la connessione con is_primary=true.
  */
 export async function executeProjectDbQuery(
   projectId: string,
   sql: string,
   params?: unknown[],
-  maxRows?: number
+  maxRows?: number,
+  connection?: string
 ): Promise<SqlExecuteResult> {
   return fetchJson(`${API_BASE}/api/projects/${projectId}/db/query`, {
     method: "POST",
-    body: JSON.stringify({ sql, params: params ?? [], max_rows: maxRows }),
+    body: JSON.stringify({
+      sql,
+      params: params ?? [],
+      max_rows: maxRows,
+      connection: connection || undefined,
+    }),
   });
 }
 

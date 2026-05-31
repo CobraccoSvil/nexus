@@ -101,6 +101,11 @@ pub struct ExecuteQueryBody {
     /// Limite righe ritornate per query read. Default 1000 (MAX_ROWS).
     #[serde(default)]
     pub max_rows: Option<usize>,
+    /// Nome della connessione DB del progetto su cui eseguire (es. "primary",
+    /// "analytics", "legacy_replica"). Se omesso o vuoto -> connessione con
+    /// is_primary=true. Risolto in project_database_config.name.
+    #[serde(default)]
+    pub connection: Option<String>,
 }
 
 // ── GET /api/projects/:id/db ─────────────────────────────────────────────────
@@ -1821,13 +1826,20 @@ pub async fn execute_project_db_query(
         })
         .collect();
 
-    let outcome = execute_query(&state.db, project_id, &sql, &params, body.max_rows)
-        .await
-        .map_err(|e| match e {
-            QueryExecError::ConnectionError(m) => api_err(StatusCode::BAD_REQUEST, m),
-            QueryExecError::Timeout => api_err(StatusCode::REQUEST_TIMEOUT, e.message()),
-            QueryExecError::Sql(_) => api_err(StatusCode::UNPROCESSABLE_ENTITY, e.message()),
-        })?;
+    let outcome = execute_query(
+        &state.db,
+        project_id,
+        &sql,
+        &params,
+        body.max_rows,
+        body.connection.as_deref(),
+    )
+    .await
+    .map_err(|e| match e {
+        QueryExecError::ConnectionError(m) => api_err(StatusCode::BAD_REQUEST, m),
+        QueryExecError::Timeout => api_err(StatusCode::REQUEST_TIMEOUT, e.message()),
+        QueryExecError::Sql(_) => api_err(StatusCode::UNPROCESSABLE_ENTITY, e.message()),
+    })?;
 
     // Emit dispatcher event: il frontend (store project-dispatcher) lo
     // intercetta e aggiorna RecentQueriesSection nel pannello DB esistente.

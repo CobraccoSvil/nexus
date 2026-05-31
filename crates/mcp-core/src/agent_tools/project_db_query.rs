@@ -53,7 +53,26 @@ pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -
         .and_then(Value::as_u64)
         .map(|n| n as usize);
 
-    match execute_query(&ctx.db, ctx.project_id, &sql, &params, max_rows).await {
+    // Connessione: se "connection" e' presente nel payload, esegue su quella
+    // (es. "analytics", "legacy_replica"); altrimenti usa la primary del
+    // progetto. Permette al modello di lavorare su DB multipli senza dover
+    // switchare il flag is_primary.
+    let connection = input
+        .get("connection")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    match execute_query(
+        &ctx.db,
+        ctx.project_id,
+        &sql,
+        &params,
+        max_rows,
+        connection.as_deref(),
+    )
+    .await
+    {
         Ok(outcome) => outcome_to_json(&outcome).to_string(),
         Err(e) => match e {
             QueryExecError::ConnectionError(m) => json!({"error": m}).to_string(),
@@ -76,8 +95,13 @@ pub(super) async fn tool_nexus_db_tables(ctx: &AgentToolContext, input: &Value) 
         .and_then(Value::as_str)
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "public".to_string());
+    let connection = input
+        .get("connection")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
-    let conn = match resolve_project_conn(&ctx.db, ctx.project_id).await {
+    let conn = match resolve_project_conn(&ctx.db, ctx.project_id, connection.as_deref()).await {
         Ok(c) => c,
         Err(e) => return json!({"error": e}).to_string(),
     };
@@ -128,8 +152,13 @@ pub(super) async fn tool_nexus_db_describe(ctx: &AgentToolContext, input: &Value
         .and_then(Value::as_str)
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "public".to_string());
+    let connection = input
+        .get("connection")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
-    let conn = match resolve_project_conn(&ctx.db, ctx.project_id).await {
+    let conn = match resolve_project_conn(&ctx.db, ctx.project_id, connection.as_deref()).await {
         Ok(c) => c,
         Err(e) => return json!({"error": e}).to_string(),
     };

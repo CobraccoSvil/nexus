@@ -31,26 +31,53 @@ pub const QUERY_TIMEOUT_SECS: u64 = 30;
 pub const MAX_ROWS: usize = 1000;
 pub const MAX_CELL_CHARS: usize = 20_000;
 
-/// Risolve la connection string del DB primario del progetto, applicando il
-/// guard-rail anti-contaminazione verso il DB Nexus.
+/// Risolve la connection string del DB del progetto.
 ///
-/// Legge `connection_secret` (bytea con la URL raw) dal pool Nexus passato.
-pub async fn resolve_project_conn(db: &PgPool, project_id: Uuid) -> Result<String, String> {
-    let row = sqlx::query(
-        "SELECT connection_secret FROM project_database_config \
-         WHERE project_id = $1 AND is_primary = true \
-         ORDER BY updated_at DESC LIMIT 1",
-    )
-    .bind(project_id)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| format!("query project_database_config fallita: {e}"))?
-    .ok_or_else(|| {
-        "Nessun database configurato per questo progetto. Usa il pannello \
-         Database del progetto per aggiungere una connessione, oppure esegui \
-         un comando che avvii il DB applicativo (auto-provisioning)."
-            .to_string()
-    })?;
+/// Se `connection_name` e' `Some(name)` filtra per `name` (case-insensitive);
+/// altrimenti torna la connessione `is_primary=true` (comportamento storico).
+///
+/// Applica il guard-rail anti-contaminazione verso il DB Nexus. Legge
+/// `connection_secret` (bytea con la URL raw) dal pool Nexus passato.
+pub async fn resolve_project_conn(
+    db: &PgPool,
+    project_id: Uuid,
+    connection_name: Option<&str>,
+) -> Result<String, String> {
+    let row = if let Some(name) = connection_name.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        sqlx::query(
+            "SELECT connection_secret FROM project_database_config \
+             WHERE project_id = $1 AND LOWER(name) = LOWER($2) \
+             LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(name)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| format!("query project_database_config fallita: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "Connessione '{}' non trovata per questo progetto. Usa il \
+                 pannello Database per crearla.",
+                name
+            )
+        })?
+    } else {
+        sqlx::query(
+            "SELECT connection_secret FROM project_database_config \
+             WHERE project_id = $1 AND is_primary = true \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| format!("query project_database_config fallita: {e}"))?
+        .ok_or_else(|| {
+            "Nessun database configurato per questo progetto. Usa il pannello \
+             Database del progetto per aggiungere una connessione, oppure esegui \
+             un comando che avvii il DB applicativo (auto-provisioning)."
+                .to_string()
+        })?
+    };
 
     let secret: Option<Vec<u8>> = row.try_get("connection_secret").unwrap_or(None);
     let conn = secret
@@ -458,10 +485,11 @@ pub async fn execute_query(
     sql: &str,
     params: &[Option<String>],
     max_rows: Option<usize>,
+    connection_name: Option<&str>,
 ) -> Result<QueryExecOutcome, QueryExecError> {
     let max_rows = max_rows.map(|n| n.min(MAX_ROWS)).unwrap_or(MAX_ROWS);
 
-    let conn = resolve_project_conn(db, project_id)
+    let conn = resolve_project_conn(db, project_id, connection_name)
         .await
         .map_err(QueryExecError::ConnectionError)?;
     let pool = open_pool(&conn).await.map_err(QueryExecError::ConnectionError)?;

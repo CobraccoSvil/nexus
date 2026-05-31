@@ -3,7 +3,13 @@
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTheme, useThemeColors } from "../../lib/theme";
-import { executeProjectDbQuery, type SqlExecuteResult, type UserProjectDetails } from "../../lib/api-client";
+import {
+  executeProjectDbQuery,
+  listProjectDbConnections,
+  type ProjectDbConnection,
+  type SqlExecuteResult,
+  type UserProjectDetails,
+} from "../../lib/api-client";
 
 const MonacoEditor = dynamic(
   async () => (await import("@monaco-editor/react")).default,
@@ -33,9 +39,41 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [connections, setConnections] = useState<ProjectDbConnection[]>([]);
+  const [selectedConnection, setSelectedConnection] = useState<string>("");
   const monacoRef = useRef<unknown | null>(null);
 
   const projectId = project?.id ?? null;
+
+  // Carica le connessioni DB del progetto per popolare il dropdown.
+  // Quando ce ne sono >1 l'utente puo' scegliere su quale DB eseguire la
+  // query senza dover spostare il flag is_primary nel pannello Database.
+  useEffect(() => {
+    if (!projectId) {
+      setConnections([]);
+      setSelectedConnection("");
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await listProjectDbConnections(projectId);
+        if (cancelled) return;
+        const conns = res.connections ?? [];
+        setConnections(conns);
+        // Default: la primary; se non c'e', la prima.
+        const primary = conns.find((c) => c.is_primary) ?? conns[0];
+        setSelectedConnection(primary?.name ?? "");
+      } catch (e) {
+        if (cancelled) return;
+        setConnections([]);
+        setSelectedConnection("");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
 
   // Sincronizza tema Monaco.
   useEffect(() => {
@@ -57,7 +95,16 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
     setLoading(true);
     setError(null);
     try {
-      const res = await executeProjectDbQuery(projectId, trimmed);
+      // Se l'utente ha selezionato una connessione esplicita, la passiamo
+      // al backend. Se vuota -> backend usa la primary (comportamento
+      // storico).
+      const res = await executeProjectDbQuery(
+        projectId,
+        trimmed,
+        undefined,
+        undefined,
+        selectedConnection || undefined,
+      );
       setResult(res);
       // Push nella cronologia locale (max 20).
       const kind = res.mode === "read" ? res.statement_kind : res.statement_kind;
@@ -82,7 +129,7 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
     } finally {
       setLoading(false);
     }
-  }, [projectId, sql]);
+  }, [projectId, sql, selectedConnection]);
 
   // Listener globale: la chat puo' aprire il pannello e pre-compilare l'editor.
   useEffect(() => {
@@ -157,6 +204,38 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
         }}
       >
         <span style={{ fontWeight: 600 }}>SQL · {project?.name ?? "(nessun progetto)"}</span>
+        {connections.length > 0 && (
+          <>
+            <span style={{ color: tc.textMuted, marginLeft: 4 }}>DB:</span>
+            <select
+              value={selectedConnection}
+              onChange={(e) => setSelectedConnection(e.target.value)}
+              disabled={loading}
+              title={
+                connections.length === 1
+                  ? "Una sola connessione nel progetto"
+                  : "Scegli su quale connessione del progetto eseguire la query (gestione multi-DB)"
+              }
+              style={{
+                background: tc.bgInput,
+                color: tc.text,
+                border: `1px solid ${tc.border}`,
+                borderRadius: 3,
+                fontSize: 11,
+                padding: "1px 6px",
+                cursor: connections.length > 1 ? "pointer" : "default",
+              }}
+            >
+              {connections.map((c) => (
+                <option key={c.id} value={c.name}>
+                  {c.name}
+                  {c.is_primary ? " (primary)" : ""}
+                  {c.engine ? ` · ${c.engine}` : ""}
+                </option>
+              ))}
+            </select>
+          </>
+        )}
         <button
           type="button"
           onClick={() => void runQuery()}
