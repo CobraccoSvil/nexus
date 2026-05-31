@@ -83,6 +83,10 @@ class AgentProfile:
         # Tool scaffolding shadcn (mig 0231): risolve loop su 'npx shadcn add'
         # creando stub funzionali in src/components/ui/ senza npm.
         "nexus_install_shadcn_components",
+        # Tool auto-healing dev server (mig 0232): diagnose pattern + fix.
+        "nexus_dev_server_diagnose",
+        # Tool verify scaffolding post-extract: check completezza prima del run.
+        "nexus_verify_scaffold",
     }
 
     def filter_tools(self, tools_json: list[dict]) -> list[dict]:

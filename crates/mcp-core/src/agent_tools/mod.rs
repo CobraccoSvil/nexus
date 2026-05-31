@@ -29,6 +29,8 @@ pub(crate) mod sandbox;
 pub(crate) mod command;
 pub(crate) mod command_hints;
 pub(crate) mod shadcn_setup;
+pub(crate) mod dev_diagnostics;
+pub(crate) mod scaffold_verifier;
 pub(crate) mod testing;
 pub(crate) mod ports;
 pub(crate) mod todos;
@@ -1314,6 +1316,42 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     }
   },
   {
+    "name": "nexus_dev_server_diagnose",
+    "description": "Auto-healing per loop iterativo dev server. Legge il log/output di un dev server (vite/next/cargo/python) e ritorna findings strutturati [{category, suggested_fix_action, confidence}] basati su pattern DB-driven (nexus_dev_diagnostics, mig 0232). Usalo DOPO 'npm start' che fallisce: invece di leggere 200 righe di log manualmente, ottieni la lista di fix concreti da applicare in ordine di confidence. Estensibile via INSERT in nexus_dev_diagnostics, no deploy. Output: ogni finding ha suggested_fix_action = {type: 'run_command'|'write_file'|'edit_file'|'invoke_tool', ...} pronto da eseguire.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "log_path": {
+          "type": "string",
+          "description": "Path file log da scansionare (es. '/tmp/bb-app.log'). Relativo a project root oppure assoluto. Letti ultimi 200KB."
+        },
+        "log": {
+          "type": "string",
+          "description": "ALTERNATIVA a log_path: stringa di log inline (es. da read_service_output)."
+        },
+        "port": {
+          "type": "integer",
+          "description": "Porta del dev server (per nota nel risultato, non usata per matching)."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "nexus_verify_scaffold",
+    "description": "Verifica completezza di un progetto scaffolded (Vite+React+TS) PRIMA del primo 'npm start'. Controlla che esistano index.html / vite.config.ts / src/main.tsx, che package.json abbia uno script dev/start, e che gli import in main.tsx puntino a file esistenti o pkg npm installati. Ritorna {ok, missing_files, inconsistent_imports, package_json_issues, suggested_fixes:[{type:'write_file'|'edit_file'|'run_command', ...}]}. Usalo DOPO nexus_extract_figma_code per evitare il primo 'npm start' fallito.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "target_dir": {
+          "type": "string",
+          "description": "Path relativo alla project root del progetto scaffolded. Default: '.' (root). Per Beauty-Book/figma_export usa 'figma_export'."
+        }
+      },
+      "required": []
+    }
+  },
+  {
     "name": "nexus_describe_image_attachment",
     "description": "Descrive un'immagine allegata alla chat usando un modello vision. Restituisce description testuale e ocr_text (se l'immagine contiene testo leggibile). Usalo quando l'inspector ha rilevato kind=image_* e devi capire il contenuto visivo (mockup UI, screenshot, foto, diagrammi).",
     "input_schema": {
@@ -1873,6 +1911,8 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "nexus_extract_figma_code" => figma_tools::tool_nexus_extract_figma_code(ctx, input).await,
         "nexus_describe_image_attachment" => vision_tools::tool_nexus_describe_image_attachment(ctx, input).await,
         "nexus_install_shadcn_components" => shadcn_setup::tool_nexus_install_shadcn_components(ctx, input).await,
+        "nexus_dev_server_diagnose" => dev_diagnostics::tool_nexus_dev_server_diagnose(ctx, input).await,
+        "nexus_verify_scaffold" => scaffold_verifier::tool_nexus_verify_scaffold(ctx, input).await,
         // FASE 2 "resa Figma Make": verifica visiva (screenshot vs design).
         "nexus_visual_compare" => visual_compare::tool_nexus_visual_compare(ctx, input).await,
         "nexus_search_semantic" => rag_search::tool_nexus_search_semantic(ctx, input).await,
