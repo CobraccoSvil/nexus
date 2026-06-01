@@ -12,6 +12,7 @@ from .nodes import (
     learner_node,
     reflection_node,
     route_after_executor,
+    route_after_regression_gate,
     route_after_verifier,
     route_by_task_type,
     router_node,
@@ -19,6 +20,7 @@ from .nodes import (
 )
 from .planner_node import planner_node, configure as _configure_planner
 from .verifier_node import verifier_node, configure as _configure_verifier
+from .regression_gate_node import regression_gate_node, configure as _configure_regression_gate
 from .understanding_node import understanding_node, configure as _configure_understanding
 from .clarify_or_expand_node import (
     clarify_or_expand_node,
@@ -125,6 +127,9 @@ def create_agent_graph(
     _configure_verifier(tool_runner=tool_runner, providers=providers, routing_client=_routing_client)
     _configure_clarify(providers=providers, routing_client=_routing_client)
     _configure_understanding(providers=providers, tool_runner=tool_runner, routing_client=_routing_client)
+    # M13.4: il regression gate riusa il tool_runner per eseguire i test impact
+    # (criteria_runner) e creare nota/todo via tool MCP.
+    _configure_regression_gate(tool_runner=tool_runner)
 
     # Crea il grafo con lo schema di stato
     workflow: StateGraph = StateGraph(AgentState)
@@ -138,6 +143,10 @@ def create_agent_graph(
     workflow.add_node("tool_dispatch", tool_dispatch_node)  # type: ignore[arg-type]
     workflow.add_node("verifier", verifier_node)  # type: ignore[arg-type]
     workflow.add_node("reflection", reflection_node)  # type: ignore[arg-type]
+    # M13.4/M13.5: regression gate, gira UNA volta a fine run tra reflection e
+    # learner. SOFT (default): pass-through con warning+nota+todo se test impact
+    # set falliti. HARD (default-OFF): puo' rimandare all'executor per il fix.
+    workflow.add_node("regression_gate", regression_gate_node)  # type: ignore[arg-type]
     workflow.add_node("learner", learner_node)  # type: ignore[arg-type]
 
     # Imposta entry point
@@ -192,8 +201,17 @@ def create_agent_graph(
         route_after_verifier,
         {"executor": "executor", "learner": "reflection"},
     )
-    # reflection passa sempre a learner (fire-and-forget interno).
-    workflow.add_edge("reflection", "learner")
+    # reflection -> regression_gate -> learner. Il gate gira UNA volta a fine run:
+    # SOFT (default M13.4) e' un pass-through che, se rileva test falliti
+    # sull'impact set, emette warning + nota KB + todo senza bloccare il run.
+    # HARD (M13.5, default-OFF) puo' rimandare all'executor per il fix
+    # (route_after_regression_gate ritorna "executor" su stop_reason='tool_use').
+    workflow.add_edge("reflection", "regression_gate")
+    workflow.add_conditional_edges(
+        "regression_gate",
+        route_after_regression_gate,
+        {"executor": "executor", "learner": "learner"},
+    )
     workflow.add_edge("learner", END)
 
     # Compila con checkpointer PostgreSQL asincrono
