@@ -412,11 +412,29 @@ class GoogleProvider(BaseProvider):
             thinking_config = None
             if _is_thinking:
                 try:
-                    thinking_config = types.ThinkingConfig(include_thoughts=True)
+                    # CONFLITTO RISOLTO (recovery): se max_tokens <= thinking_budget il
+                    # modello esaurisce TUTTO max_tokens nel reasoning interno e chiude
+                    # con output vuoto / MALFORMED_FUNCTION_CALL. Vincolo:
+                    # thinking_budget <= max_tokens//2 (min 128 = limite SDK). Se
+                    # max_tokens < 256 si disabilita il thinking (troppo poco spazio
+                    # per il reasoning + la function call). Budget base DB-driven
+                    # (providers.google.thinking_budget, regola G), default 8192.
+                    from brain.utils.settings_db import get_int_setting
+                    _tb_base = get_int_setting("providers.google.thinking_budget", 8192)
+                    if max_tokens >= 256:
+                        _tb = min(_tb_base, max(128, max_tokens // 2))
+                        thinking_config = types.ThinkingConfig(
+                            include_thoughts=True, thinking_budget=_tb,
+                        )
+                    else:
+                        thinking_config = None
                 except Exception:
-                    # SDK piu' vecchio senza ThinkingConfig: nessun include_thoughts,
-                    # il modello continua a funzionare ma senza esporre i thoughts.
-                    thinking_config = None
+                    # SDK piu' vecchio senza ThinkingConfig/thinking_budget: fallback
+                    # a solo include_thoughts; se anche quello non esiste, nessun thinking.
+                    try:
+                        thinking_config = types.ThinkingConfig(include_thoughts=True)
+                    except Exception:
+                        thinking_config = None
             # Anti-narration: al primo turno (nessun tool_result nella history),
             # forza il modello a fare almeno una tool call. Google Gemini usa
             # tool_config con FunctionCallingConfig(mode="ANY").
