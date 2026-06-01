@@ -3509,12 +3509,45 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
         content="", additional_kwargs={"anthropic_content": final_blocks},
     )
 
+    # Live UX: emette un meta_step per OGNI tool eseguito in questa iter.
+    # Senza, durante run lunghi (npm install, build, ecc.) la chat sembra
+    # ferma fino a fine run. Il generator SSE in brain/grpc_server/main.py
+    # converte questi "meta_steps" in eventi `meta_step` che la UI rende
+    # come fumetti progressivi (kind=tool_executed, vedi agent-meta-step-card.tsx).
+    _tool_steps: list[dict] = []
+    for b, r in zip(pending, results):
+        _ms_tool = b.get("name", "?")
+        _ms_input = b.get("input", {}) or {}
+        _ms_target = ""
+        if isinstance(_ms_input, dict):
+            for _k in ("path", "file_path", "abs_path", "command", "query", "pattern", "name", "tool_name"):
+                _v = _ms_input.get(_k)
+                if isinstance(_v, str) and _v:
+                    _ms_target = _v if len(_v) <= 80 else (_v[:77] + "...")
+                    break
+        _ms_err = bool(r.get("is_error"))
+        _ms_title = f"{'errore' if _ms_err else 'tool'} {_ms_tool}" + (f" — {_ms_target}" if _ms_target else "")
+        _step = meta_steps.make(
+            kind="tool_executed",
+            title=_ms_title,
+            payload={
+                "tool": _ms_tool,
+                "target": _ms_target,
+                "is_error": _ms_err,
+                "tool_use_id": b.get("id"),
+            },
+        )
+        if _step:
+            _tool_steps.append(_step)
+            meta_steps.persist_async(state.get("thread_id"), _step)
+
     return {
         "messages": [tool_msg],
         "pending_tool_uses": [],
         "stop_reason": "tool_use",
         "since_last_todo_reminder": new_reminder_counter,
         "attachment_read_bytes": new_attachment_read_bytes,
+        "meta_steps": _tool_steps,
     }
 
 

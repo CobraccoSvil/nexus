@@ -1972,6 +1972,7 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                         }
                         if ms.get("correlation_id"):
                             ms_payload["correlation_id"] = ms["correlation_id"]
+                        logger.info("SSE meta_step emit: node=%s kind=%s title=%s", node, ms["kind"], (ms.get("title") or "")[:60])
                         yield "data: " + _json.dumps(ms_payload) + "\n\n"
                     # Nexus thinking: i nodi possono popolare `nexus_thinking`
                     # come list[str] (preferito) o singola str. Lo convertiamo

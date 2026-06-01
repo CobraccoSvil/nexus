@@ -68,6 +68,16 @@ const KIND_MAP: Record<string, KindDescriptor> = {
     bg: "bg-purple-50 dark:bg-purple-950/40 border-purple-200 dark:border-purple-800",
     defaultOpen: false,
   },
+  // Live UX: ogni tool eseguito dall'executor emette questo meta_step
+  // (vedi brain/agents/nodes.py tool_dispatch_node). Card compatta, collassata:
+  // l'utente vede il flusso dei tool in tempo reale durante run lunghi.
+  tool_executed: {
+    icon: "▸",
+    label: "Tool",
+    tone: "text-emerald-700 dark:text-emerald-300",
+    bg: "bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800",
+    defaultOpen: false,
+  },
 };
 
 const DEFAULT_DESC: KindDescriptor = {
@@ -129,6 +139,18 @@ function renderPayload(kind: string, payload: Record<string, unknown>) {
   if (kind === "reflection") {
     const summary = String(payload.summary ?? "");
     return <p className="text-xs leading-snug">{summary}</p>;
+  }
+  if (kind === "tool_executed") {
+    const tool = String(payload.tool ?? "");
+    const target = String(payload.target ?? "");
+    const isErr = Boolean(payload.is_error);
+    return (
+      <div className="text-xs flex items-center gap-2 leading-snug">
+        <code className={isErr ? "text-red-700 dark:text-red-300" : ""}>{tool}</code>
+        {target && <span className="opacity-70 truncate">{target}</span>}
+        {isErr && <span className="text-red-600 dark:text-red-300">errore</span>}
+      </div>
+    );
   }
   // fallback: JSON
   return (
