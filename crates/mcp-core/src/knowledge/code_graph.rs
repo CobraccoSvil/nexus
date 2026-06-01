@@ -123,6 +123,51 @@ pub fn extract_imports(file_path: &str, content: &str) -> Vec<String> {
     out
 }
 
+/// True se il path e un file di test (convenzioni di naming multi-linguaggio).
+/// Usato per popolare project_code_tests con method='naming' (M13.3).
+pub fn is_test_file(file_path: &str) -> bool {
+    let name = file_path.rsplit('/').next().unwrap_or(file_path);
+    let lower = name.to_ascii_lowercase();
+    lower.contains(".test.")
+        || lower.contains(".spec.")
+        || lower.starts_with("test_")
+        || lower.ends_with("_test.py")
+        || lower.ends_with("_test.go")
+        || lower.ends_with("_test.rs")
+        || name.ends_with("Test.java")
+        || file_path.contains("/tests/")
+        || file_path.contains("/__tests__/")
+}
+
+/// Dato un file di test, deduce per naming il path del file coperto (stessa dir).
+/// None se non deducibile. Confidence associata: 'naming' (0.6).
+pub fn naming_target(test_path: &str) -> Option<String> {
+    let (dir, name) = match test_path.rsplit_once('/') {
+        Some((d, n)) => (format!("{d}/"), n.to_string()),
+        None => (String::new(), test_path.to_string()),
+    };
+    // X.test.ext / X.spec.ext -> X.ext
+    for marker in [".test.", ".spec."] {
+        if let Some(idx) = name.find(marker) {
+            let base = &name[..idx];
+            let ext = &name[idx + marker.len()..];
+            return Some(format!("{dir}{base}.{ext}"));
+        }
+    }
+    // test_X.py -> X.py
+    if let Some(rest) = name.strip_prefix("test_") {
+        return Some(format!("{dir}{rest}"));
+    }
+    // X_test.py / X_test.go / X_test.rs -> X.ext
+    for ext in ["py", "go", "rs"] {
+        let suffix = format!("_test.{ext}");
+        if let Some(base) = name.strip_suffix(suffix.as_str()) {
+            return Some(format!("{dir}{base}.{ext}"));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +243,27 @@ import json                # assoluto: ignorato\n\
     #[test]
     fn unsupported_extension_returns_empty() {
         assert!(extract_imports("x.go", "import \"fmt\"").is_empty());
+    }
+
+    #[test]
+    fn test_file_detection() {
+        assert!(is_test_file("a/b.test.ts"));
+        assert!(is_test_file("x.spec.tsx"));
+        assert!(is_test_file("test_foo.py"));
+        assert!(is_test_file("foo_test.go"));
+        assert!(is_test_file("src/tests/integration.rs"));
+        assert!(is_test_file("app/__tests__/x.jsx"));
+        assert!(!is_test_file("src/main.rs"));
+        assert!(!is_test_file("brain/agents/nodes.py"));
+    }
+
+    #[test]
+    fn naming_target_mapping() {
+        assert_eq!(naming_target("a/b.test.ts").as_deref(), Some("a/b.ts"));
+        assert_eq!(naming_target("comp.spec.tsx").as_deref(), Some("comp.tsx"));
+        assert_eq!(naming_target("pkg/test_utils.py").as_deref(), Some("pkg/utils.py"));
+        assert_eq!(naming_target("m_test.go").as_deref(), Some("m.go"));
+        assert_eq!(naming_target("src/parser_test.rs").as_deref(), Some("src/parser.rs"));
+        assert_eq!(naming_target("main.rs"), None);
     }
 }
