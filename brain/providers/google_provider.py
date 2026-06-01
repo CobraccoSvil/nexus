@@ -496,6 +496,43 @@ class GoogleProvider(BaseProvider):
             if not tool_use_blocks and text_content:
                 assistant_content.append({"type": "text", "text": text_content})
 
+            # finish_reason esplicito (recovery fix Vertex): i modelli thinking
+            # possono chiudere con output vuoto (0 testo + 0 tool call). Senza
+            # questo, lo stop_reason resterebbe 'end_turn' e la fallback chain
+            # tratterebbe il troncamento/malformed come risposta valida vuota.
+            # Mappiamo il finish_reason reale a uno stop_reason esplicito cosi'
+            # classify/registry possono ritentare in modo informato.
+            if not tool_use_blocks and not text_content:
+                _fr = None
+                if response.candidates:
+                    _frv = getattr(response.candidates[0], "finish_reason", None)
+                    _fr = getattr(_frv, "name", None) or (str(_frv) if _frv is not None else None)
+                _fru = (_fr or "").upper()
+                if "MAX_TOKENS" in _fru:
+                    stop_reason = "max_tokens"
+                    logger.warning(
+                        "google_provider: %s finish_reason=MAX_TOKENS con output vuoto "
+                        "(thinking-exhaustion: il reasoning ha consumato max_output_tokens=%s). "
+                        "stop_reason=max_tokens per fallback informato.", model, max_tokens,
+                    )
+                elif _fru and _fru not in ("STOP", "FINISH_REASON_UNSPECIFIED", "NONE"):
+                    # MALFORMED_FUNCTION_CALL / SAFETY / RECITATION / altro.
+                    stop_reason = "content_filter"
+                    try:
+                        _tn = [t.get("name", "?") for t in (tools or [])][:30]
+                    except Exception:
+                        _tn = ["<err>"]
+                    _um = getattr(response, "usage_metadata", None)
+                    logger.warning(
+                        "google_provider: %s output vuoto finish_reason=%s | tools=%d %s | "
+                        "messages=%d | system_len=%d | tokens in=%s out=%s",
+                        model, _fr, len(tools or []), _tn,
+                        len(messages) if isinstance(messages, list) else 0,
+                        len(system_text or ""),
+                        getattr(_um, "prompt_token_count", None) if _um else None,
+                        getattr(_um, "candidates_token_count", None) if _um else None,
+                    )
+
             # Usage
             usage_data = {}
             if response.usage_metadata:
