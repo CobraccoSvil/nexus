@@ -345,6 +345,8 @@ async fn update_status(
     };
 
     let mut affected = 0_usize;
+    // M15.1: traccia (id, status) aggiornati per emettere TodoUpdated dopo il commit.
+    let mut updated: Vec<(Uuid, String)> = Vec::new();
     for (idx, t) in todos_in.iter().enumerate() {
         let id = match t.get("id").and_then(Value::as_str).and_then(|s| Uuid::parse_str(s).ok()) {
             Some(u) => u,
@@ -375,13 +377,42 @@ async fn update_status(
                     "todo {id} non trovato (o non appartiene a run_id={run_id})"
                 ))
             }
-            Ok(r) => affected += r.rows_affected() as usize,
+            Ok(r) => {
+                affected += r.rows_affected() as usize;
+                updated.push((id, new_status.clone()));
+            }
             Err(e) => return err(&format!("UPDATE todo[{idx}] fallita: {e}")),
         }
     }
 
     if let Err(e) = tx.commit().await {
         return err(&format!("commit tx fallita: {e}"));
+    }
+
+    // M15.1 — Progresso todo live: emette TodoUpdated per ogni todo aggiornato,
+    // cosi' la checklist in chat (agent-meta-step-card.tsx) si spunta in tempo
+    // reale durante l'esecuzione (gated agent.todos.live_events).
+    let live_events = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'agent.todos.live_events' LIMIT 1",
+    )
+    .fetch_optional(&*ctx.db)
+    .await
+    .ok()
+    .flatten()
+    .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "false" | "0" | "off" | "no"))
+    .unwrap_or(true);
+    if live_events {
+        for (id, status) in &updated {
+            nexus_events::dispatcher::emit_global(
+                ctx.project_id,
+                nexus_events::event::ProjectEvent::TodoUpdated {
+                    run_id: run_id.to_string(),
+                    todo_id: id.to_string(),
+                    seq: None,
+                    status: status.clone(),
+                },
+            );
+        }
     }
 
     json!({

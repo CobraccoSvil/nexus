@@ -137,6 +137,14 @@ pub enum ProjectEvent {
         target_resource: Option<String>,
     },
 
+    // ── M15.1 — Progresso todo live in chat ───────────────────────────
+    TodoUpdated {
+        run_id: String,
+        todo_id: String,
+        seq: Option<i32>,
+        status: String,
+    },
+
     // ── Pilotaggio diretto dall'agente ────────────────────────────────
     Notification {
         severity: String, // "info" | "success" | "warning" | "error"
@@ -359,7 +367,7 @@ impl ProjectEvent {
             Self::FileChanged { .. } => TOPIC_FILES,
             Self::GitStatusChanged { .. } => TOPIC_GIT,
             Self::DbQueryRun { .. } | Self::DbConfigUpdated { .. } => TOPIC_DATABASE,
-            Self::AgentToolUsed { .. } => TOPIC_AGENT,
+            Self::AgentToolUsed { .. } | Self::TodoUpdated { .. } => TOPIC_AGENT,
             Self::Notification { .. } => TOPIC_NOTIFICATION,
             Self::FlagChanged { .. } => TOPIC_FLAGS,
             Self::MonitorUpdated { .. } | Self::HighlightPanel { .. } => TOPIC_MONITOR,
@@ -403,6 +411,7 @@ impl ProjectEvent {
             Self::DbQueryRun { .. } => "DbQueryRun",
             Self::DbConfigUpdated { .. } => "DbConfigUpdated",
             Self::AgentToolUsed { .. } => "AgentToolUsed",
+            Self::TodoUpdated { .. } => "TodoUpdated",
             Self::Notification { .. } => "Notification",
             Self::FlagChanged { .. } => "FlagChanged",
             Self::MonitorUpdated { .. } => "MonitorUpdated",

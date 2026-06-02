@@ -45,6 +45,7 @@ export type ProjectEvent =
   | { kind: "DbQueryRun"; query_id?: string; duration_ms: number; rows: number; statement_kind: string }
   | { kind: "DbConfigUpdated"; name: string; engine?: string; action: string }
   | { kind: "AgentToolUsed"; run_id: string; tool: string; target_resource?: string }
+  | { kind: "TodoUpdated"; run_id: string; todo_id: string; seq?: number; status: string }
   | { kind: "Notification"; severity: string; message: string; panel?: string; ttl_ms?: number; run_id?: string }
   | { kind: "FlagChanged"; key: string; value: unknown }
   | { kind: "MonitorUpdated"; monitor_id: string; value: unknown; label?: string }

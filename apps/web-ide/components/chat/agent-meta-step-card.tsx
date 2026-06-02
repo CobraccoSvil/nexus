@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useEventOfKind } from "../../lib/project-dispatcher/hooks";
 
 /**
  * Card collassabile per visualizzare i meta-step semantici pubblicati dal
@@ -88,20 +89,44 @@ const DEFAULT_DESC: KindDescriptor = {
   defaultOpen: false,
 };
 
+// M15.1 — Checklist todo del piano con aggiornamento LIVE via eventi TodoUpdated.
+// Lo stato iniziale viene dal payload del meta_step plan; gli aggiornamenti
+// arrivano in tempo reale (la checklist si spunta mentre l'agente lavora).
+type PlanTodo = { id?: string; seq?: number; content?: string; status?: string; priority?: string };
+function PlanChecklist({ todos }: { todos: PlanTodo[] }) {
+  // overrides[todo_id] = status piu' recente ricevuto via SSE.
+  const [overrides, setOverrides] = useState<Record<string, string>>({});
+  useEventOfKind(
+    "TodoUpdated",
+    (env) => {
+      const p = env.payload as { todo_id: string; status: string };
+      setOverrides((prev) => (prev[p.todo_id] === p.status ? prev : { ...prev, [p.todo_id]: p.status }));
+    },
+    [],
+  );
+  if (!todos.length) return <em className="text-xs opacity-70">Nessun todo</em>;
+  const MARK: Record<string, string> = {
+    completed: "[x]", in_progress: "[~]", blocked: "[!]", skipped: "[-]", pending: "[ ]",
+  };
+  return (
+    <ol className="list-none pl-0 space-y-0.5 text-xs">
+      {todos.map((t, i) => {
+        const status = (t.id ? overrides[t.id] : undefined) ?? t.status ?? "pending";
+        return (
+          <li key={t.id ?? i} className="leading-snug flex items-start gap-1.5">
+            <span className="font-mono opacity-70">{MARK[status] ?? MARK.pending}</span>
+            <span>{t.content ?? "—"}{t.priority && t.priority !== "normal" ? <span className="opacity-60"> ({t.priority})</span> : null}</span>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
 function renderPayload(kind: string, payload: Record<string, unknown>) {
   if (kind === "plan") {
-    const todos = (payload.todos ?? []) as Array<{ seq?: number; content?: string; status?: string; priority?: string }>;
-    if (!todos.length) return <em className="text-xs opacity-70">Nessun todo</em>;
-    return (
-      <ol className="list-decimal pl-5 space-y-0.5 text-xs">
-        {todos.map((t, i) => (
-          <li key={i} className="leading-snug">
-            <span className="opacity-70">[{t.status ?? "pending"}{t.priority ? `/${t.priority}` : ""}]</span>{" "}
-            {t.content ?? "—"}
-          </li>
-        ))}
-      </ol>
-    );
+    const todos = (payload.todos ?? []) as PlanTodo[];
+    return <PlanChecklist todos={todos} />;
   }
   if (kind === "routing") {
     const intent = String(payload.intent ?? "—");
