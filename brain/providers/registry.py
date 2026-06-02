@@ -82,6 +82,124 @@ def get_billing_cooldown_snapshot() -> dict[str, int]:
     return snapshot
 
 
+# ── M7 Q-value: salute provider per intent ────────────────────────────────────
+# Registra l'esito di ogni turno per (provider, model, intent) su
+# nexus_provider_intent_health e, su soglia di fallimenti, mette il provider in
+# cooldown su quell'intent. Tutto gated da routing.intent_health_enabled
+# (default OFF): con il flag spento queste funzioni sono no-op (zero overhead,
+# zero rischio sul routing). Soglie DB-driven (regola G).
+
+_RETRIABLE_OUTCOME_STOPS = {
+    "billing_error", "rate_limit", "overloaded", "provider_error", "error", "timeout",
+}
+
+
+def _intent_health_enabled() -> bool:
+    try:
+        from brain.utils.settings_db import get_bool_setting
+        return get_bool_setting("routing.intent_health_enabled", False)
+    except Exception:
+        return False
+
+
+def _classify_outcome(res: "ProviderResult") -> str:
+    """Classifica l'esito di un turno: 'failure' | 'soft_failure' | 'success'."""
+    meta = res.metadata or {}
+    stop = meta.get("stop_reason")
+    if stop in _RETRIABLE_OUTCOME_STOPS or (res.content or "").startswith("[Error"):
+        return "failure"
+    blocks = meta.get("tool_use_blocks") or []
+    if stop in ("end_turn", "stop", "", None) and not blocks and len(res.content or "") < 40:
+        return "soft_failure"
+    return "success"
+
+
+def _record_intent_health(provider: str, model: str, intent: str, outcome: str) -> None:
+    """UPSERT del contatore esito per (provider, model, intent) e cooldown su
+    soglia. No-op se il flag M7 e' OFF. Best-effort: mai solleva."""
+    if not provider or not model or not _intent_health_enabled():
+        return
+    intent = (intent or "chat").strip() or "chat"
+    col = {
+        "success": "success_count",
+        "failure": "failure_count",
+        "soft_failure": "soft_failure_count",
+    }.get(outcome)
+    if col is None:
+        return
+    try:
+        from brain.utils.settings_db import get_int_setting
+        min_attempts = get_int_setting("routing.intent_health_min_attempts", 8)
+        fail_pct = get_int_setting("routing.intent_health_failure_threshold_pct", 60)
+        cooldown_secs = get_int_setting("routing.intent_health_cooldown_secs", 600)
+    except Exception:
+        min_attempts, fail_pct, cooldown_secs = 8, 60, 600
+
+    last_ts_col = "last_success_at" if outcome == "success" else "last_failure_at"
+    import psycopg2  # type: ignore[import]
+    try:
+        db_url = os.environ.get(
+            "DATABASE_URL", "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable"
+        )
+        with psycopg2.connect(db_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"INSERT INTO nexus_provider_intent_health "
+                    f"(provider, model, intent_subkind, {col}, last_seen_at, {last_ts_col}, "
+                    f" created_at, updated_at) "
+                    f"VALUES (%s, %s, %s, 1, NOW(), NOW(), NOW(), NOW()) "
+                    f"ON CONFLICT (provider, model, intent_subkind) DO UPDATE SET "
+                    f"  {col} = nexus_provider_intent_health.{col} + 1, "
+                    f"  last_seen_at = NOW(), {last_ts_col} = NOW(), updated_at = NOW() "
+                    f"RETURNING success_count, failure_count, soft_failure_count",
+                    (provider, model, intent),
+                )
+                row = cur.fetchone()
+                if row and outcome != "success":
+                    succ, fail, soft = int(row[0]), int(row[1]), int(row[2])
+                    total = succ + fail + soft
+                    bad = fail + soft
+                    if total >= min_attempts and bad * 100 >= fail_pct * total:
+                        cur.execute(
+                            "UPDATE nexus_provider_intent_health "
+                            "SET cooldown_until = NOW() + (%s || ' seconds')::interval, "
+                            "    cooldown_reason = 'intent_failure_rate' "
+                            "WHERE provider = %s AND model = %s AND intent_subkind = %s",
+                            (str(cooldown_secs), provider, model, intent),
+                        )
+                        logger.warning(
+                            "M7: %s/%s in cooldown su intent '%s' (%d/%d fallimenti)",
+                            provider, model, intent, bad, total,
+                        )
+            conn.commit()
+    except Exception as e:
+        logger.debug("intent_health record fallito %s/%s/%s: %s", provider, model, intent, e)
+
+
+def _intent_in_cooldown(provider: str, intent: str) -> bool:
+    """True se almeno un modello del provider e' in cooldown M7 attivo su questo
+    intent. No-op (False) se il flag M7 e' OFF. Best-effort."""
+    if not provider or not _intent_health_enabled():
+        return False
+    intent = (intent or "chat").strip() or "chat"
+    import psycopg2  # type: ignore[import]
+    try:
+        db_url = os.environ.get(
+            "DATABASE_URL", "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable"
+        )
+        with psycopg2.connect(db_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM nexus_provider_intent_health "
+                    "WHERE provider = %s AND intent_subkind = %s "
+                    "  AND cooldown_until IS NOT NULL AND cooldown_until > NOW() LIMIT 1",
+                    (provider, intent),
+                )
+                return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
 # ── Billing enabled ───────────────────────────────────────────────────────────
 # Valore canonico: settings.brain_billing_enabled nel DB (admin panel).
 # Override emergenza: NEXUS_BRAIN_BILLING=on (priorita' massima).
@@ -524,6 +642,7 @@ class ProviderRegistry:
         system_text: str = "",
         usage_run_id: str = "",
         usage_iteration: int = 0,
+        usage_intent: str = "",
     ) -> ProviderResult:
         """Versione sincrona di generate_agent_turn, sicura da chiamare da thread gRPC.
 
@@ -680,6 +799,10 @@ class ProviderRegistry:
                     "iteration": usage_iteration,
                 },
             )
+            # M7 — registra l'esito per (provider, model, intent). No-op se OFF.
+            _record_intent_health(
+                result.provider, result.model, usage_intent, _classify_outcome(result)
+            )
             # Se billing_error, marca il provider in cooldown locale.
             # billing_error puo' essere su stop_reason (chain interna) o
             # error_class (format_error_result usa stop_reason="error" generico
@@ -729,6 +852,13 @@ class ProviderRegistry:
                         "Fallback skip %s: in billing-cooldown locale", fb_prov,
                     )
                     continue
+                # M7 — Skip provider in cooldown per questo intent (gated). No-op se OFF.
+                if _intent_in_cooldown(fb_prov, usage_intent):
+                    logger.info(
+                        "Fallback skip %s: in cooldown M7 sull'intent '%s'",
+                        fb_prov, usage_intent or "chat",
+                    )
+                    continue
                 fb_model = self._default_model_or_none(fb_prov)
                 if fb_model is None:
                     logger.warning(
@@ -762,6 +892,11 @@ class ProviderRegistry:
                         "run_id": usage_run_id,
                         "iteration": usage_iteration,
                     },
+                )
+                # M7 — registra l'esito del fallback per (provider, model, intent).
+                _record_intent_health(
+                    fb_result.provider, fb_result.model, usage_intent,
+                    _classify_outcome(fb_result),
                 )
                 # Se anche il fallback e' billing_error, marca anche lui.
                 if (

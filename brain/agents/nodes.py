@@ -2841,6 +2841,7 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 max_tokens=effective_max_tokens, system_text=system_text,
                 usage_run_id=str(state.get("thread_id") or ""),
                 usage_iteration=_current_iterations,
+                usage_intent=str(state.get("user_intent") or ""),
             )
             # Aggiorna provider/model effettivamente usati se la cascade ha fatto fallback.
             # Salva anche come "sticky" per le iter successive (M61): evita di ri-tentare
