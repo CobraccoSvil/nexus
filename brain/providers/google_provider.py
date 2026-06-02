@@ -442,22 +442,32 @@ class GoogleProvider(BaseProvider):
             )
             config_temperature = None if _is_thinking else temperature
             thinking_config = None
+            # Tetto di output effettivo passato a Vertex. Di default coincide con
+            # i max_tokens richiesti dal chiamante; per i modelli thinking viene
+            # alzato (vedi sotto) per non far erodere l'output dal reasoning.
+            _effective_output_tokens = max_tokens
             if _is_thinking:
                 try:
-                    # CONFLITTO RISOLTO (recovery): se max_tokens <= thinking_budget il
-                    # modello esaurisce TUTTO max_tokens nel reasoning interno e chiude
-                    # con output vuoto / MALFORMED_FUNCTION_CALL. Vincolo:
-                    # thinking_budget <= max_tokens//2 (min 128 = limite SDK). Se
-                    # max_tokens < 256 si disabilita il thinking (troppo poco spazio
-                    # per il reasoning + la function call). Budget base DB-driven
-                    # (providers.google.thinking_budget, regola G), default 8192.
+                    # ROOT CAUSE hollow completion: su Gemini 2.5 i token di
+                    # reasoning sono conteggiati DENTRO max_output_tokens. Se
+                    # lasciassimo max_output_tokens=max_tokens, un reasoning lungo
+                    # consuma tutto il budget e il modello chiude con
+                    # finish_reason=MAX_TOKENS e output VUOTO (hollow completion),
+                    # che la fallback chain interpreta come risposta vuota valida.
+                    # Fix: budget di thinking DEDICATO e tetto totale alzato a
+                    # (output desiderato + thinking), cosi' i max_tokens richiesti
+                    # restano interamente disponibili per la risposta utente.
+                    # Budget base DB-driven (providers.google.thinking_budget,
+                    # regola G), default 8192. Se max_tokens < 256 si disabilita
+                    # il thinking (troppo poco spazio anche solo per la risposta).
                     from brain.utils.settings_db import get_int_setting
                     _tb_base = get_int_setting("providers.google.thinking_budget", 8192)
                     if max_tokens >= 256:
-                        _tb = min(_tb_base, max(128, max_tokens // 2))
+                        _tb = max(128, min(_tb_base, max_tokens))
                         thinking_config = types.ThinkingConfig(
                             include_thoughts=True, thinking_budget=_tb,
                         )
+                        _effective_output_tokens = max_tokens + _tb
                     else:
                         thinking_config = None
                 except Exception:
@@ -488,7 +498,7 @@ class GoogleProvider(BaseProvider):
                         )
 
             _cfg_kwargs = dict(
-                max_output_tokens=max_tokens,
+                max_output_tokens=_effective_output_tokens,
                 temperature=config_temperature,
                 tools=google_tools,
                 tool_config=tool_config,
