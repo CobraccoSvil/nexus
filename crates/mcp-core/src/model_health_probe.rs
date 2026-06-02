@@ -527,8 +527,17 @@ pub(crate) fn classification_from_error_class(ec: &str) -> Classification {
         "billing_error" => {
             Classification::ProviderWide("credit_balance_too_low".into(), Some(ec.into()))
         }
-        "auth_error" | "forbidden" => {
+        // 401: credenziali invalide -> tutto il provider e' inutilizzabile.
+        "auth_error" => {
             Classification::ProviderWide("auth_error".into(), Some(ec.into()))
+        }
+        // 403 forbidden -> NON e' un problema di credenziali ma di accesso a
+        // quel modello/risorsa (es. Mistral 403 labs_not_enabled: modello Labs
+        // non abilitato nell'org). E' model-specific come not_found: si
+        // disabilita/conteggia il singolo modello, non si spegne l'intero
+        // provider con long cooldown 6h.
+        "forbidden" => {
+            Classification::ModelSpecific("model_forbidden".into(), Some(ec.into()))
         }
         // Transienti -> short cooldown
         "rate_limit" | "overloaded" | "service_unavailable" | "bad_gateway" | "provider_error"
@@ -642,6 +651,21 @@ mod tests {
     fn classification_billing_da_error_class() {
         let c = classification_from_error_class("billing_error");
         assert!(matches!(c, Classification::ProviderWide(ref k, _) if k == "credit_balance_too_low"));
+    }
+
+    #[test]
+    fn classification_auth_error_e_providerwide() {
+        // 401 credenziali invalide -> tutto il provider e' down.
+        let c = classification_from_error_class("auth_error");
+        assert!(matches!(c, Classification::ProviderWide(ref k, _) if k == "auth_error"));
+    }
+
+    #[test]
+    fn classification_forbidden_e_model_specific() {
+        // Regressione: 403 forbidden (es. Mistral labs_not_enabled) deve essere
+        // model-specific, NON provider-wide: non deve spegnere l'intero provider.
+        let c = classification_from_error_class("forbidden");
+        assert!(matches!(c, Classification::ModelSpecific(ref k, _) if k == "model_forbidden"));
     }
 
     #[test]

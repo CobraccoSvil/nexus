@@ -490,7 +490,15 @@ fn outcome_from_error_class(ec: &str) -> ProbeOutcome {
 fn kind_from_error_class(ec: &str) -> String {
     match ec {
         "billing_error" => "credit_balance_too_low".to_string(),
-        "auth_error" | "forbidden" => "auth_error".to_string(),
+        // 401: credenziali invalide -> tutte le chiamate falliranno, il provider
+        // va messo in cooldown (vedi outcome_from_error_class -> Billing).
+        "auth_error" => "auth_error".to_string(),
+        // 403: NON e' un problema di credenziali. E' per-modello/per-risorsa
+        // (es. Mistral 403 labs_not_enabled: un modello Labs non abilitato
+        // nell'org; oppure un modello senza accesso sul progetto). Mantenendo
+        // il kind "forbidden" l'outcome resta Transient -> cooldown breve sul
+        // singolo probe, senza disabilitare l'intero provider per 6 ore.
+        "forbidden" => "forbidden".to_string(),
         "" => "error".to_string(),
         other => other.to_string(),
     }
@@ -537,12 +545,20 @@ mod tests {
         assert_eq!(kind_from_error_class("billing_error"), "credit_balance_too_low");
         assert_eq!(kind_from_error_class("auth_error"), "auth_error");
         assert_eq!(kind_from_error_class("rate_limit"), "rate_limit");
+        // Regressione: 403 forbidden (es. Mistral labs_not_enabled) NON deve
+        // collassare in auth_error, altrimenti finisce in long cooldown 6h.
+        assert_eq!(kind_from_error_class("forbidden"), "forbidden");
     }
 
     #[test]
     fn outcome_from_error_class_billing_e_transient() {
         assert!(matches!(outcome_from_error_class("billing_error"), ProbeOutcome::Billing(_)));
         assert!(matches!(outcome_from_error_class("rate_limit"), ProbeOutcome::Transient(_)));
+        // 401 auth_error: il provider e' inutilizzabile -> Billing (long cooldown).
+        assert!(matches!(outcome_from_error_class("auth_error"), ProbeOutcome::Billing(_)));
+        // 403 forbidden: per-modello/per-risorsa -> Transient (short cooldown),
+        // non spegne l'intero provider.
+        assert!(matches!(outcome_from_error_class("forbidden"), ProbeOutcome::Transient(_)));
     }
 
     #[test]
@@ -553,34 +569,37 @@ mod tests {
 
     #[test]
     fn outcome_billing_per_credito_e_quota() {
-        // Errori billing/quota -> Billing: il provider NON va riabilitato.
+        // error_class canonici (dal brain, unico classificatore) di tipo
+        // billing/quota -> Billing: il provider resta in long cooldown finche'
+        // un 200 reale non lo riabilita. La classificazione da testo grezzo non
+        // esiste piu' in mcp-core (vedi outcome_from_error_class).
         assert_eq!(
-            outcome_from_raw_error("Your credit balance is too low to access the API"),
+            outcome_from_error_class("billing_error"),
             ProbeOutcome::Billing("credit_balance_too_low".to_string())
         );
         assert_eq!(
-            outcome_from_raw_error("Error: insufficient_quota"),
+            outcome_from_error_class("quota_exceeded"),
             ProbeOutcome::Billing("quota_exceeded".to_string())
         );
         assert_eq!(
-            outcome_from_raw_error("payment required: upgrade or purchase credits"),
+            outcome_from_error_class("billing_required"),
             ProbeOutcome::Billing("billing_required".to_string())
         );
     }
 
     #[test]
     fn outcome_transient_per_rate_limit_e_timeout() {
-        // Errori non-billing -> Transient: nuovo tentativo al prossimo giro.
+        // error_class canonici non-billing -> Transient: nuovo tentativo al giro dopo.
         assert_eq!(
-            outcome_from_raw_error("HTTP 429 rate limit exceeded"),
+            outcome_from_error_class("rate_limit"),
             ProbeOutcome::Transient("rate_limit".to_string())
         );
         assert_eq!(
-            outcome_from_raw_error("request timed out"),
+            outcome_from_error_class("timeout"),
             ProbeOutcome::Transient("timeout".to_string())
         );
         assert_eq!(
-            outcome_from_raw_error("connection refused"),
+            outcome_from_error_class("connection_error"),
             ProbeOutcome::Transient("connection_error".to_string())
         );
     }
