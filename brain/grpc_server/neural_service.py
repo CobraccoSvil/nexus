@@ -80,13 +80,28 @@ def _classify_provider_error(exc: Exception) -> tuple[str, str]:
         return ("auth_error", "Credenziali del provider AI non valide o mancanti.")
     if "deadlineexceeded" in low or "timeout" in low or "timed out" in low:
         return ("timeout", "Il provider AI non ha risposto in tempo.")
-    if "rate limit" in low or "429" in low or "quota" in low or "too many requests" in low:
+    # Credito/quota ESAURITA: persistente (serve ricarica/billing), NON un rate
+    # limit transiente. Va valutata PRIMA del check rate_limit perche'
+    # insufficient_quota di OpenAI arriva come HTTP 429 (matcherebbe "429"): se
+    # finisse in rate_limit verrebbe trattata come transiente (cooldown 60s) e il
+    # provider verrebbe ritentato all'infinito invece di essere disabilitato.
+    if (
+        "credit balance" in low
+        or "insufficient_quota" in low
+        or "exceeded your current quota" in low
+        or "plans & billing" in low
+        or "billing" in low
+    ):
+        return ("billing", "Credito esaurito sul provider AI.")
+    if "rate limit" in low or "too many requests" in low or ("429" in low and "quota" not in low):
         return ("rate_limit", "Limite di richieste del provider AI raggiunto. Riprova tra poco.")
     if "overloaded" in low or "529" in low or "could not serve" in low:
         return ("overloaded", "Provider AI sovraccarico. Riprova tra poco.")
     if "unavailable" in low or "connection refused" in low or "503" in low:
         return ("unavailable", "Provider AI momentaneamente non disponibile.")
-    if "credit balance" in low or "insufficient_quota" in low or "billing" in low:
+    if "quota" in low:
+        # "quota" generica senza i marcatori sopra: trattata come billing
+        # (quota esaurita) per sicurezza, non come rate limit.
         return ("billing", "Credito esaurito sul provider AI.")
     return ("unknown", "Errore del provider AI. Controlla i log per i dettagli.")
 

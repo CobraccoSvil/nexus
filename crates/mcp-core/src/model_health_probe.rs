@@ -211,33 +211,59 @@ async fn probe_one_model(
 
     let outcome = match result {
         Ok(Ok(response)) => {
-            // Distingue OK genuino da hollow_completion: il content deve
-            // contenere almeno 1 carattere E non essere un errore ingoiato.
-            //
-            // Il brain Python (es. brain/providers/anthropic_provider.py:211)
-            // intercetta exception API (billing_error, quota_exceeded, ecc.)
-            // e ritorna ProviderResult con content="[Error: ...]" invece di
-            // propagare l'eccezione. Cosi' il Rust riceveva "completed" e
-            // marcava healthy=true mentre in realta' il provider era giu'.
-            // Quindi controlliamo anche il pattern "[Error:" / "[error:".
-            let content_text = extract_content_text(&response);
-            let trimmed = content_text.trim();
-            if trimmed.is_empty() {
-                Classification::ModelSpecific(
-                    "hollow_completion".to_string(),
-                    Some("response had 0 chars of content".to_string()),
-                )
-            } else if trimmed.starts_with("[Error:") || trimmed.starts_with("[error:") {
-                // Errore ingoiato dal brain. Estrai messaggio e classifica.
-                let inner = trimmed
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .trim_start_matches("Error:")
-                    .trim_start_matches("error:")
-                    .trim();
-                classify_model_error(inner)
+            // PRIMA dell'analisi del content: il brain riformatta gli errori
+            // provider in un messaggio umano (multilingua) che NON inizia con
+            // "[Error:", mascherando il fallimento. Ma ritorna anche il campo
+            // strutturato `error_class`: lo usiamo come fonte autorevole
+            // (language-agnostic). Mappa error_class -> Classification.
+            let ec = response
+                .get("error_class")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    response
+                        .get("metadata")
+                        .and_then(|m| m.get("error_class"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or("");
+            let mapped_by_class: Option<Classification> = match ec {
+                "billing" => Some(Classification::ProviderWide(
+                    "credit_balance_too_low".to_string(),
+                    Some("error_class=billing".to_string()),
+                )),
+                "auth_error" | "missing_api_key" | "unauthenticated" => Some(
+                    Classification::ProviderWide("auth_error".to_string(), Some(ec.to_string())),
+                ),
+                "rate_limit" | "overloaded" | "unavailable" | "timeout" => Some(
+                    Classification::ProviderWide("rate_limit".to_string(), Some(ec.to_string())),
+                ),
+                _ => None,
+            };
+            if let Some(c) = mapped_by_class {
+                c
             } else {
-                Classification::Ok
+                // Fallback: analisi del content (hollow_completion / "[Error:" / OK).
+                let content_text = extract_content_text(&response);
+                let trimmed = content_text.trim();
+                if trimmed.is_empty() {
+                    Classification::ModelSpecific(
+                        "hollow_completion".to_string(),
+                        Some("response had 0 chars of content".to_string()),
+                    )
+                } else if trimmed.starts_with("[Error:") || trimmed.starts_with("[error:") {
+                    // Errore ingoiato dal brain. Estrai messaggio e classifica.
+                    let inner = trimmed
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .trim_start_matches("Error:")
+                        .trim_start_matches("error:")
+                        .trim();
+                    classify_model_error(inner)
+                } else {
+                    Classification::Ok
+                }
             }
         }
         Ok(Err(e)) => {
