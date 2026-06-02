@@ -80,7 +80,12 @@ def load_provider_catalog(provider: str) -> list[ProviderCatalogEntry]:
     Solleva `ProviderCatalogUnavailable` se DB irraggiungibile o nessun
     modello configurato per quel provider."""
     now = time.time()
-    if provider in _CACHE and (now - _CACHE_TS.get(provider, 0.0)) < _TTL_S:
+    try:
+        from brain.utils.settings_db import get_int_setting
+        _ttl = float(get_int_setting("providers.catalog_cache_ttl_seconds", 60))
+    except Exception:
+        _ttl = _TTL_S
+    if provider in _CACHE and (now - _CACHE_TS.get(provider, 0.0)) < _ttl:
         return _CACHE[provider]
     try:
         rows = _load_from_db(provider)

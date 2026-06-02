@@ -60,7 +60,12 @@ def load_api_key(provider: str) -> str:
     vuota se non trovata da nessuna parte (i provider gestiscono questo caso
     con il loro `[Provider API key not configured]`)."""
     now = time.time()
-    if provider in _CACHE and (now - _CACHE_TS.get(provider, 0.0)) < _TTL_S:
+    try:
+        from brain.utils.settings_db import get_int_setting
+        _ttl = float(get_int_setting("providers.api_key_cache_ttl_seconds", 60))
+    except Exception:
+        _ttl = _TTL_S
+    if provider in _CACHE and (now - _CACHE_TS.get(provider, 0.0)) < _ttl:
         return _CACHE[provider]
     key = _load_from_db(provider)
     if key is None:
