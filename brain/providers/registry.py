@@ -442,7 +442,13 @@ def _record_usage(provider: str, model: str, usage: dict[str, Any] | None, detai
                     "input_cost, output_cost, total_cost, "
                     "cache_read_cost, cache_creation_cost, "
                     "currency, status, details) "
-                    "VALUES (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, "
+                    # run_id via subquery: se il run non e' (ancora) in agent_runs
+                    # la subquery ritorna NULL invece di violare la FK
+                    # ai_usage_ledger_run_id_fkey (il ledger del turno puo' essere
+                    # scritto prima che la riga agent_runs sia persistita).
+                    "VALUES (%s::uuid, %s::uuid, "
+                    "(SELECT id FROM agent_runs WHERE id = %s::uuid), "
+                    "%s, %s, %s, %s, %s, %s, %s, "
                     "%s, %s, %s, %s, %s, %s, 'finalized', %s::jsonb)",
                     (
                         user_id,
