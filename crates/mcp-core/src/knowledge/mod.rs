@@ -10,6 +10,7 @@ pub mod graph_import;
 pub mod code_graph;
 pub mod auto_link;
 pub mod ingest_run;
+pub mod impact;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};

@@ -126,6 +126,8 @@ pub async fn execute(
     arguments: Value,
 ) -> String {
     match tool_name {
+        // ── impact analysis (M13.2) ───────────────────────────────────
+        "nexus_impact_brief" => handle_impact_brief(db, project_id, &arguments).await,
         // ── run_config ────────────────────────────────────────────────
         "nexus_run_config_list" => handle_run_config_list(db, &arguments).await,
         "nexus_run_config_detect" => handle_run_config_detect(db, &arguments).await,
@@ -1371,4 +1373,34 @@ async fn handle_open_file_in_editor(
         "path": path,
         "line": line,
     }).to_string()
+}
+
+/// M13.2 — nexus_impact_brief: dato un seed (file modificati), ritorna impact
+/// set strutturale + note KB pertinenti + test che lo coprono. Consultivo.
+/// arguments: { "paths": ["src/a.rs", ...] } oppure { "path": "src/a.rs" }.
+async fn handle_impact_brief(db: &PgPool, project_id: Uuid, arguments: &Value) -> String {
+    let mut seed_paths: Vec<String> = Vec::new();
+    if let Some(arr) = arguments.get("paths").and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                if !s.is_empty() {
+                    seed_paths.push(s.to_string());
+                }
+            }
+        }
+    }
+    if let Some(p) = arguments.get("path").and_then(|v| v.as_str()) {
+        if !p.is_empty() && !seed_paths.iter().any(|e| e == p) {
+            seed_paths.push(p.to_string());
+        }
+    }
+    if seed_paths.is_empty() {
+        return json!({
+            "error": "nexus_impact_brief richiede 'paths' (array) o 'path' (stringa) con i file seed."
+        })
+        .to_string();
+    }
+    crate::knowledge::impact::impact_brief(db, project_id, &seed_paths)
+        .await
+        .to_string()
 }
