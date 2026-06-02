@@ -87,6 +87,19 @@ pub async fn generate_code_doc_for_file(
         .map(|i| format!("- {}", i.module))
         .collect::<Vec<_>>()
         .join("\n");
+    // Call-graph (W1-bis tree-sitter): chi-chiama-cosa dentro il file. Vuoto per
+    // i linguaggi senza grammatica (fallback regex). Aiuta l'LLM a descrivere le
+    // relazioni interne con precisione invece di inferirle.
+    let calls_list = ast
+        .calls
+        .iter()
+        .take(50)
+        .map(|c| match &c.caller {
+            Some(caller) => format!("- {caller} -> {}", c.callee),
+            None => format!("- {}", c.callee),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let prompt = format!(
         "Sei un documentatore tecnico. Documenta in italiano, in Markdown, il file di codice qui sotto, \
@@ -97,11 +110,13 @@ pub async fn generate_code_doc_for_file(
          ## Note per chi modifica\n(insidie, invarianti, effetti collaterali)\n\n\
          Sii conciso e accurato. NON inventare: se un'informazione non e' deducibile dal codice, ometti la voce.\n\n\
          File: {path}\nLinguaggio: {lang}\n\nSimboli rilevati:\n{symbols}\n\nImport rilevati:\n{imports}\n\n\
+         Chiamate interne (call-graph):\n{calls}\n\n\
          --- CONTENUTO ({nchars} char, troncato se necessario) ---\n{snippet}",
         path = rel_path,
         lang = ast.language,
         symbols = if symbols_list.is_empty() { "(nessuno rilevato)".to_string() } else { symbols_list },
         imports = if imports_list.is_empty() { "(nessuno rilevato)".to_string() } else { imports_list },
+        calls = if calls_list.is_empty() { "(non disponibile per questo linguaggio)".to_string() } else { calls_list },
         nchars = content.chars().count(),
         snippet = snippet,
     );

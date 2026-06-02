@@ -5,6 +5,8 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+mod ts_parser;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
     pub name: String,
@@ -40,13 +42,28 @@ pub struct ImportInfo {
     pub line: usize,
 }
 
+/// Chiamata di funzione/metodo rilevata (call-graph). Popolata dal parser
+/// tree-sitter (AST); il fallback regex la lascia vuota.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallInfo {
+    pub caller: Option<String>, // funzione/metodo chiamante, se determinabile
+    pub callee: String,         // nome chiamato
+    pub line: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AstIndex {
     pub file_path: String,
     pub language: String,
     pub symbols: Vec<Symbol>,
     pub imports: Vec<ImportInfo>,
+    #[serde(default)]
+    pub calls: Vec<CallInfo>,
     pub line_count: usize,
+    /// true se l'indice e' stato prodotto da tree-sitter (AST preciso),
+    /// false se dal fallback regex.
+    #[serde(default)]
+    pub precise: bool,
 }
 
 /// Rileva il linguaggio dall'estensione. Language-agnostic: i linguaggi senza
@@ -99,6 +116,21 @@ pub fn detect_language(file_path: &str) -> &'static str {
 pub fn index_source(file_path: &str, source: &str) -> AstIndex {
     let language = detect_language(file_path);
     let lines: Vec<&str> = source.lines().collect();
+
+    // Tentativo AST preciso (tree-sitter) per i linguaggi con grammatica:
+    // simboli + call-graph. Gli import restano dal parser regex per-linguaggio
+    // (gia' affidabile e mirato agli import intra-progetto). Se la grammatica
+    // non c'e' o il parse fallisce, ricade sul parser regex/generic sotto.
+    if let Some(mut idx) = ts_parser::index_with_treesitter(file_path, language, source) {
+        idx.imports = match language {
+            "typescript" | "javascript" => extract_ts_imports(&lines),
+            "rust" => extract_rust_imports(&lines),
+            "python" => extract_python_imports(&lines),
+            _ => Vec::new(),
+        };
+        return idx;
+    }
+
     let line_count = lines.len();
 
     let symbols = match language {
@@ -120,7 +152,9 @@ pub fn index_source(file_path: &str, source: &str) -> AstIndex {
         language: language.to_string(),
         symbols,
         imports,
+        calls: Vec::new(),
         line_count,
+        precise: false,
     }
 }
 
@@ -444,6 +478,22 @@ pub async fn init() -> Result<()> { Ok(()) }
             .symbols
             .iter()
             .any(|s| s.name == "init" && s.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn test_treesitter_call_graph() {
+        // tree-sitter: simboli precisi (precise=true) + call-graph con caller.
+        let src = "fn helper() {}\nfn run() {\n    helper();\n    helper();\n}\n";
+        let idx = index_source("x.rs", src);
+        assert!(idx.precise, "rust deve usare tree-sitter");
+        assert!(idx.symbols.iter().any(|s| s.name == "helper"));
+        assert!(idx.symbols.iter().any(|s| s.name == "run"));
+        assert!(
+            idx.calls
+                .iter()
+                .any(|c| c.callee == "helper" && c.caller.as_deref() == Some("run")),
+            "il call-graph deve collegare run -> helper"
+        );
     }
 
     #[test]
