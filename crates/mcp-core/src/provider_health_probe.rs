@@ -30,7 +30,7 @@ use sqlx::PgPool;
 use tokio::time::sleep;
 
 use crate::orchestrator::{default_model_for_provider, Orchestrator};
-use crate::provider_cooldown::{is_provider_in_cooldown, put_provider_in_long_cooldown, remove_cooldown};
+use crate::provider_cooldown::{is_provider_in_cooldown, provider_health_timings, put_provider_in_long_cooldown, remove_cooldown};
 // `put_provider_in_cooldown` e' `pub(crate)` -> accessibile, ma la signature
 // e' `(provider: &str, retry_after_seconds: Option<u64>)`. Per slow/timeout
 // usiamo l'overload corto.
@@ -45,17 +45,11 @@ const PROBED_PROVIDERS: &[&str] = &["anthropic", "openai", "google", "deepseek",
 /// Il provider tipicamente risponde con "Hi!" o "Hello!" (1-2 token).
 const PROBE_PROMPT: &str = "hi";
 
-/// Timeout per ogni singola chiamata. Oltre questa soglia il provider
-/// e' considerato "slow" (cooldown 60s). 30s e' un valore conservativo
-/// che evita falsi positivi su latency network elevata (es. WSL Italia
-/// verso provider US-East): un primo token tipicamente arriva in 1-3s ma
-/// la connection setup + DNS + TLS handshake puo' aggiungere 5-15s.
-const PROBE_TIMEOUT_S: u64 = 30;
-
-/// Cooldown breve quando il provider e' lento (1 minuto). L'idea: dare un
-/// piccolo respiro al provider, non escluderlo definitivamente per uno
-/// spike di latency.
-const SLOW_COOLDOWN_S: u64 = 60;
+// Timeout del probe ("slow" oltre soglia) e cooldown breve per provider lento
+// sono DB-driven: settings `provider.health_probe_timeout_s` /
+// `provider.slow_cooldown_s` (migrazione 0252). Vedi
+// `provider_cooldown::provider_health_timings()`. I default storici (30s / 60s)
+// restano in `ProviderHealthTimings::default()`.
 
 /// Avvia il worker in background. Restituisce subito; il loop gira per
 /// l'intera vita del processo.
@@ -94,14 +88,14 @@ pub fn spawn_health_probe(orchestrator: Arc<Orchestrator>, db: PgPool, enabled: 
     });
 }
 
-/// Soglia "outage locale": se in un solo round 3+ provider distinti falliscono
-/// con un errore non-billing, e' praticamente certo che il problema sia
-/// l'infrastruttura locale (brain bridge giu', rete WSL ko, DNS) e non un
-/// guasto simultaneo dei provider remoti. In quel caso annulliamo i
-/// cooldown applicati nel round per evitare di marcare tutti i provider
-/// come down (visto in prod il 17-18 maggio: 5 provider down in 8 secondi
-/// con "tcp connect error" mentre il brain era riavviato).
-const OUTAGE_THRESHOLD: usize = 3;
+// Soglia "outage locale": se in un solo round troppi provider distinti
+// falliscono con un errore non-billing, e' praticamente certo che il problema
+// sia l'infrastruttura locale (brain bridge giu', rete WSL ko, DNS) e non un
+// guasto simultaneo dei provider remoti. In quel caso annulliamo i cooldown
+// applicati nel round per evitare di marcare tutti i provider come down (visto
+// in prod il 17-18 maggio: 5 provider down in 8 secondi con "tcp connect error"
+// mentre il brain era riavviato). Soglia DB-driven: setting
+// `provider.outage_threshold` (migrazione 0252).
 
 /// Accumula i provider che hanno fallito nel round corrente con cooldown
 /// applicato, per poterli liberare se viene rilevato un outage locale.
@@ -147,7 +141,7 @@ async fn run_one_round(orchestrator: &Orchestrator, db: &PgPool) {
     // Outage detection: se troppi provider sono andati in cooldown breve
     // nello stesso round, e' infrastruttura locale. Rollback.
     let victims = round_victims_drain();
-    if victims.len() >= OUTAGE_THRESHOLD {
+    if victims.len() >= provider_health_timings().outage_threshold {
         tracing::warn!(
             "provider_health_probe: OUTAGE LOCALE rilevato — {} provider hanno fallito \
              nello stesso round ({:?}). Rollback dei cooldown applicati: e' quasi \
@@ -210,12 +204,15 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
         }
     };
     let model = default_model_for_provider(&matrix_arc, provider);
+    let timings = provider_health_timings();
+    let probe_timeout_s = timings.health_probe_timeout_s;
+    let slow_cooldown_s = timings.slow_cooldown_s;
     let started = Instant::now();
     // generate_completion vive su `NeuralCoreClient`, accessibile via il
     // campo `pub(crate) neural` di `Orchestrator`.
     let result: Result<anyhow::Result<serde_json::Value>, tokio::time::error::Elapsed> =
         tokio::time::timeout(
-            Duration::from_secs(PROBE_TIMEOUT_S),
+            Duration::from_secs(probe_timeout_s),
             orchestrator.neural.generate_completion(provider, &model, PROBE_PROMPT),
         )
         .await;
@@ -247,7 +244,7 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
                 if billing {
                     put_provider_in_long_cooldown(provider, &kind);
                 } else {
-                    put_provider_in_cooldown(provider, Some(SLOW_COOLDOWN_S));
+                    put_provider_in_cooldown(provider, Some(slow_cooldown_s));
                 }
                 (false, Some(kind), Some(truncate(inner, 500)))
             } else {
@@ -329,7 +326,7 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
                 // un round, e' OUTAGE certo e NON dobbiamo applicare nulla.
                 round_victims_push(provider);
             } else {
-                put_provider_in_cooldown(provider, Some(SLOW_COOLDOWN_S));
+                put_provider_in_cooldown(provider, Some(slow_cooldown_s));
                 round_victims_push(provider);
             }
             (false, Some(kind), Some(truncate(&msg, 500)))
@@ -337,9 +334,9 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
         Err(_timeout_elapsed) => {
             // Timeout: provider troppo lento. Cooldown breve.
             tracing::warn!(
-                "provider_health_probe: {provider} TIMEOUT (>{PROBE_TIMEOUT_S}s)"
+                "provider_health_probe: {provider} TIMEOUT (>{probe_timeout_s}s)"
             );
-            put_provider_in_cooldown(provider, Some(SLOW_COOLDOWN_S));
+            put_provider_in_cooldown(provider, Some(slow_cooldown_s));
             // Timeout: spesso e' anch'esso un sintomo di outage locale
             // (brain bridge lento, WSL DNS lento, internet bloccato). Conta
             // come victim per outage detection.
@@ -347,7 +344,7 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
             (
                 false,
                 Some("timeout".to_string()),
-                Some(format!("nessuna risposta in {PROBE_TIMEOUT_S}s")),
+                Some(format!("nessuna risposta in {probe_timeout_s}s")),
             )
         }
     };
@@ -376,6 +373,71 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
     .await;
     if let Err(e) = row_result {
         tracing::warn!("provider_health_probe: persistenza fallita per {provider}: {e}");
+    }
+}
+
+/// Esito sintetico di un probe attivo, usato dalla logica probe-then-reenable
+/// (`provider_cooldown::billing_cooldown_recovery_loop`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// Il provider ha risposto correttamente: e' sano.
+    Healthy,
+    /// Errore billing/quota: il credito e' ancora insufficiente.
+    Billing(String),
+    /// Esito non conclusivo (rate-limit, timeout, errore di rete/infra, ecc.).
+    Transient(String),
+}
+
+/// Esegue un singolo probe "hi" verso un provider e ne classifica l'esito.
+///
+/// Funzione pura rispetto allo stato di cooldown: NON applica/rimuove cooldown
+/// ne' persiste history — si limita a interrogare il provider e classificare.
+/// Il chiamante decide cosa fare. Riusa `extract_response_content_text` e
+/// `classify_probe_error` con la stessa semantica di `probe_one`, inclusa la
+/// detection dell'errore "ingoiato dal brain" (`[Error: ...]`).
+pub async fn probe_provider_once(
+    orchestrator: &Orchestrator,
+    provider: &str,
+    timeout_s: u64,
+) -> ProbeOutcome {
+    let matrix_arc = match orchestrator.routing_matrix.current_async().await {
+        Ok(m) => m,
+        Err(e) => return ProbeOutcome::Transient(format!("routing_matrix non disponibile: {e}")),
+    };
+    let model = default_model_for_provider(&matrix_arc, provider);
+    let result = tokio::time::timeout(
+        Duration::from_secs(timeout_s.max(1)),
+        orchestrator.neural.generate_completion(provider, &model, PROBE_PROMPT),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(response)) => {
+            let content_text = extract_response_content_text(&response);
+            let trimmed = content_text.trim();
+            if trimmed.starts_with("[Error:") || trimmed.starts_with("[error:") {
+                let inner = trimmed.trim_start_matches('[').trim_end_matches(']');
+                outcome_from_raw_error(inner)
+            } else {
+                ProbeOutcome::Healthy
+            }
+        }
+        Ok(Err(e)) => outcome_from_raw_error(&e.to_string()),
+        Err(_elapsed) => ProbeOutcome::Transient("timeout".to_string()),
+    }
+}
+
+/// Mappa un messaggio di errore grezzo in `ProbeOutcome`: billing/quota →
+/// `Billing` (il credito e' davvero KO), tutto il resto → `Transient`.
+fn outcome_from_raw_error(raw: &str) -> ProbeOutcome {
+    let kind = classify_probe_error(raw);
+    if matches!(
+        kind.as_str(),
+        "quota_exceeded" | "credit_balance_too_low" | "billing_required"
+    ) {
+        ProbeOutcome::Billing(kind)
+    } else {
+        ProbeOutcome::Transient(kind)
     }
 }
 
@@ -498,5 +560,39 @@ mod tests {
     fn test_truncate() {
         assert_eq!(truncate("ciao", 10), "ciao");
         assert_eq!(truncate("ciao mondo bellissimo", 5), "ciao …");
+    }
+
+    #[test]
+    fn outcome_billing_per_credito_e_quota() {
+        // Errori billing/quota -> Billing: il provider NON va riabilitato.
+        assert_eq!(
+            outcome_from_raw_error("Your credit balance is too low to access the API"),
+            ProbeOutcome::Billing("credit_balance_too_low".to_string())
+        );
+        assert_eq!(
+            outcome_from_raw_error("Error: insufficient_quota"),
+            ProbeOutcome::Billing("quota_exceeded".to_string())
+        );
+        assert_eq!(
+            outcome_from_raw_error("payment required: upgrade or purchase credits"),
+            ProbeOutcome::Billing("billing_required".to_string())
+        );
+    }
+
+    #[test]
+    fn outcome_transient_per_rate_limit_e_timeout() {
+        // Errori non-billing -> Transient: nuovo tentativo al prossimo giro.
+        assert_eq!(
+            outcome_from_raw_error("HTTP 429 rate limit exceeded"),
+            ProbeOutcome::Transient("rate_limit".to_string())
+        );
+        assert_eq!(
+            outcome_from_raw_error("request timed out"),
+            ProbeOutcome::Transient("timeout".to_string())
+        );
+        assert_eq!(
+            outcome_from_raw_error("connection refused"),
+            ProbeOutcome::Transient("connection_error".to_string())
+        );
     }
 }

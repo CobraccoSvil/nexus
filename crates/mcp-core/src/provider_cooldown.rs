@@ -6,20 +6,69 @@
 //! fuori dal loop agente (es. `orchestrator.rs`).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
+/// Tempi di health/cooldown provider, DB-driven (regola G). Inizializzati da
+/// `main.rs` all'avvio leggendo la tabella `settings` (chiavi `provider.*`,
+/// migrazione 0252). Se `init_provider_health_timings` non viene chiamato (es.
+/// nei test unitari), si usano i default storici qui sotto — cosi' il modulo
+/// resta utilizzabile senza dipendere dal DB.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderHealthTimings {
+    pub cooldown_default_s: u64,
+    pub cooldown_min_s: u64,
+    pub cooldown_max_s: u64,
+    pub cooldown_long_s: u64,
+    pub circuit_breaker_window_s: u64,
+    pub circuit_breaker_threshold: usize,
+    pub circuit_breaker_extended_cooldown_s: u64,
+    pub health_probe_timeout_s: u64,
+    pub slow_cooldown_s: u64,
+    pub outage_threshold: usize,
+    pub billing_recovery_interval_s: u64,
+    pub recovery_probe_timeout_s: u64,
+}
+
+impl Default for ProviderHealthTimings {
+    fn default() -> Self {
+        Self {
+            cooldown_default_s: 300,
+            cooldown_min_s: 10,
+            cooldown_max_s: 3600,
+            cooldown_long_s: 6 * 3600,
+            circuit_breaker_window_s: 60,
+            circuit_breaker_threshold: 3,
+            circuit_breaker_extended_cooldown_s: 600,
+            health_probe_timeout_s: 30,
+            slow_cooldown_s: 60,
+            outage_threshold: 3,
+            billing_recovery_interval_s: 60,
+            recovery_probe_timeout_s: 30,
+        }
+    }
+}
+
+static HEALTH_TIMINGS: OnceLock<ProviderHealthTimings> = OnceLock::new();
+
+/// Inizializza i tempi health/cooldown dai settings DB. Idempotente: la prima
+/// chiamata vince (OnceLock). Va invocata una sola volta all'avvio da main.rs.
+pub fn init_provider_health_timings(timings: ProviderHealthTimings) {
+    let _ = HEALTH_TIMINGS.set(timings);
+}
+
+/// Ritorna i tempi correnti (copia). Default storici se non ancora inizializzati.
+pub fn provider_health_timings() -> ProviderHealthTimings {
+    HEALTH_TIMINGS.get().copied().unwrap_or_default()
+}
+
 static PROVIDER_COOLDOWN: OnceLock<Mutex<HashMap<String, std::time::Instant>>> = OnceLock::new();
-const PROVIDER_COOLDOWN_SECS: u64 = 300; // 5 minuti (default se retry-after assente)
-const PROVIDER_COOLDOWN_MAX_SECS: u64 = 3600; // cap superiore: 1 ora
-const PROVIDER_COOLDOWN_MIN_SECS: u64 = 10; // cap inferiore per evitare hammering
 
 // -- Circuit breaker state --
-// Traccia gli istanti dei fallimenti recenti per provider. Se 3+ fallimenti in 60s
-// entriamo in stato OPEN con cooldown esteso.
+// Traccia gli istanti dei fallimenti recenti per provider. Se la soglia di
+// fallimenti viene superata entro la finestra, entriamo in stato OPEN con
+// cooldown esteso (durate da `provider_health_timings()`).
 static PROVIDER_FAILURES: OnceLock<Mutex<HashMap<String, Vec<std::time::Instant>>>> = OnceLock::new();
-const CIRCUIT_BREAKER_WINDOW_SECS: u64 = 60;
-const CIRCUIT_BREAKER_THRESHOLD: usize = 3;
-const CIRCUIT_BREAKER_EXTENDED_COOLDOWN_SECS: u64 = 600; // 10 minuti dopo threshold
 
 pub fn is_provider_in_cooldown(provider: &str) -> bool {
     let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
@@ -36,12 +85,13 @@ pub fn is_provider_in_cooldown(provider: &str) -> bool {
 fn record_provider_failure(provider: &str) -> bool {
     let store = PROVIDER_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = store.lock() {
+        let t = provider_health_timings();
         let now = std::time::Instant::now();
-        let window = std::time::Duration::from_secs(CIRCUIT_BREAKER_WINDOW_SECS);
+        let window = std::time::Duration::from_secs(t.circuit_breaker_window_s);
         let entry = map.entry(provider.to_lowercase()).or_insert_with(Vec::new);
-        entry.retain(|&t| now.duration_since(t) < window);
+        entry.retain(|&ts| now.duration_since(ts) < window);
         entry.push(now);
-        entry.len() >= CIRCUIT_BREAKER_THRESHOLD
+        entry.len() >= t.circuit_breaker_threshold
     } else {
         false
     }
@@ -90,12 +140,13 @@ pub fn remove_cooldown(provider: &str) {
 /// provider (header Retry-After), lo usa con un cap a [10s, 3600s]. Altrimenti
 /// default 300s. Se il circuit breaker scatta, cooldown esteso a 600s.
 pub(crate) fn put_provider_in_cooldown(provider: &str, retry_after_seconds: Option<u64>) {
+    let t = provider_health_timings();
     let breaker_tripped = record_provider_failure(provider);
     let base_secs = retry_after_seconds
-        .map(|s| s.clamp(PROVIDER_COOLDOWN_MIN_SECS, PROVIDER_COOLDOWN_MAX_SECS))
-        .unwrap_or(PROVIDER_COOLDOWN_SECS);
+        .map(|s| s.clamp(t.cooldown_min_s, t.cooldown_max_s))
+        .unwrap_or(t.cooldown_default_s);
     let secs = if breaker_tripped {
-        base_secs.max(CIRCUIT_BREAKER_EXTENDED_COOLDOWN_SECS)
+        base_secs.max(t.circuit_breaker_extended_cooldown_s)
     } else {
         base_secs
     };
@@ -105,7 +156,7 @@ pub(crate) fn put_provider_in_cooldown(provider: &str, retry_after_seconds: Opti
         if breaker_tripped {
             tracing::warn!(
                 "Provider '{}' circuit breaker OPEN: cooldown esteso {}s (>= {} fallimenti in {}s)",
-                provider, secs, CIRCUIT_BREAKER_THRESHOLD, CIRCUIT_BREAKER_WINDOW_SECS
+                provider, secs, t.circuit_breaker_threshold, t.circuit_breaker_window_s
             );
         } else {
             tracing::warn!(
@@ -116,12 +167,6 @@ pub(crate) fn put_provider_in_cooldown(provider: &str, retry_after_seconds: Opti
         map.insert(provider.to_lowercase(), until);
     }
 }
-
-/// Cooldown lungo (default 6h) per errori non recuperabili a breve termine
-/// (credit balance too low, quota daily exceeded). Il provider non viene più
-/// scelto né dal routing automatico né dal fallback finché il cooldown non
-/// scade — costringe Nexus a usare un altro provider della gerarchia.
-const PROVIDER_COOLDOWN_LONG_SECS: u64 = 6 * 3600; // 6 ore
 
 /// Connessione Redis globale per persistere il cooldown lungo (sopravvive
 /// al riavvio di mcp-core). Inizializzata da `main.rs::main` dopo init_redis.
@@ -246,11 +291,29 @@ pub async fn propagate_billing_reenable_to_db(db: &sqlx::PgPool, provider: &str)
     }
 }
 
-/// Worker periodico: ogni `interval_secs` controlla i provider che hanno
-/// righe ancora disabilitate dal billing cooldown e li riabilita nel DB se
-/// il cooldown locale e' scaduto.
-pub async fn billing_cooldown_recovery_loop(db: sqlx::PgPool, interval_secs: u64) {
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+/// Worker periodico: ogni `interval_secs` controlla i provider che hanno righe
+/// ancora disabilitate dal billing cooldown e, se il cooldown locale e' scaduto,
+/// li riabilita nel DB **solo dopo un probe attivo andato a buon fine**
+/// (probe-then-reenable).
+///
+/// Prima del fix, la riabilitazione avveniva alla cieca allo scadere del timer:
+/// se il billing non era stato ricaricato, il provider tornava attivo, veniva
+/// scelto per un run reale, falliva di nuovo e rientrava in cooldown (ciclo).
+/// Ora, allo scadere del cooldown:
+///   - probe Healthy   -> riabilita (catalog + matrix).
+///   - probe Billing    -> il credito e' ancora KO: rinnova il cooldown lungo,
+///                         niente riabilitazione.
+///   - probe Transient  -> errore non conclusivo (rate-limit/timeout/rete):
+///                         applica un cooldown breve e riprova al prossimo giro.
+///
+/// `interval_secs` e il timeout del probe sono DB-driven (settings `provider.*`,
+/// migrazione 0252) — vedi `provider_health_timings()`.
+pub async fn billing_cooldown_recovery_loop(
+    orchestrator: Arc<crate::orchestrator::Orchestrator>,
+    db: sqlx::PgPool,
+    interval_secs: u64,
+) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(5)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ticker.tick().await; // skip immediate
 
@@ -280,7 +343,44 @@ pub async fn billing_cooldown_recovery_loop(db: sqlx::PgPool, interval_secs: u64
             if is_provider_in_cooldown(&provider) {
                 continue;
             }
-            propagate_billing_reenable_to_db(&db, &provider).await;
+            // Probe-then-reenable: il cooldown e' scaduto ma prima di riabilitare
+            // accertiamo che il provider sia DAVVERO tornato operativo.
+            let probe_timeout = provider_health_timings().recovery_probe_timeout_s;
+            match crate::provider_health_probe::probe_provider_once(
+                &orchestrator,
+                &provider,
+                probe_timeout,
+            )
+            .await
+            {
+                crate::provider_health_probe::ProbeOutcome::Healthy => {
+                    tracing::info!(
+                        target: "provider_cooldown",
+                        provider = %provider,
+                        "probe-then-reenable: provider sano, riabilito nel DB"
+                    );
+                    propagate_billing_reenable_to_db(&db, &provider).await;
+                }
+                crate::provider_health_probe::ProbeOutcome::Billing(kind) => {
+                    tracing::warn!(
+                        target: "provider_cooldown",
+                        provider = %provider,
+                        kind = %kind,
+                        "probe-then-reenable: billing ancora KO, rinnovo cooldown lungo (niente riabilitazione)"
+                    );
+                    put_provider_in_long_cooldown(&provider, &kind);
+                }
+                crate::provider_health_probe::ProbeOutcome::Transient(kind) => {
+                    let slow = provider_health_timings().slow_cooldown_s;
+                    tracing::warn!(
+                        target: "provider_cooldown",
+                        provider = %provider,
+                        kind = %kind,
+                        "probe-then-reenable: esito non conclusivo, cooldown breve e nuovo tentativo al prossimo giro"
+                    );
+                    put_provider_in_short_cooldown(&provider, &kind, slow);
+                }
+            }
         }
     }
 }
@@ -294,13 +394,14 @@ pub async fn billing_cooldown_recovery_loop(db: sqlx::PgPool, interval_secs: u64
 /// `restore_cooldown` invece di partire pulito (quel restart era il bug
 /// "LED openai verde" segnalato dall'utente).
 pub fn put_provider_in_long_cooldown(provider: &str, reason: &str) {
+    let long_secs = provider_health_timings().cooldown_long_s;
     let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut map) = store.lock() {
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(PROVIDER_COOLDOWN_LONG_SECS);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(long_secs);
         map.insert(provider.to_lowercase(), until);
         tracing::warn!(
             "Provider '{}' in COOLDOWN LUNGO ({}s, {} ore) per: {}",
-            provider, PROVIDER_COOLDOWN_LONG_SECS, PROVIDER_COOLDOWN_LONG_SECS / 3600, reason,
+            provider, long_secs, long_secs / 3600, reason,
         );
     }
     // Salva anche il motivo nel registro motivazioni
@@ -324,14 +425,14 @@ pub fn put_provider_in_long_cooldown(provider: &str, reason: &str) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let until_ts = now_ts.saturating_add(PROVIDER_COOLDOWN_LONG_SECS);
+            let until_ts = now_ts.saturating_add(long_secs);
             let key = format!("nexus:billing_cooldown:{}", provider);
             let value = format!("{}|{}", until_ts, reason);
             let res: Result<(), _> = redis::cmd("SET")
                 .arg(&key)
                 .arg(&value)
                 .arg("EX")
-                .arg(PROVIDER_COOLDOWN_LONG_SECS + 60)
+                .arg(long_secs + 60)
                 .query_async(&mut conn)
                 .await;
             match &res {
@@ -608,6 +709,32 @@ mod tests {
                 secs
             );
         }
+    }
+
+    #[test]
+    fn timings_default_riflettono_i_valori_storici() {
+        // I default DB-driven devono coincidere con le vecchie costanti
+        // hardcoded, cosi' un setting mancante non cambia il comportamento.
+        let t = ProviderHealthTimings::default();
+        assert_eq!(t.cooldown_default_s, 300);
+        assert_eq!(t.cooldown_min_s, 10);
+        assert_eq!(t.cooldown_max_s, 3600);
+        assert_eq!(t.cooldown_long_s, 6 * 3600);
+        assert_eq!(t.circuit_breaker_window_s, 60);
+        assert_eq!(t.circuit_breaker_threshold, 3);
+        assert_eq!(t.circuit_breaker_extended_cooldown_s, 600);
+        assert_eq!(t.health_probe_timeout_s, 30);
+        assert_eq!(t.slow_cooldown_s, 60);
+        assert_eq!(t.outage_threshold, 3);
+        assert_eq!(t.billing_recovery_interval_s, 60);
+        assert_eq!(t.recovery_probe_timeout_s, 30);
+    }
+
+    #[test]
+    fn provider_health_timings_ritorna_default_se_non_inizializzato() {
+        // Senza init (caso test/avvio precoce) si usano i default, mai panico.
+        let t = provider_health_timings();
+        assert_eq!(t.cooldown_long_s, 6 * 3600);
     }
 
     #[test]
