@@ -575,6 +575,7 @@ pub async fn promote_notes_on_run_completed(
     files_touched: &[String],
     project_channels: &nexus_events::ProjectChannels,
     project_id: Uuid,
+    final_answer: &str,
 ) {
     // Le note 'chat' (richiesta utente, create da create_note_from_user_message)
     // nascono draft con source_message_id valorizzato ma source_run_id NULL: il
@@ -583,12 +584,29 @@ pub async fn promote_notes_on_run_completed(
     // draft collegate sia per source_run_id (se valorizzato) sia per
     // source_message_id == run_message_id del run. Senza questo, le note chat
     // restavano draft per sempre.
+    //
+    // Inoltre ARRICCHIAMO il corpo della nota con la risposta finale dell'AI: una
+    // nota che contiene solo la richiesta utente e' inutile per decisioni future.
+    // Aggiungiamo la risposta (final_answer) in coda al body_md, una sola volta
+    // (status passa a 'active', quindi non viene ri-promossa). Marker idempotente
+    // per non duplicare l'append se la nota fosse gia' stata arricchita.
+    let answer_trim = final_answer.trim();
+    let answer_block = if answer_trim.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n---\n\n## Risposta di Nexus\n\n{answer_trim}")
+    };
     let result = sqlx::query_scalar::<_, Uuid>(
         r#"
         UPDATE project_knowledge_notes
         SET status = 'active',
             updated_at = NOW(),
-            file_paths = $2
+            file_paths = $2,
+            body_md = CASE
+                WHEN $3 <> '' AND position('## Risposta di Nexus' in body_md) = 0
+                THEN body_md || $3
+                ELSE body_md
+            END
         WHERE status = 'draft'
           AND (
             source_run_id = $1
@@ -599,6 +617,7 @@ pub async fn promote_notes_on_run_completed(
     )
     .bind(run_id)
     .bind(files_touched)
+    .bind(&answer_block)
     .fetch_all(db)
     .await;
 

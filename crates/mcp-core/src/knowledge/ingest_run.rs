@@ -175,7 +175,7 @@ pub async fn ingest_run_summary_to_kb(
 
         if read_bool_setting(db, "kb.lifecycle.promote_enabled", true).await {
             crate::knowledge::promote_notes_on_run_completed(
-                db, run_id, &file_paths, channels, project_id,
+                db, run_id, &file_paths, channels, project_id, &final_answer,
             )
             .await;
         }
