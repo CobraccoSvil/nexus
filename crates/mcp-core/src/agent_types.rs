@@ -383,6 +383,24 @@ pub async fn finalize_agent_run(
 /// Idempotente: se non ci sono modifiche staged, non commit niente.
 /// Best-effort: errori loggati ma non propagati.
 pub async fn auto_commit_project_changes(db: &PgPool, run_id: Uuid) {
+    // M13.5 — se il regression gate ha bloccato il run, NON committare il codice
+    // potenzialmente rotto. Legge l'esito registrato in project_impact_runs.
+    let gate_status: Option<String> = sqlx::query_scalar(
+        "SELECT gate_status FROM project_impact_runs WHERE run_id = $1",
+    )
+    .bind(run_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    if matches!(gate_status.as_deref(), Some("blocked") | Some("blocked_capped")) {
+        tracing::warn!(
+            "auto_commit: run {} bloccato dal regression gate (gate_status={:?}) -> commit saltato",
+            run_id, gate_status,
+        );
+        return;
+    }
+
     // 1. Recupera project_id e project_root
     let row = match sqlx::query_as::<_, (Uuid, Option<String>)>(
         r#"
