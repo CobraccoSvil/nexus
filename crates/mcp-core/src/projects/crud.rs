@@ -188,7 +188,12 @@ pub async fn register_project(
     let team_id = ensure_personal_team(&state.db, user_id).await?;
     let slug = ensure_unique_slug(&state.db, user_id, &project_name).await?;
     let git = detect_git_repo(&canonical).await;
-    assert_allowed_workspace(&state.db, &git.root_path).await?;
+    // NB: non validare git.root_path: se il project dir e dentro un repo git piu
+    // grande (es. la home dell'utente e un repo git), git.root_path e un ANTENATO
+    // fuori da projects_base_root e farebbe fallire l'assert. La cartella del
+    // progetto (`canonical`) e gia stata validata sopra (assert_allowed_workspace
+    // a inizio funzione); il root effettivo del repository viene normalizzato a
+    // `canonical` piu sotto (repo_root_path).
 
     let project_id = Uuid::new_v4();
     let workspace_id = Uuid::new_v4();
@@ -246,6 +251,21 @@ pub async fn register_project(
         .first()
         .map(|(_, fetch_url, _)| fetch_url.clone());
 
+    // Fix: se la git-root rilevata e un ANTENATO del project dir (es. la home
+    // dell'utente e un repo git, caso dotfiles, o projects_base_root sta dentro
+    // un repo git), il progetto NON coincide con la git-root. In quel caso il
+    // root del repository deve essere la cartella del progetto (`canonical`),
+    // coerente con workspaces.absolute_path e projects.repository_root_path,
+    // altrimenti i tool agente (write_file/run_command via
+    // tool_runner_server COALESCE(repositories.root_path, ...)) opererebbero
+    // nella git-root condivisa invece che nel progetto. Se invece la git-root
+    // e dentro/uguale al project dir, la si mantiene.
+    let repo_root_path = if git.root_path.starts_with(&canonical) {
+        git.root_path.clone()
+    } else {
+        canonical.clone()
+    };
+
     sqlx::query(
         r#"
         INSERT INTO repositories (id, project_id, provider, remote_url, root_path, is_git_repo, current_branch)
@@ -255,7 +275,7 @@ pub async fn register_project(
     .bind(repository_id)
     .bind(project_id)
     .bind(remote_url)
-    .bind(git.root_path.to_string_lossy().to_string())
+    .bind(repo_root_path.to_string_lossy().to_string())
     .bind(git.is_git_repo)
     .bind(git.current_branch.clone())
     .execute(&mut *tx)
