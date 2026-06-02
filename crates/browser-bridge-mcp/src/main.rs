@@ -168,10 +168,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let port: u16 = std::env::var("BROWSER_BRIDGE_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4055);
+    // Porta dal DB (regola G: unica fonte di verita', niente env/hardcoded).
+    // Questo servizio era DB-less: ci connettiamo solo per risolvere la porta.
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let port: u16 = nexus_auth::resolve_port(&db, "browser_bridge_port").await;
 
     // Per WSL2: per permettere a Chrome su Windows di raggiungere l'update.xml,
     // bisogna ascoltare su 0.0.0.0 (WSL forward -> localhost Windows).

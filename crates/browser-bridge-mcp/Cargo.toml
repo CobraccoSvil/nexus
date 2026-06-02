@@ -13,9 +13,11 @@ axum = { workspace = true, features = ["ws", "macros"] }
 base64.workspace = true
 dashmap.workspace = true
 futures.workspace = true
+nexus-auth = { path = "../nexus-auth" }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 sha2.workspace = true
 thiserror = "1"
 tokio = { workspace = true, features = ["full"] }

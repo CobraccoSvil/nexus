@@ -118,10 +118,8 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 
-    let port = std::env::var("PLUGIN_SERVICE_PORT")
-        .unwrap_or_else(|_| "4050".to_string())
-        .parse::<u16>()
-        .unwrap_or(4050);
+    // Porta dal DB (regola G: unica fonte di verita', niente env/hardcoded).
+    let port = nexus_auth::resolve_port(&db, "plugin_service_port").await;
 
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("Plugin Service listening on {addr}");

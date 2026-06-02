@@ -185,6 +185,11 @@ async fn main() -> anyhow::Result<()> {
 
     let db = db::init_pool(&database_url).await?;
 
+    // Porta HTTP dal DB (regola G: unica fonte di verita', niente env/hardcoded).
+    // Risolta subito dopo il pool: se il DB e' down panica qui (coerente con
+    // RoutingMatrixCache::init poco sotto).
+    let mcp_http_port = nexus_auth::resolve_port(&db, "mcp_core_http_port").await;
+
     // Inizializza NexusBridge con pool DB (Fase 6 + persistenza Q-values):
     // - Router Q-Learning con persistenza asincrona su nexus_q_values
     // - Caricamento Q-values esistenti in background (non blocca l'avvio)
@@ -531,8 +536,9 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let gw_url = std::env::var("NEXUS_GATEWAY_URL")
-        .unwrap_or_else(|_| "http://localhost:4060".to_string());
+    // URL gateway dalla porta nel DB (regola G: niente env/hardcoded).
+    let gw_port = nexus_auth::resolve_port(&db, "nexus_gateway_port").await;
+    let gw_url = format!("http://127.0.0.1:{gw_port}");
     let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN")
         .unwrap_or_else(|_| "dev-internal-token".to_string());
     let nexus_gw = nexus_gateway::NexusGatewayClient::new(gw_url.clone(), gw_token);
@@ -2798,7 +2804,7 @@ async fn main() -> anyhow::Result<()> {
             .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
             .layer(cors);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
+    let addr = SocketAddr::from(([0, 0, 0, 0], mcp_http_port));
     tracing::info!("mcp-core listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

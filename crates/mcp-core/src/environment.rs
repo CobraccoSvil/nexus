@@ -550,10 +550,38 @@ pub async fn qdrant_health_handler(
     Ok(Json(result))
 }
 
+/// URL del gateway risolto dalla porta nel DB (regola G: niente env/hardcoded).
+/// A runtime non si panica: se il DB e' down o la chiave manca si ritorna 503.
+async fn resolve_gateway_url(
+    db: &sqlx::PgPool,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    match crate::settings::get_setting(db, "nexus_gateway_port").await {
+        Ok(Some(v)) => match v.trim().parse::<u16>() {
+            Ok(p) if p > 0 => Ok(format!("http://127.0.0.1:{p}")),
+            _ => Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": format!("settings.nexus_gateway_port = {v:?} non e' una porta valida")
+                })),
+            )),
+        },
+        Ok(None) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "settings.nexus_gateway_port assente nel DB. Verifica la migrazione 0239."
+            })),
+        )),
+        Err(e) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": format!("lettura nexus_gateway_port fallita: {e}") })),
+        )),
+    }
+}
+
 pub async fn gateway_providers_handler(
     axum::extract::State(state): axum::extract::State<crate::AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let gw_url = std::env::var("NEXUS_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:4060".to_string());
+    let gw_url = resolve_gateway_url(&state.db).await?;
     let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN").unwrap_or_else(|_| "dev-internal-token".to_string());
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -770,9 +798,9 @@ pub async fn gateway_providers_handler(
 }
 
 pub async fn gateway_reload_handler(
-    axum::extract::State(_state): axum::extract::State<crate::AppState>,
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let gw_url = std::env::var("NEXUS_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:4060".to_string());
+    let gw_url = resolve_gateway_url(&state.db).await?;
     let gw_token = std::env::var("NEXUS_GATEWAY_SERVICE_TOKEN").unwrap_or_else(|_| "dev-internal-token".to_string());
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))

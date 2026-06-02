@@ -101,10 +101,8 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 
-    let port = std::env::var("BILLING_SERVICE_PORT")
-        .unwrap_or_else(|_| "4040".to_string())
-        .parse::<u16>()
-        .unwrap_or(4040);
+    // Porta dal DB (regola G: unica fonte di verita', niente env/hardcoded).
+    let port = nexus_auth::resolve_port(&db, "billing_service_port").await;
 
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("Billing Service listening on {addr}");

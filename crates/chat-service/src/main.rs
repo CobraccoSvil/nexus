@@ -148,10 +148,8 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 
-    let port = std::env::var("CHAT_SERVICE_PORT")
-        .unwrap_or_else(|_| "4020".to_string())
-        .parse::<u16>()
-        .unwrap_or(4020);
+    // Porta dal DB (regola G: unica fonte di verita', niente env/hardcoded).
+    let port = nexus_auth::resolve_port(&db, "chat_service_port").await;
 
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("Chat Service listening on {addr}");

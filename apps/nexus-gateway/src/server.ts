@@ -10,7 +10,8 @@ import { NexusError } from "@nexus/shared";
 // Repo root = apps/nexus-gateway/src/../../.. → D:/Sviluppo/IDEAI
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
-const PORT = Number(process.env.NEXUS_GATEWAY_PORT ?? 4060);
+// La porta NON si legge da env/hardcoded (regola G): viene risolta dal DB
+// (settings.nexus_gateway_port) appena prima del listen, vedi resolveGatewayPort().
 const ALIASES_FILE = resolve(REPO_ROOT, process.env.NEXUS_MODEL_ALIASES_FILE ?? "config/model-aliases.yaml");
 const POLICY_FILE  = resolve(REPO_ROOT, process.env.NEXUS_LLM_POLICY_FILE  ?? "config/policies/default.yaml");
 const JWT_SECRET   = process.env.JWT_SECRET ?? "";
@@ -447,9 +448,41 @@ app.post("/admin/reload", async (req, reply) => {
 });
 
 // ── Start ──────────────────────────────────────────────────────────────────────
+/**
+ * Risolve la porta di ascolto ESCLUSIVAMENTE dal DB (settings.nexus_gateway_port,
+ * regola G: niente env, niente default hardcoded). DB irraggiungibile -> retry
+ * 5x5s, poi exit. Chiave assente/non valida -> exit immediato.
+ */
+async function resolveGatewayPort(sql: typeof settingsSql): Promise<number> {
+  if (!sql) {
+    app.log.error("[gateway] DB non configurato (POSTGRES_URL/DATABASE_URL assente): impossibile risolvere nexus_gateway_port (regola G).");
+    process.exit(1);
+  }
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      const rows = await sql<{ value: string }[]>`SELECT value FROM settings WHERE key = 'nexus_gateway_port'`;
+      const raw = rows[0]?.value?.trim();
+      const port = raw ? Number(raw) : NaN;
+      if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+        app.log.error(`[gateway] settings.nexus_gateway_port assente o non valido (${raw ?? "null"}). Applica la migrazione 0239 (regola G).`);
+        process.exit(1);
+      }
+      return port;
+    } catch (err) {
+      if (attempt === 5) {
+        app.log.error(`[gateway] impossibile leggere nexus_gateway_port dal DB dopo 5 tentativi: ${(err as Error).message}`);
+        process.exit(1);
+      }
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+  }
+  process.exit(1); // unreachable
+}
+
+const GATEWAY_PORT = await resolveGatewayPort(settingsSql);
 try {
-  await app.listen({ port: PORT, host: "0.0.0.0" });
-  app.log.info(`Nexus Gateway in ascolto su :${PORT} [profilo: ${config.profile}]`);
+  await app.listen({ port: GATEWAY_PORT, host: "0.0.0.0" });
+  app.log.info(`Nexus Gateway in ascolto su :${GATEWAY_PORT} [profilo: ${config.profile}]`);
 } catch (err) {
   app.log.error(err);
   process.exit(1);

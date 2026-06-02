@@ -2454,7 +2454,7 @@ async def terminal_ws(websocket: WebSocket, session_id: str):
                 pass
 
 
-def _start_rest(port: int = 8001) -> None:
+def _start_rest(port: int) -> None:
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
 
@@ -2462,7 +2462,10 @@ def _start_rest(port: int = 8001) -> None:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    grpc_port = 50051
+    # Porte dal DB (regola G: unica fonte di verita', niente env/hardcoded).
+    from brain.utils import settings_db
+    grpc_port = settings_db.resolve_port("brain_grpc_port")
+    rest_port = settings_db.resolve_port("brain_rest_port")
 
     # Load API keys from DB at startup
     result = _load_keys_from_db()
@@ -2476,9 +2479,9 @@ def main() -> None:
     except Exception as exc:
         logger.warning("Startup agent prompts load fallito: %s", exc)
 
-    rest_thread = threading.Thread(target=_start_rest, daemon=True)
+    rest_thread = threading.Thread(target=_start_rest, args=(rest_port,), daemon=True)
     rest_thread.start()
-    logger.info("FastAPI HTTP server avviato su porta 8001")
+    logger.info("FastAPI HTTP server avviato su porta %d", rest_port)
 
     from brain.grpc_server import neural_service
     neural_service.embeddings = embeddings

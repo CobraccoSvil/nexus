@@ -31,6 +31,53 @@ pub async fn get_setting(db: &PgPool, key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Risolve la porta di bind di un servizio leggendola ESCLUSIVAMENTE dal DB
+/// (tabella `settings`, regola G del CLAUDE.md: il DB e' l'unica fonte di
+/// verita' per la configurazione). Nessun default hardcoded e nessuna env var:
+/// se il valore non e' disponibile il servizio PANICA con un messaggio chiaro,
+/// coerente con `RoutingMatrixCache::init` di mcp-core.
+///
+/// - `key`: chiave in `settings` (es. "admin_service_port").
+/// - DB irraggiungibile: retry 5 tentativi x 5s (il container Postgres puo'
+///   essere ancora in avvio), poi panic.
+/// - chiave assente o valore non valido: panic immediato (config errata /
+///   migrazione 0239 non applicata): meglio non partire che fare bind su una
+///   porta sbagliata silenziosamente.
+pub async fn resolve_port(db: &PgPool, key: &str) -> u16 {
+    for attempt in 1..=5u32 {
+        match sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
+            .bind(key)
+            .fetch_optional(db)
+            .await
+        {
+            Ok(Some(raw)) => {
+                let v = raw.trim();
+                return v.parse::<u16>().ok().filter(|p| *p > 0).unwrap_or_else(|| {
+                    panic!(
+                        "resolve_port: settings.{key} = {v:?} non e' una porta valida (1..=65535). \
+                         Correggi il valore nel DB."
+                    )
+                });
+            }
+            Ok(None) => panic!(
+                "resolve_port: settings.{key} assente nel DB. Applica la migrazione \
+                 db/migrations/0239_infrastructure_ports.sql (regola G: niente porte hardcoded)."
+            ),
+            Err(e) if attempt < 5 => {
+                tracing::warn!(
+                    "resolve_port: tentativo {attempt}/5 lettura settings.{key} fallito ({e}). Retry in 5s..."
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            Err(e) => panic!(
+                "resolve_port: impossibile leggere settings.{key} dal DB dopo 5 tentativi: {e}. \
+                 Verifica che Postgres sia raggiungibile e che la migrazione 0239 sia applicata."
+            ),
+        }
+    }
+    unreachable!("resolve_port: loop di retry terminato senza esito per {key}")
+}
+
 pub async fn get_or_create_jwt_secret(db: &PgPool) -> anyhow::Result<String> {
     if let Some(secret) = get_setting(db, "jwt_secret").await {
         return Ok(secret);
