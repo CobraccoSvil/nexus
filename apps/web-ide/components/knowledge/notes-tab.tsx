@@ -7,6 +7,7 @@ import {
   createKnowledgeNoteManual,
   initOrRefreshKnowledge,
   deleteKnowledgeNote,
+  generateCodeWiki,
   type KnowledgeNote,
 } from "../../lib/api-client";
 
@@ -161,6 +162,23 @@ export function NotesTab({ projectId }: Props) {
     }
   };
 
+  const handleGenerateCodeWiki = async () => {
+    const ok = await confirmDialog(
+      "Generare la documentazione AI per i file del progetto? Crea/aggiorna note 'code_doc' (una per file) con scopo, componenti e relazioni. Gira in background, puo' richiedere alcuni minuti.",
+      "Genera Code Wiki",
+    );
+    if (!ok) return;
+    setRefreshMsg(null);
+    try {
+      await generateCodeWiki(projectId);
+      setRefreshMsg(
+        "Code Wiki: generazione avviata in background. Le note 'code_doc' compariranno man mano (filtra per kind 'code_doc').",
+      );
+    } catch (e) {
+      setRefreshMsg("Errore: " + (e instanceof Error ? e.message : String(e)));
+    }
+  };
+
   const submitNewNote = async () => {
     const title = newTitle.trim();
     const body = newBody.trim();
@@ -246,6 +264,29 @@ export function NotesTab({ projectId }: Props) {
           }}
         >
           Reset
+        </button>
+      </div>
+
+      {/* W2 code-wiki: genera documentazione AI per-file (note code_doc). */}
+      <div style={{ display: "flex", marginBottom: 6 }}>
+        <button
+          onClick={handleGenerateCodeWiki}
+          disabled={refreshing}
+          title="Genera/aggiorna la documentazione AI per ogni file di codice indicizzato (note code_doc): scopo, componenti, dipendenze. Language-agnostic. Gira in background."
+          style={{
+            flex: 1,
+            minWidth: 0,
+            padding: "8px 12px",
+            fontSize: 12,
+            fontWeight: 600,
+            background: "transparent",
+            color: "#7c3aed",
+            border: "1px solid #7c3aed",
+            borderRadius: 6,
+            cursor: refreshing ? "default" : "pointer",
+          }}
+        >
+          Genera Code Wiki
         </button>
       </div>
 

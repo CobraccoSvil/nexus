@@ -614,16 +614,9 @@ async fn main() -> anyhow::Result<()> {
         state.project_channels.clone(),
     ));
 
-    // Worker billing_cooldown_recovery_loop (fix #78): ogni 60s riabilita nel
-    // DB i provider il cui cooldown billing locale e' scaduto. Vedi
-    // `provider_cooldown::propagate_billing_disable_to_db` (chiamata da
-    // `internal_routing::provider_error_handler`) per la fase di disable.
-    {
-        let db_billing = state.db.clone();
-        tokio::spawn(async move {
-            provider_cooldown::billing_cooldown_recovery_loop(db_billing, 60).await;
-        });
-    }
+    // Il worker billing_cooldown_recovery_loop viene avviato piu' sotto, dopo
+    // aver inizializzato la config health/cooldown provider DB-driven (cosi'
+    // riceve l'interval dai settings invece di un valore hardcoded).
 
     // ── Lettura batch settings DB ────────────────────────────────────────────
     // Leggiamo in parallelo tutti i flag comportamentali dalla tabella settings.
@@ -680,6 +673,66 @@ async fn main() -> anyhow::Result<()> {
     let http_pool = s_http_pool.ok().flatten()
         .and_then(|v| v.trim().parse::<usize>().ok());
     nexus_http::init_global_config(http_timeout, http_pool);
+
+    // ── Config health/cooldown provider DB-driven (regola G, migrazione 0252) ──
+    // Tempi di cooldown, circuit breaker, timeout probe e cadenza del recovery
+    // loop letti dalla tabella settings. Partiamo dai default storici e
+    // sovrascriviamo solo le chiavi presenti, cosi' un setting mancante non
+    // cambia il comportamento.
+    {
+        let mut pht = provider_cooldown::ProviderHealthTimings::default();
+        let p_u64 = |opt: Option<String>, d: u64| -> u64 {
+            opt.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(d)
+        };
+        let p_usize = |opt: Option<String>, d: usize| -> usize {
+            opt.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(d)
+        };
+        let (
+            s_recov_interval, s_recov_probe_to, s_cd_default, s_cd_min, s_cd_max,
+            s_cd_long, s_cb_window, s_cb_threshold, s_cb_ext, s_probe_to,
+            s_slow_cd, s_outage,
+        ) = tokio::join!(
+            settings::get_setting(&state.db, "provider.billing_recovery_interval_s"),
+            settings::get_setting(&state.db, "provider.recovery_probe_timeout_s"),
+            settings::get_setting(&state.db, "provider.cooldown_default_s"),
+            settings::get_setting(&state.db, "provider.cooldown_min_s"),
+            settings::get_setting(&state.db, "provider.cooldown_max_s"),
+            settings::get_setting(&state.db, "provider.cooldown_long_s"),
+            settings::get_setting(&state.db, "provider.circuit_breaker_window_s"),
+            settings::get_setting(&state.db, "provider.circuit_breaker_threshold"),
+            settings::get_setting(&state.db, "provider.circuit_breaker_extended_cooldown_s"),
+            settings::get_setting(&state.db, "provider.health_probe_timeout_s"),
+            settings::get_setting(&state.db, "provider.slow_cooldown_s"),
+            settings::get_setting(&state.db, "provider.outage_threshold"),
+        );
+        pht.billing_recovery_interval_s = p_u64(s_recov_interval.ok().flatten(), pht.billing_recovery_interval_s);
+        pht.recovery_probe_timeout_s = p_u64(s_recov_probe_to.ok().flatten(), pht.recovery_probe_timeout_s);
+        pht.cooldown_default_s = p_u64(s_cd_default.ok().flatten(), pht.cooldown_default_s);
+        pht.cooldown_min_s = p_u64(s_cd_min.ok().flatten(), pht.cooldown_min_s);
+        pht.cooldown_max_s = p_u64(s_cd_max.ok().flatten(), pht.cooldown_max_s);
+        pht.cooldown_long_s = p_u64(s_cd_long.ok().flatten(), pht.cooldown_long_s);
+        pht.circuit_breaker_window_s = p_u64(s_cb_window.ok().flatten(), pht.circuit_breaker_window_s);
+        pht.circuit_breaker_threshold = p_usize(s_cb_threshold.ok().flatten(), pht.circuit_breaker_threshold);
+        pht.circuit_breaker_extended_cooldown_s = p_u64(s_cb_ext.ok().flatten(), pht.circuit_breaker_extended_cooldown_s);
+        pht.health_probe_timeout_s = p_u64(s_probe_to.ok().flatten(), pht.health_probe_timeout_s);
+        pht.slow_cooldown_s = p_u64(s_slow_cd.ok().flatten(), pht.slow_cooldown_s);
+        pht.outage_threshold = p_usize(s_outage.ok().flatten(), pht.outage_threshold);
+        provider_cooldown::init_provider_health_timings(pht);
+        tracing::info!(
+            "provider health timings (DB): recovery_interval={}s probe_timeout={}s cooldown_long={}s outage_threshold={}",
+            pht.billing_recovery_interval_s, pht.recovery_probe_timeout_s,
+            pht.cooldown_long_s, pht.outage_threshold,
+        );
+
+        // Worker billing_cooldown_recovery_loop: riabilita i provider a cooldown
+        // scaduto SOLO dopo un probe attivo andato a buon fine (probe-then-reenable).
+        let db_billing = state.db.clone();
+        let orch_billing = std::sync::Arc::new(state.orchestrator.clone());
+        let recov_interval = pht.billing_recovery_interval_s;
+        tokio::spawn(async move {
+            provider_cooldown::billing_cooldown_recovery_loop(orch_billing, db_billing, recov_interval).await;
+        });
+    }
 
     // Worker `provider_health_probe`: pinga periodicamente i provider LLM
     // per rilevare cooldown / quota esaurita PRIMA del primo errore utente.
@@ -1559,6 +1612,13 @@ async fn main() -> anyhow::Result<()> {
                     state.clone(),
                     middleware::require_auth,
                 )),
+            )
+            // W2 code-wiki: genera la documentazione AI per-file del progetto.
+            .route(
+                "/api/projects/:id/knowledge/code-wiki/generate",
+                post(knowledge::code_doc::generate_code_wiki_handler).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             // M15.3 — Edit manuale dei todo di un run (traccia edited_by, ri-emette
             // TodoUpdated + PlanUpdated). Gated da agent.todos.user_editable.

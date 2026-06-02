@@ -3960,6 +3960,17 @@ export async function recomputeKnowledgeLinks(
   });
 }
 
+// W2 code-wiki: avvia la generazione della documentazione AI per-file.
+// La generazione gira in background; le note code_doc compaiono man mano.
+export async function generateCodeWiki(
+  projectId: string,
+): Promise<{ ok: boolean; started: boolean }> {
+  return fetchJson(`/api/projects/${projectId}/knowledge/code-wiki/generate`, {
+    method: "POST",
+    body: "{}",
+  });
+}
+
 export async function rebuildKnowledge(
   projectId: string,
   opts?: { reset?: boolean },

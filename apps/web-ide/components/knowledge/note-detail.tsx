@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { useI18n, type TranslationKey } from "../../lib/i18n";
 import { getKnowledgeNote, type KnowledgeNote } from "../../lib/api-client";
+import { MarkdownBlock } from "../chat/markdown-renderer";
 
 const STATUS_I18N: Record<string, TranslationKey> = {
   draft: "knowledge.note.draft",
@@ -102,7 +103,8 @@ export function NoteDetail({ projectId, noteId, onBack }: Props) {
         </div>
       )}
 
-      {/* Corpo */}
+      {/* Corpo: reso come Markdown (titoli, liste, codice, e Mermaid quando
+          presente) cosi' le note code_doc e i resoconti sono leggibili. */}
       <div
         style={{
           padding: 12,
@@ -112,11 +114,11 @@ export function NoteDetail({ projectId, noteId, onBack }: Props) {
           fontSize: 13,
           lineHeight: 1.6,
           color: "#171717",
-          whiteSpace: "pre-wrap",
           marginBottom: 16,
+          overflowX: "auto",
         }}
       >
-        {note.bodyMd}
+        <MarkdownBlock content={note.bodyMd} projectId={projectId} />
       </div>
 
       {/* Link in uscita */}
