@@ -1141,15 +1141,26 @@ def _build_kb_rag_context(intent: str, project_id: str, query_text: str) -> str:
         if not title and not snippet_text:
             continue
         intent_attr = r.get("intent") or "chat"
+        kind_attr = str(r.get("kind") or "")
         score = float(r.get("score") or 0)
         if len(snippet_text) > _snippet_cap:
             snippet_text = snippet_text[: _snippet_cap - 3] + "..."
-        snippets.append(
-            f'  <nota intent="{intent_attr}" score="{score:.2f}">\n'
-            f'    <titolo>{title}</titolo>\n'
-            f'    <contenuto>{snippet_text}</contenuto>\n'
-            f'  </nota>'
-        )
+        # Le note 'code_doc' sono la documentazione (code-wiki) del file il cui
+        # path e' nel titolo: vanno presentate come fonte autorevole sul codice
+        # esistente, cosi' l'agente non re-implementa cio' che c'e' gia'.
+        if kind_attr == "code_doc":
+            snippets.append(
+                f'  <doc_codice file="{title}" score="{score:.2f}">\n'
+                f'    <contenuto>{snippet_text}</contenuto>\n'
+                f'  </doc_codice>'
+            )
+        else:
+            snippets.append(
+                f'  <nota intent="{intent_attr}" score="{score:.2f}">\n'
+                f'    <titolo>{title}</titolo>\n'
+                f'    <contenuto>{snippet_text}</contenuto>\n'
+                f'  </nota>'
+            )
     if not snippets:
         return ""
 
@@ -1157,8 +1168,11 @@ def _build_kb_rag_context(intent: str, project_id: str, query_text: str) -> str:
                 len(snippets), intent, project_id[:8])
     return ("<knowledge_base_progetto>\n"
             "  <!-- Note dal Knowledge Base del progetto: contesto, decisioni,\n"
-            "       requirement, e messaggi simili gia' affrontati. Usa per\n"
-            "       evitare duplicazioni e mantenere coerenza. -->\n"
+            "       requirement, messaggi gia' affrontati, e <doc_codice> ossia la\n"
+            "       documentazione (code-wiki) dei file esistenti. Usa per evitare\n"
+            "       duplicazioni/ripetizioni, riusare il codice esistente e non\n"
+            "       reintrodurre errori gia' risolti. La doc_codice descrive cosa\n"
+            "       fa gia' un file: NON re-implementarlo da zero. -->\n"
             + "\n".join(snippets) + "\n</knowledge_base_progetto>")
 
 

@@ -5,6 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useThemeColors } from "../../lib/theme";
 import { ExecutableCodeBlock } from "./executable-code-block";
+import { MermaidDiagram } from "../common/mermaid-diagram";
 
 function normalizeContent(raw: string): string {
   let s = raw;
@@ -187,6 +188,20 @@ export const MarkdownBlock = React.memo(function MarkdownBlock({
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           }) as any,
           pre: (({ children }: { children?: React.ReactNode }) => {
+            // W3 code-wiki: blocchi ```mermaid -> diagramma renderizzato
+            // (indipendente da projectId, usato anche nelle note code_doc).
+            if (React.isValidElement(children)) {
+              const mEl = children as React.ReactElement<{
+                className?: string;
+                children?: React.ReactNode;
+              }>;
+              const mCls = mEl.props?.className ?? "";
+              const mMatch = mCls.match(/^language-(\w+)/);
+              if (mMatch && mMatch[1].toLowerCase() === "mermaid") {
+                const code = extractText(mEl.props?.children).replace(/\n$/, "");
+                return <MermaidDiagram code={code} />;
+              }
+            }
             // Se projectId e' fornito, intercetta blocchi bash/sh per renderizzarli
             // come ExecutableCodeBlock con pulsante "Esegui" e stato controllato.
             if (projectId && React.isValidElement(children)) {

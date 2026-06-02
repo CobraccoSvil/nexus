@@ -125,18 +125,38 @@ pub async fn generate_code_doc_for_file(
         anyhow::bail!("documentazione vuota o errore provider per {rel_path}");
     }
 
-    // 4. Body: header strutturale (deterministico) + spiegazione AI.
+    // 4a. Diagramma Mermaid delle dipendenze, generato deterministicamente dagli
+    //     import (piu' affidabile che farlo produrre all'LLM). Reso dal frontend
+    //     (W3). Gli id dei nodi sono sintetici; i path vanno nelle label.
+    let mermaid = if ast.imports.is_empty() {
+        String::new()
+    } else {
+        let mut lines = vec!["graph LR".to_string()];
+        let self_label = rel_path.replace('"', "'");
+        lines.push(format!("    self[\"{}\"]", self_label));
+        for (i, imp) in ast.imports.iter().take(15).enumerate() {
+            let label = imp.module.replace('"', "'");
+            lines.push(format!("    self --> dep{i}[\"{label}\"]"));
+        }
+        format!(
+            "\n\n## Dipendenze (diagramma)\n\n```mermaid\n{}\n```\n",
+            lines.join("\n")
+        )
+    };
+
+    // 4b. Body: header strutturale (deterministico) + spiegazione AI + diagramma.
     let body = format!(
         "<!-- code_doc: generato automaticamente da Nexus, non modificare a mano -->\n\n\
          # `{path}`\n\n\
          *Linguaggio: **{lang}** — {nsym} simboli, {nimp} import, {nlines} righe*\n\n\
-         {doc}",
+         {doc}{mermaid}",
         path = rel_path,
         lang = ast.language,
         nsym = ast.symbols.len(),
         nimp = ast.imports.len(),
         nlines = ast.line_count,
         doc = doc,
+        mermaid = mermaid,
     );
 
     let note = GeneratedProjectNote {

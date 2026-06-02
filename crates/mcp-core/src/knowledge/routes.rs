@@ -796,7 +796,7 @@ pub async fn internal_kb_search(
     let ids: Vec<Uuid> = note_hits.iter().map(|(id, _)| *id).collect();
     let rows = sqlx::query(
         r#"
-        SELECT id, title, body_md, tags, intent, status
+        SELECT id, title, body_md, tags, intent, status, kind
         FROM project_knowledge_notes
         WHERE id = ANY($1) AND project_id = $2 AND status IN ('active', 'draft')
         "#,
@@ -823,6 +823,7 @@ pub async fn internal_kb_search(
                 "title": r.try_get::<String, _>("title").unwrap_or_default(),
                 "intent": r.try_get::<Option<String>, _>("intent").ok().flatten(),
                 "status": r.try_get::<String, _>("status").unwrap_or_default(),
+                "kind": r.try_get::<Option<String>, _>("kind").ok().flatten(),
                 "tags": r.try_get::<Vec<String>, _>("tags").unwrap_or_default(),
                 "snippet": snippet,
             }),
