@@ -147,6 +147,49 @@ pub async fn ingest_run_summary_to_kb(
     let iteration_count: i32 = row.try_get("iteration_count").unwrap_or(0);
     let task_type: String = row.try_get("task_type").unwrap_or_default();
     let agent_type: String = row.try_get("agent_type").unwrap_or_default();
+    let status: String = row.try_get("status").unwrap_or_default();
+
+    // File modificati dal run: serve sia al lifecycle KB (subito sotto) sia alla
+    // nota agent_summary creata piu' avanti. Estratto una sola volta.
+    let file_paths = extract_modified_files(db, run_id).await;
+
+    // M14.1/M14.3 — Lifecycle KB: il promote delle note 'draft' -> 'active' e il
+    // flag context-stale NON dipendono dalla "substance" del summary. Vanno
+    // eseguiti a OGNI run completato, ANCHE quando l'ingest del summary viene
+    // skippato (risposta corta < kb.ingest.min_chars o task banale). Prima erano
+    // dopo i filtri substance: i task brevi lasciavano le note chat per sempre
+    // in 'draft'. Spostati qui (regola H: fix della causa radice "le note
+    // restano in bozza").
+    if status == "completed" {
+        if read_bool_setting(db, "kb.lifecycle.promote_enabled", true).await {
+            crate::knowledge::promote_notes_on_run_completed(
+                db, run_id, &file_paths, channels, project_id,
+            )
+            .await;
+        }
+        if !file_paths.is_empty()
+            && read_bool_setting(db, "kb.lifecycle.context_stale_enabled", true).await
+        {
+            let res = sqlx::query(
+                "UPDATE project_knowledge_notes \
+                 SET context_stale_at = NOW() \
+                 WHERE project_id = $1 AND status = 'active' \
+                   AND file_paths && $2 \
+                   AND (source_run_id IS NULL OR source_run_id <> $3) \
+                   AND context_stale_at IS NULL",
+            )
+            .bind(project_id)
+            .bind(&file_paths)
+            .bind(run_id)
+            .execute(db)
+            .await;
+            if let Ok(r) = res {
+                if r.rows_affected() > 0 {
+                    tracing::info!(run_id = %run_id, flagged = r.rows_affected(), "kb.lifecycle: note marcate context-stale");
+                }
+            }
+        }
+    }
 
     // Filtri substance.
     if iteration_count < 1 {
@@ -178,43 +221,9 @@ pub async fn ingest_run_summary_to_kb(
         return;
     }
 
-    let file_paths = extract_modified_files(db, run_id).await;
-
-    // M14.1 — Lifecycle: promuove le note 'draft' del run a 'active' (le note
-    // kind='chat' create durante il run). Gated kb.lifecycle.promote_enabled.
-    if read_bool_setting(db, "kb.lifecycle.promote_enabled", true).await {
-        crate::knowledge::promote_notes_on_run_completed(
-            db, run_id, &file_paths, channels, project_id,
-        )
-        .await;
-    }
-
-    // M14.3 — Flag context-stale: le note 'active' di ALTRI run che riferiscono
-    // i file appena modificati da questo run hanno il contesto potenzialmente
-    // obsoleto (il codice e' cambiato sotto di loro). Le marchiamo con
-    // context_stale_at cosi' l'intake successivo le segnala. Gated.
-    if !file_paths.is_empty()
-        && read_bool_setting(db, "kb.lifecycle.context_stale_enabled", true).await
-    {
-        let res = sqlx::query(
-            "UPDATE project_knowledge_notes \
-             SET context_stale_at = NOW() \
-             WHERE project_id = $1 AND status = 'active' \
-               AND file_paths && $2 \
-               AND (source_run_id IS NULL OR source_run_id <> $3) \
-               AND context_stale_at IS NULL",
-        )
-        .bind(project_id)
-        .bind(&file_paths)
-        .bind(run_id)
-        .execute(db)
-        .await;
-        if let Ok(r) = res {
-            if r.rows_affected() > 0 {
-                tracing::info!(run_id = %run_id, flagged = r.rows_affected(), "kb.lifecycle: note marcate context-stale");
-            }
-        }
-    }
+    // NB: il lifecycle KB (promote + context-stale) e l'estrazione di file_paths
+    // sono ora eseguiti in cima alla funzione (prima dei filtri substance), cosi'
+    // le note vengono promosse anche per i run con summary non ingeribile.
 
     let note_id = Uuid::new_v4();
     let body_max = read_int_setting(db, "kb.ingest.body_max_chars", 20000).await as usize;
