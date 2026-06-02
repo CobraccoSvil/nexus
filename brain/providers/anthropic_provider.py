@@ -247,6 +247,22 @@ class AnthropicProvider(BaseProvider):
         try:
             client = self._get_client()
 
+            # Capability DB-driven (regola G): max_tokens clampato al tetto del
+            # modello, tool_choice nel dialetto del provider. Se la riga manca
+            # (modello non censito) si degrada ai parametri richiesti.
+            cap = None
+            try:
+                from .capability_loader import load_capability
+                from .adapter_base import resolve_max_tokens
+                cap = load_capability(self.name, model)
+                max_tokens = resolve_max_tokens(cap, max_tokens)
+            except Exception as _cap_err:
+                logger.warning(
+                    "capability %s/%s non disponibile (%s): uso parametri richiesti",
+                    self.name, model, _cap_err,
+                )
+                cap = None
+
             # System prompt separato con cache_control ephemeral.
             # Anthropic mette in cache il blocco per 5 min: le chiamate successive
             # riusano la cache al 10% del costo token normale.
@@ -438,9 +454,15 @@ class AnthropicProvider(BaseProvider):
                 # forza il modello a fare almeno una tool call. Ai turni successivi
                 # tool_choice resta auto (default) per permettere risposta testuale.
                 # Anthropic usa {"type": "any"} invece di "required".
-                from ._schema_utils import is_first_agent_turn
-                if is_first_agent_turn(effective_messages):
-                    kwargs["tool_choice"] = {"type": "any"}
+                if cap is not None:
+                    from .adapter_base import resolve_tool_choice
+                    _tc = resolve_tool_choice(cap, effective_messages)
+                    if _tc is not None:
+                        kwargs["tool_choice"] = _tc
+                else:
+                    from ._schema_utils import is_first_agent_turn
+                    if is_first_agent_turn(effective_messages):
+                        kwargs["tool_choice"] = {"type": "any"}
             if use_thinking:
                 kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
                 kwargs["betas"] = ["interleaved-thinking-2025-05-14"]

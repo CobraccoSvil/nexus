@@ -378,6 +378,21 @@ class GoogleProvider(BaseProvider):
 
             client = self._get_client()
 
+            # Capability DB-driven (regola G): max_tokens clampato al tetto del
+            # modello. Degrada ai parametri richiesti se la riga manca.
+            cap = None
+            try:
+                from .capability_loader import load_capability
+                from .adapter_base import resolve_max_tokens
+                cap = load_capability(self.name, model)
+                max_tokens = resolve_max_tokens(cap, max_tokens)
+            except Exception as _cap_err:
+                logger.warning(
+                    "capability %s/%s non disponibile (%s): uso parametri richiesti",
+                    self.name, model, _cap_err,
+                )
+                cap = None
+
             # Converti messaggi Anthropic -> Google genai Contents
             contents = _convert_messages_to_google(messages)
 
@@ -440,11 +455,20 @@ class GoogleProvider(BaseProvider):
             # tool_config con FunctionCallingConfig(mode="ANY").
             tool_config = None
             if google_tools:
-                from ._schema_utils import is_first_agent_turn
-                if is_first_agent_turn([m if isinstance(m, dict) else {} for m in messages]):
+                _norm_msgs = [m if isinstance(m, dict) else {} for m in messages]
+                if cap is not None:
+                    from .adapter_base import resolve_tool_choice
+                    _tc = resolve_tool_choice(cap, _norm_msgs)
+                    _mode = (_tc or {}).get("function_calling_config", {}).get("mode", "AUTO")
                     tool_config = types.ToolConfig(
-                        function_calling_config=types.FunctionCallingConfig(mode="ANY")
+                        function_calling_config=types.FunctionCallingConfig(mode=_mode)
                     )
+                else:
+                    from ._schema_utils import is_first_agent_turn
+                    if is_first_agent_turn(_norm_msgs):
+                        tool_config = types.ToolConfig(
+                            function_calling_config=types.FunctionCallingConfig(mode="ANY")
+                        )
 
             _cfg_kwargs = dict(
                 max_output_tokens=max_tokens,

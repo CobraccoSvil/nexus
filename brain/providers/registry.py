@@ -706,7 +706,31 @@ class ProviderRegistry:
         # Fallback a cascata: se il provider fallisce per errori retriable (billing/quota/errore),
         # proviamo i provider successivi nella chain dinamica (DB-driven, niente hardcoded).
         _RETRIABLE_STOPS = {"billing_error", "rate_limit", "overloaded", "provider_error", "error", "timeout"}
-        if result.metadata.get("stop_reason") in _RETRIABLE_STOPS or result.content.startswith("[Error:"):
+
+        def _should_fallback(res: ProviderResult) -> bool:
+            """Fallback se errore retriable OPPURE soft-failure (M4): chiusura
+            naturale senza tool e con contenuto sotto soglia. Il soft-failure e
+            best-effort: se la capability manca, viene ignorato (nessun crash)."""
+            if res.metadata.get("stop_reason") in _RETRIABLE_STOPS or res.content.startswith("[Error:"):
+                return True
+            try:
+                from .capability_loader import load_capability
+                from .adapter_base import is_soft_failure
+                _cap = load_capability(res.provider, res.model)
+                if is_soft_failure(res.metadata, res.content, _cap):
+                    logger.warning(
+                        "Soft-failure %s/%s: chiusura naturale senza tool e contenuto "
+                        "sotto soglia -> fallback (M4)", res.provider, res.model,
+                    )
+                    return True
+            except Exception as _sf_err:
+                logger.debug(
+                    "soft-failure check saltato per %s/%s: %s",
+                    res.provider, res.model, _sf_err,
+                )
+            return False
+
+        if _should_fallback(result):
             for fb_prov in self._provider_fallback_chain(exclude=effective_provider):
                 # Skip provider gia' in billing-cooldown locale.
                 if _is_in_billing_cooldown(fb_prov):
@@ -749,7 +773,7 @@ class ProviderRegistry:
                     or fb_result.metadata.get("error_class") == "billing_error"
                 ):
                     _mark_billing_cooldown(fb_prov)
-                if not (fb_result.metadata.get("stop_reason") in _RETRIABLE_STOPS or fb_result.content.startswith("[Error:")):
+                if not _should_fallback(fb_result):
                     return fb_result
                 # Continua al prossimo fallback
                 result = fb_result

@@ -203,6 +203,20 @@ class OpenAIProvider(BaseProvider):
             )
         try:
             client = self._get_client()
+            # Capability DB-driven (regola G): max_tokens clampato, tool_choice
+            # nel dialetto del modello. Degrada ai parametri richiesti se assente.
+            cap = None
+            try:
+                from .capability_loader import load_capability
+                from .adapter_base import resolve_max_tokens
+                cap = load_capability(self.name, model)
+                max_tokens = resolve_max_tokens(cap, max_tokens)
+            except Exception as _cap_err:
+                logger.warning(
+                    "capability %s/%s non disponibile (%s): uso parametri richiesti",
+                    self.name, model, _cap_err,
+                )
+                cap = None
             # Converte il formato Anthropic messages → OpenAI messages
             oai_messages = _convert_messages_to_openai(messages)
             # Inietta system_text come primo messaggio system (cacheable da OpenAI)
@@ -240,10 +254,16 @@ class OpenAIProvider(BaseProvider):
                 # per evitare che il modello narri azioni senza eseguirle.
                 # Modelli o-series (reasoning) non accettano tool_choice.
                 if not _is_o_series(model):
-                    from ._schema_utils import resolve_tool_choice_openai
-                    kwargs_call["tool_choice"] = resolve_tool_choice_openai(
-                        model, oai_messages,
-                    )
+                    if cap is not None:
+                        from .adapter_base import resolve_tool_choice
+                        _tc = resolve_tool_choice(cap, oai_messages)
+                        if _tc is not None:
+                            kwargs_call["tool_choice"] = _tc
+                    else:
+                        from ._schema_utils import resolve_tool_choice_openai
+                        kwargs_call["tool_choice"] = resolve_tool_choice_openai(
+                            model, oai_messages,
+                        )
 
             response = await client.chat.completions.create(**kwargs_call)
             choice = response.choices[0]

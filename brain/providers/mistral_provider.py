@@ -110,6 +110,18 @@ class MistralProvider(BaseProvider):
             )
         try:
             client = self._get_client()
+            cap = None
+            try:
+                from .capability_loader import load_capability
+                from .adapter_base import resolve_max_tokens
+                cap = load_capability(self.name, model)
+                max_tokens = resolve_max_tokens(cap, max_tokens)
+            except Exception as _cap_err:
+                logger.warning(
+                    "capability %s/%s non disponibile (%s): uso parametri richiesti",
+                    self.name, model, _cap_err,
+                )
+                cap = None
             oai_messages = _convert_messages_to_openai(messages)
             if system_text:
                 oai_messages.insert(0, {"role": "system", "content": system_text})
@@ -125,7 +137,7 @@ class MistralProvider(BaseProvider):
             # - open-mistral-nemo: sì (a partire da mistral-nemo-2407)
             # - open-mistral-7b / mixtral-*: no (modelli deprecati/open weights)
             _TOOL_CAPABLE = ("large", "medium", "small", "codestral", "ministral", "nemo", "pixtral")
-            supports_tools = any(cap in model.lower() for cap in _TOOL_CAPABLE)
+            supports_tools = any(tag in model.lower() for tag in _TOOL_CAPABLE)
             compressed = compress_tool_list(tools) if tools and supports_tools else []
             oai_tools = [_anthropic_tool_to_openai(t) for t in compressed] if compressed else []
 
@@ -139,10 +151,19 @@ class MistralProvider(BaseProvider):
                 # Mistral small/ministral/nemo causano loop con "required" → weak_models.
                 # Per large/medium/codestral/pixtral: "required" al primo turno,
                 # "auto" dopo (helper centralizzato in _schema_utils).
-                kwargs_call["tool_choice"] = resolve_tool_choice_openai(
-                    model, oai_messages,
-                    weak_models=("small", "ministral", "nemo"),
-                )
+                if cap is not None:
+                    from .adapter_base import resolve_tool_choice
+                    _tc = resolve_tool_choice(
+                        cap, oai_messages,
+                        weak_models=("small", "ministral", "nemo"),
+                    )
+                    if _tc is not None:
+                        kwargs_call["tool_choice"] = _tc
+                else:
+                    kwargs_call["tool_choice"] = resolve_tool_choice_openai(
+                        model, oai_messages,
+                        weak_models=("small", "ministral", "nemo"),
+                    )
 
             response = await client.chat.completions.create(**kwargs_call)
             choice = response.choices[0]
