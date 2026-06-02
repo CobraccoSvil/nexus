@@ -3838,6 +3838,10 @@ export interface SimilarHit {
   status: string;
   score: number;
   createdAt: string;
+  // M14.4: stato di implementazione della richiesta gia presente in KB.
+  implemented?: boolean;
+  runStatus?: string | null;
+  runCompletedAt?: string | null;
 }
 
 export async function listKnowledgeNotes(

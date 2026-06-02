@@ -450,11 +450,26 @@ pub async fn similar_handler(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if let Ok(nid) = Uuid::parse_str(note_id_str) {
+            // M14.4: risolve anche lo stato di implementazione della nota,
+            // seguendo il run collegato sia per source_run_id (agent_summary)
+            // sia per source_message_id == agent_runs.run_message_id (note 'chat'
+            // della richiesta utente, che nascono senza source_run_id). Privilegia
+            // un run 'completed' e il piu' recente. Cosi' il banner puo' dire se la
+            // richiesta e' GIA' stata risolta, invece di un generico "note simili".
             let row = sqlx::query(
                 r#"
-                SELECT id, title, intent, status, created_at, last_accessed_at
-                FROM project_knowledge_notes
-                WHERE id = $1 AND project_id = $2
+                SELECT n.id, n.title, n.intent, n.status, n.created_at, n.last_accessed_at,
+                       r.status AS run_status, r.completed_at AS run_completed_at
+                FROM project_knowledge_notes n
+                LEFT JOIN LATERAL (
+                    SELECT ar.status, ar.completed_at
+                    FROM agent_runs ar
+                    WHERE ar.id = n.source_run_id
+                       OR (ar.run_message_id = n.source_message_id AND ar.project_id = n.project_id)
+                    ORDER BY (ar.status = 'completed') DESC, ar.completed_at DESC NULLS LAST
+                    LIMIT 1
+                ) r ON TRUE
+                WHERE n.id = $1 AND n.project_id = $2
                 "#,
             )
             .bind(nid)
@@ -465,6 +480,8 @@ pub async fn similar_handler(
             .flatten();
 
             if let Some(r) = row {
+                let run_status = r.get::<Option<String>, _>("run_status");
+                let implemented = run_status.as_deref() == Some("completed");
                 hits.push(json!({
                     "noteId": r.get::<Uuid, _>("id").to_string(),
                     "title": r.get::<String, _>("title"),
@@ -473,6 +490,9 @@ pub async fn similar_handler(
                     "score": h.score,
                     "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
                     "lastAccessedAt": r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_accessed_at").map(|t| t.to_rfc3339()),
+                    "implemented": implemented,
+                    "runStatus": run_status,
+                    "runCompletedAt": r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("run_completed_at").map(|t| t.to_rfc3339()),
                 }));
             }
         }

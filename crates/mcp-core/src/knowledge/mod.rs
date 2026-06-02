@@ -576,13 +576,24 @@ pub async fn promote_notes_on_run_completed(
     project_channels: &nexus_events::ProjectChannels,
     project_id: Uuid,
 ) {
+    // Le note 'chat' (richiesta utente, create da create_note_from_user_message)
+    // nascono draft con source_message_id valorizzato ma source_run_id NULL: il
+    // legame con il run e' il messaggio che lo ha avviato (agent_runs.run_message_id
+    // == project_knowledge_notes.source_message_id). Promuoviamo quindi le note
+    // draft collegate sia per source_run_id (se valorizzato) sia per
+    // source_message_id == run_message_id del run. Senza questo, le note chat
+    // restavano draft per sempre.
     let result = sqlx::query_scalar::<_, Uuid>(
         r#"
         UPDATE project_knowledge_notes
         SET status = 'active',
             updated_at = NOW(),
             file_paths = $2
-        WHERE source_run_id = $1 AND status = 'draft'
+        WHERE status = 'draft'
+          AND (
+            source_run_id = $1
+            OR source_message_id = (SELECT run_message_id FROM agent_runs WHERE id = $1)
+          )
         RETURNING id
         "#,
     )

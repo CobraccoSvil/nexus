@@ -301,11 +301,22 @@ def _note_implementation_status(note_id: str | None) -> dict[str, Any]:
         import psycopg2  # type: ignore[import-untyped]
         with psycopg2.connect(url) as conn:
             with conn.cursor() as cur:
+                # Il legame nota->run e' duplice: source_run_id (se valorizzato,
+                # es. agent_summary) OPPURE, per le note 'chat' della richiesta
+                # utente, source_message_id == agent_runs.run_message_id (le note
+                # chat nascono senza source_run_id). Si privilegia un run
+                # 'completed' e il piu' recente.
                 cur.execute(
-                    "SELECT r.status, r.completed_at "
+                    "SELECT r.status, r.completed_at, r.id "
                     "FROM project_knowledge_notes n "
-                    "JOIN agent_runs r ON r.id = n.source_run_id "
-                    "WHERE n.id = %s LIMIT 1",
+                    "JOIN agent_runs r ON ("
+                    "  r.id = n.source_run_id "
+                    "  OR (r.run_message_id = n.source_message_id "
+                    "      AND r.project_id = n.project_id)"
+                    ") "
+                    "WHERE n.id = %s "
+                    "ORDER BY (r.status = 'completed') DESC, r.completed_at DESC NULLS LAST "
+                    "LIMIT 1",
                     (note_id,),
                 )
                 row = cur.fetchone()
@@ -316,6 +327,7 @@ def _note_implementation_status(note_id: str | None) -> dict[str, Any]:
                     "implemented": status == "completed",
                     "run_status": status,
                     "completed_at": str(row[1]) if row[1] else None,
+                    "run_id": str(row[2]) if row[2] else None,
                 }
     except Exception as exc:
         logger.debug("intake_gate: _note_implementation_status fallita (%s)", exc)
