@@ -126,6 +126,52 @@ pub async fn tool_knowledge_search(ctx: &AgentToolContext, input: &Value) -> Str
 ///
 /// Input: `note_id` (UUID string)
 /// Output: {id, title, body_md, intent, status, tags, file_paths, created_at}
+/// `code_doc` — documentazione (Code Wiki) di un file specifico, on-demand.
+///
+/// A differenza di `knowledge_search` (ricerca semantica fuzzy), recupera
+/// direttamente la nota `code_doc` il cui titolo e' il path del file: scopo,
+/// componenti, dipendenze e call-graph del file. Da usare quando l'agente sa
+/// gia' su quale file lavora, per evitare di re-implementare o introdurre
+/// errori. Match esatto sul path, con fallback su suffisso (relativo/assoluto).
+///
+/// Input: { file_path }. Output: { file, found, body } o suggerimento.
+pub async fn tool_code_doc(ctx: &AgentToolContext, input: &Value) -> String {
+    let file_path = match input.get("file_path").and_then(|v| v.as_str()) {
+        Some(p) if !p.trim().is_empty() => p.trim(),
+        _ => return json!({"error": "file_path mancante o vuoto"}).to_string(),
+    };
+
+    let row = sqlx::query(
+        r#"
+        SELECT id, title, body_md FROM project_knowledge_notes
+        WHERE project_id = $1 AND kind = 'code_doc'
+          AND (title = $2 OR title LIKE $3 OR $2 LIKE '%' || title)
+        ORDER BY (title = $2) DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(ctx.project_id)
+    .bind(file_path)
+    .bind(format!("%{file_path}"))
+    .fetch_optional(&*ctx.db)
+    .await;
+
+    match row {
+        Ok(Some(r)) => {
+            let title: String = r.try_get("title").unwrap_or_default();
+            let body: String = r.try_get("body_md").unwrap_or_default();
+            json!({ "file": title, "found": true, "body": body }).to_string()
+        }
+        Ok(None) => json!({
+            "file": file_path,
+            "found": false,
+            "message": "Nessuna documentazione (code_doc) per questo file. Prova knowledge_search per contesto correlato, oppure genera la Code Wiki del progetto."
+        })
+        .to_string(),
+        Err(e) => json!({ "error": format!("query fallita: {e}") }).to_string(),
+    }
+}
+
 pub async fn tool_knowledge_get_note(ctx: &AgentToolContext, input: &Value) -> String {
     let note_id = match input
         .get("note_id")

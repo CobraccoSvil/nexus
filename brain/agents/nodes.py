@@ -1041,6 +1041,22 @@ def _rag_snippet_max_chars() -> int:
     return int(context_offload._load_offload_config()["rag_snippet_max_chars"])
 
 
+def _rag_injection_mode() -> str:
+    """Modalita' di iniezione KB nel prompt (DB-driven):
+      - 'index' (default): inietta solo un INDICE compatto (titolo/file + note_id)
+        e istruisce l'agente a leggere il contenuto on-demand con i tool
+        (code_doc / knowledge_get_note). Risparmia molti token per turno.
+      - 'full': inietta gli snippet completi (comportamento storico).
+    Fallback 'index' se DB down.
+    """
+    try:
+        from brain.utils.settings_db import get_setting
+        v = (get_setting("knowledge.rag_injection_mode", "index") or "index").strip().lower()
+        return v if v in ("index", "full") else "index"
+    except Exception:
+        return "index"
+
+
 def _build_rag_context(intent: str, query_text: str) -> str:
     """Recupera interazioni simili e formatta come blocco contesto.
 
@@ -1134,6 +1150,7 @@ def _build_kb_rag_context(intent: str, project_id: str, query_text: str) -> str:
     if not results:
         return ""
 
+    mode = _rag_injection_mode()
     snippets: list[str] = []
     for r in results:
         title = str(r.get("title") or "").strip()
@@ -1142,12 +1159,24 @@ def _build_kb_rag_context(intent: str, project_id: str, query_text: str) -> str:
             continue
         intent_attr = r.get("intent") or "chat"
         kind_attr = str(r.get("kind") or "")
+        note_id = str(r.get("note_id") or "")
         score = float(r.get("score") or 0)
+
+        if mode == "index":
+            # Solo indice compatto: l'agente legge il contenuto on-demand con i
+            # tool (code_doc / knowledge_get_note). Prompt molto piu' leggero.
+            if kind_attr == "code_doc":
+                snippets.append(f'  <doc_codice file="{title}" score="{score:.2f}"/>')
+            else:
+                snippets.append(
+                    f'  <nota intent="{intent_attr}" titolo="{title}" '
+                    f'note_id="{note_id}" score="{score:.2f}"/>'
+                )
+            continue
+
+        # mode == "full": snippet completo (comportamento storico).
         if len(snippet_text) > _snippet_cap:
             snippet_text = snippet_text[: _snippet_cap - 3] + "..."
-        # Le note 'code_doc' sono la documentazione (code-wiki) del file il cui
-        # path e' nel titolo: vanno presentate come fonte autorevole sul codice
-        # esistente, cosi' l'agente non re-implementa cio' che c'e' gia'.
         if kind_attr == "code_doc":
             snippets.append(
                 f'  <doc_codice file="{title}" score="{score:.2f}">\n'
@@ -1164,16 +1193,28 @@ def _build_kb_rag_context(intent: str, project_id: str, query_text: str) -> str:
     if not snippets:
         return ""
 
-    logger.info("router_node: KB-RAG injected %d note (intent=%s, project=%s)",
-                len(snippets), intent, project_id[:8])
-    return ("<knowledge_base_progetto>\n"
+    logger.info("router_node: KB-RAG injected %d note (mode=%s, intent=%s, project=%s)",
+                len(snippets), mode, intent, project_id[:8])
+    if mode == "index":
+        guida = (
+            "  <!-- INDICE della Knowledge Base rilevante (titoli/file, non il\n"
+            "       contenuto). Per leggere il dettaglio usa i TOOL on-demand:\n"
+            "       code_doc(file_path) per la doc di un file (cosa fa, dipendenze,\n"
+            "       call-graph) PRIMA di modificarlo; knowledge_get_note(note_id)\n"
+            "       per il testo completo di una nota. <doc_codice> = file gia'\n"
+            "       documentato: NON re-implementarlo da zero, evita ripetizioni\n"
+            "       ed errori gia' risolti. -->\n"
+        )
+    else:
+        guida = (
             "  <!-- Note dal Knowledge Base del progetto: contesto, decisioni,\n"
             "       requirement, messaggi gia' affrontati, e <doc_codice> ossia la\n"
             "       documentazione (code-wiki) dei file esistenti. Usa per evitare\n"
             "       duplicazioni/ripetizioni, riusare il codice esistente e non\n"
             "       reintrodurre errori gia' risolti. La doc_codice descrive cosa\n"
             "       fa gia' un file: NON re-implementarlo da zero. -->\n"
-            + "\n".join(snippets) + "\n</knowledge_base_progetto>")
+        )
+    return "<knowledge_base_progetto>\n" + guida + "\n".join(snippets) + "\n</knowledge_base_progetto>"
 
 
 # ─── Nodo: router ────────────────────────────────────────────────────────────

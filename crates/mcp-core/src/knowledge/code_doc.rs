@@ -182,7 +182,33 @@ pub async fn generate_code_doc_for_file(
         tags: vec!["kind:code_doc".to_string(), format!("lang:{}", ast.language)],
         file_paths: vec![rel_path.to_string()],
     };
-    apply_project_note(state, project_id, &note).await
+    let note_id = apply_project_note(state, project_id, &note).await?;
+
+    // Continuum KB<->wiki: collega la doc del file (code_doc) alle note
+    // decisionali/funzionali/chat che riguardano lo stesso file (overlap di
+    // file_paths), cosi' si naviga dal "cosa fa il codice" al "perche' e' stato
+    // deciso cosi'". Idempotente (ON CONFLICT). Best-effort.
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO project_knowledge_links
+            (id, from_note_id, to_note_id, rel_type, created_by, confidence)
+        SELECT gen_random_uuid(), $1, n.id, 'relates', 'auto', 0.8
+        FROM project_knowledge_notes n
+        WHERE n.project_id = $2
+          AND n.id <> $1
+          AND n.status = 'active'
+          AND n.kind <> 'code_doc'
+          AND n.file_paths && $3
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(note_id)
+    .bind(project_id)
+    .bind(&[rel_path.to_string()][..])
+    .execute(&state.db)
+    .await;
+
+    Ok(note_id)
 }
 
 /// Genera la code-wiki per l'intero progetto: itera sui file noti in

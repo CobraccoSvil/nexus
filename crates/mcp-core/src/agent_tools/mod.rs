@@ -1437,6 +1437,20 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
     }
   },
   {
+    "name": "code_doc",
+    "description": "Restituisce la documentazione (Code Wiki) di un file specifico: scopo, componenti, dipendenze e call-graph. Usalo PRIMA di modificare o estendere un file per sapere cosa fa gia', evitare di re-implementarlo e non reintrodurre errori. Diretto (per path), piu' preciso di knowledge_search quando conosci gia' il file.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "Path del file (relativo alla root del progetto, es. 'src/auth/login.ts')."
+        }
+      },
+      "required": ["file_path"]
+    }
+  },
+  {
     "name": "knowledge_get_note",
     "description": "Recupera il body COMPLETO di una nota della KB. Usalo dopo knowledge_search quando lo snippet non basta e serve il testo completo della nota. Aggiorna access_count della nota.",
     "input_schema": {
@@ -1919,6 +1933,7 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "dispatcher_highlight_panel" => dispatcher::tool_dispatcher_highlight_panel(ctx, input).await,
         // ── Knowledge Base per-progetto ────────────────────────────────────
         "knowledge_search" => knowledge::tool_knowledge_search(ctx, input).await,
+        "code_doc" => knowledge::tool_code_doc(ctx, input).await,
         "knowledge_get_note" => knowledge::tool_knowledge_get_note(ctx, input).await,
         "knowledge_create_note" => knowledge::tool_knowledge_create_note(ctx, input).await,
         // Comp.0: navigazione/modifica del grafo KB (link, sottografo, pertinenza)
