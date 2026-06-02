@@ -151,7 +151,32 @@ fi
 
 stop_service() {
     local name="$1"
-    pkill -f "$name" 2>/dev/null && sleep 1 || true
+    # Root cause (regola H): `pkill -f "$name"` su nudo nome di servizio matcha
+    # anche la command line dello script stesso quando invocato come
+    # `deploy-local.sh --service mcp-core` (l'argomento "mcp-core" e' presente
+    # nella riga di comando di bash/wsl che ospita lo script). Risultato: lo
+    # script si auto-uccideva con SIGTERM (exit 15) prima di buildare/riavviare.
+    # Colpiva solo i servizi con nome == argomento (mcp-core, admin-service, ...);
+    # il brain era immune perche' il suo pattern e' 'brain.grpc_server.main'.
+    #
+    # Fix: matchare il suffisso del PATH del binario eseguibile
+    # (`target/<profilo>/<nome>`), che non compare mai nella command line dello
+    # script. Il pattern e' indipendente da:
+    #   - modo di invocazione: assoluto (start_service usa ${BIN_DIR}/${name})
+    #     o relativo (es. ./target/release/mcp-core avviato da Start-Dev.ps1);
+    #   - profilo (debug|release): cosi' un restart in release ferma comunque un
+    #     vecchio processo debug ancora attaccato alla porta, e viceversa.
+    # L'ancoraggio finale ([[:space:]]|$) evita match parziali (es. mcp-core-x).
+    # Coperto anche il fallback `cargo run -p ${name}` (binario non ancora buildato).
+    #
+    # NB: lo script gira con `set -euo pipefail`. `pkill` ritorna 1 quando NON
+    # trova processi (caso normale: servizio gia' fermo) -> senza `|| true` il
+    # `set -e` farebbe terminare lo script proprio qui. Il `|| true` e' quindi
+    # obbligatorio, non cosmetico.
+    pkill -f "target/(debug|release)/${name}([[:space:]]|\$)" 2>/dev/null || true
+    pkill -f "cargo run -p ${name}" 2>/dev/null || true
+    sleep 1
+    return 0
 }
 
 start_service() {
