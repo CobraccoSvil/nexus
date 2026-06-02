@@ -196,6 +196,18 @@ function TerminalInstance({
             if (disposed || disposedLocal) return;
             // Don't reconnect on intentional/clean close (1000 = normal, 1001 = going away)
             if (event.code === 1000 || event.code === 1001) return;
+            // Rifiuto deterministico del server (4400-4499, es. 4403 "sessione
+            // non valida"): errore non transitorio. Riconnettere genererebbe un
+            // loop infinito di apertura/chiusura. Ci si ferma con un messaggio
+            // chiaro e niente backoff.
+            if (event.code >= 4400 && event.code <= 4499) {
+              term.writeln(
+                "\r\n\x1b[31m[Terminale non disponibile per questo progetto: " +
+                "sessione rifiutata dal server. Verifica che il progetto sia " +
+                "registrato correttamente.]\x1b[0m",
+              );
+              return;
+            }
             const isCrash = event.code === 4000;
             term.write("\r\n\x1b[90m[Connessione terminale chiusa]\x1b[0m\r\n");
             scheduleReconnect(isCrash ? "crash" : "abnormal");

@@ -160,8 +160,13 @@ pub async fn create_terminal_session(
         })?;
 
     let cwd = context.root_path.to_string_lossy().to_string();
-    let admin_root = load_projects_base_root(&state.db).await?;
-    let root = admin_root.to_string_lossy().to_string();
+    // Isolamento per-progetto (regola E): il terminale e' confinato alla root
+    // del singolo progetto, non al perimetro globale projects_base_root. Questo
+    // consente progetti registrati in qualsiasi path (es. repo importati fuori
+    // da projects_base_root) e impedisce alla shell di un progetto di navigare
+    // negli altri. Il brain autorizza il root verificando che corrisponda a una
+    // repository_root_path registrata.
+    let root = cwd.clone();
     let claims_payload = TerminalSessionClaims {
         sid: &session_id,
         uid: &user_id.to_string(),

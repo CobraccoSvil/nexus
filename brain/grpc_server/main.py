@@ -93,6 +93,62 @@ def _terminal_secret() -> str:
     return "development-terminal-secret-change-me"
 
 
+_PROJECT_ROOTS_CACHE: tuple[float, set[str]] | None = None
+_PROJECT_ROOTS_TTL_SECONDS = 30.0
+
+
+def _registered_project_roots() -> set[str]:
+    """Set delle repository_root_path dei progetti registrati, risolte.
+
+    Fonte di verita': tabella projects (regola G, niente perimetro hardcoded).
+    Cache TTL breve: evita una query DB per ogni apertura di terminale.
+    Degradazione esplicita (regola H): in caso di errore DB si riusa l'ultima
+    cache valida; se non c'e' cache, l'autorizzazione ricade sul perimetro
+    _allowed_roots() senza inghiottire l'errore (loggato come warning).
+    """
+    global _PROJECT_ROOTS_CACHE
+    now = time.time()
+    if _PROJECT_ROOTS_CACHE and now - _PROJECT_ROOTS_CACHE[0] <= _PROJECT_ROOTS_TTL_SECONDS:
+        return _PROJECT_ROOTS_CACHE[1]
+
+    db_url = os.environ.get("DATABASE_URL", "")
+    if not db_url:
+        return _PROJECT_ROOTS_CACHE[1] if _PROJECT_ROOTS_CACHE else set()
+
+    roots: set[str] = set()
+    try:
+        import psycopg2
+
+        conn = psycopg2.connect(db_url)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT repository_root_path FROM projects "
+                "WHERE repository_root_path IS NOT NULL AND repository_root_path <> ''"
+            )
+            for (path_value,) in cur.fetchall():
+                try:
+                    roots.add(str(Path(path_value).expanduser().resolve()))
+                except Exception:
+                    continue
+            cur.close()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("registered_project_roots: query progetti fallita: %s", exc)
+        if _PROJECT_ROOTS_CACHE:
+            return _PROJECT_ROOTS_CACHE[1]
+        return set()
+
+    _PROJECT_ROOTS_CACHE = (now, roots)
+    return roots
+
+
+def _is_registered_project_root(resolved_root: Path) -> bool:
+    """True se il root firmato corrisponde alla root di un progetto registrato."""
+    return str(resolved_root) in _registered_project_roots()
+
+
 def _allowed_roots() -> list[Path]:
     raw = os.environ.get("PROJECTS_ALLOWED_ROOTS", "")
     candidates = [item.strip() for item in raw.split(os.pathsep) if item.strip()]
@@ -165,7 +221,15 @@ def _verify_terminal_token(token: str | None) -> dict[str, object] | None:
     resolved_cwd = Path(cwd).expanduser().resolve()
     resolved_root = Path(root).expanduser().resolve()
 
-    if not any(_path_within(resolved_root, allowed_root) for allowed_root in _allowed_roots()):
+    # Il root del terminale e' autorizzato se sta dentro il perimetro admin
+    # (projects_base_root / PROJECTS_ALLOWED_ROOTS) OPPURE se coincide con la
+    # root di un progetto registrato (isolamento per-progetto, regola E): in
+    # questo modo i progetti importati fuori da projects_base_root hanno un
+    # terminale funzionante senza allargare il perimetro a path arbitrari.
+    within_perimeter = any(
+        _path_within(resolved_root, allowed_root) for allowed_root in _allowed_roots()
+    )
+    if not (within_perimeter or _is_registered_project_root(resolved_root)):
         return None
 
     if not _path_within(resolved_cwd, resolved_root):
