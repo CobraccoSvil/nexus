@@ -3894,6 +3894,7 @@ pub async fn send_chat_message(
                 if let Ok(proj) = load_project_context(&state.db, context.project_id, user_id).await {
                     let db_clone2 = state.db.clone();
                     let channels2 = state.agent_channels.clone();
+                    let proj_channels2 = state.project_channels.clone();
                     let neural2 = state.orchestrator.neural.clone();
                     let term2 = state.terminal_consumers.clone();
                     let session_id_r = context.session_id;
@@ -3995,7 +3996,7 @@ pub async fn send_chat_message(
                         // (nota agent_summary + embedding + auto-link). Best-effort.
                         if _run_completed {
                             crate::knowledge::ingest_run::ingest_run_summary_to_kb(
-                                &db_clone2, &neural2, new_run_id,
+                                &db_clone2, &neural2, &proj_channels2, new_run_id,
                             ).await;
                         }
                     });

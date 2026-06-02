@@ -113,7 +113,13 @@ fn title_from_answer(task_type: &str, answer: &str) -> String {
 
 /// Hook principale M12.1. Crea la nota agent_summary per il run completato.
 /// `neural` serve per l'embedding (riusato dal link composer per il semantico).
-pub async fn ingest_run_summary_to_kb(db: &PgPool, neural: &NeuralCoreClient, run_id: Uuid) {
+/// `channels` serve per il promote M14.1 (eventi KnowledgeNoteUpdated).
+pub async fn ingest_run_summary_to_kb(
+    db: &PgPool,
+    neural: &NeuralCoreClient,
+    channels: &nexus_events::ProjectChannels,
+    run_id: Uuid,
+) {
     if !read_bool_setting(db, "kb.ingest.enabled", true).await {
         return;
     }
@@ -173,6 +179,43 @@ pub async fn ingest_run_summary_to_kb(db: &PgPool, neural: &NeuralCoreClient, ru
     }
 
     let file_paths = extract_modified_files(db, run_id).await;
+
+    // M14.1 — Lifecycle: promuove le note 'draft' del run a 'active' (le note
+    // kind='chat' create durante il run). Gated kb.lifecycle.promote_enabled.
+    if read_bool_setting(db, "kb.lifecycle.promote_enabled", true).await {
+        crate::knowledge::promote_notes_on_run_completed(
+            db, run_id, &file_paths, channels, project_id,
+        )
+        .await;
+    }
+
+    // M14.3 — Flag context-stale: le note 'active' di ALTRI run che riferiscono
+    // i file appena modificati da questo run hanno il contesto potenzialmente
+    // obsoleto (il codice e' cambiato sotto di loro). Le marchiamo con
+    // context_stale_at cosi' l'intake successivo le segnala. Gated.
+    if !file_paths.is_empty()
+        && read_bool_setting(db, "kb.lifecycle.context_stale_enabled", true).await
+    {
+        let res = sqlx::query(
+            "UPDATE project_knowledge_notes \
+             SET context_stale_at = NOW() \
+             WHERE project_id = $1 AND status = 'active' \
+               AND file_paths && $2 \
+               AND (source_run_id IS NULL OR source_run_id <> $3) \
+               AND context_stale_at IS NULL",
+        )
+        .bind(project_id)
+        .bind(&file_paths)
+        .bind(run_id)
+        .execute(db)
+        .await;
+        if let Ok(r) = res {
+            if r.rows_affected() > 0 {
+                tracing::info!(run_id = %run_id, flagged = r.rows_affected(), "kb.lifecycle: note marcate context-stale");
+            }
+        }
+    }
+
     let note_id = Uuid::new_v4();
     let body_max = read_int_setting(db, "kb.ingest.body_max_chars", 20000).await as usize;
     let body_md: String = final_answer.chars().take(body_max).collect();
