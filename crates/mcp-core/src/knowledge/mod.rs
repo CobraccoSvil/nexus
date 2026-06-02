@@ -615,3 +615,61 @@ pub async fn promote_notes_on_run_completed(
         }
     }
 }
+
+/// M14.2 — Deprecazione su correzione. Quando un nuovo summary (`new_note_id`)
+/// copre gli stessi file di note 'active' precedenti, quelle note vengono
+/// marcate 'deprecated' con `superseded_by = new_note_id`. In questo modo
+/// l'intake non ripropone conoscenza superata dal codice piu' recente.
+/// Il chiamante deve gia' aver verificato il gate
+/// `kb.lifecycle.auto_deprecate_on_correction`.
+pub async fn deprecate_notes_on_correction(
+    db: &PgPool,
+    project_id: Uuid,
+    new_note_id: Uuid,
+    file_paths: &[String],
+    project_channels: &nexus_events::ProjectChannels,
+) {
+    if file_paths.is_empty() {
+        return;
+    }
+    let result = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        UPDATE project_knowledge_notes
+        SET status = 'deprecated',
+            deprecated_at = NOW(),
+            superseded_by = $2,
+            updated_at = NOW()
+        WHERE project_id = $1
+          AND status = 'active'
+          AND id <> $2
+          AND file_paths && $3
+        RETURNING id
+        "#,
+    )
+    .bind(project_id)
+    .bind(new_note_id)
+    .bind(file_paths)
+    .fetch_all(db)
+    .await;
+
+    if let Ok(ids) = result {
+        if !ids.is_empty() {
+            tracing::info!(
+                project_id = %project_id,
+                superseded_by = %new_note_id,
+                count = ids.len(),
+                "kb.lifecycle: note active deprecate da summary piu' recente"
+            );
+        }
+        for note_id in ids {
+            let _ = nexus_events::dispatcher::emit(
+                project_channels,
+                project_id,
+                nexus_events::ProjectEvent::KnowledgeNoteUpdated {
+                    note_id,
+                    status: "deprecated".to_string(),
+                },
+            );
+        }
+    }
+}

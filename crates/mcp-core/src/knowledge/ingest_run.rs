@@ -299,6 +299,16 @@ pub async fn ingest_run_summary_to_kb(
 
     tracing::info!(run_id = %run_id, note_id = %note_id, files = file_paths.len(), "kb.ingest: nota agent_summary creata");
 
+    // M14.2 — Deprecazione su correzione: questo nuovo summary supera le note
+    // active precedenti che riferiscono gli stessi file (il codice e' cambiato).
+    // Gated da kb.lifecycle.auto_deprecate_on_correction.
+    if read_bool_setting(db, "kb.lifecycle.auto_deprecate_on_correction", true).await {
+        crate::knowledge::deprecate_notes_on_correction(
+            db, project_id, note_id, &file_paths, channels,
+        )
+        .await;
+    }
+
     // Link composer M12.3 (best-effort).
     let links = auto_link::build_links_for_new_note(
         db,

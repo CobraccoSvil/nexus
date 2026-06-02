@@ -462,11 +462,11 @@ async fn cleanup_tick(db: &PgPool) -> anyhow::Result<()> {
     )
     .await;
 
-    // Archivia note draft scadute.
+    // Archivia note draft scadute (M14.5, sempre attivo).
     let result = sqlx::query(
         r#"
         UPDATE project_knowledge_notes
-        SET status = 'archived', updated_at = NOW()
+        SET status = 'archived', archived_at = NOW(), updated_at = NOW()
         WHERE status = 'draft'
           AND created_at < NOW() - ($1 || ' days')::INTERVAL
         "#,
@@ -483,6 +483,33 @@ async fn cleanup_tick(db: &PgPool) -> anyhow::Result<()> {
         );
     } else {
         tracing::debug!("knowledge_cleanup_worker: nessuna nota draft da archiviare");
+    }
+
+    // M14.5 — Archivia note active inattive. Gated da
+    // knowledge.cleanup_inactive_enabled (OFF di default) per non archiviare
+    // note attive a sorpresa su installazioni esistenti. Soglia in giorni
+    // dall'ultimo updated_at (regola G: niente costanti hardcoded).
+    let inactive_enabled = read_bool_setting(db, "knowledge.cleanup_inactive_enabled", false).await;
+    if inactive_enabled {
+        let inactive_days = read_i64_setting(db, "knowledge.cleanup_inactive_days", 90).await;
+        let res2 = sqlx::query(
+            r#"
+            UPDATE project_knowledge_notes
+            SET status = 'archived', archived_at = NOW(), updated_at = NOW()
+            WHERE status = 'active'
+              AND updated_at < NOW() - ($1 || ' days')::INTERVAL
+            "#,
+        )
+        .bind(inactive_days.to_string())
+        .execute(db)
+        .await
+        .context("cleanup active knowledge notes fallito")?;
+        let n = res2.rows_affected();
+        if n > 0 {
+            tracing::info!(
+                "knowledge_cleanup_worker: {n} note active inattive archiviate (soglia: {inactive_days} giorni)"
+            );
+        }
     }
 
     Ok(())
@@ -516,5 +543,14 @@ async fn read_i64_setting(db: &PgPool, key: &str, default: i64) -> i64 {
         .ok()
         .flatten()
         .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
+async fn read_bool_setting(db: &PgPool, key: &str, default: bool) -> bool {
+    settings::get_setting(db, key)
+        .await
+        .ok()
+        .flatten()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
         .unwrap_or(default)
 }
