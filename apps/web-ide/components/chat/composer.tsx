@@ -216,7 +216,10 @@ export function Composer({
         />
         {attachments.length > 0 && (
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
-            {attachments.map((attachment) => (
+            {attachments.map((attachment) => {
+              const isImage = (attachment.mimeType || "").startsWith("image/");
+              const ext = (attachment.name.split(".").pop() || "file").slice(0, 4);
+              return (
               <span
                 key={`${attachment.name}-${attachment.sizeBytes}`}
                 style={{
@@ -231,12 +234,32 @@ export function Composer({
                   color: tc.textSecondary,
                 }}
               >
-                {attachment.base64Content && (
+                {isImage && attachment.base64Content ? (
                   <img
                     src={`data:${attachment.mimeType};base64,${attachment.base64Content}`}
                     alt={attachment.name}
-                    style={{ height: 28, borderRadius: 4, objectFit: "cover" }}
+                    style={{ height: 20, width: 20, borderRadius: 4, objectFit: "cover" }}
                   />
+                ) : (
+                  <span
+                    aria-hidden
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      height: 18,
+                      minWidth: 18,
+                      padding: "0 4px",
+                      borderRadius: 3,
+                      background: `${tc.accent}22`,
+                      color: tc.accent,
+                      fontSize: 9,
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    {ext}
+                  </span>
                 )}
                 {attachment.name}
                 <button
@@ -254,7 +277,8 @@ export function Composer({
                   x
                 </button>
               </span>
-            ))}
+              );
+            })}
           </div>
         )}
         <div
