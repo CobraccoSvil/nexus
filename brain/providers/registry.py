@@ -716,8 +716,12 @@ class ProviderRegistry:
             try:
                 from .capability_loader import load_capability
                 from .adapter_base import is_soft_failure
+                from ._schema_utils import is_first_agent_turn
                 _cap = load_capability(res.provider, res.model)
-                if is_soft_failure(res.metadata, res.content, _cap):
+                if is_soft_failure(
+                    res.metadata, res.content, _cap,
+                    first_turn=is_first_agent_turn(messages),
+                ):
                     logger.warning(
                         "Soft-failure %s/%s: chiusura naturale senza tool e contenuto "
                         "sotto soglia -> fallback (M4)", res.provider, res.model,

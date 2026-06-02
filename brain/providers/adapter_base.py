@@ -83,14 +83,20 @@ def is_soft_failure(
     content: str,
     cap: ProviderCapability,
     iteration: int | None = None,
+    first_turn: bool = True,
 ) -> bool:
     """True se il turno e un fallimento soft: chiusura naturale (end_turn/stop)
-    SENZA tool-call e con contenuto sotto soglia. Indica un provider che "molla"
-    invece di agire -> il chiamante puo instradare al fallback (M4).
+    SENZA tool-call e con contenuto sotto soglia, MENTRE il modello non ha ancora
+    agito. Indica un provider che "molla" all'inizio invece di usare i tool ->
+    il chiamante puo instradare al fallback (M4).
 
-    `iteration` e opzionale: se fornita, il soft-failure si applica solo nelle
-    prime iterazioni (cap.soft_failure_iter_threshold); se None la condizione iter
-    e ignorata (compat con firme che non propagano l'iterazione).
+    `first_turn`: il soft-failure si applica SOLO se siamo ancora al primo turno
+    agente (nessun tool_result nella history). Se il modello ha gia eseguito tool
+    nei turni precedenti, una chiusura naturale e legittima (fine task) e NON va
+    trattata come fallimento -> evita il falso positivo del fallback a fine run.
+
+    `iteration` e opzionale: se fornita, ulteriore guardia sulle prime iterazioni
+    (cap.soft_failure_iter_threshold).
     """
     meta = metadata or {}
     stop = meta.get("stop_reason")
@@ -98,6 +104,9 @@ def is_soft_failure(
         return False
     blocks = meta.get("tool_use_blocks") or []
     if blocks:
+        return False
+    # Il modello ha gia lavorato (turni con tool alle spalle): chiusura legittima.
+    if not first_turn:
         return False
     if iteration is not None and iteration >= cap.soft_failure_iter_threshold:
         return False
