@@ -285,6 +285,16 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
             "alternative scartate)."
         )
 
+    # M15.4: inietta il backlog ereditato (todo carry_over di run precedenti
+    # ancora aperti) cosi' il planner puo' riprenderli invece di perderli.
+    backlog_ctx = _retrieve_backlog_brief(state)
+    if backlog_ctx:
+        hinted_system += (
+            "\n\n" + backlog_ctx
+            + "\n\nValuta se questi todo arretrati vanno ripresi nel piano "
+            "corrente: includili se ancora pertinenti, altrimenti ignorali."
+        )
+
     # Comp.3a: inietta le dipendenze dal grafo KB (gated). Il planner le usa per
     # assegnare node_key/dep_keys ai todo -> esecuzione in ordine topologico.
     if orchestrator_config.get().get("dag_topological_enabled"):
@@ -521,6 +531,47 @@ def _retrieve_decision_context(state: AgentState) -> str:
         "       Usali per coerenza: non ri-decidere cio' che e' gia' deciso. -->\n"
         + "\n".join(lines)
         + "\n</decisioni_passate>"
+    )
+
+
+def _retrieve_backlog_brief(state: AgentState) -> str:
+    """M15.4: recupera i todo carry_over di run precedenti del progetto ancora
+    aperti (endpoint internal /api/internal/agent/backlog/:project_id) e li
+    formatta come backlog ereditato per il planner. Best-effort, mai solleva.
+    """
+    project_id = str(state.get("project_id") or "").strip()
+    if not project_id:
+        return ""
+    try:
+        import requests  # noqa: PLC0415
+        resp = requests.get(
+            f"{_MCP_CORE_INTERNAL_URL}/api/internal/agent/backlog/{project_id}",
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return ""
+        backlog = resp.json().get("backlog", []) or []
+    except Exception as exc:
+        logger.debug("planner_node: backlog brief fallito: %s", exc)
+        return ""
+
+    if not backlog:
+        return ""
+    lines: list[str] = []
+    for item in backlog:
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        status = str(item.get("status") or "").strip()
+        lines.append(f'  <todo stato="{status}">{content}</todo>')
+    if not lines:
+        return ""
+    logger.info("planner_node: backlog ereditato iniettato (%d todo)", len(lines))
+    return (
+        "<backlog_ereditato>\n"
+        "  <!-- Todo non completati in run precedenti su questo progetto. -->\n"
+        + "\n".join(lines)
+        + "\n</backlog_ereditato>"
     )
 
 

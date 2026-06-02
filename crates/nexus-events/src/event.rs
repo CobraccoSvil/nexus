@@ -145,6 +145,16 @@ pub enum ProjectEvent {
         status: String,
     },
 
+    // ── M15 — Aggiornamento del piano (checklist todo) ────────────────
+    // Emesso quando la composizione del piano cambia (creazione/modifica/edit
+    // utente dei todo di un run): permette alla UI di aggiornare il contatore
+    // di avanzamento senza ricaricare l'intera lista.
+    PlanUpdated {
+        run_id: String,
+        total: i32,
+        completed: i32,
+    },
+
     // ── Pilotaggio diretto dall'agente ────────────────────────────────
     Notification {
         severity: String, // "info" | "success" | "warning" | "error"
@@ -367,7 +377,9 @@ impl ProjectEvent {
             Self::FileChanged { .. } => TOPIC_FILES,
             Self::GitStatusChanged { .. } => TOPIC_GIT,
             Self::DbQueryRun { .. } | Self::DbConfigUpdated { .. } => TOPIC_DATABASE,
-            Self::AgentToolUsed { .. } | Self::TodoUpdated { .. } => TOPIC_AGENT,
+            Self::AgentToolUsed { .. }
+            | Self::TodoUpdated { .. }
+            | Self::PlanUpdated { .. } => TOPIC_AGENT,
             Self::Notification { .. } => TOPIC_NOTIFICATION,
             Self::FlagChanged { .. } => TOPIC_FLAGS,
             Self::MonitorUpdated { .. } | Self::HighlightPanel { .. } => TOPIC_MONITOR,
@@ -412,6 +424,7 @@ impl ProjectEvent {
             Self::DbConfigUpdated { .. } => "DbConfigUpdated",
             Self::AgentToolUsed { .. } => "AgentToolUsed",
             Self::TodoUpdated { .. } => "TodoUpdated",
+            Self::PlanUpdated { .. } => "PlanUpdated",
             Self::Notification { .. } => "Notification",
             Self::FlagChanged { .. } => "FlagChanged",
             Self::MonitorUpdated { .. } => "MonitorUpdated",

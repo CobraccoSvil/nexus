@@ -47,6 +47,7 @@ mod environment;
 mod settings;
 mod vector_memory;
 mod knowledge;
+mod agent_todos_routes;
 mod project_context;
 mod quality_guard;
 mod project_db;
@@ -921,6 +922,12 @@ async fn main() -> anyhow::Result<()> {
                 "/api/internal/knowledge/search",
                 post(knowledge::routes::internal_kb_search),
             )
+            // /api/internal/agent/backlog/:project_id — NO-AUTH, chiamato dal
+            // brain (backlog_brief) per ereditare i todo carry_over nel planner.
+            .route(
+                "/api/internal/agent/backlog/:project_id",
+                get(agent_todos_routes::list_backlog),
+            )
             // /api/internal/providers/status — no-auth, ritorna lo stato
             // canonico dei provider (last health probe + cooldown). Usato dal
             // nexus-gateway TypeScript per evitare di tenere una sua cache
@@ -1549,6 +1556,15 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/projects/:id/knowledge/similar",
                 post(knowledge::routes::similar_handler).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            // M15.3 — Edit manuale dei todo di un run (traccia edited_by, ri-emette
+            // TodoUpdated + PlanUpdated). Gated da agent.todos.user_editable.
+            .route(
+                "/api/projects/:id/agent/todos/:run_id/edit",
+                post(agent_todos_routes::edit_todo).layer(axum_mw::from_fn_with_state(
                     state.clone(),
                     middleware::require_auth,
                 )),

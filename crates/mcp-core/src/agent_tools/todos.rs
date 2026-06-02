@@ -413,6 +413,25 @@ async fn update_status(
                 },
             );
         }
+        // M15 — PlanUpdated: avanzamento aggregato del piano (totale/completati)
+        // cosi' la UI aggiorna il contatore senza ricaricare la checklist.
+        if let Ok((total, completed)) = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'completed') \
+             FROM nexus_agent_todos WHERE run_id = $1",
+        )
+        .bind(run_id)
+        .fetch_one(&*ctx.db)
+        .await
+        {
+            nexus_events::dispatcher::emit_global(
+                ctx.project_id,
+                nexus_events::event::ProjectEvent::PlanUpdated {
+                    run_id: run_id.to_string(),
+                    total: total as i32,
+                    completed: completed as i32,
+                },
+            );
+        }
     }
 
     json!({

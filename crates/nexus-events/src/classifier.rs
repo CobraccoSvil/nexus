@@ -187,6 +187,7 @@ impl Classifier {
             // ── Agent meta + custom + system ──────────────────────────
             ProjectEvent::AgentToolUsed { .. } => None,
             ProjectEvent::TodoUpdated { .. } => None,
+            ProjectEvent::PlanUpdated { .. } => None,
             ProjectEvent::Custom { .. } => None, // candidato a LLM fallback futuro
             ProjectEvent::SnapshotRequired { .. } => None,
 

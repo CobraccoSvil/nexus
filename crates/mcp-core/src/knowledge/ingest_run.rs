@@ -161,6 +161,18 @@ pub async fn ingest_run_summary_to_kb(
     // in 'draft'. Spostati qui (regola H: fix della causa radice "le note
     // restano in bozza").
     if status == "completed" {
+        // M15.4 — Backlog cross-run: i todo non completati di questo run vengono
+        // marcati carry_over cosi' il run successivo li eredita come backlog.
+        // origin_run_id preserva il run che li ha originati (idempotente).
+        let _ = sqlx::query(
+            "UPDATE nexus_agent_todos \
+             SET carry_over = true, origin_run_id = COALESCE(origin_run_id, run_id) \
+             WHERE run_id = $1 AND status NOT IN ('completed', 'cancelled')",
+        )
+        .bind(run_id)
+        .execute(db)
+        .await;
+
         if read_bool_setting(db, "kb.lifecycle.promote_enabled", true).await {
             crate::knowledge::promote_notes_on_run_completed(
                 db, run_id, &file_paths, channels, project_id,
