@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../../lib/theme";
+import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
+import { ListEditorLayout } from "../../../components/admin/ListEditorLayout";
 
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
@@ -90,15 +92,14 @@ export default function LongRunningPage() {
   };
 
   return (
-    <div style={{ padding: 32, maxWidth: 800 }}>
-      <h2 style={{ fontSize: 20, fontWeight: 700, margin: "0 0 6px", color: tc.text }}>
-        Long-Running Patterns
-      </h2>
-      <p style={{ fontSize: 13, color: tc.textMuted, margin: "0 0 24px" }}>
-        Comandi che l&apos;agente AI riconosce automaticamente come processi long-running
-        (server, watcher, ecc.) e avvia nel terminale senza bloccare.
-      </p>
-
+    <ListEditorLayout
+      header={
+        <AdminPageHeader
+          title="Long-Running Patterns"
+          description="Comandi che l'agente AI riconosce automaticamente come processi long-running (server, watcher, ecc.) e avvia nel terminale senza bloccare."
+        />
+      }
+    >
       {/* Add form */}
       <div
         style={{
@@ -256,6 +257,6 @@ export default function LongRunningPage() {
         contiene questa sequenza, viene avviato nel terminale IDE in modalità fire-and-forget.
         I comandi non riconosciuti vengono comunque intercettati se non terminano entro 10 secondi.
       </p>
-    </div>
+    </ListEditorLayout>
   );
 }
