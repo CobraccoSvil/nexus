@@ -135,7 +135,9 @@ export function Composer({
     minWidth: 0,
   } as const;
 
-  const isProviderLocked = selectedProvider !== "auto" && forceProvider;
+  // Un provider selezionato (diverso da "auto") e' gia' forzato come override,
+  // a prescindere dal toggle "Forza": il dropdown e' la fonte di verita'.
+  const isProviderLocked = selectedProvider !== "auto";
   const showOverrideMismatch =
     isProviderLocked &&
     !!runProvider &&

@@ -780,7 +780,12 @@ export function ChatPanel({
     // Se il provider e' "auto" e c'e' un hint esterno (es. generazione documenti),
     // usa il hint per forzare un provider/modello capace.
     const hint = providerHintOverride || externalProviderHint;
-    const shouldForce = forceProvider && selectedProvider !== "auto";
+    // Un provider selezionato esplicitamente (diverso da "auto") viene SEMPRE
+    // forzato come provider_override: sceglierlo nel dropdown significa "usa
+    // questo", senza dover anche premere "Forza". Solo "auto" lascia decidere al
+    // routing (eventuale hint esterno). Il toggle forceProvider resta come
+    // conferma visiva ma non e' piu' necessario per attivare l'override.
+    const shouldForce = selectedProvider !== "auto";
     const effectiveProvider = shouldForce
       ? selectedProvider
       : selectedProvider === "auto"
