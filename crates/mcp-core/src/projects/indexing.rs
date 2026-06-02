@@ -708,6 +708,14 @@ pub async fn reindex_single_file(
         });
     }
 
+    // M13.1 — popola il code graph (nodi/edge import/test-mapping) per questo file.
+    // Best-effort: errori loggati internamente, mai propagati (regola: non rompe
+    // l'indicizzazione). Piggyback sul cambio-hash gia rilevato sopra.
+    crate::knowledge::code_graph::persist_code_graph(
+        db, project_id, root, &relative_path, &content, &content_hash,
+    )
+    .await;
+
     tracing::debug!("reindex_single_file: {relative_path} → {indexed} chunks");
     Ok(indexed)
 }
