@@ -2251,6 +2251,30 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     tools_json = state.get("tools_json") or []
     system_text = state.get("system_text") or ""
 
+    # ── M16: merge tool scoperti (discovery-first) per QUESTO turno ───────────
+    # Il turno precedente ha eseguito nexus_mcp_tool_search; tool_dispatch_node
+    # ha estratto i tool trovati in `discovered_tools_next_turn`. Qui li
+    # iniettiamo come native nel tools_json (dedup per nome, cap DB-driven).
+    # Durata 1 turno: il prossimo tool_dispatch riscrive [] se non c'e' search.
+    _discovered = state.get("discovered_tools_next_turn") or []
+    if _discovered and tools_json:
+        try:
+            from brain.utils.settings_db import get_int_setting
+            _cap = get_int_setting("agent.tools.discovery_max_injected", 20)
+        except Exception:
+            _cap = 20
+        _existing_names = {t.get("name") for t in tools_json if isinstance(t, dict)}
+        _added = 0
+        for _dt in _discovered:
+            if _added >= _cap:
+                break
+            if isinstance(_dt, dict) and _dt.get("name") and _dt["name"] not in _existing_names:
+                tools_json = tools_json + [_dt]
+                _existing_names.add(_dt["name"])
+                _added += 1
+        if _added:
+            logger.info("M16: iniettati %d tool scoperti come native -> tools=%d", _added, len(tools_json))
+
     # ── Cluster 1: iniezione plan_rationale nel system_text ───────────────────
     # Se il planner ha prodotto un razionale (gated plan_rationale_enabled),
     # lo prependiamo al system_text dell'executor: cosi' chi esegue conosce il
@@ -3541,6 +3565,45 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
             _tool_steps.append(_step)
             meta_steps.persist_async(state.get("thread_id"), _step)
 
+    # ── M16: intercetta i risultati di nexus_mcp_tool_search ──────────────────
+    # Estrae i tool scoperti e li passa come `discovered_tools_next_turn`, che
+    # executor_node iniettera' come native nel SOLO turno successivo. Scritto
+    # SEMPRE (anche []: il reducer overwrite azzera i discovered del turno prima,
+    # garantendo durata esatta 1 turno).
+    _discovered_next: list[dict] = []
+    _max_bytes = 8192
+    try:
+        from brain.utils.settings_db import get_int_setting
+        _max_bytes = get_int_setting("agent.tools.discovery_schema_max_bytes", 8192)
+    except Exception:
+        pass
+    for b, r in zip(pending, results):
+        if b.get("name") != "nexus_mcp_tool_search" or r.get("is_error"):
+            continue
+        try:
+            _payload = json.loads(r.get("content") or "{}")
+        except Exception:
+            continue
+        for _res in (_payload.get("results") or []):
+            if not isinstance(_res, dict):
+                continue
+            _name = _res.get("tool_name") or _res.get("name")
+            if not _name:
+                continue
+            _schema = _res.get("input_schema") or {"type": "object", "properties": {}}
+            # Cap dimensione schema (evita di gonfiare il prompt del turno dopo).
+            try:
+                if len(json.dumps(_schema)) > _max_bytes:
+                    _schema = {"type": "object", "properties": {}}
+            except Exception:
+                _schema = {"type": "object", "properties": {}}
+            if not any(d.get("name") == _name for d in _discovered_next):
+                _discovered_next.append({
+                    "name": _name,
+                    "description": (_res.get("description") or "")[:500],
+                    "input_schema": _schema,
+                })
+
     return {
         "messages": [tool_msg],
         "pending_tool_uses": [],
@@ -3548,6 +3611,8 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
         "since_last_todo_reminder": new_reminder_counter,
         "attachment_read_bytes": new_attachment_read_bytes,
         "meta_steps": _tool_steps,
+        # M16: durata 1 turno (overwrite reducer). [] azzera i discovered precedenti.
+        "discovered_tools_next_turn": _discovered_next,
     }
 
 
