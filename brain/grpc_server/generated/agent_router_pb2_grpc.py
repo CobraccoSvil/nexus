@@ -44,6 +44,11 @@ class AgentRouterStub(object):
                 request_serializer=agent__router__pb2.FeedbackRequest.SerializeToString,
                 response_deserializer=agent__router__pb2.FeedbackResponse.FromString,
                 _registered_method=True)
+        self.GetAgentMetrics = channel.unary_unary(
+                '/ai_orchestrator.agent_router.AgentRouter/GetAgentMetrics',
+                request_serializer=agent__router__pb2.GetAgentMetricsRequest.SerializeToString,
+                response_deserializer=agent__router__pb2.GetAgentMetricsResponse.FromString,
+                _registered_method=True)
 
 
 class AgentRouterServicer(object):
@@ -63,6 +68,13 @@ class AgentRouterServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetAgentMetrics(self, request, context):
+        """Recupera metriche aggregate per un agente specifico (admin/monitoring).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_AgentRouterServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -75,6 +87,11 @@ def add_AgentRouterServicer_to_server(servicer, server):
                     servicer.SubmitFeedback,
                     request_deserializer=agent__router__pb2.FeedbackRequest.FromString,
                     response_serializer=agent__router__pb2.FeedbackResponse.SerializeToString,
+            ),
+            'GetAgentMetrics': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetAgentMetrics,
+                    request_deserializer=agent__router__pb2.GetAgentMetricsRequest.FromString,
+                    response_serializer=agent__router__pb2.GetAgentMetricsResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -131,6 +148,33 @@ class AgentRouter(object):
             '/ai_orchestrator.agent_router.AgentRouter/SubmitFeedback',
             agent__router__pb2.FeedbackRequest.SerializeToString,
             agent__router__pb2.FeedbackResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetAgentMetrics(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ai_orchestrator.agent_router.AgentRouter/GetAgentMetrics',
+            agent__router__pb2.GetAgentMetricsRequest.SerializeToString,
+            agent__router__pb2.GetAgentMetricsResponse.FromString,
             options,
             channel_credentials,
             insecure,

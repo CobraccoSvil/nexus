@@ -228,21 +228,10 @@ async fn probe_one_model(
                         .filter(|s| !s.is_empty())
                 })
                 .unwrap_or("");
-            let mapped_by_class: Option<Classification> = match ec {
-                "billing" => Some(Classification::ProviderWide(
-                    "credit_balance_too_low".to_string(),
-                    Some("error_class=billing".to_string()),
-                )),
-                "auth_error" | "missing_api_key" | "unauthenticated" => Some(
-                    Classification::ProviderWide("auth_error".to_string(), Some(ec.to_string())),
-                ),
-                "rate_limit" | "overloaded" | "unavailable" | "timeout" => Some(
-                    Classification::ProviderWide("rate_limit".to_string(), Some(ec.to_string())),
-                ),
-                _ => None,
-            };
-            if let Some(c) = mapped_by_class {
-                c
+            // error_class CANONICO prodotto dal brain (unico classificatore):
+            // mappiamo valore->azione, senza ri-classificare il testo.
+            if !ec.is_empty() {
+                classification_from_error_class(ec)
             } else {
                 // Fallback: analisi del content (hollow_completion / "[Error:" / OK).
                 let content_text = extract_content_text(&response);
@@ -260,15 +249,18 @@ async fn probe_one_model(
                         .trim_start_matches("Error:")
                         .trim_start_matches("error:")
                         .trim();
-                    classify_model_error(inner)
+                    // Classificazione via il punto UNICO (brain gRPC).
+                    let ec = orchestrator.neural.classify_error(inner, provider).await;
+                    classification_from_error_class(&ec)
                 } else {
                     Classification::Ok
                 }
             }
         }
         Ok(Err(e)) => {
-            let msg = e.to_string();
-            classify_model_error(&msg)
+            // Errore di trasporto/gRPC: classificazione via il punto UNICO.
+            let ec = orchestrator.neural.classify_error(&e.to_string(), provider).await;
+            classification_from_error_class(&ec)
         }
         Err(_timeout_elapsed) => Classification::ModelSpecific(
             "timeout".to_string(),
@@ -504,7 +496,7 @@ pub(crate) async fn probe_model_on_insert(
                     .trim_start_matches("Error:")
                     .trim_start_matches("error:")
                     .trim();
-                match classify_model_error(inner) {
+                match classification_from_error_class(&orchestrator.neural.classify_error(inner, provider).await) {
                     Classification::Ok => ProbeOnInsertResult::Healthy,
                     Classification::ProviderWide(kind, _) => ProbeOnInsertResult::ProviderDown(kind),
                     Classification::ModelSpecific(kind, _) => ProbeOnInsertResult::ModelBroken(kind),
@@ -514,8 +506,8 @@ pub(crate) async fn probe_model_on_insert(
             }
         }
         Ok(Err(e)) => {
-            let msg = e.to_string();
-            match classify_model_error(&msg) {
+            let ec = orchestrator.neural.classify_error(&e.to_string(), provider).await;
+            match classification_from_error_class(&ec) {
                 Classification::Ok => ProbeOnInsertResult::Healthy,
                 Classification::ProviderWide(kind, _) => ProbeOnInsertResult::ProviderDown(kind),
                 Classification::ModelSpecific(kind, _) => ProbeOnInsertResult::ModelBroken(kind),
@@ -525,58 +517,32 @@ pub(crate) async fn probe_model_on_insert(
     }
 }
 
-pub(crate) fn classify_model_error(msg: &str) -> Classification {
-    let lc = msg.to_lowercase();
-
-    // Provider-wide: NON puniamo il singolo modello.
-    if lc.contains("credit balance") && lc.contains("too low") {
-        return Classification::ProviderWide("credit_balance_too_low".into(), Some(truncate(msg, 500)));
+/// Mappa l'error_class CANONICO (prodotto dal brain via il RPC ClassifyError,
+/// unico classificatore del sistema) verso la Classification del probe. NON
+/// contiene pattern di testo: e' solo una tabella valore->azione. mcp-core non
+/// classifica piu' messaggi d'errore in proprio.
+pub(crate) fn classification_from_error_class(ec: &str) -> Classification {
+    match ec {
+        // Persistenti -> long cooldown + disable provider
+        "billing_error" => {
+            Classification::ProviderWide("credit_balance_too_low".into(), Some(ec.into()))
+        }
+        "auth_error" | "forbidden" => {
+            Classification::ProviderWide("auth_error".into(), Some(ec.into()))
+        }
+        // Transienti -> short cooldown
+        "rate_limit" | "overloaded" | "service_unavailable" | "bad_gateway" | "provider_error"
+        | "timeout" | "connection_error" => {
+            Classification::ProviderWide("rate_limit".into(), Some(ec.into()))
+        }
+        // Model-specific -> conteggio/auto-disable del modello
+        "not_found" => Classification::ModelSpecific("model_not_found".into(), Some(ec.into())),
+        "context_too_long" | "invalid_request" | "unprocessable" | "unsupported" => {
+            Classification::ModelSpecific(ec.into(), Some(ec.into()))
+        }
+        "" | "ok" => Classification::Ok,
+        other => Classification::ModelSpecific(other.into(), Some(other.into())),
     }
-    if lc.contains("insufficient_quota") || lc.contains("exceeded your current quota") {
-        return Classification::ProviderWide("quota_exceeded".into(), Some(truncate(msg, 500)));
-    }
-    if lc.contains("plans & billing")
-        || lc.contains("upgrade or purchase credits")
-        || lc.contains("billing required")
-        || lc.contains("payment required")
-    {
-        return Classification::ProviderWide("billing_required".into(), Some(truncate(msg, 500)));
-    }
-    if lc.contains("rate limit") || lc.contains("429") {
-        return Classification::ProviderWide("rate_limit".into(), Some(truncate(msg, 500)));
-    }
-    if lc.contains("unauthor") || lc.contains("invalid api key") || lc.contains("401") {
-        return Classification::ProviderWide("auth_error".into(), Some(truncate(msg, 500)));
-    }
-    if lc.contains("connection")
-        || lc.contains("unreachable")
-        || lc.contains("refused")
-        || lc.contains("dns")
-    {
-        return Classification::ProviderWide("connection_error".into(), Some(truncate(msg, 500)));
-    }
-
-    // Model-specific: il modello stesso e' problematico.
-    if lc.contains("model")
-        && (lc.contains("not found")
-            || lc.contains("no longer available")
-            || lc.contains("not supported")
-            || lc.contains("does not exist")
-            || lc.contains("supported api model names")
-            || lc.contains("supported model names"))
-    {
-        return Classification::ModelSpecific("model_not_found".into(), Some(truncate(msg, 500)));
-    }
-    if lc.contains("invalid_request") || lc.contains("invalid request") || lc.contains("400") {
-        return Classification::ModelSpecific("invalid_request".into(), Some(truncate(msg, 500)));
-    }
-    if lc.contains("unsupported") || lc.contains("not supported") {
-        return Classification::ModelSpecific("unsupported".into(), Some(truncate(msg, 500)));
-    }
-
-    // Default: trattalo come model-specific (conservativo: meglio
-    // disabilitare un modello dubbio che continuare a pingerlo a vuoto).
-    Classification::ModelSpecific("unknown".into(), Some(truncate(msg, 500)))
 }
 
 /// Estrae il testo del content dalla response in vari formati provider.
@@ -667,23 +633,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classify_model_specific_not_found() {
-        let c = classify_model_error("404 model gemini-1.5-flash not found");
-        matches!(c, Classification::ModelSpecific(ref k, _) if k == "model_not_found");
+    fn classification_not_found_da_error_class() {
+        let c = classification_from_error_class("not_found");
+        assert!(matches!(c, Classification::ModelSpecific(ref k, _) if k == "model_not_found"));
     }
 
     #[test]
-    fn classify_model_specific_v4_redirect() {
-        let c = classify_model_error(
-            "The supported API model names are deepseek-v4-pro or deepseek-v4-flash",
-        );
-        matches!(c, Classification::ModelSpecific(ref k, _) if k == "model_not_found");
+    fn classification_billing_da_error_class() {
+        let c = classification_from_error_class("billing_error");
+        assert!(matches!(c, Classification::ProviderWide(ref k, _) if k == "credit_balance_too_low"));
     }
 
     #[test]
-    fn classify_provider_wide_quota() {
-        let c = classify_model_error("You exceeded your current quota");
-        matches!(c, Classification::ProviderWide(ref k, _) if k == "quota_exceeded");
+    fn classification_rate_limit_da_error_class() {
+        let c = classification_from_error_class("rate_limit");
+        assert!(matches!(c, Classification::ProviderWide(ref k, _) if k == "rate_limit"));
     }
 
     #[test]

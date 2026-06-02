@@ -34,6 +34,11 @@ class NeuralCoreServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.ClassifyError = channel.unary_unary(
+                '/ai_orchestrator.neural.NeuralCoreService/ClassifyError',
+                request_serializer=neural__core__pb2.ClassifyErrorRequest.SerializeToString,
+                response_deserializer=neural__core__pb2.JsonResponse.FromString,
+                _registered_method=True)
         self.EmbedText = channel.unary_unary(
                 '/ai_orchestrator.neural.NeuralCoreService/EmbedText',
                 request_serializer=neural__core__pb2.EmbedTextRequest.SerializeToString,
@@ -103,6 +108,12 @@ class NeuralCoreServiceStub(object):
 
 class NeuralCoreServiceServicer(object):
     """Missing associated documentation comment in .proto file."""
+
+    def ClassifyError(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def EmbedText(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -185,6 +196,11 @@ class NeuralCoreServiceServicer(object):
 
 def add_NeuralCoreServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'ClassifyError': grpc.unary_unary_rpc_method_handler(
+                    servicer.ClassifyError,
+                    request_deserializer=neural__core__pb2.ClassifyErrorRequest.FromString,
+                    response_serializer=neural__core__pb2.JsonResponse.SerializeToString,
+            ),
             'EmbedText': grpc.unary_unary_rpc_method_handler(
                     servicer.EmbedText,
                     request_deserializer=neural__core__pb2.EmbedTextRequest.FromString,
@@ -260,6 +276,33 @@ def add_NeuralCoreServiceServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class NeuralCoreService(object):
     """Missing associated documentation comment in .proto file."""
+
+    @staticmethod
+    def ClassifyError(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ai_orchestrator.neural.NeuralCoreService/ClassifyError',
+            neural__core__pb2.ClassifyErrorRequest.SerializeToString,
+            neural__core__pb2.JsonResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def EmbedText(request,

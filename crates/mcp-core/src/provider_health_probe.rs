@@ -228,25 +228,48 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
             // reali fallivano con credit_balance_too_low).
             let content_text = extract_response_content_text(&response);
             let trimmed = content_text.trim();
-            let is_brain_swallowed_error = trimmed.starts_with("[Error:")
-                || trimmed.starts_with("[error:");
-            if is_brain_swallowed_error {
+            // error_class CANONICO dal brain (error_handler) e' la fonte di
+            // verita': il content puo' essere un messaggio umano che NON inizia
+            // con "[Error:" (il brain riformatta), quindi non basta il check sul
+            // prefisso. Se error_class e' presente, deriva il kind da quello.
+            let ec_canon = response
+                .get("error_class")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    response
+                        .get("metadata")
+                        .and_then(|m| m.get("error_class"))
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("")
+                .to_string();
+            let is_brain_swallowed_error =
+                trimmed.starts_with("[Error:") || trimmed.starts_with("[error:");
+            if !ec_canon.is_empty() || is_brain_swallowed_error {
                 let inner = trimmed.trim_start_matches('[').trim_end_matches(']');
+                // error_class dal response se presente, altrimenti dal punto
+                // UNICO (brain gRPC). Nessuna classificazione locale di testo.
+                let ec = if !ec_canon.is_empty() {
+                    ec_canon.clone()
+                } else {
+                    orchestrator.neural.classify_error(inner, provider).await
+                };
+                let kind = kind_from_error_class(&ec);
                 tracing::warn!(
-                    "provider_health_probe: {provider} brain ha ingoiato errore: {}",
-                    &inner[..inner.len().min(200)]
+                    "provider_health_probe: {provider} errore provider (class={kind})"
                 );
-                let kind = classify_probe_error(inner);
+                // billing/auth: persistenti -> long cooldown (servono soldi/key).
                 let billing = matches!(
                     kind.as_str(),
-                    "quota_exceeded" | "credit_balance_too_low" | "billing_required"
+                    "quota_exceeded" | "credit_balance_too_low" | "billing_required" | "auth_error"
                 );
                 if billing {
                     put_provider_in_long_cooldown(provider, &kind);
                 } else {
                     put_provider_in_cooldown(provider, Some(slow_cooldown_s));
                 }
-                (false, Some(kind), Some(truncate(inner, 500)))
+                let detail = if inner.is_empty() { content_text.as_str() } else { inner };
+                (false, Some(kind), Some(truncate(detail, 500)))
             } else {
                 // Probe-OK con "hi" (1-2 token output): NON garantisce che
                 // il provider sia veramente pronto per workload reali. Un
@@ -293,7 +316,8 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
             // Provider ha risposto con errore (HTTP error o JSON parse).
             // Classifico per decidere il tipo di cooldown.
             let msg = e.to_string();
-            let kind = classify_probe_error(&msg);
+            // Classificazione via il punto UNICO (brain gRPC); niente pattern locali.
+            let kind = kind_from_error_class(&orchestrator.neural.classify_error(&msg, provider).await);
             tracing::warn!(
                 "provider_health_probe: {provider} ERROR ({kind}) in {latency_ms}ms: {msg}",
                 msg = &msg[..msg.len().min(200)],
@@ -417,27 +441,41 @@ pub async fn probe_provider_once(
             let trimmed = content_text.trim();
             if trimmed.starts_with("[Error:") || trimmed.starts_with("[error:") {
                 let inner = trimmed.trim_start_matches('[').trim_end_matches(']');
-                outcome_from_raw_error(inner)
+                outcome_from_error_class(&orchestrator.neural.classify_error(inner, provider).await)
             } else {
                 ProbeOutcome::Healthy
             }
         }
-        Ok(Err(e)) => outcome_from_raw_error(&e.to_string()),
+        Ok(Err(e)) => {
+            outcome_from_error_class(&orchestrator.neural.classify_error(&e.to_string(), provider).await)
+        }
         Err(_elapsed) => ProbeOutcome::Transient("timeout".to_string()),
     }
 }
 
-/// Mappa un messaggio di errore grezzo in `ProbeOutcome`: billing/quota →
-/// `Billing` (il credito e' davvero KO), tutto il resto → `Transient`.
-fn outcome_from_raw_error(raw: &str) -> ProbeOutcome {
-    let kind = classify_probe_error(raw);
+/// Mappa l'error_class CANONICO (dal brain, unico classificatore) in
+/// `ProbeOutcome`: billing/auth → `Billing` (down per credito/key), resto →
+/// `Transient`. Nessuna classificazione di testo locale.
+fn outcome_from_error_class(ec: &str) -> ProbeOutcome {
+    let kind = kind_from_error_class(ec);
     if matches!(
         kind.as_str(),
-        "quota_exceeded" | "credit_balance_too_low" | "billing_required"
+        "quota_exceeded" | "credit_balance_too_low" | "billing_required" | "auth_error"
     ) {
         ProbeOutcome::Billing(kind)
     } else {
         ProbeOutcome::Transient(kind)
+    }
+}
+
+/// Mappa l'error_class canonico al "kind" di cooldown. Solo corrispondenza
+/// valore->valore, nessun pattern (la classificazione e' nel brain).
+fn kind_from_error_class(ec: &str) -> String {
+    match ec {
+        "billing_error" => "credit_balance_too_low".to_string(),
+        "auth_error" | "forbidden" => "auth_error".to_string(),
+        "" => "error".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -464,36 +502,6 @@ fn extract_response_content_text(value: &serde_json::Value) -> String {
     String::new()
 }
 
-fn classify_probe_error(msg: &str) -> String {
-    let lc = msg.to_lowercase();
-    if lc.contains("credit balance") && lc.contains("too low") {
-        return "credit_balance_too_low".to_string();
-    }
-    if lc.contains("insufficient_quota") || lc.contains("exceeded your current quota") {
-        return "quota_exceeded".to_string();
-    }
-    if lc.contains("plans & billing")
-        || lc.contains("upgrade or purchase credits")
-        || lc.contains("billing required")
-        || lc.contains("payment required")
-    {
-        return "billing_required".to_string();
-    }
-    if lc.contains("rate limit") || lc.contains("429") {
-        return "rate_limit".to_string();
-    }
-    if lc.contains("timeout") || lc.contains("timed out") {
-        return "timeout".to_string();
-    }
-    if lc.contains("unauthor") || lc.contains("invalid api key") || lc.contains("401") {
-        return "auth_error".to_string();
-    }
-    if lc.contains("connection") || lc.contains("unreachable") || lc.contains("refused") {
-        return "connection_error".to_string();
-    }
-    "unknown".to_string()
-}
-
 /// Tronca una stringa a `max` caratteri (per evitare TEXT giganti nel DB).
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -508,52 +516,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_classify_probe_error_billing() {
-        assert_eq!(
-            classify_probe_error("Your credit balance is too low to access the Anthropic API"),
-            "credit_balance_too_low"
-        );
+    fn kind_from_error_class_mappa_billing() {
+        assert_eq!(kind_from_error_class("billing_error"), "credit_balance_too_low");
+        assert_eq!(kind_from_error_class("auth_error"), "auth_error");
+        assert_eq!(kind_from_error_class("rate_limit"), "rate_limit");
     }
 
     #[test]
-    fn test_classify_probe_error_quota() {
-        assert_eq!(
-            classify_probe_error("You exceeded your current quota, please check your plan"),
-            "quota_exceeded"
-        );
-        assert_eq!(
-            classify_probe_error("Error: insufficient_quota"),
-            "quota_exceeded"
-        );
-    }
-
-    #[test]
-    fn test_classify_probe_error_rate_limit() {
-        assert_eq!(
-            classify_probe_error("HTTP 429 too many requests, rate limit exceeded"),
-            "rate_limit"
-        );
-    }
-
-    #[test]
-    fn test_classify_probe_error_timeout() {
-        assert_eq!(classify_probe_error("request timed out"), "timeout");
-    }
-
-    #[test]
-    fn test_classify_probe_error_auth() {
-        assert_eq!(
-            classify_probe_error("HTTP 401 unauthorized: invalid api key"),
-            "auth_error"
-        );
-    }
-
-    #[test]
-    fn test_classify_probe_error_unknown() {
-        assert_eq!(
-            classify_probe_error("Some weird unrelated message"),
-            "unknown"
-        );
+    fn outcome_from_error_class_billing_e_transient() {
+        assert!(matches!(outcome_from_error_class("billing_error"), ProbeOutcome::Billing(_)));
+        assert!(matches!(outcome_from_error_class("rate_limit"), ProbeOutcome::Transient(_)));
     }
 
     #[test]

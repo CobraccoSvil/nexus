@@ -71,39 +71,20 @@ providers = None
 
 def _classify_provider_error(exc: Exception) -> tuple[str, str]:
     """Classifica errori provider e restituisce (error_class, messaggio_umano).
-    error_class è usato da mcp-core per decidere retry/fallback."""
-    text = str(exc)
-    low = text.lower()
-    if "resourceexhausted" in low or "message larger than" in low or "larger than max" in low:
-        return ("payload_too_large", "Il provider AI ha rifiutato un payload troppo grande. Riduci il contesto e riprova.")
-    if "unauthenticated" in low or "invalid api key" in low or "401" in low or "missing_api_key" in low or "missing api key" in low:
-        return ("auth_error", "Credenziali del provider AI non valide o mancanti.")
-    if "deadlineexceeded" in low or "timeout" in low or "timed out" in low:
-        return ("timeout", "Il provider AI non ha risposto in tempo.")
-    # Credito/quota ESAURITA: persistente (serve ricarica/billing), NON un rate
-    # limit transiente. Va valutata PRIMA del check rate_limit perche'
-    # insufficient_quota di OpenAI arriva come HTTP 429 (matcherebbe "429"): se
-    # finisse in rate_limit verrebbe trattata come transiente (cooldown 60s) e il
-    # provider verrebbe ritentato all'infinito invece di essere disabilitato.
-    if (
-        "credit balance" in low
-        or "insufficient_quota" in low
-        or "exceeded your current quota" in low
-        or "plans & billing" in low
-        or "billing" in low
-    ):
-        return ("billing", "Credito esaurito sul provider AI.")
-    if "rate limit" in low or "too many requests" in low or ("429" in low and "quota" not in low):
-        return ("rate_limit", "Limite di richieste del provider AI raggiunto. Riprova tra poco.")
-    if "overloaded" in low or "529" in low or "could not serve" in low:
-        return ("overloaded", "Provider AI sovraccarico. Riprova tra poco.")
-    if "unavailable" in low or "connection refused" in low or "503" in low:
-        return ("unavailable", "Provider AI momentaneamente non disponibile.")
-    if "quota" in low:
-        # "quota" generica senza i marcatori sopra: trattata come billing
-        # (quota esaurita) per sicurezza, non come rate limit.
-        return ("billing", "Credito esaurito sul provider AI.")
-    return ("unknown", "Errore del provider AI. Controlla i log per i dettagli.")
+
+    UNICA FONTE DI VERITA': delega al classificatore canonico
+    brain.providers.error_handler.classify_error, lo stesso usato dai provider
+    (format_error_result) e dal registry. error_class qui = stop_reason canonico
+    (es. 'billing_error', 'auth_error', 'rate_limit', 'context_too_long', ...),
+    cosi' neural_service, provider, registry e mcp-core parlano la stessa lingua.
+    Niente piu' tabelle di pattern duplicate divergenti.
+    """
+    from brain.providers.error_handler import classify_error
+    info = classify_error(exc)
+    return (
+        info.get("stop_reason", "error"),
+        info.get("message", "Errore del provider AI."),
+    )
 
 
 def _humanize_provider_error(exc: Exception) -> str:
@@ -142,6 +123,26 @@ class NeuralCoreServicer(pb2_grpc.NeuralCoreServiceServicer):
             "confidence": decision.confidence,
             "token_budget": request.token_budget,
         }))
+
+    def ClassifyError(self, request, context):
+        """Punto UNICO di classificazione errori provider (usato anche da
+        mcp-core/Rust via gRPC). Delega al classificatore canonico
+        brain.providers.error_handler.classify_error: nessun altro componente
+        deve avere tabelle di pattern proprie."""
+        try:
+            from brain.providers.error_handler import classify_error
+            info = classify_error(Exception(request.error_text or ""), request.provider or "")
+            return pb2.JsonResponse(json=json.dumps({
+                "error_class": info.get("stop_reason", "error"),
+                "message": info.get("message", ""),
+                "retriable": info.get("retriable", False),
+                "backoff": info.get("backoff", False),
+                "http_status": info.get("http_status"),
+                "retry_after_seconds": info.get("retry_after_seconds"),
+            }))
+        except Exception as e:
+            logger.error("ClassifyError failed: %s", e)
+            return pb2.JsonResponse(json=json.dumps({"error_class": "error", "message": str(e)}))
 
     def GenerateCompletion(self, request, context):
         try:

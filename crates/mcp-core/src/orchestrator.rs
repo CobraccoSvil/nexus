@@ -1682,6 +1682,30 @@ impl NeuralCoreClient {
         self.provider_health("system").await.is_ok()
     }
 
+    /// Classificazione errori provider via il PUNTO UNICO (brain
+    /// error_handler.classify_error, RPC ClassifyError). mcp-core NON classifica
+    /// in proprio: passa il testo dell'errore e riceve l'error_class canonico
+    /// (billing_error, auth_error, rate_limit, context_too_long, not_found, ...).
+    /// Fallback "error" solo se il brain e' irraggiungibile (nessuna logica di
+    /// pattern duplicata lato Rust).
+    pub async fn classify_error(&self, error_text: &str, provider: &str) -> String {
+        let mut client = self.client.clone();
+        let req = mcp_proto::neural::ClassifyErrorRequest {
+            error_text: error_text.to_string(),
+            provider: provider.to_string(),
+        };
+        match client.classify_error(req).await {
+            Ok(resp) => serde_json::from_str::<Value>(&resp.into_inner().json)
+                .ok()
+                .and_then(|j| j.get("error_class").and_then(|v| v.as_str()).map(String::from))
+                .unwrap_or_else(|| "error".to_string()),
+            Err(e) => {
+                tracing::debug!("classify_error gRPC fallito: {e}");
+                "error".to_string()
+            }
+        }
+    }
+
     pub async fn generate_document(
         &self,
         doc_type: &str,

@@ -85,7 +85,17 @@ message JsonResponse {
   string json = 1;
 }
 
+// Classificazione errori provider: punto UNICO. Chiunque (anche mcp-core/Rust)
+// chiama questo RPC invece di classificare per conto proprio. La risposta JSON
+// contiene { error_class, message, retriable, backoff, http_status,
+// retry_after_seconds } prodotti da brain/providers/error_handler.classify_error.
+message ClassifyErrorRequest {
+  string error_text = 1;
+  string provider = 2;
+}
+
 service NeuralCoreService {
+  rpc ClassifyError(ClassifyErrorRequest) returns (JsonResponse);
   rpc EmbedText(EmbedTextRequest) returns (JsonResponse);
   rpc EmbedBatch(EmbedBatchRequest) returns (JsonResponse);
   rpc ClassifyIntent(ClassifyIntentRequest) returns (JsonResponse);
