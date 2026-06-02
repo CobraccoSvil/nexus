@@ -2839,6 +2839,8 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 _providers.generate_agent_turn_sync,
                 provider, model, anth_messages, tools_json,
                 max_tokens=effective_max_tokens, system_text=system_text,
+                usage_run_id=str(state.get("thread_id") or ""),
+                usage_iteration=_current_iterations,
             )
             # Aggiorna provider/model effettivamente usati se la cascade ha fatto fallback.
             # Salva anche come "sticky" per le iter successive (M61): evita di ri-tentare
@@ -2920,21 +2922,11 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 additional_kwargs={"anthropic_content": assistant_content} if assistant_content else {},
             )
 
-            # Registra l'usage di questo turno nel billing ledger (B1 fix).
-            try:
-                from brain.providers.registry import record_agent_turn_usage
-                record_agent_turn_usage(
-                    provider=provider,
-                    model=model,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    cache_read_tokens=cache_read_tokens,
-                    cache_creation_tokens=cache_creation_tokens,
-                    iteration=_current_iterations,
-                    run_id=str(state.get("thread_id") or ""),
-                )
-            except Exception as billing_exc:
-                logger.warning("executor_node: billing ledger fallito iter=%d: %s", _current_iterations, billing_exc)
+            # NB: l'usage di questo turno e' gia' registrato UNA volta dentro
+            # generate_agent_turn_sync (feature neural.GenerateAgentTurn, con
+            # run_id/iteration passati sopra), inclusa l'eventuale chiamata di
+            # fallback. NON registrarlo di nuovo qui: la doppia registrazione
+            # gonfiava il consumo riportato di ~2x (regola H, fix definitivo).
 
         except Exception as exc:
             logger.error("executor_node: agent_turn %s/%s: %s", provider, model, exc)

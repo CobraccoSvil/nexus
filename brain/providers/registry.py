@@ -209,6 +209,16 @@ def _record_usage(provider: str, model: str, usage: dict[str, Any] | None, detai
     cache_creation_cost = (cache_creation_tokens / 1_000_000.0) * cache_creation_m
     total_cost = input_cost + output_cost + cache_read_cost + cache_creation_cost
 
+    # run_id come colonna dedicata (non solo dentro details) per poter attribuire
+    # il costo al run reale. La colonna e' UUID: un valore vuoto o non valido
+    # diventa NULL invece di far fallire l'INSERT.
+    import uuid as _uuid
+    _run_id_raw = (details or {}).get("run_id") or ""
+    try:
+        run_id_col = str(_uuid.UUID(str(_run_id_raw))) if _run_id_raw else None
+    except (ValueError, AttributeError, TypeError):
+        run_id_col = None
+
     # Arricchisce i details con la rottura del costo per il debug
     enriched_details: dict[str, Any] = {
         **details,
@@ -232,17 +242,18 @@ def _record_usage(provider: str, model: str, usage: dict[str, Any] | None, detai
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO ai_usage_ledger "
-                    "(user_id, project_id, provider, model, "
+                    "(user_id, project_id, run_id, provider, model, "
                     "prompt_tokens, completion_tokens, total_tokens, "
                     "cache_read_tokens, cache_creation_tokens, "
                     "input_cost, output_cost, total_cost, "
                     "cache_read_cost, cache_creation_cost, "
                     "currency, status, details) "
-                    "VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, "
+                    "VALUES (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, "
                     "%s, %s, %s, %s, %s, %s, 'finalized', %s::jsonb)",
                     (
                         user_id,
                         project_id,
+                        run_id_col,
                         provider,
                         model,
                         prompt_tokens,
@@ -269,42 +280,6 @@ def _record_usage(provider: str, model: str, usage: dict[str, Any] | None, detai
         )
     except Exception as e:
         logger.warning("billing ledger insert fallito %s/%s: %s", provider, model, e)
-
-
-def record_agent_turn_usage(
-    provider: str,
-    model: str,
-    prompt_tokens: int,
-    completion_tokens: int,
-    cache_read_tokens: int = 0,
-    cache_creation_tokens: int = 0,
-    iteration: int = 0,
-    run_id: str = "",
-) -> None:
-    """Registra l'usage di un turno dell'executor nel ledger.
-
-    Chiamata da ``executor_node`` in ``nodes.py`` dopo ogni turno agente,
-    poiche' il percorso ``generate_agent_turn`` non transita per
-    ``registry.generate`` e quindi ``_record_usage`` non viene invocata
-    automaticamente.
-    """
-    usage = {
-        "input_tokens": prompt_tokens,
-        "output_tokens": completion_tokens,
-        "cache_read_input_tokens": cache_read_tokens,
-        "cache_creation_input_tokens": cache_creation_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-    }
-    _record_usage(
-        provider,
-        model,
-        usage,
-        {
-            "feature": "agent.executor_turn",
-            "iteration": iteration,
-            "run_id": run_id,
-        },
-    )
 
 
 def _enforce_quota_estimate(provider: str, model: str, estimated_prompt_tokens: int, estimated_completion_tokens: int) -> tuple[bool, str]:
@@ -547,8 +522,16 @@ class ProviderRegistry:
         tools: list[dict],
         max_tokens: int = 4096,
         system_text: str = "",
+        usage_run_id: str = "",
+        usage_iteration: int = 0,
     ) -> ProviderResult:
         """Versione sincrona di generate_agent_turn, sicura da chiamare da thread gRPC.
+
+        ``usage_run_id``/``usage_iteration``: contesto opzionale registrato nel
+        ledger (colonna run_id + details). Quando l'executor LangGraph chiama
+        questa funzione li valorizza, cosi' l'usage viene contato UNA sola volta
+        qui (sia il tentativo primario sia l'eventuale fallback) ed e'
+        attribuibile al run. Il path gRPC li lascia vuoti.
 
         Fallback dinamico: provider preferito disabilitato o non compatibile con tool_use
         → cerca nella `_provider_fallback_chain()` (DB-driven) il prossimo abilitato.
@@ -691,7 +674,11 @@ class ProviderRegistry:
                 result.provider,
                 result.model,
                 usage if isinstance(usage, dict) else None,
-                {"feature": "neural.GenerateAgentTurn"},
+                {
+                    "feature": "neural.GenerateAgentTurn",
+                    "run_id": usage_run_id,
+                    "iteration": usage_iteration,
+                },
             )
             # Se billing_error, marca il provider in cooldown locale.
             # billing_error puo' essere su stop_reason (chain interna) o
@@ -769,7 +756,12 @@ class ProviderRegistry:
                     fb_result.provider,
                     fb_result.model,
                     usage if isinstance(usage, dict) else None,
-                    {"feature": "neural.GenerateAgentTurn", "fallback": True},
+                    {
+                        "feature": "neural.GenerateAgentTurn",
+                        "fallback": True,
+                        "run_id": usage_run_id,
+                        "iteration": usage_iteration,
+                    },
                 )
                 # Se anche il fallback e' billing_error, marca anche lui.
                 if (
