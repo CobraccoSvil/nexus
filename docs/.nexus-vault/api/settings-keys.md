@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: a046cc4fefc748578e7ff6aea827692831f5bd44
+source_commit: b364c885b0251cf43753c2f69497193332b551f3
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-30T11:29:10Z
+updated_at: 2026-06-02T15:18:52Z
 nexus_meta_version: 1
 ---
 
@@ -24,9 +24,15 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 | Chiave | Valore default | Descrizione |
 |---|---|---|
+| `agent.adaptive_budget_ttl_seconds` | `60` | TTL cache adaptive iteration budget (H-25) |
+| `agent.attachment_budget_ttl_seconds` | `60` | TTL cache attachment session budget (H-37) |
 | `agent.attachment.figma_make_ai_chat_max_load_bytes` | `536870912` | Guardia anti-OOM ESTREMA (NON un cap di contenuto) sul caricamento in RAM del file ai_chat.json di un archivio Figma Make prima del parsing. Default 512 MB: rete di sicurezza contro file patologici. I .make reali stanno nell'ordine dei MB. |
 | `agent.attachment.image_max_bytes` | `2097152` | Massima dimensione (byte) di un immagine processabile dal tool nexus_describe_image_attachment. Default 2 MB. Oltre il limite il tool ritorna errore esplicito al modello. |
+| `agent.attachment.inspector_header_bytes` | `32768` | Byte iniziali letti per magic-byte detection (H-68) |
 | `agent.attachment.read_cache_ttl_seconds` | `300` | TTL (secondi) della cache LRU read_cache che deduplica chiamate identiche a nexus_read_attachment / nexus_read_archive_entry. Default 5 minuti. |
+| `agent.attachment.read_chunk_max_bytes` | `102400` | Max byte per chiamata nexus_read_attachment (H-67) |
+| `agent.clarify_max_tokens` | `400` | max_tokens per chiamata clarify (H-40) |
+| `agent.command_loop_threshold` | `3` | Soglia stesso comando consecutivo per loop detection (H-36) |
 | `agent.complexity.file_path_points` | `2` | Punti per ogni path o file menzionato nel prompt (es. /home/, src/, *.json). |
 | `agent.complexity.keyword_weights` | `{"create":3,"write_file":2,"install":2,"build":2,"systemc...` | Pesi keyword per stima complessita' task agente (budget iterazioni adattivo). Chiave: substring da cercare nel prompt, valore: punti complessita'. Aggiornamento: aggiunti verbi italiani (implementa, sviluppa, costruisci, genera, scaffold) e sostantivi (progetto, applicazione). |
 | `agent.complexity.step_marker_points` | `5` | Punti per ogni marker di step esplicito (1., 2., step, task, phase) nel prompt. |
@@ -37,31 +43,78 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.context.compress_start_iter` | `5` | Iterazione di executor a partire dalla quale attivare la compressione escalante dei tool_result. Prima viene applicata solo la dedup. Default 5 (FIX A). |
 | `agent.context.dedup_tool_results_enabled` | `true` | Se true (default) ogni iter executor applica _dedup_tool_results_history: tool_result vecchi con stessa signature (sha256(tool_name+args_json)) vengono sostituiti con placeholder, tenendo solo l ultimo. FIX B. |
 | `agent.context.drop_unused_base64_age` | `3` | Soglia (n messaggi successivi) entro la quale verificare se un blob base64 di un tool_result vecchio viene citato testualmente. Se non viene citato, il body base64 viene sostituito con un placeholder. FIX C. |
+| `agent.context.max_chars` | `400000` | Budget chars totale per il contesto agente. Oltre questa soglia i tool result vecchi vengono compressi/sommarizzati. Approx 3.5 chars/token. DB-driven, cache 60s. |
+| `agent.context_offload_ttl_seconds` | `60` | TTL cache context_offload (H-55) |
 | `agent.context.predictive_cap_ratio` | `0.5` | Soglia (0.3-0.9) sul context_window del modello: se context_attuale + stima_tool_result supera ratio*context_window, la chiamata al tool viene intercettata e sostituita da tool_result sintetico di errore. FIX D. |
 | `agent.context.rag_offload.enabled` | `true` | Flag master offload RAG lossless. Se true (default), prima di troncare/comprimere/scartare un tool result o messaggio vecchio il brain indicizza il contenuto COMPLETO in Qdrant (tool_results_chunks) cosi' nessun dato viene perso e resta recuperabile via nexus_search_semantic. Se false, degrada al vecchio troncamento distruttivo. |
 | `agent.context.rag_offload.max_chunks_per_item` | `500` | Numero massimo di chunk indicizzati per singolo contenuto offloadato (anti-abuso: un file enorme non deve generare migliaia di point in un colpo). Oltre il cap il resto NON viene indicizzato e l'evento e' loggato come WARN. Default 500. |
 | `agent.context.rag_offload.min_chars` | `2000` | Soglia minima caratteri sotto la quale NON si indicizza un contenuto in RAG: sotto soglia il contenuto sta gia' intero nel prompt, nessuna perdita possibile. Default 2000. |
 | `agent.context.rag_offload.snippet_max_chars` | `4000` | Limite caratteri per ogni snippet RAG incluso nel contesto. Alzato da 400 (vecchio hardcoded) a 4000: snippet piu' ampi riducono i round-trip e non perdono il cuore del match. |
 | `agent.context.rag_offload.top_k` | `12` | Numero di interazioni/snippet recuperati dal RAG inline per turno. Alzato da 5 (vecchio hardcoded) a 12: con l'offload lossless il RAG e' la fonte di verita' del contenuto troncato, quindi il recupero non deve essere artificialmente stretto. |
+| `agent.context_window_ttl_seconds` | `120` | TTL cache context window per modello (H-35) |
+| `agent.ctx_mgmt_ttl_seconds` | `60` | TTL cache context management (H-34) |
+| `agent.db_query_timeout_seconds` | `5` | Timeout query DB nei nodi agente (H-39, H-44) |
+| `agent.dev_diagnostics.max_findings` | `50` | Max findings per nexus_dev_server_diagnose (H-70 a) |
+| `agent.dev_diagnostics.max_log_bytes` | `200000` | Max byte log dev_diagnostics (H-70 b) |
 | `agent.enforce_port_allocation` | `true` | Se true, write_file/edit_file rifiutano sorgenti con porte TCP hardcoded fuori dal bucket Nexus 20000-39999 (vedi ADR 0010). |
+| `agent.expand_max_tokens` | `512` | max_tokens per chiamata expand (H-41) |
+| `agent.exploration_loop.default_threshold` | `6` | Soglia exploration tool consecutive per loop detection (H-27 b) |
 | `agent.exploration_loop_threshold` | `6` | Numero di chiamate consecutive a tool di sola esplorazione (lettura/ispezione allegati e file) oltre il quale l'executor inietta un nudge verso la scrittura; a 2x la soglia abortisce. Una call produttiva (write_file, edit_file, run_command, request_port, ...) azzera il contatore. Intero >= 1. |
+| `agent.exploration_loop.ttl_seconds` | `60` | TTL cache loop detector esplorazione (H-27 a) |
+| `agent.fallback.soft_failure_enabled` | `true` | Abilita detection soft failure (M4) |
+| `agent.figma.min_string_len` | `4` | Min char stringa estratta da figma (H-71) |
+| `agent.firstturn.canonical_hint` | `true` | Inietta hint canonico nel first turn per allegati strutturati (M8) |
+| `agent.firstturn.tool_choice_force` | `true` | Forza tool_choice strict al first turn quando ci sono allegati strutturati |
+| `agent.g1_nudge.default_max` | `3` | Max nudge G1 anti-narration per run (H-26 b) |
+| `agent.g1_nudge.ttl_seconds` | `60` | TTL cache G1 anti-narration nudge (H-26 a) |
 | `agent.iteration_budget.base` | `60` | Numero base iterazioni LangGraph per ogni run agente. Sommato a per_complexity_point*complexity_score. |
 | `agent.iteration_budget.max` | `300` | Tetto massimo iterazioni anche per task molto complessi. Safety net runaway. |
 | `agent.iteration_budget.per_complexity_point` | `4` | Iterazioni aggiuntive per ogni punto di complessita del prompt (score 0-100). |
+| `agent.lang_reminder_ttl_seconds` | `60` | TTL cache language reminder (H-28) |
 | `agent.language_reminder_enabled` | `true` | Abilita l'iniezione del reminder di lingua resiliente al contesto in coda al system prompt e all'ultimo messaggio utente (bug #88). Disabilita con "false" per rollback immediato senza rideploy. |
 | `agent.language_reminder_text` | `Rispondi SEMPRE e SOLO in italiano. Mai cinese, giappones...` | Testo del reminder di lingua iniettato in coda al system prompt e all'ultimo messaggio utente per vincere il recency bias dei modelli small a contesto saturo (bug #88). |
+| `agent.learning_cfg_ttl_seconds` | `60` | TTL cache learning config (H-32) |
+| `agent.loop_detector_max_tokens` | `400` | max_tokens per chiamata LLM del loop detector (H-38) |
+| `agent.meta_steps_flag_ttl_seconds` | `60` | TTL cache meta_steps flag (H-51) |
 | `agent_narration_warn_after_chars` | `1500` | Caratteri di testo streamed senza tool call dopo i quali il badge UI passa in stato warning. |
 | `agent_narration_warn_after_ms` | `30000` | Millisecondi di run senza tool call dopo i quali il badge UI passa in stato warning (possibile loop di narrazione). |
+| `agent.orchestrator_cfg_ttl_seconds` | `60` | TTL cache orchestrator_config (H-56) |
 | `agent_parallel_enabled` | `true` | Abilita l'esecuzione parallela di piu' agenti contemporaneamente per accelerare task complessi |
 | `agent_parallel_max` | `5` | Numero massimo di agenti paralleli per sessione (1-5) |
-| `agent_router_addr` | `127.0.0.1:50501` | Indirizzo host:porta del server gRPC AgentRouter esposto da mcp-core e usato dal brain Python per consultare il Q-Learning router. Override di emergenza: AGENT_ROUTER_ADDR. Richiede riavvio di mcp-core e del brain. |
+| `agent.planner.full_max_tokens` | `4096` | max_tokens per planner completo (H-43) |
+| `agent.planner.rationale_snippet_max` | `400` | Max char snippet rationale nel planner (H-42) |
+| `agent.planner.short_max_tokens` | `512` | max_tokens per planner short (H-45) |
+| `agent.price_cache_ttl_seconds` | `300` | TTL cache prezzi modelli per cost estimation (H-30) |
+| `agent.rag_min_score` | `0.5` | Soglia minima score RAG per inclusione contesto (H-33) |
+| `agent.reasoning_bank.plan_reward_threshold` | `0.85` | Soglia reward per accettare un plan in reasoning_bank (H-53) |
+| `agent.reflection_cfg_ttl_seconds` | `60` | TTL cache reflection_config (H-52) |
 | `agent_router_enabled` | `true` | Abilita il server gRPC AgentRouter (porta 50072) che espone il router Q-Learning di nexus-orchestrator al brain Python. Quando attivo, il router_node consulta il Q-Learning per scegliere il profilo agente ottimale (es. coder, cloud_architect, tech_writer) in base alla cronologia dei reward osservati. Se disabilitato il brain usa il routing di fallback basato solo sull'intent. Richiede riavvio di mcp-core per applicare la modifica. |
+| `agent.subagent.default_max_iterations` | `25` | Max iterations default per subagent (H-50, era in yaml loader) |
+| `agent.summarizer.keep_recent` | `6` | Numero messaggi recenti preservati integralmente in summarization (H-47) |
+| `agent.summarizer.max_tokens` | `800` | max_tokens per summarization (H-48) |
+| `agent.summarizer.temperature` | `0.0` | Temperature LLM call summarizer (H-49 b) |
+| `agent.summarizer.timeout_seconds` | `15` | Timeout LLM call summarizer (H-49 a) |
+| `agent.summarizer.trigger_fraction` | `0.60` | Fraction del context window oltre cui triggerare summary (H-46) |
+| `agent.thinking_cfg_ttl_seconds` | `60` | TTL cache thinking_config (H-54) |
+| `agent.thinking_config_ttl_seconds` | `60` | TTL cache nexus_thinking config (H-29) |
+| `agent.todos.carry_over_enabled` | `true` | M15.4: a fine run i todo pending/blocked vengono marcati carry_over=true (con origin_run_id) invece di restare orfani, cosi' il planner del run successivo li eredita come backlog. |
+| `agent.todos.live_events` | `true` | M15.1: emette eventi SSE live (TodoUpdated per todo + PlanUpdated finale) quando lo status di un todo cambia, dopo il commit della transazione. |
+| `agent.todos.user_editable` | `true` | M15.3: abilita l'endpoint POST /api/agent/todos/{run_id}/edit per modificare i todo del piano dall'interfaccia utente (add/edit/reorder/remove). |
+| `agent.tools.core_whitelist` | `read_file,write_file,edit_file,list_files,search_in_files...` | CSV dei tool CORE essenziali sempre esposti col tool tiering (slim, mig 0254). Gli altri restano scopribili via nexus_mcp_tool_search. Set ridotto per stabilita function-calling Gemini 2.5. |
+| `agent.tools.discovery_first_enabled` | `true` | M16: primo turno espone SOLO i tool di discovery (nexus_mcp_tool_search/call); i tool trovati diventano native per il turno successivo. Default ON dopo verifica E2E (mig 0257). |
+| `agent.tools.discovery_first_whitelist` | `nexus_mcp_tool_search,nexus_mcp_tool_call` | CSV dei tool esposti al primo turno in modalita discovery-first. Default: i due tool di discovery. |
+| `agent.tools.discovery_max_injected` | `20` | Numero massimo di tool scoperti via nexus_mcp_tool_search iniettati come native nel turno successivo. |
+| `agent.tools.discovery_schema_max_bytes` | `8192` | Cap dimensione (byte) dell input_schema di un singolo tool scoperto, per isolare schemi malformati da plugin esterni. |
+| `agent.tools.tiering_enabled` | `true` | Abilita il tool tiering: invia al modello solo il CORE di tool + discovery (nexus_mcp_tool_search/call). Disattivare per esporre tutti gli 80 tool. |
+| `agent.vision.image_max_bytes` | `2097152` | Max byte immagine per vision describe (H-69) |
 | `agent.visual_compare.screenshot_timeout_secs` | `45` | Timeout (secondi) per la cattura dello screenshot via Playwright in nexus_visual_compare (launch + goto + wait + scatto). Default 45. |
 | `agent.visual_compare.similarity_threshold` | `85` | Soglia di similarita' (0-100) raccomandata: sotto questa soglia, o in presenza di differenze severita' alta, l'agente in modalita' Continuo dovrebbe correggere stile/layout e ripetere nexus_visual_compare. Default 85. |
 | `agent.visual_compare.viewport_height` | `800` | Altezza (px) del viewport usato da nexus_visual_compare per lo screenshot quando il parametro viewport non e' passato. Default 800. |
 | `agent.visual_compare.viewport_width` | `1280` | Larghezza (px) del viewport usato da nexus_visual_compare per lo screenshot quando il parametro viewport non e' passato. Default 1280. |
 | `agent.visual_compare.wait_ms` | `1500` | Attesa (ms) dopo il load della pagina prima dello scatto in nexus_visual_compare, per dare tempo a render/animazioni/fetch. Default 1500. Override per chiamata via parametro wait_ms. |
 | `anthropic_system_cache_ttl` | `1h` | TTL della cache prompt di sistema per Anthropic: 5m (default Anthropic) o 1h (extended-cache-ttl-2025-04-11). Il valore 1h massimizza il cache hit rate fra turni distanti (il system prompt cambia raramente). Override: NEXUS_ANTHROPIC_SYSTEM_CACHE_TTL. Richiede riavvio del brain. |
+| `attachment.kb_excerpt_max_bytes` | `16384` | Max byte excerpt salvato in kb note per attachment (H-79 a) |
+| `attachment.sanitized_filename_max_len` | `120` | Max char filename sanitizzato per attachment (H-79 b) |
 | `catalog_sync.disable_missing` | `true` | Se TRUE, disabilita i modelli del catalog non piu esposti dall API. Se FALSE solo log. |
 | `catalog_sync.enabled` | `true` | Attiva/disattiva il worker periodico di sync catalog modelli dai provider. |
 | `catalog_sync.insert_new_disabled` | `true` | Se TRUE, modelli nuovi vengono inseriti con is_enabled=false (admin verifica prezzi prima di abilitare). |
@@ -71,8 +124,17 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `extended_thinking_enabled` | `false` | Abilita il ragionamento interno esteso (Extended Thinking) di Anthropic sui modelli Sonnet/Opus. Genera token di ragionamento interni billati al prezzo output. Disabilitato di default per contenere i costi. Attivare solo per task che richiedono ragionamento profondo. |
 | `llm_classifier_enabled` | `true` | Abilita il classificatore LLM degli intent (chiamata REST /classify-intent-agentic al brain Python). Se false usa solo keyword matching locale: piu' veloce ma meno preciso. Override di emergenza: NEXUS_LLM_CLASSIFIER_ENABLED=false. Richiede riavvio di mcp-core. |
 | `terminal_default_shell` | `bash` | Shell di default per i terminali agente: bash, zsh, fish. Su Windows: powershell.exe. Override di emergenza: TERMINAL_SHELL. Richiede riavvio del brain e di mcp-core. |
-| `tool_runner_addr` | `127.0.0.1:50071` | Indirizzo host:porta del server gRPC ToolRunner esposto da mcp-core e usato dal brain Python per eseguire i tool MCP (read_file, write_file, run_command, ecc.). Entrambi i servizi leggono questo valore. Override di emergenza: TOOL_RUNNER_ADDR. Richiede riavvio di mcp-core e del brain. |
 | `tool_runner_enabled` | `true` | Abilita il server gRPC ToolRunner (porta 50071) usato dal brain LangGraph per eseguire i tool Nexus builtin. Override di emergenza: ENABLE_TOOL_RUNNER=1. Richiede riavvio di mcp-core per applicare la modifica. |
+
+## `agent_tools`
+
+| Chiave | Valore default | Descrizione |
+|---|---|---|
+| `agent.edit_file.whitespace_tolerant` | `true` | Retry fuzzy whitespace su edit_file se match esatto fallisce (M8) |
+| `agent_tools.read_cache_capacity` | `256` | LRU read cache capacity (H-66) |
+| `agent_tools.read_file_hint_lines` | `300` | Soglia righe oltre cui read_file antepone structure hint (H-62) |
+| `agent_tools.read_file_lines_max` | `100000` | Max righe leggibili con read_file_lines in singola chiamata (H-63) |
+| `agent_tools.test_log_max_chars` | `200000` | Max char log output test (H-72) |
 
 ## `ai`
 
@@ -106,6 +168,16 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | Chiave | Valore default | Descrizione |
 |---|---|---|
 | `brain_billing_enabled` | `true` | Abilita la registrazione di utilizzo AI nel ledger billing (tabella ai_usage_ledger) dal brain Python. Tenere false in sviluppo locale per non inquinare i dati di produzione. Override di emergenza: NEXUS_BRAIN_BILLING=on. Richiede riavvio del brain. |
+
+## `claude_agents`
+
+| Chiave | Valore default | Descrizione |
+|---|---|---|
+| `claude_agents.export_enabled` | `true` | Abilita la generazione dei file .claude/agents/*.md dalle definizioni DB. |
+| `claude_agents.name_prefix` | `nexus-` | Prefisso del nome file/agente generato (kind rust_implementer -> nexus-rust-implementer.md). |
+| `claude_agents.output_dir` | `.claude/agents` | Directory di output (relativa a NEXUS_REPO_ROOT) per i file agente generati. |
+| `claude_agents.overwrite_unmanaged_default` | `false` | Se false, i file senza marker AUTO-GENERATO (curati a mano) NON vengono sovrascritti dalla rigenerazione di default. |
+| `claude_agents.regen_on_post_commit` | `false` | Se true, un hook post-commit rigenera i file (opzionale; default off per non rallentare i commit). |
 
 ## `connectors`
 
@@ -186,28 +258,81 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `sandbox_enabled` | `true` | Abilita isolamento Docker per i processi agente |
 | `sandbox_memory_mb` | `1024` | Limite memoria sandbox in MB |
 
+## `impact`
+
+| Chiave | Valore default | Descrizione |
+|---|---|---|
+| `impact.depth_cap` | `2` | Profondita' massima di traversal nella forward closure dell'impact analysis (M13.4). |
+| `impact.enabled` | `true` | Abilita il popolamento del code graph durante reindex_single_file (M13.1). |
+| `impact.max_nodes` | `60` | Numero massimo di nodi raccolti in una singola impact run (anti-esplosione). |
+| `impact.test_informed_enabled` | `true` | Abilita il blocco <impact_brief> nel planner (M13.6): il planner vede impact set e test esistenti e genera todo di test/verifica mirati. |
+| `impact.test_informed_max_listed_tests` | `15` | Numero massimo di test esistenti elencati nel blocco <impact_brief> (anti-rumore nel prompt del planner). |
+| `impact.test_informed_max_seed_paths` | `12` | Numero massimo di seed path (file citati dall utente) inviati a tests-for-run in fase di planning. |
+
 ## `infrastructure`
 
 | Chiave | Valore default | Descrizione |
 |---|---|---|
+| `admin_service_port` | `4010` | Porta HTTP del microservizio admin-service (default 4010). Override: ADMIN_SERVICE_PORT. |
+| `agent_router_addr` | `127.0.0.1:50501` | Indirizzo host:porta del server gRPC AgentRouter esposto da mcp-core e usato dal brain Python per consultare il Q-Learning router. Override di emergenza: AGENT_ROUTER_ADDR. Richiede riavvio di mcp-core e del brain. |
+| `billing_service_port` | `4040` | Porta HTTP del microservizio billing-service (default 4040). Override: BILLING_SERVICE_PORT. |
+| `brain_grpc_port` | `50051` | Porta del server gRPC del brain Python (NeuralCoreService): classifier, embedding, routing. Default 50051. Override di emergenza: BRAIN_GRPC_PORT. Richiede riavvio del brain. |
+| `brain_rest_port` | `8001` | Porta del server REST FastAPI del brain Python (default 8001). Override di emergenza: BRAIN_REST_PORT. Richiede riavvio del brain. Cambiandola serve aggiornare anche brain_rest_url. |
 | `brain_rest_url` | `http://127.0.0.1:8001` | URL del server REST del brain Python (FastAPI su porta 8001). Usato da mcp-core per chiamare /agent/run/stream, /classify-intent-agentic, /catalog/sync e altri endpoint REST del brain. Override di emergenza: BRAIN_REST_URL o NEURAL_CORE_REST_URL. Richiede riavvio di mcp-core. |
+| `browser_bridge_port` | `4055` | Porta HTTP del browser-bridge-mcp (default 4055). Override: BROWSER_BRIDGE_PORT. |
+| `chat_service_port` | `4020` | Porta HTTP del microservizio chat-service (default 4020). Override: CHAT_SERVICE_PORT. |
+| `doc_service_port` | `4030` | Porta HTTP del microservizio doc-service (default 4030). Override: DOC_SERVICE_PORT. |
+| `mcp_core_http_port` | `4000` | Porta HTTP del server REST mcp-core (default 4000). Override di emergenza: MCP_SERVER_PORT o MCP_CORE_HTTP_PORT. Richiede riavvio di mcp-core. Cambiandola servono anche aggiornamenti a mcp_core_url e web-ide proxy. |
 | `mcp_core_url` | `http://127.0.0.1:4000` | URL del server HTTP mcp-core (porta 4000). Usato dal brain Python per leggere settings via _get_core_setting(), dal router semantico, dal cooldown bridge e dall'agent router client. Override di emergenza: MCP_CORE_URL. Richiede riavvio del brain. |
 | `network_dns_servers` | `1.1.1.1,8.8.8.8 ` | Server DNS personalizzati separati da virgola (es. 8.8.8.8,1.1.1.1). Usato dal Neural Core per risolvere i nomi host verso API AI esterne. |
 | `neural_core_url` | `http://localhost:50051` | Neural Core gRPC URL |
 | `nexus_external_proxy` | `` | Proxy HTTP/HTTPS per le chiamate verso API esterne (es. http://localhost:8002). Usato da tutti i backend Nexus tramite NEXUS_PROXY. Lascia vuoto per connessione diretta. |
+| `nexus_gateway_port` | `4060` | Porta HTTP del nexus-gateway (Node.js, proxy LLM unificato). Default 4060. Override di emergenza: NEXUS_GATEWAY_PORT. |
+| `plugin_service_port` | `4050` | Porta HTTP del microservizio plugin-service (default 4050). Override: PLUGIN_SERVICE_PORT. |
 | `projects_base_root` | `/home/administrator/projects` | Root assoluta sotto cui e' consentita la registrazione/navigazione dei progetti |
 | `qdrant_collection` | `code_embeddings` | Qdrant collection name |
 | `qdrant_project_context_collection` | `project_context` | Qdrant collection per indicizzazione iniziale del contesto/storia progetto |
 | `qdrant_url` | `http://localhost:6333` | Qdrant vector DB URL |
 | `redis_url` | `redis://localhost:6379` | Redis connection URL |
+| `tool_runner_addr` | `127.0.0.1:50500` | Indirizzo host:porta del server gRPC ToolRunner esposto da mcp-core e usato dal brain Python per eseguire i tool MCP (read_file, write_file, run_command, ecc.). Entrambi i servizi leggono questo valore. Override di emergenza: TOOL_RUNNER_ADDR. Richiede riavvio di mcp-core e del brain. NOTA: deve essere DIVERSO da agent_router_addr (porte distinte). |
+| `web_ide_port` | `3000` | Porta HTTP del frontend web-ide Next.js (default 3000). Override di emergenza: WEB_APP_PORT o PORT. |
+
+## `kb`
+
+| Chiave | Valore default | Descrizione |
+|---|---|---|
+| `kb.autolink.enabled` | `true` | Abilita il link composer post-create note (M12.3). |
+| `kb.autolink.semantic_threshold` | `0.65` | Score minimo Qdrant per creare un link relates semantico. |
+| `kb.autolink.semantic_top_k` | `3` | Top-K note semanticamente simili da considerare per link relates. |
+| `kb.autolink.wikilink_max_per_note` | `10` | Cap wikilink esplicitamente risolti per nota (anti-DoS). |
+| `kb.changelog_cross_enabled` | `true` | Abilita il cross-link dei changelog del meta-vault Nexus nella KB del meta-progetto Nexus (M12.4). No-op se Nexus non e' registrato come progetto. |
+| `kb.code_doc.enabled` | `true` | W2: abilita la generazione della code-wiki (note code_doc per file). |
+| `kb.code_doc.max_file_bytes` | `200000` | Dimensione massima file (byte) considerato dalla code-wiki. |
+| `kb.code_doc.max_files` | `50` | Numero massimo di file documentati per esecuzione della code-wiki. |
+| `kb.code_doc.max_source_chars` | `12000` | Caratteri di sorgente inviati all'LLM per file (troncamento). |
+| `kb.ingest.body_max_chars` | `20000` | Max char del body_md ingestito (final_answer molto lunghi vengono troncati con suffisso). |
+| `kb.ingest.enabled` | `true` | Abilita ingestione automatica del final_answer in project_knowledge_notes (M12.1). |
+| `kb.ingest.min_chars` | `300` | Lunghezza minima del final_answer per essere ingestito come note (filtro substance). |
+| `kb.ingest.title_max_chars` | `120` | Max char per il title della note generato dal final_answer. |
+| `kb.intake.confirm_if_implemented` | `true` | M14.4: se true, una richiesta gia' implementata e verificata (contesto invariato) chiede conferma anche in modalita' automatica prima di rifarla. |
+| `kb.lifecycle.auto_deprecate_on_correction` | `true` | M14.2: quando una richiesta utente corregge una decisione esistente (verdetto intake correction) e il run completa, marca la nota vecchia deprecated e crea un link correction dalla nuova nota. |
+| `kb.lifecycle.context_stale_enabled` | `true` | M14.3: marca context-stale le note active i cui file coperti vengono modificati da un run successivo non collegato alla nota (segnalazione, non cancellazione). |
+| `kb.lifecycle.promote_enabled` | `true` |  |
 
 ## `knowledge`
 
 | Chiave | Valore default | Descrizione |
 |---|---|---|
+| `kb.ingest.cjk_max_ratio_pct` | `20` | Hallucination guard kb.ingest: se >= N percento dei caratteri della final_answer e CJK (hiragana, katakana, hangul, hanzi), la nota agent_summary NON viene creata (probabile deriva semantica). 0 = disabilitato. |
+| `knowledge.cleanup_inactive_days` | `90` | Eta' (giorni) dall'ultimo updated_at oltre cui una nota active viene archiviata dal worker di cleanup (M14.5). |
+| `knowledge.cleanup_inactive_enabled` | `false` | Gate M14.5 per l'archiviazione delle note active inattive. OFF di default: non archiviare note attive a sorpresa. L'archiviazione delle draft vecchie resta sempre attiva. |
 | `knowledge.context_injection_enabled` | `true` | Abilita iniezione automatica delle note KB rilevanti nel system prompt agente |
 | `knowledge.context_injection_min_score` | `0.5` | Soglia minima di similarita cosine 0-1 |
 | `knowledge.context_injection_top_k` | `5` | Numero massimo di note KB da iniettare (1-20) |
+| `knowledge.graph_import_autolink` | `true` | Comp.2: dopo l'import collega i nodi importati ai nativi (recompute_links). |
+| `knowledge.graph_import_enabled` | `true` | Comp.2: abilita l'import di grafi esterni (JSON node-link, Mermaid, DOT) nella KB. |
+| `knowledge.graph_import_max_nodes` | `2000` | Comp.2: numero massimo di nodi importabili in un singolo grafo. |
+| `knowledge.rag_injection_mode` | `index` | Iniezione KB nel prompt: index (solo indice + tool on-demand, leggero) | full (snippet completi). |
 
 ## `learning`
 
@@ -240,6 +365,15 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `provider_health_probe_enabled` | `true` | Abilita il worker di health-check periodico dei provider LLM. Ogni ciclo invia una richiesta minimale a ciascun provider configurato per rilevare cooldown / quota esaurita prima del primo errore reale. Override: NEXUS_PROVIDER_HEALTH_PROBE_ENABLED=false. Richiede riavvio di mcp-core. |
 | `provider_health_probe_interval_s` | `300` | Intervallo in secondi tra i cicli di health-check provider (minimo 60, default 300 = 5 minuti). Abbassarlo aumenta la reattivita' ma aggiunge costo token marginale. Override: NEXUS_PROVIDER_HEALTH_PROBE_INTERVAL_S. Richiede riavvio di mcp-core. |
 
+## `nexus_tools`
+
+| Chiave | Valore default | Descrizione |
+|---|---|---|
+| `nexus_tools.fs_read_max_bytes` | `262144` | Max byte fs_read (H-74) |
+| `nexus_tools.fs_write_max_bytes` | `4194304` | Max byte fs_write (H-73) |
+| `nexus_tools.http_response_max_bytes` | `2097152` | Max byte body HTTP response in http_request (H-75) |
+| `nexus_tools.project_db_max_rows` | `100` | Max righe ritornate da project_db_query (H-76) |
+
 ## `optimizer`
 
 | Chiave | Valore default | Descrizione |
@@ -259,20 +393,27 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 | Chiave | Valore default | Descrizione |
 |---|---|---|
-| `clarify.confirm_irreversible_in_auto` | `false` | Se true, le decisioni di prodotto/irreversibili chiedono conferma anche in modalita' automatica; le tecniche/reversibili proseguono autonome. |
-| `clarify.decision_lookup_enabled` | `false` | Se true, prima di chiedere un chiarimento cerca se la decisione e' gia' stata presa (note intent=decision) e la applica. |
+| `clarify.confirm_irreversible_in_auto` | `true` | Se true, le decisioni di prodotto/irreversibili chiedono conferma anche in modalita' automatica; le tecniche/reversibili proseguono autonome. |
+| `clarify.decision_lookup_enabled` | `true` | Se true, prima di chiedere un chiarimento cerca se la decisione e' gia' stata presa (note intent=decision) e la applica. |
 | `clarify.decision_min_score` | `0.7` | Soglia minima di similarita' per considerare una decisione passata come gia' presa. |
 | `clarify.decision_topk` | `5` | Quante note decision recuperare nel lookup. |
+| `clarify.intake_gate_enabled` | `true` | Comp.1: abilita il gate di intake (classifica la relazione richiesta vs KB: nuova/duplicate/refinement/correction). Assorbe il decision-lookup del Cluster 4. |
+| `clarify.intake_match_min_score` | `0.7` | Comp.1: soglia minima di similarita per considerare la richiesta correlata a una nota esistente. |
+| `clarify.intake_topk` | `5` | Comp.1: numero di note candidate recuperate dal gate di intake. |
 | `orchestrator.adaptive_agentic_score_min` | `0.7` | Soglia di agentic_score sopra la quale attivare il planner forte. |
-| `orchestrator.adaptive_classifier_enabled` | `false` | Se true, router_node invoca il classifier agentico LLM e scrive complexity/agentic_score/is_ambiguous nello state. |
-| `orchestrator.adaptive_gating_enabled` | `false` | Se true, is_eligible_adaptive usa i segnali del classifier per gate-are il planner forte (oltre ai gate hard budget/behavior). |
+| `orchestrator.adaptive_classifier_enabled` | `true` | Se true, router_node invoca il classifier agentico LLM e scrive complexity/agentic_score/is_ambiguous nello state. |
+| `orchestrator.adaptive_gating_enabled` | `true` | Se true, is_eligible_adaptive usa i segnali del classifier per gate-are il planner forte (oltre ai gate hard budget/behavior). |
 | `orchestrator.adaptive_low_confidence_max` | `0.5` | Soglia di confidence sotto la quale (incertezza) attivare il planner forte. |
 | `orchestrator.clarify.confidence_threshold` | `0.6` | Soglia di confidence sotto cui il nodo si attiva. Sopra -> bypass. |
 | `orchestrator.clarify.enabled` | `true` | Feature flag globale per il clarify_or_expand_node. Off -> nodo no-op. |
 | `orchestrator.clarify.max_question_chars` | `280` | Cap di lunghezza della domanda di chiarimento prima del troncamento. |
 | `orchestrator.clarify.prompt_key` | `agent.clarify.base` | Indirezione per varianti A/B del prompt clarify. |
 | `orchestrator.clarify.require_llm_classifier` | `false` | Se true, attiva il clarify solo quando NEXUS_LLM_CLASSIFIER_ENABLED=true; altrimenti usa anche il fallback keyword/embedding. |
-| `orchestrator.exploratory_verify_enabled` | `false` | Se true, dopo i criteri deterministici passati il verifier esegue un controllo LLM esplorativo (RAG-informed) per anomalie non coperte. |
+| `orchestrator.dag_max_parallel` | `2` | Comp.3b: numero massimo di todo eseguiti in parallelo per ondata (cap conservativo). |
+| `orchestrator.dag_parallel_enabled` | `false` | Comp.3b: se true (e dag presente), i todo ready vengono eseguiti in parallelo via dispatch_subagents. Mutuamente esclusivo col worker-mode. |
+| `orchestrator.dag_topological_enabled` | `true` | Comp.3a: se true, il verifier sceglie il prossimo todo rispettando depends_on (ordine topologico) invece del solo seq lineare. |
+| `orchestrator.dag_verify_layer` | `true` | Comp.3b: se true, dopo ogni ondata parallela verifica i todo completati prima di procedere al layer successivo. |
+| `orchestrator.exploratory_verify_enabled` | `true` | Se true, dopo i criteri deterministici passati il verifier esegue un controllo LLM esplorativo (RAG-informed) per anomalie non coperte. |
 | `orchestrator.exploratory_verify_max_cycles` | `1` | Cap di cicli della verifica esplorativa per todo (anti-loop). Al cap si promuove comunque (deterministico primario). |
 | `orchestrator.exploratory_verify_min_score` | `0.5` | Soglia minima di similarita' per i pattern di fallimento recuperati. |
 | `orchestrator.exploratory_verify_topk` | `5` | Quanti pattern di fallimento passati recuperare via ricerca semantica. |
@@ -290,14 +431,19 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `orchestrator.plan_min_token_budget` | `50` | Sotto questa soglia di token_budget il planner viene saltato (chat brevi). |
 | `orchestrator.planner_prompt_key` | `agent.planner.base` | Indirezione per varianti A/B del prompt del planner. |
 | `orchestrator.plan_phase_enabled` | `true` | Feature flag globale per il planner_node (PR-1). Off -> grafo si comporta come oggi. |
-| `orchestrator.plan_rationale_enabled` | `false` | Se true, il planner recupera decisioni passate via RAG, produce rationale/constraints/alternatives e li tramanda all'executor. |
+| `orchestrator.plan_rationale_enabled` | `true` | Se true, il planner recupera decisioni passate via RAG, produce rationale/constraints/alternatives e li tramanda all'executor. |
 | `orchestrator.plan_rationale_min_score` | `0.55` | Soglia minima di similarita' per includere una decisione passata nel contesto del planner. |
 | `orchestrator.plan_rationale_persist_as_note` | `false` | Se true, dopo la creazione del piano il razionale viene salvato come nota knowledge intent=decision (chiude il ciclo RAG). |
 | `orchestrator.plan_rationale_rag_topk` | `5` | Quante decisioni/interazioni passate recuperare per informare il razionale del planner. |
 | `orchestrator.subagent_cost_cap_per_run_usd` | `5.00` | Hard cap di spesa cumulativa sub-agents per singolo parent run. |
 | `orchestrator.subagent_default_timeout_s` | `300` | Timeout default per kind se non specificato in nexus_subagent_definitions. |
-| `orchestrator.subagent_kinds_whitelist` | `plan,explore,implement,verify,review` | CSV dei kind ammessi per dispatch_subagent (filtra anche custom kinds). |
+| `orchestrator.subagent_inherit_plan_rationale` | `true` | Se true, il sub-agent riceve il rationale del piano del parent (nexus_agent_plans), solo strutturato. |
+| `orchestrator.subagent_kinds_whitelist` | `plan,explore,implement,verify,review,rust_implementer,pyt...` | CSV dei kind ammessi per dispatch_subagent (filtra anche custom kinds). |
 | `orchestrator.subagent_max_depth` | `2` | Profondita max di annidamento sub-agent (sub-of-sub). |
+| `orchestrator.subagent_rag_grounding_enabled` | `true` | Se true, i sub-agent ricevono un grounding sulla memoria vettoriale del progetto (ricerca semantica locale) nel system_text. |
+| `orchestrator.subagent_rag_grounding_min_score` | `0.55` | Soglia minima di similarita' per il grounding del sub-agent. |
+| `orchestrator.subagent_rag_grounding_snippet_max` | `800` | Cap caratteri per snippet del grounding (controllo costi + superficie dati verso il provider). |
+| `orchestrator.subagent_rag_grounding_topk` | `5` | Numero di note recuperate per il grounding del sub-agent. |
 | `orchestrator.subagents_enabled` | `true` | Feature flag globale sub-agents pattern. Off -> dispatch_subagent ritorna errore al main. |
 | `orchestrator.todo_reminder_every_n_steps` | `5` | Iniezione system reminder TODO ogni N tool use. |
 | `orchestrator.todo_reminder_min_todos` | `3` | Sotto questa soglia di todos pending nessun reminder iniettato (anti-spam chat brevi). |
@@ -316,6 +462,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 | Chiave | Valore default | Descrizione |
 |---|---|---|
+| `project:2758b7cd-f14c-4df1-843b-06c823b7dc56:playwright_enabled` | `true` | Playwright abilitato e configurato |
 | `project:8e697e82-1524-4c53-9634-a3ea11ac69e9:playwright_enabled` | `true` | Playwright abilitato e configurato |
 
 ## `projects`
@@ -323,6 +470,13 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | Chiave | Valore default | Descrizione |
 |---|---|---|
 | `extra_project_roots` | `` | Lista separata da virgola di percorsi extra ammessi per il browse progetti (es. /mnt/data,/opt/repos). Vuoto = solo la root del progetto attivo. Override di emergenza: NEXUS_EXTRA_ROOTS. Richiede riavvio di mcp-core. |
+
+## `prompt_templates`
+
+| Chiave | Valore default | Descrizione |
+|---|---|---|
+| `prompt_templates.base_max` | `3` | BASE_MAX per template variants (H-80 a) |
+| `prompt_templates.hard_max` | `8` | HARD_MAX per template variants (H-80 b) |
 
 ## `providers`
 
@@ -345,6 +499,31 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `mistral_enabled` | `true` | Abilita il provider Mistral |
 | `openai_api_key` | `sk-proj-vrrZB-k1qfd9oZ8iBevLYPE7maRu4RREcP6MjCYVTHML_ZeJ_...` | OpenAI API Key |
 | `openai_enabled` | `true` | Abilita il provider OpenAI (GPT) |
+| `provider.billing_recovery_interval_s` | `60` | Cadenza (secondi) del billing_cooldown_recovery_loop che riabilita i provider a cooldown scaduto previo probe. |
+| `provider.circuit_breaker_extended_cooldown_s` | `600` | Cooldown esteso (secondi) applicato quando il circuit breaker provider scatta. |
+| `provider.circuit_breaker_threshold` | `3` | Numero di fallimenti entro la finestra che apre il circuit breaker provider. |
+| `provider.circuit_breaker_window_s` | `60` | Finestra (secondi) del circuit breaker provider: N fallimenti entro questa finestra aprono il breaker. |
+| `provider.cooldown_default_s` | `300` | Durata cooldown provider di default (secondi) quando il Retry-After non e fornito. |
+| `provider.cooldown_long_s` | `21600` | Durata cooldown lungo (secondi) per errori billing/quota non risolvibili a breve. Default 6h. |
+| `provider.cooldown_max_s` | `3600` | Cap superiore (secondi) del cooldown provider. |
+| `provider.cooldown_min_s` | `10` | Cap inferiore (secondi) del cooldown provider per evitare hammering. |
+| `provider.health_probe_timeout_s` | `30` | Timeout (secondi) per la singola chiamata del provider_health_probe. Oltre la soglia il provider e considerato slow. |
+| `provider.outage_threshold` | `3` | Numero di provider falliti nello stesso round oltre cui si assume outage locale (rollback dei cooldown). |
+| `provider.recovery_probe_timeout_s` | `30` | Timeout (secondi) del probe attivo eseguito prima di riabilitare un provider (probe-then-reenable). |
+| `providers.api_key_cache_ttl_seconds` | `60` | TTL cache api_key_loader (H-07) |
+| `providers.billing_cooldown_seconds` | `600` | Durata cooldown billing-error per provider (H-11) |
+| `providers.capability_cache_ttl_seconds` | `60` | TTL (secondi) della cache delle capability provider in brain/providers/capability_loader.py. |
+| `providers.catalog_cache_ttl_seconds` | `60` | TTL cache ai_price_catalog (H-08) |
+| `providers.cooldown_bridge_timeout_seconds` | `5` | Timeout HTTP cooldown bridge (H-09) |
+| `providers.cooldown_circuit_breaker_threshold` | `3` | Soglia consecutive failure → circuit breaker (H-78) |
+| `providers.dns_timeout_seconds` | `5` | Timeout DNS resolver in dns_transport (H-10) |
+| `providers.health_probe_max_tokens` | `10` | Max tokens per health probe Anthropic (H-05) |
+| `providers.health_probe_outage_threshold` | `3` | Soglia consecutive failure → outage (H-77) |
+| `provider.slow_cooldown_s` | `60` | Cooldown breve (secondi) applicato a un provider slow/transient dal provider_health_probe. |
+| `providers.ollama.list_timeout_seconds` | `3` | Timeout Ollama list_models (H-22) |
+| `providers.quota_cooldown_seconds` | `3600` | Durata (s) del cooldown locale del brain per quota/credito esaurito persistente (insufficient_quota). Piu lungo del transitorio. DB-driven, cache 60s. |
+| `providers.test_connection_timeout_seconds` | `15` | Timeout test_connection in sync wrap (H-12) |
+| `providers.thinking_models_ttl_seconds` | `60` | TTL cache modulo Anthropic per detection modelli con thinking abilitato (H-01) |
 
 ## `quality`
 
@@ -364,6 +543,29 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `reflection_sample_rate` | `0.3` | Probabilita' campionamento reflection per ogni run agente (0.0-1.0). 0.3 = 30% dei run, 1.0 = tutti i run. Aumentare in ambienti di eval. |
 | `reflection_timeout_s` | `10` | Timeout massimo in secondi per la chiamata LLM di valutazione. Se il modello non risponde entro questo limite, la reflection viene saltata. |
 
+## `regression_gate`
+
+| Chiave | Valore default | Descrizione |
+|---|---|---|
+| `regression_gate.enabled` | `true` | Abilita il regression gate SOFT a fine run (M13.4): esegue i test dell impact set e avvisa senza bloccare. |
+| `regression_gate.hard_block` | `false` | Abilita il blocco HARD del regression gate (M13.5): se i test dell impact set falliscono il run e bloccato e l auto-commit non committa. Default-OFF (rollout). |
+| `regression_gate.max_cycles` | `1` | Numero massimo di cicli fix-and-retest che il gate hard concede prima di bloccare definitivamente il run. |
+| `regression_gate.max_tests` | `10` | Numero massimo di test dell impact set eseguiti dal gate per run (cap anti-latenza). |
+| `regression_gate.soft_only` | `true` | Forza modalita SOFT (solo warning, nota e todo). Il blocco hard e M13.5, non ancora implementato. |
+| `regression_gate.test_timeout_s` | `120` | Timeout in secondi per singolo test eseguito dal regression gate. |
+
+## `router`
+
+| Chiave | Valore default | Descrizione |
+|---|---|---|
+| `router.classifier.ambiguity_min_confidence` | `0.70` | Soglia confidence minima classifier (H-59 a) |
+| `router.classifier.ambiguity_min_margin` | `0.15` | Margine minimo ambiguity classifier (H-59 b) |
+| `router.classifier_cfg_ttl_seconds` | `60` | TTL cache config classifier (H-58) |
+| `router.classifier_llm_timeout_seconds` | `5` | Timeout LLM call classifier agentico (H-57) |
+| `router.db_connect_timeout_seconds` | `2` | Timeout DB connect del router (H-61) |
+| `router.service.cache_ttl_seconds` | `30` | TTL cache router service (H-60 b) |
+| `router.service.default_timeout_seconds` | `1.5` | Timeout default router service (H-60 a) |
+
 ## `routing`
 
 | Chiave | Valore default | Descrizione |
@@ -372,7 +574,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `default_model` | `claude-sonnet-4-6` | Default model for chat |
 | `default_provider` | `anthropic` | Default LLM provider |
 | `max_token_budget` | `32000` | Maximum token budget allowed |
-| `model_catalog_last_sync` | `2026-05-30T11:27:07.954048483+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
+| `model_catalog_last_sync` | `2026-06-02T15:13:54.064650842+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
 | `nexus_active_routing_pct` | `50` | Percentuale di richieste chat gestite dal router Q-Learning Nexus (0=off, 100=tutto). A/B testing: imposta 10-50 per un rollout graduale. |
 | `nexus_behavior_mode` | `dinamico` | Modalità comportamento Nexus: veloce|economica|bilanciata|approfondita |
 | `provider_hierarchy` | `anthropic,openai,google,deepseek,mistral` | Ordered fallback chain for chat providers |
@@ -389,10 +591,17 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `routing.classifier_cache_ttl_seconds` | `86400` | TTL della cache in-memory del classifier LLM (default 24h). Riduce le chiamate ripetute LLM su prompt identici. |
 | `routing.classifier_model` | `gemini-2.5-flash` | Modello specifico per il classifier intent agentic. Cambiare con UPDATE. |
 | `routing.classifier_provider` | `google` | Provider per il classifier intent agentic (deve esistere in nexus_provider_default_model). |
+| `routing.degradation.cooldown_seconds` | `3600` | Durata cooldown provider-intent (M7) |
+| `routing.degradation.min_visits` | `5` | Min visite prima di applicare degradation (M7) |
+| `routing.degradation.threshold` | `0.7` | Failure rate soglia per cooldown provider-intent (M7) |
 | `routing_docs_providers` | `anthropic,openai,google,deepseek,mistral` | Provider order for documentation requests |
 | `routing_fix_providers` | `anthropic,openai,google,deepseek,mistral` | Provider order for fix requests |
 | `routing.intent_deterministic_high` | `0.85` | Confidence del classificatore deterministico keyword sopra la quale si SALTA l'LLM (pre-check robusto per task agentici evidenti). Range [0.0, 1.0]. |
 | `routing.intent_deterministic_min` | `0.60` | Confidence minima del classificatore deterministico sotto la quale NON lo si usa nemmeno come fallback quando l'LLM degrada a chat. Range [0.0, 1.0]. |
+| `routing.intent_health_cooldown_secs` | `600` | Durata (secondi) del cooldown M7 di un provider su un intent dopo aver superato la soglia di fallimenti. |
+| `routing.intent_health_enabled` | `false` | M7 Q-value: registra esiti per (provider,model,intent) e salta i provider in cooldown nel fallback. OFF di default (attivare dopo aver raccolto dati). |
+| `routing.intent_health_failure_threshold_pct` | `60` | Percentuale di fallimenti su un intent oltre cui un provider entra in cooldown M7. |
+| `routing.intent_health_min_attempts` | `8` | Numero minimo di tentativi (success+failure) su un intent prima di poter mettere un provider in cooldown M7. |
 | `routing.llm_classifier_min_confidence` | `0.60` | Soglia confidence sotto cui il risultato del classifier LLM viene scartato e si usa il fallback keyword. Valore [0.0, 1.0]. |
 | `routing.llm_classifier_timeout_seconds` | `8.0` | Timeout in secondi per la chiamata HTTP al classifier LLM (POST /classify-intent-agentic). Su timeout, fallback keyword. |
 | `routing_refactor_providers` | `anthropic,openai,google,deepseek,mistral` | Provider order for refactor requests |
@@ -403,6 +612,20 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `routing.token_threshold_complex_fix` | `3000` | Soglia in token sopra cui fix/refactor passa da fix_semplice a fix_complesso (route_model_with_mode). |
 | `routing.token_threshold_long_context` | `6000` | Soglia in token sopra cui anche intent generici (chat) richiedono modello tier=medium nel catalog dynamic routing. |
 | `token_budget` | `4096` | Default token budget per request |
+
+## `runtime`
+
+| Chiave | Valore default | Descrizione |
+|---|---|---|
+| `shutdown.force_exit_timeout_seconds` | `10` | Secondi massimi che mcp-core attende dopo aver ricevuto SIGTERM/Ctrl-C prima di forzare std::process::exit(0) via watchdog su thread OS dedicato. Garantisce che il processo (e il bind su :4000) venga sempre rilasciato anche se un worker detached non risponde a cancellation. Default 10. La unit systemd ha TimeoutStopSec come ulteriore rete (SIGKILL). |
+
+## `schema`
+
+| Chiave | Valore default | Descrizione |
+|---|---|---|
+| `schema.descr_max` | `200` | Max char per description di property in JSON Schema (H-17) |
+| `schema.enum_max` | `10` | Max numero enum values prima del troncamento (H-18) |
+| `schema.tool_descr_max` | `400` | Max char per tool description (H-19) |
 
 ## `security`
 
@@ -427,4 +650,4 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 ---
 
-**Totale chiavi**: 280
+**Totale chiavi**: 453

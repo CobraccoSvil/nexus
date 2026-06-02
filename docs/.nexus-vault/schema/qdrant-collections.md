@@ -6,12 +6,12 @@ slug: qdrant-collections
 tags:
   - schema
   - qdrant
-source_commit: a046cc4fefc748578e7ff6aea827692831f5bd44
+source_commit: b364c885b0251cf43753c2f69497193332b551f3
 source_files:
   - crates/mcp-core/src/vector_memory.rs
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-30T11:29:07Z
+updated_at: 2026-06-02T15:18:51Z
 nexus_meta_version: 1
 ---
 
@@ -19,17 +19,17 @@ Collection Qdrant attualmente create. Generato chiamando `GET /collections`.
 
 | Nome | Status |
 |---|---|
-| `nexus_meta_docs` | listed |
-| `knowledge_notes` | listed |
 | `agent_interactions` | listed |
-| `project_docs` | listed |
-| `project_context` | listed |
-| `project_code_index` | listed |
+| `nexus_meta_docs` | listed |
 | `mcp_tools` | listed |
-| `prompt_corrections` | listed |
-| `code_embeddings` | listed |
-| `tool_results_chunks` | listed |
 | `conversation_context` | listed |
+| `project_docs` | listed |
+| `knowledge_notes` | listed |
+| `prompt_corrections` | listed |
+| `project_context` | listed |
+| `tool_results_chunks` | listed |
+| `code_embeddings` | listed |
+| `project_code_index` | listed |
 
 ---
 

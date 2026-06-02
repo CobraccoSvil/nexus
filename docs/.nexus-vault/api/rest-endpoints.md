@@ -6,18 +6,18 @@ slug: rest-endpoints
 tags:
   - api
   - rest
-source_commit: a046cc4fefc748578e7ff6aea827692831f5bd44
+source_commit: b364c885b0251cf43753c2f69497193332b551f3
 source_files:
   - crates/mcp-core/src/main.rs
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-30T11:29:10Z
+updated_at: 2026-06-02T15:18:52Z
 nexus_meta_version: 1
 ---
 
 Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src/main.rs`.
 
-**Totale endpoint**: 256
+**Totale endpoint**: 263
 
 Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]].
 
@@ -124,6 +124,13 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 | `POST` | `/api/chat/messages/:id/resend` | `chat_messages::resend_chat_message` |
 | `POST` | `/api/chat/precheck` | `chat_messages::precheck_chat_message` |
 
+## `/api/claude-agents`
+
+| Metodo | Path | Handler |
+|---|---|---|
+| `GET` | `/api/claude-agents/preview` | `claude_agents::preview_handler` |
+| `POST` | `/api/claude-agents/regenerate` | `claude_agents::regenerate_handler` |
+
 ## `/api/dashboard`
 
 | Metodo | Path | Handler |
@@ -162,6 +169,7 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 
 | Metodo | Path | Handler |
 |---|---|---|
+| `GET` | `/api/internal/agent/backlog/:project_id` | `agent_todos_routes::list_backlog` |
 | `GET` | `/api/internal/providers/status` | `environment::providers_status_internal` |
 | `GET` | `/api/internal/routing/catalog` | `internal_routing::list_catalog` |
 | `GET` | `/api/internal/routing/purpose` | `internal_routing::resolve_purpose` |
@@ -298,6 +306,7 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 | `PATCH` | `/api/projects/:id/default-profile` | `projects::patch_project_default_profile` |
 | `POST` | `/api/projects/:id/agent-processes/:process_id/stop` | `project_workspace::stop_agent_process` |
 | `POST` | `/api/projects/:id/agent-processes/clear-finished` | `project_workspace::clear_finished_processes` |
+| `POST` | `/api/projects/:id/agent/todos/:run_id/edit` | `agent_todos_routes::edit_todo` |
 | `POST` | `/api/projects/:id/analyze` | `projects::analyze_project` |
 | `POST` | `/api/projects/:id/db/config` | `project_db_routes::set_project_db_config` |
 | `POST` | `/api/projects/:id/db/connections/:conn_id/set-primary` | `project_db_routes::set_primary_project_db_connection` |
@@ -305,6 +314,7 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 | `POST` | `/api/projects/:id/db/migrations/apply` | `project_db_routes::apply_project_migrations` |
 | `POST` | `/api/projects/:id/db/migrations/rollback` | `project_db_routes::rollback_project_migration` |
 | `POST` | `/api/projects/:id/db/override-request` | `project_db_routes::request_ddl_override` |
+| `POST` | `/api/projects/:id/db/query` | `project_db_routes::execute_project_db_query` |
 | `POST` | `/api/projects/:id/db/test-connection` | `project_db_routes::test_project_db_connection` |
 | `POST` | `/api/projects/:id/deep-analyze` | `projects::deep_analyze_project` |
 | `POST` | `/api/projects/:id/deep-review` | `projects::submit_deep_review` |
@@ -325,6 +335,7 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 | `POST` | `/api/projects/:id/github/publish` | `github::github_publish_project` |
 | `POST` | `/api/projects/:id/github/publish-branch` | `github::github_publish_branch` |
 | `POST` | `/api/projects/:id/github/pull-request` | `github::github_create_pull_request` |
+| `POST` | `/api/projects/:id/knowledge/code-wiki/generate` | `knowledge::code_doc::generate_code_wiki_handler` |
 | `POST` | `/api/projects/:id/knowledge/extract-functional` | `knowledge::routes::extract_functional_handler` |
 | `POST` | `/api/projects/:id/knowledge/generate-rich` | `knowledge::routes::generate_rich_kb` |
 | `POST` | `/api/projects/:id/knowledge/init-or-refresh` | `knowledge::routes::init_or_refresh_knowledge` |
@@ -342,6 +353,7 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 | `POST` | `/api/projects/:id/services/:service/:action` | `project_workspace::control_project_service` |
 | `POST` | `/api/projects/:id/services/allocate-port` | `project_workspace::allocate_project_port` |
 | `POST` | `/api/projects/:id/services/cleanup-ports` | `project_workspace::cleanup_project_ports` |
+| `POST` | `/api/projects/:id/services/install-playwright` | `project_workspace::playwright_install::install_playwright` |
 | `POST` | `/api/projects/:id/services/kill-orphan-processes` | `project_workspace::kill_project_orphan_processes` |
 | `POST` | `/api/projects/:id/services/kill-port-process` | `project_workspace::kill_project_port_process` |
 | `POST` | `/api/projects/:id/services/restart-all` | `project_workspace::restart_all_project_services` |

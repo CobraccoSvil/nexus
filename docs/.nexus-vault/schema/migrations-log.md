@@ -6,12 +6,12 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: a046cc4fefc748578e7ff6aea827692831f5bd44
+source_commit: b364c885b0251cf43753c2f69497193332b551f3
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-30T11:29:07Z
+updated_at: 2026-06-02T15:18:51Z
 nexus_meta_version: 1
 ---
 
@@ -234,7 +234,39 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0215_visual_compare_directive.sql` | Mig 0215 - FASE 2 "resa Figma Make": direttiva di verifica visiva nei prompt. |
 | `0216_remove_attachment_extraction_limits.sql` | Mig 0216 — Eliminazione dei limiti che TRONCANO/PERDONO dati durante |
 | `0217_context_no_loss_rag.sql` | Mig 0217 — Context no-loss via offload RAG (zero perdita dati nel contesto LLM). |
+| `0218_domain_subagent_definitions.sql` | Migrazione 0218: kind sub-agent domain-specific (Componente C dell'allineamento). |
+| `0219_domain_subagent_prompts.sql` | Migrazione 0219: prompt per i kind domain-specific (Componente C). |
+| `0220_chat_attachment_content_hash.sql` | 0220_chat_attachment_content_hash.sql |
+| `0221_subagent_context_grounding.sql` | Migrazione 0221: contesto continuo via RAG ai sub-agent (Componente B). |
+| `0222_claude_agents_export_settings.sql` | Migrazione 0222: settings per l'export DB -> .claude/agents (Componente A). |
+| `0223_domain_subagent_enable.sql` | Migrazione 0220: abilita i kind domain-specific nella whitelist (Componente C). |
+| `0224_knowledge_graph_tools.sql` | Migrazione 0224: colonne e vincoli per i nuovi tool MCP di grafo (Componente 0). |
+| `0225_knowledge_graph_tools_prompt.sql` | Migrazione 0225: direttiva <knowledge_graph_tools> nei system prompt agente. |
+| `0226_intake_gate.sql` | Migrazione 0226: Intake Gate multi-asse (Componente 1). |
+| `0227_knowledge_graph_import.sql` | Migrazione 0227: import di grafi esterni nella KB (Componente 2). |
+| `0228_agent_todos_dag.sql` | Migrazione 0228: schema DAG per il coordinamento delle azioni (Componente 3a). |
+| `0229_dag_scheduler.sql` | Migrazione 0229: parallelizzazione DAG opt-in (Componente 3b). |
+| `0230_command_hints.sql` | 0230_command_hints.sql |
+| `0231_command_hints_extra.sql` | 0231_command_hints_extra.sql |
+| `0232_dev_diagnostics.sql` | 0232_dev_diagnostics.sql |
+| `0238_db_query_hints.sql` | 0233_db_query_hints.sql |
+| `0239_infrastructure_ports.sql` | 0239_infrastructure_ports.sql |
+| `0240_provider_capabilities.sql` | 0240_provider_capabilities.sql |
+| `0241_settings_provider_layer.sql` | 0241_settings_provider_layer.sql |
+| `0242_provider_intent_health.sql` | 0242_provider_intent_health.sql |
+| `0243_code_graph.sql` | 0243_code_graph.sql |
+| `0244_plan_table_columns.sql` | 0244_plan_table_columns.sql |
+| `0245_settings_plan_remainder.sql` | 0245_settings_plan_remainder.sql |
+| `0246_discovery_first_default_off.sql` | 0246_discovery_first_default_off.sql |
+| `0247_discovery_first_reenable.sql` | 0247_discovery_first_reenable.sql |
+| `0248_kb_lifecycle_deprecate_archive.sql` | 0248_kb_lifecycle_deprecate_archive.sql |
+| `0249_intent_health_routing.sql` | 0249_intent_health_routing.sql |
+| `0250_provider_loader_cache_ttl.sql` | 0250_provider_loader_cache_ttl.sql |
+| `0251_backfill_note_answers.sql` | 0251_backfill_note_answers.sql |
+| `0252_code_doc_wiki.sql` | 0252_code_doc_wiki.sql |
+| `0253_provider_health_settings.sql` | 0253_provider_health_settings.sql |
+| `0254_rag_injection_mode.sql` | 0254_rag_injection_mode.sql |
 
-**Totale**: 213 migrazioni.
+**Totale**: 245 migrazioni.
 
-Ultima migrazione: `0217_context_no_loss_rag.sql`.
+Ultima migrazione: `0254_rag_injection_mode.sql`.

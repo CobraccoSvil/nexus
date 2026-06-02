@@ -6,12 +6,12 @@ slug: postgres-tables
 tags:
   - schema
   - postgres
-source_commit: a046cc4fefc748578e7ff6aea827692831f5bd44
+source_commit: b364c885b0251cf43753c2f69497193332b551f3
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-05-30T11:29:07Z
+updated_at: 2026-06-02T15:18:51Z
 nexus_meta_version: 1
 ---
 
@@ -267,6 +267,8 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `indexed_at` | timestamp with time zone | YES | `—` |
 | `created_at` | timestamp with time zone | NO | `now()` |
 | `chunk_count` | integer | NO | `0` |
+| `content_hash` | text | YES | `—` |
+| `display_id` | text | YES | `—` |
 
 ## `chat_messages`
 
@@ -587,6 +589,13 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `verify_failures` | integer | NO | `0` |
 | `iteration_seen` | integer | NO | `0` |
 | `updated_at` | timestamp with time zone | NO | `now()` |
+| `depends_on` | ARRAY | NO | `'{}'::uuid[]` |
+| `dep_keys` | ARRAY | YES | `—` |
+| `node_key` | text | YES | `—` |
+| `dag_layer` | integer | YES | `—` |
+| `edited_by` | text | YES | `—` |
+| `carry_over` | boolean | NO | `false` |
+| `origin_run_id` | uuid | YES | `—` |
 
 ## `nexus_agent_types`
 
@@ -629,6 +638,19 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `created_at` | timestamp with time zone | NO | `now()` |
 | `updated_at` | timestamp with time zone | NO | `now()` |
 
+## `nexus_command_hints`
+
+| Colonna | Tipo | Nullable | Default |
+|---|---|---|---|
+| `id` | uuid | NO | `gen_random_uuid()` |
+| `pattern` | text | NO | `—` |
+| `pattern_kind` | text | NO | `'substring'::text` |
+| `hint_text` | text | NO | `—` |
+| `severity` | text | NO | `'warning'::text` |
+| `enabled` | boolean | NO | `true` |
+| `created_at` | timestamp with time zone | NO | `now()` |
+| `updated_at` | timestamp with time zone | NO | `now()` |
+
 ## `nexus_conversation_summaries`
 
 | Colonna | Tipo | Nullable | Default |
@@ -652,6 +674,21 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `error_kind` | text | YES | `—` |
 | `error_message` | text | YES | `—` |
 | `checked_at` | timestamp with time zone | NO | `now()` |
+
+## `nexus_dev_diagnostics`
+
+| Colonna | Tipo | Nullable | Default |
+|---|---|---|---|
+| `id` | uuid | NO | `gen_random_uuid()` |
+| `pattern_regex` | text | NO | `—` |
+| `category` | text | NO | `—` |
+| `fix_template` | text | NO | `—` |
+| `severity` | text | NO | `'warning'::text` |
+| `confidence` | integer | NO | `80` |
+| `description` | text | NO | `''::text` |
+| `enabled` | boolean | NO | `true` |
+| `created_at` | timestamp with time zone | NO | `now()` |
+| `updated_at` | timestamp with time zone | NO | `now()` |
 
 ## `nexus_e2e_runs`
 
@@ -847,6 +884,40 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `placeholder_vars` | jsonb | NO | `'[]'::jsonb` |
 | `experimental` | boolean | NO | `false` |
 
+## `nexus_provider_capabilities`
+
+| Colonna | Tipo | Nullable | Default |
+|---|---|---|---|
+| `provider` | text | NO | `—` |
+| `model` | text | NO | `—` |
+| `tool_use` | boolean | NO | `false` |
+| `vision` | boolean | NO | `false` |
+| `thinking` | boolean | NO | `false` |
+| `max_context_tokens` | integer | NO | `8192` |
+| `default_max_output_tokens` | integer | NO | `4096` |
+| `max_output_tokens_hard` | integer | NO | `16384` |
+| `tool_choice_style` | text | NO | `'openai_auto'::text` |
+| `tool_choice_first_turn_force` | boolean | NO | `false` |
+| `schema_strict` | boolean | NO | `false` |
+| `schema_dialect` | text | NO | `'openai_loose'::text` |
+| `tool_call_format` | text | NO | `'openai_delta'::text` |
+| `max_tools_in_request` | integer | YES | `—` |
+| `supports_prompt_cache` | boolean | NO | `false` |
+| `prompt_cache_dialect` | text | YES | `—` |
+| `supports_parallel_tools` | boolean | NO | `true` |
+| `stop_reason_dialect` | text | NO | `'openai_finish_reason'::text` |
+| `soft_failure_iter_threshold` | integer | NO | `3` |
+| `soft_failure_content_threshold` | integer | NO | `800` |
+| `history_keep_recent_messages` | integer | NO | `12` |
+| `history_max_old_tool_result_chars` | integer | NO | `2000` |
+| `request_timeout_seconds` | integer | NO | `60` |
+| `connect_timeout_seconds` | integer | NO | `10` |
+| `tool_result_max_chars` | integer | NO | `6000` |
+| `tool_result_max_bytes` | integer | NO | `512000` |
+| `tool_result_max_lines` | integer | NO | `2000` |
+| `created_at` | timestamp with time zone | NO | `now()` |
+| `updated_at` | timestamp with time zone | NO | `now()` |
+
 ## `nexus_provider_default_model`
 
 | Colonna | Tipo | Nullable | Default |
@@ -867,6 +938,24 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `error_kind` | text | YES | `—` |
 | `error_message` | text | YES | `—` |
 | `checked_at` | timestamp with time zone | NO | `now()` |
+
+## `nexus_provider_intent_health`
+
+| Colonna | Tipo | Nullable | Default |
+|---|---|---|---|
+| `provider` | text | NO | `—` |
+| `model` | text | NO | `—` |
+| `intent_subkind` | text | NO | `—` |
+| `success_count` | bigint | NO | `0` |
+| `failure_count` | bigint | NO | `0` |
+| `soft_failure_count` | bigint | NO | `0` |
+| `last_seen_at` | timestamp with time zone | NO | `now()` |
+| `last_success_at` | timestamp with time zone | YES | `—` |
+| `last_failure_at` | timestamp with time zone | YES | `—` |
+| `cooldown_until` | timestamp with time zone | YES | `—` |
+| `cooldown_reason` | text | YES | `—` |
+| `created_at` | timestamp with time zone | NO | `now()` |
+| `updated_at` | timestamp with time zone | NO | `now()` |
 
 ## `nexus_purpose_model`
 
@@ -1206,6 +1295,39 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `profile_id` | uuid | NO | `—` |
 | `mcp_server_id` | uuid | NO | `—` |
 
+## `project_code_edges`
+
+| Colonna | Tipo | Nullable | Default |
+|---|---|---|---|
+| `project_id` | uuid | NO | `—` |
+| `from_path` | text | NO | `—` |
+| `to_path` | text | NO | `—` |
+| `edge_kind` | text | NO | `—` |
+| `weight` | real | NO | `1.0` |
+| `source` | text | NO | `—` |
+| `created_at` | timestamp with time zone | NO | `now()` |
+
+## `project_code_nodes`
+
+| Colonna | Tipo | Nullable | Default |
+|---|---|---|---|
+| `project_id` | uuid | NO | `—` |
+| `file_path` | text | NO | `—` |
+| `lang` | text | YES | `—` |
+| `content_hash` | text | YES | `—` |
+| `last_seen_at` | timestamp with time zone | NO | `now()` |
+
+## `project_code_tests`
+
+| Colonna | Tipo | Nullable | Default |
+|---|---|---|---|
+| `project_id` | uuid | NO | `—` |
+| `test_path` | text | NO | `—` |
+| `covers_path` | text | NO | `—` |
+| `method` | text | NO | `—` |
+| `confidence` | real | NO | `0.6` |
+| `created_at` | timestamp with time zone | NO | `now()` |
+
 ## `project_database_config`
 
 | Colonna | Tipo | Nullable | Default |
@@ -1254,6 +1376,19 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `created_at` | timestamp with time zone | NO | `now()` |
 | `updated_at` | timestamp with time zone | NO | `now()` |
 
+## `project_impact_runs`
+
+| Colonna | Tipo | Nullable | Default |
+|---|---|---|---|
+| `id` | uuid | NO | `gen_random_uuid()` |
+| `run_id` | uuid | YES | `—` |
+| `change_request_note_id` | uuid | YES | `—` |
+| `project_id` | uuid | YES | `—` |
+| `seed_paths` | ARRAY | YES | `—` |
+| `impact_paths` | jsonb | YES | `—` |
+| `gate_status` | text | YES | `—` |
+| `created_at` | timestamp with time zone | NO | `now()` |
+
 ## `project_knowledge_links`
 
 | Colonna | Tipo | Nullable | Default |
@@ -1288,6 +1423,14 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `updated_at` | timestamp with time zone | NO | `now()` |
 | `last_accessed_at` | timestamp with time zone | YES | `—` |
 | `kind` | text | NO | `'chat'::text` |
+| `off_topic` | boolean | NO | `false` |
+| `relevance_score` | real | YES | `—` |
+| `source_kind` | text | NO | `'native'::text` |
+| `external_source_id` | text | YES | `—` |
+| `context_stale_at` | timestamp with time zone | YES | `—` |
+| `deprecated_at` | timestamp with time zone | YES | `—` |
+| `superseded_by` | uuid | YES | `—` |
+| `archived_at` | timestamp with time zone | YES | `—` |
 
 ## `project_knowledge_tags`
 
