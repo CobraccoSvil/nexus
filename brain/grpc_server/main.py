@@ -370,9 +370,17 @@ def _get_agent_router_client() -> object | None:
     if _agent_router_client is None:
         try:
             from brain.grpc_clients.agent_router_client import AgentRouterClient
-            addr = os.environ.get("AGENT_ROUTER_ADDR", "127.0.0.1:50072")
-            _agent_router_client = AgentRouterClient(address=addr)
-            logger.info("AgentRouterClient inizializzato su %s", addr)
+            # Non passare un address hardcoded (regola G: il DB e' l'unica fonte
+            # di verita'). Il costruttore risolve la gerarchia canonica
+            # env AGENT_ROUTER_ADDR > settings.agent_router_addr (DB) > default.
+            # Il vecchio default qui era '127.0.0.1:50072', porta storica
+            # dismessa: mcp-core espone AgentRouter su 50501 (mig 0190/0239),
+            # quindi il client falliva sempre con Connection refused.
+            _agent_router_client = AgentRouterClient()
+            logger.info(
+                "AgentRouterClient inizializzato su %s",
+                getattr(_agent_router_client, "address", "?"),
+            )
         except Exception as exc:
             logger.error("AgentRouterClient non disponibile: %s", exc)
             _agent_router_client = None

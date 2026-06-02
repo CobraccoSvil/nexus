@@ -782,7 +782,7 @@ pub fn read_listening_ports_proc() -> Vec<(u16, u32, String)> {
 ///
 /// Range riservato HTTP:  4000–4079  (microservizi Nexus)
 /// Range riservato gRPC:  4100–4139  (canali gRPC interni, target migrazione)
-/// Porte gRPC attuali:    50051–50072 (in uso finché non migrati)
+/// Porte gRPC attuali:    50051–50501 (in uso finché non migrati)
 /// Progetti utente:       5000+ (assegnate da find_free_port)
 pub const NEXUS_RESERVED_PORTS: &[u16] = &[
     // Porte di sistema
@@ -799,8 +799,8 @@ pub const NEXUS_RESERVED_PORTS: &[u16] = &[
     4070,  // neural-core REST (target migrazione da 8001)
     // ── gRPC interno Nexus (4100-4139, target migrazione) ─────────────────
     4100,  // neural-core gRPC (target da 50051)
-    4110,  // tool-runner gRPC (target da 50071)
-    4120,  // agent-router gRPC (target da 50072)
+    4110,  // tool-runner gRPC (target da 50500)
+    4120,  // agent-router gRPC (target da 50501)
     4130,  // presidio gRPC (target da 50052)
     // ── web-ide attuale ───────────────────────────────────────────────────
     3000,  // Nexus web-ide (attuale)
@@ -808,8 +808,8 @@ pub const NEXUS_RESERVED_PORTS: &[u16] = &[
     8001,  // neural-core REST (attuale)
     50051, // neural-core gRPC
     50052, // presidio gRPC
-    50071, // tool-runner gRPC
-    50072, // agent-router gRPC
+    50500, // tool-runner gRPC (reale, vedi mig 0239)
+    50501, // agent-router gRPC (reale, vedi mig 0190/0239)
     // ── Database e infrastruttura ─────────────────────────────────────────
     5432, 5433,   // PostgreSQL
     6333, 6334,   // Qdrant REST + gRPC
