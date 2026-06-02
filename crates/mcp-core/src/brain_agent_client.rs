@@ -127,6 +127,43 @@ async fn load_o_series_essential_tools(db: &PgPool) -> Vec<String> {
     }
 }
 
+/// M16 — True se il setting `agent.tools.discovery_first_enabled` e' attivo.
+/// Default false (opt-in). DB-driven (regola G), niente fallback hardcoded ON.
+async fn is_discovery_first_enabled(db: &PgPool) -> bool {
+    let v: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM settings WHERE key = 'agent.tools.discovery_first_enabled' LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    v.map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "false" | "0" | "off" | "no" | ""))
+        .unwrap_or(false)
+}
+
+/// M16 — Whitelist dei tool del primo turno discovery-only (CSV in
+/// `agent.tools.discovery_first_whitelist`). Fallback ai 2 tool di discovery.
+async fn load_discovery_tools(db: &PgPool) -> Vec<String> {
+    let csv: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM settings WHERE key = 'agent.tools.discovery_first_whitelist' LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    match csv {
+        Some(s) if !s.trim().is_empty() => s
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
+        _ => vec![
+            "nexus_mcp_tool_search".to_string(),
+            "nexus_mcp_tool_call".to_string(),
+        ],
+    }
+}
+
 /// Filtra il JSON tools lasciando solo quelli il cui `name` e' nella whitelist.
 fn filter_tools_by_whitelist(tools: Value, whitelist: &[String]) -> Value {
     let arr = match tools.as_array() {
@@ -314,6 +351,21 @@ pub async fn build_tools_json_for_agent(
     // (mig 0132) — niente lista hardcoded nel codice (regola G CLAUDE.md).
     let readonly_whitelist = load_study_mode_readonly_tools(db).await;
     let after_mode = filter_tools_by_automation_mode(full_tools, automation_mode, &readonly_whitelist);
+
+    // M16 — Progressive tool disclosure: se discovery-first e' attivo, il set
+    // INIZIALE passato al brain contiene SOLO i 2 tool di discovery
+    // (nexus_mcp_tool_search/call). Il brain (state.py + nodes.py) intercetta i
+    // risultati di search e inietta i tool scoperti come native per il turno
+    // successivo. Lista minima -> meno MALFORMED su Gemini, prompt piu' snello.
+    // Priorita' sopra il filtro o-series. tool_choice resta 'auto'.
+    if is_discovery_first_enabled(db).await {
+        let discovery = load_discovery_tools(db).await;
+        tracing::info!(
+            "build_tools_json: discovery-first attivo (model='{}') — primo turno {} tool di discovery",
+            model, discovery.len()
+        );
+        return filter_tools_by_whitelist(after_mode, &discovery);
+    }
 
     // Riduzione tool per modelli o-series (o1/o3/o4-mini): questi modelli non
     // supportano `tool_choice` e con 40+ tool tendono a narrare senza fare

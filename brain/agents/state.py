@@ -60,6 +60,10 @@ class AgentState(TypedDict, total=False):
     recent_tool_signatures: list[str]
     # Tools dichiarati al modello (schema Anthropic-compatible).
     tools_json: list[dict]
+    # M16 — Tool scoperti via nexus_mcp_tool_search da iniettare come native nel
+    # SOLO turno successivo. Reducer di default (overwrite): [] azzera i
+    # discovered del turno precedente, garantendo durata esatta 1 turno.
+    discovered_tools_next_turn: list[dict]
     # System prompt del profilo agente (vuoto = default).
     system_text: str
     # Session/tool runner wiring (iniettati dal chiamante di /agent/run).
