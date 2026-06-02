@@ -3984,11 +3984,20 @@ pub async fn send_chat_message(
                             .await;
                         }
 
+                        let _run_completed = matches!(result.status, crate::agent_types::AgentRunStatus::Completed);
                         crate::agent_types::finalize_agent_run(
                             &db_clone2, new_run_id,
                             result.status, result.final_answer.as_deref(),
                             result.iteration_count,
                         ).await;
+
+                        // M12.1: ingestione automatica del resoconto nella KB
+                        // (nota agent_summary + embedding + auto-link). Best-effort.
+                        if _run_completed {
+                            crate::knowledge::ingest_run::ingest_run_summary_to_kb(
+                                &db_clone2, &neural2, new_run_id,
+                            ).await;
+                        }
                     });
 
                     return Ok(Json(json!({
