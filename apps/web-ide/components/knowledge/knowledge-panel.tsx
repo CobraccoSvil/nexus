@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useI18n } from "../../lib/i18n";
 import { NotesTab } from "./notes-tab";
 import { TagsTab } from "./tags-tab";
@@ -17,6 +17,14 @@ type TabKey = "notes" | "code-wiki" | "tags" | "search" | "graph";
 export function KnowledgePanel({ project }: Props) {
   const { t } = useI18n();
   const [activeTab, setActiveTab] = useState<TabKey>("notes");
+
+  // Navigazione codice -> doc: quando l'editor chiede la doc di un file,
+  // passa alla tab Code Wiki (CodeWikiTab selezionera' la nota del file).
+  useEffect(() => {
+    const handler = () => setActiveTab("code-wiki");
+    window.addEventListener("nexus:kb:open-code-doc", handler);
+    return () => window.removeEventListener("nexus:kb:open-code-doc", handler);
+  }, []);
 
   const tabs: Array<{ key: TabKey; label: string }> = [
     { key: "notes", label: t("knowledge.tab.notes") },

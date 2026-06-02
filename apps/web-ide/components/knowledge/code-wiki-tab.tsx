@@ -144,6 +144,42 @@ export function CodeWikiTab({ projectId }: Props) {
     load();
   }, [load]);
 
+  // Navigazione codice -> doc: l'editor emette nexus:kb:open-code-doc con il
+  // path del file; selezioniamo la nota code_doc corrispondente (match
+  // flessibile per gestire path relativo/assoluto).
+  useEffect(() => {
+    const handler = async (ev: Event) => {
+      const ce = ev as CustomEvent<{ filePath?: string }>;
+      const fp = ce.detail?.filePath;
+      if (!fp) return;
+      try {
+        const r = await listKnowledgeNotes(projectId, {
+          tag: "kind:code_doc",
+          q: fp,
+          limit: 50,
+        });
+        const notes = r.notes || [];
+        const match =
+          notes.find((n) => n.title === fp) ||
+          notes.find((n) => fp.endsWith(n.title) || n.title.endsWith(fp)) ||
+          notes[0];
+        if (match) {
+          setSelectedNoteId(match.id);
+          setError(null);
+        } else {
+          setSelectedNoteId(null);
+          setError(
+            `Nessuna documentazione per "${fp}". Premi "Genera / Aggiorna Code Wiki".`,
+          );
+        }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    };
+    window.addEventListener("nexus:kb:open-code-doc", handler);
+    return () => window.removeEventListener("nexus:kb:open-code-doc", handler);
+  }, [projectId]);
+
   const toggle = (p: string) =>
     setExpanded((prev) => {
       const next = new Set(prev);

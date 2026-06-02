@@ -324,10 +324,32 @@ export function EditorArea({
               </span>
             </div>
           ))}
-          {/* Toggle Source/Preview per file markdown */}
-          {activeTab && isMarkdownPath(activeTab.path) && (
+          {/* Azioni a destra: Doc (Code Wiki) del file + toggle markdown */}
+          {activeTab && (
             <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", padding: "0 8px", gap: 4 }}>
-              {(["source", "preview"] as const).map((mode) => {
+              <button
+                onClick={() =>
+                  window.dispatchEvent(
+                    new CustomEvent("nexus:kb:open-code-doc", {
+                      detail: { filePath: activeTab.path },
+                    }),
+                  )
+                }
+                title="Apri la documentazione (Code Wiki) di questo file"
+                style={{
+                  padding: "3px 10px",
+                  fontSize: 11,
+                  borderRadius: 4,
+                  border: `1px solid ${tc.border}`,
+                  background: tc.bgCard,
+                  color: "#7c3aed",
+                  cursor: "pointer",
+                }}
+              >
+                Doc
+              </button>
+              {isMarkdownPath(activeTab.path) &&
+                (["source", "preview"] as const).map((mode) => {
                 const current = activeTab.viewMode ?? "preview";
                 const isActive = current === mode;
                 return (

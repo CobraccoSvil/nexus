@@ -471,6 +471,15 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     return () => window.removeEventListener("nexus:editor:open-file", handler);
   }, []);
 
+  // Bridge `nexus:kb:open-code-doc` -> apre la sidebar Knowledge (la tab
+  // Code Wiki e la selezione della nota del file sono gestite da KnowledgePanel
+  // e CodeWikiTab, che ascoltano lo stesso evento). Navigazione codice -> doc.
+  useEffect(() => {
+    const handler = () => setActiveSidebarView("knowledge");
+    window.addEventListener("nexus:kb:open-code-doc", handler);
+    return () => window.removeEventListener("nexus:kb:open-code-doc", handler);
+  }, []);
+
   // Bridge globale `nexus:sql:open` -> apri pannello SQL nella colonna destra.
   // Permette al markdown renderer della chat (chip "Esegui" sui blocchi ```sql)
   // di aprire il pannello SQL e pre-compilare l'editor.
