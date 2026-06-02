@@ -437,6 +437,23 @@ pub async fn probe_provider_once(
 
     match result {
         Ok(Ok(response)) => {
+            // error_class CANONICO dal response: il brain riformatta l'errore in
+            // un messaggio umano che NON inizia con "[Error:", quindi senza
+            // questo check la recovery-loop credeva il provider sano e lo
+            // riabilitava (bug: openai/anthropic senza credito tornavano attivi).
+            let ec = response
+                .get("error_class")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    response
+                        .get("metadata")
+                        .and_then(|m| m.get("error_class"))
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("");
+            if !ec.is_empty() {
+                return outcome_from_error_class(ec);
+            }
             let content_text = extract_response_content_text(&response);
             let trimmed = content_text.trim();
             if trimmed.starts_with("[Error:") || trimmed.starts_with("[error:") {
