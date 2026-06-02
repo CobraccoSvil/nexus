@@ -271,6 +271,23 @@ class GoogleProvider(BaseProvider):
             self._clients_by_loop[loop_id] = (client, signature)
         return self._clients_by_loop[loop_id][0]
 
+    async def aclose_current_loop_clients(self) -> None:
+        """Chiude il client genai (httpx.AsyncClient) legato al loop corrente,
+        rimuovendolo dalla cache. Va chiamato dal wrapper sync PRIMA di chiudere
+        il loop, per evitare 'Event loop is closed' nel finalizer di httpx."""
+        try:
+            loop_id = id(asyncio.get_running_loop())
+        except RuntimeError:
+            return
+        entry = self._clients_by_loop.pop(loop_id, None)
+        if not entry:
+            return
+        client = entry[0]
+        try:
+            await client.aio.aclose()
+        except Exception:
+            pass
+
     def _is_configured(self) -> tuple[bool, str]:
         """Verifica che il backend selezionato abbia config sufficiente.
 

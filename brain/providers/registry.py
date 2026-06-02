@@ -30,6 +30,18 @@ logger = logging.getLogger(__name__)
 # il loop di chiamate Anthropic 400 ogni turno.
 _PROVIDER_COOLDOWN_TTL_FALLBACK_S = 600  # solo fallback se DB down (regola G)
 _provider_cooldown_until: dict[str, float] = {}
+# Cache del set di provider in cooldown letto dal DB (persistente in
+# nexus_provider_health, mig 0255). TTL breve per non interrogare a ogni turno.
+_db_cooldown_set_cached: set[str] = set()
+_db_cooldown_cache_ts: float = 0.0
+_DB_COOLDOWN_CACHE_TTL_S = 30.0
+
+
+def _cooldown_db_url() -> str:
+    return os.environ.get(
+        "DATABASE_URL",
+        "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
+    )
 
 
 def _billing_cooldown_ttl_s() -> int:
@@ -42,27 +54,91 @@ def _billing_cooldown_ttl_s() -> int:
         return _PROVIDER_COOLDOWN_TTL_FALLBACK_S
 
 
+def _db_cooldown_providers() -> set[str]:
+    """Provider in billing-cooldown secondo il DB (persistente, cache 30s)."""
+    global _db_cooldown_set_cached, _db_cooldown_cache_ts
+    now = time.monotonic()
+    if now - _db_cooldown_cache_ts < _DB_COOLDOWN_CACHE_TTL_S:
+        return _db_cooldown_set_cached
+    try:
+        import psycopg2  # type: ignore[import]
+        with psycopg2.connect(_cooldown_db_url()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT provider FROM nexus_provider_health "
+                    "WHERE billing_cooldown_until IS NOT NULL "
+                    "  AND billing_cooldown_until > NOW()"
+                )
+                rows = cur.fetchall()
+        _db_cooldown_set_cached = {str(r[0]).lower() for r in rows}
+        _db_cooldown_cache_ts = now
+    except Exception as e:
+        logger.debug("cooldown DB read fallito: %s", e)
+    return _db_cooldown_set_cached
+
+
 def _is_in_billing_cooldown(provider: str) -> bool:
-    """True se il provider e' in cooldown billing-error attivo."""
-    until = _provider_cooldown_until.get(provider.lower())
-    if until is None:
-        return False
-    if time.monotonic() >= until:
-        # Scaduto: pulisci entry
-        _provider_cooldown_until.pop(provider.lower(), None)
-        return False
-    return True
+    """True se il provider e' in cooldown billing-error attivo (in-memory o DB)."""
+    key = provider.lower()
+    until = _provider_cooldown_until.get(key)
+    if until is not None:
+        if time.monotonic() < until:
+            return True
+        _provider_cooldown_until.pop(key, None)
+    return key in _db_cooldown_providers()
 
 
-def _mark_billing_cooldown(provider: str) -> None:
-    """Registra un provider in cooldown billing-error per il TTL DB-driven."""
+def _mark_billing_cooldown(provider: str, reason: str = "billing_error") -> None:
+    """Registra un provider in cooldown (in-memory + DB persistente, mig 0255)."""
+    global _db_cooldown_cache_ts
     key = provider.lower()
     ttl = _billing_cooldown_ttl_s()
     _provider_cooldown_until[key] = time.monotonic() + ttl
+    try:
+        import psycopg2  # type: ignore[import]
+        with psycopg2.connect(_cooldown_db_url()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO nexus_provider_health "
+                    "(provider, billing_cooldown_until, last_error, updated_at) "
+                    "VALUES (%s, NOW() + (%s || ' seconds')::interval, %s, NOW()) "
+                    "ON CONFLICT (provider) DO UPDATE SET "
+                    "  billing_cooldown_until = EXCLUDED.billing_cooldown_until, "
+                    "  last_error = EXCLUDED.last_error, updated_at = NOW()",
+                    (key, str(ttl), reason),
+                )
+            conn.commit()
+        _db_cooldown_cache_ts = 0.0  # invalida cache
+    except Exception as e:
+        logger.debug("cooldown DB write fallito: %s", e)
     logger.warning(
-        "Provider %s in billing-error cooldown locale per %ds (skip nelle prossime richieste)",
-        provider, ttl,
+        "Provider %s in billing-cooldown (%s) per %ds (skip nelle prossime richieste)",
+        provider, reason, ttl,
     )
+
+
+def _clear_billing_cooldown(provider: str) -> None:
+    """Ripristino automatico: azzera il cooldown del provider al primo successo."""
+    global _db_cooldown_cache_ts
+    key = provider.lower()
+    had_mem = _provider_cooldown_until.pop(key, None) is not None
+    if not had_mem and key not in _db_cooldown_set_cached:
+        return
+    try:
+        import psycopg2  # type: ignore[import]
+        with psycopg2.connect(_cooldown_db_url()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE nexus_provider_health "
+                    "SET billing_cooldown_until = NULL, updated_at = NOW() "
+                    "WHERE provider = %s AND billing_cooldown_until IS NOT NULL",
+                    (key,),
+                )
+            conn.commit()
+        _db_cooldown_cache_ts = 0.0
+        logger.info("Provider %s ripristinato (cooldown azzerato dopo un 200)", provider)
+    except Exception as e:
+        logger.debug("cooldown DB clear fallito: %s", e)
 
 
 def get_billing_cooldown_snapshot() -> dict[str, int]:
@@ -747,6 +823,18 @@ class ProviderRegistry:
                             prov.generate_agent_turn(prov_model, messages, tools, max_tokens, system_text=system_text)
                         )
                     finally:
+                        # Chiudi i client async (es. httpx di google-genai) legati a
+                        # QUESTO loop PRIMA di chiuderlo: altrimenti il finalizer del
+                        # client gira su un loop gia' chiuso -> "Event loop is closed".
+                        try:
+                            if hasattr(prov, "aclose_current_loop_clients"):
+                                loop.run_until_complete(prov.aclose_current_loop_clients())
+                        except Exception:
+                            pass
+                        try:
+                            loop.run_until_complete(loop.shutdown_asyncgens())
+                        except Exception:
+                            pass
                         loop.close()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                     return pool.submit(_run).result(timeout=90)
@@ -812,6 +900,11 @@ class ProviderRegistry:
                 or result.metadata.get("error_class") == "billing_error"
             ):
                 _mark_billing_cooldown(effective_provider)
+            elif result.metadata.get("stop_reason") not in (
+                "rate_limit", "overloaded", "provider_error", "error", "timeout",
+            ):
+                # Chiamata andata a buon fine: ripristina il provider (auto-enable).
+                _clear_billing_cooldown(effective_provider)
 
         # Fallback a cascata: se il provider fallisce per errori retriable (billing/quota/errore),
         # proviamo i provider successivi nella chain dinamica (DB-driven, niente hardcoded).
@@ -905,6 +998,8 @@ class ProviderRegistry:
                 ):
                     _mark_billing_cooldown(fb_prov)
                 if not _should_fallback(fb_result):
+                    # Fallback riuscito: ripristina il provider che ha risposto.
+                    _clear_billing_cooldown(fb_prov)
                     return fb_result
                 # Continua al prossimo fallback
                 result = fb_result
