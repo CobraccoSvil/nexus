@@ -28,8 +28,18 @@ logger = logging.getLogger(__name__)
 # Una soluzione piu' completa (con notifica UI via mcp-core) e' tracciata
 # nel task #30 — qui implementiamo solo il cooldown lato brain per evitare
 # il loop di chiamate Anthropic 400 ogni turno.
-_PROVIDER_COOLDOWN_TTL_S = 600
+_PROVIDER_COOLDOWN_TTL_FALLBACK_S = 600  # solo fallback se DB down (regola G)
 _provider_cooldown_until: dict[str, float] = {}
+
+
+def _billing_cooldown_ttl_s() -> int:
+    """TTL del cooldown billing (secondi), DB-driven (regola G). Default 600 se
+    il setting manca o il DB e' irraggiungibile."""
+    try:
+        from brain.utils.settings_db import get_int_setting
+        return get_int_setting("providers.billing_cooldown_seconds", _PROVIDER_COOLDOWN_TTL_FALLBACK_S)
+    except Exception:
+        return _PROVIDER_COOLDOWN_TTL_FALLBACK_S
 
 
 def _is_in_billing_cooldown(provider: str) -> bool:
@@ -45,12 +55,13 @@ def _is_in_billing_cooldown(provider: str) -> bool:
 
 
 def _mark_billing_cooldown(provider: str) -> None:
-    """Registra un provider in cooldown billing-error per `_PROVIDER_COOLDOWN_TTL_S`."""
+    """Registra un provider in cooldown billing-error per il TTL DB-driven."""
     key = provider.lower()
-    _provider_cooldown_until[key] = time.monotonic() + _PROVIDER_COOLDOWN_TTL_S
+    ttl = _billing_cooldown_ttl_s()
+    _provider_cooldown_until[key] = time.monotonic() + ttl
     logger.warning(
         "Provider %s in billing-error cooldown locale per %ds (skip nelle prossime richieste)",
-        provider, _PROVIDER_COOLDOWN_TTL_S,
+        provider, ttl,
     )
 
 
