@@ -34,9 +34,19 @@ if [ -f "$ENV_FILE" ]; then
     DATABASE_URL="${DATABASE_URL:-$(_read_env DATABASE_URL)}"
     POSTGRES_URL="${POSTGRES_URL:-$(_read_env POSTGRES_URL)}"
     JWT_SECRET="${JWT_SECRET:-$(_read_env JWT_SECRET)}"
-    NEXUS_GATEWAY_PORT="${NEXUS_GATEWAY_PORT:-$(_read_env NEXUS_GATEWAY_PORT)}"
-    export DATABASE_URL POSTGRES_URL JWT_SECRET NEXUS_GATEWAY_PORT
+    # NB: le PORTE dei servizi NON si leggono piu' da .env (regola G): ogni
+    # servizio le risolve dal DB (settings) all'avvio. Qui esportiamo solo le
+    # credenziali di bootstrap necessarie a raggiungere il DB.
+    export DATABASE_URL POSTGRES_URL JWT_SECRET
 fi
+
+# Helper: legge una porta dal DB (settings) per gli health-check dello script.
+# Stessa fonte di verita' dei servizi (regola G). Usa il container Postgres
+# Nexus; se non raggiungibile ritorna vuoto (health-check degradato, non fatale).
+_db_port() {
+    docker exec ideai-postgres-nexus-1 psql -U nexus -d nexus -tAc \
+        "SELECT value FROM settings WHERE key = '$1'" 2>/dev/null | tr -d '[:space:]'
+}
 
 log() { echo "==> $*"; }
 
@@ -208,8 +218,9 @@ start_service() {
 
 # Mappa dei servizi con eventuali env var extra necessarie all'avvio.
 # Formato: "nome:VAR1=val1:VAR2=val2" — le coppie dopo il primo ":" sono env var.
+# NB: nessuna porta qui (regola G): browser-bridge-mcp risolve browser_bridge_port
+# dal DB all'avvio, come tutti gli altri servizi.
 declare -A SERVICE_ENV
-SERVICE_ENV["browser-bridge-mcp"]="BROWSER_BRIDGE_PORT=${BROWSER_BRIDGE_PORT:-4055}"
 
 start_service_with_env() {
     local name="$1"
@@ -244,13 +255,22 @@ stop_gateway() {
     sleep 1
 }
 
+build_gateway() {
+    # Il gateway e' TypeScript: senza questo build dist/server.js non esiste e
+    # start_gateway fallisce con "file non trovato". turbo builda anche le
+    # dipendenze workspace (@nexus/shared, @nexus/llm-gateway, @nexus/audit).
+    log "Build nexus-gateway (TypeScript)..."
+    pnpm exec turbo run build --filter=@ideai/nexus-gateway-server
+}
+
 start_gateway() {
     local logfile="/tmp/nexus-gateway.log"
+    # Niente NEXUS_GATEWAY_PORT (regola G): il gateway risolve nexus_gateway_port
+    # dal DB all'avvio. Qui solo le credenziali DB e i file di config.
     setsid nohup env \
         NODE_ENV=production \
         DATABASE_URL="${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}" \
         POSTGRES_URL="${POSTGRES_URL:-${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}}" \
-        NEXUS_GATEWAY_PORT="${NEXUS_GATEWAY_PORT:-4060}" \
         NEXUS_LLM_POLICY_FILE="${NEXUS_LLM_POLICY_FILE:-${ROOT}/config/policies/default.yaml}" \
         NEXUS_MODEL_ALIASES_FILE="${NEXUS_MODEL_ALIASES_FILE:-${ROOT}/config/model-aliases.yaml}" \
         JWT_SECRET="${JWT_SECRET:-}" \
@@ -378,6 +398,7 @@ if [ -n "$SINGLE_SERVICE" ]; then
             start_brain
             ;;
         gateway)
+            build_gateway
             stop_gateway
             start_gateway
             ;;
@@ -434,30 +455,25 @@ cargo build ${CARGO_PROFILE_FLAG} --workspace 2>&1 | tail -10
 build_webide
 
 log "Arresto servizi in esecuzione..."
-for svc in mcp-core admin-service chat-service billing-service doc-service plugin-service browser-bridge-mcp "brain.grpc_server.main" "nexus-gateway" "apps/nexus-gateway"; do
+# I servizi Rust si fermano con stop_service (pattern target/<profilo>/<nome>).
+# brain e gateway NON sono binari Rust: vanno fermati con le loro funzioni
+# dedicate (pattern 'brain.grpc_server.main' / 'dist/server.js'), altrimenti
+# stop_service non li matcha e restano processi orfani (doppio brain).
+for svc in mcp-core admin-service chat-service billing-service doc-service plugin-service browser-bridge-mcp; do
     stop_service "$svc"
 done
+stop_brain
+stop_gateway
 stop_webide
 sleep 2
 
-log "Avvio Neural Core (Python) con REST endpoint su :8001..."
-setsid nohup env DATABASE_URL="${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}" \
-    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-    python3 -m brain.grpc_server.main --rest > /tmp/nexus-neural.log 2>&1 < /dev/null &
-disown || true
+log "Avvio Neural Core (Python, porte dal DB)..."
+start_brain
 sleep 4
 
-log "Avvio Nexus Gateway (Node.js su :4060)..."
-setsid nohup env \
-    NODE_ENV=production \
-    DATABASE_URL="${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}" \
-    POSTGRES_URL="${POSTGRES_URL:-${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}}" \
-    NEXUS_GATEWAY_PORT="${NEXUS_GATEWAY_PORT:-4060}" \
-    NEXUS_LLM_POLICY_FILE="${NEXUS_LLM_POLICY_FILE:-${ROOT}/config/policies/default.yaml}" \
-    NEXUS_MODEL_ALIASES_FILE="${NEXUS_MODEL_ALIASES_FILE:-${ROOT}/config/model-aliases.yaml}" \
-    JWT_SECRET="${JWT_SECRET:-}" \
-    node "${ROOT}/apps/nexus-gateway/dist/server.js" > /tmp/nexus-gateway.log 2>&1 < /dev/null &
-disown || true
+log "Avvio Nexus Gateway (Node.js, porta dal DB)..."
+build_gateway
+start_gateway
 sleep 2
 
 log "Avvio mcp-core..."
@@ -483,32 +499,37 @@ start_webide
 sleep 3
 
 echo ""
-log "Porte attive:"
-ss -tlnp 2>/dev/null | grep -E '3000|4000|4010|4020|4030|4040|4050|4055|4060|8001' || true
-
-echo ""
-log "Health check:"
-declare -A PORT_LABEL=(
-    [3000]="web-ide          "
-    [4000]="mcp-core         "
-    [4010]="admin-service    "
-    [4020]="chat-service     "
-    [4030]="doc-service      "
-    [4040]="billing-service  "
-    [4050]="plugin-service   "
-    [4055]="browser-bridge   "
-    [4060]="nexus-gateway    "
-    [8001]="brain (Python)   "
-)
-for port in 3000 4000 4010 4020 4030 4040 4050 4055 4060 8001; do
-    label="${PORT_LABEL[$port]}"
-    # Per brain usa /health, per web-ide controlla semplicemente la connessione TCP
-    if [ "$port" = "3000" ]; then
+log "Health check (porte risolte dal DB - regola G):"
+# Coppie chiave_settings:nome. La porta viene dal DB, stessa fonte di verita'
+# usata dai servizi: niente liste di porte hardcoded nello script.
+for entry in \
+    "web_ide_port:web-ide" \
+    "mcp_core_http_port:mcp-core" \
+    "admin_service_port:admin-service" \
+    "chat_service_port:chat-service" \
+    "doc_service_port:doc-service" \
+    "billing_service_port:billing-service" \
+    "plugin_service_port:plugin-service" \
+    "browser_bridge_port:browser-bridge" \
+    "nexus_gateway_port:nexus-gateway" \
+    "brain_rest_port:brain"; do
+    key="${entry%%:*}"; name="${entry#*:}"
+    port="$(_db_port "$key")"
+    if [ -z "$port" ]; then
+        printf "  %-16s porta non leggibile dal DB (%s)\n" "$name" "$key"
+        continue
+    fi
+    # web-ide non espone /health: prova la root.
+    if [ "$key" = "web_ide_port" ]; then
         code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/" 2>/dev/null || echo "down")
     else
         code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/health" 2>/dev/null || echo "down")
     fi
-    [ "$code" = "200" ] && echo "  :${port} ${label} OK" || echo "  :${port} ${label} ${code}"
+    if [ "$code" = "200" ]; then
+        printf "  :%-5s %-16s OK\n" "$port" "$name"
+    else
+        printf "  :%-5s %-16s %s\n" "$port" "$name" "$code"
+    fi
 done
 
 echo ""
