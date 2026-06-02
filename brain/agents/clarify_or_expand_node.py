@@ -287,6 +287,41 @@ def _intake_gate(state: AgentState, user_msg: str, cfg: dict) -> dict | None:
     }
 
 
+def _note_implementation_status(note_id: str | None) -> dict[str, Any]:
+    """M14.4 — Risolve lo stato di implementazione di una nota: segue
+    source_run_id -> agent_runs.status e ritorna {implemented, run_status,
+    completed_at}. Best-effort: in caso di errore/DB down ritorna {}.
+    """
+    if not note_id:
+        return {}
+    url = os.environ.get("DATABASE_URL", "")
+    if not url:
+        return {}
+    try:
+        import psycopg2  # type: ignore[import-untyped]
+        with psycopg2.connect(url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT r.status, r.completed_at "
+                    "FROM project_knowledge_notes n "
+                    "JOIN agent_runs r ON r.id = n.source_run_id "
+                    "WHERE n.id = %s LIMIT 1",
+                    (note_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {}
+                status = str(row[0] or "")
+                return {
+                    "implemented": status == "completed",
+                    "run_status": status,
+                    "completed_at": str(row[1]) if row[1] else None,
+                }
+    except Exception as exc:
+        logger.debug("intake_gate: _note_implementation_status fallita (%s)", exc)
+        return {}
+
+
 def _apply_intake_verdict(state: AgentState, intake: dict, cfg: dict) -> dict[str, Any] | None:
     """Comp.1: traduce il verdetto del gate in azioni di flusso (riusa il
     meccanismo clarify/meta_step, niente nuovo HITL). Ritorna gli updates da
@@ -320,6 +355,9 @@ def _apply_intake_verdict(state: AgentState, intake: dict, cfg: dict) -> dict[st
         return None
 
     if relation == "duplicate":
+        # M14.4 request-aware: risolve se la nota duplicata e' stata davvero
+        # implementata (run completed) per arricchire il verdetto e la storia.
+        impl = _note_implementation_status(related.get("note_id"))
         ms = meta_steps.make(
             kind="clarify",
             title="Richiesta gia' elaborata",
@@ -330,16 +368,27 @@ def _apply_intake_verdict(state: AgentState, intake: dict, cfg: dict) -> dict[st
                 "source_title": related.get("title"),
                 "score": related.get("score"),
                 "rationale": rationale,
+                # M14.4: storia/stato implementazione (vuoto se non risolvibile).
+                "implemented": impl.get("implemented"),
+                "run_status": impl.get("run_status"),
+                "completed_at": impl.get("completed_at"),
             },
         )
         updates: dict[str, Any] = {}
         if ms:
             updates["meta_steps"] = [ms]
             meta_steps.persist_async(run_id, ms)
-        # Interattivo: ferma per conferma riuso. Automatico: segnala e prosegue.
-        if not is_auto:
+        # M14.4: se la richiesta e' GIA' implementata-e-verificata, chiede sempre
+        # conferma prima di rifarla, ANCHE in automatico (decisione utente:
+        # evitare di rifare lavoro gia' fatto). Gated kb.intake.confirm_if_implemented.
+        confirm_if_impl = bool(cfg.get("confirm_if_implemented", True))
+        force_confirm = confirm_if_impl and impl.get("implemented")
+        if not is_auto or force_confirm:
             updates["pending_clarify"] = True
-        logger.info("intake_gate: duplicate di '%s' (auto=%s)", related.get("title"), is_auto)
+        logger.info(
+            "intake_gate: duplicate di '%s' (auto=%s, implemented=%s, force_confirm=%s)",
+            related.get("title"), is_auto, impl.get("implemented"), force_confirm,
+        )
         return updates
 
     if relation == "correction":
