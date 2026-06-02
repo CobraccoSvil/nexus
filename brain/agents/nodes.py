@@ -2275,6 +2275,29 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         if _added:
             logger.info("M16: iniettati %d tool scoperti come native -> tools=%d", _added, len(tools_json))
 
+    # ── M16 strategia "2 puri + native forzato" ──────────────────────────────
+    # Al turno di SCOPERTA (set esposto = solo i meta-tool di discovery, nessun
+    # tool gia' scoperto, e siamo al primo turno agente) esponiamo SOLO
+    # nexus_mcp_tool_search e rimuoviamo nexus_mcp_tool_call: cosi' il modello,
+    # forzato da tool_choice (first_turn_force), e' costretto a CERCARE i tool che
+    # gli servono invece di eseguire a vuoto o narrare. I tool trovati vengono
+    # estratti da tool_dispatch_node e iniettati come native al turno successivo
+    # (search->inject). Ai turni con native iniettati, o dopo il primo turno, si
+    # lascia il set completo + tool_choice auto (il modello usa i native o chiude,
+    # niente loop di chiusura).
+    _DISCOVERY_META = {"nexus_mcp_tool_search", "nexus_mcp_tool_call"}
+    if not _discovered and tools_json:
+        _names = {t.get("name") for t in tools_json if isinstance(t, dict)}
+        if _names and _names <= _DISCOVERY_META:
+            try:
+                from brain.providers._schema_utils import is_first_agent_turn
+                _is_first = is_first_agent_turn(state.get("messages") or [])
+            except Exception:
+                _is_first = True
+            if _is_first:
+                tools_json = [t for t in tools_json if t.get("name") == "nexus_mcp_tool_search"]
+                logger.info("M16: turno di scoperta -> espongo solo nexus_mcp_tool_search (forza search)")
+
     # ── Cluster 1: iniezione plan_rationale nel system_text ───────────────────
     # Se il planner ha prodotto un razionale (gated plan_rationale_enabled),
     # lo prependiamo al system_text dell'executor: cosi' chi esegue conosce il
@@ -3340,6 +3363,13 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     )
     _predictive_messages = list(state.get("messages") or [])
     _predictive_system = state.get("system_text") or ""
+    # M16: gate per la validazione tool-in-list nel loop sottostante.
+    _M16_META_TOOLS = {"nexus_mcp_tool_search", "nexus_mcp_tool_call"}
+    try:
+        from brain.utils.settings_db import get_bool_setting
+        _discovery_first_on = get_bool_setting("agent.tools.discovery_first_enabled", False)
+    except Exception:
+        _discovery_first_on = False
     for _i, b in enumerate(pending):
         name = b.get("name", "")
         # FIX D: predictive cap (ha priorita' sul budget allegati: se passa di qui,
@@ -3359,6 +3389,37 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
                 "is_error": True,
             })
             continue
+        # ── M16: validazione tool-in-list (discovery-first) ──────────────────
+        # Con discovery-first attivo il modello riceve solo i meta-tool
+        # (search/call). Se chiama un tool NON-meta che non e' stato scoperto via
+        # nexus_mcp_tool_search in questo turno (quindi non e' tra i
+        # discovered_tools_next_turn iniettati), lo rifiutiamo con un feedback che
+        # lo istruisce a cercarlo. Cosi' il modello e' costretto al pattern
+        # search->inject native invece di chiamare a memoria tool non esposti.
+        if _discovery_first_on:
+            _disc_now = {
+                d.get("name")
+                for d in (state.get("discovered_tools_next_turn") or [])
+                if isinstance(d, dict)
+            }
+            if name not in _M16_META_TOOLS and name not in _disc_now:
+                logger.info(
+                    "M16: tool '%s' non scoperto in questo turno -> rifiutato, forzo nexus_mcp_tool_search",
+                    name,
+                )
+                synthetic_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": b.get("id", ""),
+                    "content": json.dumps({
+                        "error": (
+                            f"Il tool '{name}' non e' disponibile direttamente in questo turno. "
+                            f"Usa prima nexus_mcp_tool_search (query: \"{name}\") per scoprirlo, "
+                            f"poi richiamalo al turno successivo."
+                        )
+                    }),
+                    "is_error": True,
+                })
+                continue
         if name in _ATTACHMENT_READ_TOOLS and current_bytes >= budget_total:
             err_payload = {
                 "error": (
@@ -3603,6 +3664,14 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
                     "description": (_res.get("description") or "")[:500],
                     "input_schema": _schema,
                 })
+
+    # Tracciamento M16: se il modello ha cercato, quanti tool sono stati estratti
+    # per l'iniezione native al turno successivo.
+    if any(b.get("name") == "nexus_mcp_tool_search" for b in pending):
+        logger.info(
+            "M16-TRACE dispatch: nexus_mcp_tool_search chiamato -> %d tool estratti per native injection",
+            len(_discovered_next),
+        )
 
     return {
         "messages": [tool_msg],

@@ -18,9 +18,13 @@ from __future__ import annotations
 
 from typing import Any
 
+import logging
+
 from ._models import CanonicalTool, ProviderCapability
 from ._schema_utils import is_first_agent_turn
 from .tool_translator import dialect_for_capability
+
+logger = logging.getLogger(__name__)
 
 # stop_reason che indicano una chiusura "naturale" del turno (non un errore).
 _NATURAL_STOPS = {"end_turn", "stop", "", None}
