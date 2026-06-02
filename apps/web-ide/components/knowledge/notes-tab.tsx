@@ -47,6 +47,8 @@ export function NotesTab({ projectId }: Props) {
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
   const [statusFilter, setStatusFilter] = useState("");
+  // M12.6: filtro per kind (client-side sulle note caricate).
+  const [kindFilter, setKindFilter] = useState("");
   const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
@@ -406,6 +408,27 @@ export function NotesTab({ projectId }: Props) {
         ))}
       </div>
 
+      {/* M12.6: Filtri per kind (client-side) */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+        {["", "chat", "agent_summary", "subagent_summary", "nexus_changelog_cross"].map((k) => (
+          <button
+            key={k || "all-kind"}
+            onClick={() => setKindFilter(k)}
+            style={{
+              padding: "3px 10px",
+              fontSize: 11,
+              borderRadius: 12,
+              border: kindFilter === k ? "1px solid #047857" : "1px solid #d4d4d4",
+              background: kindFilter === k ? "#047857" : "#fff",
+              color: kindFilter === k ? "#fff" : "#525252",
+              cursor: "pointer",
+            }}
+          >
+            {k === "" ? "Ogni tipo" : k}
+          </button>
+        ))}
+      </div>
+
       {loading && <p style={{ fontSize: 12, color: "#a3a3a3" }}>...</p>}
 
       {!loading && notes.length === 0 && (
@@ -414,7 +437,7 @@ export function NotesTab({ projectId }: Props) {
         </p>
       )}
 
-      {notes.map((note) => (
+      {notes.filter((n) => !kindFilter || (n as { kind?: string }).kind === kindFilter).map((note) => (
         <div
           key={note.id}
           onClick={() => setSelectedNoteId(note.id)}
