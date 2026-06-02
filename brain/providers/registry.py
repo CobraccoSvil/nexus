@@ -539,6 +539,40 @@ def _enforce_quota_estimate(provider: str, model: str, estimated_prompt_tokens: 
     return (True, "")
 
 
+def _close_loop_safely(loop: "asyncio.AbstractEventLoop", provider_obj: object | None = None) -> None:
+    """Chiude un event loop dedicato senza lasciare 'Event loop is closed'.
+
+    I provider che usano client async basati su httpx/HTTP-2 (es. google-genai)
+    schedulano task di teardown delle connessioni alla chiusura. Se il loop
+    viene chiuso prima che questi completino, i loro callback girano su un loop
+    gia' chiuso e asyncio logga 'Task exception was never retrieved ...
+    RuntimeError: Event loop is closed'. Sequenza corretta, sul loop ANCORA
+    aperto:
+      1. chiudi i client async del provider legati a questo loop;
+      2. chiudi gli async generator;
+      3. cancella e drena i task residui;
+      4. solo allora chiudi il loop.
+    """
+    if provider_obj is not None and hasattr(provider_obj, "aclose_current_loop_clients"):
+        try:
+            loop.run_until_complete(provider_obj.aclose_current_loop_clients())  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    try:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+    except Exception:
+        pass
+    try:
+        pending = asyncio.all_tasks(loop)
+        if pending:
+            for task in pending:
+                task.cancel()
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    except Exception:
+        pass
+    loop.close()
+
+
 class ProviderRegistry:
     def __init__(self) -> None:
         self._providers: dict[str, BaseProvider] = {
@@ -593,7 +627,7 @@ class ProviderRegistry:
                 try:
                     return loop.run_until_complete(p.test_connection())
                 finally:
-                    loop.close()
+                    _close_loop_safely(loop, p)
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 return pool.submit(_run).result(timeout=15)
         except Exception as e:
@@ -629,7 +663,7 @@ class ProviderRegistry:
                 try:
                     return loop.run_until_complete(p.generate(model, prompt))
                 finally:
-                    loop.close()
+                    _close_loop_safely(loop, p)
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 result = pool.submit(_run).result(timeout=60)
                 usage = (result.metadata or {}).get("usage")
@@ -829,19 +863,11 @@ class ProviderRegistry:
                             prov.generate_agent_turn(prov_model, messages, tools, max_tokens, system_text=system_text)
                         )
                     finally:
-                        # Chiudi i client async (es. httpx di google-genai) legati a
-                        # QUESTO loop PRIMA di chiuderlo: altrimenti il finalizer del
-                        # client gira su un loop gia' chiuso -> "Event loop is closed".
-                        try:
-                            if hasattr(prov, "aclose_current_loop_clients"):
-                                loop.run_until_complete(prov.aclose_current_loop_clients())
-                        except Exception:
-                            pass
-                        try:
-                            loop.run_until_complete(loop.shutdown_asyncgens())
-                        except Exception:
-                            pass
-                        loop.close()
+                        # Teardown sicuro: chiude i client async del provider e
+                        # drena i task residui PRIMA di chiudere il loop, cosi'
+                        # il teardown HTTP/2 di google-genai non finisce su un
+                        # loop chiuso ("Event loop is closed").
+                        _close_loop_safely(loop, prov)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                     return pool.submit(_run).result(timeout=90)
             except Exception as exc:
