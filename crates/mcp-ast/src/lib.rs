@@ -49,16 +49,50 @@ pub struct AstIndex {
     pub line_count: usize,
 }
 
-pub fn detect_language(file_path: &str) -> &str {
-    match file_path.rsplit('.').next().unwrap_or("") {
+/// Rileva il linguaggio dall'estensione. Language-agnostic: i linguaggi senza
+/// parser dedicato ritornano comunque il loro nome reale (non "unknown") cosi'
+/// il generatore di documentazione AI sa quale linguaggio sta documentando e il
+/// fallback `extract_generic_symbols` estrae comunque i simboli principali.
+/// "unknown" e' riservato ai file senza estensione riconoscibile.
+pub fn detect_language(file_path: &str) -> &'static str {
+    let ext = file_path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
         "rs" => "rust",
-        "ts" | "tsx" => "typescript",
-        "js" | "jsx" => "javascript",
-        "py" => "python",
+        "ts" | "tsx" | "mts" | "cts" => "typescript",
+        "js" | "jsx" | "mjs" | "cjs" => "javascript",
+        "py" | "pyi" => "python",
         "go" => "go",
         "java" => "java",
+        "kt" | "kts" => "kotlin",
+        "swift" => "swift",
+        "scala" | "sc" => "scala",
+        "rb" => "ruby",
+        "php" => "php",
+        "cs" => "csharp",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        "m" | "mm" => "objc",
+        "lua" => "lua",
+        "sh" | "bash" | "zsh" => "shell",
+        "pl" | "pm" => "perl",
+        "r" => "r",
+        "dart" => "dart",
+        "ex" | "exs" => "elixir",
+        "erl" => "erlang",
+        "hs" => "haskell",
+        "clj" | "cljs" => "clojure",
         "sql" => "sql",
-        _ => "unknown",
+        "vue" => "vue",
+        "svelte" => "svelte",
+        "" => "unknown",
+        other => {
+            // Estensione non in elenco ma presente: la usiamo come etichetta
+            // linguaggio (best-effort) invece di scartare il file.
+            match other {
+                _ if other.len() <= 8 => "code",
+                _ => "unknown",
+            }
+        }
     }
 }
 
@@ -233,17 +267,63 @@ fn extract_python_symbols(lines: &[&str]) -> Vec<Symbol> {
     symbols
 }
 
+/// Estrattore generico language-agnostic per i linguaggi senza parser dedicato
+/// (Go, Java, C/C++, C#, Ruby, PHP, Kotlin, Swift, ...). Cattura i costrutti
+/// piu' comuni con euristiche che funzionano nella maggioranza dei linguaggi a
+/// graffe e a indentazione. Best-effort: la documentazione AI completa il resto.
 fn extract_generic_symbols(lines: &[&str]) -> Vec<Symbol> {
-    let fn_re = Regex::new(r"(?:function|fn|def|func)\s+(\w+)").unwrap();
+    let fn_re = Regex::new(r"\b(?:function|fn|def|func|sub|fun)\s+(\w+)").unwrap();
+    // Tipi: class/struct/interface/enum/trait/type/record/protocol/object.
+    // Include `type Nome` (Go: `type X struct`, TS/Swift type alias) oltre alle
+    // keyword che precedono direttamente il nome del tipo.
+    let type_re = Regex::new(
+        r"\b(?:class|struct|interface|enum|trait|record|protocol|object|type)\s+(\w+)",
+    )
+    .unwrap();
+    // Metodi a graffe stile C/Java/Go: `tipo Nome(...)` o `func (r R) Nome(...)`.
+    let method_re = Regex::new(r"^\s*(?:[\w<>:\*\&\[\] ]+\s+)?(\w+)\s*\([^;]*\)\s*\{?\s*$").unwrap();
+    let const_re = Regex::new(r"\b(?:const|val|let|final|static)\s+(\w+)").unwrap();
+
+    let public_re = Regex::new(r"\b(?:pub|public|export)\b").unwrap();
+    let private_re = Regex::new(r"\b(?:private|priv|internal)\b").unwrap();
+
     let mut symbols = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
+    let mut seen: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
+    for (i, raw) in lines.iter().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with('#') || line.starts_with('*') {
+            continue;
+        }
+        let vis = if public_re.is_match(line) {
+            Visibility::Public
+        } else if private_re.is_match(line) {
+            Visibility::Private
+        } else {
+            Visibility::Unknown
+        };
+
+        let mut push = |name: &str, kind: SymbolKind, syms: &mut Vec<Symbol>| {
+            if name.is_empty() {
+                return;
+            }
+            if seen.insert((name.to_string(), i + 1)) {
+                syms.push(Symbol { name: name.to_string(), kind, line: i + 1, visibility: vis.clone() });
+            }
+        };
+
+        if let Some(cap) = type_re.captures(line) {
+            push(&cap[1], SymbolKind::Class, &mut symbols);
+        }
         if let Some(cap) = fn_re.captures(line) {
-            symbols.push(Symbol {
-                name: cap[1].to_string(),
-                kind: SymbolKind::Function,
-                line: i + 1,
-                visibility: Visibility::Unknown,
-            });
+            push(&cap[1], SymbolKind::Function, &mut symbols);
+        } else if let Some(cap) = const_re.captures(line) {
+            push(&cap[1], SymbolKind::Constant, &mut symbols);
+        } else if let Some(cap) = method_re.captures(line) {
+            // Evita falsi positivi su keyword di controllo (if/for/while/switch).
+            let name = &cap[1];
+            if !matches!(name, "if" | "for" | "while" | "switch" | "catch" | "return" | "match") {
+                push(name, SymbolKind::Method, &mut symbols);
+            }
         }
     }
     symbols
@@ -364,6 +444,35 @@ pub async fn init() -> Result<()> { Ok(()) }
             .symbols
             .iter()
             .any(|s| s.name == "init" && s.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn test_generic_languages_have_symbols() {
+        // Go: func + type struct via estrattore generico.
+        let go = index_source(
+            "main.go",
+            "package main\nfunc Handler(w http.ResponseWriter) {}\ntype Server struct {}\n",
+        );
+        assert_eq!(go.language, "go");
+        assert!(go.symbols.iter().any(|s| s.name == "Handler"));
+        assert!(go.symbols.iter().any(|s| s.name == "Server"));
+
+        // Java: class + method.
+        let java = index_source(
+            "App.java",
+            "public class App {\n  public void run() {}\n}\n",
+        );
+        assert_eq!(java.language, "java");
+        assert!(java.symbols.iter().any(|s| s.name == "App"));
+
+        // C++: class + funzione.
+        let cpp = index_source("x.cpp", "class Widget {};\nint compute(int a) { return a; }\n");
+        assert_eq!(cpp.language, "cpp");
+        assert!(cpp.symbols.iter().any(|s| s.name == "Widget"));
+
+        // Linguaggio senza estensione nota: ritorna etichetta, mai vuoto/crash.
+        let ruby = index_source("x.rb", "class Foo\n  def bar\n  end\nend\n");
+        assert_eq!(ruby.language, "ruby");
     }
 
     #[test]
