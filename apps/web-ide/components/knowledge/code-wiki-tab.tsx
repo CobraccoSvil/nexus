@@ -11,7 +11,6 @@ import {
   generateCodeWiki,
   type KnowledgeNote,
 } from "../../lib/api-client";
-import { NoteDetail } from "./note-detail";
 
 interface Props {
   projectId: string;
@@ -116,7 +115,6 @@ export function CodeWikiTab({ projectId }: Props) {
   const [notes, setNotes] = useState<KnowledgeNote[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [generating, setGenerating] = useState(false);
 
@@ -164,10 +162,12 @@ export function CodeWikiTab({ projectId }: Props) {
           notes.find((n) => fp.endsWith(n.title) || n.title.endsWith(fp)) ||
           notes[0];
         if (match) {
-          setSelectedNoteId(match.id);
+          // Apri la nota nel pannello destro (Editor Workspace).
+          window.dispatchEvent(
+            new CustomEvent("nexus:note:open", { detail: { noteId: match.id } }),
+          );
           setError(null);
         } else {
-          setSelectedNoteId(null);
           setError(
             `Nessuna documentazione per "${fp}". Premi "Genera / Aggiorna Code Wiki".`,
           );
@@ -200,15 +200,8 @@ export function CodeWikiTab({ projectId }: Props) {
     }
   };
 
-  if (selectedNoteId) {
-    return (
-      <NoteDetail
-        projectId={projectId}
-        noteId={selectedNoteId}
-        onBack={() => setSelectedNoteId(null)}
-      />
-    );
-  }
+  // Il dettaglio nota si apre nel pannello destro (Editor Workspace) via
+  // nexus:note:open, non piu' inline.
 
   const tree = buildTree(notes.map((n) => ({ id: n.id, title: n.title })));
 
@@ -279,7 +272,7 @@ export function CodeWikiTab({ projectId }: Props) {
             depth={0}
             expanded={expanded}
             toggle={toggle}
-            onSelect={setSelectedNoteId}
+            onSelect={(id) => window.dispatchEvent(new CustomEvent("nexus:note:open", { detail: { noteId: id } }))}
           />
         </div>
       )}

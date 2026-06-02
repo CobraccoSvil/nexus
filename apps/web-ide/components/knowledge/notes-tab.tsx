@@ -18,7 +18,6 @@ const STATUS_I18N: Record<string, TranslationKey> = {
   deprecated: "knowledge.note.deprecated",
 };
 import { useProjectStore, selectKnowledgeChangedAt } from "../../lib/project-dispatcher/store";
-import { NoteDetail } from "./note-detail";
 import { useGlobalDialog } from "../global-dialog-provider";
 
 interface Props {
@@ -212,15 +211,8 @@ export function NotesTab({ projectId }: Props) {
     }
   };
 
-  if (selectedNoteId) {
-    return (
-      <NoteDetail
-        projectId={projectId}
-        noteId={selectedNoteId}
-        onBack={() => { setSelectedNoteId(null); load(); }}
-      />
-    );
-  }
+  // Il dettaglio nota si apre nel pannello destro (Editor Workspace), non piu'
+  // inline nella stretta colonna KB: vedi nexus:note:open in ide-shell.
 
   return (
     <div style={{ padding: 12 }}>
@@ -481,7 +473,7 @@ export function NotesTab({ projectId }: Props) {
       {notes.filter((n) => !kindFilter || (n as { kind?: string }).kind === kindFilter).map((note) => (
         <div
           key={note.id}
-          onClick={() => setSelectedNoteId(note.id)}
+          onClick={() => window.dispatchEvent(new CustomEvent("nexus:note:open", { detail: { noteId: note.id } }))}
           style={{
             padding: "10px 12px",
             marginBottom: 6,

@@ -55,6 +55,7 @@ import { useProfiles, DEFAULT_PROFILE_ID } from "../lib/use-profiles";
 import { ProjectSwitcher } from "./project-switcher";
 import { UserSidebarMenu } from "./user-header";
 import { QuotaBadge } from "./panels/quota-badge";
+import { NoteDetail } from "./knowledge/note-detail";
 import type { SidebarView } from "./sidebar/sidebar-manager";
 import type { PanelTab } from "./panels/bottom-panel-manager";
 import { TruncatedText } from "./truncated-text";
@@ -469,6 +470,23 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     };
     window.addEventListener("nexus:editor:open-file", handler);
     return () => window.removeEventListener("nexus:editor:open-file", handler);
+  }, []);
+
+  // Nota KB aperta nel pannello destro (Editor Workspace) invece che nella
+  // stretta colonna sinistra. notes-tab/code-wiki-tab emettono nexus:note:open.
+  const [openNoteId, setOpenNoteId] = useState<string | null>(null);
+  useEffect(() => {
+    const open = (ev: Event) => {
+      const id = (ev as CustomEvent<{ noteId?: string }>).detail?.noteId;
+      if (id) setOpenNoteId(String(id));
+    };
+    const close = () => setOpenNoteId(null);
+    window.addEventListener("nexus:note:open", open);
+    window.addEventListener("nexus:note:close", close);
+    return () => {
+      window.removeEventListener("nexus:note:open", open);
+      window.removeEventListener("nexus:note:close", close);
+    };
   }, []);
 
   // Bridge `nexus:kb:open-code-doc` -> apre la sidebar Knowledge (la tab
@@ -1922,18 +1940,28 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           />
         </div>
         <div style={{ minWidth: 0, minHeight: 0, height: "100%", overflow: "hidden" }}>
-          <EditorArea
-            editorGroups={editorGroups}
-            activeEditorGroupId={activeEditorGroupId}
-            activeProject={activeProject}
-            problemItems={problemItems}
-            onSetActiveGroup={setActiveEditorGroupId}
-            onSetEditorGroups={setEditorGroups}
-            onSaveActive={() => void saveActiveEditor()}
-            onRenameActive={() => void handleRenameActive()}
-            onDeleteActive={() => void handleDeleteActive()}
-            onConfirmCloseTab={confirmCloseDirtyTab}
-          />
+          {openNoteId ? (
+            <div style={{ height: "100%", overflow: "auto", background: tc.bg }}>
+              <NoteDetail
+                projectId={activeProject?.id ?? ""}
+                noteId={openNoteId}
+                onBack={() => setOpenNoteId(null)}
+              />
+            </div>
+          ) : (
+            <EditorArea
+              editorGroups={editorGroups}
+              activeEditorGroupId={activeEditorGroupId}
+              activeProject={activeProject}
+              problemItems={problemItems}
+              onSetActiveGroup={setActiveEditorGroupId}
+              onSetEditorGroups={setEditorGroups}
+              onSaveActive={() => void saveActiveEditor()}
+              onRenameActive={() => void handleRenameActive()}
+              onDeleteActive={() => void handleDeleteActive()}
+              onConfirmCloseTab={confirmCloseDirtyTab}
+            />
+          )}
         </div>
       </div>
     );
