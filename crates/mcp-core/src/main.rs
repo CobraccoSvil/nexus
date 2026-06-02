@@ -847,6 +847,11 @@ async fn main() -> anyhow::Result<()> {
     // Intervallo giornaliero (86400s).
     knowledge_workers::start_knowledge_cleanup_worker(state.db.clone());
 
+    // Recupero promote: promuove a 'active' le note chat di run completati (+
+    // risposta AI) se il promote inline a fine run non e' scattato. Rete di
+    // sicurezza, interval breve (default 60s). Vedi knowledge_promote_worker.
+    knowledge_workers::start_knowledge_promote_worker(state.db.clone());
+
     // Meta-docs vault watcher: file watcher bidirezionale per docs/.nexus-vault/.
     // Quando l'utente modifica un .md (es. via Obsidian), il watcher aggiorna il DB.
     // Loop detection via SHA-256 per evitare reazioni ai propri write.

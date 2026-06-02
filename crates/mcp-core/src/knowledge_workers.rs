@@ -515,6 +515,62 @@ async fn cleanup_tick(db: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Worker di recupero promote: promuove le note 'chat' draft collegate a run
+/// COMPLETATI (e le arricchisce con la risposta finale dell'AI) che il promote
+/// inline a fine run non ha promosso. Rete di sicurezza strutturale: garantisce
+/// che nessuna nota resti orfana in 'draft' anche se l'ingest inline non scatta
+/// (es. il run non transita per il call site atteso). Interval breve (default
+/// 60s, DB-driven). Idempotente: salta le note gia' arricchite.
+pub fn start_knowledge_promote_worker(db: PgPool) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        loop {
+            let interval =
+                read_interval_setting(&db, "knowledge.promote_recovery_interval_secs", 60).await;
+            if let Err(e) = promote_recovery_tick(&db).await {
+                tracing::warn!("knowledge_promote_worker: tick fallito: {e}");
+            }
+            tokio::time::sleep(Duration::from_secs(interval.max(15))).await;
+        }
+    });
+    tracing::info!("knowledge_promote_worker: avviato");
+}
+
+async fn promote_recovery_tick(db: &PgPool) -> anyhow::Result<()> {
+    if !read_bool_setting(db, "kb.lifecycle.promote_enabled", true).await {
+        return Ok(());
+    }
+    let res = sqlx::query(
+        r#"
+        UPDATE project_knowledge_notes n
+        SET status = 'active',
+            updated_at = NOW(),
+            body_md = CASE
+                WHEN position('## Risposta di Nexus' in n.body_md) = 0
+                     AND r.final_answer IS NOT NULL AND trim(r.final_answer) <> ''
+                THEN n.body_md || E'\n\n---\n\n## Risposta di Nexus\n\n' || r.final_answer
+                ELSE n.body_md
+            END
+        FROM agent_runs r
+        WHERE n.status = 'draft'
+          AND n.kind = 'chat'
+          AND r.status = 'completed'
+          AND (
+            r.id = n.source_run_id
+            OR (r.run_message_id = n.source_message_id AND r.project_id = n.project_id)
+          )
+        "#,
+    )
+    .execute(db)
+    .await
+    .context("promote recovery fallito")?;
+    let n = res.rows_affected();
+    if n > 0 {
+        tracing::info!("knowledge_promote_worker: {n} note chat promosse a active (recupero)");
+    }
+    Ok(())
+}
+
 // ======================================================================
 // Helper per lettura settings dal DB con fallback
 // ======================================================================
