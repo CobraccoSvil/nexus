@@ -1,4 +1,4 @@
--- 0252_provider_health_settings.sql
+-- 0253_provider_health_settings.sql
 -- Health/cooldown provider: tempi di polling e durate cooldown resi DB-driven
 -- (regola G). Prima erano costanti hardcoded in provider_cooldown.rs /
 -- provider_health_probe.rs / main.rs (interval recovery loop = 60s letterale).
