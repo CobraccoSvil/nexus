@@ -54,7 +54,7 @@ async fn read_pgid(pid: u32) -> Option<u32> {
 /// intero e il processo padre non rilancia il figlio che reggeva il listener
 /// (causa per cui un kill del solo PID lasciava la porta occupata). Fallback al
 /// solo `pid` se il PGID non e' leggibile.
-async fn kill_process_tree(pid: u32) {
+pub(crate) async fn kill_process_tree(pid: u32) {
     let target = match read_pgid(pid).await {
         // Il `-` davanti al PGID dice a kill(1) di colpire l'intero gruppo.
         Some(pgid) if pgid > 1 => format!("-{pgid}"),

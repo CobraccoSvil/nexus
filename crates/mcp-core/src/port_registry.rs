@@ -477,6 +477,147 @@ pub async fn cleanup_orphaned_ports(db: &PgPool, grace_secs: i64) -> u64 {
     released
 }
 
+/// Radice dei progetti utente sotto cui un dev-server e' considerato candidato.
+const USER_PROJECTS_ROOT: &str = "/home/administrator/projects/";
+/// Radice del meta-progetto Nexus: i processi con cwd qui sono infrastruttura e
+/// NON vanno mai terminati (regola E di CLAUDE.md).
+const NEXUS_ROOT: &str = "/home/administrator/ideai";
+
+/// True se la command line (token NUL-separati di /proc/{pid}/cmdline) appartiene
+/// a un dev-server di un'app utente (Vite, Next, `pnpm dev`, ecc.). Esclude
+/// esplicitamente build/install e i processi di Nexus stesso.
+fn is_dev_server_cmdline(cmdline: &str) -> bool {
+    let cl = cmdline.to_lowercase();
+    // Esclusioni: build/install e tooling che non e' un long-running dev-server.
+    const EXCLUDE: &[&str] = &[
+        "npm install",
+        "pnpm install",
+        "yarn install",
+        "esbuild --service",
+        "mcp-core",
+        "nexus-orchestrator",
+        "brain",
+        "next build",
+        "vite build",
+    ];
+    if EXCLUDE.iter().any(|kw| cl.contains(kw)) {
+        return false;
+    }
+    const INCLUDE: &[&str] = &[
+        "vite.js",
+        "vite",
+        "next dev",
+        "next-server",
+        "pnpm dev",
+        "npm run dev",
+        "npm exec dev",
+    ];
+    INCLUDE.iter().any(|kw| cl.contains(kw))
+}
+
+/// Legge il campo 22 (`starttime`, clock ticks dall'avvio del sistema) da
+/// /proc/{pid}/stat. None se non leggibile/parsabile. Serve per individuare il
+/// processo piu' recente fra duplicati dello stesso progetto.
+fn read_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` (campo 2) puo' contenere spazi/parentesi: si parte da dopo l'ultima
+    // ')'. Dopo di essa, `starttime` e' il 20° campo (campo 22 globale, 3..=21
+    // sono state..itrealvalue).
+    let after = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    // Indici 0-based in `after`: 0=state(3) ... 19=starttime(22).
+    fields.get(19).and_then(|s| s.parse::<u64>().ok())
+}
+
+/// Termina i dev-server duplicati per progetto avviati fuori dal registry (es.
+/// `pnpm dev`/`vite` rilanciati a mano: Vite auto-incrementa la porta lasciando
+/// le istanze precedenti vive e non tracciate in `nexus_port_allocations`).
+///
+/// Scansiona /proc, raggruppa i candidati per cwd risolto (= project_root sotto
+/// `/home/administrator/projects/`) e in ogni gruppo con piu' di un processo tiene
+/// solo il piu' recente (start time piu' alto), terminando gli altri via
+/// `kill_process_tree`. Ritorna quanti processi sono stati terminati. Gated da
+/// `agent.port_gc.dedupe_dev_servers` (regola G).
+pub async fn cleanup_duplicate_dev_servers(db: &PgPool) -> u64 {
+    let enabled = crate::settings::get_setting(db, "agent.port_gc.dedupe_dev_servers")
+        .await
+        .ok()
+        .flatten()
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    if !enabled {
+        return 0;
+    }
+
+    let own_pid = std::process::id();
+    // cwd risolto -> lista (pid, start_time).
+    let mut groups: HashMap<String, Vec<(u32, u64)>> = HashMap::new();
+
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    for entry in entries.flatten() {
+        let pid: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+        if pid == own_pid {
+            continue;
+        }
+
+        // cmdline NUL-separated -> spazi per il matching dei pattern.
+        let cmdline_raw = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        if cmdline_raw.is_empty() {
+            continue; // kernel thread o processo sparito
+        }
+        let cmdline: String = cmdline_raw
+            .split(|b| *b == 0)
+            .map(|seg| String::from_utf8_lossy(seg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !is_dev_server_cmdline(&cmdline) {
+            continue;
+        }
+
+        // cwd reale: scarta se fuori dai progetti utente o dentro Nexus (regola E).
+        let cwd = match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let cwd_str = cwd.to_string_lossy().to_string();
+        if cwd_str.starts_with(NEXUS_ROOT) || !cwd_str.starts_with(USER_PROJECTS_ROOT) {
+            continue;
+        }
+
+        let start = read_start_time(pid).unwrap_or(0);
+        groups.entry(cwd_str).or_default().push((pid, start));
+    }
+
+    let mut killed = 0u64;
+    for (cwd, mut procs) in groups {
+        if procs.len() < 2 {
+            continue;
+        }
+        // Ordina per start time decrescente: il primo e' il piu' recente, da tenere.
+        procs.sort_by(|a, b| b.1.cmp(&a.1));
+        let keep = procs[0].0;
+        for (pid, _) in procs.iter().skip(1) {
+            info!(
+                "cleanup_duplicate_dev_servers: terminato dev-server duplicato pid={} cwd={} (tengo pid piu' recente {})",
+                pid, cwd, keep
+            );
+            crate::project_workspace::port_recovery::kill_process_tree(*pid).await;
+            killed += 1;
+        }
+    }
+
+    if killed > 0 {
+        warn!("cleanup_duplicate_dev_servers: terminati {killed} dev-server duplicati");
+    }
+    killed
+}
+
 /// Worker periodico di garbage-collection delle porte orfane. `interval_secs` e
 /// `grace_secs` sono passati dal chiamante (DB-driven).
 pub async fn port_gc_loop(db: PgPool, interval_secs: u64, grace_secs: i64) {
@@ -485,6 +626,7 @@ pub async fn port_gc_loop(db: PgPool, interval_secs: u64, grace_secs: i64) {
     loop {
         tick.tick().await;
         cleanup_orphaned_ports(&db, grace_secs).await;
+        cleanup_duplicate_dev_servers(&db).await;
     }
 }
 
