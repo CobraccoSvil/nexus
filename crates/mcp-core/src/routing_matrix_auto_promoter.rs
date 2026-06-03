@@ -85,8 +85,8 @@ pub fn spawn_routing_matrix_auto_promoter(db: PgPool, enabled: bool, interval_s:
         loop {
             match run_one_round(&db).await {
                 Ok(stats) => tracing::info!(
-                    "routing_matrix_auto_promoter: round completato — updated={} skipped_manual={} no_candidates={}",
-                    stats.updated, stats.skipped_manual, stats.no_candidates
+                    "routing_matrix_auto_promoter: round completato — updated={} skipped_manual={} no_candidates={} cleaned_up={}",
+                    stats.updated, stats.skipped_manual, stats.no_candidates, stats.cleaned_up
                 ),
                 Err(e) => tracing::warn!("routing_matrix_auto_promoter: round fallito: {e}"),
             }
@@ -100,6 +100,7 @@ pub struct PromoteStats {
     pub updated: usize,
     pub skipped_manual: usize,
     pub no_candidates: usize,
+    pub cleaned_up: usize,
 }
 
 pub async fn run_one_round(db: &PgPool) -> anyhow::Result<PromoteStats> {
@@ -157,7 +158,157 @@ pub async fn run_one_round(db: &PgPool) -> anyhow::Result<PromoteStats> {
             stats.updated += 1;
         }
     }
+
+    // ── Cleanup pass ─────────────────────────────────────────────────────────
+    // ORDINE CRITICO: il cleanup gira DOPO il promote, mai prima. Il promote ha
+    // gia' inserito/aggiornato i modelli buoni; ora disattiviamo le righe
+    // "stale" (modello ora broken nel catalog) senza creare una finestra senza
+    // routing. Vedi cleanup_stale_rows per la logica idempotente e la safety
+    // anti-blackout.
+    match cleanup_stale_rows(db).await {
+        Ok(deactivated) => {
+            stats.cleaned_up = deactivated as usize;
+        }
+        Err(e) => {
+            tracing::warn!("routing_matrix_auto_promoter: cleanup_stale_rows fallito: {e}");
+        }
+    }
+
     Ok(stats)
+}
+
+/// Disattiva le righe "stale" della routing matrix: righe `is_active=true` e
+/// `manual_override=false` il cui `(provider, model_id)` NON ha piu' nel catalog
+/// un modello sano (`is_enabled=true AND consecutive_failures=0`).
+///
+/// Idempotente: una seconda esecuzione non tocca nulla (le righe sono gia'
+/// `is_active=false`). RISPETTA `manual_override=true` — quelle righe non
+/// vengono MAI toccate.
+///
+/// Safety anti-blackout: dopo la disattivazione, per ogni `(intent,
+/// behavior_mode)` rimasto SENZA alcuna riga `is_active=true` NON riattiviamo
+/// righe broken (sarebbe mascherare il problema): logghiamo a WARNING l'elenco
+/// cosi' la mancanza di routing e' visibile. In condizioni normali il promote
+/// che precede ha gia' inserito modelli buoni; se non ce ne sono e' un problema
+/// reale di disponibilita' modelli da risolvere a monte (catalog).
+///
+/// Ritorna il numero di righe disattivate.
+/// Stato minimale di una riga matrix per la decisione di cleanup (testabile).
+#[derive(Debug, Clone)]
+struct MatrixRowRef {
+    provider: String,
+    model_id: String,
+    is_active: bool,
+    manual_override: bool,
+}
+
+/// Stato minimale di un modello del catalog per la decisione di cleanup.
+#[derive(Debug, Clone)]
+struct CatalogHealthRef {
+    provider: String,
+    model: String,
+    is_enabled: bool,
+    consecutive_failures: i32,
+}
+
+/// Regola PURA: la riga matrix va disattivata dal cleanup?
+/// True sse: e' attiva, non manuale, e nel catalog NON esiste un modello sano
+/// (`is_enabled=true AND consecutive_failures=0`) con stesso provider
+/// (case-insensitive) e stesso model_id.
+/// Identica alla condizione della query SQL di `cleanup_stale_rows`.
+fn row_should_be_deactivated(row: &MatrixRowRef, catalog: &[CatalogHealthRef]) -> bool {
+    if !row.is_active || row.manual_override {
+        return false;
+    }
+    let has_healthy = catalog.iter().any(|c| {
+        c.provider.eq_ignore_ascii_case(&row.provider)
+            && c.model == row.model_id
+            && c.is_enabled
+            && c.consecutive_failures == 0
+    });
+    !has_healthy
+}
+
+pub async fn cleanup_stale_rows(db: &PgPool) -> sqlx::Result<u64> {
+    // Flag enforcement (settings, regola G — niente env/hardcode).
+    let enabled = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'agent.routing_matrix_cleanup_stale_enabled'",
+    )
+    .fetch_optional(db)
+    .await?
+    .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+    .unwrap_or(true);
+    if !enabled {
+        tracing::info!("routing_matrix_auto_promoter: cleanup_stale_rows DISABILITATO (flag)");
+        return Ok(0);
+    }
+
+    const STALE_TAG: &str = " [auto-cleanup: modello non disponibile nel catalog]";
+
+    // Disattiva le righe stale. Il NOT EXISTS confronta la riga matrix con un
+    // modello sano nel catalog (case-insensitive sul provider per coerenza con
+    // il resto del sistema). Appende il marcatore a notes solo se non gia'
+    // presente (idempotenza sul testo di notes).
+    let res = sqlx::query(
+        "UPDATE nexus_routing_matrix m
+            SET is_active = false,
+                notes = COALESCE(m.notes, '') ||
+                        CASE WHEN COALESCE(m.notes, '') LIKE '%' || $1 || '%'
+                             THEN '' ELSE $1 END,
+                updated_at = NOW()
+          WHERE m.is_active = true
+            AND COALESCE(m.manual_override, false) = false
+            AND NOT EXISTS (
+                SELECT 1 FROM ai_price_catalog c
+                 WHERE LOWER(c.provider) = LOWER(m.provider)
+                   AND c.model = m.model_id
+                   AND c.is_enabled = true
+                   AND c.consecutive_failures = 0
+            )",
+    )
+    .bind(STALE_TAG)
+    .execute(db)
+    .await?;
+    let deactivated = res.rows_affected();
+
+    if deactivated > 0 {
+        tracing::info!(
+            "routing_matrix_auto_promoter: cleanup disattivate {} righe stale (modelli non piu' sani nel catalog)",
+            deactivated
+        );
+    }
+
+    // Safety anti-blackout: elenca (intent, behavior_mode) rimasti senza routing.
+    let orphaned = sqlx::query(
+        "SELECT DISTINCT m.intent, m.behavior_mode
+           FROM nexus_routing_matrix m
+          WHERE NOT EXISTS (
+                SELECT 1 FROM nexus_routing_matrix a
+                 WHERE a.intent = m.intent
+                   AND a.behavior_mode = m.behavior_mode
+                   AND a.is_active = true
+            )
+          ORDER BY m.intent, m.behavior_mode",
+    )
+    .fetch_all(db)
+    .await?;
+    if !orphaned.is_empty() {
+        let pairs: Vec<String> = orphaned
+            .iter()
+            .map(|r| {
+                let intent: String = r.try_get("intent").unwrap_or_default();
+                let mode: String = r.try_get("behavior_mode").unwrap_or_default();
+                format!("{intent}/{mode}")
+            })
+            .collect();
+        tracing::warn!(
+            "routing_matrix_auto_promoter: dopo cleanup {} (intent, behavior_mode) SENZA routing attivo: [{}] — problema reale di disponibilita' modelli, non riattivo righe broken",
+            pairs.len(),
+            pairs.join(", ")
+        );
+    }
+
+    Ok(deactivated)
 }
 
 async fn load_requirements(db: &PgPool) -> sqlx::Result<Vec<IntentRequirement>> {
@@ -495,6 +646,71 @@ mod tests {
         let top = select_top_candidates(&r, &catalog);
         assert_eq!(top.len(), 1);
         assert_eq!(top[0].catalog.model, "ok");
+    }
+
+    // ── Cleanup pass (A) ─────────────────────────────────────────────────
+    fn mrow(provider: &str, model_id: &str, active: bool, manual: bool) -> MatrixRowRef {
+        MatrixRowRef {
+            provider: provider.into(),
+            model_id: model_id.into(),
+            is_active: active,
+            manual_override: manual,
+        }
+    }
+    fn chealth(provider: &str, model: &str, enabled: bool, failures: i32) -> CatalogHealthRef {
+        CatalogHealthRef {
+            provider: provider.into(),
+            model: model.into(),
+            is_enabled: enabled,
+            consecutive_failures: failures,
+        }
+    }
+
+    #[test]
+    fn cleanup_deactivates_row_with_disabled_model() {
+        // Modello disabilitato nel catalog -> riga matrix attiva non-manuale stale.
+        let row = mrow("google", "gemini-2.5-pro", true, false);
+        let catalog = vec![chealth("google", "gemini-2.5-pro", false, 0)];
+        assert!(row_should_be_deactivated(&row, &catalog));
+    }
+
+    #[test]
+    fn cleanup_deactivates_row_with_failing_model() {
+        // Modello enabled ma con consecutive_failures>0 -> non e' "sano".
+        let row = mrow("openai", "gpt-5", true, false);
+        let catalog = vec![chealth("openai", "gpt-5", true, 2)];
+        assert!(row_should_be_deactivated(&row, &catalog));
+    }
+
+    #[test]
+    fn cleanup_keeps_row_with_healthy_model() {
+        let row = mrow("anthropic", "claude-opus", true, false);
+        let catalog = vec![chealth("anthropic", "claude-opus", true, 0)];
+        assert!(!row_should_be_deactivated(&row, &catalog));
+    }
+
+    #[test]
+    fn cleanup_respects_manual_override() {
+        // Anche se il modello e' broken nel catalog, manual_override=true non si tocca MAI.
+        let row = mrow("google", "gemini-2.5-pro", true, true);
+        let catalog = vec![chealth("google", "gemini-2.5-pro", false, 5)];
+        assert!(!row_should_be_deactivated(&row, &catalog));
+    }
+
+    #[test]
+    fn cleanup_idempotent_on_already_inactive() {
+        // Riga gia' disattivata: non rientra nel cleanup (idempotenza).
+        let row = mrow("google", "gemini-2.5-pro", false, false);
+        let catalog = vec![chealth("google", "gemini-2.5-pro", false, 0)];
+        assert!(!row_should_be_deactivated(&row, &catalog));
+    }
+
+    #[test]
+    fn cleanup_provider_case_insensitive() {
+        // provider 'Google' nella matrix vs 'google' nel catalog: match sano -> tieni.
+        let row = mrow("Google", "gemini-2.5-pro", true, false);
+        let catalog = vec![chealth("google", "gemini-2.5-pro", true, 0)];
+        assert!(!row_should_be_deactivated(&row, &catalog));
     }
 
     #[test]

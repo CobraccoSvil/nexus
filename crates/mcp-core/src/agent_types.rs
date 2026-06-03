@@ -196,6 +196,14 @@ pub struct AgentRunResult {
     /// Tipico di modelli piccoli che "allucinano il completamento".
     #[serde(default)]
     pub hollow_completion: bool,
+    /// `true` quando l'hollow e' specificamente del tipo "aveva tool esposti ma
+    /// non ne ha invocato nessuno al primo turno" (steps vuoti, iteration <= 1).
+    /// E' il segnale runtime di un MALFORMED_FUNCTION_CALL / output-vuoto sul
+    /// tool-forcing (es. gemini-2.5-pro sui task agentici). Permette al caller
+    /// di marcare il modello come NON tool-capable (supports_tool_use=false)
+    /// senza disabilitarlo globalmente, lasciandolo disponibile per i task chat.
+    #[serde(default)]
+    pub hollow_no_tools: bool,
 }
 
 /// Evento di trace LLM: mostra i messaggi inviati al provider e la risposta ricevuta.
@@ -302,6 +310,54 @@ pub(crate) fn detect_action_request(text: &str) -> bool {
         "make ", "make\t",
     ];
     action_patterns.iter().any(|p| lower.contains(p))
+}
+
+/// Azione da applicare al catalog dopo un turno-con-tool agentico, in base
+/// all'esito (regola B: tool-failure model-specific via supports_tool_use).
+/// Funzione PURA per testabilita' — il chiamante (chat_messages.rs) la
+/// traduce nelle UPDATE SQL effettive.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum ToolCapabilityAction {
+    /// Nessuna azione (es. intent chat, o run fallito non classificabile).
+    None,
+    /// Incrementa consecutive_tool_failures di 1.
+    IncrementToolFailure,
+    /// Soglia raggiunta: marca supports_tool_use=false (NON is_enabled).
+    MarkNonToolCapable,
+    /// Turno-con-tool riuscito: reset contatori + riabilita tool-capability.
+    ResetOnSuccess,
+}
+
+/// Decide l'azione tool-capability dato lo stato del turno.
+/// - `intent_uses_tools`: l'intent richiede tool (non "chat").
+/// - `completed`: status == Completed.
+/// - `hollow_no_tools`: segnale MALFORMED/output-vuoto sul tool-forcing.
+/// - `success_with_tool`: completato con final_answer non vuoto e non hollow.
+/// - `prior_tool_failures`: valore corrente di consecutive_tool_failures.
+/// - `threshold`: soglia da settings.agent.model_tool_failure_threshold.
+pub(crate) fn tool_failure_action(
+    intent_uses_tools: bool,
+    completed: bool,
+    hollow_no_tools: bool,
+    success_with_tool: bool,
+    prior_tool_failures: i32,
+    threshold: i32,
+) -> ToolCapabilityAction {
+    if !intent_uses_tools || !completed {
+        return ToolCapabilityAction::None;
+    }
+    if hollow_no_tools {
+        let new_count = prior_tool_failures + 1;
+        if new_count >= threshold {
+            ToolCapabilityAction::MarkNonToolCapable
+        } else {
+            ToolCapabilityAction::IncrementToolFailure
+        }
+    } else if success_with_tool {
+        ToolCapabilityAction::ResetOnSuccess
+    } else {
+        ToolCapabilityAction::None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -666,4 +722,51 @@ pub async fn save_startup_command_if_needed(
         );
     })
     .map_err(|e| tracing::warn!("G4: salvataggio startup_command fallito: {e}"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_action_chat_intent_is_none() {
+        // Intent chat: mai toccare la tool-capability anche se hollow_no_tools.
+        let a = tool_failure_action(false, true, true, false, 5, 3);
+        assert_eq!(a, ToolCapabilityAction::None);
+    }
+
+    #[test]
+    fn tool_action_increment_below_threshold() {
+        // hollow_no_tools, prior=1, threshold=3 -> new=2 < 3 -> solo incremento.
+        let a = tool_failure_action(true, true, true, false, 1, 3);
+        assert_eq!(a, ToolCapabilityAction::IncrementToolFailure);
+    }
+
+    #[test]
+    fn tool_action_marks_non_tool_capable_at_threshold() {
+        // hollow_no_tools, prior=2, threshold=3 -> new=3 >= 3 -> non tool-capable.
+        let a = tool_failure_action(true, true, true, false, 2, 3);
+        assert_eq!(a, ToolCapabilityAction::MarkNonToolCapable);
+    }
+
+    #[test]
+    fn tool_action_reset_on_success_with_tool() {
+        // Turno-con-tool riuscito -> reset (riabilita tool-capability).
+        let a = tool_failure_action(true, true, false, true, 2, 3);
+        assert_eq!(a, ToolCapabilityAction::ResetOnSuccess);
+    }
+
+    #[test]
+    fn tool_action_completed_but_not_hollow_not_success_is_none() {
+        // Completato ma ne' hollow_no_tools ne' success_with_tool (es. hollow
+        // generico empty-answer): la regola B non agisce qui.
+        let a = tool_failure_action(true, true, false, false, 0, 3);
+        assert_eq!(a, ToolCapabilityAction::None);
+    }
+
+    #[test]
+    fn tool_action_not_completed_is_none() {
+        let a = tool_failure_action(true, false, true, false, 0, 3);
+        assert_eq!(a, ToolCapabilityAction::None);
+    }
 }

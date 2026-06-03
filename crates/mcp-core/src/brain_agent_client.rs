@@ -1106,6 +1106,7 @@ pub async fn run_via_brain(
         error_class: last_error_class,
         stop_reason: last_stop_reason,
         hollow_completion,
+        hollow_no_tools,
     }
 }
 
@@ -1232,6 +1233,7 @@ fn fail_result(
         error_class: None,
         stop_reason: Some("error".to_string()),
         hollow_completion: false,
+        hollow_no_tools: false,
     }
 }
 

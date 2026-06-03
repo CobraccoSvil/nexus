@@ -2930,7 +2930,78 @@ async fn spawn_agent_run(
                     && result.final_answer.as_ref()
                         .map(|s| !s.trim().is_empty())
                         .unwrap_or(false);
-                if result.hollow_completion {
+
+                // ── B: tool-failure model-specific (MALFORMED / output-vuoto su tool) ──
+                // `hollow_no_tools` = il modello aveva tool esposti ma non ne ha
+                // invocato nessuno al primo turno: e' il segnale runtime di
+                // finish_reason=MALFORMED_FUNCTION_CALL / output vuoto sul
+                // tool-forcing (es. gemini-2.5-pro sui task agentici). Questo NON
+                // significa che il modello sia rotto in assoluto: funziona per i
+                // task chat. Quindi NON tocchiamo is_enabled (che lo escluderebbe
+                // ANCHE dai task chat) ma incrementiamo un contatore DEDICATO
+                // (consecutive_tool_failures) e a soglia marchiamo
+                // supports_tool_use=false. L'auto-promoter, che per gli intent con
+                // requires_tool_use filtra su supports_tool_use, lo escludera' dai
+                // soli intent agentici lasciandolo per chat; il cleanup pass (A)
+                // disattivera' poi la riga matrix agentica gia' presente.
+                if result.hollow_no_tools {
+                    let tool_threshold: i32 = crate::settings::get_setting(
+                        &db_clone,
+                        "agent.model_tool_failure_threshold",
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.trim().parse::<i32>().ok())
+                    .filter(|n| *n > 0)
+                    .unwrap_or(3);
+
+                    // Incrementa il contatore DEDICATO e decide l'azione con la
+                    // funzione pura testata (agent_types::tool_failure_action).
+                    let new_count: Option<i32> = sqlx::query_scalar(
+                        "UPDATE ai_price_catalog
+                            SET consecutive_tool_failures = consecutive_tool_failures + 1,
+                                updated_at = NOW()
+                          WHERE provider = $1 AND model = $2
+                        RETURNING consecutive_tool_failures",
+                    )
+                    .bind(&result.provider)
+                    .bind(&result.model)
+                    .fetch_optional(&db_clone)
+                    .await
+                    .ok()
+                    .flatten();
+                    if let Some(n) = new_count {
+                        let action = crate::agent_types::tool_failure_action(
+                            true, true, true, false, n - 1, tool_threshold,
+                        );
+                        tracing::warn!(
+                            "agent_run {}: tool-failure (MALFORMED/empty su tool) su {}/{} — tool_counter={}/{}",
+                            run_id, result.provider, result.model, n, tool_threshold
+                        );
+                        if matches!(action, crate::agent_types::ToolCapabilityAction::MarkNonToolCapable) {
+                            let _ = sqlx::query(
+                                "UPDATE ai_price_catalog
+                                    SET supports_tool_use = false,
+                                        auto_disabled_reason = 'malformed_tool_calls',
+                                        updated_at = NOW()
+                                  WHERE provider = $1 AND model = $2
+                                    AND supports_tool_use = true",
+                            )
+                            .bind(&result.provider)
+                            .bind(&result.model)
+                            .execute(&db_clone)
+                            .await;
+                            tracing::warn!(
+                                "MARK NON-TOOL-CAPABLE {}/{} dopo {} tool-failure consecutivi (supports_tool_use=false). Resta disponibile per i task chat.",
+                                result.provider, result.model, n
+                            );
+                        }
+                    }
+                } else if result.hollow_completion {
+                    // Hollow generico NON dovuto al tool-forcing (empty answer /
+                    // resigned con content): mantiene la semantica storica sul
+                    // contatore consecutive_failures -> is_enabled=false a soglia 3.
                     let new_count: Option<i32> = sqlx::query_scalar(
                         "UPDATE ai_price_catalog
                             SET consecutive_failures = consecutive_failures + 1,
@@ -2970,13 +3041,25 @@ async fn spawn_agent_run(
                         }
                     }
                 } else if success_now {
+                    // Turno-con-tool andato a buon fine: reset di ENTRAMBI i
+                    // contatori (generico e tool-specific) e riabilita la
+                    // tool-capability se era stata revocata per malformed.
                     let _ = sqlx::query(
                         "UPDATE ai_price_catalog
                             SET consecutive_failures = 0,
+                                consecutive_tool_failures = 0,
+                                supports_tool_use = CASE
+                                    WHEN auto_disabled_reason = 'malformed_tool_calls' THEN true
+                                    ELSE supports_tool_use END,
                                 auto_disabled_at = NULL,
-                                auto_disabled_reason = NULL,
+                                auto_disabled_reason = CASE
+                                    WHEN auto_disabled_reason = 'malformed_tool_calls' THEN NULL
+                                    ELSE auto_disabled_reason END,
                                 updated_at = NOW()
-                          WHERE provider = $1 AND model = $2 AND consecutive_failures > 0",
+                          WHERE provider = $1 AND model = $2
+                            AND (consecutive_failures > 0
+                                 OR consecutive_tool_failures > 0
+                                 OR auto_disabled_reason = 'malformed_tool_calls')",
                     )
                     .bind(&result.provider)
                     .bind(&result.model)
