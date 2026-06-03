@@ -585,9 +585,18 @@ export function ChatPanel({
   const secondsSinceLastStep = Math.max(0, Math.floor((nowTick - runStartedAt) / 1000));
   // "Stuck" calcolato sul tempo dall'ULTIMO step (non dall'inizio run): se
   // l'agente non emette step da >60s e' in attesa di qualcosa (LLM lento).
-  const lastStepAt = agentSteps.length > 0
+  // Meta-step live del run corrente: arrivano via SSE in tempo reale, a
+  // differenza di `agentSteps` che si popola solo a fine run / via polling.
+  // Li usiamo per (a) far avanzare lastStepAt cosi' "Agente in attesa" non
+  // scatta mentre l'agente sta lavorando (emette meta_step), e (b) mostrare
+  // l'attivita' corrente (titolo dell'ultimo meta_step).
+  const liveMetaSteps = (agentRun?.runId ? metaStepsMap.get(agentRun.runId) : undefined) ?? [];
+  const lastMetaStep = liveMetaSteps.length > 0 ? liveMetaSteps[liveMetaSteps.length - 1] : null;
+  const lastMetaStepAt = lastMetaStep ? new Date(lastMetaStep.createdAt).getTime() : 0;
+  const lastAgentStepAt = agentSteps.length > 0
     ? Math.max(...agentSteps.map((s) => new Date(s.createdAt ?? 0).getTime()))
     : runStartedAt;
+  const lastStepAt = Math.max(lastAgentStepAt, lastMetaStepAt);
   const secondsSinceLastStepInternal = Math.max(0, Math.floor((nowTick - lastStepAt) / 1000));
   const isAgentStuck = isAgentRunning && secondsSinceLastStepInternal > 60;
 
@@ -1620,11 +1629,28 @@ export function ChatPanel({
             <strong style={{ color: isAgentStuck ? "#f97316" : tc.text, fontSize: 12 }}>
               {secondsSinceLastStep > 120 ? "⚠ AI in elaborazione" : isAgentStuck ? "⚠ Agente in attesa" : busyLabel}
             </strong>
-            {isAgentRunning && runningAgentStep && (
+            {isAgentRunning && runningAgentStep ? (
               <span style={{ color: tc.textMuted, fontSize: 11 }}>
                 step {runningAgentStep.stepIndex + 1} • {runningAgentStep.toolName}
               </span>
-            )}
+            ) : isAgentRunning && lastMetaStep ? (
+              // Attivita' corrente live dal flusso meta_step (es. "tool
+              // edit_file — vite.config.ts"): aggiornata in tempo reale anche
+              // quando agentSteps non e' ancora popolato.
+              <span
+                style={{
+                  color: tc.textMuted,
+                  fontSize: 11,
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  maxWidth: 320,
+                }}
+                title={lastMetaStep.title}
+              >
+                {lastMetaStep.title}
+              </span>
+            ) : null}
             {isAgentRunning && (
               <span style={{
                 fontSize: 10,
