@@ -148,6 +148,18 @@ class NeuralCoreServicer(pb2_grpc.NeuralCoreServiceServicer):
         try:
             result = providers.generate_completion(request.provider, request.model, request.prompt)
             content = result.content or ""
+            if not isinstance(content, str):
+                # Alcuni provider/percorsi ritornano content come lista di blocchi
+                # (structured/multimodal) o tipo non-stringa: normalizziamo per
+                # evitare AttributeError su .startswith ("'list' object has no
+                # attribute 'startswith'", osservato su finish_reason malformati).
+                if isinstance(content, list):
+                    content = " ".join(
+                        str(b.get("text", "")) if isinstance(b, dict) else str(b)
+                        for b in content
+                    )
+                else:
+                    content = str(content)
             error_meta = result.metadata.get("error")
             error_class = ""
             if content.startswith("[Error:") or error_meta:
@@ -222,6 +234,18 @@ class NeuralCoreServicer(pb2_grpc.NeuralCoreServiceServicer):
             # Sanitizza errori grezzi: i provider scrivono "[Error: <raw>]" dentro content;
             # convertiamoli in messaggio italiano umano. Niente JSON/grpc status nell'UI.
             content = result.content or ""
+            if not isinstance(content, str):
+                # Alcuni provider/percorsi ritornano content come lista di blocchi
+                # (structured/multimodal) o tipo non-stringa: normalizziamo per
+                # evitare AttributeError su .startswith ("'list' object has no
+                # attribute 'startswith'", osservato su finish_reason malformati).
+                if isinstance(content, list):
+                    content = " ".join(
+                        str(b.get("text", "")) if isinstance(b, dict) else str(b)
+                        for b in content
+                    )
+                else:
+                    content = str(content)
             error_meta = result.metadata.get("error")
             error_class = ""
             if content.startswith("[Error:") or error_meta:
