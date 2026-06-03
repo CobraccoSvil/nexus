@@ -3433,10 +3433,26 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     # M16: gate per la validazione tool-in-list nel loop sottostante.
     _M16_META_TOOLS = {"nexus_mcp_tool_search", "nexus_mcp_tool_call"}
     try:
-        from brain.utils.settings_db import get_bool_setting
+        from brain.utils.settings_db import get_bool_setting, get_setting
         _discovery_first_on = get_bool_setting("agent.tools.discovery_first_enabled", False)
+        # Whitelist dei tool SEMPRE esposti al primo turno discovery (STESSA fonte
+        # DB usata da mcp-core build_tools_json: agent.tools.discovery_first_whitelist).
+        # Vanno permessi dalla validazione M16 anche se non "scoperti", altrimenti
+        # i tool core (list_files, read_file, ...) — pur esposti al modello —
+        # verrebbero rifiutati e il modello entra in loop search->reject.
+        _df_whitelist = {
+            t.strip()
+            for t in get_setting(
+                "agent.tools.discovery_first_whitelist",
+                "nexus_mcp_tool_search,nexus_mcp_tool_call",
+            ).split(",")
+            if t.strip()
+        }
     except Exception:
         _discovery_first_on = False
+        _df_whitelist = set()
+    # Tool sempre ammessi dalla validazione M16 = meta di discovery + whitelist DB.
+    _M16_ALLOWED = _M16_META_TOOLS | _df_whitelist
     for _i, b in enumerate(pending):
         name = b.get("name", "")
         # FIX D: predictive cap (ha priorita' sul budget allegati: se passa di qui,
@@ -3469,9 +3485,9 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
                 for d in (state.get("discovered_tools_next_turn") or [])
                 if isinstance(d, dict)
             }
-            if name not in _M16_META_TOOLS and name not in _disc_now:
+            if name not in _M16_ALLOWED and name not in _disc_now:
                 logger.info(
-                    "M16: tool '%s' non scoperto in questo turno -> rifiutato, forzo nexus_mcp_tool_search",
+                    "M16: tool '%s' non scoperto/non in whitelist -> rifiutato, forzo nexus_mcp_tool_search",
                     name,
                 )
                 synthetic_results.append({
