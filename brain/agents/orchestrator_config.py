@@ -395,7 +395,15 @@ def is_eligible_adaptive(
         return True
 
     # Gating adattivo: decide dai segnali del classifier.
-    if complexity and str(complexity).lower() == "high":
+    _complexity = str(complexity or "").lower()
+    # Task a BASSA complessita' non attivano MAI il planner forte, anche se il
+    # classifier assegna un agentic_score alto (es. "elenca i file" -> agentic
+    # 0.9-0.98 ma complexity 'low'). Sono task diretti che l'executor risolve in
+    # pochi step: planner+todo+verifier+sub-agenti su questi e' over-orchestrazione
+    # (osservata dal vivo: "2 agenti in parallelo" per un semplice listing).
+    if _complexity == "low":
+        return False
+    if _complexity == "high":
         return True
     if is_ambiguous:
         return True
