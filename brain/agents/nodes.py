@@ -1927,6 +1927,211 @@ def _compress_old_tool_results(
     return compressed
 
 
+# ── Freno TOKEN-based intra-turno (mig 0280) ────────────────────────────────
+
+_AGGRESSIVE_TRUNC_MARKER = "[...troncato per limite contesto...]"
+
+
+def _first_human_index(messages: list[Any]) -> int:
+    """Indice del PRIMO HumanMessage (la richiesta originale), -1 se assente."""
+    for i, m in enumerate(messages):
+        if getattr(m, "type", None) == "human":
+            return i
+    return -1
+
+
+def _truncate_message_content(m: Any, max_content_chars: int) -> tuple[Any, bool]:
+    """Tronca AGGRESSIVAMENTE il contenuto di un messaggio (incluso assistant).
+
+    A differenza di `_compress_old_tool_results` (che tocca solo i blocchi
+    tool_result), qui si troncano TUTTI i blocchi testuali lunghi:
+    - blocchi `text` (ragionamenti assistant),
+    - blocchi `tool_result` (output tool),
+    - input dei blocchi `tool_use` se l'arg testuale e' enorme,
+    - `content` stringa diretto.
+
+    I blocchi `tool_use` mantengono `id`/`name` intatti (necessari per il
+    pairing con i tool_result Anthropic): si tronca solo il payload `input`.
+
+    Ritorna (nuovo_messaggio, changed). Non solleva mai.
+    """
+    changed = False
+    extra = getattr(m, "additional_kwargs", {}) or {}
+    blocks = extra.get("anthropic_content")
+
+    if blocks is not None and isinstance(blocks, list):
+        new_blocks: list[Any] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                new_blocks.append(block)
+                continue
+            btype = block.get("type")
+            if btype in ("text", "tool_result"):
+                # I blocchi text Anthropic portano il testo in "text"; i
+                # tool_result in "content". Alcuni text usano "content".
+                content_key = "content"
+                if btype == "text":
+                    content = block.get("text")
+                    if isinstance(content, str):
+                        content_key = "text"
+                    else:
+                        content = block.get("content", "")
+                else:
+                    content = block.get("content", "")
+                if isinstance(content, str) and len(content) > max_content_chars:
+                    kept = max(max_content_chars - len(_AGGRESSIVE_TRUNC_MARKER), 50)
+                    truncated = content[:kept] + _compress_marker(content) + _AGGRESSIVE_TRUNC_MARKER
+                    nb = {**block, content_key: truncated}
+                    new_blocks.append(nb)
+                    changed = True
+                    continue
+                new_blocks.append(block)
+            elif btype == "tool_use":
+                tin = block.get("input")
+                try:
+                    tin_str = json.dumps(tin, ensure_ascii=False, default=str)
+                except Exception:
+                    tin_str = str(tin)
+                if len(tin_str) > max_content_chars:
+                    nb = {**block, "input": {"_truncated": tin_str[:max_content_chars] + _AGGRESSIVE_TRUNC_MARKER}}
+                    new_blocks.append(nb)
+                    changed = True
+                else:
+                    new_blocks.append(block)
+            else:
+                new_blocks.append(block)
+        if changed:
+            cls = type(m)
+            try:
+                new_msg = cls(
+                    content=getattr(m, "content", ""),
+                    additional_kwargs={"anthropic_content": new_blocks},
+                )
+            except Exception:
+                new_msg = HumanMessage(
+                    content=getattr(m, "content", ""),
+                    additional_kwargs={"anthropic_content": new_blocks},
+                )
+            return new_msg, True
+        return m, False
+
+    # content stringa diretto (assistant senza blocchi strutturati).
+    content = getattr(m, "content", "")
+    if isinstance(content, str) and len(content) > max_content_chars:
+        kept = max(max_content_chars - len(_AGGRESSIVE_TRUNC_MARKER), 50)
+        new_content = content[:kept] + _compress_marker(content) + _AGGRESSIVE_TRUNC_MARKER
+        cls = type(m)
+        try:
+            new_msg = cls(content=new_content, additional_kwargs=extra)
+        except Exception:
+            return m, False
+        return new_msg, True
+    return m, False
+
+
+def _is_summary_message(m: Any) -> bool:
+    """True se il messaggio e' un riassunto rolling (da preservare)."""
+    extra = getattr(m, "additional_kwargs", {}) or {}
+    if extra.get("nexus_summary") or extra.get("rolling_summary"):
+        return True
+    content = getattr(m, "content", "")
+    return isinstance(content, str) and content.lstrip().startswith("[RIASSUNTO")
+
+
+def _compress_aggressive_token_based(
+    messages: list[Any],
+    keep_recent: int,
+    max_content_chars: int,
+) -> tuple[list[Any], bool]:
+    """Compressione AGGRESSIVA: tronca TUTTI i messaggi vecchi (anche assistant).
+
+    Preserva integri:
+    - il PRIMO HumanMessage (richiesta originale),
+    - gli eventuali messaggi 'summary' (riassunto rolling),
+    - gli ultimi `keep_recent` messaggi.
+
+    Tutto il resto viene troncato a `max_content_chars`. Ritorna
+    (messaggi, changed). Non solleva mai (best-effort).
+    """
+    n = len(messages)
+    if n <= keep_recent + 1:
+        return messages, False
+    first_human = _first_human_index(messages)
+    boundary = n - keep_recent
+    out: list[Any] = []
+    any_changed = False
+    for i, m in enumerate(messages):
+        if i >= boundary or i == first_human or _is_summary_message(m):
+            out.append(m)
+            continue
+        new_m, changed = _truncate_message_content(m, max_content_chars)
+        out.append(new_m)
+        any_changed = any_changed or changed
+    return out, any_changed
+
+
+def _apply_token_brake(
+    messages: list[Any],
+    model: str,
+    cfg: dict[str, Any],
+    iteration: int,
+) -> list[Any]:
+    """Freno TOKEN-based: se la stima token >= ratio*window, comprime aggressivo.
+
+    Riusa `_estimate_context_chars` (~4 char/token) e `_model_context_window`.
+    Ri-applica la compressione finche' la stima scende sotto la soglia o non c'e'
+    piu' nulla da comprimere (max passate limitate). Se anche cosi' resta sopra
+    il window, applica un cap di sicurezza hard (richiesta originale + ultimi 2).
+
+    Logga solo CONTEGGI (mai payload/prompt/response). Non solleva mai.
+    """
+    try:
+        window = _model_context_window(model)
+        ratio = float(cfg.get("max_context_ratio", 0.70))
+        keep_recent = int(cfg.get("aggressive_keep_recent", 3))
+        max_chars = int(cfg.get("aggressive_max_chars", 200))
+        threshold_tokens = int(window * ratio)
+
+        est_tokens = _estimate_context_chars(messages) // 4
+        if est_tokens < threshold_tokens:
+            return messages
+
+        tokens_before = est_tokens
+        max_passes = 5
+        for _ in range(max_passes):
+            messages, changed = _compress_aggressive_token_based(
+                messages, keep_recent=keep_recent, max_content_chars=max_chars
+            )
+            est_tokens = _estimate_context_chars(messages) // 4
+            if est_tokens < threshold_tokens or not changed:
+                break
+
+        logger.info(
+            "executor_node: freno TOKEN-based iter=%d window=%d soglia=%d "
+            "token %d -> %d (ratio=%.2f keep_recent=%d max_chars=%d)",
+            iteration, window, threshold_tokens, tokens_before, est_tokens,
+            ratio, keep_recent, max_chars,
+        )
+
+        # Cap di sicurezza hard: se ancora sopra il window pieno, riduci all'osso.
+        if est_tokens >= window:
+            first_human = _first_human_index(messages)
+            keep_idx = set(range(max(0, len(messages) - 2), len(messages)))
+            if first_human >= 0:
+                keep_idx.add(first_human)
+            messages = [m for i, m in enumerate(messages) if i in keep_idx]
+            est_hard = _estimate_context_chars(messages) // 4
+            logger.warning(
+                "executor_node: context cap raggiunto, troncamento hard "
+                "iter=%d window=%d token %d -> %d",
+                iteration, window, est_tokens, est_hard,
+            )
+        return messages
+    except Exception as exc:  # noqa: BLE001 - best-effort, mai bloccare il turno
+        logger.warning("executor_node: freno TOKEN-based fallito: %s", exc)
+        return messages
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # FIX A-D (ADR 0014) — Context size management
 # ────────────────────────────────────────────────────────────────────────────
@@ -1942,6 +2147,12 @@ _CTX_MGMT_DEFAULTS: dict[str, Any] = {
     "dedup_tool_results_enabled": True,
     "drop_unused_base64_age": 3,
     "predictive_cap_ratio": 0.5,
+    # Freno TOKEN-based intra-turno (mig 0280). Se la stima token del contesto
+    # supera max_context_ratio * context_window del modello attivo, scatta una
+    # compressione AGGRESSIVA che tocca anche i messaggi assistant lunghi.
+    "max_context_ratio": 0.70,
+    "aggressive_keep_recent": 3,
+    "aggressive_max_chars": 200,
 }
 
 
@@ -1963,6 +2174,9 @@ def _load_ctx_mgmt_config() -> dict[str, Any]:
         "dedup_tool_results_enabled": bool(_CTX_MGMT_DEFAULTS["dedup_tool_results_enabled"]),
         "drop_unused_base64_age": int(_CTX_MGMT_DEFAULTS["drop_unused_base64_age"]),
         "predictive_cap_ratio": float(_CTX_MGMT_DEFAULTS["predictive_cap_ratio"]),
+        "max_context_ratio": float(_CTX_MGMT_DEFAULTS["max_context_ratio"]),
+        "aggressive_keep_recent": int(_CTX_MGMT_DEFAULTS["aggressive_keep_recent"]),
+        "aggressive_max_chars": int(_CTX_MGMT_DEFAULTS["aggressive_max_chars"]),
     }
     try:
         import os as _os
@@ -1993,6 +2207,14 @@ def _load_ctx_mgmt_config() -> dict[str, Any]:
                     r = float(sval)
                     if 0.3 <= r <= 0.9:
                         config["predictive_cap_ratio"] = r
+                elif key == "agent.context.max_context_ratio":
+                    r = float(sval)
+                    if 0.4 <= r <= 0.9:
+                        config["max_context_ratio"] = r
+                elif key == "agent.context.aggressive_keep_recent":
+                    config["aggressive_keep_recent"] = max(1, int(sval))
+                elif key == "agent.context.aggressive_max_chars":
+                    config["aggressive_max_chars"] = max(50, int(sval))
             except Exception as parse_exc:
                 logger.warning("ctx_mgmt: parse setting %s fallito: %s", key, parse_exc)
     except Exception as exc:
@@ -3081,6 +3303,13 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 "executor_node: contesto compresso (safety net) %d -> %d char",
                 ctx_size, new_size,
             )
+        # ── Freno TOKEN-based intra-turno (mig 0280) ─────────────────────────
+        # Ultima barriera PRIMA di costruire i messaggi Anthropic: a differenza
+        # di FIX A (iter-based, solo tool_result) qui la soglia e' sul context
+        # window del modello attivo e la compressione aggressiva tocca ANCHE i
+        # messaggi assistant lunghi. Garantisce che il context inviato al
+        # provider non superi mai il window (cap hard come safety net).
+        messages = _apply_token_brake(messages, model, _ctx_cfg, _current_iterations)
         # Bug #88: reminder lingua resiliente al contesto/profilo. Iniettato qui
         # cosi' copre sia la chiamata principale (generate_agent_turn_sync con
         # system_text) sia il fallback anti-loop (system_text2 = system_text +
@@ -4059,7 +4288,12 @@ def route_after_executor(state: AgentState) -> str:
     # importato non resti orfano (app placeholder). Indipendente dal planner.
     if not state.get("plan_phase_active"):
         try:
-            from . import orchestrator_config, final_gate as _fg
+            # orchestrator_config e' gia' importato a livello modulo (riga ~27).
+            # NON re-importarlo qui: un import locale lo renderebbe variabile
+            # locale per TUTTA la funzione, e l'uso precedente a riga ~4004
+            # (ramo plan_phase_active) solleverebbe UnboundLocalError quando un
+            # piano e' attivo. Importiamo solo final_gate (non globale, cicli).
+            from . import final_gate as _fg
             _cfg = orchestrator_config.get()
             if _cfg.get("final_gate_enabled") and _fg._is_software_task(state, _cfg):
                 _fc = int(state.get("final_gate_cycle", 0) or 0)

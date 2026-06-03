@@ -1,0 +1,126 @@
+[
+  {
+    "ts": "2026-04-23T08:36:24.328Z",
+    "kind": "write",
+    "fp": "//wsl.localhost/Ubuntu/home/administrator/ideai/brain/agents/state.py",
+    "content": "\"\"\"Schema TypedDict per lo stato condiviso del grafo LangGraph.\"\"\"\nfrom __future__ import annotations\n\nfrom operator import add\nfrom typing import Annotated, Sequence\n\nfrom langchain_core.messages import BaseMessage\n\n\nclass AgentState(dict):  # type: ignore[type-arg]\n    \"\"\"Stato condiviso tra tutti i nodi del grafo Nexus Agent.\n\n    Estende dict per compatibilità con StateGraph di LangGraph.\n    I campi `messages` usa l'annotazione `add` per l'aggregazione.\n    \"\"\"\n\n    messages: Annotated[Sequence[BaseMessage], add]\n    user_intent: str\n    task_type: str\n    behavior_mode: str\n    token_budget: int\n    result: str | None\n    provider_used: str | None\n    model_used: str | None\n    feedback_score: float | None\n    latency_ms: float | None\n    token_usage: int | None\n    iterations: int\n    thread_id: str\n"
+  },
+  {
+    "ts": "2026-04-23T08:36:29.265Z",
+    "kind": "write",
+    "fp": "//wsl.localhost/Ubuntu/home/administrator/ideai/brain/agents/state.py",
+    "content": "\"\"\"Schema TypedDict per lo stato condiviso del grafo LangGraph.\"\"\"\nfrom __future__ import annotations\n\nfrom operator import add\nfrom typing import Annotated, Sequence\n\nfrom langchain_core.messages import BaseMessage\nfrom typing_extensions import TypedDict\n\n\nclass AgentState(TypedDict, total=False):\n    \"\"\"Stato condiviso tra tutti i nodi del grafo Nexus Agent.\n\n    `messages` usa l'annotazione `add` per l'aggregazione automatica LangGraph.\n    \"\"\"\n\n    messages: Annotated[Sequence[BaseMessage], add]\n    user_intent: str\n    task_type: str\n    behavior_mode: str\n    token_budget: int\n    result: str | None\n    provider_used: str | None\n    model_used: str | None\n    feedback_score: float | None\n    latency_ms: float | None\n    token_usage: int | None\n    iterations: int\n    thread_id: str\n"
+  },
+  {
+    "ts": "2026-04-27T10:59:50.893Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\state.py",
+    "old": "    created_at: str | None  # ISO8601\n    completed_at: str | None  # ISO8601",
+    "new": "    created_at: str | None  # ISO8601\n    completed_at: str | None  # ISO8601\n\n    # ── Self-reflection (Fase 2) ────────────────────────────────────────────\n    # Punteggio prodotto dal reflection_node (0.0-1.0). None = skip per sampling.\n    reflection_score: float | None\n    # Dettaglio per dimensione: correctness, completeness, efficiency, safety\n    reflection_dimensions: dict | None\n    # Punti deboli rilevati dal valutatore\n    reflection_weaknesses: list | None\n    # Suggerimenti di miglioramento del prompt\n    reflection_suggestions: list | None\n    # Reward finale fuso: 0.7 * heuristic + 0.3 * reflection_score\n    final_reward: float | None",
+    "all": false
+  },
+  {
+    "ts": "2026-05-01T10:13:00.728Z",
+    "kind": "edit",
+    "fp": "D:\\Sviluppo\\ideai\\fervent-cohen-fad855\\brain\\agents\\state.py",
+    "old": "    # ── Agent tool loop (Fase 2) ─────────────────────────────────────────────\n    # Popolati da executor_node quando il modello risponde con tool_use.\n    pending_tool_uses: list[dict]\n    # \"tool_use\" → loop verso tool_dispatch; \"end_turn\"/\"stop\" → learner.\n    stop_reason: str | None",
+    "new": "    # ── Agent tool loop (Fase 2) ─────────────────────────────────────────────\n    # Popolati da executor_node quando il modello risponde con tool_use.\n    pending_tool_uses: list[dict]\n    # \"tool_use\" → loop verso tool_dispatch; \"end_turn\"/\"stop\" → learner.\n    # \"loop_detected\" → executor ha rilevato chiamate ripetute, forza chiusura.\n    stop_reason: str | None\n    # Firme delle ultime tool calls (tool_name + hash input) per loop detection.\n    recent_tool_signatures: list[str]",
+    "all": false
+  },
+  {
+    "ts": "2026-05-20T18:15:16.907Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\state.py",
+    "old": "    # M69 sticky cascade specifico per planner_node: dopo un cascade riuscito\n    # nel planner, memorizza il provider/model effettivo cosi' i replan\n    # successivi (o riusi del planner) partono direttamente da li' senza\n    # ri-tentare la chain completa (anthropic -> openai -> google -> deepseek).\n    planner_sticky_provider: str | None\n    planner_sticky_model: str | None",
+    "new": "    # M69 sticky cascade specifico per planner_node: dopo un cascade riuscito\n    # nel planner, memorizza il provider/model effettivo cosi' i replan\n    # successivi (o riusi del planner) partono direttamente da li' senza\n    # ri-tentare la chain completa (anthropic -> openai -> google -> deepseek).\n    planner_sticky_provider: str | None\n    planner_sticky_model: str | None\n\n    # Modalita' automazione del turno chat propagata da mcp-core.\n    # Valori attesi: \"none\" | \"confirm\" | \"automatic\" | \"continuous\".\n    # Usato dal clarify_or_expand_node per saltare la domanda di chiarimento\n    # quando l'utente ha scelto un livello autonomo (\"automatic\"/\"continuous\"):\n    # l'agente downstream esplora invece di bloccare l'utente.\n    automation_mode: str | None",
+    "all": false
+  },
+  {
+    "ts": "2026-05-23T17:24:03.496Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\state.py",
+    "old": "    # M61 sticky cascade fallback: dopo un cascade riuscito, persisti il\n    # provider/model effettivo cosi' le iter successive partono direttamente\n    # da li' invece di ri-tentare il primario fallito ad ogni round.\n    sticky_provider: str | None",
+    "new": "    # G1: contatore nudge iniettati per richieste d'azione senza tool call.\n    # Reset a 0 ad ogni nuovo run. Cap a 2 (evita loop di nudge).\n    action_nudge_count: int\n\n    # M61 sticky cascade fallback: dopo un cascade riuscito, persisti il\n    # provider/model effettivo cosi' le iter successive partono direttamente\n    # da li' invece di ri-tentare il primario fallito ad ogni round.\n    sticky_provider: str | None",
+    "all": false
+  },
+  {
+    "ts": "2026-05-26T17:09:04.531Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\state.py",
+    "old": "    # M61 sticky cascade fallback: dopo un cascade riuscito, persisti il\n    # provider/model effettivo cosi' le iter successive partono direttamente\n    # da li' invece di ri-tentare il primario fallito ad ogni round.\n    sticky_provider: str | None\n    sticky_model: str | None",
+    "new": "    # M61 sticky cascade fallback: dopo un cascade riuscito, persisti il\n    # provider/model effettivo cosi' le iter successive partono direttamente\n    # da li' invece di ri-tentare il primario fallito ad ogni round.\n    sticky_provider: str | None\n    sticky_model: str | None\n\n    # Mig 0181 (adaptive_agent_budget): budget di iterazioni calcolato dal\n    # router_node sulla base della complessita' del prompt. Sostituisce il\n    # MAX_AGENT_ITERATIONS costante. Default 60 se non popolato.\n    # Anche complexity_score (0-100) viene tracciato per metrica/learning.\n    iteration_budget: int\n    complexity_score: int",
+    "all": false
+  },
+  {
+    "ts": "2026-05-28T19:54:20.282Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\state.py",
+    "old": "    # G1: contatore nudge iniettati per richieste d'azione senza tool call.\n    # Reset a 0 ad ogni nuovo run. Cap a 2 (evita loop di nudge).\n    action_nudge_count: int",
+    "new": "    # G1: contatore nudge iniettati per richieste d'azione senza tool call.\n    # Reset a 0 ad ogni nuovo run. Cap a 2 (evita loop di nudge).\n    action_nudge_count: int\n\n    # G1: contatore di re-routing eseguiti da route_after_executor verso\n    # executor per motivo \"risposta descrittiva su action request\".\n    # Indipendente da action_nudge_count (che e' alzato solo se il nudge\n    # viene effettivamente iniettato): conta i giri di re-execution G1,\n    # serve per il cap configurabile via settings DB (agent.g1_max_nudges)\n    # ed evita loop infiniti quando il nudge non puo' essere iniettato\n    # (es. history contiene gia' tool call). Reset a 0 ad ogni nuovo run.\n    g1_reroute_count: int",
+    "all": false
+  },
+  {
+    "ts": "2026-05-30T07:31:36.925Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\state.py",
+    "old": "    intent_confidence: float\n    # Query arricchita prodotta dal clarify_or_expand_node (mode=expand).",
+    "new": "    intent_confidence: float\n    # PR-D: segnali del classifier agentico per il gating adattivo del planner\n    # forte (popolati da router_node solo se adaptive_classifier_enabled).\n    # task_complexity: 'low'|'medium'|'high'; agentic_score 0..1; is_ambiguous bool.\n    task_complexity: str | None\n    agentic_score: float | None\n    is_ambiguous: bool | None\n    # Query arricchita prodotta dal clarify_or_expand_node (mode=expand).",
+    "all": false
+  },
+  {
+    "ts": "2026-05-30T08:17:29.773Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/brain/agents/state.py",
+    "old": "    g1_reroute_count: int\n\n    # M61 sticky cascade fallback: dopo un cascade riuscito, persisti il",
+    "new": "    g1_reroute_count: int\n\n    # Loop-detection semantica: numero di chiamate a tool di SOLA esplorazione\n    # (lettura/ispezione allegati e file) consecutive, senza tool produttivi in\n    # mezzo. Una sola call produttiva (write_file, edit_file, run_command, ...)\n    # azzera il contatore. Oltre la soglia (agent.exploration_loop_threshold)\n    # iniettiamo un nudge; a 2x la soglia abortiamo. Reset a 0 ad ogni nuovo run.\n    consecutive_exploration_calls: int\n    # True dopo aver iniettato il nudge anti-esplorazione, per non ripeterlo a\n    # ogni giro mentre il contatore resta sopra soglia. Reset quando il\n    # contatore viene azzerato da una call produttiva.\n    exploration_nudge_sent: bool\n\n    # M61 sticky cascade fallback: dopo un cascade riuscito, persisti il",
+    "all": false
+  },
+  {
+    "ts": "2026-05-30T08:30:40.846Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\state.py",
+    "old": "    # ID del todo \"attivo\" (in_progress o primo pending). Aggiornato dal verifier in PR-2.\n    active_todo_id: str | None",
+    "new": "    # ID del todo \"attivo\" (in_progress o primo pending). Aggiornato dal verifier in PR-2.\n    active_todo_id: str | None\n    # ── Cluster 1 (plan_rationale): contesto decisionale del planner forte ──\n    # Popolati dal planner_node (gated plan_rationale_enabled); iniettati\n    # dall'executor nel system_text per non perdere il \"perche'\" tra le fasi.\n    plan_rationale: str | None\n    plan_constraints: list[str] | None\n    plan_alternatives: list[dict] | None\n    # Contesto RAG (decisioni/interazioni passate) recuperato PRIMA di pianificare.\n    plan_rationale_context: str | None",
+    "all": false
+  },
+  {
+    "ts": "2026-05-30T08:39:52.328Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\state.py",
+    "old": "    # PR-2: ciclo verifier corrente per active_todo (reset a 0 ad ogni todo).\n    verify_cycle: int",
+    "new": "    # PR-2: ciclo verifier corrente per active_todo (reset a 0 ad ogni todo).\n    verify_cycle: int\n    # Cluster 3: ciclo della verifica esplorativa LLM (cap dedicato, reset per todo).\n    exploratory_verify_cycle: int",
+    "all": false
+  },
+  {
+    "ts": "2026-05-30T08:46:21.658Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\state.py",
+    "old": "    # Contesto RAG (decisioni/interazioni passate) recuperato PRIMA di pianificare.\n    plan_rationale_context: str | None",
+    "new": "    # Contesto RAG (decisioni/interazioni passate) recuperato PRIMA di pianificare.\n    plan_rationale_context: str | None\n    # ── Cluster 2 (nodo understanding): comprensione pre-planning ──\n    # context_brief: grounding semantico + esplorazioni, iniettato nel planner.\n    context_brief: str | None\n    understanding_active: bool\n    understanding_skip_reason: str | None",
+    "all": false
+  },
+  {
+    "ts": "2026-05-30T20:59:44.514Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\state.py",
+    "old": "    consecutive_exploration_calls: int\n    # True dopo aver iniettato il nudge anti-esplorazione, per non ripeterlo a\n    # ogni giro mentre il contatore resta sopra soglia. Reset quando il\n    # contatore viene azzerato da una call produttiva.\n    exploration_nudge_sent: bool",
+    "new": "    consecutive_exploration_calls: int\n    # True dopo aver iniettato il nudge anti-esplorazione, per non ripeterlo a\n    # ogni giro mentre il contatore resta sopra soglia. Reset quando il\n    # contatore viene azzerato da una call produttiva.\n    exploration_nudge_sent: bool\n    # True dopo aver iniettato il nudge anti-loop-comando ripetuto (fix\n    # 30/05/2026): evita di ripetere il nudge ad ogni giro se il modello\n    # continua a chiamare lo stesso comando fallito.\n    repeated_cmd_nudge_sent: bool",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T20:35:52.091Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/brain/agents/state.py",
+    "old": "    # PR-2: ciclo verifier corrente per active_todo (reset a 0 ad ogni todo).\n    verify_cycle: int",
+    "new": "    # PR-2: ciclo verifier corrente per active_todo (reset a 0 ad ogni todo).\n    verify_cycle: int\n    # M13.5: ciclo del regression gate HARD (fix-and-retest). Incrementato dal\n    # regression_gate_node quando rimanda all'executor; cap regression_gate.max_cycles.\n    regression_cycle: int",
+    "all": false
+  },
+  {
+    "ts": "2026-06-01T14:12:42.585Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\state.py",
+    "old": "    # Tools dichiarati al modello (schema Anthropic-compatible).\n    tools_json: list[dict]",
+    "new": "    # Tools dichiarati al modello (schema Anthropic-compatible).\n    tools_json: list[dict]\n    # M16 Progressive Tool Disclosure: tool scoperti dall'ultima nexus_mcp_tool_search,\n    # iniettati come native nel SOLO turno successivo (durata 1 turno via reducer\n    # overwrite di default; NON usare Annotated[..., add]). Vuoto = nessun discovered.\n    discovered_tools_next_turn: list[dict]",
+    "all": false
+  }
+]

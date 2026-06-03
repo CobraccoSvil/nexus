@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 use crate::nexus_tools::db_helper::get_pool;
 use crate::project_db::{MigrationTool, ProjectDbContext, runner::MigrationRunner};
+use crate::project_db::exec::{open_pool, resolve_project_conn};
 
 pub struct ProjectDbApplyMigrationTool;
 
@@ -37,7 +38,16 @@ impl NexusToolHandler for ProjectDbApplyMigrationTool {
             .unwrap_or_else(|| "migrations".into());
         let hosting_mode: String = config.try_get("hosting_mode").unwrap_or_default();
 
-        let project_conn_url = resolve_project_db_url(&ctx.project_id, &hosting_mode);
+        // Risolve la connessione decifrando `connection_secret` dalla stessa
+        // funzione del pannello SQL (regola H). hosting_mode resta informativo.
+        let _ = &hosting_mode;
+        let project_conn_url = match resolve_project_conn(&nexus_pool, ctx.project_id, None).await {
+            Ok(u) => u,
+            Err(e) => {
+                nexus_pool.close().await;
+                return Ok(json!({"ok": false, "error": format!("Connessione DB progetto non risolvibile: {}", e)}));
+            }
+        };
 
         let migration_tool = tool_str.as_deref()
             .and_then(MigrationTool::from_str)
@@ -133,23 +143,9 @@ impl NexusToolHandler for ProjectDbApplyMigrationTool {
     }
 }
 
-fn resolve_project_db_url(project_id: &uuid::Uuid, hosting_mode: &str) -> String {
-    let env_key = format!("PROJECT_{}_DB_URL", project_id.as_simple());
-    if let Ok(url) = std::env::var(&env_key) { return url; }
-    if hosting_mode == "internal" {
-        format!("postgresql://nexus:nexus@proj-{}-db:5432/app", project_id.as_simple())
-    } else {
-        String::new()
-    }
-}
-
 async fn apply_raw_sql(connection_url: &str, sql: &str) -> Result<(), String> {
     if connection_url.is_empty() { return Err("URL connessione progetto non configurata".into()); }
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(std::time::Duration::from_secs(30))
-        .connect(connection_url).await
-        .map_err(|e| format!("connect progetto: {}", e))?;
+    let pool = open_pool(connection_url).await?;
     sqlx::raw_sql(sql).execute(&pool).await
         .map_err(|e| format!("esecuzione SQL: {}", e))?;
     pool.close().await;

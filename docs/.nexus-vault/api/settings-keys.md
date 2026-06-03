@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: b364c885b0251cf43753c2f69497193332b551f3
+source_commit: 36ad8a7e169d982cfd7e97c12388b7a4ec130b55
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-02T15:18:52Z
+updated_at: 2026-06-03T15:25:40Z
 nexus_meta_version: 1
 ---
 
@@ -63,12 +63,16 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.exploration_loop.ttl_seconds` | `60` | TTL cache loop detector esplorazione (H-27 a) |
 | `agent.fallback.soft_failure_enabled` | `true` | Abilita detection soft failure (M4) |
 | `agent.figma.min_string_len` | `4` | Min char stringa estratta da figma (H-71) |
+| `agent.final_gate.enabled` | `true` | Abilita il final gate generale fail-closed (anti-placeholder) per i task software senza plan_phase. |
+| `agent.final_gate.max_cycles` | `2` | Numero massimo di cicli di retry del final gate prima di chiudere comunque (no loop infinito). |
+| `agent.final_gate.software_intents` | `code,debug,scaffold,implement,build,frontend,fix,refactor` | CSV degli intent considerati task software per cui il final gate si attiva. |
 | `agent.firstturn.canonical_hint` | `true` | Inietta hint canonico nel first turn per allegati strutturati (M8) |
 | `agent.firstturn.tool_choice_force` | `true` | Forza tool_choice strict al first turn quando ci sono allegati strutturati |
 | `agent.g1_nudge.default_max` | `3` | Max nudge G1 anti-narration per run (H-26 b) |
 | `agent.g1_nudge.ttl_seconds` | `60` | TTL cache G1 anti-narration nudge (H-26 a) |
-| `agent.iteration_budget.base` | `60` | Numero base iterazioni LangGraph per ogni run agente. Sommato a per_complexity_point*complexity_score. |
-| `agent.iteration_budget.max` | `300` | Tetto massimo iterazioni anche per task molto complessi. Safety net runaway. |
+| `agent.import_staging_dirs` | `figma_export` | CSV delle directory di staging del codice importato (design) controllate dal gate no_orphan_imported. |
+| `agent.iteration_budget.base` | `40` | Numero base iterazioni LangGraph per ogni run agente. Sommato a per_complexity_point*complexity_score. |
+| `agent.iteration_budget.max` | `100` | Tetto massimo iterazioni anche per task molto complessi. Safety net runaway. |
 | `agent.iteration_budget.per_complexity_point` | `4` | Iterazioni aggiuntive per ogni punto di complessita del prompt (score 0-100). |
 | `agent.lang_reminder_ttl_seconds` | `60` | TTL cache language reminder (H-28) |
 | `agent.language_reminder_enabled` | `true` | Abilita l'iniezione del reminder di lingua resiliente al contesto in coda al system prompt e all'ultimo messaggio utente (bug #88). Disabilita con "false" per rollback immediato senza rideploy. |
@@ -78,12 +82,16 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.meta_steps_flag_ttl_seconds` | `60` | TTL cache meta_steps flag (H-51) |
 | `agent_narration_warn_after_chars` | `1500` | Caratteri di testo streamed senza tool call dopo i quali il badge UI passa in stato warning. |
 | `agent_narration_warn_after_ms` | `30000` | Millisecondi di run senza tool call dopo i quali il badge UI passa in stato warning (possibile loop di narrazione). |
+| `agent.no_orphan.min_ratio` | `0.4` | Frazione minima di moduli staged che l'entry servito deve raggiungere via grafo import per superare il gate. |
 | `agent.orchestrator_cfg_ttl_seconds` | `60` | TTL cache orchestrator_config (H-56) |
 | `agent_parallel_enabled` | `true` | Abilita l'esecuzione parallela di piu' agenti contemporaneamente per accelerare task complessi |
 | `agent_parallel_max` | `5` | Numero massimo di agenti paralleli per sessione (1-5) |
 | `agent.planner.full_max_tokens` | `4096` | max_tokens per planner completo (H-43) |
 | `agent.planner.rationale_snippet_max` | `400` | Max char snippet rationale nel planner (H-42) |
 | `agent.planner.short_max_tokens` | `512` | max_tokens per planner short (H-45) |
+| `agent.port_gc.dedupe_dev_servers` | `true` | Se true, il GC termina i dev-server duplicati (Vite/Next/pnpm dev) per progetto, tenendo solo la istanza piu' recente. |
+| `agent.port_gc.grace_seconds` | `180` | Grace period (secondi) prima di rilasciare un'allocazione porta dynamic senza listener. |
+| `agent.port_gc.interval_seconds` | `120` | Intervallo (secondi) del GC delle porte orfane in mcp-core. |
 | `agent.price_cache_ttl_seconds` | `300` | TTL cache prezzi modelli per cost estimation (H-30) |
 | `agent.rag_min_score` | `0.5` | Soglia minima score RAG per inclusione contesto (H-33) |
 | `agent.reasoning_bank.plan_reward_threshold` | `0.85` | Soglia reward per accettare un plan in reasoning_bank (H-53) |
@@ -102,16 +110,23 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.todos.user_editable` | `true` | M15.3: abilita l'endpoint POST /api/agent/todos/{run_id}/edit per modificare i todo del piano dall'interfaccia utente (add/edit/reorder/remove). |
 | `agent.tools.core_whitelist` | `read_file,write_file,edit_file,list_files,search_in_files...` | CSV dei tool CORE essenziali sempre esposti col tool tiering (slim, mig 0254). Gli altri restano scopribili via nexus_mcp_tool_search. Set ridotto per stabilita function-calling Gemini 2.5. |
 | `agent.tools.discovery_first_enabled` | `true` | M16: primo turno espone SOLO i tool di discovery (nexus_mcp_tool_search/call); i tool trovati diventano native per il turno successivo. Default ON dopo verifica E2E (mig 0257). |
-| `agent.tools.discovery_first_whitelist` | `nexus_mcp_tool_search,nexus_mcp_tool_call` | CSV dei tool esposti al primo turno in modalita discovery-first. Default: i due tool di discovery. |
+| `agent.tools.discovery_first_whitelist` | `nexus_mcp_tool_search,nexus_mcp_tool_call,list_files,read...` | Tool esposti al primo turno quando discovery-first e' attivo (CSV). Include i meta di discovery + i tool core del filesystem sempre disponibili (lettura/scrittura/comando). Gli altri tool restano scopribili via nexus_mcp_tool_search. |
 | `agent.tools.discovery_max_injected` | `20` | Numero massimo di tool scoperti via nexus_mcp_tool_search iniettati come native nel turno successivo. |
 | `agent.tools.discovery_schema_max_bytes` | `8192` | Cap dimensione (byte) dell input_schema di un singolo tool scoperto, per isolare schemi malformati da plugin esterni. |
 | `agent.tools.tiering_enabled` | `true` | Abilita il tool tiering: invia al modello solo il CORE di tool + discovery (nexus_mcp_tool_search/call). Disattivare per esporre tutti gli 80 tool. |
+| `agent.verifier.fail_closed` | `true` | Se true il verifier_node, in assenza di acceptance_criteria sul todo software, esegue comunque i gate generali invece di marcare completed. |
 | `agent.vision.image_max_bytes` | `2097152` | Max byte immagine per vision describe (H-69) |
 | `agent.visual_compare.screenshot_timeout_secs` | `45` | Timeout (secondi) per la cattura dello screenshot via Playwright in nexus_visual_compare (launch + goto + wait + scatto). Default 45. |
 | `agent.visual_compare.similarity_threshold` | `85` | Soglia di similarita' (0-100) raccomandata: sotto questa soglia, o in presenza di differenze severita' alta, l'agente in modalita' Continuo dovrebbe correggere stile/layout e ripetere nexus_visual_compare. Default 85. |
 | `agent.visual_compare.viewport_height` | `800` | Altezza (px) del viewport usato da nexus_visual_compare per lo screenshot quando il parametro viewport non e' passato. Default 800. |
 | `agent.visual_compare.viewport_width` | `1280` | Larghezza (px) del viewport usato da nexus_visual_compare per lo screenshot quando il parametro viewport non e' passato. Default 1280. |
 | `agent.visual_compare.wait_ms` | `1500` | Attesa (ms) dopo il load della pagina prima dello scatto in nexus_visual_compare, per dare tempo a render/animazioni/fetch. Default 1500. Override per chiamata via parametro wait_ms. |
+| `agent.watchdog.enabled` | `true` | Abilita il watchdog generale dei microservizi (TCP probe + auto-restart in dev). |
+| `agent.watchdog.fail_threshold` | `2` | Numero di cicli down CONSECUTIVI prima di tentare il riavvio di un servizio. |
+| `agent.watchdog.interval_seconds` | `30` | Intervallo (secondi) tra i cicli di probe del watchdog servizi. |
+| `agent.watchdog.max_consecutive_restarts` | `5` | Riavvii consecutivi falliti oltre i quali il servizio e' considerato irrecuperabile (stop tentativi, log ERROR). |
+| `agent.watchdog.restart_cooldown_seconds` | `120` | Cooldown (secondi) dopo un riavvio prima di poter ritentare lo stesso servizio. |
+| `agent.watchdog.services` | `[{"name":"brain","port_setting_key":"brain_rest_port"},{"...` | Lista JSON dei microservizi monitorati dal watchdog. name = nome per deploy-local.sh --service; port_setting_key = chiave settings da cui risolvere la porta (regola G). mcp-core escluso (ospita il watchdog). |
 | `anthropic_system_cache_ttl` | `1h` | TTL della cache prompt di sistema per Anthropic: 5m (default Anthropic) o 1h (extended-cache-ttl-2025-04-11). Il valore 1h massimizza il cache hit rate fra turni distanti (il system prompt cambia raramente). Override: NEXUS_ANTHROPIC_SYSTEM_CACHE_TTL. Richiede riavvio del brain. |
 | `attachment.kb_excerpt_max_bytes` | `16384` | Max byte excerpt salvato in kb note per attachment (H-79 a) |
 | `attachment.sanitized_filename_max_len` | `120` | Max char filename sanitizzato per attachment (H-79 b) |
@@ -400,7 +415,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `clarify.intake_gate_enabled` | `true` | Comp.1: abilita il gate di intake (classifica la relazione richiesta vs KB: nuova/duplicate/refinement/correction). Assorbe il decision-lookup del Cluster 4. |
 | `clarify.intake_match_min_score` | `0.7` | Comp.1: soglia minima di similarita per considerare la richiesta correlata a una nota esistente. |
 | `clarify.intake_topk` | `5` | Comp.1: numero di note candidate recuperate dal gate di intake. |
-| `orchestrator.adaptive_agentic_score_min` | `0.7` | Soglia di agentic_score sopra la quale attivare il planner forte. |
+| `orchestrator.adaptive_agentic_score_min` | `0.85` | Soglia di agentic_score sopra la quale attivare il planner forte. |
 | `orchestrator.adaptive_classifier_enabled` | `true` | Se true, router_node invoca il classifier agentico LLM e scrive complexity/agentic_score/is_ambiguous nello state. |
 | `orchestrator.adaptive_gating_enabled` | `true` | Se true, is_eligible_adaptive usa i segnali del classifier per gate-are il planner forte (oltre ai gate hard budget/behavior). |
 | `orchestrator.adaptive_low_confidence_max` | `0.5` | Soglia di confidence sotto la quale (incertezza) attivare il planner forte. |
@@ -427,8 +442,8 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `orchestrator.meta_steps.reflection_enabled` | `false` | Pubblica la riflessione post-hoc come meta_step kind=reflection. Off di default (costo LLM extra). |
 | `orchestrator.meta_steps.routing_enabled` | `true` | Pubblica la decisione di routing/profile come meta_step kind=routing. |
 | `orchestrator.plan_behavior_modes` | `bilanciata,approfondita,veloce,economica` | CSV dei behavior_mode che attivano il flusso plan/act/verify. |
-| `orchestrator.plan_intents` | `code,implement,fix,refactor,scaffold_app,architecture,doc...` | CSV degli intent eleggibili per il planner. |
-| `orchestrator.plan_min_token_budget` | `50` | Sotto questa soglia di token_budget il planner viene saltato (chat brevi). |
+| `orchestrator.plan_intents` | `code,implement,fix,refactor,scaffold_app,architecture` | CSV degli intent eleggibili per il planner. |
+| `orchestrator.plan_min_token_budget` | `1500` | Sotto questa soglia di token_budget il planner viene saltato (chat brevi). |
 | `orchestrator.planner_prompt_key` | `agent.planner.base` | Indirezione per varianti A/B del prompt del planner. |
 | `orchestrator.plan_phase_enabled` | `true` | Feature flag globale per il planner_node (PR-1). Off -> grafo si comporta come oggi. |
 | `orchestrator.plan_rationale_enabled` | `true` | Se true, il planner recupera decisioni passate via RAG, produce rationale/constraints/alternatives e li tramanda all'executor. |
@@ -511,7 +526,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `provider.outage_threshold` | `3` | Numero di provider falliti nello stesso round oltre cui si assume outage locale (rollback dei cooldown). |
 | `provider.recovery_probe_timeout_s` | `30` | Timeout (secondi) del probe attivo eseguito prima di riabilitare un provider (probe-then-reenable). |
 | `providers.api_key_cache_ttl_seconds` | `60` | TTL cache api_key_loader (H-07) |
-| `providers.billing_cooldown_seconds` | `600` | Durata cooldown billing-error per provider (H-11) |
+| `providers.billing_cooldown_seconds` | `21600` | Durata cooldown billing-error per provider (H-11) |
 | `providers.capability_cache_ttl_seconds` | `60` | TTL (secondi) della cache delle capability provider in brain/providers/capability_loader.py. |
 | `providers.catalog_cache_ttl_seconds` | `60` | TTL cache ai_price_catalog (H-08) |
 | `providers.cooldown_bridge_timeout_seconds` | `5` | Timeout HTTP cooldown bridge (H-09) |
@@ -570,11 +585,15 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 | Chiave | Valore default | Descrizione |
 |---|---|---|
+| `agent.catalog_sync_health_window_hours` | `24` | Finestra (ore) entro cui un health check healthy=true rende un modello "recentemente sano" per il catalog_sync. Se sano e assente da upstream, catalog_sync lo lascia is_enabled=true (la verita e l account, non la lista upstream). |
+| `agent.model_tool_failure_threshold` | `3` | Numero di turni agentici (con tool esposti) consecutivi chiusi con MALFORMED/output-vuoto dopo i quali un modello viene marcato supports_tool_use=false. Reset al primo successo con tool. |
+| `agent.model_tool_probe.enabled` | `true` | Se true, model_health_probe esegue (oltre al ping chat) un tool-probe sul path agente per i soli modelli supports_tool_use=true: forza una tool call su un tool fittizio. A soglia (agent.model_tool_failure_threshold) marca supports_tool_use=false senza toccare is_enabled. Disattivabile per ridurre il costo delle chiamate API. |
+| `agent.routing_matrix_cleanup_stale_enabled` | `true` | Se true, l'auto-promoter disattiva (is_active=false) le righe della routing matrix non-manuali il cui (provider, model_id) non ha piu un modello sano nel catalog (is_enabled=true AND consecutive_failures=0). |
 | `billing_base_currency` | `EUR` | Base currency used for AI accounting and quotas |
 | `default_model` | `claude-sonnet-4-6` | Default model for chat |
 | `default_provider` | `anthropic` | Default LLM provider |
 | `max_token_budget` | `32000` | Maximum token budget allowed |
-| `model_catalog_last_sync` | `2026-06-02T15:13:54.064650842+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
+| `model_catalog_last_sync` | `2026-06-03T15:22:45.512746304+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
 | `nexus_active_routing_pct` | `50` | Percentuale di richieste chat gestite dal router Q-Learning Nexus (0=off, 100=tutto). A/B testing: imposta 10-50 per un rollout graduale. |
 | `nexus_behavior_mode` | `dinamico` | Modalità comportamento Nexus: veloce|economica|bilanciata|approfondita |
 | `provider_hierarchy` | `anthropic,openai,google,deepseek,mistral` | Ordered fallback chain for chat providers |
@@ -639,7 +658,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 | Chiave | Valore default | Descrizione |
 |---|---|---|
-| `brain_log_level` | `info` | Livello di log del brain Python: debug, info, warning, error. In sviluppo locale si usa debug; in produzione info. Override di emergenza: LOG_LEVEL. Richiede riavvio del brain. |
+| `brain_log_level` | `debug` | Livello di log del brain Python: debug, info, warning, error. In sviluppo locale si usa debug; in produzione info. Override di emergenza: LOG_LEVEL. Richiede riavvio del brain. |
 
 ## `vector`
 
@@ -650,4 +669,4 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 ---
 
-**Totale chiavi**: 453
+**Totale chiavi**: 472

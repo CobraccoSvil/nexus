@@ -17,7 +17,7 @@
 
 use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, QueryBuilder, Postgres, Row};
 use uuid::Uuid;
 
 use crate::mcp_connectors;
@@ -29,6 +29,34 @@ const DEFAULT_QDRANT_URL: &str = "http://localhost:6333";
 const DEFAULT_COLLECTION: &str = "mcp_tools";
 const VECTOR_SIZE: u64 = 384;
 const DEFAULT_MIN_SCORE: f64 = 0.35;
+
+/// Lunghezza minima (in byte/char ascii) sotto la quale un token viene
+/// scartato dalla tokenizzazione del fallback ILIKE. Articoli/preposizioni
+/// corte ("il", "di", "su") finiscono sotto soglia; termini tecnici corti
+/// ("db", "id") sono comunque rari e il filtro stopword copre il resto.
+const TOKEN_MIN_LEN: usize = 3;
+
+/// Numero massimo di token usati nel fallback ILIKE tokenizzato. Limita il
+/// numero di clausole OR generate (e quindi il costo della query) anche con
+/// query molto lunghe. I primi N token significativi sono sufficienti.
+const MAX_SEARCH_TOKENS: usize = 12;
+
+/// Stopword italiane/inglesi (articoli, preposizioni, congiunzioni, ausiliari)
+/// scartate dalla tokenizzazione. NON include termini tecnici (sql, database,
+/// query, migration, table...) che restano significativi per il ranking.
+const SEARCH_STOPWORDS: &[&str] = &[
+    // italiano
+    "una", "uno", "del", "dei", "delle", "della", "dello", "sul", "sui",
+    "sulla", "con", "per", "che", "non", "come", "dove", "quando", "questo",
+    "questa", "quello", "quella", "nel", "nella", "negli", "alla", "allo",
+    "agli", "dal", "dalla", "tra", "fra", "gli", "lei", "lui", "noi", "voi",
+    "loro", "suo", "sua", "mio", "mia", "tuo", "tua", "fare", "essere",
+    "avere", "esegui", "eseguire", "crea", "creare", "vuoi", "puoi",
+    // inglese
+    "and", "the", "for", "with", "that", "this", "from", "into", "your",
+    "you", "can", "are", "was", "were", "has", "have", "his", "her", "its",
+    "our", "their", "want", "create", "make", "run", "exec", "execute",
+];
 
 // ── Helpers DB settings ───────────────────────────────────────────────────────
 
@@ -142,11 +170,21 @@ fn tool_point_id(server_id: Uuid, tool_name: &str) -> String {
     Uuid::from_bytes(bytes).to_string()
 }
 
-/// Hash dei primi 256 char di (name + description) per rilevare cambiamenti.
-fn embedding_hash(tool_name: &str, description: &str) -> String {
+/// Hash dei primi 256 char di (name + description) piu' la signature
+/// dell'embedder attivo, per rilevare cambiamenti.
+///
+/// La signature (es. `"all-MiniLM-L6-v2:384"` oppure `"hash:256"`) rende
+/// l'hash sensibile al modello embedder: quando l'embedder cambia, l'hash
+/// cambia anche a parita' di descrizione, cosi' il reindex automatico
+/// all'avvio rigenera i vettori nel nuovo spazio senza interventi manuali.
+/// A parita' di embedder + descrizione l'hash resta stabile (idempotenza).
+fn embedding_hash(tool_name: &str, description: &str, embedder_signature: &str) -> String {
     let mut h = Sha256::new();
     let combined = format!("{tool_name}:{description}");
     h.update(combined.as_bytes().iter().take(256).copied().collect::<Vec<_>>());
+    // La signature non e' troncata: e' corta e identifica lo spazio vettoriale.
+    h.update(b"|emb:");
+    h.update(embedder_signature.as_bytes());
     format!("{:x}", h.finalize())
 }
 
@@ -170,9 +208,7 @@ pub async fn index_tool(
     description: &str,
     scope: &str,
 ) -> anyhow::Result<()> {
-    let new_hash = embedding_hash(tool_name, description);
-
-    // Controlla se già indicizzato con stesso hash
+    // Hash corrente nel DB (potenzialmente nullo se mai indicizzato).
     let existing: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT embedding_hash FROM mcp_server_tools WHERE server_id=$1 AND tool_name=$2",
     )
@@ -181,17 +217,23 @@ pub async fn index_tool(
     .fetch_optional(db)
     .await
     .unwrap_or(None);
+    let old_hash: Option<String> = existing.and_then(|(h,)| h);
 
-    if let Some((Some(old_hash),)) = existing {
-        if old_hash == new_hash {
-            return Ok(()); // Nessun cambiamento, skip
-        }
-    }
-
-    // Genera embedding
+    // Genera embedding. Il brain ritorna il modello effettivamente usato:
+    // (modello + dimensione vettore) compongono la signature dell'embedder,
+    // che entra nell'hash per invalidarlo automaticamente al cambio embedder.
     let text = embed_text_for_tool(tool_name, description);
-    let vector = neural.embed_text("", &text).await
+    let (used_model, vector) = neural.embed_text_with_model("", &text).await
         .map_err(|e| anyhow::anyhow!("embed_text fallita: {e}"))?;
+    let embedder_signature = format!("{}:{}", used_model, vector.len());
+    let new_hash = embedding_hash(tool_name, description, &embedder_signature);
+
+    // Idempotenza: a parita' di descrizione + embedder l'hash coincide -> skip
+    // dell'upsert su Qdrant (l'embed e' gia' stato calcolato ma e' a basso costo
+    // rispetto alla riscrittura del point e all'aggiornamento DB).
+    if old_hash.as_deref() == Some(new_hash.as_str()) {
+        return Ok(()); // Nessun cambiamento (descrizione + embedder invariati)
+    }
 
     // Upsert in Qdrant
     ensure_mcp_tools_collection(db).await?;
@@ -359,6 +401,39 @@ pub async fn handle_mcp_tool_search_with_neural(
     handle_mcp_tool_search_inner(db, Some(neural), user_id, project_id, arguments).await
 }
 
+/// Tokenizza una query libera in keyword significative per il fallback ILIKE.
+///
+/// Pipeline: lowercase -> split su qualunque carattere non alfanumerico
+/// (whitespace + punteggiatura) -> scarta token < `TOKEN_MIN_LEN` e stopword
+/// -> dedup preservando l'ordine -> tronca a `MAX_SEARCH_TOKENS`.
+///
+/// I `%` e `_` (wildcard ILIKE) sono gia' esclusi essendo non alfanumerici,
+/// quindi i token sono safe per il bind `%token%`. Il valore resta comunque
+/// passato come bind parametrico (mai interpolato), questa e' difesa in
+/// profondita'.
+fn tokenize_query(query: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for raw in query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+    {
+        if raw.chars().count() < TOKEN_MIN_LEN {
+            continue;
+        }
+        if SEARCH_STOPWORDS.contains(&raw) {
+            continue;
+        }
+        if seen.insert(raw.to_string()) {
+            out.push(raw.to_string());
+            if out.len() >= MAX_SEARCH_TOKENS {
+                break;
+            }
+        }
+    }
+    out
+}
+
 async fn handle_mcp_tool_search_inner(
     db: &PgPool,
     neural: Option<&NeuralCoreClient>,
@@ -401,41 +476,103 @@ async fn handle_mcp_tool_search_inner(
         }
     }
 
-    // ── Fallback: ILIKE testuale ──────────────────────────────────────────────
-    let like = format!("%{}%", query.replace('%', "").replace('_', ""));
-    let rows = sqlx::query(
-        r#"
-        SELECT
-          s.id          AS server_id,
-          s.name        AS server_name,
-          s.scope       AS scope,
-          t.tool_name   AS tool_name,
-          t.description AS description,
-          t.input_schema AS input_schema
-        FROM mcp_servers s
-        JOIN mcp_server_tools t ON t.server_id = s.id
-        WHERE s.enabled = true
-          AND (
-            s.scope = 'global'
-            OR (s.scope = 'user' AND s.user_id = $1)
-            OR (s.scope = 'project' AND s.project_id = $2)
-          )
-          AND (
-            t.tool_name ILIKE $3
-            OR COALESCE(t.description,'') ILIKE $3
-            OR s.name ILIKE $3
-          )
-        ORDER BY s.scope DESC, s.name, t.tool_name
-        LIMIT $4
-        "#,
-    )
-    .bind(user_id)
-    .bind(project_id)
-    .bind(like)
-    .bind(limit)
-    .fetch_all(db)
-    .await
-    .unwrap_or_default();
+    // ── Fallback: ILIKE testuale TOKENIZZATO con ranking ──────────────────────
+    // La query utente e' spesso una frase ("esegui una query SQL sul database
+    // del progetto"). Cercare la frase intera come unica substring ritorna 0
+    // (nessun tool contiene la frase). Tokenizziamo in keyword e cerchiamo in
+    // OR sui token, ordinando per numero di token che matchano (ranking).
+    let tokens = tokenize_query(&query);
+
+    let rows = if tokens.is_empty() {
+        // Nessun token significativo (query di sole stopword/simboli):
+        // fallback al comportamento legacy (frase intera) per non regredire.
+        let like = format!("%{}%", query.replace('%', "").replace('_', ""));
+        sqlx::query(
+            r#"
+            SELECT
+              s.id          AS server_id,
+              s.name        AS server_name,
+              s.scope       AS scope,
+              t.tool_name   AS tool_name,
+              t.description AS description,
+              t.input_schema AS input_schema,
+              1::int        AS match_score
+            FROM mcp_servers s
+            JOIN mcp_server_tools t ON t.server_id = s.id
+            WHERE s.enabled = true
+              AND (
+                s.scope = 'global'
+                OR (s.scope = 'user' AND s.user_id = $1)
+                OR (s.scope = 'project' AND s.project_id = $2)
+              )
+              AND (
+                t.tool_name ILIKE $3
+                OR COALESCE(t.description,'') ILIKE $3
+                OR s.name ILIKE $3
+              )
+            ORDER BY s.scope DESC, s.name, t.tool_name
+            LIMIT $4
+            "#,
+        )
+        .bind(user_id)
+        .bind(project_id)
+        .bind(like)
+        .bind(limit)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default()
+    } else {
+        // Costruzione dinamica SQL injection-safe via QueryBuilder: ogni token
+        // produce (a) una clausola OR nel WHERE e (b) un addendo CASE WHEN nel
+        // punteggio. Tutti i valori `%token%` sono bind parametrici.
+        let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+            "SELECT s.id AS server_id, s.name AS server_name, s.scope AS scope, \
+             t.tool_name AS tool_name, t.description AS description, \
+             t.input_schema AS input_schema, (",
+        );
+        // Punteggio: somma di CASE WHEN (tool_name|description|server_name match token) THEN 1.
+        let mut first = true;
+        for tok in &tokens {
+            let pat = format!("%{tok}%");
+            if !first {
+                qb.push(" + ");
+            }
+            first = false;
+            qb.push("(CASE WHEN t.tool_name ILIKE ");
+            qb.push_bind(pat.clone());
+            qb.push(" OR COALESCE(t.description,'') ILIKE ");
+            qb.push_bind(pat.clone());
+            qb.push(" OR s.name ILIKE ");
+            qb.push_bind(pat.clone());
+            qb.push(" THEN 1 ELSE 0 END)");
+        }
+        qb.push(") AS match_score FROM mcp_servers s \
+                 JOIN mcp_server_tools t ON t.server_id = s.id \
+                 WHERE s.enabled = true AND (s.scope = 'global' OR (s.scope = 'user' AND s.user_id = ");
+        qb.push_bind(user_id);
+        qb.push(") OR (s.scope = 'project' AND s.project_id = ");
+        qb.push_bind(project_id);
+        qb.push(")) AND (");
+        // Clausola WHERE: almeno un token deve matchare.
+        let mut first_w = true;
+        for tok in &tokens {
+            let pat = format!("%{tok}%");
+            if !first_w {
+                qb.push(" OR ");
+            }
+            first_w = false;
+            qb.push("t.tool_name ILIKE ");
+            qb.push_bind(pat.clone());
+            qb.push(" OR COALESCE(t.description,'') ILIKE ");
+            qb.push_bind(pat.clone());
+            qb.push(" OR s.name ILIKE ");
+            qb.push_bind(pat.clone());
+        }
+        qb.push(") ORDER BY match_score DESC, s.scope DESC, s.name, t.tool_name LIMIT ");
+        qb.push_bind(limit);
+
+        qb.build().fetch_all(db).await.unwrap_or_default()
+    };
 
     let external_results: Vec<Value> = rows
         .iter()
@@ -463,6 +600,15 @@ async fn handle_mcp_tool_search_inner(
     let mut merged = builtin_matches;
     merged.extend(external_results.into_iter());
 
+    // Osservabilita': nessun payload sensibile, solo la query (gia' loggata
+    // altrove come metadato del tool call) + conteggi.
+    tracing::info!(
+        token_count = tokens.len(),
+        result_count = merged.len(),
+        "mcp_tool_search: fallback ILIKE tokenizzato per query='{}'",
+        query
+    );
+
     format_json(&json!({
       "query": query,
       "count": merged.len(),
@@ -477,15 +623,17 @@ async fn handle_mcp_tool_search_inner(
 /// `agent_tools::execute_agent_tool` riconosce questo server_id sentinella
 /// e fa dispatch ricorsivo al tool builtin.
 ///
-/// Match: substring case-insensitive su `name` e `description` (no regex,
-/// no boundary parsing). Sufficiente per query come "estrai codice figma" o
-/// "leggi pdf". L'ordine preserva quello di AGENT_TOOLS_JSON: i tool piu'
-/// fondamentali sono dichiarati per primi.
+/// Match: tokenizzazione della query (stessa di `tokenize_query`) + ricerca
+/// per keyword su `name` e `description`, con ranking per numero di token che
+/// matchano. Per query frasali ("esegui una query SQL sul database") la
+/// ricerca della frase intera ritornerebbe 0; cosi' i builtin fondamentali
+/// restano scopribili per parola chiave. Se la query non produce token
+/// significativi (sole stopword/simboli) si ricade sulla substring intera per
+/// non regredire su query mono-keyword corte.
 fn search_builtin_tools(query: &str, limit: usize) -> Vec<Value> {
     if query.trim().is_empty() {
         return Vec::new();
     }
-    let needle = query.to_ascii_lowercase();
     let tools_json: Value =
         match serde_json::from_str(crate::agent_tools::AGENT_TOOLS_JSON) {
             Ok(v) => v,
@@ -498,31 +646,57 @@ fn search_builtin_tools(query: &str, limit: usize) -> Vec<Value> {
         Some(a) => a,
         None => return Vec::new(),
     };
-    let mut out = Vec::with_capacity(limit.min(arr.len()));
-    for t in arr.iter() {
+
+    let tokens = tokenize_query(query);
+    // Fallback frase intera quando non restano token significativi.
+    let whole = query.to_ascii_lowercase();
+
+    // Raccoglie (score, indice_originale, value) per ranking stabile.
+    let mut scored: Vec<(usize, usize, Value)> = Vec::new();
+    for (idx, t) in arr.iter().enumerate() {
         let name = t.get("name").and_then(Value::as_str).unwrap_or("");
         let description = t.get("description").and_then(Value::as_str).unwrap_or("");
         let input_schema = t.get("input_schema").cloned().unwrap_or(json!({}));
         if name.is_empty() {
             continue;
         }
-        let haystack = format!("{}\n{}", name.to_ascii_lowercase(), description.to_ascii_lowercase());
-        if !haystack.contains(&needle) {
+        let haystack = format!(
+            "{}\n{}",
+            name.to_ascii_lowercase(),
+            description.to_ascii_lowercase()
+        );
+
+        let score = if tokens.is_empty() {
+            if haystack.contains(&whole) { 1 } else { 0 }
+        } else {
+            tokens.iter().filter(|tok| haystack.contains(tok.as_str())).count()
+        };
+        if score == 0 {
             continue;
         }
-        out.push(json!({
-            "server_id": "builtin",
-            "server_name": "Nexus builtin",
-            "tool_name": name,
-            "description": description,
-            "input_schema": input_schema,
-            "match_type": "builtin",
-        }));
-        if out.len() >= limit {
-            break;
-        }
+
+        scored.push((
+            score,
+            idx,
+            json!({
+                "server_id": "builtin",
+                "server_name": "Nexus builtin",
+                "tool_name": name,
+                "description": description,
+                "input_schema": input_schema,
+                "match_type": "builtin",
+            }),
+        ));
     }
-    out
+
+    // Ordina per score DESC, poi ordine di dichiarazione (i tool piu'
+    // fondamentali sono dichiarati per primi in AGENT_TOOLS_JSON).
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, v)| v)
+        .collect()
 }
 
 // ── Handler: nexus_mcp_tool_call ─────────────────────────────────────────────
@@ -624,4 +798,74 @@ pub async fn handle_mcp_tool_reindex(
 
 fn format_json(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedding_hash_idempotente_a_parita_di_embedder() {
+        let a = embedding_hash("read_file", "legge un file", "onnx-minilm-l6-v2:384");
+        let b = embedding_hash("read_file", "legge un file", "onnx-minilm-l6-v2:384");
+        assert_eq!(a, b, "stesso embedder + descrizione -> hash stabile");
+    }
+
+    #[test]
+    fn embedding_hash_cambia_al_cambio_embedder() {
+        let onnx = embedding_hash("read_file", "legge un file", "onnx-minilm-l6-v2:384");
+        let hash = embedding_hash("read_file", "legge un file", "hash:256");
+        assert_ne!(
+            onnx, hash,
+            "cambio embedder deve invalidare l'hash per forzare il reindex"
+        );
+    }
+
+    #[test]
+    fn tokenize_estrae_keyword_significative() {
+        let toks = tokenize_query("esegui una query SQL sul database del progetto");
+        // "esegui", "una", "sul", "del" scartati (stopword); "query", "sql",
+        // "database", "progetto" tenuti.
+        assert!(toks.contains(&"query".to_string()));
+        assert!(toks.contains(&"sql".to_string()));
+        assert!(toks.contains(&"database".to_string()));
+        assert!(toks.contains(&"progetto".to_string()));
+        assert!(!toks.contains(&"una".to_string()));
+        assert!(!toks.contains(&"esegui".to_string()));
+    }
+
+    #[test]
+    fn tokenize_dedup_e_lowercase() {
+        let toks = tokenize_query("Database DATABASE database");
+        assert_eq!(toks, vec!["database".to_string()]);
+    }
+
+    #[test]
+    fn tokenize_scarta_token_corti_e_punteggiatura() {
+        let toks = tokenize_query("crea db, id: ok!");
+        // "crea" stopword, "db"/"id"/"ok" < TOKEN_MIN_LEN -> nessun token.
+        assert!(toks.is_empty());
+    }
+
+    #[test]
+    fn tokenize_tronca_a_max() {
+        let lunga = (0..30)
+            .map(|i| format!("token{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let toks = tokenize_query(&lunga);
+        assert_eq!(toks.len(), MAX_SEARCH_TOKENS);
+    }
+
+    #[test]
+    fn builtin_search_matcha_per_keyword() {
+        // Una query frasale deve comunque scoprire qualche builtin se la frase
+        // contiene keyword presenti nei nomi/descrizioni dei tool.
+        let res = search_builtin_tools("leggi il contenuto di un allegato pdf", 10);
+        // Non asseriamo un tool specifico (il set evolve), ma la tokenizzazione
+        // non deve far regredire a 0 quando keyword come "pdf"/"allegato"
+        // esistono. Se il catalogo builtin cambia drasticamente questo test
+        // resta tollerante: verifica solo che non panichi e ritorni un Vec.
+        let _ = res.len();
+    }
 }

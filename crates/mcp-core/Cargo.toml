@@ -67,9 +67,12 @@ lru = "0.12"
 tempfile = "3"
 
 [features]
+# default: include onnx — l'ambiente locale canonico (WSL, regola "Esecuzione
+# locale canonica") ha AVX2 e il modello in models/minilm/. Il fallback a
+# HashEmbedder resta come rete di sicurezza se i file modello mancano.
+default = ["onnx"]
 # onnx: abilita OnnxMiniLmEmbedder (384-dim) in nexus-orchestrator per semantic tool search
-# Richiede CPU con AVX2 per libonnxruntime (Haswell e successivi)
-# Default: disabilitato (fallback a HashEmbedder)
+# Richiede CPU con AVX2 per libonnxruntime (Haswell e successivi) a runtime.
 onnx = ["nexus-orchestrator/onnx"]
 
 # libc: usata in sandbox.rs::build_sandboxed_command per leggere uid/gid

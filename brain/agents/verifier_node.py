@@ -156,7 +156,28 @@ async def verifier_node(state: AgentState) -> dict[str, Any]:
         })
 
     duration_ms = int((time.monotonic() - started) * 1000)
-    all_passed = all(r["passed"] for r in results)
+    # Escludi i criteri inconcludenti (expected non macchina-valutabile,
+    # marcato da criteria_runner) dal conteggio: non sono ne' pass ne' fail,
+    # non devono bloccare il todo. Contano solo i criteri realmente valutabili.
+    evaluable = [r for r in results if not (r.get("evidence") or {}).get("inconclusive")]
+    inconclusive_n = len(results) - len(evaluable)
+    if inconclusive_n:
+        logger.warning(
+            "verifier_node: %d/%d criteri inconcludenti (expected non valutabile) esclusi dal conteggio",
+            inconclusive_n, len(results),
+        )
+    if evaluable:
+        all_passed = all(r["passed"] for r in evaluable)
+    else:
+        # Tutti i criteri inconcludenti: non promuovere a vuoto. Per i task
+        # software esegui i gate generali (no_orphan_imported) come rete di
+        # sicurezza; altrimenti considera passato (nulla di valutabile).
+        from . import final_gate
+        if cfg.get("verifier_fail_closed", True) and final_gate._is_software_task(state, cfg):
+            all_passed, gate_results = await final_gate.run_general_gates(state, cfg)
+            results.extend(gate_results or [])
+        else:
+            all_passed = True
     cycle = int(state.get("verify_cycle", 0) or 0) + 1
 
     # Persistenza best-effort

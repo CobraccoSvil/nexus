@@ -907,4 +907,36 @@ pub(super) static NEXUS_TOOLS: &[ToolDef] = &[
         description: "Usa questo tool per installare runtime e pacchetti (dotnet, apt, npm, pip, curl), eseguire script bash, comandi di sistema arbitrari. Ideale per setup ambienti, installazione .NET SDK, Node.js, strumenti CLI. Timeout configurabile fino a 600s per installazioni lente.",
         schema: r#"{"type":"object","required":["command"],"properties":{"command":{"type":"string"},"project_id":{"type":"string"},"timeout_secs":{"type":"integer"}}}"#,
     },
+    // -- database (provisioning + esecuzione, collegati al pannello Database) --
+    ToolDef {
+        name: "nexus_db_provision",
+        description: "Crea/registra un database per il progetto. mode=internal (default) provisiona un Postgres dedicato gestito da Nexus SENZA chiedere host/porta/credenziali. mode=external registra un DB esistente data una connection_string. Usa questo tool quando l utente chiede di creare/configurare un database: NON chiedere credenziali per mode=internal.",
+        schema: r#"{"type":"object","properties":{"mode":{"type":"string","enum":["internal","external"],"description":"internal (default) o external"},"name":{"type":"string","description":"Nome logico della connessione (default primary)"},"db_name":{"type":"string","description":"Nome del database fisico (solo internal)"},"connection_string":{"type":"string","description":"Connection string (richiesta solo per mode=external)"}}}"#,
+    },
+    ToolDef {
+        name: "nexus_db_execute_sql",
+        description: "Esegue SQL (DDL o DML) sul database applicativo del progetto. Le DDL vengono archiviate automaticamente come nota KB + file migration versionato. Usa per creare tabelle, indici, inserire dati. La connessione e risolta dal pannello Database del progetto.",
+        schema: r#"{"type":"object","required":["sql"],"properties":{"sql":{"type":"string","description":"Statement SQL (CREATE TABLE, ALTER, INSERT, ...)"},"connection":{"type":"string","description":"Nome connessione DB (default primary)"}}}"#,
+    },
+    ToolDef {
+        name: "nexus_db_apply_schema_file",
+        description: "Importa lo schema da un file SQL del progetto (es. backend/db_schema.sql, schema.sql, migrations/*.sql) ed esegue il contenuto sul DB del progetto. Se file_path manca cerca candidati comuni; se ambiguo ritorna la lista per farti scegliere. Preferisci questo tool quando esiste gia un file schema nel repo.",
+        schema: r#"{"type":"object","properties":{"file_path":{"type":"string","description":"Percorso del file SQL relativo alla root (opzionale)"},"connection":{"type":"string","description":"Nome connessione DB (default primary)"}}}"#,
+    },
+    ToolDef {
+        name: "nexus_db_status",
+        description: "Ritorna le connessioni database configurate per il progetto e, per la connessione primaria, la lista delle tabelle. Usa per capire lo stato del DB prima di provisionare o creare tabelle.",
+        schema: r#"{"type":"object","properties":{}}"#,
+    },
+    // -- alias per nomi tool comunemente allucinati dall agente (regola H: instradano ai canonici) --
+    ToolDef {
+        name: "nexus_db_query",
+        description: "Esegue una query/statement SQL (SELECT, INSERT, UPDATE, DELETE, DDL) sul database del progetto. Alias di nexus_db_execute_sql.",
+        schema: r#"{"type":"object","required":["sql"],"properties":{"sql":{"type":"string","description":"Statement SQL (SELECT, INSERT, UPDATE, DELETE, DDL)"},"connection":{"type":"string","description":"Nome connessione DB (default primary)"}}}"#,
+    },
+    ToolDef {
+        name: "nexus_db_tables",
+        description: "Elenca le tabelle del database del progetto. Alias di nexus_db_table_list.",
+        schema: r#"{"type":"object","properties":{"schema":{"type":"string"}}}"#,
+    },
 ];

@@ -684,6 +684,10 @@ pub async fn execute(
         "nexus_db_table_list" => {
             dispatch_catalog_tool(db, user_id, project_id, "db_table_list", &arguments).await
         }
+        // alias: nome spesso allucinato dall agente (regola H: stesso handler canonico)
+        "nexus_db_tables" => {
+            dispatch_catalog_tool(db, user_id, project_id, "db_table_list", &arguments).await
+        }
         "nexus_db_table_count" => {
             dispatch_catalog_tool(db, user_id, project_id, "db_table_count", &arguments).await
         }
@@ -1201,6 +1205,14 @@ pub async fn execute(
         "nexus_service_status" => handle_service_status(db, project_id).await,
         "nexus_service_control" => handle_service_control(db, project_id, &arguments).await,
 
+        // ── database (collegati al pannello Database, regola H) ─────────────
+        "nexus_db_provision" => handle_db_provision(db, project_id, &arguments).await,
+        "nexus_db_execute_sql" => handle_db_execute_sql(db, project_id, &arguments).await,
+        // alias: nome spesso allucinato dall agente (regola H: stesso handler, niente duplicazione)
+        "nexus_db_query" => handle_db_execute_sql(db, project_id, &arguments).await,
+        "nexus_db_apply_schema_file" => handle_db_apply_schema_file(db, project_id, &arguments).await,
+        "nexus_db_status" => handle_db_status(db, project_id).await,
+
         _ => {
             let _ = (user_id, project_id);
             format!("[Nexus Builtin] Tool '{}' non riconosciuto.", tool_name)
@@ -1403,4 +1415,114 @@ async fn handle_impact_brief(db: &PgPool, project_id: Uuid, arguments: &Value) -
     crate::knowledge::impact::impact_brief(db, project_id, &seed_paths)
         .await
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Database tools (regola H: riuso totale della logica del pannello Database)
+// ---------------------------------------------------------------------------
+// Tool per provisionare il DB ed eseguire SQL/schema RIUSANDO le funzioni gia
+// esistenti (provision_internal_core, execute_query, archive_ddl, import-schema
+// helpers). project_id viene dal contesto del run agente. Nessun segreto loggato.
+
+async fn handle_db_provision(db: &PgPool, project_id: Uuid, arguments: &Value) -> String {
+    let mode = arguments.get("mode").and_then(Value::as_str).unwrap_or("internal").trim().to_lowercase();
+    let name = arguments.get("name").and_then(Value::as_str).map(|s| s.trim()).filter(|s| !s.is_empty()).unwrap_or("primary");
+    match mode.as_str() {
+        "internal" => {
+            let db_name = arguments.get("db_name").and_then(Value::as_str);
+            let engine = arguments.get("engine").and_then(Value::as_str);
+            match crate::project_db_routes::provision_internal_core(db, project_id, name, engine, db_name).await {
+                Ok(v) => v.to_string(),
+                Err(e) => json!({ "ok": false, "error": e }).to_string(),
+            }
+        }
+        "external" => {
+            let Some(conn) = arguments.get("connection_string").and_then(Value::as_str).map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+                return json!({ "ok": false, "error": "connection_string richiesta per mode=external. Per un DB gestito da Nexus usa mode=internal." }).to_string();
+            };
+            let engine = if conn.starts_with("mysql") { "mysql" } else if conn.starts_with("sqlite") { "sqlite" } else { "postgres" };
+            let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_database_config WHERE project_id = $1").bind(project_id).fetch_one(db).await.unwrap_or(0);
+            let is_primary = existing == 0;
+            let meta = json!({ "source": "agent_db_provision_external" });
+            let res = sqlx::query("INSERT INTO project_database_config (project_id, name, engine, hosting_mode, connection_secret, is_primary, allow_ddl_override, detection_metadata) VALUES ($1, $2, $3, 'external', $4::bytea, $5, false, $6) ON CONFLICT (project_id, LOWER(name)) DO UPDATE SET engine = EXCLUDED.engine, hosting_mode = EXCLUDED.hosting_mode, connection_secret = EXCLUDED.connection_secret, updated_at = NOW()")
+                .bind(project_id).bind(name).bind(engine).bind(conn.as_bytes()).bind(is_primary).bind(&meta).execute(db).await;
+            match res {
+                Ok(_) => json!({ "ok": true, "mode": "external", "name": name, "engine": engine, "is_primary": is_primary }).to_string(),
+                Err(e) => json!({ "ok": false, "error": format!("registrazione connessione fallita: {e}") }).to_string(),
+            }
+        }
+        other => json!({ "ok": false, "error": format!("mode non valido: {other} (attesi internal | external)") }).to_string(),
+    }
+}
+
+async fn handle_db_execute_sql(db: &PgPool, project_id: Uuid, arguments: &Value) -> String {
+    let Some(sql) = arguments.get("sql").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else {
+        return json!({ "ok": false, "error": "Campo sql obbligatorio." }).to_string();
+    };
+    let connection = arguments.get("connection").and_then(Value::as_str);
+    match crate::project_db::exec::execute_query(db, project_id, sql, &[], None, connection).await {
+        Ok(outcome) => {
+            let archive = crate::project_db::exec::archive_ddl(db, project_id, sql, &outcome, connection).await;
+            let mut payload = crate::project_db::exec::outcome_to_json(&outcome);
+            if let (Some(a), Value::Object(ref mut map)) = (archive, &mut payload) {
+                map.insert("archived_ddl".to_string(), json!({ "note_id": a.note_id.to_string(), "migration_filename": a.migration_filename }));
+            }
+            payload.to_string()
+        }
+        Err(e) => json!({ "ok": false, "error": e.message() }).to_string(),
+    }
+}
+
+async fn handle_db_apply_schema_file(db: &PgPool, project_id: Uuid, arguments: &Value) -> String {
+    let root = match get_project_root(db, project_id).await {
+        Ok(r) => r,
+        Err(e) => return json!({ "ok": false, "error": e }).to_string(),
+    };
+    let connection = arguments.get("connection").and_then(Value::as_str);
+    let chosen = match arguments.get("file_path").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+        Some(fp) => fp.to_string(),
+        None => {
+            let candidates = crate::project_db_routes::discover_schema_candidates(&root).await;
+            match candidates.len() {
+                0 => return json!({ "ok": false, "error": "Nessun file schema trovato. Indica file_path esplicitamente." }).to_string(),
+                1 => candidates[0].clone(),
+                _ => return json!({ "ok": false, "ambiguous": true, "candidates": candidates, "message": "Piu file schema trovati. Richiama il tool con file_path." }).to_string(),
+            }
+        }
+    };
+    let (rel_file, sql) = match crate::project_db_routes::read_schema_file(&root, &chosen).await {
+        Ok(x) => x,
+        Err(e) => return json!({ "ok": false, "error": e }).to_string(),
+    };
+    if sql.trim().is_empty() {
+        return json!({ "ok": false, "error": "Il file schema e vuoto." }).to_string();
+    }
+    match crate::project_db::exec::execute_query(db, project_id, &sql, &[], None, connection).await {
+        Ok(outcome) => {
+            let archive = crate::project_db::exec::archive_ddl(db, project_id, &sql, &outcome, connection).await;
+            json!({ "ok": true, "file": rel_file, "statements_run": outcome.statements_executed, "archived_ddl": archive.as_ref().map(|a| json!({ "note_id": a.note_id.to_string(), "migration_filename": a.migration_filename })) }).to_string()
+        }
+        Err(e) => json!({ "ok": false, "file": rel_file, "error": e.message() }).to_string(),
+    }
+}
+
+async fn handle_db_status(db: &PgPool, project_id: Uuid) -> String {
+    let rows = sqlx::query("SELECT name, engine, hosting_mode, is_primary FROM project_database_config WHERE project_id = $1 ORDER BY is_primary DESC, LOWER(name)").bind(project_id).fetch_all(db).await;
+    let connections: Vec<Value> = match rows {
+        Ok(rs) => rs.into_iter().map(|r| json!({
+            "name": r.try_get::<String, _>("name").unwrap_or_default(),
+            "engine": r.try_get::<Option<String>, _>("engine").unwrap_or(None),
+            "hosting_mode": r.try_get::<Option<String>, _>("hosting_mode").unwrap_or(None),
+            "is_primary": r.try_get::<bool, _>("is_primary").unwrap_or(false),
+        })).collect(),
+        Err(e) => return json!({ "ok": false, "error": format!("query connessioni fallita: {e}") }).to_string(),
+    };
+    if connections.is_empty() {
+        return json!({ "ok": true, "connections": [], "tables": [], "hint": "Nessun database configurato. Usa nexus_db_provision (mode=internal) per crearne uno." }).to_string();
+    }
+    let tables: Value = match crate::project_db::exec::execute_query(db, project_id, "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name", &[], None, None).await {
+        Ok(outcome) => Value::Array(outcome.rows.iter().filter_map(|r| r.get("table_name").cloned()).collect()),
+        Err(e) => json!({ "error": e.message() }),
+    };
+    json!({ "ok": true, "connections": connections, "tables": tables }).to_string()
 }

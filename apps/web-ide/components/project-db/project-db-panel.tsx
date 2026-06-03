@@ -12,10 +12,12 @@ import {
   listProjectMigrations,
   applyProjectMigrations,
   rollbackProjectMigration,
+  importProjectDbSchema,
   getProjectDbConfig,
   setProjectDbConfig,
   requestProjectDbOverride,
   detectProjectDb,
+  provisionProjectDb,
   testProjectDbConnection,
   listProjectDbConnections,
   setPrimaryProjectDbConnection,
@@ -109,6 +111,9 @@ export function ProjectDbPanel({ project }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
+  // Stato per "Importa schema dai file": lista candidati quando ambiguo.
+  const [schemaCandidates, setSchemaCandidates] = useState<string[]>([]);
+  const [selectedSchemaFile, setSelectedSchemaFile] = useState<string>("");
   const [showInit, setShowInit] = useState(false);
   const [showNewMig, setShowNewMig] = useState(false);
   const [initForm, setInitForm] = useState({
@@ -169,6 +174,79 @@ export function ProjectDbPanel({ project }: Props) {
     hints: string[];
   } | null>(null);
   const [detectedTestResult, setDetectedTestResult] = useState<ProjectDbTestResult | null>(null);
+
+  // Wizard "Crea database": guida l utente su DOVE (internal/external) e COME (nome/engine).
+  const [showProvision, setShowProvision] = useState(false);
+  const [provStep, setProvStep] = useState<"where" | "how">("where");
+  const [provMode, setProvMode] = useState<"internal" | "external">("internal");
+  const [provName, setProvName] = useState("primary");
+  const [provDbName, setProvDbName] = useState("");
+  const [provEngine, setProvEngine] = useState("postgres");
+  const [provExt, setProvExt] = useState({ host: "localhost", port: "5432", database: "", username: "", password: "" });
+  const [provBusy, setProvBusy] = useState(false);
+  const [provResult, setProvResult] = useState<{ ok: boolean; message: string } | null>(null);
+
+  // Nome database fisico suggerito dallo slug del progetto.
+  const slugSuggestion = (() => {
+    const base = (project?.slug || project?.id || "").toString().toLowerCase();
+    const cleaned = base.replace(/[^a-z0-9_]/g, "_").slice(0, 56);
+    const safe = /^[0-9]/.test(cleaned) || cleaned === "" ? "p" + cleaned : cleaned;
+    return safe ? safe + "_app" : "";
+  })();
+
+  const openProvisionWizard = () => {
+    setProvStep("where");
+    setProvMode("internal");
+    setProvName("primary");
+    setProvDbName(slugSuggestion);
+    setProvEngine("postgres");
+    setProvExt({ host: "localhost", port: "5432", database: slugSuggestion, username: "", password: "" });
+    setProvResult(null);
+    setShowProvision(true);
+  };
+
+  const buildExternalConnString = () => {
+    const { host, port, database, username, password } = provExt;
+    if (provEngine === "sqlite") return database;
+    if (provEngine === "mysql") return `mysql://${username}:${password}@${host}:${port || "3306"}/${database}`;
+    if (provEngine === "sqlserver") {
+      return `Server=${host}${port && port !== "1433" ? `,${port}` : ""};Database=${database};User Id=${username};Password=${password};TrustServerCertificate=True;`;
+    }
+    return `Host=${host};Port=${port || "5432"};Database=${database};Username=${username};Password=${password}`;
+  };
+
+  const handleProvision = async () => {
+    if (!projectId) return;
+    setProvBusy(true);
+    setProvResult(null);
+    try {
+      const body =
+        provMode === "internal"
+          ? { mode: "internal" as const, name: provName.trim() || "primary", db_name: provDbName.trim() || undefined, engine: "postgres" }
+          : {
+              mode: "external" as const,
+              name: provName.trim() || "primary",
+              engine: provEngine,
+              connection_string: buildExternalConnString(),
+            };
+      const res = await provisionProjectDb(projectId, body);
+      if (res.ok) {
+        const detail =
+          provMode === "internal"
+            ? `Database creato: ${res.db_name ?? ""}${res.dsn ? ` (${res.dsn})` : ""}`
+            : `Connessione esterna registrata${res.server_version ? ` - ${res.server_version}` : ""}`;
+        setProvResult({ ok: true, message: detail });
+        await load();
+        setTimeout(() => setShowProvision(false), 1200);
+      } else {
+        setProvResult({ ok: false, message: res.error || "Provisioning fallito" });
+      }
+    } catch (e) {
+      setProvResult({ ok: false, message: e instanceof Error ? e.message : "Errore provisioning" });
+    } finally {
+      setProvBusy(false);
+    }
+  };
 
   const load = useCallback(async () => {
     if (!projectId) {
@@ -260,6 +338,39 @@ export function ProjectDbPanel({ project }: Props) {
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Errore rollback");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Importa lo schema da un file SQL del progetto. Se il backend ritorna piu'
+  // candidati (ambiguo) mostra un select per scegliere; alla scelta riapplica
+  // con il file selezionato.
+  const handleImportSchema = async (filePath?: string) => {
+    if (!projectId) return;
+    setBusy(true);
+    setActionMsg(null);
+    setError(null);
+    try {
+      const res = await importProjectDbSchema(projectId, filePath);
+      if (res.ambiguous && res.candidates && res.candidates.length > 0) {
+        setSchemaCandidates(res.candidates);
+        setSelectedSchemaFile(res.candidates[0]);
+        setActionMsg("Piu' file schema trovati: seleziona quello da importare.");
+        return;
+      }
+      if (res.ok) {
+        setSchemaCandidates([]);
+        setSelectedSchemaFile("");
+        setActionMsg(
+          `Schema importato da ${res.file ?? "file"} (${res.statements_run ?? 0} statement, ${res.tables_after ?? "?"} tabelle).`
+        );
+        await load();
+      } else {
+        setError(res.message ?? "Importazione schema fallita.");
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Errore importazione schema");
     } finally {
       setBusy(false);
     }
@@ -619,12 +730,289 @@ export function ProjectDbPanel({ project }: Props) {
       </div>
 
       <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+      {showProvision && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 1000,
+            background: "rgba(0,0,0,0.55)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+          }}
+          onClick={() => { if (!provBusy) setShowProvision(false); }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 480,
+              maxWidth: "100%",
+              maxHeight: "90vh",
+              overflow: "auto",
+              background: tc.bgCard,
+              border: `1px solid ${tc.border}`,
+              borderRadius: 10,
+              padding: 16,
+              display: "flex",
+              flexDirection: "column",
+              gap: 12,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: tc.text }}>Crea database</div>
+              <button
+                type="button"
+                onClick={() => { if (!provBusy) setShowProvision(false); }}
+                style={{ border: "none", background: "transparent", color: tc.textMuted, cursor: "pointer", fontSize: 16, lineHeight: 1 }}
+              >
+                x
+              </button>
+            </div>
+
+            <div style={{ display: "flex", gap: 8, fontSize: 11 }}>
+              <span style={{ color: provStep === "where" ? tc.accent : tc.textMuted, fontWeight: 700 }}>1. Dove</span>
+              <span style={{ color: tc.textMuted }}>-</span>
+              <span style={{ color: provStep === "how" ? tc.accent : tc.textMuted, fontWeight: 700 }}>2. Come</span>
+            </div>
+
+            {provStep === "where" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <button
+                  type="button"
+                  onClick={() => { setProvMode("internal"); setProvEngine("postgres"); }}
+                  style={{
+                    textAlign: "left",
+                    padding: 12,
+                    borderRadius: 8,
+                    border: `2px solid ${provMode === "internal" ? tc.accent : tc.border}`,
+                    background: provMode === "internal" ? `${tc.accent}12` : "transparent",
+                    color: tc.text,
+                    cursor: "pointer",
+                  }}
+                >
+                  <div style={{ fontSize: 12, fontWeight: 700 }}>Container dedicato (Nexus)</div>
+                  <div style={{ fontSize: 11, color: tc.textSecondary, marginTop: 4 }}>
+                    Nexus crea un PostgreSQL isolato per questo progetto nel cluster dedicato.
+                    Nessuna credenziale richiesta: il database e separato da quelli degli altri progetti.
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setProvMode("external")}
+                  style={{
+                    textAlign: "left",
+                    padding: 12,
+                    borderRadius: 8,
+                    border: `2px solid ${provMode === "external" ? tc.accent : tc.border}`,
+                    background: provMode === "external" ? `${tc.accent}12` : "transparent",
+                    color: tc.text,
+                    cursor: "pointer",
+                  }}
+                >
+                  <div style={{ fontSize: 12, fontWeight: 700 }}>Database esterno</div>
+                  <div style={{ fontSize: 11, color: tc.textSecondary, marginTop: 4 }}>
+                    Usa un database gia esistente fornendo host, porta e credenziali.
+                    La connessione viene testata prima di essere registrata.
+                  </div>
+                </button>
+              </div>
+            )}
+
+            {provStep === "how" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <label style={{ fontSize: 10, color: tc.textMuted }}>Nome connessione logica</label>
+                  <input
+                    type="text"
+                    value={provName}
+                    placeholder="primary"
+                    onChange={(e) => setProvName(e.target.value)}
+                    style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
+                  />
+                </div>
+
+                {provMode === "internal" && (
+                  <>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <label style={{ fontSize: 10, color: tc.textMuted }}>Nome del database</label>
+                      <input
+                        type="text"
+                        value={provDbName}
+                        placeholder={slugSuggestion}
+                        onChange={(e) => setProvDbName(e.target.value)}
+                        style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
+                      />
+                      <div style={{ fontSize: 10, color: tc.textMuted }}>
+                        Suggerito dallo slug del progetto. Caratteri non validi vengono sostituiti con underscore.
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <label style={{ fontSize: 10, color: tc.textMuted }}>Engine</label>
+                      <select
+                        value="postgres"
+                        disabled
+                        style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
+                      >
+                        <option value="postgres">PostgreSQL</option>
+                      </select>
+                    </div>
+                  </>
+                )}
+
+                {provMode === "external" && (
+                  <>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <label style={{ fontSize: 10, color: tc.textMuted }}>Engine</label>
+                      <select
+                        value={provEngine}
+                        onChange={(e) => setProvEngine(e.target.value)}
+                        style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
+                      >
+                        <option value="postgres">PostgreSQL</option>
+                        <option value="mysql">MySQL</option>
+                        <option value="sqlserver">SQL Server</option>
+                        <option value="sqlite">SQLite</option>
+                      </select>
+                    </div>
+                    {provEngine !== "sqlite" && (
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <div style={{ flex: 2, display: "flex", flexDirection: "column", gap: 4 }}>
+                          <label style={{ fontSize: 10, color: tc.textMuted }}>Host</label>
+                          <input type="text" value={provExt.host} onChange={(e) => setProvExt((p) => ({ ...p, host: e.target.value }))}
+                            style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }} />
+                        </div>
+                        <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
+                          <label style={{ fontSize: 10, color: tc.textMuted }}>Porta</label>
+                          <input type="text" value={provExt.port} onChange={(e) => setProvExt((p) => ({ ...p, port: e.target.value }))}
+                            style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }} />
+                        </div>
+                      </div>
+                    )}
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <label style={{ fontSize: 10, color: tc.textMuted }}>{provEngine === "sqlite" ? "Percorso file" : "Nome database"}</label>
+                      <input type="text" value={provExt.database} onChange={(e) => setProvExt((p) => ({ ...p, database: e.target.value }))}
+                        style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }} />
+                    </div>
+                    {provEngine !== "sqlite" && (
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
+                          <label style={{ fontSize: 10, color: tc.textMuted }}>Utente</label>
+                          <input type="text" value={provExt.username} onChange={(e) => setProvExt((p) => ({ ...p, username: e.target.value }))}
+                            style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }} />
+                        </div>
+                        <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
+                          <label style={{ fontSize: 10, color: tc.textMuted }}>Password</label>
+                          <input type="password" value={provExt.password} onChange={(e) => setProvExt((p) => ({ ...p, password: e.target.value }))}
+                            style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }} />
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
+            {provResult && (
+              <div
+                style={{
+                  fontSize: 11,
+                  padding: 8,
+                  borderRadius: 6,
+                  border: `1px solid ${provResult.ok ? "#22c55e" : "#ef4444"}`,
+                  background: provResult.ok ? "#22c55e18" : "#ef444418",
+                  color: tc.text,
+                  wordBreak: "break-all",
+                }}
+              >
+                {provResult.message}
+              </div>
+            )}
+
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginTop: 4 }}>
+              <button
+                type="button"
+                disabled={provBusy}
+                onClick={() => {
+                  if (provStep === "how") setProvStep("where");
+                  else setShowProvision(false);
+                }}
+                style={{
+                  padding: "7px 12px",
+                  borderRadius: 6,
+                  border: `1px solid ${tc.border}`,
+                  background: "transparent",
+                  color: tc.text,
+                  cursor: provBusy ? "not-allowed" : "pointer",
+                  fontSize: 12,
+                }}
+              >
+                {provStep === "how" ? "Indietro" : "Annulla"}
+              </button>
+              {provStep === "where" ? (
+                <button
+                  type="button"
+                  onClick={() => setProvStep("how")}
+                  style={{
+                    padding: "7px 14px",
+                    borderRadius: 6,
+                    border: "none",
+                    background: tc.accent,
+                    color: "#fff",
+                    cursor: "pointer",
+                    fontSize: 12,
+                    fontWeight: 700,
+                  }}
+                >
+                  Avanti
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={provBusy}
+                  onClick={() => void handleProvision()}
+                  style={{
+                    padding: "7px 14px",
+                    borderRadius: 6,
+                    border: "none",
+                    background: tc.accent,
+                    color: "#fff",
+                    cursor: provBusy ? "not-allowed" : "pointer",
+                    fontSize: 12,
+                    fontWeight: 700,
+                  }}
+                >
+                  {provBusy ? "Creazione in corso..." : "Crea"}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {!isConfigured && !showInit && !loading && (
         <div style={{ padding: 10, borderBottom: `1px solid ${tc.border}`, background: `${tc.accent}10` }}>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <div style={{ fontSize: 11, color: tc.textSecondary }}>
-              Database progetto non configurato. Inizializza per abilitare la gestione delle migrazioni.
+              Database progetto non configurato. Crea il database scegliendo dove e come, oppure rileva la configurazione dai sorgenti.
             </div>
+            <button
+              type="button"
+              onClick={openProvisionWizard}
+              style={{
+                padding: "8px 10px",
+                borderRadius: 6,
+                border: "none",
+                background: tc.accent,
+                color: "#fff",
+                cursor: "pointer",
+                fontSize: 12,
+                fontWeight: 700,
+              }}
+            >
+              Crea database
+            </button>
             <button
               type="button"
               onClick={() => void handleDetect()}
@@ -1281,23 +1669,42 @@ export function ProjectDbPanel({ project }: Props) {
             <div style={{ fontSize: 11, fontWeight: 600, color: tc.text }}>
               DB del progetto ({connections.length})
             </div>
-            <button
-              type="button"
-              onClick={handleAddConnection}
-              disabled={busy}
-              style={{
-                padding: "2px 8px",
-                borderRadius: 4,
-                border: `1px solid ${tc.accent}`,
-                background: "transparent",
-                color: tc.accent,
-                cursor: busy ? "not-allowed" : "pointer",
-                fontSize: 10,
-                fontWeight: 600,
-              }}
-            >
-              + Aggiungi DB
-            </button>
+            <div style={{ display: "flex", gap: 6 }}>
+              <button
+                type="button"
+                onClick={openProvisionWizard}
+                disabled={busy}
+                style={{
+                  padding: "2px 8px",
+                  borderRadius: 4,
+                  border: "none",
+                  background: tc.accent,
+                  color: "#fff",
+                  cursor: busy ? "not-allowed" : "pointer",
+                  fontSize: 10,
+                  fontWeight: 700,
+                }}
+              >
+                Crea database
+              </button>
+              <button
+                type="button"
+                onClick={handleAddConnection}
+                disabled={busy}
+                style={{
+                  padding: "2px 8px",
+                  borderRadius: 4,
+                  border: `1px solid ${tc.accent}`,
+                  background: "transparent",
+                  color: tc.accent,
+                  cursor: busy ? "not-allowed" : "pointer",
+                  fontSize: 10,
+                  fontWeight: 600,
+                }}
+              >
+                + Aggiungi DB
+              </button>
+            </div>
           </div>
           {connections.map((c) => (
             <div
@@ -1544,6 +1951,67 @@ export function ProjectDbPanel({ project }: Props) {
         >
           Rollback
         </button>
+      </div>
+
+      <div style={{ padding: "0 10px 10px", display: "flex", flexDirection: "column", gap: 6, borderBottom: `1px solid ${tc.border}` }}>
+        <button
+          type="button"
+          onClick={() => void handleImportSchema(selectedSchemaFile || undefined)}
+          disabled={busy}
+          title="Cerca un file schema nel progetto ed eseguilo sul database"
+          style={{
+            padding: "6px 8px",
+            borderRadius: 6,
+            border: `1px solid ${tc.border}`,
+            background: tc.bgCard,
+            color: tc.text,
+            cursor: busy ? "not-allowed" : "pointer",
+            fontSize: 12,
+            fontWeight: 600,
+          }}
+        >
+          {busy ? "…" : "Importa schema dai file"}
+        </button>
+        {schemaCandidates.length > 0 && (
+          <div style={{ display: "flex", gap: 6 }}>
+            <select
+              value={selectedSchemaFile}
+              onChange={(e) => setSelectedSchemaFile(e.target.value)}
+              style={{
+                flex: 1,
+                padding: "6px 8px",
+                borderRadius: 6,
+                border: `1px solid ${tc.border}`,
+                background: tc.bgCard,
+                color: tc.text,
+                fontSize: 11,
+              }}
+            >
+              {schemaCandidates.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={() => void handleImportSchema(selectedSchemaFile)}
+              disabled={busy || !selectedSchemaFile}
+              style={{
+                padding: "6px 10px",
+                borderRadius: 6,
+                border: "none",
+                background: tc.accent,
+                color: "#fff",
+                cursor: busy ? "not-allowed" : "pointer",
+                fontSize: 11,
+                fontWeight: 600,
+              }}
+            >
+              Importa
+            </button>
+          </div>
+        )}
       </div>
 
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: 10, display: "flex", flexDirection: "column", gap: 6 }}>

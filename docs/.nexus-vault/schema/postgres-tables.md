@@ -6,12 +6,12 @@ slug: postgres-tables
 tags:
   - schema
   - postgres
-source_commit: b364c885b0251cf43753c2f69497193332b551f3
+source_commit: 36ad8a7e169d982cfd7e97c12388b7a4ec130b55
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-02T15:18:51Z
+updated_at: 2026-06-03T15:25:37Z
 nexus_meta_version: 1
 ---
 
@@ -125,6 +125,7 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `consecutive_failures` | integer | NO | `0` |
 | `auto_disabled_at` | timestamp with time zone | YES | `—` |
 | `auto_disabled_reason` | text | YES | `—` |
+| `consecutive_tool_failures` | integer | NO | `0` |
 
 ## `ai_price_catalog_audit`
 
@@ -925,6 +926,15 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `provider` | text | NO | `—` |
 | `model_id` | text | NO | `—` |
 | `notes` | text | YES | `—` |
+| `updated_at` | timestamp with time zone | NO | `now()` |
+
+## `nexus_provider_health`
+
+| Colonna | Tipo | Nullable | Default |
+|---|---|---|---|
+| `provider` | text | NO | `—` |
+| `billing_cooldown_until` | timestamp with time zone | YES | `—` |
+| `last_error` | text | YES | `—` |
 | `updated_at` | timestamp with time zone | NO | `now()` |
 
 ## `nexus_provider_health_history`

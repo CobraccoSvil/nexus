@@ -3399,6 +3399,42 @@ export async function setProjectDbConfig(
   });
 }
 
+export interface ProvisionProjectDbResult {
+  ok: boolean;
+  mode?: string;
+  name?: string;
+  db_name?: string;
+  dsn?: string;
+  created?: boolean;
+  is_primary?: boolean;
+  engine?: string;
+  server_version?: string | null;
+  table_count?: number | null;
+  error?: string;
+}
+
+/**
+ * Provisiona davvero un database per il progetto.
+ * - mode "internal": Nexus crea un Postgres isolato nel cluster dedicato
+ *   (nessuna credenziale richiesta).
+ * - mode "external": valida e registra la connection_string fornita.
+ */
+export async function provisionProjectDb(
+  projectId: string,
+  body: {
+    mode: "internal" | "external";
+    name?: string;
+    db_name?: string;
+    engine?: string;
+    connection_string?: string;
+  }
+): Promise<ProvisionProjectDbResult> {
+  return fetchJson(`${API_BASE}/api/projects/${projectId}/db/provision`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
 export interface ProjectDbConnection {
   id: string;
   name: string;
@@ -3572,6 +3608,30 @@ export async function applyProjectMigrations(
 export async function rollbackProjectMigration(projectId: string): Promise<{ ok: boolean; rolled_back?: string; error?: string }> {
   return fetchJson(`${API_BASE}/api/projects/${projectId}/db/migrations/rollback`, {
     method: "POST",
+  });
+}
+
+export interface ImportSchemaResult {
+  ok: boolean;
+  ambiguous?: boolean;
+  candidates?: string[];
+  message?: string;
+  file?: string;
+  statements_run?: number;
+  tables_after?: number | null;
+}
+
+export async function importProjectDbSchema(
+  projectId: string,
+  filePath?: string,
+  connection?: string
+): Promise<ImportSchemaResult> {
+  return fetchJson(`${API_BASE}/api/projects/${projectId}/db/import-schema`, {
+    method: "POST",
+    body: JSON.stringify({
+      file_path: filePath || undefined,
+      connection: connection || undefined,
+    }),
   });
 }
 

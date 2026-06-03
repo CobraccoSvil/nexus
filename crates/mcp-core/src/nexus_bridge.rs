@@ -69,6 +69,10 @@ pub struct NexusBridge {
     /// A runtime: OnnxMiniLmEmbedder (384-d) se il modello è presente,
     /// altrimenti HashEmbedder (256-d) come fallback.
     embedder: Arc<dyn Embedder>,
+    /// `true` quando l'embedder semantico ONNX non era disponibile e si e'
+    /// caduti su HashEmbedder (ricerche semantiche di qualita' ridotta).
+    /// Esposto via `/api/embedder-status` per observability.
+    embedder_degraded: bool,
     /// Consensus engine per aggregare voti multi-agente (Fase 9E)
     consensus: Arc<ConsensusEngine>,
     /// Pool PostgreSQL (opzionale) — usato da flush_replication_pending e flush_q_table
@@ -98,21 +102,28 @@ impl NexusBridge {
         // cade back su HashEmbedder(256) in modo completamente silenzioso
         // (solo un WARN nel log). Questo permette di sviluppare senza il
         // file modello e di attivarlo solo in produzione.
-        let embedder: Arc<dyn Embedder> = match OnnxMiniLmEmbedder::try_from_env() {
-            Ok(onnx) => {
-                info!(
-                    "OnnxMiniLmEmbedder loaded: dim={}, model={}",
-                    nexus_orchestrator::MINILM_DIM,
-                    std::env::var("NEXUS_MINILM_MODEL")
-                        .unwrap_or_else(|_| nexus_orchestrator::DEFAULT_MODEL_PATH.to_string()),
-                );
-                Arc::new(onnx) as Arc<dyn Embedder>
-            }
-            Err(e) => {
-                warn!("OnnxMiniLmEmbedder unavailable ({e}), using HashEmbedder(256)");
-                Arc::new(HashEmbedder::new(256)) as Arc<dyn Embedder>
-            }
-        };
+        let (embedder, embedder_degraded): (Arc<dyn Embedder>, bool) =
+            match OnnxMiniLmEmbedder::try_from_env() {
+                Ok(onnx) => {
+                    info!(
+                        "OnnxMiniLmEmbedder loaded: dim={}, model={}",
+                        nexus_orchestrator::MINILM_DIM,
+                        std::env::var("NEXUS_MINILM_MODEL")
+                            .unwrap_or_else(|_| nexus_orchestrator::DEFAULT_MODEL_PATH.to_string()),
+                    );
+                    (Arc::new(onnx) as Arc<dyn Embedder>, false)
+                }
+                Err(e) => {
+                    // WARN una-tantum all'avvio (non spam): stato osservabile
+                    // anche via /api/embedder-status (embedder_degraded=true).
+                    warn!(
+                        "Embedder semantico degradato: ONNX non disponibile ({e}), \
+                         uso HashEmbedder (ricerche semantiche di qualita' ridotta). \
+                         Verifica feature 'onnx' e models/minilm/."
+                    );
+                    (Arc::new(HashEmbedder::new(256)) as Arc<dyn Embedder>, true)
+                }
+            };
 
         let config = QLearningConfig::default();
         let router_base = QLearningRouter::new(config, embedder.clone());
@@ -374,6 +385,7 @@ impl NexusBridge {
             ruvector_store,
             vector_stores,
             embedder,
+            embedder_degraded,
             consensus,
             pool,
             periodic_handle: tokio::sync::Mutex::new(None),
@@ -529,6 +541,16 @@ impl NexusBridge {
     /// Può essere `OnnxMiniLmEmbedder` (384-d) o `HashEmbedder` (256-d).
     pub fn embedder(&self) -> &Arc<dyn Embedder> {
         &self.embedder
+    }
+
+    /// Stato osservabile dell'embedder: tipo attivo, dimensione e flag degraded.
+    /// `degraded=true` quando ONNX non era disponibile e si usa HashEmbedder.
+    pub fn embedder_status(&self) -> (String, usize, bool) {
+        (
+            self.embedder.name().to_string(),
+            self.embedder.dim(),
+            self.embedder_degraded,
+        )
     }
 
     /// Consensus engine (Fase 9E)
@@ -899,6 +921,38 @@ pub async fn nexus_healthz() -> impl IntoResponse {
                         "workers": b.scheduler().len(),
                         "total_runs": s.total_runs,
                         "total_failures": s.total_failures,
+                    }
+                })),
+            )
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not_initialized",
+                "reason": "NexusBridge::init_global not called or failed"
+            })),
+        ),
+    }
+}
+
+/// GET /api/embedder-status — Stato dell'embedder semantico del bridge.
+///
+/// Ritorna `{ embedder: { kind, dim, degraded } }`. `degraded=true` indica che
+/// ONNX non era disponibile e si usa HashEmbedder (qualita' ridotta). Pensato
+/// per dashboard/alerting: nessun dato sensibile. Public route come gli altri
+/// endpoint observability del bridge.
+pub async fn nexus_embedder_status() -> impl IntoResponse {
+    match NexusBridge::global() {
+        Some(b) => {
+            let (kind, dim, degraded) = b.embedder_status();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "ok",
+                    "embedder": {
+                        "kind": kind,
+                        "dim": dim,
+                        "degraded": degraded,
                     }
                 })),
             )

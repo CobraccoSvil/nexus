@@ -45,6 +45,7 @@ mod prompt_templates;
 mod documents;
 mod environment;
 mod settings;
+mod context_settings;
 mod vector_memory;
 mod knowledge;
 mod agent_todos_routes;
@@ -1006,6 +1007,7 @@ async fn main() -> anyhow::Result<()> {
             .route("/nexus/tools", get(nexus_bridge::nexus_tools))
             .route("/nexus/metrics", get(nexus_bridge::nexus_prometheus))
             .route("/nexus/test-routing", post(nexus_bridge::nexus_test_routing))
+            .route("/api/embedder-status", get(nexus_bridge::nexus_embedder_status))
             .route("/auth/github", get(auth::github_login))
             .route("/auth/github/callback", get(auth::github_callback))
             .route(
@@ -1619,6 +1621,13 @@ async fn main() -> anyhow::Result<()> {
                 )),
             )
             .route(
+                "/api/projects/:id/db/provision",
+                post(project_db_routes::provision_project_db).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
                 "/api/projects/:id/db/connections",
                 get(project_db_routes::list_project_db_connections).layer(axum_mw::from_fn_with_state(
                     state.clone(),
@@ -1640,6 +1649,12 @@ async fn main() -> anyhow::Result<()> {
             .route(
                 "/api/projects/:id/db/query",
                 post(project_db_routes::execute_project_db_query).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
+            )
+            .route(
+                "/api/projects/:id/db/import-schema",
+                post(project_db_routes::import_project_db_schema).layer(
                     axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
                 ),
             )

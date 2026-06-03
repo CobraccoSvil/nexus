@@ -1,0 +1,130 @@
+[
+  {
+    "ts": "2026-05-31T16:29:04.931Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/knowledge/ingest_run.rs",
+    "old": "    // Embedding + Qdrant (best-effort).\n    let embed_slice = if body_md.len() > 2000 { &body_md[..2000] } else { &body_md };\n    let qdrant_point_id: Option<String> = match neural.embed_text(\"\", embed_slice).await {\n        Ok(vector) => {\n            let point_id = Uuid::new_v4().to_string();\n            let payload = json!({\n                \"project_id\": snapshot.project_id.to_string(),\n                \"note_id\": note_id.to_string(),\n                \"intent\": \"agent_summary\",\n                \"status\": \"active\",\n                \"kind\": \"agent_summary\",\n            });\n            match crate::vector_memory::upsert_knowledge_point(db, &point_id, vector, payload).await\n            {\n                Ok(_) => Some(point_id),\n                Err(e) => {\n                    tracing::warn!(\n                        run_id = %run_id,\n                        error = %e,\n                        \"kb.ingest: Qdrant upsert fallito (procedo senza embedding)\"\n                    );\n                    None\n                }\n            }\n        }\n        Err(e) => {\n            tracing::warn!(\n                run_id = %run_id,\n                error = %e,\n                \"kb.ingest: embed_text fallito (procedo senza embedding)\"\n            );\n            None\n        }\n    };",
+    "new": "    // Embedding + Qdrant (best-effort). Il vettore viene riusato dal link\n    // composer (M12.3) per il passo semantico, evitando un secondo embedding.\n    let embed_slice = if body_md.len() > 2000 { &body_md[..2000] } else { &body_md };\n    let mut embed_vector: Option<Vec<f32>> = None;\n    let qdrant_point_id: Option<String> = match neural.embed_text(\"\", embed_slice).await {\n        Ok(vector) => {\n            embed_vector = Some(vector.clone());\n            let point_id = Uuid::new_v4().to_string();\n            let payload = json!({\n                \"project_id\": snapshot.project_id.to_string(),\n                \"note_id\": note_id.to_string(),\n                \"intent\": \"agent_summary\",\n                \"status\": \"active\",\n                \"kind\": \"agent_summary\",\n            });\n            match crate::vector_memory::upsert_knowledge_point(db, &point_id, vector, payload).await\n            {\n                Ok(_) => Some(point_id),\n                Err(e) => {\n                    tracing::warn!(\n                        run_id = %run_id,\n                        error = %e,\n                        \"kb.ingest: Qdrant upsert fallito (procedo senza embedding)\"\n                    );\n                    None\n                }\n            }\n        }\n        Err(e) => {\n            tracing::warn!(\n                run_id = %run_id,\n                error = %e,\n                \"kb.ingest: embed_text fallito (procedo senza embedding)\"\n            );\n            None\n        }\n    };",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T16:29:15.243Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/knowledge/ingest_run.rs",
+    "old": "                .bind(snapshot.project_id)\n                .bind(tag)\n                .execute(db)\n                .await;\n            }\n        }\n        Err(e) => {\n            tracing::warn!(\n                run_id = %run_id,\n                error = %e,\n                \"kb.ingest: INSERT project_knowledge_notes fallito\"\n            );\n        }\n    }\n}",
+    "new": "                .bind(snapshot.project_id)\n                .bind(tag)\n                .execute(db)\n                .await;\n            }\n\n            // M12.3 — Link composer triplo (strutturale + semantico + wikilink).\n            // Best-effort: errori loggati internamente, mai propagati.\n            let link_input = crate::knowledge::auto_link::NewNoteLinkInput {\n                project_id: snapshot.project_id,\n                note_id,\n                body_md: body_md.clone(),\n                file_paths: file_paths.clone(),\n                source_run_id: Some(run_id),\n                parent_run_id: None,\n                embed_vector,\n                embed_fallback_text: format!(\"{title}\\n\\n{body_md}\"),\n            };\n            crate::knowledge::auto_link::build_links_for_new_note(db, neural, link_input).await;\n        }\n        Err(e) => {\n            tracing::warn!(\n                run_id = %run_id,\n                error = %e,\n                \"kb.ingest: INSERT project_knowledge_notes fallito\"\n            );\n        }\n    }\n}",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T16:29:28.242Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/knowledge/ingest_run.rs",
+    "old": "    // Embedding + Qdrant best-effort.\n    let embed_slice = if body_md.len() > 2000 { &body_md[..2000] } else { &body_md };\n    let qdrant_point_id: Option<String> = match neural.embed_text(\"\", embed_slice).await {\n        Ok(vector) => {\n            let point_id = Uuid::new_v4().to_string();\n            let payload = json!({\n                \"project_id\": snapshot.project_id.to_string(),\n                \"note_id\": note_id.to_string(),\n                \"intent\": \"subagent_summary\",\n                \"status\": \"active\",\n                \"kind\": \"subagent_summary\",\n            });",
+    "new": "    // Embedding + Qdrant best-effort. Vettore riusato dal link composer (M12.3).\n    let embed_slice = if body_md.len() > 2000 { &body_md[..2000] } else { &body_md };\n    let mut embed_vector: Option<Vec<f32>> = None;\n    let qdrant_point_id: Option<String> = match neural.embed_text(\"\", embed_slice).await {\n        Ok(vector) => {\n            embed_vector = Some(vector.clone());\n            let point_id = Uuid::new_v4().to_string();\n            let payload = json!({\n                \"project_id\": snapshot.project_id.to_string(),\n                \"note_id\": note_id.to_string(),\n                \"intent\": \"subagent_summary\",\n                \"status\": \"active\",\n                \"kind\": \"subagent_summary\",\n            });",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T16:29:41.597Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/knowledge/ingest_run.rs",
+    "old": "                .bind(snapshot.project_id)\n                .bind(tag)\n                .execute(db)\n                .await;\n            }\n        }\n        Err(e) => {\n            tracing::warn!(\n                subagent_run_id = %subagent_run_id,\n                error = %e,\n                \"kb.ingest sub-agent: INSERT fallito\"\n            );\n        }\n    }\n}",
+    "new": "                .bind(snapshot.project_id)\n                .bind(tag)\n                .execute(db)\n                .await;\n            }\n\n            // M12.3 — Link composer: per il sub-agent il legame primario e'\n            // `followup` verso la nota del parent run (se gia' ingestata).\n            let link_input = crate::knowledge::auto_link::NewNoteLinkInput {\n                project_id: snapshot.project_id,\n                note_id,\n                body_md: body_md.clone(),\n                file_paths: Vec::new(),\n                source_run_id: Some(snapshot.parent_run_id),\n                parent_run_id: Some(snapshot.parent_run_id),\n                embed_vector,\n                embed_fallback_text: format!(\"{title}\\n\\n{body_md}\"),\n            };\n            crate::knowledge::auto_link::build_links_for_new_note(db, neural, link_input).await;\n        }\n        Err(e) => {\n            tracing::warn!(\n                subagent_run_id = %subagent_run_id,\n                error = %e,\n                \"kb.ingest sub-agent: INSERT fallito\"\n            );\n        }\n    }\n}",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T16:57:40.595Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/knowledge/ingest_run.rs",
+    "old": "    if !ingest_enabled(db).await {\n        tracing::debug!(run_id = %run_id, \"kb.ingest disabled, skip\");\n        return;\n    }\n    let snapshot = match load_run_snapshot(db, run_id).await {\n        Some(s) => s,\n        None => {\n            tracing::debug!(run_id = %run_id, \"kb.ingest: run non completed o final_answer assente, skip\");\n            return;\n        }\n    };",
+    "new": "    tracing::info!(run_id = %run_id, \"kb.ingest: ingest_run_summary_to_kb INVOCATA (diag M12.1)\");\n    if !ingest_enabled(db).await {\n        tracing::info!(run_id = %run_id, \"kb.ingest disabled, skip\");\n        return;\n    }\n    let snapshot = match load_run_snapshot(db, run_id).await {\n        Some(s) => s,\n        None => {\n            tracing::info!(run_id = %run_id, \"kb.ingest: run non completed o final_answer assente, skip\");\n            return;\n        }\n    };",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T16:58:05.606Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/knowledge/ingest_run.rs",
+    "old": "    let trimmed_answer = snapshot.final_answer.trim();\n    if trimmed_answer.chars().count() < min_chars {\n        tracing::debug!(\n            run_id = %run_id,\n            chars = trimmed_answer.chars().count(),\n            min = min_chars,\n            \"kb.ingest: final_answer sotto soglia min_chars, skip\"\n        );\n        return;\n    }\n    if trimmed_answer.starts_with(\"[Error:\") || trimmed_answer.starts_with(\"[Errore\") {\n        tracing::debug!(run_id = %run_id, \"kb.ingest: final_answer e' un error marker, skip\");\n        return;\n    }\n    if snapshot.iteration_count < 1 {\n        tracing::debug!(run_id = %run_id, \"kb.ingest: iteration_count=0, skip\");\n        return;\n    }",
+    "new": "    let trimmed_answer = snapshot.final_answer.trim();\n    if trimmed_answer.chars().count() < min_chars {\n        tracing::info!(\n            run_id = %run_id,\n            chars = trimmed_answer.chars().count(),\n            min = min_chars,\n            \"kb.ingest: final_answer sotto soglia min_chars, skip\"\n        );\n        return;\n    }\n    if trimmed_answer.starts_with(\"[Error:\") || trimmed_answer.starts_with(\"[Errore\") {\n        tracing::info!(run_id = %run_id, \"kb.ingest: final_answer e' un error marker, skip\");\n        return;\n    }\n    if snapshot.iteration_count < 1 {\n        tracing::info!(run_id = %run_id, \"kb.ingest: iteration_count=0, skip\");\n        return;\n    }",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T17:04:24.391Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/knowledge/ingest_run.rs",
+    "old": "async fn read_int_setting(db: &PgPool, key: &str, default: i32) -> i32 {",
+    "new": "/// Prefisso di `s` lungo al massimo `max_bytes`, troncato su un boundary di\n/// carattere UTF-8 valido. Sostituisce `&s[..n]` che PANICA se `n` cade in\n/// mezzo a un carattere multibyte (es. accenti italiani à/è/é/ò/ù). Il panic\n/// avveniva in un `tokio::spawn` detached → silenzioso, e bloccava l'intera\n/// ingestione KB (M12.1) per ogni run con final_answer > 2000 byte.\nfn safe_byte_prefix(s: &str, max_bytes: usize) -> &str {\n    if s.len() <= max_bytes {\n        return s;\n    }\n    let mut end = max_bytes;\n    while end > 0 && !s.is_char_boundary(end) {\n        end -= 1;\n    }\n    &s[..end]\n}\n\nasync fn read_int_setting(db: &PgPool, key: &str, default: i32) -> i32 {",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T17:05:19.420Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/knowledge/ingest_run.rs",
+    "old": "    let file_paths = extract_modified_files(db, run_id).await;\n    let title = build_title(&snapshot, title_max_chars);\n    let body_md = truncate_body(trimmed_answer, body_max_chars);\n    let tags = build_tags(&snapshot);\n    let note_id = Uuid::new_v4();\n\n    // Embedding + Qdrant (best-effort). Il vettore viene riusato dal link\n    // composer (M12.3) per il passo semantico, evitando un secondo embedding.\n    let embed_slice = safe_byte_prefix(&body_md, 2000);",
+    "new": "    tracing::info!(run_id = %run_id, \"kb.ingest: filtri superati, costruisco nota (diag M12.1)\");\n    let file_paths = extract_modified_files(db, run_id).await;\n    let title = build_title(&snapshot, title_max_chars);\n    let body_md = truncate_body(trimmed_answer, body_max_chars);\n    let tags = build_tags(&snapshot);\n    let note_id = Uuid::new_v4();\n\n    // Embedding + Qdrant (best-effort). Il vettore viene riusato dal link\n    // composer (M12.3) per il passo semantico, evitando un secondo embedding.\n    let embed_slice = safe_byte_prefix(&body_md, 2000);\n    tracing::info!(run_id = %run_id, embed_bytes = embed_slice.len(), \"kb.ingest: pre-embed (diag M12.1)\");",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T17:05:33.162Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/knowledge/ingest_run.rs",
+    "old": "        Err(e) => {\n            tracing::warn!(\n                run_id = %run_id,\n                error = %e,\n                \"kb.ingest: embed_text fallito (procedo senza embedding)\"\n            );\n            None\n        }\n    };\n\n    // INSERT della note con TUTTI i campi pertinenti.",
+    "new": "        Err(e) => {\n            tracing::warn!(\n                run_id = %run_id,\n                error = %e,\n                \"kb.ingest: embed_text fallito (procedo senza embedding)\"\n            );\n            None\n        }\n    };\n    tracing::info!(run_id = %run_id, indexed = qdrant_point_id.is_some(), \"kb.ingest: post-embed, eseguo INSERT (diag M12.1)\");\n\n    // INSERT della note con TUTTI i campi pertinenti.",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T17:13:17.661Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/knowledge/ingest_run.rs",
+    "old": "    tracing::info!(run_id = %run_id, \"kb.ingest: ingest_run_summary_to_kb INVOCATA (diag M12.1)\");\n    if !ingest_enabled(db).await {\n        tracing::info!(run_id = %run_id, \"kb.ingest disabled, skip\");\n        return;\n    }\n    let snapshot = match load_run_snapshot(db, run_id).await {\n        Some(s) => s,\n        None => {\n            tracing::info!(run_id = %run_id, \"kb.ingest: run non completed o final_answer assente, skip\");\n            return;\n        }\n    };",
+    "new": "    tracing::info!(run_id = %run_id, \"kb.ingest: ingest_run_summary_to_kb INVOCATA (diag M12.1)\");\n    if !ingest_enabled(db).await {\n        tracing::info!(run_id = %run_id, \"kb.ingest disabled, skip\");\n        return;\n    }\n    tracing::info!(run_id = %run_id, \"kb.ingest: post ingest_enabled (diag M12.1)\");\n    let snapshot = match load_run_snapshot(db, run_id).await {\n        Some(s) => s,\n        None => {\n            tracing::info!(run_id = %run_id, \"kb.ingest: run non completed o final_answer assente, skip\");\n            return;\n        }\n    };\n    tracing::info!(run_id = %run_id, \"kb.ingest: post load_run_snapshot (diag M12.1)\");",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T17:19:41.413Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/knowledge/ingest_run.rs",
+    "old": "    if now - TS.load(Ordering::Relaxed) < 60 {\n        return CACHED.load(Ordering::Relaxed);\n    }\n    let value: Option<String> =\n        sqlx::query_scalar(\"SELECT value FROM settings WHERE key = 'kb.ingest.enabled' LIMIT 1\")\n            .fetch_optional(db)\n            .await\n            .ok()\n            .flatten();",
+    "new": "    if now - TS.load(Ordering::Relaxed) < 60 {\n        tracing::info!(\"kb.ingest: ingest_enabled cache hit (diag)\");\n        return CACHED.load(Ordering::Relaxed);\n    }\n    tracing::info!(\"kb.ingest: ingest_enabled pre-query settings (diag)\");\n    let value: Option<String> =\n        sqlx::query_scalar(\"SELECT value FROM settings WHERE key = 'kb.ingest.enabled' LIMIT 1\")\n            .fetch_optional(db)\n            .await\n            .ok()\n            .flatten();\n    tracing::info!(?value, \"kb.ingest: ingest_enabled post-query settings (diag)\");",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T17:33:20.811Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/knowledge/ingest_run.rs",
+    "old": "    if snapshot.iteration_count < 1 {\n        tracing::info!(run_id = %run_id, \"kb.ingest: iteration_count=0, skip\");\n        return;\n    }\n\n    tracing::info!(run_id = %run_id, \"kb.ingest: filtri superati, costruisco nota (diag M12.1)\");\n    let file_paths = extract_modified_files(db, run_id).await;",
+    "new": "    if snapshot.iteration_count < 1 {\n        tracing::info!(run_id = %run_id, \"kb.ingest: iteration_count=0, skip\");\n        return;\n    }\n\n    // Idempotenza basata su source_run_id (NON su source_message_id): il\n    // run_message_id e' il messaggio UTENTE, gia' usato come source_message_id\n    // dalla nota kind='chat' creata all'arrivo del messaggio. Riusarlo qui\n    // collideva con l'indice UNIQUE idx_pkn_msg_unique -> ON CONFLICT DO NOTHING\n    // -> la nota agent_summary non veniva MAI creata. Ora la nota usa\n    // source_message_id=NULL e l'unicita' e' garantita da questo pre-check.\n    let already: Option<Uuid> = sqlx::query_scalar(\n        \"SELECT id FROM project_knowledge_notes \\\n         WHERE source_run_id = $1 AND kind = 'agent_summary' LIMIT 1\",\n    )\n    .bind(run_id)\n    .fetch_optional(db)\n    .await\n    .ok()\n    .flatten();\n    if already.is_some() {\n        tracing::debug!(run_id = %run_id, \"kb.ingest: nota agent_summary gia' presente per il run, skip\");\n        return;\n    }\n\n    tracing::info!(run_id = %run_id, \"kb.ingest: filtri superati, costruisco nota (diag M12.1)\");\n    let file_paths = extract_modified_files(db, run_id).await;",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T17:33:38.632Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/knowledge/ingest_run.rs",
+    "old": "    // INSERT della note con TUTTI i campi pertinenti.\n    // kind='agent_summary' + intent='agent_summary' + status='active' (la nota\n    // nasce gia' active perche' viene da run completed — coerente con M14.1\n    // promote draft->active a fine run; qui shortcircuito al valore finale).\n    // Idempotenza via idx_pkn_msg_unique su source_message_id.\n    let insert = sqlx::query(\n        r#\"\n        INSERT INTO project_knowledge_notes (\n            id, project_id, source_run_id, source_message_id,\n            intent, title, body_md, status, qdrant_point_id,\n            tags, file_paths, kind, source_kind\n        )\n        VALUES ($1, $2, $3, $4, 'agent_summary', $5, $6, 'active', $7, $8, $9, 'agent_summary', 'native')\n        ON CONFLICT (source_message_id) WHERE source_message_id IS NOT NULL\n        DO NOTHING\n        \"#,\n    )\n    .bind(note_id)\n    .bind(snapshot.project_id)\n    .bind(run_id)\n    .bind(snapshot.run_message_id)\n    .bind(&title)\n    .bind(&body_md)\n    .bind(qdrant_point_id.as_deref())\n    .bind(&tags)\n    .bind(&file_paths)\n    .execute(db)\n    .await;",
+    "new": "    // INSERT della note con TUTTI i campi pertinenti.\n    // kind='agent_summary' + intent='agent_summary' + status='active' (la nota\n    // nasce gia' active perche' viene da run completed — coerente con M14.1).\n    // source_message_id = NULL: NON usiamo run_message_id (messaggio utente,\n    // gia' occupato dalla nota kind='chat' via idx_pkn_msg_unique). L'unicita'\n    // per run e' garantita dal pre-check su source_run_id sopra.\n    let _ = snapshot.run_message_id; // intenzionalmente non usato come source_message_id\n    let insert = sqlx::query(\n        r#\"\n        INSERT INTO project_knowledge_notes (\n            id, project_id, source_run_id, source_message_id,\n            intent, title, body_md, status, qdrant_point_id,\n            tags, file_paths, kind, source_kind\n        )\n        VALUES ($1, $2, $3, NULL, 'agent_summary', $4, $5, 'active', $6, $7, $8, 'agent_summary', 'native')\n        \"#,\n    )\n    .bind(note_id)\n    .bind(snapshot.project_id)\n    .bind(run_id)\n    .bind(&title)\n    .bind(&body_md)\n    .bind(qdrant_point_id.as_deref())\n    .bind(&tags)\n    .bind(&file_paths)\n    .execute(db)\n    .await;",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T17:34:16.980Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/knowledge/ingest_run.rs",
+    "old": "    let tags = vec![\n        \"kind:subagent_summary\".to_string(),\n        format!(\"subagent_kind:{}\", snapshot.kind),\n        format!(\"parent_run:{}\", snapshot.parent_run_id),\n    ];\n\n    let synthetic_msg_id = synthetic_message_id_for_subagent(subagent_run_id);\n    let note_id = Uuid::new_v4();",
+    "new": "    let tags = vec![\n        \"kind:subagent_summary\".to_string(),\n        format!(\"subagent_kind:{}\", snapshot.kind),\n        format!(\"parent_run:{}\", snapshot.parent_run_id),\n        // Tag di idempotenza: identifica univocamente il sub-agent run.\n        format!(\"subagent_run:{}\", subagent_run_id),\n    ];\n\n    // Idempotenza per subagent_run_id (via tag). NON usiamo source_message_id\n    // con UUID v5 sintetico: violava la FK verso chat_messages (l'id non esiste)\n    // -> INSERT in errore silenzioso. Ora source_message_id=NULL e l'unicita'\n    // e' garantita da questo pre-check sul tag subagent_run.\n    let already: Option<Uuid> = sqlx::query_scalar(\n        \"SELECT id FROM project_knowledge_notes \\\n         WHERE project_id = $1 AND kind = 'subagent_summary' AND tags @> $2 LIMIT 1\",\n    )\n    .bind(snapshot.project_id)\n    .bind(vec![format!(\"subagent_run:{}\", subagent_run_id)])\n    .fetch_optional(db)\n    .await\n    .ok()\n    .flatten();\n    if already.is_some() {\n        tracing::debug!(subagent_run_id = %subagent_run_id, \"kb.ingest sub-agent: nota gia' presente, skip\");\n        return;\n    }\n\n    let note_id = Uuid::new_v4();",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T17:34:29.248Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/knowledge/ingest_run.rs",
+    "old": "    // INSERT note. source_run_id = parent_run_id (collega alla run principale).\n    // source_message_id = synthetic UUID v5 derivato da subagent_run_id (idempotenza).\n    let insert = sqlx::query(\n        r#\"\n        INSERT INTO project_knowledge_notes (\n            id, project_id, source_run_id, source_message_id,\n            intent, title, body_md, status, qdrant_point_id,\n            tags, file_paths, kind, source_kind\n        )\n        VALUES ($1, $2, $3, $4, 'subagent_summary', $5, $6, 'active', $7, $8, ARRAY[]::TEXT[], 'subagent_summary', 'native')\n        ON CONFLICT (source_message_id) WHERE source_message_id IS NOT NULL\n        DO NOTHING\n        \"#,\n    )\n    .bind(note_id)\n    .bind(snapshot.project_id)\n    .bind(snapshot.parent_run_id)\n    .bind(synthetic_msg_id)\n    .bind(&title)\n    .bind(&body_md)\n    .bind(qdrant_point_id.as_deref())\n    .bind(&tags)\n    .execute(db)",
+    "new": "    // INSERT note. source_run_id = parent_run_id (collega alla run principale).\n    // source_message_id = NULL (vedi pre-check idempotenza sopra).\n    let insert = sqlx::query(\n        r#\"\n        INSERT INTO project_knowledge_notes (\n            id, project_id, source_run_id, source_message_id,\n            intent, title, body_md, status, qdrant_point_id,\n            tags, file_paths, kind, source_kind\n        )\n        VALUES ($1, $2, $3, NULL, 'subagent_summary', $4, $5, 'active', $6, $7, ARRAY[]::TEXT[], 'subagent_summary', 'native')\n        \"#,\n    )\n    .bind(note_id)\n    .bind(snapshot.project_id)\n    .bind(snapshot.parent_run_id)\n    .bind(&title)\n    .bind(&body_md)\n    .bind(qdrant_point_id.as_deref())\n    .bind(&tags)\n    .execute(db)",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T17:34:50.439Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/knowledge/ingest_run.rs",
+    "old": "/// UUID v5 deterministico dal subagent_run_id per garantire idempotenza\n/// via il vincolo idx_pkn_msg_unique. Namespace fisso = oid.\nfn synthetic_message_id_for_subagent(subagent_run_id: Uuid) -> Uuid {\n    // OID_NAMESPACE = 6ba7b812-9dad-11d1-80b4-00c04fd430c8\n    let namespace = Uuid::parse_str(\"6ba7b812-9dad-11d1-80b4-00c04fd430c8\").unwrap();\n    Uuid::new_v5(&namespace, subagent_run_id.as_bytes())\n}\n\n",
+    "new": "",
+    "all": false
+  }
+]

@@ -314,17 +314,56 @@ pub async fn delete_chat_session(
     Ok(Json(json!({ "ok": true })))
 }
 
-pub async fn compact_chat_session(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    Path(session_id_str): Path<String>,
-) -> ApiResult {
-    let user_id = parse_user_id(&claims)?;
-    let session_id = Uuid::parse_str(&session_id_str)
-        .map_err(|_| api_error(axum::http::StatusCode::BAD_REQUEST, "session id non valido"))?;
+/// Esito di una compattazione riuscita. Riusato sia dall'endpoint manuale
+/// (`compact_chat_session`) sia dall'auto-compact a soglia (`spawn_agent_run`).
+#[derive(Debug, Clone)]
+pub(crate) struct CompactOutcome {
+    pub summary_text: String,
+    pub point_id: String,
+    /// Numero di messaggi user/assistant soft-deletati dal compact.
+    pub soft_deleted: u64,
+}
 
-    let ctx = load_session_context(&state.db, session_id, user_id).await?;
+/// Errore di compattazione che trasporta lo status HTTP coerente con il
+/// comportamento storico dell'endpoint manuale. L'auto-compact lo tratta come
+/// stringa best-effort (logga WARN e prosegue).
+#[derive(Debug, Clone)]
+pub(crate) struct CompactError {
+    pub status: axum::http::StatusCode,
+    pub message: String,
+}
 
+impl std::fmt::Display for CompactError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl CompactError {
+    fn new(status: axum::http::StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
+}
+
+/// Logica core di compattazione, condivisa tra l'endpoint manuale e
+/// l'auto-compact a soglia. Genera il riassunto, lo salva in vector memory
+/// (Qdrant + prompt_corrections), fa soft-delete dei messaggi user/assistant,
+/// inserisce il messaggio role='summary', marca la sessione 'compacted' ed
+/// emette gli eventi SSE. Niente auth qui: il chiamante deve aver gia'
+/// verificato l'accesso (l'endpoint via load_session_context, l'auto-compact
+/// perche' opera nel contesto del run gia' autorizzato).
+pub(crate) async fn compact_session_core(
+    state: &AppState,
+    session_id: Uuid,
+    project_id: Uuid,
+) -> Result<CompactOutcome, CompactError> {
     // La compattazione e' sempre ripetibile: ogni invocazione produce un nuovo
     // riassunto + nuovo correction_id, e ri-marca la sessione come 'compacted'.
     // Necessario perche' dopo una compattazione l'utente continua a chattare
@@ -338,13 +377,16 @@ pub async fn compact_chat_session(
         ORDER BY created_at ASC
         "#,
     )
-    .bind(ctx.session_id)
+    .bind(session_id)
     .fetch_all(&state.db)
     .await
-    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| CompactError::internal(e.to_string()))?;
 
     if rows.is_empty() {
-        return Err(api_error(axum::http::StatusCode::UNPROCESSABLE_ENTITY, "Nessun messaggio da compattare"));
+        return Err(CompactError::new(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "Nessun messaggio da compattare",
+        ));
     }
 
     // Build messages JSON for summarization
@@ -364,7 +406,7 @@ pub async fn compact_chat_session(
     }));
 
     let messages_json = serde_json::to_string(&msgs)
-        .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| CompactError::internal(e.to_string()))?;
 
     // Risolvi provider/modello dalla routing matrix (purpose 'conversation_summary')
     // cosi' la compattazione usa lo stesso router dei modelli della chat.
@@ -385,7 +427,7 @@ pub async fn compact_chat_session(
         .neural
         .generate_agent_turn(&summary_provider, &summary_model, &messages_json, "[]", 1500, "")
         .await
-        .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Neural Core error: {e}")))?;
+        .map_err(|e| CompactError::internal(format!("Neural Core error: {e}")))?;
 
     // Extract text from response (try multiple possible keys)
     let summary_text = summary_resp
@@ -413,11 +455,11 @@ pub async fn compact_chat_session(
         || lower.contains("billing");
     if is_degenerate {
         tracing::warn!(
-            "compact_chat_session: riassunto degenere ({} char): \"{}\"",
+            "compact_session_core: riassunto degenere ({} char): \"{}\"",
             summary_text.len(),
             summary_text.chars().take(120).collect::<String>()
         );
-        return Err(api_error(
+        return Err(CompactError::new(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "Compattazione fallita: tutti i provider AI hanno restituito errore. \
              Riprova fra qualche minuto o sblocca un provider in /admin/settings/providers.",
@@ -438,12 +480,12 @@ pub async fn compact_chat_session(
             .orchestrator
             .embed_text(&summary_text)
             .await
-            .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Embedding error: {e}")))?;
+            .map_err(|e| CompactError::internal(format!("Embedding error: {e}")))?;
 
         // Store in Qdrant via vector_memory
         let payload = json!({
-            "project_id": ctx.project_id.to_string(),
-            "session_id": ctx.session_id.to_string(),
+            "project_id": project_id.to_string(),
+            "session_id": session_id.to_string(),
             "type": "session_memory",
             "active": false,   // inactive until user activates
             "text": summary_text,
@@ -455,7 +497,7 @@ pub async fn compact_chat_session(
             payload,
         )
         .await
-        .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| CompactError::internal(e.to_string()))?;
     }
 
     // Persist to prompt_corrections table
@@ -467,14 +509,14 @@ pub async fn compact_chat_session(
         VALUES ($1, $2, $3, 'session_memory', $4, $5, $6, false, 'saved', 'session_memory')
     "#)
     .bind(correction_id)
-    .bind(ctx.project_id)
-    .bind(ctx.session_id)
+    .bind(project_id)
+    .bind(session_id)
     .bind(&summary_text)
-    .bind(format!("session:{}", ctx.session_id))
+    .bind(format!("session:{}", session_id))
     .bind(&point_id)
     .execute(&state.db)
     .await
-    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| CompactError::internal(e.to_string()))?;
 
     // Soft-delete dei messaggi user/assistant precedenti il compact: la
     // sintesi e' ora in vector memory e verra' iniettata come messaggio
@@ -486,10 +528,10 @@ pub async fn compact_chat_session(
          WHERE session_id = $1 AND deleted_at IS NULL \
            AND role IN ('user', 'assistant')",
     )
-    .bind(ctx.session_id)
+    .bind(session_id)
     .execute(&state.db)
     .await
-    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| CompactError::internal(e.to_string()))?;
 
     // Stima del costo "logico" del summary in token (approx 4 char per token).
     let summary_tokens_est: i64 = ((summary_text.chars().count() as i64) / 4).max(1);
@@ -514,22 +556,22 @@ pub async fn compact_chat_session(
          VALUES ($1, $2, $3, 'summary', $4, $5, NOW())",
     )
     .bind(summary_msg_id)
-    .bind(ctx.session_id)
-    .bind(ctx.project_id)
+    .bind(session_id)
+    .bind(project_id)
     .bind(&summary_content)
     .bind(&summary_metadata)
     .execute(&state.db)
     .await
-    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| CompactError::internal(e.to_string()))?;
 
     // Mark session as compacted
     sqlx::query(
         "UPDATE chat_sessions SET status = 'compacted', updated_at = NOW() WHERE id = $1"
     )
-    .bind(ctx.session_id)
+    .bind(session_id)
     .execute(&state.db)
     .await
-    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| CompactError::internal(e.to_string()))?;
 
     // Dopo il soft-delete, il totale token mostrato dalla TokenUsageBar e'
     // solo quello del summary nuovo (i precedenti sono deleted_at NOT NULL e
@@ -543,9 +585,9 @@ pub async fn compact_chat_session(
     // - ChatSessionStatusChanged → tab della sessione mostra icona "compactata"
     nexus_events::dispatcher::emit(
         &state.project_channels,
-        ctx.project_id,
+        project_id,
         nexus_events::ProjectEvent::ChatSessionCompacted {
-            session_id: ctx.session_id,
+            session_id,
             summary_point_id: Some(point_id.clone()),
             total_tokens,
             total_cost_usd,
@@ -553,17 +595,41 @@ pub async fn compact_chat_session(
     );
     nexus_events::dispatcher::emit(
         &state.project_channels,
-        ctx.project_id,
+        project_id,
         nexus_events::ProjectEvent::ChatSessionStatusChanged {
-            session_id: ctx.session_id,
+            session_id,
             status: "compacted".into(),
         },
     );
 
+    Ok(CompactOutcome {
+        summary_text,
+        point_id,
+        soft_deleted: soft_deleted.rows_affected(),
+    })
+}
+
+/// Endpoint manuale (pulsante "Compatta chat"). Thin wrapper: verifica
+/// l'accesso e delega alla logica core condivisa con l'auto-compact.
+pub async fn compact_chat_session(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(session_id_str): Path<String>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let session_id = Uuid::parse_str(&session_id_str)
+        .map_err(|_| api_error(axum::http::StatusCode::BAD_REQUEST, "session id non valido"))?;
+
+    let ctx = load_session_context(&state.db, session_id, user_id).await?;
+
+    let outcome = compact_session_core(&state, ctx.session_id, ctx.project_id)
+        .await
+        .map_err(|e| api_error(e.status, e.message))?;
+
     Ok(Json(json!({
         "ok": true,
-        "summary": summary_text,
-        "pointId": point_id,
+        "summary": outcome.summary_text,
+        "pointId": outcome.point_id,
     })))
 }
 

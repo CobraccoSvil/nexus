@@ -6,12 +6,12 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: b364c885b0251cf43753c2f69497193332b551f3
+source_commit: 36ad8a7e169d982cfd7e97c12388b7a4ec130b55
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-02T15:18:51Z
+updated_at: 2026-06-03T15:25:37Z
 nexus_meta_version: 1
 ---
 
@@ -266,7 +266,26 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0252_code_doc_wiki.sql` | 0252_code_doc_wiki.sql |
 | `0253_provider_health_settings.sql` | 0253_provider_health_settings.sql |
 | `0254_rag_injection_mode.sql` | 0254_rag_injection_mode.sql |
+| `0255_provider_health_cooldown.sql` | 0255_provider_health_cooldown.sql |
+| `0256_deepseek_v4_thinking_capability.sql` | 0256_deepseek_v4_thinking_capability.sql |
+| `0257_discovery_first_core_tools.sql` | 0257_discovery_first_core_tools.sql |
+| `0258_deepseek_v4_catalog_context_window.sql` | 0258_deepseek_v4_catalog_context_window.sql |
+| `0259_gemini_25_thinking_capability.sql` | 0259_gemini_25_thinking_capability.sql |
+| `0260_routing_agentic_intents_off_mistral_small.sql` | 0260_routing_agentic_intents_off_mistral_small.sql |
+| `0261_agentic_gating_budget_cooldown.sql` | 0261_agentic_gating_budget_cooldown.sql |
+| `0262_port_gc_settings.sql` | 0262_port_gc_settings.sql |
+| `0263_dev_server_dedupe_setting.sql` | 0263_dev_server_dedupe_setting.sql |
+| `0264_loop_fallback_capable_model.sql` | 0264: il target di escalation per "modello in difficolta'" deve essere un |
+| `0265_final_gate_settings.sql` | 0265_final_gate_settings.sql |
+| `0266_planner_tool_robust_model.sql` | 0266: il planner deve usare un modello NON-thinking con function calling |
+| `0267_planner_fallback_purpose.sql` | 0267: purpose 'planner_fallback' per il fallback tool-robust del planner. |
+| `0268_routing_matrix_working_models.sql` | 0268_routing_matrix_working_models.sql |
+| `0269_model_tool_failure_tracking.sql` | 0269: tracking auto-manutenzione tool-capability dei modelli. |
+| `0270_pin_working_mistral_model.sql` | 0270: usa il modello Mistral PINNED che funziona davvero con l'account |
+| `0271_tool_aware_probe_and_catalog_sync.sql` | 0271: probe tool-aware + catalog_sync probe-aware. |
+| `0272_services_watchdog.sql` | 0272_services_watchdog.sql |
+| `0273_clarify_exploration_aware.sql` | Migrazione 0273: clarify e agenti esplorazione-aware. |
 
-**Totale**: 245 migrazioni.
+**Totale**: 264 migrazioni.
 
-Ultima migrazione: `0254_rag_injection_mode.sql`.
+Ultima migrazione: `0273_clarify_exploration_aware.sql`.

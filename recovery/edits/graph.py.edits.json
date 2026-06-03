@@ -1,0 +1,184 @@
+[
+  {
+    "ts": "2026-04-23T08:37:58.147Z",
+    "kind": "write",
+    "fp": "//wsl.localhost/Ubuntu/home/administrator/ideai/brain/agents/graph.py",
+    "content": "\"\"\"Definizione e compilazione del grafo LangGraph per Nexus.\"\"\"\nfrom __future__ import annotations\n\nimport logging\nfrom typing import Any\n\nfrom langgraph.graph import END, StateGraph  # type: ignore[import-untyped]\n\nfrom .nodes import configure_services, executor_node, learner_node, route_by_task_type, router_node\nfrom .state import AgentState\n\nlogger = logging.getLogger(__name__)\n\n\ndef create_agent_graph(\n    providers: Any,\n    router: Any,\n    embeddings: Any,\n    checkpointer_path: str | None = None,\n) -> Any:\n    \"\"\"Crea e compila il grafo LangGraph con tutti i servizi Nexus.\n\n    Args:\n        providers: ProviderRegistry globale di Nexus\n        router: SemanticRouter globale di Nexus\n        embeddings: EmbeddingService globale di Nexus\n        checkpointer_path: Path opzionale al database SQLite per il checkpointer.\n                           Se None usa il path default in nexus_memory/langgraph.db.\n\n    Returns:\n        Grafo compilato con SqliteSaver e interrupt_before=[\"executor\"].\n    \"\"\"\n    from brain.memory.retrieval import InteractionRetriever\n    from brain.memory.storage import LocalLearningStorage\n\n    from .checkpointer import create_checkpointer, get_memory_db_path\n\n    # Inizializza storage locale\n    memory_path = get_memory_db_path()\n    storage = LocalLearningStorage(db_path=memory_path)\n    retriever = InteractionRetriever(embedding_service=embeddings)\n\n    # Inietta servizi nei nodi\n    configure_services(\n        providers=providers,\n        router=router,\n        embeddings=embeddings,\n        storage=storage,\n        retriever=retriever,\n    )\n\n    # Crea il grafo con lo schema di stato\n    workflow: StateGraph = StateGraph(AgentState)\n\n    # Aggiunge nodi\n    workflow.add_node(\"router\", router_node)\n    workflow.add_node(\"executor\", executor_node)  # type: ignore[arg-type]\n    workflow.add_node(\"learner\", learner_node)\n\n    # Imposta entry point\n    workflow.set_entry_point(\"router\")\n\n    # Routing condizionale da router a executor (sempre executor per ora)\n    workflow.add_conditional_edges(\n        \"router\",\n        route_by_task_type,\n        {\"executor\": \"executor\"},\n    )\n\n    # Edges fissi\n    workflow.add_edge(\"executor\", \"learner\")\n    workflow.add_edge(\"learner\", END)\n\n    # Compila con checkpointer e human-in-the-loop\n    checkpointer = create_checkpointer()\n\n    compiled = workflow.compile(\n        checkpointer=checkpointer,\n        interrupt_before=[\"executor\"],\n    )\n\n    logger.info(\n        \"Grafo LangGraph compilato: checkpointer=%s memory=%s\",\n        checkpointer.__class__.__name__,\n        memory_path,\n    )\n\n    return compiled\n"
+  },
+  {
+    "ts": "2026-04-27T11:01:31.272Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\graph.py",
+    "old": "from .nodes import (\n    configure_services,\n    executor_node,\n    learner_node,\n    route_after_executor,\n    route_by_task_type,\n    router_node,\n    tool_dispatch_node,\n)",
+    "new": "from .nodes import (\n    configure_services,\n    executor_node,\n    learner_node,\n    reflection_node,\n    route_after_executor,\n    route_by_task_type,\n    router_node,\n    tool_dispatch_node,\n)",
+    "all": false
+  },
+  {
+    "ts": "2026-04-27T11:01:42.664Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\graph.py",
+    "old": "    # Aggiunge nodi\n    workflow.add_node(\"router\", router_node)  # type: ignore[arg-type]\n    workflow.add_node(\"executor\", executor_node)  # type: ignore[arg-type]\n    workflow.add_node(\"tool_dispatch\", tool_dispatch_node)  # type: ignore[arg-type]\n    workflow.add_node(\"learner\", learner_node)  # type: ignore[arg-type]\n\n    # Imposta entry point\n    workflow.set_entry_point(\"router\")\n\n    # Routing condizionale da router a executor\n    workflow.add_conditional_edges(\n        \"router\",\n        route_by_task_type,\n        {\"executor\": \"executor\"},\n    )\n\n    # Dopo executor: loop su tool_dispatch o chiusura in learner.\n    workflow.add_conditional_edges(\n        \"executor\",\n        route_after_executor,\n        {\"tool_dispatch\": \"tool_dispatch\", \"learner\": \"learner\"},\n    )\n    # tool_dispatch rientra nell'executor per un'altra iterazione.\n    workflow.add_edge(\"tool_dispatch\", \"executor\")\n    workflow.add_edge(\"learner\", END)",
+    "new": "    # Aggiunge nodi\n    workflow.add_node(\"router\", router_node)  # type: ignore[arg-type]\n    workflow.add_node(\"executor\", executor_node)  # type: ignore[arg-type]\n    workflow.add_node(\"tool_dispatch\", tool_dispatch_node)  # type: ignore[arg-type]\n    workflow.add_node(\"reflection\", reflection_node)  # type: ignore[arg-type]\n    workflow.add_node(\"learner\", learner_node)  # type: ignore[arg-type]\n\n    # Imposta entry point\n    workflow.set_entry_point(\"router\")\n\n    # Routing condizionale da router a executor\n    workflow.add_conditional_edges(\n        \"router\",\n        route_by_task_type,\n        {\"executor\": \"executor\"},\n    )\n\n    # Dopo executor: loop su tool_dispatch o passo a reflection.\n    # Nota: route_after_executor ora manda a \"reflection\" invece di \"learner\"\n    # direttamente. reflection_node poi passa sempre a learner.\n    workflow.add_conditional_edges(\n        \"executor\",\n        route_after_executor,\n        {\"tool_dispatch\": \"tool_dispatch\", \"learner\": \"reflection\"},\n    )\n    # tool_dispatch rientra nell'executor per un'altra iterazione.\n    workflow.add_edge(\"tool_dispatch\", \"executor\")\n    # reflection passa sempre a learner (fire-and-forget interno).\n    workflow.add_edge(\"reflection\", \"learner\")\n    workflow.add_edge(\"learner\", END)",
+    "all": false
+  },
+  {
+    "ts": "2026-05-21T12:25:42.953Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\graph.py",
+    "old": "    from brain.memory.storage import LocalLearningStorage\n\n    from .checkpointer import create_checkpointer, get_memory_db_path\n\n    # Inizializza storage locale\n    memory_path = get_memory_db_path()\n    storage = LocalLearningStorage(db_path=memory_path)",
+    "new": "    from brain.memory.storage import PostgresLearningStorage\n\n    from .checkpointer import create_checkpointer\n\n    # Inizializza storage PostgreSQL (sostituisce il vecchio SQLite locale)\n    storage = PostgresLearningStorage()",
+    "all": false
+  },
+  {
+    "ts": "2026-05-21T12:30:18.173Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\graph.py",
+    "old": "    logger.info(\n        \"Grafo LangGraph compilato: checkpointer=%s (PostgreSQL asincrono) memory=%s\",\n        checkpointer.__class__.__name__,\n        memory_path,\n    )",
+    "new": "    logger.info(\n        \"Grafo LangGraph compilato: checkpointer=%s (PostgreSQL asincrono) learning=PostgreSQL\",\n        checkpointer.__class__.__name__,\n    )",
+    "all": false
+  },
+  {
+    "ts": "2026-05-21T12:30:29.986Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\graph.py",
+    "old": "    \"\"\"Crea e compila il grafo LangGraph con tutti i servizi Nexus.\n\n    Args:\n        providers: ProviderRegistry globale di Nexus\n        router: SemanticRouter globale di Nexus\n        embeddings: EmbeddingService globale di Nexus\n        checkpointer_path: Path opzionale al database SQLite per il checkpointer.\n                           Se None usa il path default in nexus_memory/langgraph.db.\n\n    Returns:\n        Grafo compilato con SqliteSaver e interrupt_before=[\"executor\"].\n    \"\"\"",
+    "new": "    \"\"\"Crea e compila il grafo LangGraph con tutti i servizi Nexus.\n\n    Args:\n        providers: ProviderRegistry globale di Nexus\n        router: SemanticRouter globale di Nexus\n        embeddings: EmbeddingService globale di Nexus\n        checkpointer_path: Deprecato, ignorato. Il checkpointer usa PostgreSQL.\n        tool_runner: Runner opzionale per tool dispatch.\n        agent_router: Router agente opzionale.\n\n    Returns:\n        Grafo compilato con PostgresCheckpointer e interrupt_before=[\"executor\"].\n    \"\"\"",
+    "all": false
+  },
+  {
+    "ts": "2026-05-26T13:56:56.289Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\graph.py",
+    "old": "    # Dopo executor: loop su tool_dispatch, verificare (PR-2), o passo a reflection.\n    # PR-2: se plan_phase_active + verifier_enabled e stop_reason=end_turn,\n    # route_after_executor ritorna \"verifier\" che lancia la verifica DoD.\n    workflow.add_conditional_edges(\n        \"executor\",\n        route_after_executor,\n        {\n            \"tool_dispatch\": \"tool_dispatch\",\n            \"verifier\": \"verifier\",\n            \"learner\": \"reflection\",\n        },\n    )",
+    "new": "    # Dopo executor: loop su tool_dispatch, verificare (PR-2), o passo a reflection.\n    # PR-2: se plan_phase_active + verifier_enabled e stop_reason=end_turn,\n    # route_after_executor ritorna \"verifier\" che lancia la verifica DoD.\n    # G1 anti-descrittivo (nodes.py route_after_executor): se il modello ha\n    # risposto descrittivamente a un'action request, route_after_executor ritorna\n    # \"executor\" per ri-tentare con nudge. Senza la mapping \"executor\"->\"executor\"\n    # qui sotto, LangGraph lanciava KeyError('executor') interrompendo il turno\n    # con \"Si e' verificato un errore durante l'elaborazione. Dettaglio: 'executor'\".\n    workflow.add_conditional_edges(\n        \"executor\",\n        route_after_executor,\n        {\n            \"tool_dispatch\": \"tool_dispatch\",\n            \"verifier\": \"verifier\",\n            \"learner\": \"reflection\",\n            \"executor\": \"executor\",\n        },\n    )",
+    "all": false
+  },
+  {
+    "ts": "2026-05-28T18:07:37.735Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\graph.py",
+    "old": "    workflow.add_conditional_edges(\n        \"executor\",\n        route_after_executor,\n        {\n            \"tool_dispatch\": \"tool_dispatch\",\n            \"verifier\": \"verifier\",\n            \"learner\": \"reflection\",\n        },\n    )",
+    "new": "    workflow.add_conditional_edges(\n        \"executor\",\n        route_after_executor,\n        {\n            \"tool_dispatch\": \"tool_dispatch\",\n            \"verifier\": \"verifier\",\n            \"learner\": \"reflection\",\n            \"executor\": \"executor\",\n        },\n    )",
+    "all": false
+  },
+  {
+    "ts": "2026-05-28T18:07:48.901Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\graph.py",
+    "old": "    workflow.add_conditional_edges(\n        \"executor\",\n        route_after_executor,\n        {\n            \"tool_dispatch\": \"tool_dispatch\",\n            \"verifier\": \"verifier\",\n            \"learner\": \"reflection\",\n        },\n    )",
+    "new": "    workflow.add_conditional_edges(\n        \"executor\",\n        route_after_executor,\n        {\n            \"tool_dispatch\": \"tool_dispatch\",\n            \"verifier\": \"verifier\",\n            \"learner\": \"reflection\",\n            \"executor\": \"executor\",\n        },\n    )",
+    "all": false
+  },
+  {
+    "ts": "2026-05-30T07:28:48.725Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\graph.py",
+    "old": "    from . import orchestrator_config\n    behavior_mode = state.get(\"behavior_mode\")\n    intent = state.get(\"user_intent\")\n    token_budget = int(state.get(\"token_budget\") or 0)\n    cfg = orchestrator_config.get()\n    eligible = orchestrator_config.is_eligible(behavior_mode, intent, token_budget)\n    logger.info(\n        \"route_after_router: eligible=%s plan_enabled=%s mode=%r intent=%r budget=%d -> %s\",\n        eligible, cfg.get(\"plan_phase_enabled\"), behavior_mode, intent, token_budget,\n        \"planner\" if eligible else \"executor\",\n    )\n    return \"planner\" if eligible else \"executor\"",
+    "new": "    from . import orchestrator_config\n    behavior_mode = state.get(\"behavior_mode\")\n    intent = state.get(\"user_intent\")\n    token_budget = int(state.get(\"token_budget\") or 0)\n    cfg = orchestrator_config.get()\n    # PR-D: gating adattivo. is_eligible_adaptive integra i segnali del\n    # classifier (complexity/confidence/agentic/ambiguity) quando\n    # adaptive_gating_enabled e' ON; altrimenti si comporta come is_eligible.\n    eligible = orchestrator_config.is_eligible_adaptive(\n        behavior_mode,\n        intent,\n        token_budget,\n        complexity=state.get(\"task_complexity\"),\n        confidence=state.get(\"intent_confidence\"),\n        agentic_score=state.get(\"agentic_score\"),\n        is_ambiguous=state.get(\"is_ambiguous\"),\n    )\n    logger.info(\n        \"route_after_router: eligible=%s plan_enabled=%s adaptive=%s mode=%r intent=%r \"\n        \"budget=%d complexity=%r agentic=%r -> %s\",\n        eligible, cfg.get(\"plan_phase_enabled\"), cfg.get(\"adaptive_gating_enabled\"),\n        behavior_mode, intent, token_budget,\n        state.get(\"task_complexity\"), state.get(\"agentic_score\"),\n        \"planner\" if eligible else \"executor\",\n    )\n    return \"planner\" if eligible else \"executor\"",
+    "all": false
+  },
+  {
+    "ts": "2026-05-30T07:28:55.801Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\graph.py",
+    "old": "def create_agent_graph(\n    providers: Any,\n    router: Any,\n    embeddings: Any,\n    checkpointer_path: str | None = None,\n    tool_runner: Any = None,\n    agent_router: Any = None,\n) -> Any:",
+    "new": "def create_agent_graph(\n    providers: Any,\n    router: Any,\n    embeddings: Any,\n    checkpointer_path: str | None = None,\n    tool_runner: Any = None,\n    agent_router: Any = None,\n    agentic_classifier: Any = None,\n) -> Any:",
+    "all": false
+  },
+  {
+    "ts": "2026-05-30T07:31:21.074Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\graph.py",
+    "old": "    configure_services(\n        providers=providers,\n        router=router,\n        embeddings=embeddings,\n        storage=storage,\n        retriever=retriever,\n        tool_runner=tool_runner,\n        agent_router=agent_router,\n    )",
+    "new": "    configure_services(\n        providers=providers,\n        router=router,\n        embeddings=embeddings,\n        storage=storage,\n        retriever=retriever,\n        tool_runner=tool_runner,\n        agent_router=agent_router,\n        agentic_classifier=agentic_classifier,\n    )",
+    "all": false
+  },
+  {
+    "ts": "2026-05-30T08:40:20.719Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\graph.py",
+    "old": "    _configure_verifier(tool_runner=tool_runner)",
+    "new": "    _configure_verifier(tool_runner=tool_runner, providers=providers, routing_client=_routing_client)",
+    "all": false
+  },
+  {
+    "ts": "2026-05-30T08:47:05.179Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\graph.py",
+    "old": "from .planner_node import planner_node, configure as _configure_planner\nfrom .verifier_node import verifier_node, configure as _configure_verifier",
+    "new": "from .planner_node import planner_node, configure as _configure_planner\nfrom .verifier_node import verifier_node, configure as _configure_verifier\nfrom .understanding_node import understanding_node, configure as _configure_understanding",
+    "all": false
+  },
+  {
+    "ts": "2026-05-30T08:47:11.107Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\graph.py",
+    "old": "    _configure_verifier(tool_runner=tool_runner, providers=providers, routing_client=_routing_client)\n    _configure_clarify(providers=providers, routing_client=_routing_client)",
+    "new": "    _configure_verifier(tool_runner=tool_runner, providers=providers, routing_client=_routing_client)\n    _configure_clarify(providers=providers, routing_client=_routing_client)\n    _configure_understanding(providers=providers, tool_runner=tool_runner, routing_client=_routing_client)",
+    "all": false
+  },
+  {
+    "ts": "2026-05-30T08:47:17.318Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\graph.py",
+    "old": "    workflow.add_node(\"clarify_or_expand\", clarify_or_expand_node)  # type: ignore[arg-type]\n    workflow.add_node(\"planner\", planner_node)  # type: ignore[arg-type]",
+    "new": "    workflow.add_node(\"clarify_or_expand\", clarify_or_expand_node)  # type: ignore[arg-type]\n    workflow.add_node(\"understanding\", understanding_node)  # type: ignore[arg-type]\n    workflow.add_node(\"planner\", planner_node)  # type: ignore[arg-type]",
+    "all": false
+  },
+  {
+    "ts": "2026-05-30T08:47:29.067Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\brain\\agents\\graph.py",
+    "old": "    # Dopo clarify_or_expand:\n    #   - se ha emesso una richiesta di chiarimento → END (turno si ferma,\n    #     l'utente risponde nel turno successivo).\n    #   - altrimenti → route_after_router (planner o executor).\n    def _route_after_clarify_or_expand(state: AgentState) -> str:\n        if state.get(\"pending_clarify\"):\n            return \"end\"\n        return route_after_router(state)\n\n    workflow.add_conditional_edges(\n        \"clarify_or_expand\",\n        _route_after_clarify_or_expand,\n        {\"end\": END, \"planner\": \"planner\", \"executor\": \"executor\"},\n    )\n    # Il planner emette il piano e poi passa il controllo all'executor.\n    workflow.add_edge(\"planner\", \"executor\")",
+    "new": "    # Dopo clarify_or_expand:\n    #   - se ha emesso una richiesta di chiarimento → END (turno si ferma).\n    #   - altrimenti → understanding (Cluster 2). Il nodo understanding e'\n    #     pass-through se disabilitato/non complesso: in quel caso il routing\n    #     verso planner/executor avviene comunque dopo, via route_after_router.\n    def _route_after_clarify_or_expand(state: AgentState) -> str:\n        if state.get(\"pending_clarify\"):\n            return \"end\"\n        return \"understanding\"\n\n    workflow.add_conditional_edges(\n        \"clarify_or_expand\",\n        _route_after_clarify_or_expand,\n        {\"end\": END, \"understanding\": \"understanding\"},\n    )\n    # Dopo understanding (pass-through se OFF): routing standard planner/executor.\n    workflow.add_conditional_edges(\n        \"understanding\",\n        route_after_router,\n        {\"planner\": \"planner\", \"executor\": \"executor\"},\n    )\n    # Il planner emette il piano e poi passa il controllo all'executor.\n    workflow.add_edge(\"planner\", \"executor\")",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T20:22:45.108Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/brain/agents/graph.py",
+    "old": "from .planner_node import planner_node, configure as _configure_planner\nfrom .verifier_node import verifier_node, configure as _configure_verifier",
+    "new": "from .planner_node import planner_node, configure as _configure_planner\nfrom .verifier_node import verifier_node, configure as _configure_verifier\nfrom .regression_gate_node import regression_gate_node, configure as _configure_regression_gate",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T20:22:51.300Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/brain/agents/graph.py",
+    "old": "    _configure_understanding(providers=providers, tool_runner=tool_runner, routing_client=_routing_client)",
+    "new": "    _configure_understanding(providers=providers, tool_runner=tool_runner, routing_client=_routing_client)\n    # M13.4: il regression gate riusa il tool_runner per eseguire i test\n    # (criteria_runner) e per creare nota/todo via tool MCP.\n    _configure_regression_gate(tool_runner=tool_runner)",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T20:22:57.819Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/brain/agents/graph.py",
+    "old": "    workflow.add_node(\"reflection\", reflection_node)  # type: ignore[arg-type]\n    workflow.add_node(\"learner\", learner_node)  # type: ignore[arg-type]",
+    "new": "    workflow.add_node(\"reflection\", reflection_node)  # type: ignore[arg-type]\n    # M13.4: regression gate SOFT-only, gira UNA volta a fine run tra\n    # reflection e learner. Non blocca mai (blocco hard = M13.5, default-OFF).\n    workflow.add_node(\"regression_gate\", regression_gate_node)  # type: ignore[arg-type]\n    workflow.add_node(\"learner\", learner_node)  # type: ignore[arg-type]",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T20:23:04.601Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/brain/agents/graph.py",
+    "old": "    # reflection passa sempre a learner (fire-and-forget interno).\n    workflow.add_edge(\"reflection\", \"learner\")\n    workflow.add_edge(\"learner\", END)",
+    "new": "    # reflection -> regression_gate -> learner. Il gate (M13.4) gira UNA volta a\n    # fine run: e' un pass-through SOFT che, se rileva test falliti sull'impact\n    # set, emette warning + nota KB + todo di follow-up senza bloccare il run.\n    workflow.add_edge(\"reflection\", \"regression_gate\")\n    workflow.add_edge(\"regression_gate\", \"learner\")\n    workflow.add_edge(\"learner\", END)",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T20:36:26.536Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/brain/agents/graph.py",
+    "old": "    route_after_executor,\n    route_after_verifier,",
+    "new": "    route_after_executor,\n    route_after_regression_gate,\n    route_after_verifier,",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T20:36:35.890Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/brain/agents/graph.py",
+    "old": "    # reflection -> regression_gate -> learner. Il gate (M13.4) gira UNA volta a\n    # fine run: e' un pass-through SOFT che, se rileva test falliti sull'impact\n    # set, emette warning + nota KB + todo di follow-up senza bloccare il run.\n    workflow.add_edge(\"reflection\", \"regression_gate\")\n    workflow.add_edge(\"regression_gate\", \"learner\")\n    workflow.add_edge(\"learner\", END)",
+    "new": "    # reflection -> regression_gate -> learner. Il gate gira a fine run:\n    # in SOFT (default M13.4) e' un pass-through che, se rileva test falliti\n    # sull'impact set, emette warning + nota KB + todo senza bloccare il run.\n    # In HARD (M13.5, default-OFF) puo' rimandare all'executor per il fix\n    # (route_after_regression_gate ritorna \"executor\" su stop_reason='tool_use').\n    workflow.add_edge(\"reflection\", \"regression_gate\")\n    workflow.add_conditional_edges(\n        \"regression_gate\",\n        route_after_regression_gate,\n        {\"executor\": \"executor\", \"learner\": \"learner\"},\n    )\n    workflow.add_edge(\"learner\", END)",
+    "all": false
+  }
+]

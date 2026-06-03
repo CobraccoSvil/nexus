@@ -1,0 +1,50 @@
+[
+  {
+    "ts": "2026-05-31T21:19:34.329Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\apps\\web-ide\\components\\chat\\agent-meta-step-card.tsx",
+    "old": "import { useState } from \"react\";",
+    "new": "import { useEffect, useState } from \"react\";\nimport { subscribeAll } from \"../../lib/project-dispatcher/store\";",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T21:19:51.895Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\apps\\web-ide\\components\\chat\\agent-meta-step-card.tsx",
+    "old": "function renderPayload(kind: string, payload: Record<string, unknown>) {\n  if (kind === \"plan\") {\n    const todos = (payload.todos ?? []) as Array<{ seq?: number; content?: string; status?: string; priority?: string }>;\n    if (!todos.length) return <em className=\"text-xs opacity-70\">Nessun todo</em>;\n    return (\n      <ol className=\"list-decimal pl-5 space-y-0.5 text-xs\">\n        {todos.map((t, i) => (\n          <li key={i} className=\"leading-snug\">\n            <span className=\"opacity-70\">[{t.status ?? \"pending\"}{t.priority ? `/${t.priority}` : \"\"}]</span>{\" \"}\n            {t.content ?? \"—\"}\n          </li>\n        ))}\n      </ol>\n    );\n  }",
+    "new": "// Marcatori ASCII per stato todo (niente emoji, regola A del CLAUDE.md).\nconst STATUS_MARKER: Record<string, string> = {\n  completed: \"[x]\",\n  in_progress: \"[~]\",\n  blocked: \"[!]\",\n  skipped: \"[-]\",\n  pending: \"[ ]\",\n};\n\ninterface PlanTodo {\n  id?: string;\n  seq?: number;\n  content?: string;\n  status?: string;\n  priority?: string;\n}\n\n/**\n * Checklist live dei todo di un piano agente.\n *\n * Stato iniziale dai todo nel payload del meta-step `plan`; aggiornamenti in\n * tempo reale via eventi `TodoUpdated` filtrati sul `run_id` del piano\n * (payload.plan_id, che coincide con il run_id del run agente).\n */\nfunction PlanChecklist({ runId, todos }: { runId: string | null; todos: PlanTodo[] }) {\n  // overrides[todo_id] = status piu' recente ricevuto via SSE.\n  const [overrides, setOverrides] = useState<Record<string, string>>({});\n\n  useEffect(() => {\n    if (!runId) return;\n    const unsubscribe = subscribeAll((env) => {\n      const ev = env.payload;\n      if (ev.kind === \"TodoUpdated\" && ev.run_id === runId) {\n        setOverrides((prev) =>\n          prev[ev.todo_id] === ev.status ? prev : { ...prev, [ev.todo_id]: ev.status },\n        );\n      }\n    });\n    return unsubscribe;\n  }, [runId]);\n\n  if (!todos.length) return <em className=\"text-xs opacity-70\">Nessun todo</em>;\n\n  return (\n    <ol className=\"list-none pl-0 space-y-0.5 text-xs\">\n      {todos.map((t, i) => {\n        const status = (t.id ? overrides[t.id] : undefined) ?? t.status ?? \"pending\";\n        const marker = STATUS_MARKER[status] ?? STATUS_MARKER.pending;\n        return (\n          <li\n            key={t.id ?? i}\n            className=\"leading-snug flex items-start gap-1.5\"\n            style={{ minWidth: 0 }}\n          >\n            <span className=\"font-mono opacity-70\" style={{ flexShrink: 0 }}>{marker}</span>\n            <span style={{ minWidth: 0, flex: 1 }}>\n              {t.content ?? \"—\"}\n              {t.priority && t.priority !== \"normal\" ? (\n                <span className=\"opacity-60\"> ({t.priority})</span>\n              ) : null}\n            </span>\n          </li>\n        );\n      })}\n    </ol>\n  );\n}\n\nfunction renderPayload(kind: string, payload: Record<string, unknown>) {\n  if (kind === \"plan\") {\n    const todos = (payload.todos ?? []) as PlanTodo[];\n    // Il run id del piano e' in payload.plan_id (coincide col run_id agente).\n    const runId =\n      typeof payload.plan_id === \"string\" ? payload.plan_id : null;\n    return <PlanChecklist runId={runId} todos={todos} />;\n  }",
+    "all": false
+  },
+  {
+    "ts": "2026-06-01T15:14:07.995Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\apps\\web-ide\\components\\chat\\agent-meta-step-card.tsx",
+    "old": "  reflection: {\n    icon: \"◐\",\n    label: \"Riflessione\",\n    tone: \"text-purple-700 dark:text-purple-300\",\n    bg: \"bg-purple-50 dark:bg-purple-950/40 border-purple-200 dark:border-purple-800\",\n    defaultOpen: false,\n  },\n};",
+    "new": "  reflection: {\n    icon: \"◐\",\n    label: \"Riflessione\",\n    tone: \"text-purple-700 dark:text-purple-300\",\n    bg: \"bg-purple-50 dark:bg-purple-950/40 border-purple-200 dark:border-purple-800\",\n    defaultOpen: false,\n  },\n  // Live UX: ogni tool eseguito dall'executor emette questo meta_step\n  // (vedi brain/agents/nodes.py tool_dispatch_node). Card compatta, collassata\n  // di default: l'utente vede il flusso dei tool in tempo reale durante run lunghi.\n  tool_executed: {\n    icon: \"▸\",\n    label: \"Tool\",\n    tone: \"text-emerald-700 dark:text-emerald-300\",\n    bg: \"bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800\",\n    defaultOpen: false,\n  },\n  // Provider call (gia' emesso dall'executor: kind=\"executor_call\")\n  executor_call: {\n    icon: \"→\",\n    label: \"AI\",\n    tone: \"text-sky-700 dark:text-sky-300\",\n    bg: \"bg-sky-50 dark:bg-sky-950/40 border-sky-200 dark:border-sky-800\",\n    defaultOpen: false,\n  },\n};",
+    "all": false
+  },
+  {
+    "ts": "2026-06-01T15:14:22.241Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\apps\\web-ide\\components\\chat\\agent-meta-step-card.tsx",
+    "old": "  if (kind === \"reflection\") {\n    const summary = String(payload.summary ?? \"\");\n    return <p className=\"text-xs leading-snug\">{summary}</p>;\n  }\n  // fallback: JSON\n  return (",
+    "new": "  if (kind === \"reflection\") {\n    const summary = String(payload.summary ?? \"\");\n    return <p className=\"text-xs leading-snug\">{summary}</p>;\n  }\n  if (kind === \"tool_executed\") {\n    const tool = String(payload.tool ?? \"\");\n    const target = String(payload.target ?? \"\");\n    const isErr = Boolean(payload.is_error);\n    return (\n      <div className=\"text-xs flex items-center gap-2 leading-snug\">\n        <code className={isErr ? \"text-red-700 dark:text-red-300\" : \"\"}>{tool}</code>\n        {target && <span className=\"opacity-70 truncate\">{target}</span>}\n        {isErr && <span className=\"text-red-600 dark:text-red-300\">errore</span>}\n      </div>\n    );\n  }\n  // fallback: JSON\n  return (",
+    "all": false
+  },
+  {
+    "ts": "2026-06-01T19:20:42.851Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\apps\\web-ide\\components\\chat\\agent-meta-step-card.tsx",
+    "old": "  reflection: {\n    icon: \"◐\",\n    label: \"Riflessione\",\n    tone: \"text-purple-700 dark:text-purple-300\",\n    bg: \"bg-purple-50 dark:bg-purple-950/40 border-purple-200 dark:border-purple-800\",\n    defaultOpen: false,\n  },\n};",
+    "new": "  reflection: {\n    icon: \"◐\",\n    label: \"Riflessione\",\n    tone: \"text-purple-700 dark:text-purple-300\",\n    bg: \"bg-purple-50 dark:bg-purple-950/40 border-purple-200 dark:border-purple-800\",\n    defaultOpen: false,\n  },\n  // Live UX: ogni tool eseguito dall'executor emette questo meta_step\n  // (vedi brain/agents/nodes.py tool_dispatch_node). Card compatta, collassata:\n  // l'utente vede il flusso dei tool in tempo reale durante run lunghi.\n  tool_executed: {\n    icon: \"▸\",\n    label: \"Tool\",\n    tone: \"text-emerald-700 dark:text-emerald-300\",\n    bg: \"bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800\",\n    defaultOpen: false,\n  },\n};",
+    "all": false
+  },
+  {
+    "ts": "2026-06-01T19:21:14.147Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\apps\\web-ide\\components\\chat\\agent-meta-step-card.tsx",
+    "old": "  if (kind === \"reflection\") {\n    const summary = String(payload.summary ?? \"\");\n    return <p className=\"text-xs leading-snug\">{summary}</p>;\n  }\n  // fallback: JSON",
+    "new": "  if (kind === \"reflection\") {\n    const summary = String(payload.summary ?? \"\");\n    return <p className=\"text-xs leading-snug\">{summary}</p>;\n  }\n  if (kind === \"tool_executed\") {\n    const tool = String(payload.tool ?? \"\");\n    const target = String(payload.target ?? \"\");\n    const isErr = Boolean(payload.is_error);\n    return (\n      <div className=\"text-xs flex items-center gap-2 leading-snug\">\n        <code className={isErr ? \"text-red-700 dark:text-red-300\" : \"\"}>{tool}</code>\n        {target && <span className=\"opacity-70 truncate\">{target}</span>}\n        {isErr && <span className=\"text-red-600 dark:text-red-300\">errore</span>}\n      </div>\n    );\n  }\n  // fallback: JSON",
+    "all": false
+  }
+]

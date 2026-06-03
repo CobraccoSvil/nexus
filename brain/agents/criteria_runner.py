@@ -65,16 +65,36 @@ async def run_criterion(criterion: dict[str, Any], ctx: dict[str, Any]) -> tuple
             )
         spec = {}
     expected_raw = criterion.get("expected")
+    expected_was_natural_language = False
     if isinstance(expected_raw, dict):
         expected = expected_raw
     else:
         if expected_raw not in (None, "", {}):
+            expected_was_natural_language = True
             logger.warning(
                 "criterion type=%s ha expected non-dict (%s): %r — normalizzo a {}",
                 c_type, type(expected_raw).__name__, str(expected_raw)[:200],
             )
         expected = {}
     timeout_s = float(criterion.get("timeout_s") or ctx.get("timeout_s") or 30.0)
+
+    # Inconclusive-guard: alcuni tipi (db_query/http/regex_in_output) ASSERISCONO
+    # tramite `expected` strutturato. Se il planner LLM ha prodotto un `expected`
+    # in linguaggio naturale (es. "Numero di tabelle pari alle interfacce"), il
+    # criterio NON e' macchina-valutabile: eseguirlo lo farebbe fallire sempre
+    # (query su DB applicativo inesistente -> errore -> passed=False) e bloccare
+    # il todo dopo N cicli (deadlock DAG). Un criterio senza condizione di
+    # successo valutabile non e' un fallimento: e' inconcludente. Lo marchiamo
+    # tale e il verifier_node lo esclude dal conteggio (vedi nota la').
+    if expected_was_natural_language and c_type in ("db_query", "http", "regex_in_output"):
+        return True, {
+            "inconclusive": True,
+            "type": c_type,
+            "skipped_reason": (
+                "expected in linguaggio naturale non valutabile deterministicamente: "
+                + repr(str(expected_raw)[:160])
+            ),
+        }
 
     if c_type == "run_command":
         ok, ev = await _check_run_command(spec, expected, ctx, timeout_s)

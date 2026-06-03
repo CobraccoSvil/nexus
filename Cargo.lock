@@ -347,6 +347,7 @@ dependencies = [
  "base64 0.22.1",
  "dashmap",
  "futures",
+ "nexus-auth",
  "pkcs1",
  "rand 0.8.5",
  "rsa",
@@ -354,6 +355,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "spki",
+ "sqlx",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
@@ -2223,6 +2225,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx",
+ "tokio",
  "tracing",
  "uuid",
 ]

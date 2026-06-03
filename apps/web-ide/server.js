@@ -61,11 +61,59 @@ wsProxy.on("error", (err, req, socket) => {
   if (socket && !socket.destroyed) socket.destroy();
 });
 
+// Proxy DIRETTO per gli endpoint SSE (text/event-stream) verso mcp-core.
+// Le rewrites di Next.js (next.config.ts -> /api/:path* -> :4000) BUFFERIZZANO
+// la risposta: per gli stream SSE long-lived (agent-stream, event-stream) i
+// meta_step restano nel buffer e non arrivano al browser in tempo reale; dopo
+// l'evento iniziale la connessione cade lato client ("Failed to fetch") e i
+// progressi del run agente non si vedono. http-proxy fa pipe streaming reale
+// (selfHandleResponse=false di default) -> nessun buffering, i chunk arrivano
+// appena emessi. Stesso target del fallback /api/:path* (BACKEND_URL = :4000).
+const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:4000";
+const sseProxy = httpProxy.createProxyServer({
+  target: BACKEND_URL,
+  changeOrigin: true,
+});
+
+sseProxy.on("error", (err, req, res) => {
+  console.error("[sse-proxy] error:", err.message);
+  if (res && !res.headersSent && typeof res.writeHead === "function") {
+    res.writeHead(502, { "content-type": "text/plain" });
+  }
+  if (res && typeof res.end === "function" && !res.writableEnded) res.end();
+});
+
+// Disabilita il buffering Nagle sui socket SSE: flush immediato di ogni chunk.
+sseProxy.on("proxyRes", (proxyRes, req, res) => {
+  if (typeof res.setHeader === "function" && !res.headersSent) {
+    res.setHeader("X-Accel-Buffering", "no");
+  }
+  if (res.socket && typeof res.socket.setNoDelay === "function") {
+    res.socket.setNoDelay(true);
+  }
+});
+
+/** True per i path SSE long-lived che NON devono passare per il buffering Next.js. */
+function isSseStreamPath(path) {
+  return (
+    path.endsWith("/agent-stream") ||
+    path.endsWith("/event-stream") ||
+    /\/playwright\/runs\/[^/]+\/stream$/.test(path)
+  );
+}
+
 app.prepare().then(async () => {
   const PORT = await resolveWebIdePort();
   const server = createServer((req, res) => {
     const parsedUrl = parse(req.url, true);
     const path = parsedUrl.pathname || "";
+
+    // Stream SSE → proxy diretto a mcp-core (bypassa il buffering Next.js).
+    // Senza questo i progressi del run agente non arrivano al browser.
+    if (isSseStreamPath(path)) {
+      sseProxy.web(req, res);
+      return;
+    }
 
     // Fix MIME type for CSS files (browser cache may reference old dev-mode paths)
     if (path.endsWith(".css") || path.includes("/_next/static/css/")) {

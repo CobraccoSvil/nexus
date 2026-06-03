@@ -1,0 +1,146 @@
+[
+  {
+    "ts": "2026-04-28T15:01:11.870Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\crates\\mcp-core\\src\\agent_types.rs",
+    "old": "#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]\n#[serde(rename_all = \"snake_case\")]\npub enum AgentStepStatus {\n    Running,\n    Completed,\n    Failed,\n    AwaitingConfirmation,\n    Skipped,\n}\n\nimpl AgentStepStatus {\n    #[allow(dead_code)]\n    pub fn as_str(&self) -> &'static str {\n        match self {\n            Self::Running => \"running\",\n            Self::Completed => \"completed\",\n            Self::Failed => \"failed\",\n            Self::AwaitingConfirmation => \"awaiting_confirmation\",\n            Self::Skipped => \"skipped\",\n        }\n    }\n}",
+    "new": "#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]\n#[serde(rename_all = \"snake_case\")]\npub enum AgentStepStatus {\n    Running,\n    Completed,\n    Failed,\n    AwaitingConfirmation,\n    Skipped,\n    /// Tutti i provider configurati sono in cooldown / non disponibili.\n    /// Stato emesso da `chat_messages.rs::spawn_agent_run` quando il\n    /// routing ritorna `no_capable_provider=true`. La UI deve mostrare un\n    /// banner di alert (vedi `chat-panel.tsx` gestione `provider_unavailable`)\n    /// e NON avviare il run agente.\n    ProviderUnavailable,\n}\n\nimpl AgentStepStatus {\n    #[allow(dead_code)]\n    pub fn as_str(&self) -> &'static str {\n        match self {\n            Self::Running => \"running\",\n            Self::Completed => \"completed\",\n            Self::Failed => \"failed\",\n            Self::AwaitingConfirmation => \"awaiting_confirmation\",\n            Self::Skipped => \"skipped\",\n            Self::ProviderUnavailable => \"provider_unavailable\",\n        }\n    }\n}",
+    "all": false
+  },
+  {
+    "ts": "2026-04-29T09:16:04.561Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\crates\\mcp-core\\src\\agent_types.rs",
+    "old": "//! ponte `brain_agent_client`, dall'SSE del frontend e da `semantic_compact`.",
+    "new": "//! ponte `brain_agent_client` e dall'SSE del frontend.",
+    "all": false
+  },
+  {
+    "ts": "2026-04-29T09:16:18.217Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\crates\\mcp-core\\src\\agent_types.rs",
+    "old": "//! ponte `brain_agent_client`, dall'SSE del frontend e da `semantic_compact`.",
+    "new": "//! ponte `brain_agent_client` e dall'SSE del frontend.",
+    "all": false
+  },
+  {
+    "ts": "2026-04-29T16:44:03.193Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\crates\\mcp-core\\src\\agent_types.rs",
+    "old": "    /// Avviso privacy per provider non-EU/non-locali. Mostrato prima della risposta.\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub provider_privacy_notice: Option<String>,\n}",
+    "new": "    /// Avviso privacy per provider non-EU/non-locali. Mostrato prima della risposta.\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub provider_privacy_notice: Option<String>,\n    /// Token di input (prompt) accumulati durante tutto il run.\n    #[serde(default)]\n    pub prompt_tokens: i64,\n    /// Token di output (completion) accumulati durante tutto il run.\n    #[serde(default)]\n    pub completion_tokens: i64,\n    /// Token totali accumulati durante tutto il run.\n    #[serde(default)]\n    pub total_tokens: i64,\n    /// Costo totale accumulato durante tutto il run (USD).\n    #[serde(default)]\n    pub total_cost: f64,\n}",
+    "all": false
+  },
+  {
+    "ts": "2026-04-30T16:21:06.114Z",
+    "kind": "edit",
+    "fp": "D:\\Sviluppo\\ideai\\fervent-cohen-fad855\\crates\\mcp-core\\src\\agent_types.rs",
+    "old": "    /// Avviso privacy per provider non-EU/non-locali. Mostrato prima della risposta.\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub provider_privacy_notice: Option<String>,\n}",
+    "new": "    /// Avviso privacy per provider non-EU/non-locali. Mostrato prima della risposta.\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub provider_privacy_notice: Option<String>,\n    pub prompt_tokens: u32,\n    pub completion_tokens: u32,\n    pub total_tokens: u32,\n    pub total_cost: f64,\n}",
+    "all": false
+  },
+  {
+    "ts": "2026-04-30T16:21:15.986Z",
+    "kind": "edit",
+    "fp": "D:\\Sviluppo\\ideai\\fervent-cohen-fad855\\crates\\mcp-core\\src\\agent_types.rs",
+    "old": "    /// Avviso privacy per provider non-EU/non-locali. Mostrato prima della risposta.\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub provider_privacy_notice: Option<String>,\n}\n\n/// Evento di trace LLM",
+    "new": "    /// Avviso privacy per provider non-EU/non-locali. Mostrato prima della risposta.\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub provider_privacy_notice: Option<String>,\n    pub prompt_tokens: u32,\n    pub completion_tokens: u32,\n    pub total_tokens: u32,\n    pub total_cost: f64,\n}\n\n/// Evento di trace LLM",
+    "all": false
+  },
+  {
+    "ts": "2026-05-01T18:04:34.908Z",
+    "kind": "edit",
+    "fp": "D:\\Sviluppo\\ideai\\fervent-cohen-fad855\\crates\\mcp-core\\src\\agent_types.rs",
+    "old": "    pub provider_privacy_notice: Option<String>,\n    pub prompt_tokens: u32,\n    pub completion_tokens: u32,\n    pub total_tokens: u32,\n    pub total_cost: f64,\n}",
+    "new": "    pub provider_privacy_notice: Option<String>,\n    pub prompt_tokens: u32,\n    pub completion_tokens: u32,\n    pub total_tokens: u32,\n    pub total_cost: f64,\n    /// Classe errore propagata dal brain (es. \"billing_error\", \"rate_limit\",\n    /// \"overloaded\", \"provider_error\"). Permette al chiamante in chat_messages.rs\n    /// di decidere se ritentare con altro provider e di applicare il cooldown\n    /// corretto (lungo per billing, breve per transient 5xx/429).\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub error_class: Option<String>,\n    /// Stop reason finale: end_turn | tool_use | error | loop_detected | timeout.\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub stop_reason: Option<String>,\n}",
+    "all": false
+  },
+  {
+    "ts": "2026-05-11T07:54:25.161Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/agent_types.rs",
+    "old": "#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]\n#[serde(rename_all = \"snake_case\")]\npub enum AgentRunStatus {\n    Running,\n    Completed,\n    AwaitingConfirmation,\n    Failed,\n    TimedOut,\n    Cancelled,\n}",
+    "new": "#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]\n#[serde(rename_all = \"snake_case\")]\npub enum AgentRunStatus {\n    Running,\n    Completed,\n    AwaitingConfirmation,\n    Failed,\n    TimedOut,\n    Cancelled,\n    /// Il brain ha rilevato un loop (stessa tool call ripetuta >= LOOP_THRESHOLD volte)\n    /// e tutti i tentativi di escalation intra-provider e cross-provider sono esauriti.\n    LoopAborted,\n    /// Nessun provider disponibile: tutti in cooldown (billing_error / rate_limit)\n    /// o non configurati. Il turno non ha potuto essere elaborato.\n    ProviderUnavailable,\n}",
+    "all": false
+  },
+  {
+    "ts": "2026-05-11T07:54:32.299Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/agent_types.rs",
+    "old": "    let status_str = match &status {\n        AgentRunStatus::Completed => \"completed\",\n        AgentRunStatus::Failed => \"failed\",\n        AgentRunStatus::TimedOut => \"timed_out\",\n        AgentRunStatus::AwaitingConfirmation => \"awaiting_confirmation\",\n        AgentRunStatus::Cancelled => \"cancelled\",\n        AgentRunStatus::Running => \"running\",\n    };",
+    "new": "    let status_str = match &status {\n        AgentRunStatus::Completed => \"completed\",\n        AgentRunStatus::Failed => \"failed\",\n        AgentRunStatus::TimedOut => \"timed_out\",\n        AgentRunStatus::AwaitingConfirmation => \"awaiting_confirmation\",\n        AgentRunStatus::Cancelled => \"cancelled\",\n        AgentRunStatus::Running => \"running\",\n        AgentRunStatus::LoopAborted => \"loop_aborted\",\n        AgentRunStatus::ProviderUnavailable => \"provider_unavailable\",\n    };",
+    "all": false
+  },
+  {
+    "ts": "2026-05-11T21:50:38.637Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\crates\\mcp-core\\src\\agent_types.rs",
+    "old": "    /// Stop reason finale: end_turn | tool_use | error | loop_detected | timeout.\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub stop_reason: Option<String>,\n}",
+    "new": "    /// Stop reason finale: end_turn | tool_use | error | loop_detected | timeout.\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub stop_reason: Option<String>,\n    /// Task type rilevato dal router (es. \"fix\", \"code_read\", \"architecture\").\n    /// Propagato dal brain Python nell'evento SSE end_turn per popolare\n    /// la colonna `nexus_task_type` in agent_runs.\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub nexus_task_type: Option<String>,\n}",
+    "all": false
+  },
+  {
+    "ts": "2026-05-13T08:06:38.610Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/agent_types.rs",
+    "old": "    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub nexus_task_type: Option<String>,\n}",
+    "new": "    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub nexus_task_type: Option<String>,\n    /// `true` se l'agente ha dichiarato di aver completato senza invocare\n    /// alcun tool nonostante avesse tool disponibili (0 step, iteration <= 1).\n    /// Tipico di modelli piccoli che \"allucinano il completamento\".\n    #[serde(default)]\n    pub hollow_completion: bool,\n}",
+    "all": false
+  },
+  {
+    "ts": "2026-05-23T17:07:31.174Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\crates\\mcp-core\\src\\agent_types.rs",
+    "old": "        Err(e) => tracing::warn!(\"auto_commit: spawn git commit fallito: {}\", e),\n    }\n}",
+    "new": "        Err(e) => tracing::warn!(\"auto_commit: spawn git commit fallito: {}\", e),\n    }\n}\n\n// ---------------------------------------------------------------------------\n// G4 — Memorizzazione startup_command dopo avvio servizio riuscito\n// ---------------------------------------------------------------------------\n\n/// G4: dopo un run completato con successo cerca l'ultimo `shell_exec` che ha\n/// eseguito `docker compose up` e salva il comando esatto in `memory_entries`\n/// con ns_type='project'. Al turno successivo, `build_project_context_block`\n/// lo mostrerà in \"Memoria di progetto\" → l'agente sa già cosa eseguire.\n///\n/// Fire-and-forget: gli errori non bloccano il return del run.\npub async fn save_startup_command_if_needed(\n    db: &PgPool,\n    project_id: Uuid,\n    steps: &[AgentStep],\n) {\n    // Cerca l'ultimo step shell_exec riuscito con `docker compose up`\n    let docker_cmd = steps\n        .iter()\n        .rev()\n        .filter(|s| {\n            s.tool_name == \"shell_exec\"\n                && s.status == AgentStepStatus::Completed\n        })\n        .find_map(|s| {\n            let cmd = s.tool_input.get(\"command\").and_then(|v| v.as_str())?;\n            if cmd.contains(\"docker\") && cmd.contains(\"compose\") && cmd.contains(\"up\") {\n                Some(cmd.to_string())\n            } else {\n                None\n            }\n        });\n\n    let cmd = match docker_cmd {\n        Some(c) => c,\n        None => return, // nessun docker compose up → niente da salvare\n    };\n\n    // Cerca o crea il namespace di tipo 'project' per questo progetto\n    let ns_key = format!(\"project:{project_id}\");\n    let ns_id: Option<Uuid> = sqlx::query_scalar(\n        \"SELECT id FROM memory_namespaces WHERE ns_key = $1 AND active = TRUE LIMIT 1\",\n    )\n    .bind(&ns_key)\n    .fetch_optional(db)\n    .await\n    .unwrap_or(None);\n\n    let ns_id = match ns_id {\n        Some(id) => id,\n        None => {\n            let new_id = Uuid::new_v4();\n            let _ = sqlx::query(\n                \"INSERT INTO memory_namespaces \\\n                 (id, ns_key, ns_type, project_id, merge_strategy, active) \\\n                 VALUES ($1, $2, 'project', $3, 'lww', TRUE) \\\n                 ON CONFLICT (ns_key) DO NOTHING\",\n            )\n            .bind(new_id)\n            .bind(&ns_key)\n            .bind(project_id)\n            .execute(db)\n            .await;\n            match sqlx::query_scalar::<_, Uuid>(\n                \"SELECT id FROM memory_namespaces WHERE ns_key = $1 AND active = TRUE LIMIT 1\",\n            )\n            .bind(&ns_key)\n            .fetch_optional(db)\n            .await\n            {\n                Ok(Some(id)) => id,\n                _ => {\n                    tracing::debug!(\n                        \"G4: impossibile creare/trovare namespace per {ns_key}\"\n                    );\n                    return;\n                }\n            }\n        }\n    };\n\n    let value = serde_json::json!(cmd);\n    let _ = sqlx::query(\n        \"INSERT INTO memory_entries \\\n         (id, namespace_id, entry_key, value, written_by, version, vector_clock) \\\n         VALUES (gen_random_uuid(), $1, 'startup_command', $2, 'agent_run', 1, '{}') \\\n         ON CONFLICT (namespace_id, entry_key) WHERE deleted = FALSE \\\n         DO UPDATE SET value = EXCLUDED.value, \\\n                       written_by = EXCLUDED.written_by, \\\n                       version = memory_entries.version + 1, \\\n                       updated_at = NOW()\",\n    )\n    .bind(ns_id)\n    .bind(&value)\n    .execute(db)\n    .await\n    .map(|_| {\n        tracing::info!(\n            \"G4: startup_command salvato per progetto {project_id}: {cmd:?}\"\n        );\n    })\n    .map_err(|e| tracing::warn!(\"G4: salvataggio startup_command fallito: {e}\"));\n}",
+    "all": false
+  },
+  {
+    "ts": "2026-05-28T15:12:42.845Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\crates\\mcp-core\\src\\agent_types.rs",
+    "old": "    pub prompt_tokens: u32,\n    pub completion_tokens: u32,\n    pub total_tokens: u32,\n    pub total_cost: f64,",
+    "new": "    pub prompt_tokens: u32,\n    pub completion_tokens: u32,\n    pub total_tokens: u32,\n    pub total_cost: f64,\n    /// Token di prompt dell'ULTIMA iterazione dell'agent loop.\n    /// Usato dal frontend per calcolare il context ratio (% di occupazione\n    /// della context_window del modello). `prompt_tokens` resta il valore\n    /// cumulativo di tutte le iterazioni, corretto per il billing.\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub last_prompt_tokens: Option<u32>,",
+    "all": false
+  },
+  {
+    "ts": "2026-05-28T15:26:37.289Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\crates\\mcp-core\\src\\agent_types.rs",
+    "old": "    /// Token parziale durante la generazione (streaming). Se presente, è evento `agent_token`.\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub token_delta: Option<String>,\n    /// Meta-step (plan/routing/clarify/fallback/reflection). Mutuamente\n    /// esclusivo con `step`/`trace`/`token_delta` ma non vincolato.\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub meta_step: Option<AgentMetaStep>,\n}",
+    "new": "    /// Token parziale durante la generazione (streaming). Se presente, è evento `agent_token`.\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub token_delta: Option<String>,\n    /// Ragionamento intermedio del modello (testo che accompagna le tool calls\n    /// durante le iterazioni dell'agent loop). Mostrato nella chat come blocco\n    /// collassabile \"Ragionamento\" per dare feedback visivo durante il lavoro.\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub thinking_delta: Option<String>,\n    /// Meta-step (plan/routing/clarify/fallback/reflection). Mutuamente\n    /// esclusivo con `step`/`trace`/`token_delta` ma non vincolato.\n    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub meta_step: Option<AgentMetaStep>,\n}",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T10:23:45.198Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\crates\\mcp-core\\src\\agent_types.rs",
+    "old": "#[allow(dead_code)]\npub const AGENT_MAX_ITERATIONS: u32 = 60;\n#[allow(dead_code)]\npub const AGENT_TIMEOUT_SECS: u64 = 480;\n\n// ---------------------------------------------------------------------------",
+    "new": "// ---------------------------------------------------------------------------",
+    "all": false
+  },
+  {
+    "ts": "2026-05-31T20:31:15.285Z",
+    "kind": "edit",
+    "fp": "/home/administrator/ideai/crates/mcp-core/src/agent_types.rs",
+    "old": "    if !is_git {\n        return;\n    }\n    // Fix M34: se manca .gitignore, scrive un default minimo prima del git add",
+    "new": "    if !is_git {\n        return;\n    }\n    // M13.5: regression gate HARD block. Se il gate ha bloccato il run, NON\n    // committiamo il codice (prevenzione alla radice, regola H). Disaccoppiato\n    // dallo status del run: il run puo' chiudere Completed ma con codice rotto\n    // rilevato dai test dell'impact set. Gated da regression_gate.hard_block\n    // (regola G: nessun fallback hardcoded; se il flag non e' 'true' il gate\n    // hard e' OFF e l'auto-commit procede come prima — default-OFF, mig 0244).\n    let hard_block: Option<String> =\n        sqlx::query_scalar(\"SELECT value FROM settings WHERE key = 'regression_gate.hard_block'\")\n            .fetch_optional(db)\n            .await\n            .unwrap_or(None);\n    if hard_block.as_deref() == Some(\"true\") {\n        let blocked_status: Option<String> = sqlx::query_scalar(\n            r#\"\n            SELECT gate_status\n            FROM project_impact_runs\n            WHERE run_id = $1\n              AND gate_status IN ('blocked', 'blocked_capped')\n            LIMIT 1\n            \"#,\n        )\n        .bind(run_id)\n        .fetch_optional(db)\n        .await\n        .unwrap_or(None);\n        if let Some(gate_status) = blocked_status {\n            tracing::warn!(\n                \"auto_commit saltato: regression gate ha bloccato il run {} (gate_status={})\",\n                run_id,\n                gate_status\n            );\n            return;\n        }\n    }\n    // Fix M34: se manca .gitignore, scrive un default minimo prima del git add",
+    "all": false
+  },
+  {
+    "ts": "2026-06-01T06:50:17.355Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\crates\\mcp-core\\src\\agent_types.rs",
+    "old": "        \"systemctl start\", \"service start\",\n        \"make \", \"make\\t\",\n    ];\n    action_patterns.iter().any(|p| lower.contains(p))\n}",
+    "new": "        \"systemctl start\", \"service start\",\n        \"make \", \"make\\t\",\n    ];\n    // Negation-aware (fix #37): un pattern d'azione preceduto da una negazione\n    // ravvicinata (\"senza eseguire\", \"non creare\", \"no azioni\") NON e' una\n    // richiesta d'azione. Specchio di brain/agents/nodes.py::_detect_action_request.\n    const NEGATIONS: &[&str] = &[\n        \"senza \", \"non \", \"no \", \"nessun\", \"evita\", \"evitare\",\n        \"without \", \"don't \", \"dont \", \"do not \", \"avoid \", \"never \",\n    ];\n    for p in action_patterns {\n        let mut from = 0usize;\n        while let Some(rel) = lower[from..].find(p) {\n            let idx = from + rel;\n            let window_start = idx.saturating_sub(16);\n            let preceding = &lower[window_start..idx];\n            if !NEGATIONS.iter().any(|n| preceding.contains(n)) {\n                return true;\n            }\n            from = idx + 1;\n        }\n    }\n    false\n}",
+    "all": false
+  },
+  {
+    "ts": "2026-06-01T06:50:30.113Z",
+    "kind": "edit",
+    "fp": "\\\\wsl.localhost\\Ubuntu\\home\\administrator\\ideai\\crates\\mcp-core\\src\\agent_types.rs",
+    "old": "    for p in action_patterns {\n        let mut from = 0usize;\n        while let Some(rel) = lower[from..].find(p) {\n            let idx = from + rel;\n            let window_start = idx.saturating_sub(16);\n            let preceding = &lower[window_start..idx];\n            if !NEGATIONS.iter().any(|n| preceding.contains(n)) {\n                return true;\n            }\n            from = idx + 1;\n        }\n    }\n    false",
+    "new": "    for p in action_patterns {\n        let mut from = 0usize;\n        while let Some(rel) = lower[from..].find(p) {\n            let idx = from + rel;\n            // window_start char-boundary-safe (lower puo' contenere accenti UTF-8)\n            let mut window_start = idx.saturating_sub(16);\n            while window_start > 0 && !lower.is_char_boundary(window_start) {\n                window_start -= 1;\n            }\n            let preceding = &lower[window_start..idx];\n            if !NEGATIONS.iter().any(|n| preceding.contains(n)) {\n                return true;\n            }\n            from = idx + 1;\n        }\n    }\n    false",
+    "all": false
+  }
+]

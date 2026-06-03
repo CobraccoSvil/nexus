@@ -26,6 +26,20 @@ pub trait Embedder: Send + Sync {
     fn embed_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
         texts.iter().map(|t| self.embed(t)).collect()
     }
+
+    /// Signature stabile dell'embedder: identifica univocamente lo spazio
+    /// vettoriale prodotto. Formato `"<nome>:<dim>"` (es. `"onnx-minilm-l6-v2:384"`
+    /// o `"hash:256"`).
+    ///
+    /// Usata per invalidare gli hash di indicizzazione quando l'embedder cambia:
+    /// includere la signature nel digest fa sì che il reindex automatico riparta
+    /// da solo al cambio modello, senza azzerare gli hash a mano.
+    fn signature(&self) -> String {
+        format!("{}:{}", self.name(), self.dim())
+    }
+
+    /// Nome stabile dell'embedder concreto (senza dimensione).
+    fn name(&self) -> &'static str;
 }
 
 /// Embedder semplice basato su hashing di n-grams
@@ -75,6 +89,10 @@ impl HashEmbedder {
 impl Embedder for HashEmbedder {
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn name(&self) -> &'static str {
+        "hash"
     }
 
     fn embed(&self, text: &str) -> Vec<f32> {
@@ -138,6 +156,10 @@ impl<E: Embedder> CachedEmbedder<E> {
 impl<E: Embedder> Embedder for CachedEmbedder<E> {
     fn dim(&self) -> usize {
         self.inner.dim()
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
     }
 
     fn embed(&self, text: &str) -> Vec<f32> {
@@ -269,6 +291,10 @@ unsafe impl Sync for OnnxMiniLmEmbedder {}
 impl Embedder for OnnxMiniLmEmbedder {
     fn dim(&self) -> usize {
         MINILM_DIM
+    }
+
+    fn name(&self) -> &'static str {
+        "onnx-minilm-l6-v2"
     }
 
     fn embed(&self, text: &str) -> Vec<f32> {
@@ -414,6 +440,9 @@ impl Embedder for OnnxMiniLmEmbedder {
     fn dim(&self) -> usize {
         MINILM_DIM
     }
+    fn name(&self) -> &'static str {
+        "onnx-minilm-l6-v2"
+    }
     fn embed(&self, _text: &str) -> Vec<f32> {
         vec![0.0; MINILM_DIM]
     }
@@ -448,6 +477,21 @@ mod tests {
         let v = embedder.embed("test some text here");
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 0.01 || norm == 0.0, "Vector deve essere L2-normalized, got norm={}", norm);
+    }
+
+    #[test]
+    fn test_embedder_signature_distinguishes_models() {
+        let hash = HashEmbedder::new(256);
+        assert_eq!(hash.name(), "hash");
+        assert_eq!(hash.signature(), "hash:256");
+
+        // Signature diversa per dimensione diversa (stesso embedder)
+        let hash384 = HashEmbedder::new(384);
+        assert_ne!(hash.signature(), hash384.signature());
+
+        // CachedEmbedder delega name/signature all'inner
+        let cached = CachedEmbedder::new(HashEmbedder::new(256), 10);
+        assert_eq!(cached.signature(), "hash:256");
     }
 
     #[test]

@@ -971,34 +971,54 @@ async fn route_model_from_catalog(
         .map(|(name, _, _)| name)
         .collect();
 
-    let query = format!(
-        r#"SELECT provider, model FROM ai_price_catalog
-           WHERE is_enabled = TRUE
-             AND performance_tier = $1
-             AND capabilities @> $2::jsonb
-             AND supports_tool_use = TRUE
-             AND provider <> ALL($3)
-           ORDER BY {order_clause}
-           LIMIT 1"#
-    );
-
     let capability_json = format!("[\"{capability}\"]");
 
-    let row: Option<(String, String)> = sqlx::query_as(&query)
-        .bind(required_tier)
-        .bind(&capability_json)
-        .bind(&cooldown_providers)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten();
+    // Esclusione modelli thinking (is_thinking) dal routing AGENTICO: l'agente
+    // passa sempre per il planner che forza tool_choice; un modello thinking
+    // produce MALFORMED_FUNCTION_CALL (mig 0275). Tutti i modelli heavy enabled
+    // sono thinking, quindi serve una degradazione di tier controllata verso il
+    // miglior modello tool-robust non-thinking (es. heavy -> medium = deepseek-v4-pro).
+    let tier_chain: Vec<&str> = match required_tier {
+        "heavy" => vec!["heavy", "medium"],
+        "medium" => vec!["medium", "light"],
+        "light" => vec!["light", "medium"],
+        other => vec![other],
+    };
 
-    if let Some((provider, model)) = row {
-        return Some(DynamicRoutingDecision {
-            provider,
-            model,
-            rationale: "catalog dynamic routing",
-        });
+    for try_tier in tier_chain {
+        let query = format!(
+            r#"SELECT provider, model FROM ai_price_catalog
+               WHERE is_enabled = TRUE
+                 AND performance_tier = $1
+                 AND capabilities @> $2::jsonb
+                 AND supports_tool_use = TRUE
+                 AND is_thinking = FALSE
+                 AND provider <> ALL($3)
+               ORDER BY {order_clause}
+               LIMIT 1"#
+        );
+
+        let row: Option<(String, String)> = sqlx::query_as(&query)
+            .bind(try_tier)
+            .bind(&capability_json)
+            .bind(&cooldown_providers)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+
+        if let Some((provider, model)) = row {
+            let rationale = if try_tier == required_tier {
+                "catalog dynamic routing (tool-safe)"
+            } else {
+                "catalog dynamic routing (tool-safe, tier-degraded)"
+            };
+            return Some(DynamicRoutingDecision {
+                provider,
+                model,
+                rationale,
+            });
+        }
     }
 
     None
@@ -1033,8 +1053,10 @@ pub async fn best_model_for_tier(
     } else {
         String::new()
     };
+    // Quando si richiede il tool-use, escludi anche i modelli thinking: col
+    // tool_choice forzato producono MALFORMED_FUNCTION_CALL (mig 0275).
     let tool_use_predicate = if requires_tool_use {
-        "AND supports_tool_use = TRUE"
+        "AND supports_tool_use = TRUE AND is_thinking = FALSE"
     } else {
         ""
     };
@@ -1487,6 +1509,20 @@ impl NeuralCoreClient {
     }
 
     pub async fn embed_text(&self, model: &str, text: &str) -> anyhow::Result<Vec<f32>> {
+        let (_model, vector) = self.embed_text_with_model(model, text).await?;
+        Ok(vector)
+    }
+
+    /// Come `embed_text`, ma ritorna anche il nome del modello effettivamente
+    /// usato dal brain per generare il vettore. Serve a costruire una signature
+    /// dell'embedder (modello + dimensione) da incorporare negli hash di
+    /// indicizzazione: cosi' un cambio di embedder invalida automaticamente gli
+    /// hash e forza il reindex, senza interventi manuali sul DB.
+    pub async fn embed_text_with_model(
+        &self,
+        model: &str,
+        text: &str,
+    ) -> anyhow::Result<(String, Vec<f32>)> {
         let mut client = self.client.clone();
         let resp = client
             .embed_text(EmbedTextRequest {
@@ -1505,7 +1541,15 @@ impl NeuralCoreClient {
         if vector.is_empty() {
             anyhow::bail!("empty_embed_vector");
         }
-        Ok(vector)
+        // Il brain ritorna il modello realmente usato (default risolto se input
+        // vuoto). Se assente, ripieghiamo su una etichetta neutra.
+        let used_model = json
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        Ok((used_model, vector))
     }
 
     pub async fn generate_completion(
