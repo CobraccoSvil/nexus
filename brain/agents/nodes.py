@@ -611,6 +611,72 @@ def _detect_action_request(text: str) -> bool:
     return any(p in lower for p in _ACTION_PATTERNS)
 
 
+# Pattern di "intenzione imminente non compiuta": il modello annuncia la
+# prossima azione (verifica/lettura/esecuzione) ma chiude il turno SENZA
+# emettere alcuna tool call. Tipico dei modelli thinking con tool_choice=auto
+# (gemini-2.5, deepseek-v4): narrano il piano e si fermano. A differenza di
+# _detect_action_request — che valuta la richiesta dell'utente (input) — questo
+# valuta l'OUTPUT del modello, cosi' il nudge scatta anche quando il primo
+# messaggio umano non e' imperativo (es. "l'applicazione non parte").
+_INTENT_NARRATION_PATTERNS: tuple[str, ...] = (
+    # Italiano — intenzione futura imminente (verbi d'azione al presente/futuro)
+    "inizio verificando", "inizio controllando", "inizio analizzando",
+    "inizio leggendo", "inizio esaminando", "inizio con ", "inizio a ",
+    "inizio dal", "inizio dalla", "comincio con", "comincio a ",
+    "comincio verificando", "comincio dal", "iniziamo verificando",
+    "iniziamo con", "iniziamo dal", "cominciamo con", "partiamo da",
+    "procedo a ", "procedo con", "procedo alla", "procedo nel", "procedo ora",
+    "procedo subito", "procediamo con", "vado a ", "ora vado", "adesso vado",
+    "ora verifico", "ora controllo", "ora leggo", "ora analizzo", "ora eseguo",
+    "ora apro", "ora esamino", "adesso verifico", "adesso controllo",
+    "adesso leggo", "verifico la presenza", "verifico se", "verifico il",
+    "verifico la config", "verifico ora", "controllo la presenza",
+    "controllo se", "controllo il", "controllo la config", "esamino il",
+    "esamino la", "leggo il", "leggo la config", "fammi verificare",
+    "fammi controllare", "fammi leggere", "fammi dare un", "fammi guardare",
+    "il prossimo passo", "prossimo step", "passo successivo", "passo a ",
+    "proseguo con", "proseguo a ",
+    # Inglese — intenzione futura imminente
+    "let me check", "let me verify", "let me start", "let me read",
+    "let me look", "let me inspect", "let me examine", "let me first",
+    "let me begin", "i'll check", "i'll verify", "i'll start", "i'll read",
+    "i'll look", "i'll first", "i'll begin", "i'll inspect", "i'll examine",
+    "i will check", "i will verify", "i will start", "i will read",
+    "i'm going to", "i am going to", "let's check", "let's verify",
+    "let's start", "let's look", "next, i", "now i'll", "now i will",
+    "first, i'll", "first i'll", "first, let me",
+)
+
+
+def _detect_unfulfilled_intent(text: str | None) -> bool:
+    """True se l'OUTPUT annuncia un'azione imminente ma non l'ha eseguita.
+
+    Valutato sulla CODA del testo (la narrazione di intenzione chiude
+    tipicamente il messaggio: "...Inizio verificando index.html."). Usato dal
+    router G1 e dal nudge executor per ri-mandare all'executor quando un modello
+    thinking narra il piano e chiude senza tool call. Il cap g1_reroute_count
+    impedisce loop infiniti su eventuali falsi positivi.
+    """
+    if not text or not text.strip():
+        return False
+    tail = text.strip().lower()[-400:]
+    return any(p in tail for p in _INTENT_NARRATION_PATTERNS)
+
+
+def _last_assistant_text(messages: list) -> str:
+    """Ritorna il testo dell'ultimo AIMessage nella history (vuoto se assente)."""
+    for m in reversed(messages or []):
+        if isinstance(m, AIMessage):
+            content = getattr(m, "content", "")
+            if isinstance(content, list):
+                return " ".join(
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            return str(content or "")
+    return ""
+
+
 def _has_tool_calls_in_history(messages: list) -> bool:
     """Controlla se nella history ci sono già stati tool call effettivi (AIMessage con tool_use)."""
     for m in messages:
@@ -2517,7 +2583,15 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             _first_human_for_g1 = " ".join(
                 b.get("text", "") for b in _first_human_for_g1 if isinstance(b, dict)
             )
-        if _detect_action_request(str(_first_human_for_g1)):
+        # Conta la re-entry G1 sia per richiesta action-oriented (input) sia
+        # per intenzione annunciata e non compiuta (output): cosi' il cap
+        # anti-loop si applica anche ai debug dove il primo messaggio non e'
+        # imperativo ma il modello narra "Inizio verificando X" senza agire.
+        _g1_should_count = (
+            _detect_action_request(str(_first_human_for_g1))
+            or _detect_unfulfilled_intent(_last_assistant_text(messages))
+        )
+        if _g1_should_count:
             # FIX G1 intelligente: se il modello sta legittimamente reagendo a
             # un tool_result d'errore recente (es. "npm install" fallito), NON
             # e' "descrittivo" ma "in difficolta'": dargli piu' tentativi prima
@@ -2758,20 +2832,31 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             _first_human_text = " ".join(
                 b.get("text", "") for b in _first_human_text if isinstance(b, dict)
             )
-        if _detect_action_request(str(_first_human_text)):
+        # G1 esteso: il nudge scatta sia quando la richiesta utente e' un'azione
+        # concreta (input action-oriented) sia quando il modello ha appena
+        # ANNUNCIATO un'azione imminente senza eseguirla (output con intenzione
+        # non compiuta — "Inizio verificando index.html" e poi chiude). Questo
+        # secondo caso copre i debug/diagnosi dove il primo messaggio non e'
+        # imperativo ma l'agente narra il piano invece di agire.
+        _is_action_req = _detect_action_request(str(_first_human_text))
+        _is_unfulfilled = _detect_unfulfilled_intent(_last_assistant_text(messages))
+        if _is_action_req or _is_unfulfilled:
             _nudge_msg = HumanMessage(
                 content=(
-                    "⚠️ ERRORE: hai risposto descrivendo cosa avresti fatto, "
+                    "⚠️ ERRORE: hai annunciato/descritto cosa avresti fatto, "
                     "ma NON hai chiamato nessun tool. Questo non è accettabile. "
-                    "AGISCI ADESSO — usa shell_exec per comandi (docker, npm, dotnet, ecc.), "
+                    "AGISCI ADESSO — esegui l'azione che hai appena dichiarato "
+                    "usando un tool: shell_exec/run_command per comandi (docker, "
+                    "npm, dotnet, ss, ecc.), read_file/list_files per ispezionare, "
                     "write_file/edit_file per creare o modificare file. "
                     "Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call."
                 )
             )
             messages = list(messages) + [_nudge_msg]
             logger.warning(
-                "G1 nudge iniettato (iter=%d, nudge_count=%d, intent=%s)",
+                "G1 nudge iniettato (iter=%d, nudge_count=%d, intent=%s, motivo=%s)",
                 _current_iter, _nudge_count, intent,
+                "action-request" if _is_action_req else "intent-non-compiuta",
             )
 
     # Heartbeat A: pubblica step "calling_model" cosi' l'utente vede in chat
@@ -3839,11 +3924,20 @@ def route_after_executor(state: AgentState) -> str:
                 _first_human = " ".join(
                     b.get("text", "") for b in _first_human if isinstance(b, dict)
                 )
-            if _detect_action_request(str(_first_human)):
+            # Re-routing G1: scatta sia quando la richiesta originale e'
+            # action-oriented, sia quando l'ULTIMA risposta del modello ha
+            # annunciato un'azione imminente senza eseguirla (intenzione non
+            # compiuta). Il secondo caso copre i debug dove il primo messaggio
+            # umano non e' imperativo ma il modello narra "Inizio verificando X"
+            # e chiude. Cap g1_reroute_count previene loop su falsi positivi.
+            _is_action_req = _detect_action_request(str(_first_human))
+            _is_unfulfilled = _detect_unfulfilled_intent(state.get("result"))
+            if _is_action_req or _is_unfulfilled:
                 _nudge_count_log = int(state.get("action_nudge_count") or 0)
                 logger.warning(
-                    "route_after_executor: G1 risposta descrittiva su action request "
+                    "route_after_executor: G1 risposta descrittiva su %s "
                     "(iter=%d reroute=%d/%d nudge=%d) -> re-executor",
+                    "action-request" if _is_action_req else "intent-non-compiuta",
                     iterations, _reroute_count, _max_nudges, _nudge_count_log,
                 )
                 return "executor"
