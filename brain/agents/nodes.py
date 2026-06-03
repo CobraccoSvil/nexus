@@ -299,11 +299,16 @@ def _inject_language_reminder(
         return messages, system_text
 
     # Punto 1: garanzia nel system_text (idempotente via marcatore).
+    # Il vincolo di lingua va messo in TESTA, non in coda: i modelli con forte
+    # bias linguistico (es. deepseek-chat -> cinese) ignorano una direttiva in
+    # fondo a un system prompt lungo / con context compresso. Come PRIMA
+    # istruzione (e ribadita in coda) diventa molto piu' difficile da ignorare.
     base_system = system_text or ""
     if _LANG_REMINDER_MARKER not in base_system:
+        _lang_block = f"### LINGUA RISPOSTA OBBLIGATORIA ###\n{reminder_text}"
         new_system = (
-            f"{base_system}\n\n{_LANG_REMINDER_MARKER}\n"
-            f"### LINGUA RISPOSTA OBBLIGATORIA ###\n{reminder_text}"
+            f"{_LANG_REMINDER_MARKER}\n{_lang_block}\n\n"
+            f"{base_system}\n\n{_lang_block}"
         )
     else:
         new_system = system_text
