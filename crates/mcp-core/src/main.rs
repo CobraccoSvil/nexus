@@ -454,19 +454,35 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let neural_client = {
-        let mut attempts = 0;
+        let mut attempts = 0u32;
+        // Resilienza all'avvio (regola H): il brain (Neural Core) puo' avere un
+        // cold start lento (build debug, warmup Vertex) o subire un hang
+        // transitorio del filesystem 9p su WSL. Il vecchio loop si arrendeva
+        // dopo 10 tentativi x 2s = 20s, facendo USCIRE mcp-core in cascata
+        // quando il brain non era ancora pronto (instabilita' ricorrente: mcp-core
+        // morto, da rilanciare a mano). Ora attendiamo molto piu' a lungo con
+        // backoff (2s -> cap 10s, ~9 minuti) prima di arrenderci davvero.
+        const MAX_ATTEMPTS: u32 = 60;
         loop {
             match NeuralCoreClient::connect(&neural_core_url).await {
-                Ok(c) => break c,
+                Ok(c) => {
+                    if attempts > 0 {
+                        tracing::info!("Neural Core connesso dopo {attempts} tentativi");
+                    }
+                    break c;
+                }
                 Err(e) => {
                     attempts += 1;
-                    if attempts >= 10 {
+                    if attempts >= MAX_ATTEMPTS {
                         anyhow::bail!(
                             "Failed to connect to Neural Core after {attempts} attempts: {e}"
                         );
                     }
-                    tracing::warn!("Neural Core not ready (attempt {attempts}/10): {e}");
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let backoff = std::cmp::min(2 + attempts as u64, 10);
+                    tracing::warn!(
+                        "Neural Core not ready (attempt {attempts}/{MAX_ATTEMPTS}): {e} — retry in {backoff}s"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
                 }
             }
         }
