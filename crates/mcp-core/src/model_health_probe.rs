@@ -48,6 +48,15 @@ use crate::provider_cooldown::{
 /// Prompt minimale. Stesso usato da `provider_health_probe`.
 const PROBE_PROMPT: &str = "ping";
 
+/// FIX 1 (probe tool-aware): nome del tool fittizio usato per verificare che
+/// il modello sappia EFFETTIVAMENTE produrre una tool call (path agente), non
+/// solo rispondere a una chat "ping". Diagnostica l'inversione in cui un
+/// modello "ping-healthy" fallisce poi sul tool-forcing reale (es. alias
+/// Mistral che risolve a un modello Labs 403, o gemini-2.5-pro che ritorna
+/// MALFORMED_FUNCTION_CALL).
+const TOOL_PROBE_TOOL_NAME: &str = "nexus_probe_tool";
+const TOOL_PROBE_MAX_TOKENS: u32 = 256;
+
 /// Timeout per la singola chiamata al modello. Piu' generoso del provider
 /// probe (30s) perche' i modelli "thinking" (gemini-2.5-pro) possono
 /// spendere molto tempo nella fase di reasoning.
@@ -118,7 +127,26 @@ pub(crate) async fn run_one_round(
         ..Default::default()
     };
 
-    for (provider, model, consecutive_failures) in models {
+    // FIX 1: config DB-driven del tool-probe (regola G, niente hardcode).
+    // - `agent.model_tool_probe.enabled` (default true): abilita il tool-probe.
+    // - `agent.model_tool_failure_threshold` (default 3, mig 0269): soglia oltre
+    //   la quale un modello che fallisce il tool-forcing viene marcato
+    //   supports_tool_use=false (NON is_enabled=false).
+    let tool_probe_enabled = crate::settings::get_setting(db, "agent.model_tool_probe.enabled")
+        .await
+        .ok()
+        .flatten()
+        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true);
+    let tool_failure_threshold = crate::settings::get_setting(db, "agent.model_tool_failure_threshold")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|t| *t > 0)
+        .unwrap_or(3);
+
+    for (provider, model, consecutive_failures, supports_tool_use, tool_failures) in models {
         // Salta se il provider e' in cooldown lungo: faremmo solo rumore
         // (tutte le probe ritornerebbero errore di quota/billing che e'
         // gia' noto al sistema).
@@ -138,17 +166,41 @@ pub(crate) async fn run_one_round(
         }
 
         sleep(Duration::from_millis(INTER_PROBE_SLEEP_MS)).await;
+
+        // FIX 1: tool-probe SOLO per i modelli candidati agli intent agentici
+        // (supports_tool_use=true). Costo contenuto: i modelli pure-chat non
+        // vengono toccati. Il provider in cooldown e' gia' stato saltato sopra.
+        if tool_probe_enabled && supports_tool_use {
+            match tool_probe_one_model(
+                orchestrator, db, &provider, &model, tool_failures, tool_failure_threshold,
+            )
+            .await
+            {
+                ToolProbeOutcome::Ok => stats.tool_probe_ok += 1,
+                ToolProbeOutcome::FailedCounted => stats.tool_probe_failed += 1,
+                ToolProbeOutcome::MarkedNonToolCapable => {
+                    stats.tool_probe_failed += 1;
+                    stats.tool_probe_disabled += 1;
+                }
+                ToolProbeOutcome::Skipped => {}
+            }
+            sleep(Duration::from_millis(INTER_PROBE_SLEEP_MS)).await;
+        }
     }
 
     tracing::info!(
         "model_health_probe: round completato — total={} healthy={} provider_errors={} \
-         model_errors={} auto_disabled={} skipped={}",
+         model_errors={} auto_disabled={} skipped={} tool_probe_ok={} tool_probe_failed={} \
+         tool_probe_disabled={}",
         stats.total,
         stats.healthy,
         stats.provider_wide_errors,
         stats.model_errors,
         stats.auto_disabled,
         stats.skipped_provider_cooldown,
+        stats.tool_probe_ok,
+        stats.tool_probe_failed,
+        stats.tool_probe_disabled,
     );
     stats
 }
@@ -161,6 +213,12 @@ pub struct ProbeRoundStats {
     pub model_errors: usize,
     pub auto_disabled: usize,
     pub skipped_provider_cooldown: usize,
+    /// FIX 1: modelli tool-capable che hanno superato il tool-probe.
+    pub tool_probe_ok: usize,
+    /// FIX 1: modelli che hanno fallito il tool-probe (sotto soglia).
+    pub tool_probe_failed: usize,
+    /// FIX 1: modelli marcati supports_tool_use=false dal tool-probe (soglia).
+    pub tool_probe_disabled: usize,
 }
 
 enum ProbeOutcome {
@@ -170,10 +228,29 @@ enum ProbeOutcome {
     AutoDisabled,
 }
 
-/// Legge i modelli enabled dal catalog. Ritorna (provider, model, consecutive_failures).
-async fn load_enabled_models(db: &PgPool) -> sqlx::Result<Vec<(String, String, i32)>> {
+/// Esito del tool-probe (FIX 1). Non tocca mai `is_enabled`: solo
+/// `supports_tool_use` + `consecutive_tool_failures`.
+enum ToolProbeOutcome {
+    /// Tool call valida ricevuta -> reset contatore + riabilita tool-capability.
+    Ok,
+    /// Tool-forcing fallito ma sotto soglia -> incremento contatore.
+    FailedCounted,
+    /// Soglia raggiunta -> supports_tool_use=false (modello resta per chat).
+    MarkedNonToolCapable,
+    /// Errore provider-wide (cooldown gia' applicato dal probe chat) -> nessuna
+    /// azione tool-specific (non punisce il modello per colpa del provider).
+    Skipped,
+}
+
+/// Legge i modelli enabled dal catalog. Ritorna
+/// (provider, model, consecutive_failures, supports_tool_use, consecutive_tool_failures).
+async fn load_enabled_models(
+    db: &PgPool,
+) -> sqlx::Result<Vec<(String, String, i32, bool, i32)>> {
     let rows = sqlx::query(
-        "SELECT provider, model, consecutive_failures
+        "SELECT provider, model, consecutive_failures, \
+                COALESCE(supports_tool_use, false) AS supports_tool_use, \
+                COALESCE(consecutive_tool_failures, 0) AS consecutive_tool_failures
            FROM ai_price_catalog
           WHERE is_enabled = true
           ORDER BY provider, model",
@@ -187,7 +264,9 @@ async fn load_enabled_models(db: &PgPool) -> sqlx::Result<Vec<(String, String, i
             let p: String = r.try_get("provider").unwrap_or_default();
             let m: String = r.try_get("model").unwrap_or_default();
             let f: i32 = r.try_get("consecutive_failures").unwrap_or(0);
-            (p, m, f)
+            let stu: bool = r.try_get("supports_tool_use").unwrap_or(false);
+            let tf: i32 = r.try_get("consecutive_tool_failures").unwrap_or(0);
+            (p, m, f, stu, tf)
         })
         .collect())
 }
@@ -364,6 +443,230 @@ async fn probe_one_model(
                     "model_health_probe: {provider}/{model} fail #{new_count}/{failure_threshold} ({kind})"
                 );
                 ProbeOutcome::ModelSpecificCounted
+            }
+        }
+    }
+}
+
+/// FIX 1: esito puro della valutazione di una response di tool-probe.
+/// Testabile senza DB/rete.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ToolProbeVerdict {
+    /// Tool call valida per `nexus_probe_tool` ricevuta.
+    Success,
+    /// Tool-forcing fallito (no tool call / malformed / output vuoto). Il
+    /// modello e' raggiungibile ma non sa rispettare il tool-forcing.
+    ToolFailed(String),
+    /// Errore provider-wide (billing/quota/auth/rate_limit): non e' colpa del
+    /// modello. Niente azione tool-specific.
+    ProviderWide(String),
+}
+
+/// Valuta la response JSON del brain (`GenerateAgentTurn`) per il tool-probe.
+/// Logica:
+/// - error_class provider-wide -> ProviderWide (non punire il modello).
+/// - error_class model-specific / forbidden / not_found -> ToolFailed.
+/// - presenza di un `tool_use_blocks` con name == nexus_probe_tool -> Success.
+/// - altrimenti (stop_reason=error, malformed, nessuna tool call) -> ToolFailed.
+pub(crate) fn evaluate_tool_probe(response: &serde_json::Value) -> ToolProbeVerdict {
+    // 1. error_class autorevole dal brain.
+    let ec = response
+        .get("error_class")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+    if !ec.is_empty() {
+        return match classification_from_error_class(ec) {
+            Classification::ProviderWide(kind, _) => ToolProbeVerdict::ProviderWide(kind),
+            Classification::ModelSpecific(kind, _) => ToolProbeVerdict::ToolFailed(kind),
+            Classification::Ok => ToolProbeVerdict::ToolFailed("unexpected_ok_with_error_class".into()),
+        };
+    }
+
+    // 2. stop_reason=error senza error_class: trattalo come tool-failure.
+    let stop_reason = response
+        .get("stop_reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if stop_reason == "error" {
+        return ToolProbeVerdict::ToolFailed("stop_reason_error".into());
+    }
+
+    // 3. Tool call valida verso nexus_probe_tool?
+    let has_valid_tool_call = response
+        .get("tool_use_blocks")
+        .and_then(|v| v.as_array())
+        .map(|blocks| {
+            blocks.iter().any(|b| {
+                b.get("name").and_then(|n| n.as_str()) == Some(TOOL_PROBE_TOOL_NAME)
+            })
+        })
+        .unwrap_or(false);
+    if has_valid_tool_call {
+        return ToolProbeVerdict::Success;
+    }
+
+    // 4. Nessuna tool call (output vuoto / malformed / il modello ha chiacchierato
+    //    invece di chiamare il tool forzato).
+    ToolProbeVerdict::ToolFailed(if stop_reason.is_empty() {
+        "no_tool_call".into()
+    } else {
+        format!("no_tool_call:{stop_reason}")
+    })
+}
+
+/// FIX 1: esegue il tool-probe su un singolo modello tool-capable, sul PATH
+/// AGENTE (`generate_agent_turn`), forzando una tool call su un tool fittizio.
+/// Applica la stessa semantica del runtime (`tool_failure_action`): a soglia
+/// marca `supports_tool_use=false` SENZA toccare `is_enabled`.
+async fn tool_probe_one_model(
+    orchestrator: &Orchestrator,
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+    prior_tool_failures: i32,
+    threshold: i32,
+) -> ToolProbeOutcome {
+    // Tool fittizio minimale + tool_choice forzato. Mettiamo il tool_choice
+    // nel JSON dei tools cosi' il brain lo inoltra al provider (lo schema
+    // generate_agent_turn non ha un campo tool_choice dedicato: i provider
+    // OpenAI-compatible accettano la forzatura via messaggio + presenza tool).
+    let tools_json = serde_json::json!([
+        {
+            "name": TOOL_PROBE_TOOL_NAME,
+            "description": "Tool di verifica capacita: rispondi chiamandolo con ok=true.",
+            "input_schema": {
+                "type": "object",
+                "properties": { "ok": { "type": "boolean" } },
+                "required": ["ok"]
+            }
+        }
+    ])
+    .to_string();
+    let messages_json = serde_json::json!([
+        {
+            "role": "user",
+            "content": format!("Verifica capacita tool: chiama {TOOL_PROBE_TOOL_NAME} con ok=true.")
+        }
+    ])
+    .to_string();
+    let system_text =
+        format!("Devi rispondere ESCLUSIVAMENTE chiamando il tool {TOOL_PROBE_TOOL_NAME}.");
+
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(PROBE_TIMEOUT_S),
+        orchestrator.neural.generate_agent_turn(
+            provider,
+            model,
+            &messages_json,
+            &tools_json,
+            TOOL_PROBE_MAX_TOKENS,
+            &system_text,
+        ),
+    )
+    .await;
+    let latency_ms = started.elapsed().as_millis() as i32;
+
+    let verdict = match result {
+        Ok(Ok(response)) => evaluate_tool_probe(&response),
+        Ok(Err(e)) => {
+            let ec = orchestrator.neural.classify_error(&e.to_string(), provider).await;
+            match classification_from_error_class(&ec) {
+                Classification::ProviderWide(kind, _) => ToolProbeVerdict::ProviderWide(kind),
+                Classification::ModelSpecific(kind, _) => ToolProbeVerdict::ToolFailed(kind),
+                Classification::Ok => ToolProbeVerdict::ToolFailed("transport_ok_no_tool".into()),
+            }
+        }
+        Err(_timeout) => ToolProbeVerdict::ToolFailed("tool_probe_timeout".into()),
+    };
+
+    // Persisti l'esito nello storico (diagnosticabile). error_kind prefissato
+    // 'tool_probe:' per distinguerlo dal probe chat.
+    let (healthy, error_kind) = match &verdict {
+        ToolProbeVerdict::Success => (true, None),
+        ToolProbeVerdict::ToolFailed(k) => (false, Some(format!("tool_probe:{k}"))),
+        ToolProbeVerdict::ProviderWide(k) => (false, Some(format!("tool_probe_provider:{k}"))),
+    };
+    let _ = sqlx::query(
+        r#"INSERT INTO ai_model_health_history
+           (provider, model, healthy, latency_ms, error_kind, error_message)
+           VALUES ($1, $2, $3, $4, $5, $6)"#,
+    )
+    .bind(provider)
+    .bind(model)
+    .bind(healthy)
+    .bind(latency_ms)
+    .bind(error_kind.as_deref())
+    .bind(error_kind.as_deref())
+    .execute(db)
+    .await;
+
+    match verdict {
+        ToolProbeVerdict::ProviderWide(kind) => {
+            tracing::debug!(
+                "model_health_probe[tool]: {provider}/{model} provider-wide '{kind}' -> nessuna azione tool-specific"
+            );
+            ToolProbeOutcome::Skipped
+        }
+        ToolProbeVerdict::Success => {
+            // Reset contatore + riabilita tool-capability se era stata marcata
+            // off da un precedente tool_probe_failed (NON tocca un disable manuale
+            // ne' is_enabled). Reset idempotente.
+            let _ = sqlx::query(
+                "UPDATE ai_price_catalog
+                    SET consecutive_tool_failures = 0,
+                        supports_tool_use = true,
+                        updated_at = NOW()
+                  WHERE provider = $1 AND model = $2
+                    AND (consecutive_tool_failures > 0 OR supports_tool_use = false)
+                    AND (auto_disabled_reason IS NULL OR auto_disabled_reason LIKE 'tool_probe_failed:%')",
+            )
+            .bind(provider)
+            .bind(model)
+            .execute(db)
+            .await;
+            tracing::debug!("model_health_probe[tool]: {provider}/{model} tool-probe OK");
+            ToolProbeOutcome::Ok
+        }
+        ToolProbeVerdict::ToolFailed(kind) => {
+            let new_count = prior_tool_failures + 1;
+            if new_count >= threshold {
+                let reason = format!("tool_probe_failed:{kind}");
+                let _ = sqlx::query(
+                    "UPDATE ai_price_catalog
+                        SET supports_tool_use = false,
+                            consecutive_tool_failures = $3,
+                            auto_disabled_reason = $4,
+                            updated_at = NOW()
+                      WHERE provider = $1 AND model = $2",
+                )
+                .bind(provider)
+                .bind(model)
+                .bind(new_count)
+                .bind(&reason)
+                .execute(db)
+                .await;
+                tracing::warn!(
+                    "model_health_probe[tool]: MARK NON-TOOL-CAPABLE {provider}/{model} \
+                     (tool_failures={new_count}, reason={kind}) — is_enabled invariato"
+                );
+                ToolProbeOutcome::MarkedNonToolCapable
+            } else {
+                let _ = sqlx::query(
+                    "UPDATE ai_price_catalog
+                        SET consecutive_tool_failures = $3, updated_at = NOW()
+                      WHERE provider = $1 AND model = $2",
+                )
+                .bind(provider)
+                .bind(model)
+                .bind(new_count)
+                .execute(db)
+                .await;
+                tracing::debug!(
+                    "model_health_probe[tool]: {provider}/{model} tool-fail #{new_count}/{threshold} ({kind})"
+                );
+                ToolProbeOutcome::FailedCounted
             }
         }
     }
@@ -702,5 +1005,62 @@ mod tests {
     fn extract_content_empty() {
         let v = serde_json::json!({"content": ""});
         assert_eq!(extract_content_len(&v), 0);
+    }
+
+    // --- FIX 1: tool-probe verdict ------------------------------------------
+
+    #[test]
+    fn tool_probe_success_su_tool_call_valida() {
+        // Il modello ha chiamato nexus_probe_tool -> Success.
+        let v = serde_json::json!({
+            "stop_reason": "tool_use",
+            "tool_use_blocks": [{ "name": TOOL_PROBE_TOOL_NAME, "input": {"ok": true} }]
+        });
+        assert_eq!(evaluate_tool_probe(&v), ToolProbeVerdict::Success);
+    }
+
+    #[test]
+    fn tool_probe_fail_su_nessuna_tool_call() {
+        // Il modello ha risposto in chat senza chiamare il tool forzato
+        // (tipico hollow_no_tools / output-vuoto sul tool-forcing).
+        let v = serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": "Certo, procedo.",
+            "tool_use_blocks": []
+        });
+        assert!(matches!(
+            evaluate_tool_probe(&v),
+            ToolProbeVerdict::ToolFailed(ref k) if k.contains("no_tool_call")
+        ));
+    }
+
+    #[test]
+    fn tool_probe_fail_su_forbidden_model_specific() {
+        // 403 forbidden (es. alias Mistral -> Labs 403) e' model-specific:
+        // il tool-probe lo conta come ToolFailed, NON provider-wide.
+        let v = serde_json::json!({ "error_class": "forbidden", "tool_use_blocks": [] });
+        assert!(matches!(
+            evaluate_tool_probe(&v),
+            ToolProbeVerdict::ToolFailed(ref k) if k == "model_forbidden"
+        ));
+    }
+
+    #[test]
+    fn tool_probe_providerwide_su_billing() {
+        // billing_error e' colpa del provider: non punisce il modello.
+        let v = serde_json::json!({ "error_class": "billing_error", "tool_use_blocks": [] });
+        assert!(matches!(
+            evaluate_tool_probe(&v),
+            ToolProbeVerdict::ProviderWide(ref k) if k == "credit_balance_too_low"
+        ));
+    }
+
+    #[test]
+    fn tool_probe_fail_su_stop_reason_error() {
+        let v = serde_json::json!({ "stop_reason": "error", "tool_use_blocks": [] });
+        assert!(matches!(
+            evaluate_tool_probe(&v),
+            ToolProbeVerdict::ToolFailed(ref k) if k == "stop_reason_error"
+        ));
     }
 }

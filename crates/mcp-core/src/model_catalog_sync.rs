@@ -577,6 +577,31 @@ async fn sync_provider(
                 if base_name.as_str() != catalog_model.as_str() && api_set.contains(base_name.as_str()) {
                     continue;
                 }
+
+                // FIX 2 (catalog_sync probe-aware): la lista upstream LiteLLM/
+                // provider e' un INDIZIO, non la verita'. La verita' e' l'account:
+                // se il probe (model_health_probe) trova ancora il modello SANO,
+                // non spegnerlo solo perche' "datato" / non piu' in lista. Cosi'
+                // evitiamo l'inversione diagnosticata (modello funzionante per
+                // l'account disabilitato perche' rimosso da upstream).
+                // Disabilitiamo solo se anche l'health reale lo conferma rotto.
+                if model_recently_healthy(db, provider, catalog_model).await {
+                    // Annotazione diagnostica idempotente: il modello resta
+                    // is_enabled=true (NON tocchiamo auto_disabled_*), ma
+                    // l'audit_log registra la decisione cosi' e' rintracciabile
+                    // perche' un modello "datato" e' rimasto attivo.
+                    tracing::info!(
+                        "catalog_sync[{}]: '{}' assente da upstream MA probe recente healthy -> NON disabilito (legacy, lascio is_enabled=true)",
+                        provider, catalog_model,
+                    );
+                    audit_log(
+                        db, provider, catalog_model, "kept_enabled_legacy",
+                        json!({"reason":"missing_from_api_but_recently_healthy"}),
+                    )
+                    .await;
+                    continue;
+                }
+
                 let res = sqlx::query(
                     "UPDATE ai_price_catalog SET is_enabled = false, \
                      auto_disabled_at = NOW(), auto_disabled_reason = 'missing_from_api' \
@@ -614,6 +639,69 @@ fn strip_date_suffix(model: &str) -> String {
         }
     }
     model.to_string()
+}
+
+/// FIX 2: verifica se un modello e' "recentemente sano" secondo l'account,
+/// non secondo la lista upstream. Usato dal catalog_sync per NON disabilitare
+/// modelli assenti da upstream ma ancora funzionanti per l'account.
+///
+/// Sano = (a) esiste un health check recente con healthy=true entro la finestra
+///         `agent.catalog_sync_health_window_hours` (default 24h), OPPURE
+///        (b) il catalog riporta consecutive_failures=0 per il modello (mai
+///         fallito un probe model-specific).
+///
+/// Conservativo: se la query fallisce, ritorna `false` (cioe' lascia procedere
+/// la disabilitazione come prima — niente nuovi falsi-positivi su DB down).
+async fn model_recently_healthy(db: &PgPool, provider: &str, model: &str) -> bool {
+    // Finestra di freschezza DB-driven (regola G: niente hardcode magico).
+    let window_hours: i64 = get_setting(db, "agent.catalog_sync_health_window_hours")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|h| *h > 0)
+        .unwrap_or(24);
+
+    // (a) Ultimo health check recente healthy=true.
+    let recent_healthy: Option<bool> = sqlx::query_scalar(
+        "SELECT healthy
+           FROM ai_model_health_history
+          WHERE provider = $1 AND model = $2
+            AND checked_at >= NOW() - make_interval(hours => $3)
+          ORDER BY checked_at DESC
+          LIMIT 1",
+    )
+    .bind(provider)
+    .bind(model)
+    .bind(window_hours as i32)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    if matches!(recent_healthy, Some(true)) {
+        return true;
+    }
+
+    // (b) Fallback: nessun probe recente, ma il catalog non registra fallimenti
+    // model-specific consecutivi -> consideriamo il modello ancora valido.
+    // (Se un probe l'avesse trovato rotto, consecutive_failures sarebbe > 0.)
+    if recent_healthy.is_none() {
+        let cf: Option<i32> = sqlx::query_scalar(
+            "SELECT consecutive_failures FROM ai_price_catalog
+              WHERE provider = $1 AND model = $2",
+        )
+        .bind(provider)
+        .bind(model)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+        if matches!(cf, Some(0)) {
+            return true;
+        }
+    }
+
+    false
 }
 
 async fn audit_log(db: &PgPool, provider: &str, model: &str, action: &str, details: Value) {
