@@ -846,12 +846,13 @@ export function ChatPanel({
       try {
         const r = await findSimilarKnowledge(projectId, text);
         if (r.hits.length > 0) {
+          // Qualsiasi richiesta simile (gia' completata O solo correlata): mostra
+          // il banner e ATTENDE la conferma esplicita dell'utente ("Rifai
+          // comunque" / "Invia comunque"). L'agente NON parte da solo.
           setSimilarHits(r.hits);
-          if (r.hits.some((h) => h.implemented)) {
-            pendingProceedSendRef.current = fireSend;
-            clearComposer();
-            return;
-          }
+          pendingProceedSendRef.current = fireSend;
+          clearComposer();
+          return;
         }
       } catch {
         /* ricerca note non bloccante: in caso di errore si procede con l'invio */
