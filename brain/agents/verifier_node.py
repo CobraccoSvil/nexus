@@ -79,7 +79,55 @@ async def verifier_node(state: AgentState) -> dict[str, Any]:
         except Exception:
             criteria_raw = []
     if not criteria_raw:
-        # Nessun criterion: marca completed e passa al prossimo
+        # Nessun criterion sul todo. Fail-closed: per i task software con il
+        # flag verifier_fail_closed attivo, esegui comunque i gate generali
+        # (no_orphan_imported) cosi' un'app placeholder sopra un design
+        # importato NON passa silenziosamente. Per task non software o flag
+        # off: comportamento storico (completed + advance).
+        from . import final_gate
+        if cfg.get("verifier_fail_closed", True) and final_gate._is_software_task(state, cfg):
+            gate_passed, gate_results = await final_gate.run_general_gates(state, cfg)
+            if gate_passed:
+                _mark_todo_status(active_todo_id, "completed")
+                return _advance_or_end(run_id)
+            fc_cycle = int(state.get("verify_cycle", 0) or 0) + 1
+            fc_max = int(cfg["max_verify_cycles"])
+            if fc_cycle >= fc_max:
+                _mark_todo_status(active_todo_id, "blocked")
+                logger.warning(
+                    "verifier_node: gate generale fallito, todo %s blocked dopo %d cicli",
+                    active_todo_id, fc_cycle,
+                )
+                advance = _advance_or_end(run_id)
+                advance["verify_cycle"] = 0
+                advance["verifier_last_result"] = {
+                    "passed": False, "cycle": fc_cycle, "results": gate_results,
+                }
+                return advance
+            # Retry: inietta il verdetto e rimanda all'executor.
+            fc_failed_block = _render_failed_block(todo, fc_cycle, fc_max, gate_results)
+            fc_behavior = (state.get("behavior_mode") or "").strip().lower()
+            if fc_behavior in ("automatic", "automatico", "continuous", "continuo"):
+                fc_failed_block = (
+                    "<autonomy_hint mode=\"" + fc_behavior + "\">\n"
+                    "L'utente ha selezionato la modalita' '" + fc_behavior + "': procedi\n"
+                    "AUTONOMAMENTE col retry. NON chiedere conferma all'utente.\n"
+                    "</autonomy_hint>\n\n"
+                ) + fc_failed_block
+            logger.info(
+                "verifier_node: gate generale fallito (cycle=%d/%d) -> retry executor",
+                fc_cycle, fc_max,
+            )
+            return {
+                "messages": [HumanMessage(content=fc_failed_block)],
+                "verify_cycle": fc_cycle,
+                "verifier_last_result": {
+                    "passed": False, "cycle": fc_cycle, "results": gate_results,
+                },
+                "stop_reason": "tool_use",
+                "pending_tool_uses": [],
+            }
+        # Nessun criterion + task non software / flag off: marca completed.
         _mark_todo_status(active_todo_id, "completed")
         return _advance_or_end(run_id)
 

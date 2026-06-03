@@ -136,6 +136,9 @@ class AgentState(TypedDict, total=False):
     verify_cycle: int
     # Cluster 3: ciclo della verifica esplorativa LLM (cap dedicato, reset per todo).
     exploratory_verify_cycle: int
+    # Final gate generale (fail-closed) per task software senza plan_phase:
+    # ciclo corrente del gate anti-placeholder (cap final_gate_max_cycles).
+    final_gate_cycle: int
     # PR-2: ultimo risultato del verifier (criteria_results).
     verifier_last_result: dict | None
     # PR-2: contatore revisioni strutturali del plan (cap max_plan_revisions).

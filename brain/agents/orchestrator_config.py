@@ -93,7 +93,32 @@ _KEYS = (
     "dag_parallel_enabled",
     "dag_max_parallel",
     "dag_verify_layer",
+    # Final gate generale (fail-closed) anti-placeholder
+    "final_gate_enabled",
+    "final_gate_software_intents",
+    "final_gate_max_cycles",
+    "import_staging_dirs",
+    "no_orphan_min_ratio",
+    "verifier_fail_closed",
 )
+
+# Override del nome completo (key DB) per le chiavi che NON usano il prefisso
+# 'orchestrator.'. Il final gate vive sotto la categoria/prefisso 'agent.'
+# (coerente con le migrazioni recenti su settings, es. 0262/0263). Le chiavi
+# locali restano pulite per uso programmatico.
+_KEY_FULL_NAME: dict[str, str] = {
+    "final_gate_enabled": "agent.final_gate.enabled",
+    "final_gate_software_intents": "agent.final_gate.software_intents",
+    "final_gate_max_cycles": "agent.final_gate.max_cycles",
+    "import_staging_dirs": "agent.import_staging_dirs",
+    "no_orphan_min_ratio": "agent.no_orphan.min_ratio",
+    "verifier_fail_closed": "agent.verifier.fail_closed",
+}
+
+
+def _full_key(local_key: str) -> str:
+    """Nome completo della chiave nel DB per una chiave locale."""
+    return _KEY_FULL_NAME.get(local_key, _KEY_PREFIX + local_key)
 
 # Default conservativi: feature OFF se DB irraggiungibile.
 _SAFE_DEFAULTS: dict[str, Any] = {
@@ -152,6 +177,16 @@ _SAFE_DEFAULTS: dict[str, Any] = {
     "dag_parallel_enabled": False,
     "dag_max_parallel": 2,
     "dag_verify_layer": True,
+    # Final gate generale (fail-closed) anti-placeholder (mig 0265).
+    "final_gate_enabled": True,
+    "final_gate_software_intents": [
+        "code", "debug", "scaffold", "implement", "build",
+        "frontend", "fix", "refactor",
+    ],
+    "final_gate_max_cycles": 2,
+    "import_staging_dirs": ["figma_export"],
+    "no_orphan_min_ratio": 0.4,
+    "verifier_fail_closed": True,
 }
 
 _lock = threading.RLock()
@@ -193,7 +228,7 @@ def _load_from_db() -> dict[str, Any]:
         logger.warning("orchestrator_config: psycopg2 non installato, uso safe_defaults")
         return dict(_SAFE_DEFAULTS)
 
-    full_keys = [_KEY_PREFIX + k for k in _KEYS]
+    full_keys = [_full_key(k) for k in _KEYS]
     try:
         conn = psycopg2.connect(database_url)
         try:
@@ -211,7 +246,7 @@ def _load_from_db() -> dict[str, Any]:
 
     result: dict[str, Any] = {}
     for local_key, safe_val in _SAFE_DEFAULTS.items():
-        raw = rows.get(_KEY_PREFIX + local_key, "")
+        raw = rows.get(_full_key(local_key), "")
         if not raw:
             result[local_key] = safe_val
             continue

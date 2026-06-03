@@ -1,0 +1,188 @@
+"""final_gate: gate generale fail-closed per task software senza plan_phase.
+
+Il verifier_node gira solo quando il piano e' attivo (`plan_phase_active`). Per i
+task software che chiudono SENZA plan (executor diretto, end_turn) non c'era
+alcuna verifica: un'app placeholder (hello-world) montata sopra un design
+importato passava silenziosamente (fail-open).
+
+Questo modulo chiude quel buco riusando il motore di verifica generale
+(`criteria_runner`), in particolare il criterio `no_orphan_imported`: se esiste
+codice staged in figma_export/ con abbastanza moduli, l'entry servito
+(src/main.tsx) deve raggiungerli via grafo degli import. Hello-world -> fallisce
+(re-executor); design montato -> passa (chiude); nessuno staging -> N/A.
+
+Tutta la configurazione e' letta da `orchestrator_config` (settings DB, cache
+60s). Nessun nome modello / valore hardcoded (regola G).
+"""
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+
+from langchain_core.messages import HumanMessage
+
+from . import orchestrator_config, criteria_runner
+
+logger = logging.getLogger(__name__)
+
+# ToolRunnerClient gRPC iniettato dal graph builder (come verifier_node).
+_tool_runner = None
+
+
+def configure(tool_runner: Any) -> None:
+    """Inject del ToolRunnerClient usato dai criteri generali."""
+    global _tool_runner
+    _tool_runner = tool_runner
+
+
+def _is_software_task(state: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    """True se l'intent del task corrente e' un task software (build/code/debug...).
+
+    Lo state usa `user_intent` (popolato da router_node). Manteniamo anche un
+    fallback su `intent` per robustezza verso eventuali percorsi che usano
+    quella chiave.
+    """
+    intent = str(state.get("user_intent") or state.get("intent") or "").lower()
+    if not intent:
+        return False
+    software_intents = [str(i).lower() for i in (cfg.get("final_gate_software_intents") or [])]
+    return intent in software_intents
+
+
+async def run_general_gates(
+    state: dict[str, Any], cfg: dict[str, Any]
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Esegue i criteri generali via criteria_runner.
+
+    Per ora un unico criterio: `no_orphan_imported` (anti-placeholder).
+    Best-effort: su eccezione di un criterio, passed=False con evidence error.
+
+    Ritorna (all_passed, results) con results = lista di
+    {type, passed, evidence}.
+    """
+    project_id = state.get("project_id") or os.environ.get("NEXUS_PROJECT_ID", "")
+    ctx = {
+        "tool_runner": _tool_runner,
+        "session_id": state.get("session_id"),
+        "project_id": project_id,
+        "timeout_s": cfg.get("verifier_timeout_s", 30),
+    }
+
+    criteria: list[dict[str, Any]] = [
+        {
+            "type": "no_orphan_imported",
+            "spec": {
+                "staging_dir": cfg.get("import_staging_dirs") or ["figma_export"],
+                "min_reached_ratio": cfg.get("no_orphan_min_ratio", 0.4),
+            },
+            "expected": {"mounted": True},
+        }
+    ]
+
+    results: list[dict[str, Any]] = []
+    for c in criteria:
+        try:
+            ok, evidence = await criteria_runner.run_criterion(c, ctx)
+        except Exception as exc:
+            logger.error("final_gate: criterion %s exception: %s", c.get("type"), exc)
+            ok, evidence = False, {"error": str(exc)}
+        results.append({
+            "type": c.get("type"),
+            "passed": bool(ok),
+            "evidence": evidence,
+        })
+
+    all_passed = all(r["passed"] for r in results)
+    return all_passed, results
+
+
+def _render_failed_block(
+    state: dict[str, Any], cycle: int, max_cycles: int, results: list[dict[str, Any]]
+) -> str:
+    """Costruisce il testo del HumanMessage da iniettare quando il gate fallisce.
+
+    Rispetta la modalita' autonoma (automatic/continuo) prependendo un blocco
+    <autonomy_hint> come fa verifier_node._render_failed_block.
+    """
+    failed = [r for r in results if not r.get("passed")]
+    diagnostic = ""
+    verdict = ""
+    if failed:
+        ev = failed[0].get("evidence") or {}
+        diagnostic = ev.get("output_excerpt") or ev.get("error") or ""
+        verdict = ev.get("verdict") or ev.get("reason") or ""
+
+    body = (
+        f"<final_gate_failed cycle=\"{cycle}/{max_cycles}\">\n"
+        f"Verifica generale fallita: il codice importato (design staged) NON e'\n"
+        f"raggiungibile dall'entry servito dell'app. Sembra un'app placeholder\n"
+        f"(es. hello-world) montata SOPRA un design importato che resta orfano.\n"
+    )
+    if verdict:
+        body += f"Verdetto: {verdict}\n"
+    if diagnostic:
+        body += f"Dettaglio:\n{str(diagnostic)[:800]}\n"
+    body += (
+        "AGISCI: integra il codice importato e montalo dall'entry (es. importa il\n"
+        "componente App reale in src/main.tsx e collega routes/pagine/servizi).\n"
+        "Non lasciare un placeholder sopra il design.\n"
+        "</final_gate_failed>"
+    )
+
+    behavior_mode = (state.get("behavior_mode") or "").strip().lower()
+    is_autonomous = behavior_mode in ("automatic", "automatico", "continuous", "continuo")
+    if is_autonomous:
+        autonomy_prefix = (
+            "<autonomy_hint mode=\"" + behavior_mode + "\">\n"
+            "L'utente ha selezionato la modalita' '" + behavior_mode + "': procedi\n"
+            "AUTONOMAMENTE con l'integrazione. NON chiedere conferma, NON scrivere\n"
+            "domande tipo 'Vuoi che lo faccia?' o 'Confermi?'. Esegui direttamente\n"
+            "le modifiche necessarie usando i tool disponibili.\n"
+            "</autonomy_hint>\n\n"
+        )
+        body = autonomy_prefix + body
+    return body
+
+
+async def final_gate_node(state: dict[str, Any]) -> dict[str, Any]:
+    """Gate generale fail-closed.
+
+    - Pass-through ({}): se disabilitato o task non software.
+    - Passa: chiude (stop_reason end_turn -> reflection).
+    - Cap raggiunto: chiude comunque (niente loop infinito).
+    - Fallisce: inietta verdetto e rimanda all'executor (stop_reason tool_use).
+    """
+    cfg = orchestrator_config.get()
+    if not cfg.get("final_gate_enabled") or not _is_software_task(state, cfg):
+        return {}
+
+    cycle = int(state.get("final_gate_cycle", 0) or 0) + 1
+    max_cycles = int(cfg["final_gate_max_cycles"])
+
+    passed, results = await run_general_gates(state, cfg)
+
+    if passed:
+        logger.info("final_gate: passato (cycle=%d) -> chiusura", cycle)
+        return {"final_gate_cycle": 0, "stop_reason": "end_turn"}
+
+    if cycle >= max_cycles:
+        logger.warning(
+            "final_gate cap raggiunto (cycle=%d/%d): chiudo comunque per evitare loop",
+            cycle, max_cycles,
+        )
+        return {"final_gate_cycle": 0, "stop_reason": "end_turn"}
+
+    logger.info("final_gate: fallito (cycle=%d/%d) -> re-executor", cycle, max_cycles)
+    hm = HumanMessage(content=_render_failed_block(state, cycle, max_cycles, results))
+    return {
+        "messages": [hm],
+        "final_gate_cycle": cycle,
+        "stop_reason": "tool_use",
+        "pending_tool_uses": [],
+    }
+
+
+def route_after_final_gate(state: dict[str, Any]) -> str:
+    """Routing post-final_gate: re-executor su tool_use, altrimenti chiusura."""
+    return "executor" if state.get("stop_reason") == "tool_use" else "learner"

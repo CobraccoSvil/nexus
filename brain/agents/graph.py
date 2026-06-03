@@ -20,6 +20,11 @@ from .nodes import (
 )
 from .planner_node import planner_node, configure as _configure_planner
 from .verifier_node import verifier_node, configure as _configure_verifier
+from .final_gate import (
+    final_gate_node,
+    route_after_final_gate,
+    configure as _configure_final_gate,
+)
 from .regression_gate_node import regression_gate_node, configure as _configure_regression_gate
 from .understanding_node import understanding_node, configure as _configure_understanding
 from .clarify_or_expand_node import (
@@ -125,6 +130,9 @@ def create_agent_graph(
         _routing_client = None
     _configure_planner(providers=providers, tool_runner=tool_runner, routing_client=_routing_client)
     _configure_verifier(tool_runner=tool_runner, providers=providers, routing_client=_routing_client)
+    # Final gate generale (fail-closed): riusa il tool_runner per i criteri
+    # generali (no_orphan_imported) sui task software senza plan_phase.
+    _configure_final_gate(tool_runner=tool_runner)
     _configure_clarify(providers=providers, routing_client=_routing_client)
     _configure_understanding(providers=providers, tool_runner=tool_runner, routing_client=_routing_client)
     # M13.4: il regression gate riusa il tool_runner per eseguire i test impact
@@ -142,6 +150,7 @@ def create_agent_graph(
     workflow.add_node("executor", executor_node)  # type: ignore[arg-type]
     workflow.add_node("tool_dispatch", tool_dispatch_node)  # type: ignore[arg-type]
     workflow.add_node("verifier", verifier_node)  # type: ignore[arg-type]
+    workflow.add_node("final_gate", final_gate_node)  # type: ignore[arg-type]
     workflow.add_node("reflection", reflection_node)  # type: ignore[arg-type]
     # M13.4/M13.5: regression gate, gira UNA volta a fine run tra reflection e
     # learner. SOFT (default): pass-through con warning+nota+todo se test impact
@@ -188,9 +197,17 @@ def create_agent_graph(
         {
             "tool_dispatch": "tool_dispatch",
             "verifier": "verifier",
+            "final_gate": "final_gate",
             "learner": "reflection",
             "executor": "executor",
         },
+    )
+    # Final gate: se fallisce rimanda all'executor per l'integrazione,
+    # altrimenti chiude verso reflection (-> learner).
+    workflow.add_conditional_edges(
+        "final_gate",
+        route_after_final_gate,
+        {"executor": "executor", "learner": "reflection"},
     )
     # tool_dispatch rientra nell'executor per un'altra iterazione.
     workflow.add_edge("tool_dispatch", "executor")

@@ -4054,6 +4054,20 @@ def route_after_executor(state: AgentState) -> str:
                 "(iter=%d reroute=%d/%d) -> chiusura forzata via learner",
                 iterations, _reroute_count, _max_nudges,
             )
+    # Final gate generale (fail-closed): per task software che chiudono SENZA
+    # plan_phase (il verifier non gira), un gate minimo verifica che il codice
+    # importato non resti orfano (app placeholder). Indipendente dal planner.
+    if not state.get("plan_phase_active"):
+        try:
+            from . import orchestrator_config, final_gate as _fg
+            _cfg = orchestrator_config.get()
+            if _cfg.get("final_gate_enabled") and _fg._is_software_task(state, _cfg):
+                _fc = int(state.get("final_gate_cycle", 0) or 0)
+                if _fc < int(_cfg["final_gate_max_cycles"]):
+                    logger.info("route_after_executor: software task end_turn senza plan -> final_gate")
+                    return "final_gate"
+        except Exception as _e:
+            logger.debug("route_after_executor: final_gate skip (%s)", _e)
     return "learner"
 
 
