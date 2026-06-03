@@ -170,6 +170,108 @@ fn systemctl_user() -> tokio::process::Command {
     cmd
 }
 
+/// Marcatori che indicano l'assenza del manager `systemd --user`.
+/// Tipicamente in WSL o in container senza `user@UID.service` attivo.
+fn systemd_bus_unavailable(text: &str) -> bool {
+    let t = text.to_lowercase();
+    t.contains("failed to connect to bus")
+        || t.contains("connection refused")
+        || t.contains("no such file or directory")
+        || t.contains("host is down")
+}
+
+/// Verifica se il manager `systemd --user` risponde.
+///
+/// Esegue `systemctl --user is-system-running`: in un ambiente con user manager
+/// attivo ritorna `running`/`degraded`/`starting` (anche con exit code != 0 nel
+/// caso `degraded`, ma il bus risponde). In WSL senza user manager il comando
+/// stampa "Failed to connect to bus: Connection refused" su stderr.
+///
+/// Default conservativo: in caso di dubbio (errore di spawn, output ambiguo)
+/// ritorna `false` -> si va in fallback detached, che e' sempre sicuro.
+async fn systemd_user_available() -> bool {
+    match systemctl_user()
+        .args(["--user", "is-system-running"])
+        .output()
+        .await
+    {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if systemd_bus_unavailable(&stderr) || systemd_bus_unavailable(&stdout) {
+                return false;
+            }
+            // Il manager risponde: stdout contiene uno stato noto.
+            let s = stdout.trim();
+            matches!(
+                s,
+                "running" | "degraded" | "starting" | "initializing" | "stopping" | "maintenance"
+            )
+        }
+        Err(_) => false,
+    }
+}
+
+/// Avvia il comando del servizio come processo detached persistente, scollegato
+/// dal ciclo di vita di mcp-core. Usato come fallback quando `systemd --user`
+/// non e' disponibile (es. WSL senza user manager).
+///
+/// Pattern collaudato nel repo (vedi `task_watchdog::try_restart_gateway`):
+/// `setsid nohup ... > LOGFILE 2>&1 < /dev/null &`. `setsid` crea una nuova
+/// sessione: il figlio non riceve SIGTERM/SIGHUP quando mcp-core termina.
+///
+/// Idempotenza best-effort: prima di avviare, termina un eventuale processo
+/// detached precedente che esegua lo stesso `exec_start` (match su pattern).
+///
+/// Ritorna `Ok(logfile)` in caso di spawn riuscito, `Err(msg)` se lo spawn
+/// stesso fallisce (in tal caso il chiamante deve ritornare ok:false).
+async fn spawn_detached_service(
+    unit_name: &str,
+    cwd: &str,
+    env_map: &std::collections::HashMap<String, String>,
+    exec_start: &str,
+) -> Result<String, String> {
+    let logfile = format!("/tmp/nexus-proj-{}.log", unit_name);
+
+    // Idempotenza best-effort: termina un eventuale detached precedente che
+    // gira lo stesso comando. pkill -f match sull'exec_start (non bloccante).
+    let _ = tokio::process::Command::new("pkill")
+        .args(["-f", exec_start])
+        .output()
+        .await;
+
+    // Stringa env in stile `KEY='val' KEY2='val2'` (quoting singolo, escape ').
+    let env_str: String = env_map
+        .iter()
+        .map(|(k, v)| format!("{}='{}' ", k, v.replace('\'', "'\\''")))
+        .collect();
+
+    // setsid nohup env <ENV> bash -lc 'exec <CMD>' > LOG 2>&1 < /dev/null &
+    let shell = format!(
+        "cd '{}' && setsid nohup env {}bash -lc 'exec {}' > '{}' 2>&1 < /dev/null &",
+        cwd.replace('\'', "'\\''"),
+        env_str,
+        exec_start.replace('\'', "'\\''"),
+        logfile,
+    );
+
+    match tokio::process::Command::new("/bin/sh")
+        .args(["-c", &shell])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => Ok(logfile),
+        Ok(out) => Err(format!(
+            "spawn detached fallito: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Err(format!("spawn detached: shell exec fallito: {}", e)),
+    }
+}
+
 // ── Wizard ────────────────────────────────────────────────────────────────────
 
 /// Analizza il filesystem del progetto e suggerisce definizioni di servizi systemd.
@@ -805,15 +907,9 @@ pub async fn wizard_install_service(
         }
     }
 
-    // daemon-reload + enable
-    let _ = systemctl_user()
-        .args(["--user", "daemon-reload"]).output().await;
-    let enable_out = systemctl_user()
-        .args(["--user", "enable", &unit_name]).output().await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
     // Registra le porte del servizio nel port_registry (mig 0114).
     // Estrae le porte dal contenuto unit appena scritto e le registra come "auto".
+    // Indipendente dalla strategia di avvio (systemd o detached).
     let detected_ports = services::extract_ports_from_unit(&unit_content);
     for p in &detected_ports {
         // Ignora errori di registrazione (es. porta gia' allocata) — non blocca l'install
@@ -824,16 +920,59 @@ pub async fn wizard_install_service(
         }
     }
 
-    let ok = enable_out.status.success();
-    if !ok {
-        let stderr = String::from_utf8_lossy(&enable_out.stderr);
-        let stdout = String::from_utf8_lossy(&enable_out.stdout);
-        tracing::warn!(
+    // ── Strategia di avvio ──────────────────────────────────────────────────
+    // Se il manager `systemd --user` risponde: daemon-reload + enable --now (avvio
+    // reale, persistente al riavvio). Altrimenti (es. WSL senza user manager):
+    // fallback detached. In entrambi i casi la unit file e' gia' stata scritta,
+    // utile per quando systemd --user diventera' disponibile.
+    let ok: bool;
+    let mode: &str;
+    let mut warning: Option<String> = None;
+
+    if systemd_user_available().await {
+        mode = "systemd";
+        let _ = systemctl_user()
+            .args(["--user", "daemon-reload"]).output().await;
+        // enable --now: abilita all'avvio E avvia subito (prima si faceva solo
+        // `enable`, quindi il servizio non partiva).
+        let enable_out = systemctl_user()
+            .args(["--user", "enable", "--now", &unit_name]).output().await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        ok = enable_out.status.success();
+        if !ok {
+            let stderr = String::from_utf8_lossy(&enable_out.stderr);
+            let stdout = String::from_utf8_lossy(&enable_out.stdout);
+            tracing::warn!(
+                unit = %unit_name,
+                stderr = %stderr,
+                stdout = %stdout,
+                "systemctl --user enable --now fallito"
+            );
+        }
+    } else {
+        mode = "detached_fallback";
+        tracing::info!(
             unit = %unit_name,
-            stderr = %stderr,
-            stdout = %stdout,
-            "systemctl --user enable fallito"
+            "systemd --user non disponibile: avvio servizio in modalita' detached"
         );
+        match spawn_detached_service(&unit_name, cwd, &env_map, &exec_start).await {
+            Ok(logfile) => {
+                ok = true;
+                warning = Some(format!(
+                    "systemd --user non e' attivo in questo ambiente (es. WSL senza user manager): \
+                     il servizio e' stato avviato in modalita' diretta (non persistente al riavvio \
+                     del sistema). La unit e' stata salvata in ~/.config/systemd/user/ per quando \
+                     systemd --user sara' disponibile. Log: {}",
+                    logfile
+                ));
+            }
+            Err(e) => {
+                // Lo spawn detached stesso e' fallito: errore reale, ok:false.
+                ok = false;
+                warning = Some(format!("Avvio detached fallito: {}", e));
+                tracing::warn!(unit = %unit_name, error = %e, "spawn detached fallito");
+            }
+        }
     }
 
     // ── Auto-setup ambiente: installa dipendenze per qualsiasi framework ────────
@@ -848,6 +987,8 @@ pub async fn wizard_install_service(
         "content":   unit_content,
         "cleaned":   cleaned,
         "setup_log": setup_log,
+        "mode":      mode,
+        "warning":   warning,
     })))
 }
 
@@ -1567,4 +1708,40 @@ pub(super) fn detect_dotnet_suggestions(root: &std::path::Path) -> Vec<Value> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rileva_bus_non_disponibile_connection_refused() {
+        // Output tipico di WSL senza user manager.
+        assert!(systemd_bus_unavailable(
+            "Failed to connect to bus: Connection refused"
+        ));
+    }
+
+    #[test]
+    fn rileva_bus_non_disponibile_case_insensitive() {
+        assert!(systemd_bus_unavailable("FAILED TO CONNECT TO BUS"));
+        assert!(systemd_bus_unavailable("connection refused"));
+    }
+
+    #[test]
+    fn rileva_bus_non_disponibile_no_such_file() {
+        // XDG_RUNTIME_DIR/bus inesistente.
+        assert!(systemd_bus_unavailable(
+            "Failed to connect to bus: No such file or directory"
+        ));
+    }
+
+    #[test]
+    fn stato_running_non_e_errore_bus() {
+        // Output normale di un manager attivo non deve essere classificato
+        // come bus non disponibile.
+        assert!(!systemd_bus_unavailable("running"));
+        assert!(!systemd_bus_unavailable("degraded"));
+        assert!(!systemd_bus_unavailable(""));
+    }
 }
