@@ -65,6 +65,7 @@ mod catalog_sync_worker;
 mod deepseek_balance_sync;
 mod routing_matrix_auto_promoter;
 mod dispatcher_routes;
+mod services_watchdog;
 mod task_watchdog;
 mod knowledge_workers;
 mod knowledge_watcher;
@@ -803,6 +804,12 @@ async fn main() -> anyhow::Result<()> {
         state.dependency_status.clone(),
         state.agent_channels.clone(),
     );
+
+    // Worker `services_watchdog`: in dev/WSL (senza systemd Restart=on-failure)
+    // monitora i microservizi Nexus (brain, gateway, *-service, web-ide) via TCP
+    // probe e li riavvia se cadono. Config DB-driven (agent.watchdog.*, mig 0272),
+    // gating runtime via agent.watchdog.enabled. mcp-core escluso (ospita il loop).
+    services_watchdog::spawn_services_watchdog(state.db.clone());
 
     // Worker `catalog_sync`: aggiorna periodicamente ai_price_catalog dal
     // JSON LiteLLM. Cadenza configurabile via settings.model_catalog_sync_interval_s
