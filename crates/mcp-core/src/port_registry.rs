@@ -437,6 +437,57 @@ impl PortRegistryCache {
     }
 }
 
+/// Rilascia le allocazioni porta "dynamic"/"auto" (non systemd) ORFANE: oltre la
+/// grace period e SENZA alcun listener TCP. Sono i residui dei tentativi falliti
+/// degli agenti (es. `pnpm dev` su porte diverse) che il recovery systemd non
+/// pulisce. Ritorna il numero di allocazioni rilasciate.
+pub async fn cleanup_orphaned_ports(db: &PgPool, grace_secs: i64) -> u64 {
+    let grace = grace_secs.max(60);
+    let rows: Vec<(Uuid, i32)> = sqlx::query_as(
+        "SELECT project_id, port FROM nexus_port_allocations \
+         WHERE service_unit IS NULL AND created_at < NOW() - make_interval(secs => $1)",
+    )
+    .bind(grace as f64)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    let mut released = 0u64;
+    for (project_id, port) in rows {
+        let p = port as u16;
+        // Se qualcuno ascolta sulla porta, e' in uso: non la tocchiamo.
+        if crate::project_workspace::port_recovery::tcp_probe(p, 200).await {
+            continue;
+        }
+        let n = sqlx::query(
+            "DELETE FROM nexus_port_allocations \
+             WHERE project_id = $1 AND port = $2 AND service_unit IS NULL",
+        )
+        .bind(project_id)
+        .bind(port)
+        .execute(db)
+        .await
+        .map(|r| r.rows_affected())
+        .unwrap_or(0);
+        released += n;
+    }
+    if released > 0 {
+        info!("port_gc: rilasciate {released} allocazioni orfane (nessun listener)");
+    }
+    released
+}
+
+/// Worker periodico di garbage-collection delle porte orfane. `interval_secs` e
+/// `grace_secs` sono passati dal chiamante (DB-driven).
+pub async fn port_gc_loop(db: PgPool, interval_secs: u64, grace_secs: i64) {
+    let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(30)));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        cleanup_orphaned_ports(&db, grace_secs).await;
+    }
+}
+
 /// Estrae le porte da un contenuto di file .service (replica semplificata
 /// di `extract_ports_from_unit` in services.rs per evitare dipendenze circolari).
 fn extract_ports_from_unit_content(content: &str) -> Vec<u16> {

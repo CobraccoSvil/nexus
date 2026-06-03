@@ -493,6 +493,27 @@ async fn main() -> anyhow::Result<()> {
     let port_registry_cache = port_registry::PortRegistryCache::init(db.clone()).await;
     // Recovery: sincronizza registro con file .service esistenti su disco.
     port_registry_cache.startup_recovery().await;
+    // GC periodico: rilascia le allocazioni porta dynamic orfane (nessun
+    // listener, oltre la grace period) lasciate dai tentativi falliti degli
+    // agenti. Intervallo/grace DB-driven con default sicuri.
+    {
+        let db_gc = db.clone();
+        let gc_interval = settings::get_setting(&db, "agent.port_gc.interval_seconds")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(120);
+        let gc_grace = settings::get_setting(&db, "agent.port_gc.grace_seconds")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(180);
+        tokio::spawn(async move {
+            port_registry::port_gc_loop(db_gc, gc_interval, gc_grace).await;
+        });
+    }
 
     // Pre-creazione collection Qdrant globali (best-effort, async).
     // La collection `knowledge_notes` deve esistere prima del primo search/upsert.

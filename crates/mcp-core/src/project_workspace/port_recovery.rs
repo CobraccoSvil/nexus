@@ -34,6 +34,46 @@ pub async fn tcp_probe(port: u16, timeout_ms: u64) -> bool {
     )
 }
 
+/// Legge il process group id (PGID) di `pid` da /proc/{pid}/stat (campo `pgrp`,
+/// il 3° dopo la `)` che chiude `comm`). None se non leggibile.
+async fn read_pgid(pid: u32) -> Option<u32> {
+    let stat = tokio::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .await
+        .ok()?;
+    // Formato: "pid (comm) state ppid pgrp ...". `comm` puo' contenere spazi e
+    // parentesi, quindi si parte da dopo l'ULTIMA ')'.
+    let after = stat.rsplit_once(')')?.1;
+    let mut fields = after.split_whitespace();
+    let _state = fields.next()?;
+    let _ppid = fields.next()?;
+    fields.next()?.parse::<u32>().ok()
+}
+
+/// Termina l'intero PROCESS GROUP di `pid` (SIGTERM, poi SIGKILL dopo 500ms se
+/// ancora vivo). Cosi' una catena `pnpm dev -> node -> vite` viene fermata per
+/// intero e il processo padre non rilancia il figlio che reggeva il listener
+/// (causa per cui un kill del solo PID lasciava la porta occupata). Fallback al
+/// solo `pid` se il PGID non e' leggibile.
+async fn kill_process_tree(pid: u32) {
+    let target = match read_pgid(pid).await {
+        // Il `-` davanti al PGID dice a kill(1) di colpire l'intero gruppo.
+        Some(pgid) if pgid > 1 => format!("-{pgid}"),
+        _ => pid.to_string(),
+    };
+    let _ = tokio::process::Command::new("kill")
+        .args(["-TERM", &target])
+        .output()
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        let _ = tokio::process::Command::new("kill")
+            .args(["-KILL", &target])
+            .output()
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Lista (port, pid, program) in ascolto. Usa `ss` se disponibile, fallback /proc.
 pub async fn listening_ports() -> Vec<(u16, u32, String)> {
     if let Ok(v) = read_listening_ports_ss().await {
@@ -63,20 +103,9 @@ pub async fn try_free_port(port: u16) -> bool {
             port,
             pid,
             program = %program,
-            "try_free_port: invio SIGTERM a PID estraneo che occupa porta richiesta"
+            "try_free_port: termino il process group del PID che occupa la porta"
         );
-        let _ = tokio::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output()
-            .await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        if std::path::Path::new(&format!("/proc/{pid}")).exists() {
-            let _ = tokio::process::Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .output()
-                .await;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        kill_process_tree(pid).await;
     }
 
     tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
@@ -150,19 +179,9 @@ pub async fn kill_bucket_orphans(db: &PgPool, project_id: Uuid) -> Vec<u32> {
         }
         tracing::warn!(
             project_id = %project_id, port, pid, program = %program,
-            "kill_bucket_orphans: termino orfano del bucket"
+            "kill_bucket_orphans: termino il process group dell'orfano del bucket"
         );
-        let _ = tokio::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output()
-            .await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        if std::path::Path::new(&format!("/proc/{pid}")).exists() {
-            let _ = tokio::process::Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .output()
-                .await;
-        }
+        kill_process_tree(pid).await;
         killed.push(pid);
     }
     killed
