@@ -341,31 +341,13 @@ fn recover_content_json(window: &str) -> Option<String> {
 /// Applica un oggetto outer (gia' parsato) di tipo scrittura file allo
 /// snapshot, condividendo la logica con `extract_make_code_snapshot`.
 fn apply_outer_tool_write(snap: &mut CodeSnapshot, outer: &Value) {
-    let tool_name = outer.get("toolName").and_then(Value::as_str).unwrap_or("");
-    if !FILE_WRITE_TOOL_NAMES.contains(&tool_name) {
-        return;
-    }
-    let Some(result_str) = outer.get("resultJson").and_then(Value::as_str) else {
-        return;
-    };
-    let Ok(result) = serde_json::from_str::<Value>(result_str) else {
-        return;
-    };
-    if let Some(false) = result.get("success").and_then(Value::as_bool) {
-        return;
-    }
-    let content = result.get("content").and_then(Value::as_str).unwrap_or("");
-    if content.trim().is_empty() {
-        return;
-    }
-    let message = result.get("message").and_then(Value::as_str).unwrap_or("");
-    let Some(raw_path) = parse_path_from_message(message) else {
+    let Some((raw_path, content)) = extract_write_from_outer(outer) else {
         return;
     };
     let Some(norm_path) = normalize_snapshot_path(&raw_path) else {
         return;
     };
-    snap.files.insert(norm_path, content.to_string());
+    snap.files.insert(norm_path, content);
 }
 
 /// Risultato della pipeline ZIP scan: indici delle entry chiave.
@@ -665,13 +647,32 @@ const FILE_WRITE_TOOL_NAMES: &[&str] = &[
 
 /// Estrae il path dal campo `message` tipo
 /// "Successfully updated the file at /src/app/X.tsx." -> "/src/app/X.tsx".
-/// Ritorna `None` se il pattern non c'e' o il path appare sporco.
+/// Riconosce piu' marker emessi dai tool Figma Make:
+/// "file at ", "created file ", "rewrote file ", "updated file ", "wrote file ".
+/// Ritorna `None` se nessun pattern e' presente o il path appare sporco.
 fn parse_path_from_message(message: &str) -> Option<String> {
-    // Cerca "file at " (case-insensitive sul prefisso comune).
+    // Marker noti (case-insensitive). "file at " resta prioritario per
+    // compatibilita' col formato fast_apply_tool gia' gestito.
+    const MARKERS: &[&str] = &[
+        "file at ",
+        "created file ",
+        "rewrote file ",
+        "updated file ",
+        "wrote file ",
+    ];
     let lower = message.to_lowercase();
-    let marker = "file at ";
-    let pos = lower.find(marker)?;
-    let after = &message[pos + marker.len()..];
+    // Scegli il marker il cui contenuto-path inizia per primo nel messaggio.
+    let mut after_end: Option<usize> = None;
+    for marker in MARKERS {
+        if let Some(pos) = lower.find(marker) {
+            let end = pos + marker.len();
+            if after_end.is_none_or(|b| end < b) {
+                after_end = Some(end);
+            }
+        }
+    }
+    let after_pos = after_end?;
+    let after = &message[after_pos..];
     // Il path termina al primo newline; togliamo eventuale punto finale e spazi.
     let raw = after.lines().next().unwrap_or(after).trim();
     let raw = raw.trim_end_matches('.').trim();
@@ -689,6 +690,59 @@ fn parse_path_from_message(message: &str) -> Option<String> {
         return None;
     }
     Some(raw.to_string())
+}
+
+/// Estrae `(raw_path, content)` da un oggetto outer (gia' parsato) che
+/// rappresenta una scrittura file in un thread Figma Make. Tenta in ordine:
+///
+/// - **Formato A** (`fast_apply_tool`, `edit_tool`): outer ha `resultJson`
+///   (stringa JSON) = `{success, message, content}`; path dal `message`,
+///   contenuto da `content`.
+/// - **Formato B** (`write_tool`, `create_file_tool`): outer NON ha
+///   `resultJson` ma `argsJson` (stringa JSON) = `{path, file_text}`.
+///
+/// La normalizzazione del path resta a carico del chiamante.
+fn extract_write_from_outer(outer: &Value) -> Option<(String, String)> {
+    let tool_name = outer.get("toolName").and_then(Value::as_str).unwrap_or("");
+    if !FILE_WRITE_TOOL_NAMES.contains(&tool_name) {
+        return None;
+    }
+
+    // Formato A: resultJson.{success, message, content}.
+    if let Some(result_str) = outer.get("resultJson").and_then(Value::as_str) {
+        if let Ok(result) = serde_json::from_str::<Value>(result_str) {
+            // success: se presente deve essere true; se assente, tolleriamo.
+            let not_failed = result.get("success").and_then(Value::as_bool) != Some(false);
+            if not_failed {
+                let content = result.get("content").and_then(Value::as_str).unwrap_or("");
+                let message = result.get("message").and_then(Value::as_str).unwrap_or("");
+                if !content.trim().is_empty() {
+                    if let Some(raw_path) = parse_path_from_message(message) {
+                        return Some((raw_path, content.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Formato B: argsJson.{path|file|filename, file_text|content|text}.
+    if let Some(args_str) = outer.get("argsJson").and_then(Value::as_str) {
+        if let Ok(args) = serde_json::from_str::<Value>(args_str) {
+            let raw_path = ["path", "file", "filename"]
+                .iter()
+                .filter_map(|k| args.get(*k).and_then(Value::as_str))
+                .find(|s| !s.trim().is_empty());
+            let content = ["file_text", "content", "text"]
+                .iter()
+                .filter_map(|k| args.get(*k).and_then(Value::as_str))
+                .find(|s| !s.trim().is_empty());
+            if let (Some(raw_path), Some(content)) = (raw_path, content) {
+                return Some((raw_path.to_string(), content.to_string()));
+            }
+        }
+    }
+
+    None
 }
 
 /// Normalizza un path: rimuove leading "/" e backslash, mantiene la struttura
@@ -737,34 +791,16 @@ fn extract_make_code_snapshot(ai_chat: &Value, ai_chat_truncated: bool) -> CodeS
                 let Ok(outer) = serde_json::from_str::<Value>(content_json) else {
                     continue;
                 };
-                let tool_name = outer.get("toolName").and_then(Value::as_str).unwrap_or("");
-                if !FILE_WRITE_TOOL_NAMES.contains(&tool_name) {
-                    continue;
-                }
-                // resultJson e' anch'esso una STRINGA con JSON dentro.
-                let Some(result_str) = outer.get("resultJson").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Ok(result) = serde_json::from_str::<Value>(result_str) else {
-                    continue;
-                };
-                // success: se presente deve essere true; se assente, tolleriamo.
-                if let Some(false) = result.get("success").and_then(Value::as_bool) {
-                    continue;
-                }
-                let content = result.get("content").and_then(Value::as_str).unwrap_or("");
-                if content.trim().is_empty() {
-                    continue;
-                }
-                let message = result.get("message").and_then(Value::as_str).unwrap_or("");
-                let Some(raw_path) = parse_path_from_message(message) else {
+                // Estrai (path, content) provando Formato A (resultJson) poi
+                // Formato B (argsJson). La normalizzazione resta qui.
+                let Some((raw_path, content)) = extract_write_from_outer(&outer) else {
                     continue;
                 };
                 let Some(norm_path) = normalize_snapshot_path(&raw_path) else {
                     continue;
                 };
                 // L'ultima occorrenza vince (insert sovrascrive).
-                snap.files.insert(norm_path, content.to_string());
+                snap.files.insert(norm_path, content);
             }
         }
     }
@@ -1302,6 +1338,43 @@ mod tests {
         );
         assert!(parse_path_from_message("Successfully updated the file at /src/X.tsx Make sure to fall back").is_none());
         assert!(parse_path_from_message("nothing here").is_none());
+    }
+
+    #[test]
+    fn parse_path_from_message_recognizes_created_file_marker() {
+        assert_eq!(
+            parse_path_from_message("Successfully created file /src/app/Y.tsx").as_deref(),
+            Some("/src/app/Y.tsx")
+        );
+        assert_eq!(
+            parse_path_from_message("Successfully rewrote file /src/app/Z.tsx.").as_deref(),
+            Some("/src/app/Z.tsx")
+        );
+        assert_eq!(
+            parse_path_from_message("wrote file /src/main.ts").as_deref(),
+            Some("/src/main.ts")
+        );
+    }
+
+    #[test]
+    fn extract_make_snapshot_handles_format_b_argsjson() {
+        // Formato B: write_tool con argsJson (path + file_text), nessun resultJson.
+        let outer = r#"{"toolName":"write_tool","argsJson":"{\"path\":\"/src/app/X.tsx\",\"file_text\":\"export const X = 1;\"}"}"#;
+        let body = format!(
+            r#"{{"threads":[{{"messages":[
+                {{"role":"assistant","parts":[
+                    {{"partType":"text","contentJson":{}}}
+                ]}}
+            ]}}]}}"#,
+            serde_json::to_string(outer).unwrap()
+        );
+        let root: Value = serde_json::from_str(&body).expect("ai_chat valido");
+        let snap = extract_make_code_snapshot(&root, false);
+        assert_eq!(
+            snap.files.get("src/app/X.tsx").map(String::as_str),
+            Some("export const X = 1;"),
+            "il file scritto con write_tool (Formato B) deve essere estratto"
+        );
     }
 
     #[test]
