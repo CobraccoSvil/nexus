@@ -129,16 +129,41 @@ pub(super) async fn tool_nexus_extract_figma_code(
     };
 
     if snapshot.files.is_empty() {
+        let empty_samples: Vec<Value> = snapshot
+            .unrecognized
+            .iter()
+            .map(|u| json!({ "tool_name": u.tool_name, "outer_keys": u.outer_keys }))
+            .collect();
+        let mut empty_notes = String::from(
+            "Nessuna scrittura file (fast_apply_tool/write_tool) trasformata in \
+             (path, content) nel thread ai_chat.json: questo .make non contiene un \
+             code-snapshot ricostruibile. Usa nexus_extract_figma_structure per la \
+             specifica chat e implementa l'app dalla descrizione.",
+        );
+        if snapshot.unrecognized_total > 0 {
+            let sample = snapshot.unrecognized.first();
+            let tool_hint = sample.map(|u| u.tool_name.as_str()).unwrap_or("?");
+            let keys_hint = sample.map(|u| u.outer_keys.join(",")).unwrap_or_default();
+            empty_notes.push_str(&format!(
+                " ATTENZIONE: {} scritture file con toolName noto ma formato sconosciuto \
+                 (toolName={}, campi=[{}]): l'estrattore non le ha sapute leggere. \
+                 Ispeziona manualmente questi tool nel .make o aggiorna l'estrattore.",
+                snapshot.unrecognized_total, tool_hint, keys_hint
+            ));
+        }
         return json!({
             "format": "figma_make_code",
             "total_files": 0,
             "files_written": [],
             "target_dir": target_subdir,
             "partial": snapshot.partial,
-            "notes": "Nessuna scrittura file (fast_apply_tool/write_tool) trovata nel \
-                      thread ai_chat.json: questo .make non contiene un code-snapshot \
-                      ricostruibile. Usa nexus_extract_figma_structure per la specifica \
-                      chat e implementa l'app dalla descrizione.",
+            "extraction_residuals": json!({
+                "write_attempts": snapshot.write_attempts,
+                "recognized": snapshot.recognized,
+                "unrecognized": snapshot.unrecognized_total,
+                "unrecognized_samples": empty_samples,
+            }),
+            "notes": empty_notes,
         })
         .to_string();
     }
@@ -216,6 +241,34 @@ pub(super) async fn tool_nexus_extract_figma_code(
         );
     }
 
+    // Telemetria estrazione: scritture non riconosciute = file potenzialmente
+    // persi. Le dichiariamo nel manifest (loud on residuals) cosi' un formato
+    // ignoto e' visibile invece di sparire in silenzio.
+    let unrecognized_samples: Vec<Value> = snapshot
+        .unrecognized
+        .iter()
+        .map(|u| json!({ "tool_name": u.tool_name, "outer_keys": u.outer_keys }))
+        .collect();
+    let extraction_residuals = json!({
+        "write_attempts": snapshot.write_attempts,
+        "recognized": snapshot.recognized,
+        "unrecognized": snapshot.unrecognized_total,
+        "unrecognized_samples": unrecognized_samples,
+    });
+    if snapshot.unrecognized_total > 0 {
+        let sample = snapshot.unrecognized.first();
+        let tool_hint = sample.map(|u| u.tool_name.as_str()).unwrap_or("?");
+        let keys_hint = sample
+            .map(|u| u.outer_keys.join(","))
+            .unwrap_or_default();
+        notes.push_str(&format!(
+            " ATTENZIONE: {} scritture file non riconosciute (formato sconosciuto: \
+             toolName={}, campi=[{}]). Il code-snapshot potrebbe essere INCOMPLETO: \
+             ispeziona manualmente questi tool nel .make o aggiorna l'estrattore.",
+            snapshot.unrecognized_total, tool_hint, keys_hint
+        ));
+    }
+
     json!({
         "format": "figma_make_code",
         "files_written": files_written,
@@ -225,6 +278,7 @@ pub(super) async fn tool_nexus_extract_figma_code(
         "entrypoints": entrypoints,
         "detected_dependencies": detected_dependencies,
         "partial": partial,
+        "extraction_residuals": extraction_residuals,
         "notes": notes,
     })
     .to_string()
@@ -341,13 +395,12 @@ fn recover_content_json(window: &str) -> Option<String> {
 /// Applica un oggetto outer (gia' parsato) di tipo scrittura file allo
 /// snapshot, condividendo la logica con `extract_make_code_snapshot`.
 fn apply_outer_tool_write(snap: &mut CodeSnapshot, outer: &Value) {
-    let Some((raw_path, content)) = extract_write_from_outer(outer) else {
+    let tool_name = outer.get("toolName").and_then(Value::as_str).unwrap_or("");
+    if !FILE_WRITE_TOOL_NAMES.contains(&tool_name) {
         return;
-    };
-    let Some(norm_path) = normalize_snapshot_path(&raw_path) else {
-        return;
-    };
-    snap.files.insert(norm_path, content);
+    }
+    let extracted = extract_write_from_outer(outer);
+    snap.record_write(outer, extracted);
 }
 
 /// Risultato della pipeline ZIP scan: indici delle entry chiave.
@@ -633,6 +686,74 @@ struct CodeSnapshot {
     /// true se il parsing si e' fermato perche' ai_chat era troncato al load
     /// o per limiti: il manifest segnala il risultato come parziale.
     partial: bool,
+    /// Telemetria estrazione (best-practice "tolerant reader, loud on
+    /// residuals"): quante part avevano un `toolName` in
+    /// `FILE_WRITE_TOOL_NAMES`.
+    write_attempts: usize,
+    /// Quante di quelle part hanno prodotto un `(path, content)` valido.
+    recognized: usize,
+    /// Scritture con `toolName` noto ma formato outer non trasformabile in
+    /// `(path, content)`: contate qui per non sparire in silenzio. Il vettore
+    /// e' limitato ai primi campioni (vedi `UNRECOGNIZED_SAMPLES_CAP`) ma il
+    /// conteggio totale resta in `unrecognized_total`.
+    unrecognized: Vec<UnrecognizedWrite>,
+    /// Conteggio totale delle scritture non riconosciute (anche oltre il cap
+    /// dei campioni in `unrecognized`).
+    unrecognized_total: usize,
+}
+
+/// Numero massimo di campioni di scritture non riconosciute conservati in
+/// `CodeSnapshot::unrecognized` (il conteggio totale non e' limitato).
+const UNRECOGNIZED_SAMPLES_CAP: usize = 20;
+
+/// Campione diagnostico di una scrittura file con `toolName` noto ma formato
+/// outer ignoto: registra il tool e le chiavi top-level dell'outer JSON per
+/// poter riconoscere e supportare un formato futuro.
+#[derive(Default, Clone)]
+struct UnrecognizedWrite {
+    /// Valore di `toolName` dell'outer (es. "write_tool").
+    tool_name: String,
+    /// Chiavi top-level dell'outer JSON (es. ["toolCallId","toolName","argsJson"]).
+    outer_keys: Vec<String>,
+}
+
+impl CodeSnapshot {
+    /// Registra una scrittura file con `toolName` noto: aggiorna i contatori e,
+    /// se l'outer non e' trasformabile, conserva un campione diagnostico.
+    fn record_write(&mut self, outer: &Value, extracted: Option<(String, String)>) {
+        self.write_attempts += 1;
+        match extracted {
+            Some((raw_path, content)) => {
+                if let Some(norm_path) = normalize_snapshot_path(&raw_path) {
+                    self.recognized += 1;
+                    self.files.insert(norm_path, content);
+                } else {
+                    self.note_unrecognized(outer);
+                }
+            }
+            None => self.note_unrecognized(outer),
+        }
+    }
+
+    /// Conta una scrittura non riconosciuta e ne salva un campione se sotto cap.
+    fn note_unrecognized(&mut self, outer: &Value) {
+        self.unrecognized_total += 1;
+        if self.unrecognized.len() < UNRECOGNIZED_SAMPLES_CAP {
+            let tool_name = outer
+                .get("toolName")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let outer_keys = outer
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            self.unrecognized.push(UnrecognizedWrite {
+                tool_name,
+                outer_keys,
+            });
+        }
+    }
 }
 
 /// `toolName` noti che rappresentano una scrittura file con `resultJson.content`.
@@ -791,16 +912,18 @@ fn extract_make_code_snapshot(ai_chat: &Value, ai_chat_truncated: bool) -> CodeS
                 let Ok(outer) = serde_json::from_str::<Value>(content_json) else {
                     continue;
                 };
+                // Conta solo le part che dichiarano un toolName di scrittura
+                // file: gli altri part (testo, immagini, ...) non sono residui.
+                let tool_name = outer.get("toolName").and_then(Value::as_str).unwrap_or("");
+                if !FILE_WRITE_TOOL_NAMES.contains(&tool_name) {
+                    continue;
+                }
                 // Estrai (path, content) provando Formato A (resultJson) poi
-                // Formato B (argsJson). La normalizzazione resta qui.
-                let Some((raw_path, content)) = extract_write_from_outer(&outer) else {
-                    continue;
-                };
-                let Some(norm_path) = normalize_snapshot_path(&raw_path) else {
-                    continue;
-                };
-                // L'ultima occorrenza vince (insert sovrascrive).
-                snap.files.insert(norm_path, content);
+                // Formato B (argsJson). `record_write` aggiorna telemetria,
+                // normalizza il path e fa l'insert (l'ultima occorrenza vince),
+                // oppure registra un residuo non riconosciuto.
+                let extracted = extract_write_from_outer(&outer);
+                snap.record_write(&outer, extracted);
             }
         }
     }
@@ -1290,6 +1413,56 @@ mod tests {
         assert!(app.contains("Routes"), "deve vincere la v2 (write_tool)");
         assert!(snap.files.contains_key("src/app/pages/BookingPage.tsx"));
         assert!(!snap.partial);
+    }
+
+    #[test]
+    fn extract_snapshot_counts_unrecognized_residuals() {
+        // Part A: write riconosciuto via argsJson (Formato B).
+        let recognized_outer = serde_json::json!({
+            "toolCallId": "tc-ok",
+            "toolName": "write_tool",
+            "argsJson": serde_json::json!({
+                "path": "/src/app/Ok.tsx",
+                "file_text": "export const Ok = () => null;",
+            })
+            .to_string(),
+        })
+        .to_string();
+        let p_ok = serde_json::json!({ "contentJson": recognized_outer }).to_string();
+
+        // Part B: toolName noto ma nessun resultJson/argsJson utilizzabile
+        // (formato ignoto) -> deve finire tra gli unrecognized.
+        let unknown_outer = serde_json::json!({
+            "toolCallId": "tc-bad",
+            "toolName": "fast_apply_tool",
+            "weirdField": { "nested": 1 },
+        })
+        .to_string();
+        let p_bad = serde_json::json!({ "contentJson": unknown_outer }).to_string();
+
+        let body = format!(
+            r#"{{"threads":[{{"messages":[
+                {{"parts":[{p_ok}]}},
+                {{"parts":[{p_bad}]}}
+            ]}}]}}"#
+        );
+        let root: Value = serde_json::from_str(&body).expect("ai_chat valido");
+        let snap = extract_make_code_snapshot(&root, false);
+
+        assert_eq!(snap.write_attempts, 2, "due part con toolName di scrittura");
+        assert_eq!(snap.recognized, 1, "solo Ok.tsx riconosciuto");
+        assert_eq!(snap.unrecognized_total, 1, "una scrittura ignota");
+        assert_eq!(snap.unrecognized.len(), 1, "un campione conservato");
+        assert!(snap.files.contains_key("src/app/Ok.tsx"));
+
+        let sample = &snap.unrecognized[0];
+        assert_eq!(sample.tool_name, "fast_apply_tool");
+        assert!(
+            sample.outer_keys.contains(&"toolName".to_string())
+                && sample.outer_keys.contains(&"weirdField".to_string()),
+            "outer_keys deve riportare le chiavi top-level: {:?}",
+            sample.outer_keys
+        );
     }
 
     #[test]
