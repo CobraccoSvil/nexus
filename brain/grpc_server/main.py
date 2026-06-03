@@ -389,10 +389,8 @@ def _get_agent_router_client() -> object | None:
 
 def _get_tool_runner_client() -> object | None:
     """Singleton `ToolRunnerClient`: usato dal nodo `tool_dispatch` per
-    eseguire i tool contro mcp-core. Se la variabile d'ambiente
-    `TOOL_RUNNER_ADDR` non e' impostata (o `DISABLE_TOOL_RUNNER=1`) il
-    client non viene istanziato e il grafo torna in modalita' legacy
-    single-shot + interrupt_before=[executor].
+    eseguire i tool contro mcp-core. Disabilitabile con `DISABLE_TOOL_RUNNER=1`;
+    altrimenti il client viene sempre istanziato risolvendo l'indirizzo dal DB.
     """
     global _tool_runner_client
     if os.environ.get("DISABLE_TOOL_RUNNER") == "1":
@@ -400,9 +398,17 @@ def _get_tool_runner_client() -> object | None:
     if _tool_runner_client is None:
         try:
             from brain.grpc_clients.tool_runner_client import ToolRunnerClient
-            addr = os.environ.get("TOOL_RUNNER_ADDR", "127.0.0.1:50071")
-            _tool_runner_client = ToolRunnerClient(address=addr)
-            logger.info("ToolRunnerClient inizializzato su %s", addr)
+            # Non passare un address hardcoded (regola G): il costruttore risolve
+            # la gerarchia canonica env TOOL_RUNNER_ADDR >
+            # settings.tool_runner_addr (DB) > default. Il vecchio default qui
+            # era '127.0.0.1:50071', porta storica dismessa: mcp-core espone il
+            # ToolRunner su 50500 (mig 0239), quindi il client falliva sempre con
+            # Connection refused e NESSUN tool veniva eseguito -> hollow completion.
+            _tool_runner_client = ToolRunnerClient()
+            logger.info(
+                "ToolRunnerClient inizializzato su %s",
+                getattr(_tool_runner_client, "address", "?"),
+            )
         except Exception as exc:
             logger.error("ToolRunnerClient non disponibile: %s", exc)
             _tool_runner_client = None
