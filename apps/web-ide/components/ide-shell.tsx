@@ -1825,6 +1825,36 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   );
 
   const renderMainArea = () => {
+    // Pannello editor condiviso ai tre layout. Se una nota KB e' aperta
+    // (openNoteId, emesso da notes-tab/code-wiki-tab via nexus:note:open) mostra
+    // NoteDetail al posto dell'editor. Prima questa logica esisteva SOLO nel
+    // layout split-ai-editor: nei layout ai-center / editor-center la nota non
+    // si apriva (bug 4e27af1) — l'evento partiva ma nessun pannello lo guardava.
+    const editorAreaEl = (
+      <EditorArea
+        editorGroups={editorGroups}
+        activeEditorGroupId={activeEditorGroupId}
+        activeProject={activeProject}
+        problemItems={problemItems}
+        onSetActiveGroup={setActiveEditorGroupId}
+        onSetEditorGroups={setEditorGroups}
+        onSaveActive={() => void saveActiveEditor()}
+        onRenameActive={() => void handleRenameActive()}
+        onDeleteActive={() => void handleDeleteActive()}
+        onConfirmCloseTab={confirmCloseDirtyTab}
+      />
+    );
+    const editorPanel = openNoteId ? (
+      <div style={{ height: "100%", overflow: "auto", background: tc.bg }}>
+        <NoteDetail
+          projectId={activeProject?.id ?? ""}
+          noteId={openNoteId}
+          onBack={() => setOpenNoteId(null)}
+        />
+      </div>
+    ) : (
+      editorAreaEl
+    );
     if (layoutMode === "ai-center") {
       return (
         <div
@@ -1870,18 +1900,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               tc={tc}
             />
             {rightView === "editor" ? (
-              <EditorArea
-                editorGroups={editorGroups}
-                activeEditorGroupId={activeEditorGroupId}
-                activeProject={activeProject}
-                problemItems={problemItems}
-                onSetActiveGroup={setActiveEditorGroupId}
-                onSetEditorGroups={setEditorGroups}
-                onSaveActive={() => void saveActiveEditor()}
-                onRenameActive={() => void handleRenameActive()}
-                onDeleteActive={() => void handleDeleteActive()}
-                onConfirmCloseTab={confirmCloseDirtyTab}
-              />
+              editorPanel
             ) : (
               <SqlQueryPanel project={activeProject} />
             )}
@@ -1893,18 +1912,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     if (layoutMode === "editor-center") {
       return (
         <div style={{ minHeight: 0, height: "100%" }}>
-          <EditorArea
-            editorGroups={editorGroups}
-            activeEditorGroupId={activeEditorGroupId}
-            activeProject={activeProject}
-            problemItems={problemItems}
-            onSetActiveGroup={setActiveEditorGroupId}
-            onSetEditorGroups={setEditorGroups}
-            onSaveActive={() => void saveActiveEditor()}
-            onRenameActive={() => void handleRenameActive()}
-            onDeleteActive={() => void handleDeleteActive()}
-            onConfirmCloseTab={confirmCloseDirtyTab}
-          />
+          {editorPanel}
         </div>
       );
     }
@@ -1940,28 +1948,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           />
         </div>
         <div style={{ minWidth: 0, minHeight: 0, height: "100%", overflow: "hidden" }}>
-          {openNoteId ? (
-            <div style={{ height: "100%", overflow: "auto", background: tc.bg }}>
-              <NoteDetail
-                projectId={activeProject?.id ?? ""}
-                noteId={openNoteId}
-                onBack={() => setOpenNoteId(null)}
-              />
-            </div>
-          ) : (
-            <EditorArea
-              editorGroups={editorGroups}
-              activeEditorGroupId={activeEditorGroupId}
-              activeProject={activeProject}
-              problemItems={problemItems}
-              onSetActiveGroup={setActiveEditorGroupId}
-              onSetEditorGroups={setEditorGroups}
-              onSaveActive={() => void saveActiveEditor()}
-              onRenameActive={() => void handleRenameActive()}
-              onDeleteActive={() => void handleDeleteActive()}
-              onConfirmCloseTab={confirmCloseDirtyTab}
-            />
-          )}
+          {editorPanel}
         </div>
       </div>
     );
