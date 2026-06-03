@@ -151,6 +151,13 @@ else
     CARGO_PROFILE_FLAG="--release"
 fi
 
+# ── Modelli ML per la feature onnx (semantic embedder) ──────────────────────
+# Idempotente: scarica model.onnx/tokenizer.json solo se mancanti. Non versionati
+# nel repo perche' troppo grandi (vedi .gitignore + scripts/fetch-models.sh).
+if [ -x "${ROOT}/scripts/fetch-models.sh" ]; then
+    "${ROOT}/scripts/fetch-models.sh" || log "WARN: fetch-models fallito; OnnxMiniLmEmbedder cadra' sul fallback HashEmbedder"
+fi
+
 if $DO_SYNC; then
     sync_from_windows
 fi

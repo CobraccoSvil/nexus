@@ -1,9 +1,16 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// knowledge/vault.rs — Serializzazione Markdown/YAML Obsidian-compatible
+// knowledge/vault.rs — Serializzazione Markdown/YAML Obsidian-compatible (KB).
+//
+// Gli helper agnostici allo scope (parse_frontmatter, extract_wikilinks) vivono
+// in `crate::docs_core::vault` e sono re-esportati qui per compatibilita' con i
+// call site esistenti (`knowledge::vault::parse_frontmatter`, ecc.). Qui resta
+// la serializzazione specifica della Knowledge Base per-progetto.
 // ═══════════════════════════════════════════════════════════════════════════
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
+
+pub use crate::docs_core::vault::{extract_wikilinks, parse_frontmatter};
 
 /// Rappresenta un link tra note nel formato vault.
 pub struct VaultNoteLink {
@@ -97,99 +104,16 @@ pub fn serialize_note(
     out
 }
 
-/// Parsing base del frontmatter YAML da un file .md vault.
-/// Ritorna (frontmatter_map, body_senza_frontmatter).
-pub fn parse_frontmatter(content: &str) -> Option<(serde_json::Value, String)> {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        return None;
-    }
-    let after_first = &trimmed[3..];
-    let end_idx = after_first.find("\n---")?;
-    let yaml_str = &after_first[..end_idx];
-    let body = after_first[end_idx + 4..].trim_start_matches('\n').to_string();
-
-    // Parsing YAML semplificato: usiamo serde_yaml se disponibile,
-    // altrimenti un parsing manuale delle coppie key: value
-    let fm = parse_yaml_simple(yaml_str);
-    Some((fm, body))
-}
-
-/// Parsing YAML semplificato (senza dipendenza da serde_yaml).
-fn parse_yaml_simple(yaml: &str) -> serde_json::Value {
-    use serde_json::{json, Map, Value};
-    let mut map = Map::new();
-    let mut current_array_key: Option<String> = None;
-    let mut current_array: Vec<Value> = Vec::new();
-
-    for line in yaml.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        // Array item
-        if trimmed.starts_with("- ") {
-            if let Some(ref key) = current_array_key {
-                let val = trimmed.trim_start_matches("- ").trim().to_string();
-                current_array.push(Value::String(val));
-                let _ = key; // keep borrow checker happy
-            }
-            continue;
-        }
-        // Flush previous array
-        if let Some(key) = current_array_key.take() {
-            map.insert(key, Value::Array(current_array.clone()));
-            current_array.clear();
-        }
-        // Key: value
-        if let Some(colon_idx) = trimmed.find(':') {
-            let key = trimmed[..colon_idx].trim().to_string();
-            let val_str = trimmed[colon_idx + 1..].trim();
-            if val_str.is_empty() {
-                // Prossime righe saranno array items
-                current_array_key = Some(key);
-                current_array.clear();
-            } else if val_str == "[]" {
-                map.insert(key, json!([]));
-            } else {
-                map.insert(key, Value::String(val_str.to_string()));
-            }
-        }
-    }
-    // Flush finale
-    if let Some(key) = current_array_key {
-        map.insert(key, Value::Array(current_array));
-    }
-
-    Value::Object(map)
-}
-
-/// Estrai wikilinks [[...]] dal body markdown.
-pub fn extract_wikilinks(body: &str) -> Vec<String> {
-    let mut links = Vec::new();
-    let mut rest = body;
-    while let Some(start) = rest.find("[[") {
-        let after = &rest[start + 2..];
-        if let Some(end) = after.find("]]") {
-            let link = after[..end].trim().to_string();
-            if !link.is_empty() && !links.contains(&link) {
-                links.push(link);
-            }
-            rest = &after[end + 2..];
-        } else {
-            break;
-        }
-    }
-    links
-}
-
 /// Assicura che `.nexus/` sia presente nel .gitignore del progetto.
 pub async fn ensure_gitignore_entry(repo_root: &str) {
     let gitignore_path = format!("{repo_root}/.gitignore");
     let content = tokio::fs::read_to_string(&gitignore_path)
         .await
         .unwrap_or_default();
-    if !content.lines().any(|l| l.trim() == ".nexus/" || l.trim() == ".nexus") {
+    if !content
+        .lines()
+        .any(|l| l.trim() == ".nexus/" || l.trim() == ".nexus")
+    {
         let mut new_content = content;
         if !new_content.ends_with('\n') && !new_content.is_empty() {
             new_content.push('\n');

@@ -6,12 +6,12 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: 36ad8a7e169d982cfd7e97c12388b7a4ec130b55
+source_commit: d6f2c3dcd0c0ff77d19a6b136ff7058325d9981a
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-03T15:25:37Z
+updated_at: 2026-06-03T20:53:30Z
 nexus_meta_version: 1
 ---
 
@@ -285,7 +285,15 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0271_tool_aware_probe_and_catalog_sync.sql` | 0271: probe tool-aware + catalog_sync probe-aware. |
 | `0272_services_watchdog.sql` | 0272_services_watchdog.sql |
 | `0273_clarify_exploration_aware.sql` | Migrazione 0273: clarify e agenti esplorazione-aware. |
+| `0274_fix_thinking_model_on_agentic_intents.sql` | 0274: i modelli THINKING non devono essere primi sugli intent agentici |
+| `0275_catalog_is_thinking_flag.sql` | 0275: flag esplicito is_thinking nel catalog + routing agentico tool-safe. |
+| `0276_ai_usage_ledger_drop_run_fk.sql` | 0276: il ledger di billing deve registrare SEMPRE il consumo AI, anche per |
+| `0277_auto_compact_chat_sessions.sql` | Mig 0277 — Auto-compact automatico delle sessioni chat a soglia. |
+| `0278_db_provisioning_directive.sql` | Migrazione 0278: direttiva <database_provisioning> nei system prompt agente. |
+| `0279_db_tools_strict_naming.sql` | Migrazione 0279: elenco esatto dei tool DB e divieto di inventarne i nomi. |
+| `0280_context_token_brake.sql` | Mig 0280 — Freno TOKEN-based intra-turno (estensione FIX A-D ADR 0014). |
+| `0281_db_provision_idempotency_directive.sql` | Migrazione 0281: rafforza la direttiva di provisioning DB con il check |
 
-**Totale**: 264 migrazioni.
+**Totale**: 272 migrazioni.
 
-Ultima migrazione: `0273_clarify_exploration_aware.sql`.
+Ultima migrazione: `0281_db_provision_idempotency_directive.sql`.

@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: 36ad8a7e169d982cfd7e97c12388b7a4ec130b55
+source_commit: d6f2c3dcd0c0ff77d19a6b136ff7058325d9981a
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-03T15:25:40Z
+updated_at: 2026-06-03T20:53:35Z
 nexus_meta_version: 1
 ---
 
@@ -37,6 +37,10 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.complexity.keyword_weights` | `{"create":3,"write_file":2,"install":2,"build":2,"systemc...` | Pesi keyword per stima complessita' task agente (budget iterazioni adattivo). Chiave: substring da cercare nel prompt, valore: punti complessita'. Aggiornamento: aggiunti verbi italiani (implementa, sviluppa, costruisci, genera, scaffold) e sostantivi (progetto, applicazione). |
 | `agent.complexity.step_marker_points` | `5` | Punti per ogni marker di step esplicito (1., 2., step, task, phase) nel prompt. |
 | `agent.complexity.weak_model_multiplier` | `1.5` | Moltiplicatore budget se il modello iniziale e gpt-4o-mini / haiku / nano (necessita piu iter per G1 nudge). |
+| `agent.context.aggressive_keep_recent` | `3` | Numero di messaggi piu recenti mantenuti integri dalla compressione aggressiva TOKEN-based. La richiesta originale (primo messaggio umano) e i riassunti rolling sono sempre preservati. Default 3. |
+| `agent.context.aggressive_max_chars` | `200` | max_content_chars per la compressione aggressiva TOKEN-based: i messaggi vecchi (inclusi assistant) vengono troncati a questa lunghezza con marker [...troncato per limite contesto...]. Default 200. |
+| `agent.context.auto_compact_enabled` | `true` | Flag master auto-compact. Se true (default), prima di ogni nuovo turno agente il sistema valuta il rapporto token sessione / context window del modello attivo e, se >= agent.context.auto_compact_ratio, compatta automaticamente la sessione (stesso meccanismo del pulsante "Compatta chat"). Se false, il compact resta solo manuale. |
+| `agent.context.auto_compact_ratio` | `0.80` | Soglia ratio = session_tokens / context_window oltre la quale (>=) scatta l'auto-compact prima del turno agente. Default 0.80. Range valido [0.5, 0.95]: il codice clampa i valori fuori range. Token sessione = somma dei total/prompt tokens dei messaggi non soft-deleted (deleted_at IS NULL), con stima a ~4 char/token quando i token non sono persistiti. context_window dal catalog ai_price_catalog del modello risolto per il turno. |
 | `agent.context.compress_phase_boundaries` | `5,10,20,50` | CSV crescente dei boundary di fase per compressione escalante. iter < primo = no compressione. Tra phase[i] e phase[i+1] = applica keep_recent[i] e max_chars[i]. Le tre liste boundaries/keep_recent/max_chars devono avere stessa lunghezza. |
 | `agent.context.compress_phase_keep_recent` | `8,5,3,2` | CSV keep_recent per ogni fase di compressione (allineato a compress_phase_boundaries). |
 | `agent.context.compress_phase_max_chars` | `2000,1000,500,150` | CSV max_content_chars per ogni fase di compressione (allineato a compress_phase_boundaries). |
@@ -44,6 +48,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.context.dedup_tool_results_enabled` | `true` | Se true (default) ogni iter executor applica _dedup_tool_results_history: tool_result vecchi con stessa signature (sha256(tool_name+args_json)) vengono sostituiti con placeholder, tenendo solo l ultimo. FIX B. |
 | `agent.context.drop_unused_base64_age` | `3` | Soglia (n messaggi successivi) entro la quale verificare se un blob base64 di un tool_result vecchio viene citato testualmente. Se non viene citato, il body base64 viene sostituito con un placeholder. FIX C. |
 | `agent.context.max_chars` | `400000` | Budget chars totale per il contesto agente. Oltre questa soglia i tool result vecchi vengono compressi/sommarizzati. Approx 3.5 chars/token. DB-driven, cache 60s. |
+| `agent.context.max_context_ratio` | `0.70` | Soglia (0.4-0.9) sul context_window del modello attivo: se la stima token del contesto in executor supera ratio*context_window, scatta la compressione aggressiva TOKEN-based che tronca anche i messaggi assistant lunghi. Default 0.70. |
 | `agent.context_offload_ttl_seconds` | `60` | TTL cache context_offload (H-55) |
 | `agent.context.predictive_cap_ratio` | `0.5` | Soglia (0.3-0.9) sul context_window del modello: se context_attuale + stima_tool_result supera ratio*context_window, la chiamata al tool viene intercettata e sostituita da tool_result sintetico di errore. FIX D. |
 | `agent.context.rag_offload.enabled` | `true` | Flag master offload RAG lossless. Se true (default), prima di troncare/comprimere/scartare un tool result o messaggio vecchio il brain indicizza il contenuto COMPLETO in Qdrant (tool_results_chunks) cosi' nessun dato viene perso e resta recuperabile via nexus_search_semantic. Se false, degrada al vecchio troncamento distruttivo. |
@@ -593,7 +598,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `default_model` | `claude-sonnet-4-6` | Default model for chat |
 | `default_provider` | `anthropic` | Default LLM provider |
 | `max_token_budget` | `32000` | Maximum token budget allowed |
-| `model_catalog_last_sync` | `2026-06-03T15:22:45.512746304+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
+| `model_catalog_last_sync` | `2026-06-03T20:48:52.339139749+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
 | `nexus_active_routing_pct` | `50` | Percentuale di richieste chat gestite dal router Q-Learning Nexus (0=off, 100=tutto). A/B testing: imposta 10-50 per un rollout graduale. |
 | `nexus_behavior_mode` | `dinamico` | Modalità comportamento Nexus: veloce|economica|bilanciata|approfondita |
 | `provider_hierarchy` | `anthropic,openai,google,deepseek,mistral` | Ordered fallback chain for chat providers |
@@ -669,4 +674,4 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 ---
 
-**Totale chiavi**: 472
+**Totale chiavi**: 477

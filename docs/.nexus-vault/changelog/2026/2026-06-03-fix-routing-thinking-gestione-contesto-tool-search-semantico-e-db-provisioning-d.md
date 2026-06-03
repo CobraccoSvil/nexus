@@ -1,0 +1,336 @@
+---
+id: d1ff5e7c-253f-45f6-95c9-405b886d2e6c
+kind: changelog
+title: "fix: routing thinking, gestione contesto, tool-search semantico e DB provisioning da chat"
+slug: fix-routing-thinking-gestione-contesto-tool-search-semantico-e-db-provisioning-d
+tags:
+  - changelog
+source_commit: d6f2c3dcd0c0ff77d19a6b136ff7058325d9981a
+source_files:
+  - Cargo.lock
+  - apps/web-ide/components/project-db/project-db-panel.tsx
+  - apps/web-ide/lib/api-client.ts
+  - apps/web-ide/server.js
+  - brain/agents/criteria_runner.py
+  - brain/agents/nodes.py
+  - brain/agents/verifier_node.py
+  - crates/mcp-core/Cargo.toml
+  - crates/mcp-core/src/chat_messages.rs
+  - crates/mcp-core/src/chat_sessions.rs
+  - crates/mcp-core/src/context_settings.rs
+  - crates/mcp-core/src/main.rs
+  - crates/mcp-core/src/nexus_bridge.rs
+  - crates/mcp-core/src/nexus_builtin/catalog.rs
+  - crates/mcp-core/src/nexus_builtin/mcp_runtime.rs
+  - crates/mcp-core/src/nexus_builtin/mod.rs
+  - crates/mcp-core/src/nexus_tools/project_db_apply_migration.rs
+  - crates/mcp-core/src/orchestrator.rs
+  - crates/mcp-core/src/project_db_routes.rs
+  - crates/nexus-orchestrator/src/embedder.rs
+  - db/migrations/0274_fix_thinking_model_on_agentic_intents.sql
+  - db/migrations/0275_catalog_is_thinking_flag.sql
+  - db/migrations/0276_ai_usage_ledger_drop_run_fk.sql
+  - db/migrations/0277_auto_compact_chat_sessions.sql
+  - db/migrations/0278_db_provisioning_directive.sql
+  - db/migrations/0279_db_tools_strict_naming.sql
+  - db/migrations/0280_context_token_brake.sql
+  - db/migrations/0281_db_provision_idempotency_directive.sql
+  - docs/.nexus-vault/api/rest-endpoints.md
+  - docs/.nexus-vault/api/settings-keys.md
+  - docs/.nexus-vault/architecture/brain-python.md
+  - docs/.nexus-vault/architecture/crates-rust.md
+  - docs/.nexus-vault/architecture/frontend-nextjs.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-docs-aggiorna-meta-vault-changelog-architettura-della-sessione-code-wiki.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-featconfig-ogni-servizio-risolve-la-propria-porta-dal-db-regola-g.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-featkb-le-note-kb-si-aprono-nel-pannello-destro-editor-workspace-non-inline.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-featproviders-classificatore-errori-unico-via-grpc-classifyerror-end-to-end.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-fixbilling-run-id-del-ledger-via-subquery-per-non-violare-la-fk-ai-usage-ledger-.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-fixchat-chip-allegato-non-immagine-senza-icona-rotta-e-disallineato.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-fixchat-un-provider-selezionato-nel-dropdown-viene-forzato-senza-premere-forza.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-fixdeploy-porte-dal-db-nello-script-e-stop-affidabile-di-braingateway.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-fixdeploy-stop-service-non-si-auto-uccide-su-service-nome.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-fixkb-worker-di-recupero-promote-le-note-chat-di-run-completati-non-restano-in-b.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-fixproviders-403-forbidden-non-spegne-piu-lintero-provider-per-6h.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-fixproviders-cooldown-billing-persistente-auto-disable-chiusura-client-async-goo.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-fixproviders-insufficient-quota-classificato-billing-non-rate-limit-probe-usa-er.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-fixproviders-no-hollow-completion-sui-modelli-thinking-di-google.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-fixproviders-probe-then-reenable-usa-error-class-non-riabilita-provider-senza-cr.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-fixproviders-propaga-il-cooldown-billingquota-alla-routing-matrix-fix-run-vuoto-.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-fixproviders-teardown-sicuro-del-client-async-no-event-loop-is-closed.md
+  - docs/.nexus-vault/changelog/2026/2026-06-02-fixrouting-agentrouter-su-porta-50501-rimosso-default-hardcoded-50072.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-0258-deepseek-v4-catalog-context-windowsql-completa-il-fix-della-migrazione-0256.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-featcatalog-probe-tool-aware-catalog-sync-probe-aware-anti-inversione.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-featfigma-estrattore-dichiara-i-residui-non-riconosciuti.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-featrouting-auto-manutenzione-della-matrix-cleanup-stale-tool-failure.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-featverifier-criterio-generale-no-orphan-imported-anti-placeholder.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-featverifier-final-gate-fail-closed-anti-placeholder-per-task-software.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-featwatchdog-riavvio-automatico-dei-microservizi-nexus-caduti.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixagent-tool-core-esposti-al-primo-turno-discovery-first-no-loop-list-files.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixbrain-normalizza-content-non-stringa-prima-di-startswith.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixcapabilities-gemini-25-flashpro-thinkingtrue-no-tool-choice-forzato-no-hollow.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixcatalog-allinea-ai-price-catalogcontext-window-deepseek-v4-a-131072-sblocca-p.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixclarify-esplorazione-aware-deduci-il-dominio-invece-di-chiederlo.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixcooldown-429-quota-openai-cooldown-lungo-billing.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixexecutor-rileva-intenzione-annunciata-non-compiuta-nelloutput.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixfigma-estrai-anche-i-file-scritti-con-write-tool-argsjson.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixmcp-core-resiliente-al-cold-start-del-brain-no-exit-in-cascata.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixorchestrator-complexitylow-non-attiva-mai-il-planner-forte.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixorchestrator-escalation-automatica-del-modello-al-cap-g1-non-resa.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixorchestrator-no-planner-fortesub-agenti-su-task-banali-budget-e-cooldown.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixplanner-modello-non-thinking-tool-robust-gemini-25-pro-mistral-large.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixplanneropenai-fallback-tool-robust-del-planner-openai-no-retry-in-cooldown.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixports-kill-del-process-group-gc-periodico-delle-porte-orfane.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixports-process-gc-termina-i-dev-server-duplicati-per-progetto.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixproviders-guard-thinking-in-resolve-tool-choice-capability-deepseek-v4.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixrouter-budget-per-file-ops-e-gating-dellagentrouter-non-addestrato.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixrouting-matrix-allineata-ai-modelli-funzionanti-per-i-task-agentici.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixrouting-toolrunner-risolto-dal-db-50500-rimosso-default-50071.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixrouting-usa-mistral-large-2411-pinned-alias-latest-da-403-labs.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixroutinglang-gemini-25-flash-primario-sugli-agent-task-reminder-lingua-in-test.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixverifier-file-exists-senza-path-na-non-errore-bloccante.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixweb-ide-auto-reconnect-dello-stream-sse-del-run-agente.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixweb-ide-l-invio-attende-conferma-per-qualsiasi-richiesta-simile-non-solo-gia-.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixweb-ide-l-invio-attende-rifai-comunque-se-la-richiesta-e-gia-completata.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixweb-ide-le-note-kb-si-aprono-in-tutti-i-layout-non-solo-split-ai-editor.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixweb-ide-mostra-l-attivita-live-dell-agente-dai-meta-step-no-falso-agente-in-a.md
+  - docs/.nexus-vault/changelog/2026/2026-06-03-fixwizard-install-service-robusto-senza-systemd-user-fallback-detached.md
+  - docs/.nexus-vault/concepts/auto-fix-workflow.md
+  - docs/.nexus-vault/concepts/change-drafter.md
+  - docs/.nexus-vault/concepts/glossario.md
+  - docs/.nexus-vault/concepts/isolamento-progetti.md
+  - docs/.nexus-vault/concepts/knowledge-base-funzionamento.md
+  - docs/.nexus-vault/concepts/meta-vault-architettura.md
+  - docs/.nexus-vault/concepts/multi-provider-routing.md
+  - docs/.nexus-vault/concepts/nexus-architetturale.md
+  - docs/.nexus-vault/concepts/nexus-funzionale.md
+  - docs/.nexus-vault/concepts/pattern-learning-worker.md
+  - docs/.nexus-vault/concepts/pattern-mcp-tool.md
+  - docs/.nexus-vault/concepts/routing-matrix.md
+  - docs/.nexus-vault/concepts/sub-agents-claude-code.md
+  - docs/.nexus-vault/schema/migrations-log.md
+  - docs/.nexus-vault/schema/postgres-tables.md
+  - docs/.nexus-vault/schema/qdrant-collections.md
+  - eta.txt
+  - models/minilm/model.onnx
+  - models/minilm/tokenizer.json
+  - recovery/INVENTORY.md
+  - recovery/edits/agent-meta-step-card.tsx.edits.json
+  - recovery/edits/agent_types.rs.edits.json
+  - recovery/edits/brain_agent_client.rs.edits.json
+  - recovery/edits/chat_attachments.rs.edits.json
+  - recovery/edits/clarify_or_expand_node.py.edits.json
+  - recovery/edits/files.rs.edits.json
+  - recovery/edits/google_provider.py.edits.json
+  - recovery/edits/graph.py.edits.json
+  - recovery/edits/indexing.rs.edits.json
+  - recovery/edits/ingest_run.rs.edits.json
+  - recovery/edits/main.rs.edits.json
+  - recovery/edits/nodes.py.edits.json
+  - recovery/edits/orchestrator.rs.edits.json
+  - recovery/edits/registry.py.edits.json
+  - recovery/edits/service.py.edits.json
+  - recovery/edits/state.py.edits.json
+  - recovery/files/auto_link.rs
+  - recovery/files/code_graph.rs
+  - recovery/files/regression_gate_node.py
+  - recovery/files2/home__administrator__ideai__brain__agents__regression_gate_node.py
+  - recovery/files2/home__administrator__ideai__crates__mcp-core__src__knowledge__auto_link.rs
+  - recovery/migrations/0240_provider_capabilities.sql
+  - recovery/migrations/0241_agent_tool_tiering.sql
+  - recovery/migrations/0241_settings_provider_layer.sql
+  - recovery/migrations/0242_code_graph.sql
+  - recovery/migrations/0242_provider_intent_health.sql
+  - recovery/migrations/0243_code_graph.sql
+  - recovery/migrations/0243_regression_gate_settings.sql
+  - recovery/migrations/0244_plan_table_columns.sql
+  - recovery/migrations/0244_regression_gate_hard_block.sql
+  - recovery/migrations/0245_test_informed_settings.sql
+  - recovery/migrations/0247_context_stale.sql
+  - recovery/migrations/0248_intake_request_aware.sql
+  - recovery/migrations/0249_todo_live_events.sql
+  - recovery/migrations/0250_todos_evolution.sql
+  - recovery/migrations/0251_kb_changelog_cross_settings.sql
+  - recovery/migrations/0252_shutdown_force_exit_timeout.sql
+  - recovery/migrations_final/0240_recovery_m7_m16.sql
+  - recovery/schema/m7_m13_tables.sql
+auto_generated: true
+created_at: 2026-06-03T20:53:36Z
+updated_at: 2026-06-03T20:53:30Z
+nexus_meta_version: 1
+---
+
+# fix: routing thinking, gestione contesto, tool-search semantico e DB provisioning da chat
+
+**Commit**: `d6f2c3dcd0c0ff77d19a6b136ff7058325d9981a` (2026-06-03 20:53 UTC)
+
+**Significance**: 0.95
+
+## File toccati
+
+- `Cargo.lock`
+- `apps/web-ide/components/project-db/project-db-panel.tsx`
+- `apps/web-ide/lib/api-client.ts`
+- `apps/web-ide/server.js`
+- `brain/agents/criteria_runner.py`
+- `brain/agents/nodes.py`
+- `brain/agents/verifier_node.py`
+- `crates/mcp-core/Cargo.toml`
+- `crates/mcp-core/src/chat_messages.rs`
+- `crates/mcp-core/src/chat_sessions.rs`
+- `crates/mcp-core/src/context_settings.rs`
+- `crates/mcp-core/src/main.rs`
+- `crates/mcp-core/src/nexus_bridge.rs`
+- `crates/mcp-core/src/nexus_builtin/catalog.rs`
+- `crates/mcp-core/src/nexus_builtin/mcp_runtime.rs`
+- `crates/mcp-core/src/nexus_builtin/mod.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_apply_migration.rs`
+- `crates/mcp-core/src/orchestrator.rs`
+- `crates/mcp-core/src/project_db_routes.rs`
+- `crates/nexus-orchestrator/src/embedder.rs`
+- `db/migrations/0274_fix_thinking_model_on_agentic_intents.sql`
+- `db/migrations/0275_catalog_is_thinking_flag.sql`
+- `db/migrations/0276_ai_usage_ledger_drop_run_fk.sql`
+- `db/migrations/0277_auto_compact_chat_sessions.sql`
+- `db/migrations/0278_db_provisioning_directive.sql`
+- `db/migrations/0279_db_tools_strict_naming.sql`
+- `db/migrations/0280_context_token_brake.sql`
+- `db/migrations/0281_db_provision_idempotency_directive.sql`
+- `docs/.nexus-vault/api/rest-endpoints.md`
+- `docs/.nexus-vault/api/settings-keys.md`
+- `docs/.nexus-vault/architecture/brain-python.md`
+- `docs/.nexus-vault/architecture/crates-rust.md`
+- `docs/.nexus-vault/architecture/frontend-nextjs.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-docs-aggiorna-meta-vault-changelog-architettura-della-sessione-code-wiki.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-featconfig-ogni-servizio-risolve-la-propria-porta-dal-db-regola-g.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-featkb-le-note-kb-si-aprono-nel-pannello-destro-editor-workspace-non-inline.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-featproviders-classificatore-errori-unico-via-grpc-classifyerror-end-to-end.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-fixbilling-run-id-del-ledger-via-subquery-per-non-violare-la-fk-ai-usage-ledger-.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-fixchat-chip-allegato-non-immagine-senza-icona-rotta-e-disallineato.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-fixchat-un-provider-selezionato-nel-dropdown-viene-forzato-senza-premere-forza.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-fixdeploy-porte-dal-db-nello-script-e-stop-affidabile-di-braingateway.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-fixdeploy-stop-service-non-si-auto-uccide-su-service-nome.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-fixkb-worker-di-recupero-promote-le-note-chat-di-run-completati-non-restano-in-b.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-fixproviders-403-forbidden-non-spegne-piu-lintero-provider-per-6h.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-fixproviders-cooldown-billing-persistente-auto-disable-chiusura-client-async-goo.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-fixproviders-insufficient-quota-classificato-billing-non-rate-limit-probe-usa-er.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-fixproviders-no-hollow-completion-sui-modelli-thinking-di-google.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-fixproviders-probe-then-reenable-usa-error-class-non-riabilita-provider-senza-cr.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-fixproviders-propaga-il-cooldown-billingquota-alla-routing-matrix-fix-run-vuoto-.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-fixproviders-teardown-sicuro-del-client-async-no-event-loop-is-closed.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-02-fixrouting-agentrouter-su-porta-50501-rimosso-default-hardcoded-50072.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-0258-deepseek-v4-catalog-context-windowsql-completa-il-fix-della-migrazione-0256.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-featcatalog-probe-tool-aware-catalog-sync-probe-aware-anti-inversione.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-featfigma-estrattore-dichiara-i-residui-non-riconosciuti.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-featrouting-auto-manutenzione-della-matrix-cleanup-stale-tool-failure.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-featverifier-criterio-generale-no-orphan-imported-anti-placeholder.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-featverifier-final-gate-fail-closed-anti-placeholder-per-task-software.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-featwatchdog-riavvio-automatico-dei-microservizi-nexus-caduti.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixagent-tool-core-esposti-al-primo-turno-discovery-first-no-loop-list-files.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixbrain-normalizza-content-non-stringa-prima-di-startswith.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixcapabilities-gemini-25-flashpro-thinkingtrue-no-tool-choice-forzato-no-hollow.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixcatalog-allinea-ai-price-catalogcontext-window-deepseek-v4-a-131072-sblocca-p.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixclarify-esplorazione-aware-deduci-il-dominio-invece-di-chiederlo.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixcooldown-429-quota-openai-cooldown-lungo-billing.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixexecutor-rileva-intenzione-annunciata-non-compiuta-nelloutput.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixfigma-estrai-anche-i-file-scritti-con-write-tool-argsjson.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixmcp-core-resiliente-al-cold-start-del-brain-no-exit-in-cascata.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixorchestrator-complexitylow-non-attiva-mai-il-planner-forte.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixorchestrator-escalation-automatica-del-modello-al-cap-g1-non-resa.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixorchestrator-no-planner-fortesub-agenti-su-task-banali-budget-e-cooldown.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixplanner-modello-non-thinking-tool-robust-gemini-25-pro-mistral-large.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixplanneropenai-fallback-tool-robust-del-planner-openai-no-retry-in-cooldown.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixports-kill-del-process-group-gc-periodico-delle-porte-orfane.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixports-process-gc-termina-i-dev-server-duplicati-per-progetto.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixproviders-guard-thinking-in-resolve-tool-choice-capability-deepseek-v4.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixrouter-budget-per-file-ops-e-gating-dellagentrouter-non-addestrato.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixrouting-matrix-allineata-ai-modelli-funzionanti-per-i-task-agentici.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixrouting-toolrunner-risolto-dal-db-50500-rimosso-default-50071.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixrouting-usa-mistral-large-2411-pinned-alias-latest-da-403-labs.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixroutinglang-gemini-25-flash-primario-sugli-agent-task-reminder-lingua-in-test.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixverifier-file-exists-senza-path-na-non-errore-bloccante.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixweb-ide-auto-reconnect-dello-stream-sse-del-run-agente.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixweb-ide-l-invio-attende-conferma-per-qualsiasi-richiesta-simile-non-solo-gia-.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixweb-ide-l-invio-attende-rifai-comunque-se-la-richiesta-e-gia-completata.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixweb-ide-le-note-kb-si-aprono-in-tutti-i-layout-non-solo-split-ai-editor.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixweb-ide-mostra-l-attivita-live-dell-agente-dai-meta-step-no-falso-agente-in-a.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-03-fixwizard-install-service-robusto-senza-systemd-user-fallback-detached.md`
+- `docs/.nexus-vault/concepts/auto-fix-workflow.md`
+- `docs/.nexus-vault/concepts/change-drafter.md`
+- `docs/.nexus-vault/concepts/glossario.md`
+- `docs/.nexus-vault/concepts/isolamento-progetti.md`
+- `docs/.nexus-vault/concepts/knowledge-base-funzionamento.md`
+- `docs/.nexus-vault/concepts/meta-vault-architettura.md`
+- `docs/.nexus-vault/concepts/multi-provider-routing.md`
+- `docs/.nexus-vault/concepts/nexus-architetturale.md`
+- `docs/.nexus-vault/concepts/nexus-funzionale.md`
+- `docs/.nexus-vault/concepts/pattern-learning-worker.md`
+- `docs/.nexus-vault/concepts/pattern-mcp-tool.md`
+- `docs/.nexus-vault/concepts/routing-matrix.md`
+- `docs/.nexus-vault/concepts/sub-agents-claude-code.md`
+- `docs/.nexus-vault/schema/migrations-log.md`
+- `docs/.nexus-vault/schema/postgres-tables.md`
+- `docs/.nexus-vault/schema/qdrant-collections.md`
+- `eta.txt`
+- `models/minilm/model.onnx`
+- `models/minilm/tokenizer.json`
+- `recovery/INVENTORY.md`
+- `recovery/edits/agent-meta-step-card.tsx.edits.json`
+- `recovery/edits/agent_types.rs.edits.json`
+- `recovery/edits/brain_agent_client.rs.edits.json`
+- `recovery/edits/chat_attachments.rs.edits.json`
+- `recovery/edits/clarify_or_expand_node.py.edits.json`
+- `recovery/edits/files.rs.edits.json`
+- `recovery/edits/google_provider.py.edits.json`
+- `recovery/edits/graph.py.edits.json`
+- `recovery/edits/indexing.rs.edits.json`
+- `recovery/edits/ingest_run.rs.edits.json`
+- `recovery/edits/main.rs.edits.json`
+- `recovery/edits/nodes.py.edits.json`
+- `recovery/edits/orchestrator.rs.edits.json`
+- `recovery/edits/registry.py.edits.json`
+- `recovery/edits/service.py.edits.json`
+- `recovery/edits/state.py.edits.json`
+- `recovery/files/auto_link.rs`
+- `recovery/files/code_graph.rs`
+- `recovery/files/regression_gate_node.py`
+- `recovery/files2/home__administrator__ideai__brain__agents__regression_gate_node.py`
+- `recovery/files2/home__administrator__ideai__crates__mcp-core__src__knowledge__auto_link.rs`
+- `recovery/migrations/0240_provider_capabilities.sql`
+- `recovery/migrations/0241_agent_tool_tiering.sql`
+- `recovery/migrations/0241_settings_provider_layer.sql`
+- `recovery/migrations/0242_code_graph.sql`
+- `recovery/migrations/0242_provider_intent_health.sql`
+- `recovery/migrations/0243_code_graph.sql`
+- `recovery/migrations/0243_regression_gate_settings.sql`
+- `recovery/migrations/0244_plan_table_columns.sql`
+- `recovery/migrations/0244_regression_gate_hard_block.sql`
+- `recovery/migrations/0245_test_informed_settings.sql`
+- `recovery/migrations/0247_context_stale.sql`
+- `recovery/migrations/0248_intake_request_aware.sql`
+- `recovery/migrations/0249_todo_live_events.sql`
+- `recovery/migrations/0250_todos_evolution.sql`
+- `recovery/migrations/0251_kb_changelog_cross_settings.sql`
+- `recovery/migrations/0252_shutdown_force_exit_timeout.sql`
+- `recovery/migrations_final/0240_recovery_m7_m16.sql`
+- `recovery/schema/m7_m13_tables.sql`
+
+## Cosa cambia
+
+fix: routing thinking, gestione contesto, tool-search semantico e DB provisioning da chat
+
+## Riferimenti
+
+- Vedi diff git: `git show d6f2c3dcd0c0ff77d19a6b136ff7058325d9981a`
+
+## Documenti correlati
+
+- [[crates-rust]]
+- [[brain-python]]
+- [[frontend-nextjs]]
+- [[postgres-tables]]
+- [[migrations-log]]
+- [[rest-endpoints]]
+- [[qdrant-collections]]
+- [[knowledge-base-funzionamento]]
+- [[multi-provider-routing]]
+- [[routing-matrix]]

@@ -6,12 +6,12 @@ slug: postgres-tables
 tags:
   - schema
   - postgres
-source_commit: 36ad8a7e169d982cfd7e97c12388b7a4ec130b55
+source_commit: d6f2c3dcd0c0ff77d19a6b136ff7058325d9981a
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-03T15:25:37Z
+updated_at: 2026-06-03T20:53:30Z
 nexus_meta_version: 1
 ---
 
@@ -126,6 +126,7 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `auto_disabled_at` | timestamp with time zone | YES | `—` |
 | `auto_disabled_reason` | text | YES | `—` |
 | `consecutive_tool_failures` | integer | NO | `0` |
+| `is_thinking` | boolean | NO | `false` |
 
 ## `ai_price_catalog_audit`
 

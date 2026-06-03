@@ -56,3 +56,6 @@ test-results/
 # I template (collect.sh, monitor.sh, report-template.md, rubric.md) restano tracked.
 tests/nexus-maturity/202[5-9]-*/
 
+
+# Modelli ML scaricati via scripts/fetch-models.sh (troppo grandi per git)
+models/minilm/

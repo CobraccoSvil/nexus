@@ -47,6 +47,7 @@ mod environment;
 mod settings;
 mod context_settings;
 mod vector_memory;
+mod docs_core;
 mod knowledge;
 mod agent_todos_routes;
 mod project_context;

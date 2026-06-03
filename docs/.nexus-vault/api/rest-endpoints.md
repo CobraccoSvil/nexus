@@ -6,18 +6,18 @@ slug: rest-endpoints
 tags:
   - api
   - rest
-source_commit: 36ad8a7e169d982cfd7e97c12388b7a4ec130b55
+source_commit: d6f2c3dcd0c0ff77d19a6b136ff7058325d9981a
 source_files:
   - crates/mcp-core/src/main.rs
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-03T15:25:40Z
+updated_at: 2026-06-03T20:53:35Z
 nexus_meta_version: 1
 ---
 
 Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src/main.rs`.
 
-**Totale endpoint**: 263
+**Totale endpoint**: 266
 
 Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]].
 
@@ -136,6 +136,12 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 | Metodo | Path | Handler |
 |---|---|---|
 | `GET` | `/api/dashboard` | `dashboard` |
+
+## `/api/embedder-status`
+
+| Metodo | Path | Handler |
+|---|---|---|
+| `GET` | `/api/embedder-status` | `nexus_bridge::nexus_embedder_status` |
 
 ## `/api/fs`
 
@@ -311,9 +317,11 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 | `POST` | `/api/projects/:id/db/config` | `project_db_routes::set_project_db_config` |
 | `POST` | `/api/projects/:id/db/connections/:conn_id/set-primary` | `project_db_routes::set_primary_project_db_connection` |
 | `POST` | `/api/projects/:id/db/detect` | `project_db_routes::detect_project_db` |
+| `POST` | `/api/projects/:id/db/import-schema` | `project_db_routes::import_project_db_schema` |
 | `POST` | `/api/projects/:id/db/migrations/apply` | `project_db_routes::apply_project_migrations` |
 | `POST` | `/api/projects/:id/db/migrations/rollback` | `project_db_routes::rollback_project_migration` |
 | `POST` | `/api/projects/:id/db/override-request` | `project_db_routes::request_ddl_override` |
+| `POST` | `/api/projects/:id/db/provision` | `project_db_routes::provision_project_db` |
 | `POST` | `/api/projects/:id/db/query` | `project_db_routes::execute_project_db_query` |
 | `POST` | `/api/projects/:id/db/test-connection` | `project_db_routes::test_project_db_connection` |
 | `POST` | `/api/projects/:id/deep-analyze` | `projects::deep_analyze_project` |
