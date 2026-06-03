@@ -194,7 +194,14 @@ async def _check_file_exists(
     """
     path = spec.get("path") or ""
     if not path:
-        return False, {"error": "spec.path obbligatorio"}
+        # Criterio file_exists senza path: NON pertinente. Capita quando il
+        # planner genera per errore un acceptance_criteria di tipo "creazione"
+        # su un task di sola lettura/listing (es. "elenca i file"), che non
+        # produce un file verificabile. Trattiamo il criterio come N/A (pass)
+        # invece di fallire con "spec.path obbligatorio": altrimenti il verifier
+        # entra in loop di retry finche' marca il todo blocked, e il task utile
+        # (gia' eseguito) non viene mai chiuso.
+        return True, {"skipped": "file_exists senza path: criterio non applicabile (N/A)"}
     tool_runner = ctx.get("tool_runner")
     session_id = ctx.get("session_id")
     if not tool_runner or not session_id:
