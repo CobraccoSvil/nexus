@@ -677,6 +677,59 @@ def _last_assistant_text(messages: list) -> str:
     return ""
 
 
+def _pick_escalation_model(
+    provider: str | None, model: str | None, escalations: int
+) -> tuple[str, str] | None:
+    """Sceglie un modello piu' capace per l'escalation dell'orchestratore.
+
+    Priorita' (nessun fallback hardcoded, regola G):
+      1. Catena intra-provider DB (nexus_model_escalation_chain): stesso
+         provider, tier superiore, posizione = numero di escalation gia' fatte.
+      2. Purpose model cross-provider (loop_fallback_default) dal router.
+
+    Ritorna (provider, model) del modello escalato, o None se non c'e' un
+    candidato diverso da quello corrente. Usato sia dalla loop-detection sia
+    dal cap G1 (modello che descrive senza agire): in entrambi i casi
+    l'orchestratore promuove il turno a un modello migliore invece di arrendersi.
+    """
+    # Tier 1: catena intra-provider (stesso provider, tier superiore).
+    if provider and model:
+        try:
+            import psycopg2  # type: ignore[import]
+            import os as _os
+            _db_url = _os.environ.get(
+                "DATABASE_URL",
+                "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
+            )
+            with psycopg2.connect(_db_url) as _conn:
+                with _conn.cursor() as _cur:
+                    _cur.execute(
+                        "SELECT escalation_model FROM nexus_model_escalation_chain "
+                        "WHERE provider = %s AND base_model = %s AND is_active = TRUE "
+                        "ORDER BY escalation_position ASC LIMIT %s",
+                        (provider, model, escalations + 1),
+                    )
+                    _rows = _cur.fetchall()
+            if _rows and len(_rows) > escalations:
+                _cand = _rows[escalations][0]
+                if _cand and _cand != model:
+                    return (provider, _cand)
+        except Exception as _e:
+            logger.debug("_pick_escalation_model: catena DB fallita: %s", _e)
+    # Tier 2: purpose model cross-provider dal router Rust.
+    try:
+        from brain.router.service import _routing_client_singleton
+        d = _routing_client_singleton().purpose_model(purpose="loop_fallback_default")
+        if (
+            d.provider not in ("__router_unavailable__", "__no_capable_provider__")
+            and not (d.provider == provider and d.model == model)
+        ):
+            return (d.provider, d.model)
+    except Exception:
+        pass
+    return None
+
+
 def _has_tool_calls_in_history(messages: list) -> bool:
     """Controlla se nella history ci sono già stati tool call effettivi (AIMessage con tool_use)."""
     for m in messages:
@@ -2615,15 +2668,63 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                     _g1_reroute_count, _g1_max_nudges,
                 )
     if _g1_reroute_count >= _g1_max_nudges:
+        # Escalation orchestratore: invece di arrenderci e scaricare il problema
+        # sull'utente ("usa un modello piu' capace"), e' l'orchestratore stesso
+        # a promuovere il turno a un modello migliore (catena DB), azzerando il
+        # contatore reroute cosi' il nuovo modello ha il suo budget di tentativi.
+        # Solo a catena di escalation ESAURITA ci fermiamo davvero.
+        _g1_cur_provider = (
+            state.get("provider_used")
+            or state.get("sticky_provider")
+            or state.get("provider_override")
+        )
+        _g1_cur_model = (
+            state.get("model_used")
+            or state.get("sticky_model")
+            or state.get("model_override")
+        )
+        _g1_escal = int(state.get("auto_escalations") or 0)
+        _g1_picked = (
+            _pick_escalation_model(_g1_cur_provider, _g1_cur_model, _g1_escal)
+            if _g1_escal < 3
+            else None
+        )
+        if _g1_picked:
+            _esc_provider, _esc_model = _g1_picked
+            logger.warning(
+                "executor_node: G1 cap (%d) su %s/%s -> ESCALATION orchestratore a "
+                "%s/%s (auto_escalations=%d), azzero reroute e ri-do il turno",
+                _g1_max_nudges, _g1_cur_provider, _g1_cur_model,
+                _esc_provider, _esc_model, _g1_escal + 1,
+            )
+            _esc_nudge = HumanMessage(
+                content=(
+                    f"Il modello precedente ha solo descritto le azioni senza "
+                    f"eseguirle dopo {_g1_max_nudges} tentativi. Ora rispondi tu, "
+                    f"che sei un modello piu' capace: NON descrivere, ESEGUI subito "
+                    f"il prossimo step concreto con un tool call."
+                )
+            )
+            return {
+                "messages": [_esc_nudge],
+                "sticky_provider": _esc_provider,
+                "sticky_model": _esc_model,
+                "auto_escalations": _g1_escal + 1,
+                "g1_reroute_count": 0,
+                "action_nudge_count": 0,
+                "pending_tool_uses": [],
+                "stop_reason": "g1_escalated",
+                "iterations": int(state.get("iterations") or 0) + 1,
+            }
         logger.warning(
-            "executor_node: G1 cap raggiunto (reroute_count=%d >= max=%d), "
-            "interrompo esecuzione con messaggio assistant esplicito",
-            _g1_reroute_count, _g1_max_nudges,
+            "executor_node: G1 cap raggiunto (reroute_count=%d >= max=%d) e catena "
+            "escalation esaurita (auto_escalations=%d), interrompo esecuzione",
+            _g1_reroute_count, _g1_max_nudges, _g1_escal,
         )
         _cap_text = (
-            f"Modello non risponde con azione dopo {_g1_max_nudges} tentativi, "
-            f"fermo l'esecuzione. Riformula la richiesta in modo piu' specifico "
-            f"oppure prova con un modello piu' capace."
+            f"Modello non risponde con azione dopo {_g1_max_nudges} tentativi e "
+            f"anche i modelli piu' capaci provati in escalation non hanno agito. "
+            f"Fermo l'esecuzione: riformula la richiesta in modo piu' specifico."
         )
         return {
             "messages": [AIMessage(content=_cap_text)],
@@ -3878,6 +3979,12 @@ def route_after_executor(state: AgentState) -> str:
     if stop_reason == "loop_detected":
         logger.warning("route_after_executor: loop detected, chiusura forzata")
         return "learner"
+    # G1 escalation: l'executor ha promosso il turno a un modello piu' capace
+    # (sticky_model aggiornato, reroute azzerato). Ri-entra nell'executor per
+    # far agire il modello escalato. Il cap iterazioni globale resta la safety.
+    if stop_reason == "g1_escalated":
+        logger.warning("route_after_executor: G1 escalation orchestratore -> re-executor")
+        return "executor"
     # G1 cap: l'executor stesso ha gia' segnalato di aver raggiunto il
     # numero massimo di re-execution G1 e ha emesso il messaggio assistant
     # esplicativo. Andiamo direttamente al learner senza altri giri.
