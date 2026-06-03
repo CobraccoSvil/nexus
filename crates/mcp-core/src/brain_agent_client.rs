@@ -406,22 +406,46 @@ fn classify_provider_error(
     error_class: Option<&str>,
     msg: &str,
 ) -> Option<(&'static str, CooldownKind, &'static str)> {
+    // Marker testuali di quota/credito esaurito. Un HTTP 429 e' AMBIGUO: puo'
+    // essere un rate-limit transitorio (finestra di richieste, cooldown breve)
+    // oppure quota/credito esaurito (cooldown lungo come credit_balance_too_low).
+    // La distinzione si fa SOLO sul contenuto del messaggio: se compare uno di
+    // questi marker e' billing/quota, altrimenti rate-limit transitorio.
+    let lower = msg.to_lowercase();
+    let has_billing_marker = (lower.contains("credit balance") && lower.contains("too low"))
+        || lower.contains("insufficient_quota")
+        || lower.contains("insufficient quota")
+        || lower.contains("exceeded your current quota")
+        || lower.contains("billing_hard_limit_reached")
+        || lower.contains("billing hard limit")
+        || lower.contains("plans & billing")
+        || lower.contains("upgrade or purchase credits")
+        || lower.contains("upgrade or purchase")
+        || lower.contains("billing required")
+        || lower.contains("payment required")
+        || lower.contains("account is not active")
+        || lower.contains("no credits")
+        || lower.contains("quota ai esaurita")
+        || lower.contains("credito insufficiente");
+
+    const BILLING_REASON: &str = "Quota AI esaurita o credito insufficiente";
+
     // Step 1: error_class esplicito propagato dal brain.
     match error_class {
         Some("billing_error") | Some("billing_required") | Some("quota_exceeded")
         | Some("credit_balance_too_low") | Some("insufficient_quota") => {
-            return Some((
-                "billing_error",
-                CooldownKind::Long,
-                "Quota AI esaurita o credito insufficiente",
-            ));
+            return Some(("billing_error", CooldownKind::Long, BILLING_REASON));
         }
         Some("rate_limit") => {
-            return Some((
-                "rate_limit",
-                CooldownKind::Short,
-                "Rate limit raggiunto",
-            ));
+            // Anche con error_class=rate_limit esplicito, un 429 puo' in realta'
+            // essere quota/credito esaurito: il brain (o un altro provider) puo'
+            // aver mappato il 429 a rate_limit senza esaminare il messaggio.
+            // Se il testo contiene marker billing, promuovi a cooldown lungo,
+            // altrimenti resta rate-limit transitorio (cooldown breve).
+            if has_billing_marker {
+                return Some(("billing_error", CooldownKind::Long, BILLING_REASON));
+            }
+            return Some(("rate_limit", CooldownKind::Short, "Rate limit raggiunto"));
         }
         Some("overloaded") | Some("provider_error") | Some("server_error")
         | Some("service_unavailable") | Some("bad_gateway") | Some("internal_server_error") => {
@@ -435,22 +459,8 @@ fn classify_provider_error(
     }
 
     // Step 2: pattern matching sul testo (it/en).
-    let lower = msg.to_lowercase();
-    if (lower.contains("credit balance") && lower.contains("too low"))
-        || lower.contains("insufficient_quota")
-        || lower.contains("exceeded your current quota")
-        || lower.contains("plans & billing")
-        || lower.contains("upgrade or purchase credits")
-        || lower.contains("billing required")
-        || lower.contains("payment required")
-        || lower.contains("quota ai esaurita")
-        || lower.contains("credito insufficiente")
-    {
-        return Some((
-            "billing_error",
-            CooldownKind::Long,
-            "Quota AI esaurita o credito insufficiente",
-        ));
+    if has_billing_marker {
+        return Some(("billing_error", CooldownKind::Long, BILLING_REASON));
     }
     if lower.contains("rate limit")
         || lower.contains("limite di richieste")
@@ -1470,5 +1480,75 @@ mod tests {
         // Non devono esserci tool non in whitelist
         assert!(!names.contains(&"edit_file"));
         assert!(!names.contains(&"run_command"));
+    }
+
+    // ── Classificazione errori provider / cooldown ────────────────────────────
+
+    #[test]
+    fn quota_429_e_billing_cooldown_lungo() {
+        // Caso live: OpenAI risponde HTTP 429 "You exceeded your current quota".
+        // E' quota/credito esaurito, NON un rate-limit transitorio: deve dare
+        // cooldown lungo come credit_balance_too_low.
+        let msg = "Error code: 429 - {'error': {'message': 'You exceeded your current quota, please check your plan and billing details.', 'type': 'insufficient_quota'}}";
+        let (class, kind, _) = classify_provider_error(None, msg)
+            .expect("429 quota deve essere classificato");
+        assert_eq!(class, "billing_error");
+        assert_eq!(kind, CooldownKind::Long);
+    }
+
+    #[test]
+    fn rate_limit_429_senza_marker_quota_e_cooldown_breve() {
+        // 429 generico (finestra di richieste) senza marker di quota/credito:
+        // rate-limit transitorio, cooldown breve.
+        let msg = "Error code: 429 - Rate limit reached for requests. Please try again later.";
+        let (class, kind, _) = classify_provider_error(None, msg)
+            .expect("429 rate limit deve essere classificato");
+        assert_eq!(class, "rate_limit");
+        assert_eq!(kind, CooldownKind::Short);
+    }
+
+    #[test]
+    fn error_class_rate_limit_ma_messaggio_quota_promosso_a_billing() {
+        // Difesa in profondita': anche se il brain (o un provider) ha mappato
+        // il 429 a error_class=rate_limit, se il messaggio contiene marker di
+        // quota la classe va promossa a billing/cooldown-lungo. Senza questo,
+        // l'error_class esplicito short-circuitava il pattern matching e il
+        // provider con quota esaurita restava nel cascade (bug live).
+        let msg = "You exceeded your current quota, please check your plan and billing details.";
+        let (class, kind, _) = classify_provider_error(Some("rate_limit"), msg)
+            .expect("deve essere classificato");
+        assert_eq!(class, "billing_error");
+        assert_eq!(kind, CooldownKind::Long);
+    }
+
+    #[test]
+    fn error_class_rate_limit_senza_marker_resta_rate_limit() {
+        // error_class=rate_limit + messaggio senza marker quota: resta
+        // rate-limit transitorio (cooldown breve).
+        let (class, kind, _) =
+            classify_provider_error(Some("rate_limit"), "Too Many Requests")
+                .expect("deve essere classificato");
+        assert_eq!(class, "rate_limit");
+        assert_eq!(kind, CooldownKind::Short);
+    }
+
+    #[test]
+    fn insufficient_quota_error_class_e_billing() {
+        // error_class esplicito insufficient_quota -> billing/cooldown-lungo.
+        let (class, kind, _) =
+            classify_provider_error(Some("insufficient_quota"), "")
+                .expect("deve essere classificato");
+        assert_eq!(class, "billing_error");
+        assert_eq!(kind, CooldownKind::Long);
+    }
+
+    #[test]
+    fn billing_hard_limit_reached_e_billing() {
+        // Marker OpenAI billing_hard_limit_reached -> cooldown lungo.
+        let msg = "Error code: 429 - billing_hard_limit_reached";
+        let (class, kind, _) = classify_provider_error(None, msg)
+            .expect("deve essere classificato");
+        assert_eq!(class, "billing_error");
+        assert_eq!(kind, CooldownKind::Long);
     }
 }
