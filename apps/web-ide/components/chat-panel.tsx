@@ -546,6 +546,9 @@ export function ChatPanel({
   // Azzerato al primo response success o quando l'utente ricomincia a scrivere
   // (per non sovrascrivere il nuovo input se l'errore arriva in ritardo).
   const pendingSendSnapshotRef = useRef<{ text: string; attachments: ChatAttachment[] } | null>(null);
+  // Invio "in sospeso" quando la richiesta risulta GIA' COMPLETATA: l'agente NON
+  // parte finche' l'utente non clicca "Rifai comunque" (onProceed del banner).
+  const pendingProceedSendRef = useRef<(() => void) | null>(null);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [precheckPending] = useState(false);
   const [precheckResult, setPrecheckResult] = useState<PrecheckResult & { originalText: string } | null>(null);
@@ -776,7 +779,7 @@ export function ChatPanel({
 
   /* ---- Handlers ---- */
 
-  const doSend = (text: string, providerHintOverride?: { provider?: string; model?: string }) => {
+  const doSend = async (text: string, providerHintOverride?: { provider?: string; model?: string }) => {
     // Se il provider e' "auto" e c'e' un hint esterno (es. generazione documenti),
     // usa il hint per forzare un provider/modello capace.
     const hint = providerHintOverride || externalProviderHint;
@@ -798,33 +801,56 @@ export function ChatPanel({
         : undefined;
     const modeForSend = automationOnceRef.current ?? automationMode;
     automationOnceRef.current = null;
-    // Knowledge: ricerca note simili (non bloccante)
-    if (hasProject) {
-      findSimilarKnowledge(projectId, text)
-        .then((r) => { if (r.hits.length > 0) setSimilarHits(r.hits); })
-        .catch(() => {});
-    }
-    // Snapshot del messaggio in volo: se l'invio fallisce (es. 500 backend,
-    // network, body limit), useEffect su `error` riporta input + attachments
-    // nello stato cosi' l'utente non perde quello che aveva scritto e puo'
-    // ritentare con un solo click. Vedi l'useEffect "restore-on-error" piu'
-    // sotto. snapshot azzerato al primo response success o quando l'utente
-    // ricomincia a scrivere.
-    pendingSendSnapshotRef.current = { text, attachments: [...attachments] };
-    void send(text, {
+
+    const snapshotAttachments = [...attachments];
+    const sendOpts = {
       profileId,
       activeFiles,
       providerOverride: effectiveProvider,
       modelOverride: effectiveModel,
       automationMode: modeForSend,
       supervisorMode: supervisorMode !== "none" ? supervisorMode : undefined,
-      attachments,
-    });
-    setInput("");
-    setAttachments([]);
-    setAttachmentError(null);
-    setPrecheckResult(null);
-    if (fileInputRef.current) fileInputRef.current.value = "";
+      attachments: snapshotAttachments,
+    };
+    // Snapshot del messaggio in volo: se l'invio fallisce (es. 500 backend,
+    // network, body limit), useEffect su `error` riporta input + attachments
+    // nello stato cosi' l'utente non perde quello che aveva scritto e puo'
+    // ritentare con un solo click.
+    const fireSend = () => {
+      pendingSendSnapshotRef.current = { text, attachments: snapshotAttachments };
+      void send(text, sendOpts);
+    };
+    const clearComposer = () => {
+      setInput("");
+      setAttachments([]);
+      setAttachmentError(null);
+      setPrecheckResult(null);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    };
+
+    // Knowledge: ricerca note simili. Se la richiesta risulta GIA' COMPLETATA
+    // (hit.implemented), mostra il banner e NON spawna l'agente: l'invio resta
+    // in sospeso finche' l'utente non clicca "Rifai comunque" (onProceed). Hit
+    // solo "simili" (non completate) o errore della ricerca: banner informativo,
+    // ma si procede normalmente.
+    if (hasProject) {
+      try {
+        const r = await findSimilarKnowledge(projectId, text);
+        if (r.hits.length > 0) {
+          setSimilarHits(r.hits);
+          if (r.hits.some((h) => h.implemented)) {
+            pendingProceedSendRef.current = fireSend;
+            clearComposer();
+            return;
+          }
+        }
+      } catch {
+        /* ricerca note non bloccante: in caso di errore si procede con l'invio */
+      }
+    }
+
+    fireSend();
+    clearComposer();
   };
 
   // Auto-send: quando l'input esterno richiede invio automatico (es. Auto Fix sequenziale)
@@ -1874,9 +1900,26 @@ export function ChatPanel({
       {similarHits.length > 0 && (
         <SimilarRequestBanner
           hits={similarHits}
-          onProceed={() => setSimilarHits([])}
-          onOpenNote={() => setSimilarHits([])}
-          onDismiss={() => setSimilarHits([])}
+          onProceed={() => {
+            // "Rifai comunque": esegue l'invio rimasto in sospeso (se la richiesta
+            // era gia' completata). Per gli hit solo "simili" non c'e' invio in
+            // sospeso e il banner era puramente informativo.
+            const proceed = pendingProceedSendRef.current;
+            pendingProceedSendRef.current = null;
+            setSimilarHits([]);
+            proceed?.();
+          }}
+          onOpenNote={(noteId) => {
+            // Apre la nota e annulla l'invio in sospeso (l'utente sta consultando).
+            pendingProceedSendRef.current = null;
+            setSimilarHits([]);
+            window.dispatchEvent(new CustomEvent("nexus:note:open", { detail: { noteId } }));
+          }}
+          onDismiss={() => {
+            // Chiude senza eseguire: scarta l'eventuale invio in sospeso.
+            pendingProceedSendRef.current = null;
+            setSimilarHits([]);
+          }}
         />
       )}
 
