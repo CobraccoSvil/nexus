@@ -330,6 +330,59 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
 
     # Estrai il tool_use per nexus_todo_write
     todo_block = next((b for b in pending_tool_uses if b.get("name") == "nexus_todo_write"), None)
+
+    # ── FALLBACK tool-robust (mig 0267) ──────────────────────────────────────
+    # Se il modello primario NON ha emesso la tool call (tipico dei modelli
+    # thinking che ritornano finish_reason MALFORMED_FUNCTION_CALL con output
+    # vuoto sotto tool_choice forzato), prima di rinunciare tentiamo UNA sola
+    # volta con un modello fallback non-thinking risolto via DB
+    # (nexus_purpose_model.planner_fallback, regola G). Niente ricorsione/loop.
+    if todo_block is None:
+        try:
+            fb_decision = _routing_client.purpose_model(purpose="planner_fallback")
+            fb_provider = fb_decision.provider
+            fb_model = fb_decision.model
+        except Exception as exc:
+            logger.error(
+                "planner_node: purpose_model(planner_fallback) fallito: %s — skip",
+                exc,
+            )
+            fb_provider = None
+            fb_model = None
+
+        _sentinels = {"__router_unavailable__", "__no_capable_provider__"}
+        if (
+            fb_provider
+            and fb_provider not in _sentinels
+            and fb_model not in _sentinels
+            and (fb_provider, fb_model) != (used_provider, used_model)
+        ):
+            logger.warning(
+                "planner_node: nessuna tool call dal primario %s/%s — "
+                "tentativo fallback tool-robust %s/%s",
+                used_provider, used_model, fb_provider, fb_model,
+            )
+            try:
+                fb_result = await _asyncio.to_thread(
+                    _providers.generate_agent_turn_sync,
+                    fb_provider, fb_model, anth_messages, tools_json,
+                    max_tokens=4096, system_text=hinted_system,
+                )
+                fb_meta = fb_result.metadata or {}
+                pending_tool_uses = list(fb_meta.get("tool_use_blocks") or [])
+                used_provider = fb_result.provider or fb_provider
+                used_model = fb_result.model or fb_model
+                todo_block = next(
+                    (b for b in pending_tool_uses if b.get("name") == "nexus_todo_write"),
+                    None,
+                )
+            except Exception as exc:
+                logger.error("planner_node: LLM call fallback fallita: %s", exc)
+                return {
+                    "plan_phase_active": False,
+                    "plan_phase_skip_reason": f"llm_error:{type(exc).__name__}",
+                }
+
     if todo_block is None:
         logger.warning(
             "planner_node: il modello non ha emesso nexus_todo_write (pending=%d) — skip",

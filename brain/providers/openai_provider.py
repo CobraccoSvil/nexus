@@ -119,7 +119,16 @@ class OpenAIProvider(BaseProvider):
             import httpx
             transport = get_global_dns_transport()
             http_client = httpx.AsyncClient(transport=transport) if transport is not None else None
-            self._client = AsyncOpenAI(api_key=self._api_key, http_client=http_client)
+            # max_retries=0: i retry sono governati a livello applicativo (cascade
+            # M60 nel registry), non dall'SDK. Su errori non-retriabili come
+            # 402/insufficient_quota (credit_balance_too_low) il client OpenAI
+            # ritenterebbe comunque, sprecando latenza durante il cascade mentre
+            # openai e' gia' in cooldown billing. Vedi FIX cooldown openai.
+            self._client = AsyncOpenAI(
+                api_key=self._api_key,
+                http_client=http_client,
+                max_retries=0,
+            )
         return self._client
 
     def list_models(self) -> list[ProviderCatalogEntry]:
