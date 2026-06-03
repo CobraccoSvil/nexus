@@ -1345,8 +1345,14 @@ async def router_node(state: AgentState) -> dict[str, Any]:
     behavior_mode = state.get("behavior_mode", "bilanciata")
 
     # Boost token_budget per intent complessi che richiedono piu' output
-    # (generazione documenti, analisi codice, fix estesi).
-    COMPLEX_INTENTS = {"doc_generate", "analyze", "fix", "refactor", "implement"}
+    # (generazione documenti, analisi codice, fix estesi). Inclusi anche gli
+    # intent "attivi" che usano tool e producono output reale (file_ops,
+    # architecture, system_admin): senza boost restavano al floor di 400 token,
+    # insufficiente per un turno agentico con tool_use + risposta.
+    COMPLEX_INTENTS = {
+        "doc_generate", "analyze", "fix", "refactor", "implement",
+        "file_ops", "architecture", "system_admin",
+    }
     text_lower = str(text).lower()
     is_complex = intent in COMPLEX_INTENTS or any(
         kw in text_lower for kw in ("genera", "document", "analisi tecnica", "implementa")
@@ -1373,7 +1379,14 @@ async def router_node(state: AgentState) -> dict[str, Any]:
                 task_type=intent, instructions=last_text,
                 task_id=state.get("thread_id"),
             )
-            if not sel.is_empty:
+            # Gating: ci si fida del Q-router SOLO quando la scelta deriva da
+            # Q-value appresi (EXPLOITATION) o e' forzata (FORCED). In COLD_START
+            # (Q-table ancora vuota) ed EXPLORATION (epsilon-greedy random) la
+            # selezione e' basata su similarity/caso e produce profili incoerenti
+            # col task (es. 'tester' per file_ops): in quei casi si preferisce il
+            # fallback statico intent->profilo (route_profile_for_intent piu' sotto).
+            _trusted = sel.strategy in ("EXPLOITATION", "FORCED")
+            if not sel.is_empty and _trusted:
                 suggested = profile_loader.get_profile(sel.agent_type)
                 if suggested is not None:
                     logger.info(
@@ -1388,6 +1401,12 @@ async def router_node(state: AgentState) -> dict[str, Any]:
                         "non presente nel catalog",
                         sel.agent_type,
                     )
+            elif not sel.is_empty:
+                logger.info(
+                    "router_node: agent_router strategy=%s (q=%.3f) non affidabile, "
+                    "uso fallback statico intent->profilo",
+                    sel.strategy, sel.q_value,
+                )
         except Exception as exc:
             logger.debug("router_node: agent_router select fallito: %s", exc)
 
