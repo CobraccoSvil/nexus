@@ -53,7 +53,19 @@ def resolve_tool_choice(
         return None
 
     weak = bool(weak_models) and any(t in cap.model.lower() for t in weak_models)
-    force_first = cap.tool_choice_first_turn_force and not weak and is_first_agent_turn(messages)
+    # I modelli in thinking/reasoning mode non accettano un tool_choice forzato:
+    # DeepSeek V4 risponde HTTP 400 "Thinking mode does not support this
+    # tool_choice", e lo stesso vincolo vale per Anthropic con extended thinking
+    # e per i reasoning OpenAI (o1/o3, gia' style 'none'). In quel caso si degrada
+    # ad "auto": il modello decide da se' quando invocare i tool, senza la
+    # forzatura anti-narration del primo turno. Guard cross-provider, valido per
+    # qualunque modello thinking presente o futuro (la verita' resta cap.thinking).
+    force_first = (
+        cap.tool_choice_first_turn_force
+        and not weak
+        and not cap.thinking
+        and is_first_agent_turn(messages)
+    )
 
     if style == "anthropic_any":
         return {"type": "any"} if force_first else {"type": "auto"}
