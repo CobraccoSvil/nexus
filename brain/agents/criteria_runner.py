@@ -25,6 +25,15 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Estensioni di codice sorgente considerate "moduli applicativi" per il gate
+# no_orphan_imported (frontend JS/TS framework-agnostic).
+_CODE_EXTS: tuple[str, ...] = (".tsx", ".ts", ".jsx", ".js", ".vue", ".svelte")
+# Import/re-export con sorgente RELATIVA (./ o ../). Cattura sia
+# `... from "./x"` sia `import "./x"`.
+_REL_IMPORT_RE = re.compile(
+    r"""(?:from|import)\s*['"](\.{1,2}/[^'"]+)['"]"""
+)
+
 
 async def run_criterion(criterion: dict[str, Any], ctx: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
     """Esegue un singolo acceptance_criterion.
@@ -77,6 +86,8 @@ async def run_criterion(criterion: dict[str, Any], ctx: dict[str, Any]) -> tuple
         ok, ev = await _check_regex_in_output(spec, expected, ctx, timeout_s)
     elif c_type == "db_query":
         ok, ev = await _check_db_query(spec, expected, timeout_s)
+    elif c_type in ("no_orphan_imported", "imported_code_mounted"):
+        ok, ev = await _check_no_orphan_imported(spec, expected, ctx, timeout_s)
     else:
         ok = False
         ev = {"error": f"tipo di criterion sconosciuto: '{c_type}'"}
@@ -132,6 +143,155 @@ async def _check_run_command(
         "expected_exit": expected_exit,
         "output_excerpt": raw[:600],
     }
+    return passed, evidence
+
+
+# ── no_orphan_imported (gate generale anti-placeholder) ────────────────────
+
+
+async def _check_no_orphan_imported(
+    spec: dict[str, Any], expected: dict[str, Any], ctx: dict[str, Any], timeout_s: float,
+) -> tuple[bool, dict[str, Any]]:
+    """Gate GENERALE contro il pattern "placeholder/hello-world sopra codice importato".
+
+    Principio (indipendente da schema/sorgente del design): se nel progetto
+    esiste codice importato/staged (default `figma_export/`) con almeno N file
+    di codice, l'entry servito dell'app (default `src/main.tsx`) DEVE raggiungere,
+    via grafo degli import relativi, una frazione significativa di quei moduli.
+    Se il codice importato resta ORFANO (l'app monta un guscio vuoto), il task
+    non e' completo. Vale per Figma/v0/Builder/qualsiasi import.
+
+    spec: {staging_dir: "figma_export"|[...], entry: "src/main.tsx",
+           min_staging_files: 3, min_reached_ratio: 0.4, max_reads: 80}
+    expected: {mounted: true}
+    """
+    tool_runner = ctx.get("tool_runner")
+    session_id = ctx.get("session_id")
+    if not tool_runner or not session_id:
+        return False, {"error": "tool_runner o session_id assenti"}
+
+    staging = spec.get("staging_dir") or "figma_export"
+    staging_dirs = [staging] if isinstance(staging, str) else [str(s) for s in staging]
+    entry = spec.get("entry") or "src/main.tsx"
+    min_staging = int(spec.get("min_staging_files", 3))
+    min_ratio = float(spec.get("min_reached_ratio", 0.4))
+    cap_reads = int(spec.get("max_reads", 80))
+    sid = str(session_id)
+
+    async def _run(cmd: str) -> str:
+        try:
+            r = await asyncio.wait_for(
+                tool_runner.execute_tool(
+                    tool_name="run_command", tool_input={"command": cmd},
+                    session_id=sid, tool_use_id=str(uuid.uuid4()),
+                ),
+                timeout=timeout_s,
+            )
+            return r.result_json or ""
+        except Exception:
+            return ""
+
+    async def _read(path: str) -> str | None:
+        try:
+            r = await asyncio.wait_for(
+                tool_runner.execute_tool(
+                    tool_name="read_file", tool_input={"path": path},
+                    session_id=sid, tool_use_id=str(uuid.uuid4()),
+                ),
+                timeout=timeout_s,
+            )
+            raw = r.result_json or ""
+            head = raw[:120].lower()
+            if raw.startswith("❌") or "[errore" in head or "[error" in head \
+                    or "not found" in head or "non trovato" in head:
+                return None
+            return raw
+        except Exception:
+            return None
+
+    def _code_paths(out: str) -> list[str]:
+        res = []
+        for line in out.splitlines():
+            line = line.strip()
+            if "/" in line and line.endswith(_CODE_EXTS):
+                res.append(line)
+        return res
+
+    exts_find = " -o ".join(f"-name '*{e}'" for e in _CODE_EXTS)
+
+    # 1. File di codice nello staging (codice del design importato).
+    staging_files: list[str] = []
+    for sdir in staging_dirs:
+        out = await _run(f"find {sdir} -type f \\( {exts_find} \\) 2>/dev/null")
+        staging_files.extend(_code_paths(out))
+    # basename "chiave": escludiamo entrypoint generici che non discriminano.
+    _generic = {"main.tsx", "main.ts", "main.jsx", "main.js",
+                "index.ts", "index.tsx", "index.js", "index.jsx", "vite-env.d.ts"}
+    staging_key = {p.rsplit("/", 1)[-1] for p in staging_files} - _generic
+    if len(staging_key) < min_staging:
+        return True, {
+            "skipped": f"staging {staging_dirs} con < {min_staging} file di codice: "
+                       "nessun design importato significativo, criterio N/A",
+            "staging_key_files": len(staging_key),
+        }
+
+    # 2. Mappa basename->path dei file in src/ (per risolvere gli import).
+    src_root = entry.split("/", 1)[0] if "/" in entry else "src"
+    src_files = _code_paths(await _run(f"find {src_root} -type f \\( {exts_find} \\) 2>/dev/null"))
+    by_stem: dict[str, list[str]] = {}
+    for p in src_files:
+        stem = p.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        by_stem.setdefault(stem, []).append(p)
+
+    # 3. BFS sul grafo degli import a partire dall'entry servito.
+    visited: set[str] = set()
+    reached: set[str] = set()
+    frontier = [entry]
+    reads = 0
+    while frontier and reads < cap_reads:
+        cur = frontier.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        content = await _read(cur)
+        reads += 1
+        if not content:
+            continue
+        reached.add(cur.rsplit("/", 1)[-1])
+        for m in _REL_IMPORT_RE.finditer(content):
+            rel = m.group(1)
+            imp_stem = rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            if imp_stem in ("index", ""):
+                imp_stem = rel.rstrip("/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            for cand in by_stem.get(imp_stem, []):
+                if cand not in visited:
+                    frontier.append(cand)
+
+    # 4. Quanti moduli chiave del design sono effettivamente raggiunti?
+    matched = {b for b in staging_key if b in reached}
+    ratio = len(matched) / max(1, len(staging_key))
+    mounted = ratio >= min_ratio
+    expected_mounted = bool(expected.get("mounted", True))
+    passed = (mounted == expected_mounted)
+    evidence = {
+        "staging_dirs": staging_dirs,
+        "staging_key_files": len(staging_key),
+        "entry": entry,
+        "reached_modules": len(reached),
+        "matched_count": len(matched),
+        "matched": sorted(matched)[:30],
+        "ratio": round(ratio, 2),
+        "min_ratio": min_ratio,
+        "mounted": mounted,
+        "reads": reads,
+    }
+    if not mounted:
+        evidence["output_excerpt"] = (
+            f"CODICE IMPORTATO ORFANO: l'app servita ({entry}) monta solo "
+            f"{len(matched)}/{len(staging_key)} moduli del design in {staging_dirs} "
+            f"(ratio {round(ratio, 2)} < {min_ratio}). Integra gli entrypoint del "
+            f"design in {src_root}/ e montali da {entry} (non lasciare un placeholder)."
+        )
     return passed, evidence
 
 
