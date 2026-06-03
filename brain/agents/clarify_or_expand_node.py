@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from typing import Any
 
 from . import meta_steps, prompt_registry
@@ -37,17 +38,45 @@ logger = logging.getLogger(__name__)
 # Iniettati da configure(); riusiamo gli stessi singletoni di planner_node.
 _providers: Any = None
 _routing_client: Any = None
+# Tool runner gRPC (stesso singleton di verifier/understanding) per esplorare
+# il workspace e dedurre il dominio invece di chiedere all'utente.
+_tool_runner: Any = None
 
 # Endpoint interno no-auth gia' usato altrove: riuso del servizio di ricerca
 # vettoriale esistente (condizione di integrazione, niente client nuovo).
 _MCP_CORE_INTERNAL_URL = os.environ.get("MCP_CORE_INTERNAL_URL", "http://localhost:4000")
 
+# Marcatori di dominio/codice/design: la loro presenza nel listing top-level del
+# progetto indica un progetto ESISTENTE da cui dedurre dominio ed entita',
+# rendendo superflua la domanda all'utente.
+_DOMAIN_MARKERS: tuple[tuple[str, str], ...] = (
+    ("figma_export", "design importato (figma_export/)"),
+    ("src", "codice sorgente (src/)"),
+    ("app", "codice applicativo (app/)"),
+    ("lib", "codice di libreria (lib/)"),
+    ("package.json", "progetto Node/JS (package.json)"),
+    ("requirements.txt", "progetto Python (requirements.txt)"),
+    ("pyproject.toml", "progetto Python (pyproject.toml)"),
+    ("go.mod", "progetto Go (go.mod)"),
+    ("cargo.toml", "progetto Rust (Cargo.toml)"),
+    ("pom.xml", "progetto Java/Maven (pom.xml)"),
+    ("readme", "documentazione di progetto (README)"),
+    (".csproj", "progetto .NET (*.csproj)"),
+    ("composer.json", "progetto PHP (composer.json)"),
+    ("gemfile", "progetto Ruby (Gemfile)"),
+)
 
-def configure(providers: Any, routing_client: Any) -> None:
-    """Iniettato dal grpc_server in startup, in parallelo a planner_node."""
-    global _providers, _routing_client
+
+def configure(providers: Any, routing_client: Any, tool_runner: Any = None) -> None:
+    """Iniettato dal grpc_server in startup, in parallelo a planner_node.
+
+    `tool_runner` (opzionale) abilita l'esplorazione leggera del workspace per
+    dedurre il dominio dei progetti esistenti (vedi `_build_project_context`).
+    """
+    global _providers, _routing_client, _tool_runner
     _providers = providers
     _routing_client = routing_client
+    _tool_runner = tool_runner
 
 
 def _load_config() -> dict[str, Any]:
@@ -463,6 +492,58 @@ def _apply_intake_verdict(state: AgentState, intake: dict, cfg: dict) -> dict[st
     return updates
 
 
+async def _build_project_context(state: AgentState) -> str:
+    """Esplora in modo leggero il progetto (UNA `list_files` sulla root) e
+    rileva marcatori di dominio/codice/design. Ritorna un breve blocco testuale
+    da iniettare nel prompt del clarify, oppure "" se non c'e' nulla da segnalare
+    o se il tool_runner non e' configurato.
+
+    Best-effort: qualunque errore -> "" (comportamento storico, nessun blocco).
+    NON legge file pesanti: solo il listing top-level (1 chiamata).
+    """
+    if _tool_runner is None:
+        return ""
+    session_id = str(state.get("session_id") or "")
+    if not session_id:
+        return ""
+    try:
+        import asyncio as _aio_ctx
+        res = await _aio_ctx.wait_for(
+            _tool_runner.execute_tool(
+                tool_name="list_files",
+                tool_input={"directory": "."},
+                session_id=session_id,
+                tool_use_id=str(uuid.uuid4()),
+            ),
+            timeout=5,
+        )
+        raw = getattr(res, "result_json", None) or ""
+    except Exception as exc:
+        logger.debug("clarify_or_expand: list_files root fallita (%s)", exc)
+        return ""
+
+    if not raw or raw.startswith("❌") or "[Errore" in raw[:30] or "[Error" in raw[:30]:
+        return ""
+
+    raw_lower = raw.lower()
+    found: list[str] = []
+    seen: set[str] = set()
+    for marker, label in _DOMAIN_MARKERS:
+        if marker in raw_lower and label not in seen:
+            found.append(label)
+            seen.add(label)
+    if not found:
+        return ""
+    logger.info("clarify_or_expand: project_context rilevato (%d marcatori)", len(found))
+    return (
+        "CONTESTO PROGETTO: il workspace contiene gia' "
+        + ", ".join(found)
+        + ". Si tratta di un progetto ESISTENTE: dominio, entita' e stack sono "
+        "DEDUCIBILI esplorando questi file. NON chiedere all'utente la natura "
+        "dell'applicazione ne' le entita'."
+    )
+
+
 async def clarify_or_expand_node(state: AgentState) -> dict[str, Any]:
     """Decide se chiedere chiarimento o arricchire la query per il retrieve.
 
@@ -597,6 +678,13 @@ async def clarify_or_expand_node(state: AgentState) -> dict[str, Any]:
     if not system_text:
         logger.debug("clarify_or_expand: prompt '%s' non trovato, skip", cfg["prompt_key"])
         return {}
+
+    # CONTESTO PROGETTO (esplorazione leggera): solo ora che il clarify e' gia'
+    # triggerato (NON su ogni messaggio). Una list_files top-level per dedurre
+    # se il dominio e' gia' presente nei file -> prompt sceglie mode=skip.
+    project_context = await _build_project_context(state)
+    if project_context:
+        system_text = system_text + "\n\n" + project_context
 
     # Tool con schema strutturato per garantire un JSON parsabile.
     tools_json = [{

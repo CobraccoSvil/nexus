@@ -133,7 +133,7 @@ def create_agent_graph(
     # Final gate generale (fail-closed): riusa il tool_runner per i criteri
     # generali (no_orphan_imported) sui task software senza plan_phase.
     _configure_final_gate(tool_runner=tool_runner)
-    _configure_clarify(providers=providers, routing_client=_routing_client)
+    _configure_clarify(providers=providers, routing_client=_routing_client, tool_runner=tool_runner)
     _configure_understanding(providers=providers, tool_runner=tool_runner, routing_client=_routing_client)
     # M13.4: il regression gate riusa il tool_runner per eseguire i test impact
     # (criteria_runner) e creare nota/todo via tool MCP.
