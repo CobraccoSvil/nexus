@@ -11,9 +11,10 @@ tags:
   - verifier
   - anti-pattern
   - structural-signals
+  - capability-gate
 auto_generated: false
 created_at: 2026-06-04T00:00:00Z
-updated_at: 2026-06-04T00:00:00Z
+updated_at: 2026-06-04T12:00:00Z
 nexus_meta_version: 1
 ---
 
@@ -21,7 +22,8 @@ nexus_meta_version: 1
 
 ## Stato
 
-Proposto (2026-06-04). Implementazione a fasi.
+Proposto (2026-06-04), rafforzato lo stesso giorno con il gate di capability
+(leva 0) dopo verifica sul catalog reale. Implementazione a fasi.
 
 ## Contesto
 
@@ -68,8 +70,35 @@ possiede.
 ## Decisione
 
 Sostituire le euristiche testuali con **segnali strutturali** gia' disponibili
-nel sistema, relegando le blacklist a fallback di ultima istanza. Tre leve
-complementari:
+nel sistema, eliminando le blacklist invece che relegarle a fallback. Quattro
+leve complementari, in ordine di applicazione:
+
+### 0. Gate di capability sul routing agentico
+
+Il routing per i run agente deve selezionare SOLO modelli con
+`ai_price_catalog.supports_tool_use = true`. I modelli non tool-capable (FIM,
+chat-completion puri, alcuni reasoning) restano disponibili per usi
+non-agentici (classify, vision, embedding, completion) ma non vengono mai
+assegnati a un loop agentico. Il campo `supports_tool_use` (boolean NOT NULL) e
+`consecutive_tool_failures` esistono GIA' in `ai_price_catalog`.
+
+Questo gate e' la pre-condizione che rende applicabili le leve successive: se al
+loop arrivano solo modelli capaci di usare tool, lo stop narrativo non e' piu'
+un comportamento "lecito ma indesiderato" del modello, ma diventa rilevabile e
+correggibile in modo strutturale.
+
+> ### Evidenza dai dati (2026-06-04)
+>
+> Verifica sul catalog reale: nel routing agentico era presente
+> `mistral | mistral-code-latest` con `supports_tool_use = false` — una
+> misconfigurazione che permette al router di assegnare a un run agente un
+> modello incapace di usare tool, producendo esattamente lo stop
+> narrativo/fallimento oggetto di questo ADR. Altri modelli non-tool
+> (`magistral-*` reasoning, `mistral-code-fim`, `gpt-5-chat-latest`,
+> `gpt-5.1-chat-latest`) sono correttamente fuori dal routing agentico. Tutti
+> gli altri modelli agentici (Claude 4.x, gemini-2.5, gpt-4o/5.x,
+> deepseek-v4-pro, o1) sono tool-capable. Il gate di capability risolve la
+> misconfigurazione in modo strutturale (regola H), non con un UPDATE manuale.
 
 ### 1. Segnali del protocollo (non testo)
 
@@ -91,8 +120,16 @@ Esiste gia' una logica discovery-aware (commit `d5e5b1c`).
 
 Caveat: non tutti i provider lo supportano (Gemini < 2.0). Va gestito
 `MALFORMED_FUNCTION_CALL` per modelli non tool-capable, marcando
-`ai_price_catalog.supports_tool_use = false` e facendo fallback alle euristiche
-solo per quei modelli.
+`ai_price_catalog.supports_tool_use = false` (gia' coperto dal gate della leva
+0, quindi questi modelli non arrivano nemmeno al loop agentico).
+
+Caveat capability fine: `supports_tool_use = true` non garantisce il supporto
+di `tool_choice = required` (es. o1 e alcuni reasoning hanno restrizioni sul
+forcing). Per distinguere, si puo' introdurre una capability
+`tool_choice_forcing` nel jsonb `capabilities` di `ai_price_catalog`. I modelli
+tool-capable ma senza forcing sono coperti dal livello 2 strutturale (segnale
+`stop_reason` + `tool_calls presence`), che NON e' una blacklist testuale:
+nessuna blacklist e' necessaria neppure per loro.
 
 ### 3. Motore di completamento task come fonte di verita' unica
 
@@ -111,44 +148,65 @@ Positive:
 - Decisioni del loop auditable e ripetibili.
 - Robustezza a lingua e a modello nuovo per costruzione.
 
+Conseguenza rafforzata sulle blacklist (rispetto alla stesura iniziale):
+
+- Con il gate di capability (leva 0), il `tool_choice` forcing e' SEMPRE
+  applicabile ai modelli agentici. Quindi le blacklist testuali
+  (`_INTENT_NARRATION_PATTERNS`, `_ACTION_PATTERNS` come meccanismo di
+  rilevamento intento, `resigned_patterns`) NON sono piu' necessarie nemmeno
+  come fallback: vanno RIMOSSE, non solo deprecate.
+- Il fallback per i (pochi) modelli che supportano `tool_use` ma non il
+  `tool_choice` forcing e' il LIVELLO 2 STRUTTURALE (segnale `stop_reason` +
+  `tool_calls presence`), che NON e' una blacklist testuale. Risultato: due
+  livelli, entrambi strutturali, zero blacklist.
+
 Negative e caveat:
 
-- Le blacklist restano come **fallback** per i provider senza tool_choice
-  forcing: non si eliminano del tutto, ma cessano di essere il meccanismo
-  decisionale primario.
 - L'implementazione tocca il cuore del loop agentico e i provider adapter:
   rischio di regressione reale. Serve copertura test esplicita sulle
   ramificazioni critiche (regola F del progetto).
+- La rimozione delle blacklist va eseguita solo dopo che gate + forcing +
+  segnale strutturale sono in produzione e verificati (vedi Fase 3): rimuoverle
+  prima lascerebbe scoperti i modelli senza forcing nella finestra di rollout.
 
 ## Piano a fasi
 
 ### Fase 1 - cuore (~90% del problema)
 
-- tool_choice forcing nei provider adapter, con normalizzazione cross-provider
-  (Anthropic / Gemini / OpenAI / Mistral).
-- Sostituzione del rilevamento G1 unfulfilled-intent con il segnale strutturale
-  (`stop_reason` + `tool_calls presence`).
-- `_INTENT_NARRATION_PATTERNS` (A2) diventa fallback solo quando tool_choice non
-  e' supportato dal provider.
+- (a) GATE di capability `supports_tool_use = true` sul routing agentico: il
+  router non assegna mai un modello non tool-capable a un loop agente.
+- (b) `tool_choice` forcing nei turni d'azione per i modelli che lo supportano,
+  con normalizzazione cross-provider (Anthropic / Gemini / OpenAI / Mistral).
+- (c) G1 reroute basato sul segnale strutturale `(stop_reason, tool_calls
+  presence)`, in sostituzione del rilevamento unfulfilled-intent testuale.
 
 ### Fase 2 - unificazione e router
 
 - Unificare A1 (`_ACTION_PATTERNS`) Python/Rust in un'unica fonte DB (tabella o
-  `settings`), eliminando l'hardcode doppio (regola G).
+  `settings`), eliminando l'hardcode doppio (regola G); oppure rimuoverli del
+  tutto se gia' coperti dal forcing e dall'intento del router.
 - Migrare il complexity scoring (A6) da keyword a `user_intent` del router.
 
-### Fase 3 - verifier come giudice unico
+### Fase 3 - rimozione blacklist e verifier come giudice unico
 
+- RIMOZIONE delle blacklist testuali (`_INTENT_NARRATION_PATTERNS` A2,
+  `resigned_patterns` A3) ora che il gate (leva 0) + forcing (leva 2) + segnale
+  strutturale (leva 1) le rendono superflue: niente piu' deprecazione, si
+  cancellano.
+- Eventuale capability `tool_choice_forcing` nel jsonb `capabilities` di
+  `ai_price_catalog` per i modelli tool-capable senza forcing (coperti dal
+  livello 2 strutturale).
 - Aggiungere i 3 criterion type al verifier e al `criteria_runner`:
   `action_requested`, `tool_capability`, `completion_confirmed`.
-- Deprecare A2 e A3 come logica primaria.
 
 ## Rischi
 
 - **Provider non tool-capable**: senza una mappa `supports_tool_use` accurata in
   `ai_price_catalog`, il forcing genera `MALFORMED_FUNCTION_CALL`. Mitigazione:
-  popolare e mantenere il campo, fallback automatico alle euristiche per quei
-  modelli.
+  il gate della leva 0 esclude questi modelli dal routing agentico prima ancora
+  che arrivino al forcing; resta da mantenere accurato il campo nel catalog
+  (l'incidente `mistral-code-latest` del 2026-06-04 mostra il costo di una sua
+  misconfigurazione).
 - **Regressione nel loop**: le tre leve toccano routing, adapter e gate.
   Mitigazione: rollout per fase, test di regressione sul caso Beauty-Book chat 7
   e su almeno un provider per ciascuna famiglia tool-choice.
