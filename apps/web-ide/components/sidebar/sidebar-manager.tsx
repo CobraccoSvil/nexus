@@ -6,7 +6,7 @@ import { ProjectExplorer } from "../project-explorer";
 import { SourceControlPanel } from "../git/source-control-panel";
 import { ServerMonitorPanel } from "./server-monitor-panel";
 import { ProjectDbPanel } from "../project-db/project-db-panel";
-import { KnowledgePanel } from "../knowledge/knowledge-panel";
+import { KnowledgeWorkspace } from "../wiki/knowledge-workspace";
 import { iconButton, inputStyle, listRowButton } from "./manager/shared";
 import { ViewHeader } from "./manager/view-header";
 import { RunDebugView } from "./manager/run-debug-view";
@@ -315,8 +315,30 @@ export function SidebarManager({
 
   if (activeSidebarView === "knowledge" && project) {
     return (
-      <div style={{ flex: 1, minHeight: 0, height: "100%", overflow: "hidden", display: "flex", flexDirection: "column" }}>
-        <KnowledgePanel project={project} />
+      <div style={{ flex: 1, minHeight: 0, height: "100%", overflow: "hidden", display: "flex", flexDirection: "column", minWidth: 0 }}>
+        <a
+          href={`/projects/${project.id}/kb`}
+          style={{
+            flexShrink: 0,
+            padding: "6px 10px",
+            background: `${tc.accent}1a`,
+            borderBottom: `1px solid ${tc.border}`,
+            color: tc.accent,
+            fontSize: 11,
+            textDecoration: "none",
+            display: "block",
+            lineHeight: 1.3,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+          title="Apri la Knowledge Base unificata a tutto schermo"
+        >
+          Knowledge Base unificata · <strong>Apri a schermo intero →</strong>
+        </a>
+        <div style={{ flex: 1, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column", minWidth: 0 }}>
+          <KnowledgeWorkspace scope="project" projectId={project.id} />
+        </div>
       </div>
     );
   }

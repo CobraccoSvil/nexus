@@ -226,9 +226,9 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     };
   }, []);
 
-  // Bridge `nexus:kb:open-code-doc` -> apre la sidebar Knowledge (la tab
-  // Code Wiki e la selezione della nota del file sono gestite da KnowledgePanel
-  // e CodeWikiTab, che ascoltano lo stesso evento). Navigazione codice -> doc.
+  // Bridge `nexus:kb:open-code-doc` -> apre la sidebar Knowledge, che ora
+  // monta KnowledgeWorkspace (sistema wiki unificato, API /api/wiki/*).
+  // Navigazione codice -> doc.
   useEffect(() => {
     const handler = () => setActiveSidebarView("knowledge");
     window.addEventListener("nexus:kb:open-code-doc", handler);
