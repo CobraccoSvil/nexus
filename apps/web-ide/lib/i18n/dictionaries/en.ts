@@ -372,6 +372,8 @@ export const en = {
     "wiki.tree.filter": "Filter docs...",
     "wiki.tree.docs": "docs",
     "wiki.tree.new_doc": "New doc",
+    "wiki.nav.open_hint": "Click a document to open it full screen.",
+    "wiki.nav.empty": "No documents in the knowledge base.",
     "wiki.empty.select_doc": "Select a doc from the tree on the left.",
     "wiki.editor.save": "Save (Ctrl+S)",
     "wiki.editor.saving": "Saving...",

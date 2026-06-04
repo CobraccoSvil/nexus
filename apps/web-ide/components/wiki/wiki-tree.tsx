@@ -87,14 +87,24 @@ export function WikiTreeNodeView({
 
   // Foglia: documento selezionabile.
   const isSel = node.doc?.id === selectedId;
+  const leafTitle = node.doc?.title ?? node.name;
+  // `category` mappa kind (meta) o intent (progetto): mostralo come tag piccolo
+  // per disambiguare i tipi (chat/run/code_doc/...). Vedi WikiDocSummary.
+  const kind = node.doc?.category;
+  // Tooltip HTML col titolo COMPLETO (+ tipo) cosi' l'hover mostra il nome
+  // intero anche quando l'ellipsis tronca nello spazio stretto della sidebar.
+  const fullTooltip = kind ? `${leafTitle} [${kind}]` : leafTitle;
   return (
     <button
       type="button"
       onClick={() => node.doc && onSelect(node.doc.id)}
-      title={node.doc?.title}
+      title={fullTooltip}
       style={{
-        display: "block",
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
         width: "100%",
+        minWidth: 0,
         textAlign: "left",
         background: isSel ? tc.accent + "30" : "none",
         border: "none",
@@ -104,13 +114,40 @@ export function WikiTreeNodeView({
         padding: "3px 0",
         paddingLeft: 10 + depth * 12,
         fontSize: 12.5,
-        whiteSpace: "nowrap",
-        overflow: "hidden",
-        textOverflow: "ellipsis",
       }}
     >
-      <span style={{ opacity: 0.7, marginRight: 4 }}>·</span>
-      {node.doc?.title ?? node.name}
+      <span style={{ opacity: 0.7, flexShrink: 0 }}>·</span>
+      <span
+        style={{
+          flex: 1,
+          minWidth: 0,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {leafTitle}
+      </span>
+      {kind && (
+        <span
+          style={{
+            flexShrink: 0,
+            fontSize: 9.5,
+            lineHeight: 1.4,
+            padding: "0 5px",
+            borderRadius: 8,
+            background: tc.bgInput,
+            color: tc.textSecondary,
+            border: `1px solid ${tc.border}`,
+            maxWidth: 84,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {kind}
+        </span>
+      )}
     </button>
   );
 }

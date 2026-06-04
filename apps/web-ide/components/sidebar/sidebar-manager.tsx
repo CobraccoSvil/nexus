@@ -6,7 +6,7 @@ import { ProjectExplorer } from "../project-explorer";
 import { SourceControlPanel } from "../git/source-control-panel";
 import { ServerMonitorPanel } from "./server-monitor-panel";
 import { ProjectDbPanel } from "../project-db/project-db-panel";
-import { KnowledgeWorkspace } from "../wiki/knowledge-workspace";
+import { KnowledgeNavigator } from "./knowledge-navigator";
 import { iconButton, inputStyle, listRowButton } from "./manager/shared";
 import { ViewHeader } from "./manager/view-header";
 import { RunDebugView } from "./manager/run-debug-view";
@@ -336,9 +336,7 @@ export function SidebarManager({
         >
           Knowledge Base unificata · <strong>Apri a schermo intero →</strong>
         </a>
-        <div style={{ flex: 1, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column", minWidth: 0 }}>
-          <KnowledgeWorkspace scope="project" projectId={project.id} />
-        </div>
+        <KnowledgeNavigator projectId={project.id} />
       </div>
     );
   }

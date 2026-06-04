@@ -5,7 +5,7 @@
 // ADR 0017 v2 fase 7.
 
 import * as React from "react";
-import { useParams } from "next/navigation";
+import { useParams, useSearchParams } from "next/navigation";
 import { KnowledgeWorkspace } from "../../../../components/wiki/knowledge-workspace";
 import { useThemeColors } from "../../../../lib/theme";
 import { useI18n } from "../../../../lib/i18n";
@@ -13,6 +13,10 @@ import { useI18n } from "../../../../lib/i18n";
 export default function ProjectKbPage() {
   const params = useParams<{ projectId: string }>();
   const projectId = params?.projectId;
+  // `?doc=<id>` permette al navigatore leggero della sidebar IDE di aprire la
+  // KB completa (3 colonne) gia' posizionata sul documento selezionato.
+  const searchParams = useSearchParams();
+  const initialDocId = searchParams?.get("doc") ?? undefined;
   const tc = useThemeColors();
   const { t } = useI18n();
 
@@ -59,7 +63,7 @@ export default function ProjectKbPage() {
         </span>
       </div>
       <div style={{ flex: 1, minHeight: 0, padding: 8 }}>
-        <KnowledgeWorkspace scope="project" projectId={projectId} />
+        <KnowledgeWorkspace scope="project" projectId={projectId} initialDocId={initialDocId} />
       </div>
     </div>
   );

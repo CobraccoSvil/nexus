@@ -365,6 +365,8 @@ export const it: PartialDictionary = {
     "wiki.tree.filter": "Filtra documenti...",
     "wiki.tree.docs": "documenti",
     "wiki.tree.new_doc": "Nuovo documento",
+    "wiki.nav.open_hint": "Clicca un documento per aprirlo a schermo intero.",
+    "wiki.nav.empty": "Nessun documento nella knowledge base.",
     "wiki.empty.select_doc": "Seleziona un documento dall'albero a sinistra.",
     "wiki.editor.save": "Salva (Ctrl+S)",
     "wiki.editor.saving": "Salvataggio...",

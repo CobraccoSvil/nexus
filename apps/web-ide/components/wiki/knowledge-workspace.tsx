@@ -36,6 +36,12 @@ import { TripleBrowser } from "./triple-browser";
 interface Props {
   scope: WikiScope;
   projectId?: string;
+  /**
+   * Doc da pre-selezionare al mount (es. arrivando da `?doc=...`).
+   * Usato quando il navigatore leggero in sidebar apre la KB full-page su un
+   * documento specifico. Si applica una sola volta all'apertura.
+   */
+  initialDocId?: string;
 }
 
 type TabKey = "edit" | "graph" | "triples" | "history";
@@ -52,7 +58,7 @@ function docToSummary(d: WikiDoc): WikiDocSummary {
   };
 }
 
-export function KnowledgeWorkspace({ scope, projectId }: Props) {
+export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
   const tc = useThemeColors();
   const { t } = useI18n();
   const dialog = useGlobalDialog();
@@ -60,7 +66,7 @@ export function KnowledgeWorkspace({ scope, projectId }: Props) {
   // ─── Stato lista/selezione ──────────────────────────────────────────
   const [docs, setDocs] = React.useState<WikiDoc[]>([]);
   const [loadingList, setLoadingList] = React.useState(false);
-  const [selectedId, setSelectedId] = React.useState<string | null>(null);
+  const [selectedId, setSelectedId] = React.useState<string | null>(initialDocId ?? null);
   const [selected, setSelected] = React.useState<WikiDoc | null>(null);
   const [links, setLinks] = React.useState<WikiLinksResponse | null>(null);
   const [loadingDetail, setLoadingDetail] = React.useState(false);
