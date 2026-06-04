@@ -822,23 +822,30 @@ pub async fn list_doc_links(
         let target_slug: String = row.try_get("target_slug").unwrap_or_default();
         let target_title: String = row.try_get("target_title").unwrap_or_default();
         let target_kind: String = row.try_get("target_kind").unwrap_or_default();
-        json!({
-            "from_doc_id": from_id,
-            "to_doc_id": to_id,
-            "rel_type": rel_type,
-            "confidence": confidence,
-            "created_by": created_by,
-            "evidence": evidence,
-            "direction": edge_dir,
-            "target": {
-                "id": target_id,
-                "scope": target_scope,
-                "project_id": target_project_id,
-                "slug": target_slug,
-                "title": target_title,
-                "kind": target_kind,
-            }
-        })
+        let doc_obj = json!({
+            "id": target_id,
+            "scope": target_scope,
+            "project_id": target_project_id,
+            "slug": target_slug,
+            "title": target_title,
+            "kind": target_kind,
+        });
+        // Contratto TS WikiLinksResponse: outbound[].to_doc, inbound[].from_doc
+        // (oggetti WikiDoc con .title). Il frontend usa l.to_doc/l.from_doc; "target"
+        // (flat) faceva l.from_doc undefined -> crash reading 'title'. Esponiamo la
+        // chiave nidificata attesa (più "target" per retrocompatibilità).
+        let doc_key = if edge_dir == "outbound" { "to_doc" } else { "from_doc" };
+        let mut obj = serde_json::Map::new();
+        obj.insert("from_doc_id".to_string(), json!(from_id));
+        obj.insert("to_doc_id".to_string(), json!(to_id));
+        obj.insert("rel_type".to_string(), json!(rel_type));
+        obj.insert("confidence".to_string(), json!(confidence));
+        obj.insert("created_by".to_string(), json!(created_by));
+        obj.insert("evidence".to_string(), json!(evidence));
+        obj.insert("direction".to_string(), json!(edge_dir));
+        obj.insert(doc_key.to_string(), doc_obj.clone());
+        obj.insert("target".to_string(), doc_obj);
+        Value::Object(obj)
     };
 
     let outbound: Vec<Value> = outbound_rows.into_iter().map(|r| map_row(r, "outbound")).collect();
