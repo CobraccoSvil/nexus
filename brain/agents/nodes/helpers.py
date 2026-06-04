@@ -735,6 +735,23 @@ _INTENT_NARRATION_PATTERNS: tuple[str, ...] = (
     "fammi controllare", "fammi leggere", "fammi dare un", "fammi guardare",
     "il prossimo passo", "prossimo step", "passo successivo", "passo a ",
     "proseguo con", "proseguo a ",
+    # Italiano — gerundio "sto + gerundio" (Fix A ADR 0017, caso chat 6 reale
+    # Beauty-Book run e38aaba7: "Sto procedendo con la creazione di altri test").
+    # I pattern "procedo con" sopra NON matchavano "procedENDO con": gap colmato.
+    "sto procedendo", "procedendo con", "procedendo a ", "procedendo alla",
+    "sto creando", "sto implementando", "sto scrivendo", "sto aggiungendo",
+    "sto generando", "sto preparando", "sto sviluppando",
+    "stiamo procedendo", "stiamo creando", "stiamo implementando",
+    # Italiano — futuro semplice (annuncio: "creero il file X" -> mai eseguito)
+    "creerò ", "creero ", "implementerò ", "implementero ",
+    "scriverò ", "scrivero ", "aggiungerò ", "aggiungero ",
+    "genererò ", "generero ", "preparerò ", "preparero ",
+    "continuerò ", "continuero ", "proseguirò ", "proseguiro ",
+    "il prossimo file", "i prossimi file", "i prossimi test",
+    # Italiano — perifrasi "continuo con" / "passo al"
+    "continuo con", "continuo a ", "passo al", "passo alla", "passo ai",
+    "ora creo", "ora implemento", "ora scrivo", "ora aggiungo",
+    "adesso creo", "adesso implemento", "adesso scrivo",
     # Inglese — intenzione futura imminente
     "let me check", "let me verify", "let me start", "let me read",
     "let me look", "let me inspect", "let me examine", "let me first",
@@ -744,6 +761,13 @@ _INTENT_NARRATION_PATTERNS: tuple[str, ...] = (
     "i'm going to", "i am going to", "let's check", "let's verify",
     "let's start", "let's look", "next, i", "now i'll", "now i will",
     "first, i'll", "first i'll", "first, let me",
+    # Inglese — present progressive + future complementari (gap colmato)
+    "i'm proceeding", "i am proceeding", "i'll proceed", "i will proceed",
+    "i'm creating", "i'm implementing", "i'm writing", "i'm adding",
+    "moving on to", "continuing with", "next i will create",
+    "i'll create", "i'll implement", "i'll write", "i'll add",
+    "i will create", "i will implement", "i will write", "i will add",
+    "the next step is", "the next file",
 )
 
 

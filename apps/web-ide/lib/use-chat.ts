@@ -28,217 +28,10 @@ import {
   selectChatLastMessage,
   useProjectStore,
 } from "./project-dispatcher";
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-type BusyAction = "resend" | "delete" | "feedback" | "feedback-positive";
-
-function upsertSyntheticAssistantMessage(current: ChatMessage[], message: ChatMessage): ChatMessage[] {
-  const index = current.findIndex((item) => item.id === message.id);
-  if (index >= 0) {
-    const next = [...current];
-    next[index] = message;
-    return next;
-  }
-  return [...current, message];
-}
-
-function buildTerminalRunSummary(run: AgentRunInfo): string {
-  const completed = run.steps.filter((step) => step.status === "completed").length;
-  const failed = run.steps.filter((step) => step.status === "failed").length;
-  const awaiting = run.pendingActions.length;
-
-  if (run.status === "completed") {
-    return completed > 0
-      ? `Operazione completata. Ho eseguito ${completed} step.`
-      : "Operazione completata.";
-  }
-  if (run.status === "failed") {
-    if (completed > 0) {
-      return `Operazione terminata con errore dopo ${completed} step completati${failed > 0 ? ` e ${failed} falliti` : ""}.`;
-    }
-    return "Operazione terminata con errore.";
-  }
-  if (run.status === "timed_out") {
-    return completed > 0
-      ? `Operazione interrotta per timeout dopo ${completed} step completati.`
-      : "Operazione interrotta per timeout prima della risposta finale.";
-  }
-  if (run.status === "cancelled") {
-    return "Operazione annullata.";
-  }
-  if (run.status === "interrupted") {
-    return completed > 0
-      ? `Elaborazione interrotta dal riavvio del server dopo ${completed} step. Puoi ripetere la richiesta.`
-      : "Elaborazione interrotta dal riavvio del server. Puoi ripetere la richiesta.";
-  }
-  if (run.status === "loop_aborted") {
-    return completed > 0
-      ? `Operazione interrotta: il modello era entrato in un ciclo ripetitivo dopo ${completed} step. Al prossimo invio verrà usato automaticamente un modello più capace.`
-      : "Operazione interrotta: il modello era entrato in un ciclo ripetitivo. Al prossimo invio verrà usato automaticamente un modello più capace.";
-  }
-  if (run.status === "provider_unavailable") {
-    return "Operazione interrotta: tutti i provider AI configurati sono temporaneamente non disponibili (quota esaurita o rate limit). Riprova tra qualche minuto.";
-  }
-  if (run.status === "awaiting_confirmation") {
-    return awaiting > 0
-      ? `In attesa di conferma per ${awaiting} azion${awaiting === 1 ? "e" : "i"}.`
-      : "In attesa di conferma per proseguire.";
-  }
-  return "Operazione conclusa.";
-}
-
-/** Costruisce un riepilogo dettagliato delle azioni eseguite dall'agente (P2). */
-function buildSemanticDetail(run: AgentRunInfo): string {
-  const WRITE_TOOLS = new Set(["write_file", "edit_file", "create_file", "patch_file"]);
-  const CMD_TOOLS = new Set(["run_in_terminal", "run_command"]);
-  const READ_TOOLS = new Set(["read_file", "search_in_files", "search_files"]);
-  const IGNORE_TOOLS = new Set(["supervisor_check"]);
-
-  const modifiedFiles: string[] = [];
-  const commands: string[] = [];
-  let analysisCount = 0;
-  let errorCount = 0;
-
-  for (const step of run.steps) {
-    if (IGNORE_TOOLS.has(step.toolName)) continue;
-    if (step.status === "failed") errorCount++;
-
-    if (WRITE_TOOLS.has(step.toolName)) {
-      const path = (step.toolInput?.path || step.toolInput?.file_path || step.toolInput?.filename) as string | undefined;
-      if (path && !modifiedFiles.includes(path)) {
-        modifiedFiles.push(path);
-      }
-    } else if (CMD_TOOLS.has(step.toolName)) {
-      const cmd = (step.toolInput?.command || step.toolInput?.cmd || step.toolInput?.text) as string | undefined;
-      if (cmd) {
-        // Tronca comandi molto lunghi
-        const short = cmd.length > 80 ? cmd.slice(0, 77) + "..." : cmd;
-        if (!commands.includes(short)) commands.push(short);
-      }
-    } else if (READ_TOOLS.has(step.toolName)) {
-      analysisCount++;
-    }
-  }
-
-  // Se non ci sono azioni significative, non generare dettagli
-  if (modifiedFiles.length === 0 && commands.length === 0 && analysisCount === 0) {
-    return "";
-  }
-
-  const lines: string[] = [];
-  if (modifiedFiles.length > 0) {
-    const MAX_FILES = 5;
-    const shown = modifiedFiles.slice(0, MAX_FILES).map((f) => {
-      // Mostra solo il nome del file (senza path lungo)
-      const parts = f.replace(/\\/g, "/").split("/");
-      return `\`${parts.length > 2 ? ".../" + parts.slice(-2).join("/") : f}\``;
-    });
-    const extra = modifiedFiles.length > MAX_FILES ? ` e altri ${modifiedFiles.length - MAX_FILES} file` : "";
-    lines.push(`- Modificati ${modifiedFiles.length} file: ${shown.join(", ")}${extra}`);
-  }
-  if (commands.length > 0) {
-    const MAX_CMDS = 3;
-    const shown = commands.slice(0, MAX_CMDS).map((c) => `\`${c}\``);
-    const extra = commands.length > MAX_CMDS ? ` e altri ${commands.length - MAX_CMDS}` : "";
-    lines.push(`- Eseguiti ${commands.length} comandi: ${shown.join(", ")}${extra}`);
-  }
-  if (analysisCount > 0) {
-    lines.push(`- Analizzati ${analysisCount} file`);
-  }
-
-  const completed = run.steps.filter((s) => s.status === "completed").length;
-  lines.push(`- Risultato: ${completed} step completati${errorCount > 0 ? `, ${errorCount} errori` : ""}`);
-
-  return `\n\n**Riepilogo:**\n${lines.join("\n")}`;
-}
-
-function createTerminalMessage(run: AgentRunInfo, pid: string, lastStreamingText?: string): ChatMessage {
-  const statusSummary = buildTerminalRunSummary(run);
-  const semanticDetail = buildSemanticDetail(run);
-
-  let baseContent: string;
-  if (run.finalAnswer?.trim() && run.finalAnswer.trim().length > 0) {
-    // La risposta finale del modello e' presente: usala, appendi il dettaglio semantico
-    baseContent = run.finalAnswer + semanticDetail;
-  } else if (lastStreamingText?.trim() && lastStreamingText.trim().length > 0) {
-    // Testo streaming parziale: usalo, appendi il dettaglio semantico
-    baseContent = lastStreamingText + semanticDetail;
-  } else {
-    // Nessuna risposta dal modello: usa status + dettaglio semantico
-    baseContent = statusSummary + semanticDetail;
-  }
-
-  // Prependi l'avviso privacy se il provider non e' EU/locale
-  const content = run.providerPrivacyNotice
-    ? `${run.providerPrivacyNotice}\n\n---\n\n${baseContent}`
-    : baseContent;
-
-  return {
-    id: `agent-${run.runId}`,
-    sessionId: run.sessionId,
-    projectId: pid,
-    role: "assistant",
-    content,
-    runId: run.runId,
-    automationMode: "agent" as const,
-    provider: run.provider,
-    model: run.model,
-    promptTokens: run.usage?.totalPromptTokens,
-    completionTokens: run.usage?.totalCompletionTokens,
-    totalTokens: run.usage?.totalTokens,
-    totalCost: run.totalCostUsd,
-    createdAt: run.completedAt ?? new Date().toISOString(),
-  };
-}
-
-function formatChatError(error: unknown, fallback: string): string {
-  if (error instanceof DOMException && error.name === "AbortError") {
-    return "La richiesta e' stata interrotta (timeout di rete o navigazione). Riprova.";
-  }
-  const raw = error instanceof Error ? error.message : fallback;
-  const normalized = raw.trim();
-  const lower = normalized.toLowerCase();
-
-  if (lower.includes("aborted") || lower.includes("abort")) {
-    return "La richiesta e' stata interrotta. Riprova tra qualche secondo.";
-  }
-  if (
-    lower.includes("429") ||
-    lower.includes("rate limit") ||
-    lower.includes("rate_limit") ||
-    lower.includes("quota")
-  ) {
-    return "Il provider AI e' temporaneamente in rate limit. Riprovo in fallback automatico; se persiste, attendi qualche secondo e ripeti.";
-  }
-  if (
-    (lower.includes("not_found_error") || lower.includes("not found")) &&
-    lower.includes("model")
-  ) {
-    return "Il modello selezionato non e' disponibile presso il provider corrente. Prova un modello diverso o lascia la selezione automatica.";
-  }
-  if (lower.includes("connection error")) {
-    return "Connessione al provider interrotta durante l'esecuzione. Ho mantenuto lo stato del run; puoi riprovare subito.";
-  }
-  if (
-    lower.includes("transport error") ||
-    lower.includes("status: unavailable") ||
-    lower.includes("connection refused")
-  ) {
-    return "Connessione interna ai servizi AI temporaneamente non disponibile. Riprova tra pochi secondi.";
-  }
-  if (lower.includes("timeout")) {
-    return "La richiesta e' andata in timeout. Riprova tra poco o con un prompt piu' breve.";
-  }
-  const compact = normalized.replace(/\s+/g, " ");
-  if (compact.startsWith("{") || compact.startsWith("[")) {
-    return fallback;
-  }
-  if (compact.length > 220) {
-    return `${compact.slice(0, 220)}...`;
-  }
-  return compact || fallback;
-}
+import { UUID_RE, type BusyAction, type MetaStepEntry } from "./use-chat/types";
+import { upsertSyntheticAssistantMessage, isStatusTerminal } from "./use-chat/helpers";
+import { createTerminalMessage } from "./use-chat/run-summary";
+import { formatChatError } from "./use-chat/errors";
 
 export function useChat(
   projectId = "default",
@@ -273,13 +66,7 @@ export function useChat(
   // il backend emette via SSE `agent_meta_step`. Sono rese visibili come
   // card collassabili sopra/dentro il messaggio assistant del run.
   const [metaStepsMap, setMetaStepsMap] = useState<
-    Map<string, Array<{
-      kind: string;
-      title: string;
-      payload: Record<string, unknown>;
-      correlationId?: string | null;
-      createdAt: string;
-    }>>
+    Map<string, MetaStepEntry[]>
   >(new Map());
   const [tokenUsage, setTokenUsage] = useState({ totalTokens: 0, totalCostUsd: 0 });
   const [traces, setTraces] = useState<AITraceEvent[]>([]);
@@ -558,16 +345,6 @@ export function useChat(
         },
         async () => {
           try {
-            // Helper per valutare lo stato come terminale
-            const isStatusTerminal = (status: string) =>
-              status === "completed" ||
-              status === "failed" ||
-              status === "timed_out" ||
-              status === "cancelled" ||
-              status === "interrupted" ||
-              status === "loop_aborted" ||
-              status === "provider_unavailable";
-
             // Polling con retry: se l'evento agent_final SSE e' arrivato MA
             // il DB risponde ancora "running", potrebbe esserci una race
             // condition (UPDATE finale in corso) oppure un bug backend
@@ -1068,15 +845,7 @@ export function useChat(
                 const finalRun = await getAgentRun(runId);
                 setAgentRun(finalRun);
                 setAgentSteps(finalRun.steps);
-                const isTerminal =
-                  finalRun.status === "completed" ||
-                  finalRun.status === "failed" ||
-                  finalRun.status === "timed_out" ||
-                  finalRun.status === "cancelled" ||
-                  finalRun.status === "interrupted" ||
-                  finalRun.status === "loop_aborted" ||
-                  finalRun.status === "provider_unavailable";
-                if (isTerminal) {
+                if (isStatusTerminal(finalRun.status)) {
                   const syntheticMsg = createTerminalMessage(finalRun, projectId);
                   setMessages((current) => upsertSyntheticAssistantMessage(current, syntheticMsg));
                 }
