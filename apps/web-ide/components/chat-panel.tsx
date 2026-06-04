@@ -8,12 +8,11 @@ import {
   type FormEvent,
 } from "react";
 import { useChat } from "../lib/use-chat";
-import { listProjectMemories, getProjectDbConfig, listAdminSettings, getModels, findSimilarKnowledge, indexAttachmentsToKb, type AITraceEvent, type ChatAttachment, type ModelCatalogEntry, type PrecheckResult, type ProjectDbConfig, type SavedChatAttachment, type SimilarHit } from "../lib/api-client";
+import { listProjectMemories, getProjectDbConfig, listAdminSettings, getModels, findSimilarKnowledge, indexAttachmentsToKb, type AITraceEvent, type ChatAttachment, type ModelCatalogEntry, type PrecheckResult, type ProjectDbConfig, type SimilarHit } from "../lib/api-client";
 import { SimilarRequestBanner } from "./knowledge/similar-request-banner";
 import { fallbackContextWindow } from "../lib/context-window";
 import { useThemeColors } from "../lib/theme";
 import { useI18n } from "../lib/i18n";
-import { ModalPortal } from "./modal-portal";
 import { useGlobalDialog } from "./global-dialog-provider";
 import { FeedbackErrorDialog } from "./feedback-error-dialog";
 import { IconButton } from "./icon-button";
@@ -24,6 +23,16 @@ import { InlineTracePanel } from "./chat/inline-trace-panel";
 import { Composer } from "./chat/composer";
 import { MemoryPanel } from "./chat/memory-panel";
 import { TokenUsageBar } from "./chat/token-usage-bar";
+import {
+  AgentPreparingBubble,
+  ThinkingBlock,
+  AgentProgressInline,
+} from "./chat/agent-status-bubbles";
+import { AttachmentIndexDialog } from "./chat/attachment-index-dialog";
+import { ProviderUnavailableBanner } from "./chat/provider-unavailable-banner";
+import { ConnectionStatusBanner } from "./chat/connection-status-banner";
+import { PrecheckSuggestion } from "./chat/precheck-suggestion";
+import { AgentActivityBar } from "./chat/agent-activity-bar";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Limite singolo allegato in chat. Aumentato da 2 MB a 25 MB perche' 2 MB
@@ -77,268 +86,6 @@ declare global {
     SpeechRecognition?: new () => SpeechRecognitionLike;
     webkitSpeechRecognition?: new () => SpeechRecognitionLike;
   }
-}
-
-/* ------------------------------------------------------------------ */
-/* AgentPreparingBubble  (P1)                                          */
-/* ------------------------------------------------------------------ */
-
-function AgentPreparingBubble({ tc }: { tc: Record<string, string> }) {
-  const [seconds, setSeconds] = useState(0);
-  useEffect(() => {
-    const id = setInterval(() => setSeconds((s) => s + 1), 1000);
-    return () => clearInterval(id);
-  }, []);
-  return (
-    <div
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 10,
-        padding: "10px 14px",
-        borderRadius: 10,
-        background: tc.bgCard,
-        border: `1px solid ${tc.border}`,
-        alignSelf: "flex-start",
-        maxWidth: "80%",
-      }}
-    >
-      <span
-        style={{
-          width: 10,
-          height: 10,
-          borderRadius: "50%",
-          background: "#22c55e",
-          animation: "pulse 1.4s ease-in-out infinite",
-          flexShrink: 0,
-        }}
-      />
-      <span style={{ color: tc.textMuted, fontSize: 13, fontStyle: "italic" }}>
-        Nexus sta preparando l&apos;esecuzione&hellip;
-      </span>
-      <span style={{ color: tc.textMuted, fontSize: 11, opacity: 0.7 }}>
-        {seconds}s
-      </span>
-    </div>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* ThinkingBlock  — ragionamento intermedio del modello                 */
-/* ------------------------------------------------------------------ */
-
-function ThinkingBlock({ text, tc }: { text: string; tc: Record<string, string> }) {
-  const [expanded, setExpanded] = useState(false);
-  // Scroll automatico a fondo quando arriva una nuova riga di thinking.
-  // Garantisce che il pannello mostri sempre l-ultimo pensiero, sia con il
-  // blocco collassato (preview limitato) sia espanso.
-  const preRef = useRef<HTMLPreElement | null>(null);
-  useEffect(() => {
-    const el = preRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [text, expanded]);
-
-  /* Mostra solo le ultime 4 righe se collassato */
-  const lines = text.split("\n");
-  const preview = lines.length > 4 ? lines.slice(-4).join("\n") : text;
-
-  return (
-    <div
-      style={{
-        padding: "10px 14px",
-        borderRadius: 10,
-        background: tc.bgCard,
-        border: `1px solid ${tc.border}`,
-        alignSelf: "flex-start",
-        maxWidth: "80%",
-        fontSize: 13,
-        lineHeight: 1.5,
-      }}
-    >
-      {/* Intestazione cliccabile */}
-      <div
-        onClick={() => setExpanded((e) => !e)}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          cursor: "pointer",
-          userSelect: "none",
-          marginBottom: 6,
-        }}
-      >
-        <span
-          style={{
-            width: 8,
-            height: 8,
-            borderRadius: "50%",
-            background: "#a78bfa",
-            animation: "pulse 1.4s ease-in-out infinite",
-            flexShrink: 0,
-          }}
-        />
-        <span style={{ color: tc.textMuted, fontSize: 12, fontWeight: 600 }}>
-          Ragionamento Nexus
-        </span>
-        <span style={{ color: tc.textMuted, fontSize: 11, opacity: 0.6 }}>
-          {expanded ? "▲" : "▼"}
-        </span>
-      </div>
-
-      {/* Contenuto */}
-      <pre
-        ref={preRef}
-        style={{
-          margin: 0,
-          whiteSpace: "pre-wrap",
-          wordBreak: "break-word",
-          color: tc.textMuted,
-          fontSize: 12,
-          fontFamily: "inherit",
-          maxHeight: expanded ? "none" : 100,
-          overflow: expanded ? "visible" : "hidden",
-          opacity: 0.85,
-        }}
-      >
-        {expanded ? text : preview}
-      </pre>
-
-      {!expanded && lines.length > 4 && (
-        <span
-          onClick={() => setExpanded(true)}
-          style={{
-            color: "#a78bfa",
-            fontSize: 11,
-            cursor: "pointer",
-            marginTop: 4,
-            display: "inline-block",
-          }}
-        >
-          Mostra tutto ({lines.length} righe)
-        </span>
-      )}
-    </div>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* AgentProgressInline  (P3)                                           */
-/* ------------------------------------------------------------------ */
-
-function AgentProgressInline({
-  tc,
-  steps,
-}: {
-  tc: Record<string, string>;
-  steps: import("../lib/api-client").AgentStep[];
-}) {
-  // Tempo dall'inizio del run (mount del componente). NON resettiamo ad ogni
-  // step nuovo: con agenti che fanno step rapidi (<1s ognuno), il counter
-  // restava bloccato a 0s confondendo l'utente. Ora avanza monotonicamente
-  // per tutta la durata del run.
-  const [elapsed, setElapsed] = useState(0);
-  useEffect(() => {
-    const id = setInterval(() => setElapsed((s) => s + 1), 1000);
-    return () => clearInterval(id);
-  }, []);
-
-  const currentStep = steps[steps.length - 1];
-  const recentDone = steps.filter((s) => s.status === "completed" || s.status === "failed").slice(-3);
-
-  const toolLabel = (name: string) => {
-    const labels: Record<string, string> = {
-      write_file: "Scrittura file",
-      edit_file: "Modifica file",
-      create_file: "Creazione file",
-      patch_file: "Patch file",
-      read_file: "Lettura file",
-      run_in_terminal: "Comando terminale",
-      run_command: "Comando terminale",
-      search_in_files: "Ricerca nel codice",
-      search_files: "Ricerca file",
-      supervisor_check: "Verifica supervisore",
-    };
-    return labels[name] || name.replace(/_/g, " ");
-  };
-
-  const statusIcon = (status: string) => {
-    if (status === "completed") return "✓";
-    if (status === "failed") return "✗";
-    return "•";
-  };
-
-  const statusColor = (status: string) => {
-    if (status === "completed") return "#22c55e";
-    if (status === "failed") return tc.error || "#ef4444";
-    return tc.textMuted;
-  };
-
-  // Badge avviso per step lenti
-  let slowBadge: React.ReactNode = null;
-  if (currentStep?.status === "running" && elapsed > 120) {
-    slowBadge = (
-      <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 4, background: "#ef444430", color: "#ef4444", fontWeight: 600 }}>
-        &gt;2min
-      </span>
-    );
-  } else if (currentStep?.status === "running" && elapsed > 30) {
-    slowBadge = (
-      <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 4, background: "#f9731630", color: "#f97316", fontWeight: 600 }}>
-        &gt;30s
-      </span>
-    );
-  }
-
-  return (
-    <div
-      style={{
-        padding: "10px 14px",
-        borderRadius: 8,
-        background: tc.bgCard,
-        border: `1px solid ${tc.border}`,
-        alignSelf: "stretch",
-        fontSize: 12,
-      }}
-    >
-      {/* Intestazione */}
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: recentDone.length > 0 ? 6 : 0 }}>
-        <span
-          style={{
-            width: 8,
-            height: 8,
-            borderRadius: "50%",
-            background: "#22c55e",
-            animation: "pulse 1.4s ease-in-out infinite",
-            flexShrink: 0,
-          }}
-        />
-        <span style={{ fontWeight: 600, color: tc.text }}>
-          Nexus sta lavorando&hellip;
-        </span>
-        <span style={{ color: tc.textMuted }}>
-          {toolLabel(currentStep?.toolName || "...")}
-        </span>
-        <span style={{ color: tc.textMuted, opacity: 0.7, fontSize: 11 }}>
-          {elapsed}s
-        </span>
-        {slowBadge}
-      </div>
-
-      {/* Step recenti completati */}
-      {recentDone.length > 0 && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 2, marginLeft: 16 }}>
-          {recentDone.map((s) => (
-            <div key={s.stepIndex} style={{ display: "flex", alignItems: "center", gap: 6, color: tc.textMuted }}>
-              <span style={{ color: statusColor(s.status), fontSize: 11, fontWeight: 700 }}>
-                {statusIcon(s.status)}
-              </span>
-              <span>{s.stepIndex + 1}. {toolLabel(s.toolName)}</span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -1184,56 +931,11 @@ export function ChatPanel({
           run da sola. L'utente clicca "Configurazione provider" per andare
           all'admin oppure aspetta il reset cooldown. */}
       {providerUnavailableStep && (
-        <div style={{
-          background: "rgba(239,68,68,0.10)",
-          border: "1px solid rgba(239,68,68,0.50)",
-          borderLeft: "4px solid #ef4444",
-          borderRadius: 6,
-          padding: "10px 14px",
-          margin: "0 0 10px 0",
-          fontSize: 12,
-          color: tc.text,
-          display: "flex",
-          flexDirection: "column",
-          gap: 6,
-        }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ fontSize: 16 }}>⚠</span>
-            <span style={{ fontWeight: 700, color: "#ef4444" }}>
-              Nessun provider AI disponibile
-            </span>
-          </div>
-          <div style={{ lineHeight: 1.5 }}>
-            {providerUnavailableStep.toolResult ?? "Tutti i provider configurati sono in cooldown."}
-          </div>
-          {providersInCooldown.length > 0 && (
-            <div style={{ fontSize: 10, color: tc.textMuted }}>
-              In cooldown: {providersInCooldown.join(", ")}
-            </div>
-          )}
-          <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
-            <button
-              type="button"
-              onClick={() => {
-                if (typeof window !== "undefined") {
-                  window.open("/admin/settings/providers", "_blank", "noopener");
-                }
-              }}
-              style={{
-                background: "rgba(239,68,68,0.18)",
-                border: "1px solid rgba(239,68,68,0.55)",
-                borderRadius: 4,
-                color: "#ef4444",
-                cursor: "pointer",
-                padding: "3px 10px",
-                fontSize: 11,
-                fontWeight: 600,
-              }}
-            >
-              Configurazione provider
-            </button>
-          </div>
-        </div>
+        <ProviderUnavailableBanner
+          step={providerUnavailableStep}
+          providersInCooldown={providersInCooldown}
+          tc={tc}
+        />
       )}
 
       <div
@@ -1353,49 +1055,11 @@ export function ChatPanel({
           {messages.length === 0 && hasProject && isReady && (
             <div style={{ color: tc.textMuted }}>{t("chat.empty")}</div>
           )}
-          {isReconnecting && (
-            <div
-              className="flex-row-gap-8 text-base"
-              style={{
-                position: "sticky",
-                top: 0,
-                zIndex: 8,
-                alignSelf: "stretch",
-                padding: "8px 12px",
-                borderRadius: 10,
-                border: "1px solid #f9731680",
-                background: tc.bgCard,
-                borderLeft: "3px solid #f97316",
-                color: "#f97316",
-              }}
-            >
-              <span style={{ animation: "spin 1s linear infinite", fontSize: 16 }}>↻</span>
-              <strong>Connessione persa</strong>
-              <span style={{ color: tc.textMuted, fontSize: 12 }}>
-                — Riconnessione al server in corso, attendere…
-              </span>
-            </div>
-          )}
-          {reconnectSuccess && !isReconnecting && (
-            <div
-              className="flex-row-gap-8 text-base"
-              style={{
-                position: "sticky",
-                top: 0,
-                zIndex: 8,
-                alignSelf: "stretch",
-                padding: "8px 12px",
-                borderRadius: 10,
-                border: "1px solid #22c55e80",
-                background: tc.bgCard,
-                borderLeft: "3px solid #22c55e",
-                color: "#22c55e",
-              }}
-            >
-              <span style={{ fontSize: 16 }}>✓</span>
-              <strong>Connessione ripristinata</strong>
-            </div>
-          )}
+          <ConnectionStatusBanner
+            isReconnecting={isReconnecting}
+            reconnectSuccess={reconnectSuccess}
+            tc={tc}
+          />
 
           <MessageList
             messages={messages}
@@ -1600,148 +1264,26 @@ export function ChatPanel({
       </div>
 
       {isChatBusy && (
-        <div
-          style={{
-            margin: "6px 0 0",
-            borderRadius: 8,
-            border: `1px solid ${tc.border}`,
-            background: tc.bgCard,
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            flexShrink: 0,
-            boxShadow: "0 2px 8px rgba(0,0,0,0.10)",
-          }}
-          aria-live="polite"
-        >
-          {/* Riga principale */}
-          <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px" }}>
-            <span
-              style={{
-                width: 8,
-                height: 8,
-                borderRadius: "50%",
-                background: "#22c55e",
-                boxShadow: "0 0 0 2px #22c55e33",
-                animation: "pulse 1s ease-in-out infinite",
-                flexShrink: 0,
-              }}
-            />
-            <strong style={{ color: isAgentStuck ? "#f97316" : tc.text, fontSize: 12 }}>
-              {secondsSinceLastStep > 120 ? "⚠ AI in elaborazione" : isAgentStuck ? "⚠ Agente in attesa" : busyLabel}
-            </strong>
-            {isAgentRunning && runningAgentStep ? (
-              <span style={{ color: tc.textMuted, fontSize: 11 }}>
-                step {runningAgentStep.stepIndex + 1} • {runningAgentStep.toolName}
-              </span>
-            ) : isAgentRunning && lastMetaStep ? (
-              // Attivita' corrente live dal flusso meta_step (es. "tool
-              // edit_file — vite.config.ts"): aggiornata in tempo reale anche
-              // quando agentSteps non e' ancora popolato.
-              <span
-                style={{
-                  color: tc.textMuted,
-                  fontSize: 11,
-                  whiteSpace: "nowrap",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  maxWidth: 320,
-                }}
-                title={lastMetaStep.title}
-              >
-                {lastMetaStep.title}
-              </span>
-            ) : null}
-            {isAgentRunning && (
-              <span style={{
-                fontSize: 10,
-                color: secondsSinceLastStep > 120 ? "#f97316" : tc.textMuted,
-                fontVariantNumeric: "tabular-nums",
-                marginLeft: 4,
-              }}>
-                {secondsSinceLastStep < 60
-                  ? `${secondsSinceLastStep}s`
-                  : `${Math.floor(secondsSinceLastStep / 60)}m ${secondsSinceLastStep % 60}s`}
-              </span>
-            )}
-            {secondsSinceLastStep > 120 && agentRun?.runId && (
-              <button
-                type="button"
-                onClick={() => void cancelRun(agentRun.runId)}
-                style={{
-                  fontSize: 10, padding: "2px 8px", borderRadius: 4,
-                  border: "1px solid #f9731680", background: "#f9731618",
-                  color: "#f97316", cursor: "pointer", fontWeight: 600,
-                }}
-              >
-                Forza stop
-              </button>
-            )}
-            {isAgentRunning && (
-              <button
-                type="button"
-                onClick={() => setAgentStatusExpanded((v) => !v)}
-                title={agentStatusExpanded ? "Comprimi dettagli" : "Espandi dettagli"}
-                style={{
-                  marginLeft: "auto", border: `1px solid ${tc.border}`,
-                  background: "transparent", color: tc.text, borderRadius: 6,
-                  width: 22, height: 22, display: "inline-flex", alignItems: "center",
-                  justifyContent: "center", cursor: "pointer", fontSize: 11,
-                }}
-              >
-                {agentStatusExpanded ? "▾" : "▸"}
-              </button>
-            )}
-          </div>
-          {/* Dettagli espandibili */}
-          {isAgentRunning && agentStatusExpanded && (
-            <div style={{
-              borderTop: `1px solid ${tc.border}`,
-              padding: "6px 10px 8px",
-              display: "flex", flexDirection: "column", gap: 4,
-            }}>
-              <div style={{ color: tc.textMuted, fontSize: 11 }}>
-                Step completati: {completedSteps}
-                {runningSteps > 0 ? ` • in corso: ${runningSteps}` : ""}
-                {failedSteps > 0 ? ` • falliti: ${failedSteps}` : ""}
-              </div>
-              {runningCommand && (
-                <div style={{
-                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-                  fontSize: 11, color: tc.textSecondary,
-                  whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-                }} title={runningCommand}>
-                  cmd: {runningCommand}
-                </div>
-              )}
-              {latestOutputSnippet && (
-                <div style={{
-                  fontSize: 11, color: tc.textMuted,
-                  whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-                }} title={latestStepWithOutput?.toolResult}>
-                  output: {latestOutputSnippet}
-                </div>
-              )}
-              {timelineSteps.length > 0 && (
-                <div style={{ marginTop: 2, paddingTop: 4, borderTop: `1px dashed ${tc.border}`, display: "flex", flexDirection: "column", gap: 1 }}>
-                  {timelineSteps.map((step) => (
-                    <div
-                      key={`tl-${step.stepIndex}`}
-                      style={{
-                        color: step.status === "failed" ? tc.error : tc.textSecondary,
-                        fontSize: 11, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-                        whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-                      }}
-                    >
-                      {step.stepIndex + 1}. {step.toolName} —{" "}
-                      {step.status === "completed" ? "ok" : step.status === "running" ? "in corso" : step.status === "failed" ? "errore" : step.status}
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
+        <AgentActivityBar
+          tc={tc}
+          isAgentStuck={isAgentStuck}
+          secondsSinceLastStep={secondsSinceLastStep}
+          busyLabel={busyLabel}
+          isAgentRunning={isAgentRunning}
+          runningAgentStep={runningAgentStep}
+          lastMetaStep={lastMetaStep}
+          agentRun={agentRun ?? null}
+          onCancelRun={(runId) => void cancelRun(runId)}
+          agentStatusExpanded={agentStatusExpanded}
+          onToggleExpanded={() => setAgentStatusExpanded((v) => !v)}
+          completedSteps={completedSteps}
+          runningSteps={runningSteps}
+          failedSteps={failedSteps}
+          runningCommand={runningCommand}
+          latestOutputSnippet={latestOutputSnippet}
+          latestStepWithOutputResult={latestStepWithOutput?.toolResult}
+          timelineSteps={timelineSteps}
+        />
       )}
 
       {/* Token usage bar */}
@@ -1783,146 +1325,13 @@ export function ChatPanel({
       })()}
 
       {/* Precheck widget */}
-      {precheckPending && (
-        <div style={{
-          margin: "0 8px 4px",
-          padding: "8px 12px",
-          borderRadius: 8,
-          border: `1px solid ${tc.border}`,
-          background: tc.bgCard,
-          fontSize: 12,
-          color: tc.textMuted,
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-        }}>
-          <span style={{ animation: "spin 1s linear infinite", display: "inline-block" }}>⟳</span>
-          Controllo ortografia e contesto…
-        </div>
-      )}
-      {precheckResult && !precheckPending && (
-        <div style={{
-          margin: "0 8px 6px",
-          borderRadius: 8,
-          border: `1px solid ${tc.accent}66`,
-          background: tc.bgCard,
-          fontSize: 12,
-          overflow: "hidden",
-        }}>
-          {/* Header */}
-          <div style={{
-            padding: "7px 12px",
-            borderBottom: `1px solid ${tc.border}`,
-            background: tc.bg,
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-          }}>
-            <span style={{ fontWeight: 600, color: tc.accent, fontSize: 11 }}>
-              ✦ Suggerimento
-            </span>
-            <button
-              onClick={() => setPrecheckResult(null)}
-              style={{ background: "none", border: "none", color: tc.textMuted, cursor: "pointer", fontSize: 14, lineHeight: 1 }}
-            >×</button>
-          </div>
-
-          <div style={{ padding: "10px 12px", display: "flex", flexDirection: "column", gap: 8 }}>
-            {/* Testo corretto */}
-            {precheckResult.correctedText && (
-              <div>
-                <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>
-                  Testo corretto
-                </div>
-                <div style={{
-                  padding: "6px 8px",
-                  borderRadius: 6,
-                  background: tc.bg,
-                  border: `1px solid ${tc.success}44`,
-                  color: tc.text,
-                  whiteSpace: "pre-wrap",
-                }}>
-                  {precheckResult.correctedText}
-                </div>
-              </div>
-            )}
-
-            {/* Suggerimento contesto */}
-            {precheckResult.contextSuggestion && (
-              <div>
-                <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>
-                  Aggiungi contesto
-                </div>
-                <div style={{
-                  padding: "6px 8px",
-                  borderRadius: 6,
-                  background: tc.bg,
-                  border: `1px solid ${tc.accent}44`,
-                  color: tc.textMuted,
-                  fontStyle: "italic",
-                }}>
-                  {precheckResult.contextSuggestion}
-                </div>
-              </div>
-            )}
-
-            {/* Problemi */}
-            {(precheckResult.issues?.length ?? 0) > 0 && (
-              <div style={{ fontSize: 11, color: tc.textMuted }}>
-                {(precheckResult.issues ?? []).map((issue, i) => (
-                  <span key={i} style={{ marginRight: 8 }}>• {issue}</span>
-                ))}
-              </div>
-            )}
-
-            {/* Azioni */}
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 2 }}>
-              {precheckResult.correctedText && (
-                <button
-                  onClick={() => {
-                    // Invia direttamente il testo corretto (non ri-triggerare il precheck)
-                    doSend(precheckResult.correctedText!);
-                  }}
-                  style={{
-                    padding: "5px 12px", borderRadius: 6, border: "none",
-                    background: tc.accent, color: "#fff",
-                    cursor: "pointer", fontSize: 11, fontWeight: 600,
-                  }}
-                >
-                  Usa testo corretto
-                </button>
-              )}
-              {precheckResult.contextSuggestion && (
-                <button
-                  onClick={() => {
-                    // Invia direttamente il testo originale + suggerimento contesto
-                    doSend(precheckResult.originalText + "\n\n" + precheckResult.contextSuggestion!);
-                  }}
-                  style={{
-                    padding: "5px 12px", borderRadius: 6,
-                    border: `1px solid ${tc.accent}`,
-                    background: "none", color: tc.accent,
-                    cursor: "pointer", fontSize: 11,
-                  }}
-                >
-                  Aggiungi contesto
-                </button>
-              )}
-              <button
-                onClick={() => doSend(precheckResult.originalText)}
-                style={{
-                  padding: "5px 12px", borderRadius: 6,
-                  border: `1px solid ${tc.border}`,
-                  background: "none", color: tc.textMuted,
-                  cursor: "pointer", fontSize: 11,
-                }}
-              >
-                Invia comunque
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <PrecheckSuggestion
+        precheckPending={precheckPending}
+        precheckResult={precheckResult}
+        onClose={() => setPrecheckResult(null)}
+        onSend={(text) => doSend(text)}
+        tc={tc}
+      />
 
       {similarHits.length > 0 && (
         <SimilarRequestBanner
@@ -2028,217 +1437,5 @@ export function ChatPanel({
       />
     )}
     </>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* AttachmentIndexDialog                                              */
-/* ------------------------------------------------------------------ */
-/**
- * Dialog modale per la scelta dell'utente di quali allegati indicizzare
- * nella Knowledge Base. Pre-spunta i 'text' (gia' indicizzabili come body)
- * e lascia non spuntati image/binary. L'utente puo' scegliere un
- * sottoinsieme o saltare tutto. La chiamata vera all'API la fa il chiamante.
- */
-function AttachmentIndexDialog({
-  proposal,
-  onClose,
-  onConfirm,
-  tc,
-}: {
-  proposal: { messageId: string; attachments: SavedChatAttachment[] };
-  onClose: () => void;
-  onConfirm: (attachmentIds: string[]) => void | Promise<void>;
-  tc: ReturnType<typeof useThemeColors>;
-}) {
-  // Stato di selezione: default = solo i 'text' pre-spuntati.
-  // Gli 'binary' restano disabilitati (backend rifiuta comunque).
-  const initialSelected = new Set<string>(
-    proposal.attachments
-      .filter((att) => att.kind === "text")
-      .map((att) => att.id),
-  );
-  const [selected, setSelected] = useState<Set<string>>(initialSelected);
-  const [submitting, setSubmitting] = useState(false);
-
-  const toggle = (id: string) => {
-    setSelected((current) => {
-      const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  };
-
-  const handleConfirm = async () => {
-    if (submitting) return;
-    setSubmitting(true);
-    try {
-      await onConfirm(Array.from(selected));
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <ModalPortal>
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-label="Indicizzazione allegati nella Knowledge Base"
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: "rgba(5, 10, 18, 0.5)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        zIndex: 1300,
-        padding: 16,
-      }}
-      onClick={(e) => {
-        if (e.target === e.currentTarget && !submitting) onClose();
-      }}
-    >
-      <div
-        style={{
-          width: 520,
-          maxWidth: "95vw",
-          maxHeight: "85vh",
-          overflow: "auto",
-          borderRadius: 10,
-          border: `1px solid ${tc.border}`,
-          background: tc.bgCard,
-          boxShadow: "0 14px 44px rgba(0,0,0,0.4)",
-          padding: 16,
-          display: "flex",
-          flexDirection: "column",
-          gap: 12,
-        }}
-      >
-        <div style={{ color: tc.text, fontWeight: 700, fontSize: 15 }}>
-          Indicizzare nella Knowledge Base?
-        </div>
-        <div style={{ color: tc.textSecondary, fontSize: 12 }}>
-          Gli allegati salvati possono essere aggiunti alla KB del progetto come
-          note ricercabili. Seleziona quali file vuoi indicizzare. I file di
-          testo sono pre-selezionati; immagini e binari sono disponibili come
-          metadata-only o esclusi.
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          {proposal.attachments.map((att) => {
-            const isBinary = att.kind === "binary";
-            return (
-              <label
-                key={att.id}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  padding: "6px 8px",
-                  borderRadius: 6,
-                  border: `1px solid ${tc.border}`,
-                  background: isBinary ? tc.bgInput : tc.bgCard,
-                  color: isBinary ? tc.textMuted : tc.text,
-                  cursor: isBinary ? "not-allowed" : "pointer",
-                  fontSize: 12,
-                }}
-                title={
-                  isBinary
-                    ? "Tipo binario non indicizzabile nella KB"
-                    : att.fileName
-                }
-              >
-                <input
-                  type="checkbox"
-                  disabled={isBinary || submitting}
-                  checked={!isBinary && selected.has(att.id)}
-                  onChange={() => !isBinary && toggle(att.id)}
-                />
-                <span
-                  aria-hidden
-                  style={{
-                    fontSize: 10,
-                    fontWeight: 700,
-                    color: tc.textSecondary,
-                    letterSpacing: "0.5px",
-                    minWidth: 28,
-                    textAlign: "center",
-                  }}
-                >
-                  {att.kind === "image"
-                    ? "IMG"
-                    : att.kind === "text"
-                      ? "TXT"
-                      : "BIN"}
-                </span>
-                <span
-                  style={{
-                    flex: 1,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {att.fileName}
-                </span>
-                <span style={{ color: tc.textMuted, fontSize: 11 }}>
-                  {att.kind}
-                </span>
-              </label>
-            );
-          })}
-        </div>
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "flex-end",
-            gap: 8,
-            marginTop: 4,
-          }}
-        >
-          <button
-            type="button"
-            disabled={submitting}
-            onClick={onClose}
-            style={{
-              border: `1px solid ${tc.border}`,
-              background: tc.bgInput,
-              color: tc.text,
-              borderRadius: 8,
-              padding: "6px 12px",
-              fontSize: 12,
-              cursor: submitting ? "not-allowed" : "pointer",
-              fontFamily: "inherit",
-            }}
-          >
-            Salta tutto
-          </button>
-          <button
-            type="button"
-            disabled={submitting || selected.size === 0}
-            onClick={() => void handleConfirm()}
-            style={{
-              border: `1px solid ${tc.accent}`,
-              background: tc.accentBg,
-              color: tc.accent,
-              borderRadius: 8,
-              padding: "6px 12px",
-              fontSize: 12,
-              cursor:
-                submitting || selected.size === 0 ? "not-allowed" : "pointer",
-              fontWeight: 700,
-              fontFamily: "inherit",
-              opacity: selected.size === 0 ? 0.5 : 1,
-            }}
-          >
-            {submitting
-              ? "Indicizzazione…"
-              : `Indicizza selezionati (${selected.size})`}
-          </button>
-        </div>
-      </div>
-    </div>
-    </ModalPortal>
   );
 }
