@@ -32,6 +32,7 @@ export default function AdminKbPage() {
     >
       <div
         style={{
+          flexShrink: 0,
           padding: "10px 16px",
           borderBottom: `1px solid ${tc.border}`,
           background: tc.bgCard,
@@ -47,7 +48,7 @@ export default function AdminKbPage() {
           scope=meta
         </span>
       </div>
-      <div style={{ flex: 1, minHeight: 0, padding: 8 }}>
+      <div style={{ flex: 1, minHeight: 0, display: "flex", overflow: "hidden", padding: 8 }}>
         <KnowledgeWorkspace scope="meta" />
       </div>
     </div>

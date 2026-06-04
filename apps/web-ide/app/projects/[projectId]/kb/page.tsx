@@ -41,6 +41,7 @@ export default function ProjectKbPage() {
     >
       <div
         style={{
+          flexShrink: 0,
           padding: "10px 16px",
           borderBottom: `1px solid ${tc.border}`,
           background: tc.bgCard,
@@ -62,7 +63,7 @@ export default function ProjectKbPage() {
           {projectId.slice(0, 8)}
         </span>
       </div>
-      <div style={{ flex: 1, minHeight: 0, padding: 8 }}>
+      <div style={{ flex: 1, minHeight: 0, display: "flex", overflow: "hidden", padding: 8 }}>
         <KnowledgeWorkspace scope="project" projectId={projectId} initialDocId={initialDocId} />
       </div>
     </div>

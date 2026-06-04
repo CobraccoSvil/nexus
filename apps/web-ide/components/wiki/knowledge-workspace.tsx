@@ -728,6 +728,7 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
   return (
     <div
       style={{
+        flex: 1,
         display: "flex",
         height: "100%",
         background: tc.bg,
@@ -736,6 +737,7 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
         border: `1px solid ${tc.border}`,
         borderRadius: 6,
         minWidth: 0,
+        minHeight: 0,
       }}
     >
       {isDesktop && treeColumn}
