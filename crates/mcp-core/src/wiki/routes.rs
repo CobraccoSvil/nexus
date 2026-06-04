@@ -603,11 +603,21 @@ pub async fn list_doc_links(
              ORDER BY l.confidence DESC, l.rel_type ASC"
         )
     };
-    let inbound_sql = outbound_sql
-        .replace("l.from_doc_id = $", "l.to_doc_id = $tmp$")
-        .replace("JOIN wiki_docs ON wiki_docs.id = l.to_doc_id", "JOIN wiki_docs ON wiki_docs.id = l.from_doc_id")
-        .replace("JOIN wiki_docs d ON d.id = l.to_doc_id", "JOIN wiki_docs d ON d.id = l.from_doc_id")
-        .replace("$tmp$", if acl_param_used { "2" } else { "1" });
+    // Inbound: edges verso `id` (l.to_doc_id = id), il doc "altro" da mostrare e'
+    // la SORGENTE (l.from_doc_id). Costruito esplicitamente (NON via replace di
+    // stringhe: la vecchia logica produceva "l.to_doc_id = 22" -> errore SQL
+    // uuid = integer). Stessi parametri di outbound: $2/$1 = id, $1 = acl.
+    let id_placeholder = if acl_param_used { "$2" } else { "$1" };
+    let inbound_sql = format!(
+        "SELECT l.from_doc_id, l.to_doc_id, l.rel_type, l.confidence, l.created_by, \
+                l.evidence, l.created_at, \
+                d.id AS target_id, d.scope AS target_scope, d.project_id AS target_project_id, \
+                d.slug AS target_slug, d.title AS target_title, d.kind AS target_kind \
+         FROM wiki_links l JOIN wiki_docs ON wiki_docs.id = l.from_doc_id \
+                           JOIN wiki_docs d ON d.id = l.from_doc_id \
+         WHERE l.to_doc_id = {id_placeholder} AND {acl_clause} \
+         ORDER BY l.confidence DESC, l.rel_type ASC"
+    );
 
     let mut q_out = sqlx::query(&outbound_sql);
     let mut q_in = sqlx::query(&inbound_sql);
