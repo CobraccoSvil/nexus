@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: f9041b2dbe81653f3ff9a090b24a702602b6840e
+source_commit: a367c2c2fde4d601201d834d03e32807da2adbac
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T04:42:34Z
+updated_at: 2026-06-04T05:07:03Z
 nexus_meta_version: 1
 ---
 
