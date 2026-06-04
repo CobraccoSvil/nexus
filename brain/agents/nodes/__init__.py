@@ -68,6 +68,7 @@ from .helpers import (
     _LANG_REMINDER_DEFAULT_ENABLED,
     _LANG_REMINDER_DEFAULT_TEXT,
     _load_language_reminder,
+    _inject_forced_rag_reminder,
     _inject_language_reminder,
     estimate_prompt_complexity,
     compute_iteration_budget,
@@ -101,6 +102,7 @@ from .helpers import (
     MAX_CONTEXT_CHARS,
     _smart_truncate,
     _estimate_context_chars,
+    _estimate_context_tokens,
     _dedup_tool_results,
     _first_human_index,
     _is_summary_message,
@@ -117,6 +119,10 @@ from .helpers import (
     _CONTEXT_WINDOW_CACHE,
     _CONTEXT_WINDOW_TTL_SEC,
     _model_context_window,
+    _offload_system_prompt_if_huge,
+    _apply_rolling_summary,
+    _provider_from_model,
+    _smart_upscale_model,
     _estimate_tool_result_size_bytes,
     _current_context_token_estimate,
     _predictive_cap_check,
@@ -1102,7 +1108,9 @@ def _apply_token_brake(
 ) -> list[Any]:
     """Freno TOKEN-based: se la stima token >= ratio*window, comprime aggressivo.
 
-    Riusa `_estimate_context_chars` (~4 char/token) e `_model_context_window`.
+    ADR 0016 Fase D: usa il tokenizer reale (tiktoken cl100k_base) invece di
+    `chars//4` che sottostimava fino a 3-5x su JSON tool_result, codice e CJK.
+    Riusa `_estimate_context_tokens` (precisione ±2%) e `_model_context_window`.
     Ri-applica la compressione finche' la stima scende sotto la soglia o non c'e'
     piu' nulla da comprimere (max passate limitate). Se anche cosi' resta sopra
     il window, applica un cap di sicurezza hard (richiesta originale + ultimi 2).
@@ -1116,7 +1124,7 @@ def _apply_token_brake(
         max_chars = int(cfg.get("aggressive_max_chars", 200))
         threshold_tokens = int(window * ratio)
 
-        est_tokens = _estimate_context_chars(messages) // 4
+        est_tokens = _estimate_context_tokens(messages)
         if est_tokens < threshold_tokens:
             return messages
 
@@ -1126,13 +1134,13 @@ def _apply_token_brake(
             messages, changed = _compress_aggressive_token_based(
                 messages, keep_recent=keep_recent, max_content_chars=max_chars
             )
-            est_tokens = _estimate_context_chars(messages) // 4
+            est_tokens = _estimate_context_tokens(messages)
             if est_tokens < threshold_tokens or not changed:
                 break
 
         logger.info(
             "executor_node: freno TOKEN-based iter=%d window=%d soglia=%d "
-            "token %d -> %d (ratio=%.2f keep_recent=%d max_chars=%d)",
+            "token %d -> %d (ratio=%.2f keep_recent=%d max_chars=%d tokenizer=tiktoken)",
             iteration, window, threshold_tokens, tokens_before, est_tokens,
             ratio, keep_recent, max_chars,
         )
@@ -1144,7 +1152,7 @@ def _apply_token_brake(
             if first_human >= 0:
                 keep_idx.add(first_human)
             messages = [m for i, m in enumerate(messages) if i in keep_idx]
-            est_hard = _estimate_context_chars(messages) // 4
+            est_hard = _estimate_context_tokens(messages)
             logger.warning(
                 "executor_node: context cap raggiunto, troncamento hard "
                 "iter=%d window=%d token %d -> %d",
@@ -1804,21 +1812,71 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 "executor_node: contesto compresso (safety net) %d -> %d char",
                 ctx_size, new_size,
             )
-        # ── Freno TOKEN-based intra-turno (mig 0280) ─────────────────────────
-        # Ultima barriera PRIMA di costruire i messaggi Anthropic: a differenza
-        # di FIX A (iter-based, solo tool_result) qui la soglia e' sul context
-        # window del modello attivo e la compressione aggressiva tocca ANCHE i
-        # messaggi assistant lunghi. Garantisce che il context inviato al
-        # provider non superi mai il window (cap hard come safety net).
+        # ── ADR 0016 Fase A.3: rolling summary cross-turno ───────────────────
+        # Ogni N turni offloada i messaggi vecchi in Qdrant chat_history_rolling
+        # e li sostituisce con un summary compatto. Originali retrievabili via
+        # nexus_search_semantic(source_kinds=chat_history). Best-effort: se
+        # offload fallisce, no compressione (degrada ai brake successivi).
+        try:
+            messages = _apply_rolling_summary(messages, _current_iterations, _embeddings)
+        except Exception as _roll_exc:
+            logger.warning("rolling_summary best-effort fallita: %s", _roll_exc)
+
+        # ── ADR 0016 Fase C: smart upscale modello ───────────────────────────
+        # Se il context stimato supera il window del modello attivo, escalation
+        # a modello con window maggiore (gemini-2.5-pro / claude-opus-4-6 / ...).
+        # PRIMA del brake: cosi' il brake usa il window del modello effettivo,
+        # non di quello iniziale. Switch tracciato in agent_runs (Fase C UI).
+        try:
+            _upscale_pre_tokens = _estimate_context_tokens(messages)
+            _upscale_window = _model_context_window(model)
+            _upscale_result = _smart_upscale_model(model, _upscale_window, _upscale_pre_tokens)
+            if _upscale_result is not None:
+                _orig_model = model
+                model, _upscale_reason = _upscale_result
+                provider = _provider_from_model(model) or provider
+                logger.info(
+                    "executor_node: smart upscale %s -> %s (reason=%s, est=%d)",
+                    _orig_model, model, _upscale_reason, _upscale_pre_tokens,
+                )
+        except Exception as _upscale_exc:
+            logger.warning("smart upscale fallito (no switch): %s", _upscale_exc)
+
+        # ── Freno TOKEN-based intra-turno (mig 0280 + ADR 0016 Fase D) ───────
+        # Ultima barriera PRIMA di costruire i messaggi Anthropic: garantisce
+        # che il context inviato al provider non superi mai il window (cap hard
+        # come safety net). Usa tiktoken (Fase D) per stima accurata.
         messages = _apply_token_brake(messages, model, _ctx_cfg, _current_iterations)
         # Bug #88: reminder lingua resiliente al contesto/profilo. Iniettato qui
         # cosi' copre sia la chiamata principale (generate_agent_turn_sync con
         # system_text) sia il fallback anti-loop (system_text2 = system_text +
         # anti_loop_hint, che eredita il reminder dal system_text base). Doppia
         # iniezione: garanzia nel system + recency sull'ultimo HumanMessage.
+        # ── ADR 0016 Fase A.1: offload preventivo system prompt ─────────────
+        # Se il system prompt supera threshold token, indicizziamo in Qdrant
+        # (collection tool_results_chunks, source_kind=system_context) e nel
+        # prompt resta head + pointer esplicito. L'agente recupera con
+        # nexus_search_semantic(source_kinds=system_context) on-demand.
+        try:
+            system_text = _offload_system_prompt_if_huge(system_text, _embeddings)
+        except Exception as _offload_exc:
+            logger.warning("system_prompt offload best-effort fallita: %s", _offload_exc)
+
         _lang_enabled, _lang_text = _load_language_reminder()
         messages, system_text = _inject_language_reminder(
             messages, system_text, _lang_enabled, _lang_text
+        )
+        # ── ADR 0016 Fase A.4: forced RAG reminder ───────────────────────────
+        # Quando il context stimato supera forced_rag_threshold_ratio*window,
+        # iniettiamo un'istruzione assertiva: l'agente deve usare
+        # nexus_search_semantic prima di rispondere, invece di assumere visione
+        # completa del context. Riduce in modo strutturale i casi di context
+        # overflow (vedi chat 6 incident: 1.2M token mandati a window 131k).
+        # Usa _estimate_context_tokens (tiktoken, Fase D) per stima accurata.
+        _rag_est_tokens = _estimate_context_tokens(messages)
+        _rag_window = _model_context_window(model)
+        messages, system_text = _inject_forced_rag_reminder(
+            messages, system_text, _rag_est_tokens, _rag_window
         )
         anth_messages = _langchain_to_anthropic_messages(messages)
         try:

@@ -2,6 +2,7 @@ mod admin;
 mod agent_processes;
 mod agent_router_server;
 mod agent_todos_routes;
+mod agent_tool_result_cache;
 mod agent_tools;
 mod agent_types;
 mod auth;
@@ -1006,6 +1007,7 @@ async fn main() -> anyhow::Result<()> {
     // configurabile via settings.knowledge.cleanup_draft_days (default 30 giorni).
     // Intervallo giornaliero (86400s).
     knowledge_workers::start_knowledge_cleanup_worker(state.db.clone());
+    agent_tool_result_cache::start_cleanup_worker(state.db.clone());
 
     // Recupero promote: promuove a 'active' le note chat di run completati (+
     // risposta AI) se il promote inline a fine run non e' scattato. Rete di

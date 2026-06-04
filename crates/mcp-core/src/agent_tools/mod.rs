@@ -280,7 +280,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "nexus_todo_write",
-    "description": "PR-1 Plan/Act/Verify: crea o aggiorna la TODO list strutturata del piano agente. Tool riservato principalmente al planner_node per emettere il plan iniziale (action='create'). L'executor puo' usarlo solo per action='check' (marca completato) o 'update' (cambia status). Persiste in nexus_agent_todos con isolation per project_id. Tipi di azione: 'create' (ricrea l'intera lista, cancellando i todos precedenti del run), 'check' (UPDATE status='completed' su lista di id), 'add' (INSERT nuovi todo in coda con seq incrementale), 'update' (UPDATE status arbitrario su id). Ritorna JSON {ok, action, affected, plan_id?, todo_ids?}.",
+    "description": "Gestisce la TODO list del piano agente. Azioni: create (planner: nuovo plan), check (marca completato), update (cambia status), add (append). Ritorna {ok,action,affected,todo_ids?}.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -1201,7 +1201,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "nexus_inspect_attachment",
-    "description": "Investiga il vero formato di un allegato usando la magic byte detection. Da chiamare SEMPRE prima di rinunciare quando il MIME e' application/octet-stream o l'estensione e' sospetta (.make, .dat, .bin, .pkg, .fig). Ritorna {kind, mime_reale, extension_reale, is_text, extraction_tools, hint, next_action_recommended}. REGOLA OBBLIGATORIA (ADR 0012): dopo aver chiamato questo tool, chiama IL TOOL indicato in `next_action_recommended.tool` con i parametri `next_action_recommended.input` cosi' come sono. NON chiamare `nexus_read_attachment` o `nexus_read_archive_entry` con offset crescenti su file binari: e' inefficiente e satura il context window. Per i kind binari opachi `next_action_recommended` puo' essere null: in quel caso chiedi all'utente come procedere.",
+    "description": "Magic-byte detection del formato reale di un allegato (.make/.dat/.bin/.fig). Ritorna kind+mime+extraction_tools+next_action_recommended. Chiama SEMPRE prima di leggere binari opachi: poi usa esattamente il tool suggerito in next_action_recommended.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -1289,7 +1289,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "nexus_extract_figma_code",
-    "description": "FASE 1 resa Figma Make. Estrae il code-snapshot React/TypeScript/Tailwind GIA' PRESENTE dentro un .make Figma e lo SCRIVE SU DISCO sotto la project_root (default sottocartella 'figma_export/'). Un .make non contiene solo la specifica: dentro ai_chat.json ci sono tutte le scritture file dell'app salvate come chiamate-tool (fast_apply_tool/write_tool). Questo tool ricostruisce l'ultima versione di ogni file e la materializza. NON ritorna il contenuto dei file (per non saturare il contesto): ritorna solo un MANIFEST {format:'figma_make_code', files_written:[{path,bytes}], total_files, total_bytes, target_dir, entrypoints, detected_dependencies, partial, notes}. Usalo al posto di rigenerare l'app da zero quando l'inspector segnala che il .make contiene fast_apply. Dopo l'estrazione leggi i singoli file con read_file e genera package.json da detected_dependencies.",
+    "description": "Estrae il code-snapshot React/TS/Tailwind da un .make Figma e scrive i file su disco (default figma_export/). Ritorna manifest con files_written, entrypoints, detected_dependencies. Usa quando inspector segnala fast_apply.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -1360,7 +1360,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "nexus_db_query",
-    "description": "Esegue SQL arbitrario sul DATABASE APPLICATIVO del progetto attivo (SELECT/INSERT/UPDATE/DELETE/CREATE TABLE/ALTER/DROP). USA QUESTO per qualsiasi operazione sui dati del progetto: NON usare psql (non installato) ne run_command. La connessione e' risolta automaticamente da project_database_config (DB applicativo dedicato, isolato dal DB Nexus). SELECT ritorna {columns, rows, row_count, truncated}; INSERT/UPDATE/DELETE/DDL ritornano {rows_affected}. Per query parametrizzate usa $1,$2 in 'sql' e passa i valori in 'params' (es. INSERT INTO users(email) VALUES ($1) con params=['x@y.it']); per tipi non-testo usa cast nel SQL ($1::int). Aggiungi RETURNING per leggere il record inserito. Se la tabella non esiste, creala prima con CREATE TABLE.",
+    "description": "Esegue SQL sul DB applicativo del progetto (SELECT/INSERT/UPDATE/DELETE/DDL). SELECT ritorna {columns,rows,row_count}; mutazioni ritornano {rows_affected}. Usa params=$1,$2 con cast ($1::int) per tipi non testo. Sostituisce psql/run_command.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -1408,7 +1408,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "nexus_visual_compare",
-    "description": "FASE 2 resa Figma Make: verifica visiva. Screenshotta l'URL locale dell'app avviata e la confronta col design di riferimento Figma usando un modello vision. Ritorna {similarity_score (0-100), differences:[{category:'colore|tipografia|layout|spaziatura|componente', severity:'alta|media|bassa', description, suggested_fix}], screenshot_path (su disco), reference_source:'thumbnail|attachment', model_used}. Le immagini NON sono incluse nella risposta: lo screenshot e' salvato su disco. Usalo dopo aver avviato il dev server per misurare la distanza dal design e, in modalita' Continuo, iterare correggendo stile/layout finche' similarity_score supera la soglia (default 85) e non restano differenze di severita' alta. Se ritorna un errore strutturato (Playwright assente, url irraggiungibile, vision non configurata) non insistere in loop.",
+    "description": "Confronta screenshot dell'app locale con design Figma via vision model. Ritorna similarity_score (0-100), differences[], screenshot_path. Usa per iterare layout/stile fino a soglia (default 85).",
     "input_schema": {
       "type": "object",
       "properties": {

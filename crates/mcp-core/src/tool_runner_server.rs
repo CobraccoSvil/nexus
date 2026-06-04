@@ -170,12 +170,60 @@ impl ToolRunner for ToolRunnerService {
         };
 
         let ctx = self.build_ctx(session_id).await?;
+
+        // ── ADR 0016 Fase A.5: cache cross-turn tool_result ───────────────
+        // Lookup PRIMA dell'esecuzione. Hit → ritorna payload cached con
+        // marker [cache_ref] nel content. Miss → esegue, cacha (se non in
+        // skiplist) e ritorna. I tool con side-effect (run_command,
+        // write_file, ecc.) non vengono cachati: cache_cfg.skip_for.
+        let cache_cfg =
+            crate::agent_tool_result_cache::CacheConfig::load(&self.deps.db).await;
+        let cache_eligible = cache_cfg.should_cache(&req.tool_name);
+
+        if cache_eligible {
+            if let Some(hit) = crate::agent_tool_result_cache::lookup(
+                &self.deps.db, &req.tool_name, &input,
+            ).await {
+                let duration_ms = started.elapsed().as_millis() as u64;
+                tracing::info!(
+                    tool = %req.tool_name,
+                    age_s = hit.age_seconds,
+                    cache_key = %&hit.cache_key[..12.min(hit.cache_key.len())],
+                    "tool_result_cache: hit"
+                );
+                return Ok(Response::new(ExecuteToolResponse {
+                    tool_use_id: req.tool_use_id,
+                    tool_result_json: hit.payload,
+                    is_error: false,
+                    duration_ms,
+                }));
+            }
+        }
+
         let result = execute_agent_tool(&ctx, &req.tool_name, &input).await;
 
         // execute_agent_tool codifica l'errore come stringa che inizia
         // con il carattere '❌'. Lo mappiamo su is_error=true.
         let is_error = result.trim_start().starts_with('\u{274C}');
         let duration_ms = started.elapsed().as_millis() as u64;
+
+        // Store cache (best-effort, solo se ok e tool cacheable).
+        if cache_eligible && !is_error {
+            let db = self.deps.db.clone();
+            let tool_name = req.tool_name.clone();
+            let args_for_cache = input.clone();
+            let payload = result.clone();
+            let ttl = cache_cfg.ttl_seconds;
+            tokio::spawn(async move {
+                if let Err(e) = crate::agent_tool_result_cache::store(
+                    &db, &tool_name, &args_for_cache, &payload, ttl,
+                )
+                .await
+                {
+                    tracing::debug!("tool_result_cache store fallita: {e}");
+                }
+            });
+        }
 
         Ok(Response::new(ExecuteToolResponse {
             tool_use_id: req.tool_use_id,

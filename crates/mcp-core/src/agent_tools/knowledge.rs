@@ -25,15 +25,83 @@ pub async fn tool_knowledge_search(ctx: &AgentToolContext, input: &Value) -> Str
         Some(q) if !q.trim().is_empty() => q.trim(),
         _ => return json!({"error": "query mancante o vuota"}).to_string(),
     };
+    // ADR 0016 Fase A.6: clamp esteso a 100, sopra graph_summary_threshold_topk
+    // l'output diventa {mode:summary, clusters:[{theme,count,sample_titles}]}.
     let top_k = input
         .get("top_k")
         .and_then(|v| v.as_u64())
         .unwrap_or(5)
-        .clamp(1, 20) as usize;
+        .clamp(1, 100) as usize;
     let min_score = input
         .get("min_score")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.4) as f32;
+
+    // Soglia per modalita' graph summary (Fase A.6).
+    let summary_threshold: usize = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'agent.kb.graph_summary_threshold_topk'",
+    )
+    .fetch_optional(&*ctx.db)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|v| v.trim().parse().ok())
+    .unwrap_or(20);
+    let summary_mode = top_k > summary_threshold;
+
+    if summary_mode {
+        // Cluster per intent (GROUP BY) — output compatto vs N body interi.
+        // Quando top_k > 20, l'agente vuole una panoramica: ritorna clusters
+        // {theme, count, sample_titles} invece di saturare il context.
+        let rows = sqlx::query(
+            r#"
+            WITH ranked AS (
+                SELECT intent, title,
+                       row_number() OVER (PARTITION BY COALESCE(intent,'other')
+                                          ORDER BY updated_at DESC) AS rk
+                FROM project_knowledge_notes
+                WHERE project_id = $1 AND status IN ('active','draft')
+            )
+            SELECT
+                COALESCE(intent,'other') AS theme,
+                COUNT(*)::int            AS count,
+                array_agg(title ORDER BY rk) FILTER (WHERE rk <= 3) AS sample_titles
+            FROM ranked
+            GROUP BY COALESCE(intent,'other')
+            ORDER BY count DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(ctx.project_id)
+        .bind(top_k as i32)
+        .fetch_all(&*ctx.db)
+        .await;
+        let rows = match rows {
+            Ok(r) => r,
+            Err(e) => return json!({"error": format!("DB cluster query: {e}")}).to_string(),
+        };
+        let clusters: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                let theme: String = r.try_get("theme").unwrap_or_default();
+                let count: i32 = r.try_get("count").unwrap_or(0);
+                let titles: Vec<String> = r.try_get("sample_titles").unwrap_or_default();
+                json!({
+                    "theme": theme,
+                    "count": count,
+                    "sample_titles": titles,
+                })
+            })
+            .collect();
+        let total: i32 = clusters.iter().filter_map(|c| c.get("count").and_then(|v| v.as_i64())).sum::<i64>() as i32;
+        return json!({
+            "mode": "summary",
+            "clusters": clusters,
+            "total": total,
+            "hint": "Per body completo di un cluster: knowledge_search(query, top_k<=20, intent='<theme>')."
+        })
+        .to_string();
+    }
 
     let embed_text = if query.len() > 2000 {
         &query[..2000]

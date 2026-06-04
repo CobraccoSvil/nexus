@@ -383,10 +383,58 @@ pub async fn build_tools_json_for_agent(
             "build_tools_json: modello o-series '{}' rilevato — riduzione a {} tool essenziali + discovery",
             model, essential.len()
         );
-        filter_tools_by_whitelist(after_mode, &essential)
-    } else {
-        after_mode
+        return filter_tools_by_whitelist(after_mode, &essential);
     }
+
+    // ── ADR 0016 Fase A.2: tool discovery on-demand per TUTTI i modelli ────
+    // Se `agent.tools.discovery_enabled` e' true, il set inline contiene SOLO
+    // i tool core (`agent.tools.inline_core_whitelist`). I rimanenti (~66) sono
+    // raggiungibili via nexus_mcp_tool_search / nexus_mcp_tool_call (gia' inline).
+    // Risparmio ~14k token/turno di tool definitions sui 19k totali.
+    if is_a2_discovery_enabled(db).await {
+        let core = load_inline_core_whitelist(db).await;
+        if !core.is_empty() {
+            tracing::info!(
+                "build_tools_json: A.2 discovery on-demand attivo (model='{}') — {} tool core inline",
+                model, core.len()
+            );
+            return filter_tools_by_whitelist(after_mode, &core);
+        }
+    }
+
+    after_mode
+}
+
+/// Settings `agent.tools.discovery_enabled` (default false: opt-in).
+async fn is_a2_discovery_enabled(db: &PgPool) -> bool {
+    sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'agent.tools.discovery_enabled'",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .map(|v| v.trim().eq_ignore_ascii_case("true"))
+    .unwrap_or(false)
+}
+
+/// Whitelist tool core inline (Fase A.2). CSV in
+/// `agent.tools.inline_core_whitelist`. Lista vuota -> disabilita la riduzione.
+async fn load_inline_core_whitelist(db: &PgPool) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'agent.tools.inline_core_whitelist'",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .map(|csv| {
+        csv.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Riconosce gli errori del provider AI che indicano "credito esaurito" / "quota

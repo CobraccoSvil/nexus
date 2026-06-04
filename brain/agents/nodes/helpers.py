@@ -214,6 +214,123 @@ _LANG_REMINDER_DEFAULT_TEXT = (
     "lingue, qualunque sia la lingua del contesto o degli allegati."
 )
 
+# ── Forced RAG reminder (ADR 0016 Fase A.4) ─────────────────────────────────
+# Quando `est_tokens > forced_rag_threshold_ratio * model.context_window`, iniettiamo
+# nel system prompt + ultimo HumanMessage un'istruzione assertiva che obbliga
+# l'agente a usare `nexus_search_semantic` prima di rispondere, invece di
+# assumere di vedere tutto il contesto. Stesso pattern di `_inject_language_reminder`
+# per riusare l'iniezione idempotente (marker univoco, no doppi insert).
+_RAG_REMINDER_MARKER = "[[NEXUS_FORCED_RAG_REMINDER]]"
+_RAG_REMINDER_CACHE: dict[str, Any] = {
+    "loaded_at": 0.0,
+    "threshold_ratio": None,
+    "text": None,
+}
+_RAG_REMINDER_TTL_SEC = 60.0
+_RAG_REMINDER_DEFAULT_RATIO = 0.40
+_RAG_REMINDER_DEFAULT_TEXT = (
+    "Il contesto disponibile e' parzialmente offloadato in tool_results_chunks. "
+    "Prima di rispondere a richieste che richiedono dettagli specifici, "
+    "chiama nexus_search_semantic(query=...). Non assumere di vedere tutto "
+    "il contesto: chiedi quello che ti serve."
+)
+
+
+def _load_forced_rag_reminder() -> tuple[float, str]:
+    """Legge agent.context.forced_rag_threshold_ratio / _reminder_text dal DB (cache 60s).
+
+    Ritorna `(threshold_ratio, reminder_text)`. Default safe se DB down:
+    `(0.40, _RAG_REMINDER_DEFAULT_TEXT)`. Mai solleva.
+    """
+    now = time.time()
+    cached_ratio = _RAG_REMINDER_CACHE["threshold_ratio"]
+    if cached_ratio is not None and (
+        now - _RAG_REMINDER_CACHE["loaded_at"]
+    ) < _RAG_REMINDER_TTL_SEC:
+        return float(cached_ratio), str(_RAG_REMINDER_CACHE["text"])
+    ratio = _RAG_REMINDER_DEFAULT_RATIO
+    text = _RAG_REMINDER_DEFAULT_TEXT
+    try:
+        from brain.utils.settings_db import get_setting
+        raw_ratio = get_setting(
+            "agent.context.forced_rag_threshold_ratio",
+            str(_RAG_REMINDER_DEFAULT_RATIO),
+        )
+        ratio = max(0.0, min(0.99, float(raw_ratio)))
+        text = (
+            get_setting(
+                "agent.context.forced_rag_reminder_text",
+                _RAG_REMINDER_DEFAULT_TEXT,
+            ).strip()
+            or _RAG_REMINDER_DEFAULT_TEXT
+        )
+    except Exception as exc:
+        logger.warning(
+            "forced_rag_reminder: load DB fallito, uso default (%s)", exc
+        )
+    _RAG_REMINDER_CACHE["threshold_ratio"] = ratio
+    _RAG_REMINDER_CACHE["text"] = text
+    _RAG_REMINDER_CACHE["loaded_at"] = now
+    return ratio, text
+
+
+def _inject_forced_rag_reminder(
+    messages: list[Any],
+    system_text: str,
+    est_tokens: int,
+    window: int,
+) -> tuple[list[Any], str]:
+    """Inietta il forced RAG reminder se `est_tokens > ratio * window`.
+
+    Pattern speculare a `_inject_language_reminder` (marker idempotente,
+    iniezione in TESTA al system + recency su ultimo HumanMessage). Quando il
+    context e' grande, l'agente viene istruito a recuperare on-demand invece
+    di assumere visione completa.
+
+    Idempotente: ricaricare la stessa funzione non duplica il reminder.
+    Ritorna `(messages, system_text)` invariati se sotto soglia o se ratio<=0.
+    """
+    if window <= 0 or est_tokens <= 0:
+        return messages, system_text
+    ratio, reminder_text = _load_forced_rag_reminder()
+    if ratio <= 0 or not reminder_text:
+        return messages, system_text
+    threshold = int(window * ratio)
+    if est_tokens < threshold:
+        return messages, system_text
+
+    base_system = system_text or ""
+    if _RAG_REMINDER_MARKER not in base_system:
+        rag_block = f"### RECUPERO ON-DEMAND DEL CONTESTO ###\n{reminder_text}"
+        new_system = (
+            f"{_RAG_REMINDER_MARKER}\n{rag_block}\n\n{base_system}\n\n{rag_block}"
+        )
+    else:
+        new_system = system_text
+
+    new_messages = messages
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if not isinstance(msg, HumanMessage):
+            continue
+        content = getattr(msg, "content", None)
+        if not isinstance(content, str):
+            break
+        if _RAG_REMINDER_MARKER in content:
+            break
+        # Crea copia (no mutate sullo stato condiviso).
+        appended = f"{content}\n\n{_RAG_REMINDER_MARKER} {reminder_text}"
+        new_msg = HumanMessage(content=appended)
+        new_messages = list(messages)
+        new_messages[idx] = new_msg
+        break
+
+    logger.info(
+        "forced_rag_reminder: iniettato (est_tokens=%d window=%d threshold=%d ratio=%.2f)",
+        est_tokens, window, threshold, ratio,
+    )
+    return new_messages, new_system
+
 
 def _load_language_reminder() -> tuple[bool, str]:
     """Legge agent.language_reminder_enabled / _text dal DB con cache 60s.
@@ -975,6 +1092,410 @@ def _estimate_context_chars(messages: list) -> int:
             if isinstance(block, dict):
                 c = block.get("content", "")
                 total += len(c) if isinstance(c, str) else 0
+    return total
+
+
+# ── Tokenizer-based context size (ADR 0016 Fase D) ──────────────────────────
+# Sostituisce la stima `chars//4` (sottostima fino a 3-5x su contenuti densi:
+# JSON tool_result, codice, CJK, base64). tiktoken cl100k_base e' lo stesso
+# tokenizer BPE usato da Claude/GPT/Mistral. Cache LRU su hash content per
+# evitare ri-tokenizzazione di messaggi gia' visti (perf critica con history
+# lunga). Fallback a chars//4 se tiktoken non disponibile (regola H: niente
+# panic, degrada in modo controllato).
+import functools as _functools_for_tok
+import hashlib as _hashlib_for_tok
+
+_TOKENIZER_CACHE: dict[str, Any] = {"encoder": None, "name": None}
+_TOK_DEFAULT_NAME = "cl100k_base"
+
+
+def _get_tokenizer():
+    """Carica e cache l'encoder tiktoken (key: agent.context.tokenizer)."""
+    try:
+        from brain.utils.settings_db import get_setting
+        name = (get_setting("agent.context.tokenizer", _TOK_DEFAULT_NAME) or _TOK_DEFAULT_NAME).strip()
+    except Exception:
+        name = _TOK_DEFAULT_NAME
+    if _TOKENIZER_CACHE["encoder"] is not None and _TOKENIZER_CACHE["name"] == name:
+        return _TOKENIZER_CACHE["encoder"]
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding(name)
+    except Exception as exc:
+        logger.warning("tokenizer %s non disponibile (%s), fallback chars//4", name, exc)
+        return None
+    _TOKENIZER_CACHE["encoder"] = enc
+    _TOKENIZER_CACHE["name"] = name
+    return enc
+
+
+@_functools_for_tok.lru_cache(maxsize=4096)
+def _count_tokens_cached(content_hash: str, length: int) -> int:
+    """Slot LRU: il vero conteggio passa per _count_tokens (che chiama questa)."""
+    # NB: questa funzione e' un placeholder per cache: la chiave include hash+len
+    # per evitare collisioni. Il valore reale viene messo via _count_tokens.
+    return length // 4  # fallback se mai raggiunto direttamente
+
+
+def _count_tokens(text: str) -> int:
+    """Conta token di una stringa con tiktoken + cache LRU per hash."""
+    if not text:
+        return 0
+    enc = _get_tokenizer()
+    if enc is None:
+        return max(1, len(text) // 4)
+    # Cache: chiave hash content (i messaggi vecchi sono identici tra turni).
+    h = _hashlib_for_tok.sha1(text.encode("utf-8", "ignore")).hexdigest()
+    cache_key = (h, len(text))
+    cached = _COUNT_TOKENS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        n = len(enc.encode(text, disallowed_special=()))
+    except Exception:
+        n = max(1, len(text) // 4)
+    _COUNT_TOKENS_CACHE[cache_key] = n
+    # Cap dimensione cache LRU semplice.
+    if len(_COUNT_TOKENS_CACHE) > 4096:
+        # rimuovi il piu' vecchio (FIFO approssimato — dict mantiene insertion order)
+        first_key = next(iter(_COUNT_TOKENS_CACHE))
+        _COUNT_TOKENS_CACHE.pop(first_key, None)
+    return n
+
+
+_COUNT_TOKENS_CACHE: dict[tuple[str, int], int] = {}
+
+
+# ── Rolling summary cross-turno (ADR 0016 Fase A.3) ─────────────────────────
+# Ogni N turni, sostituisce i messaggi piu' vecchi con un summary compatto.
+# Gli originali restano in Qdrant (collection chat_history_rolling) e sono
+# retrievabili con nexus_search_semantic(source_kinds=chat_history).
+# Implementazione MINIMA: tronca i messaggi vecchi a `aggressive_max_chars`
+# preservando role+content essenziale, e li offloada in batch.
+_ROLLING_DEFAULT_ENABLED = True
+_ROLLING_DEFAULT_WINDOW = 5
+_ROLLING_DEFAULT_KEEP_RECENT = 3
+
+
+def _load_rolling_config() -> dict[str, Any]:
+    """Settings rolling summary (cache via _CTX_MGMT* esistente)."""
+    enabled = _ROLLING_DEFAULT_ENABLED
+    window = _ROLLING_DEFAULT_WINDOW
+    keep_recent = _ROLLING_DEFAULT_KEEP_RECENT
+    try:
+        from brain.utils.settings_db import get_bool_setting, get_setting
+        enabled = get_bool_setting("agent.context.rolling_summary_enabled", True)
+        window = int(get_setting("agent.context.rolling_window_turns", "5") or "5")
+        keep_recent = int(get_setting("agent.context.rolling_keep_recent_turns", "3") or "3")
+    except Exception as exc:
+        logger.debug("rolling_summary: load DB fallito (%s), default", exc)
+    return {"enabled": enabled, "window": window, "keep_recent": keep_recent}
+
+
+def _apply_rolling_summary(messages: list[Any], iteration: int, embeddings: Any | None) -> list[Any]:
+    """Ogni `window` turni, offloada i messaggi piu' vecchi e li sostituisce
+    con un placeholder compatto. Mantiene `keep_recent` integri.
+
+    Best-effort: non solleva mai. Quando l'offload non e' disponibile,
+    semplicemente non comprime (degrada ai brake successivi).
+    """
+    cfg = _load_rolling_config()
+    if not cfg["enabled"]:
+        return messages
+    if iteration <= 0 or iteration % cfg["window"] != 0:
+        return messages
+    if len(messages) <= cfg["keep_recent"] + 1:
+        return messages
+
+    try:
+        from brain.agents import context_offload
+        first_human = _first_human_index(messages)
+        cutoff = max(first_human + 1, len(messages) - cfg["keep_recent"])
+        if cutoff <= 1:
+            return messages
+        to_compress = messages[1:cutoff] if first_human == 0 else messages[:cutoff]
+        if not to_compress:
+            return messages
+
+        # Concatena i contenuti per offload (manteniamo struttura semantica
+        # role:content separati da delimitatori per retrieval).
+        parts: list[str] = []
+        for m in to_compress:
+            role = m.__class__.__name__
+            content = getattr(m, "content", None)
+            content_str = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False) if content else ""
+            parts.append(f"### {role}\n{content_str}")
+        full_text = "\n\n".join(parts)
+        if len(full_text) < 2000:
+            return messages  # troppo piccolo, non vale la pena
+
+        offload = context_offload.offload_to_rag(
+            embeddings,
+            full_text,
+            source_kind="chat_history",
+            metadata={"turns_compressed": len(to_compress), "at_iteration": iteration},
+        )
+        pointer = context_offload.build_pointer(
+            len(full_text), offload, what="messaggi precedenti"
+        )
+        # Sostituisci il blocco con UN messaggio di summary.
+        try:
+            from langchain_core.messages import SystemMessage
+            summary_msg = SystemMessage(content=(
+                f"[Rolling summary turni 1..{cutoff}]\n"
+                f"{len(to_compress)} messaggi precedenti compressi e indicizzati. {pointer}"
+            ))
+        except Exception:
+            summary_msg = to_compress[-1]  # fallback minimo
+        new_messages = [summary_msg] + messages[cutoff:]
+        if first_human == 0 and len(messages) > 0:
+            new_messages = [messages[0], summary_msg] + messages[cutoff:]
+        logger.info(
+            "rolling_summary: iter=%d offload %d messaggi (%d char) -> 1 summary",
+            iteration, len(to_compress), len(full_text),
+        )
+        return new_messages
+    except Exception as exc:
+        logger.warning("rolling_summary fallito (best-effort): %s", exc)
+        return messages
+
+
+# ── System prompt offload (ADR 0016 Fase A.1) ───────────────────────────────
+# Quando il system prompt (project context, KB snapshot, tool defs verbose)
+# supera `agent.context.system_prompt_offload_threshold_tokens`, il blocco viene
+# indicizzato in Qdrant (collection tool_results_chunks, source_kind=system_context)
+# e nel prompt resta un summary + pointer esplicito a `nexus_search_semantic`.
+# Riusa `offload_to_rag` esistente: l'agente recupera con il tool gia' noto.
+_SYS_OFFLOAD_DEFAULT_THRESHOLD = 8000
+_SYS_OFFLOAD_DEFAULT_SUMMARY_MAX = 800
+
+
+def _load_system_offload_config() -> tuple[int, int]:
+    """Threshold token + max summary token (cache 60s)."""
+    threshold = _SYS_OFFLOAD_DEFAULT_THRESHOLD
+    max_summary = _SYS_OFFLOAD_DEFAULT_SUMMARY_MAX
+    try:
+        from brain.utils.settings_db import get_setting
+        threshold = int(
+            get_setting(
+                "agent.context.system_prompt_offload_threshold_tokens",
+                str(_SYS_OFFLOAD_DEFAULT_THRESHOLD),
+            )
+        )
+        max_summary = int(
+            get_setting(
+                "agent.context.system_prompt_summary_max_tokens",
+                str(_SYS_OFFLOAD_DEFAULT_SUMMARY_MAX),
+            )
+        )
+    except Exception as exc:
+        logger.debug("system_offload: load DB fallito, default (%s)", exc)
+    return threshold, max_summary
+
+
+def _offload_system_prompt_if_huge(system_text: str, embeddings: Any | None) -> str:
+    """Se `system_text` > threshold token, offload in Qdrant e ritorna summary+pointer.
+
+    Mantiene SEMPRE l'intestazione del system prompt (prime righe, fino a
+    `summary_max_tokens` stimati). Il resto va in Qdrant ed e' raggiungibile
+    via `nexus_search_semantic(source_kinds=system_context)`. Best-effort:
+    in caso di errore offload, ritorna il system_text invariato.
+    """
+    if not system_text:
+        return system_text
+    threshold_tokens, max_summary_tokens = _load_system_offload_config()
+    est_tokens = _count_tokens(system_text)
+    if est_tokens <= threshold_tokens:
+        return system_text
+
+    # Calcola char budget per il summary: ~4 char/token + 200 per pointer.
+    summary_chars = max_summary_tokens * 4
+    head = system_text[:summary_chars]
+    try:
+        from brain.agents import context_offload
+        offload = context_offload.offload_to_rag(
+            embeddings,
+            system_text,
+            source_kind="system_context",
+            metadata={"est_tokens": est_tokens},
+        )
+        pointer = context_offload.build_pointer(
+            len(system_text), offload, what="system prompt"
+        )
+        logger.info(
+            "system_prompt_offload: est_tokens=%d > threshold=%d -> offloadato "
+            "(head=%d char + pointer)",
+            est_tokens, threshold_tokens, len(head),
+        )
+        return f"{head}\n\n{pointer}"
+    except Exception as exc:
+        logger.warning(
+            "system_prompt_offload: fallito (%s), system_text inviato intero", exc
+        )
+        return system_text
+
+
+# ── Smart upscale (ADR 0016 Fase C) ─────────────────────────────────────────
+# Quando il context stimato supera 0.9*window del modello attivo, cerca nella
+# routing matrix un modello con context_window >= est_tokens*overhead_ratio
+# tra quelli `preferred_targets`. Lo switch e' visibile in UI e tracciato in
+# `agent_runs.upscale_*`.
+_UPSCALE_CACHE: dict[str, Any] = {
+    "loaded_at": 0.0,
+    "enabled": None,
+    "overhead": None,
+    "targets": None,
+    "cost_cap": None,
+}
+_UPSCALE_TTL_SEC = 60.0
+
+
+def _load_upscale_config() -> dict[str, Any]:
+    """Carica i settings agent.upscale.* dal DB (cache 60s)."""
+    now = time.time()
+    if _UPSCALE_CACHE["enabled"] is not None and (
+        now - _UPSCALE_CACHE["loaded_at"]
+    ) < _UPSCALE_TTL_SEC:
+        return {
+            "enabled": _UPSCALE_CACHE["enabled"],
+            "overhead": _UPSCALE_CACHE["overhead"],
+            "targets": _UPSCALE_CACHE["targets"],
+            "cost_cap": _UPSCALE_CACHE["cost_cap"],
+        }
+    enabled = True
+    overhead = 1.2
+    targets: list[str] = ["claude-opus-4-6", "gemini-2.5-pro", "gpt-5.5", "claude-sonnet-4-6"]
+    cost_cap = 0.50
+    try:
+        from brain.utils.settings_db import get_bool_setting, get_setting
+        enabled = get_bool_setting("agent.upscale.enabled", True)
+        overhead = float(get_setting("agent.upscale.target_overhead_ratio", "1.2") or "1.2")
+        raw_targets = get_setting("agent.upscale.preferred_targets", ",".join(targets)) or ""
+        targets = [t.strip() for t in raw_targets.split(",") if t.strip()]
+        cost_cap = float(get_setting("agent.upscale.cost_cap_usd_per_run", "0.50") or "0.50")
+    except Exception as exc:
+        logger.warning("upscale: load DB fallito, uso default (%s)", exc)
+    _UPSCALE_CACHE["loaded_at"] = now
+    _UPSCALE_CACHE["enabled"] = enabled
+    _UPSCALE_CACHE["overhead"] = overhead
+    _UPSCALE_CACHE["targets"] = targets
+    _UPSCALE_CACHE["cost_cap"] = cost_cap
+    return {"enabled": enabled, "overhead": overhead, "targets": targets, "cost_cap": cost_cap}
+
+
+_PROVIDER_FROM_MODEL_CACHE: dict[str, str] = {}
+
+
+def _provider_from_model(model: str) -> str | None:
+    """Risolve `provider` dal nome modello via `ai_price_catalog` (cache process)."""
+    if not model:
+        return None
+    cached = _PROVIDER_FROM_MODEL_CACHE.get(model)
+    if cached is not None:
+        return cached
+    try:
+        import os as _os
+        import psycopg2  # type: ignore[import-untyped]
+        db_url = _os.environ.get("DATABASE_URL") or "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable"
+        with psycopg2.connect(db_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT provider FROM ai_price_catalog WHERE model = %s AND is_enabled = TRUE LIMIT 1",
+                    (model,),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    _PROVIDER_FROM_MODEL_CACHE[model] = row[0]
+                    return row[0]
+    except Exception as exc:
+        logger.debug("_provider_from_model: lookup fallito %s (%s)", model, exc)
+    return None
+
+
+def _smart_upscale_model(
+    current_model: str,
+    current_window: int,
+    est_tokens: int,
+) -> tuple[str, str] | None:
+    """Ritorna `(new_model, reason)` se trova un modello con window adeguato.
+
+    None se non serve upscale o non c'e' alternativa. Cerca nei `preferred_targets`
+    in ordine, scegliendo il primo con `context_window >= est_tokens*overhead`
+    e abilitato in `ai_price_catalog`.
+    """
+    cfg = _load_upscale_config()
+    if not cfg["enabled"] or est_tokens <= 0 or current_window <= 0:
+        return None
+    if est_tokens < current_window * 0.9:
+        return None  # il modello attuale ce la fa
+
+    required = int(est_tokens * cfg["overhead"])
+    try:
+        import os as _os
+        import psycopg2  # type: ignore[import-untyped]
+        db_url = _os.environ.get("DATABASE_URL") or "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable"
+        with psycopg2.connect(db_url) as conn:
+            with conn.cursor() as cur:
+                # Costruisce l'ordering dei target via array_position per rispettare la preferenza CSV
+                placeholders = ",".join(["%s"] * len(cfg["targets"]))
+                cur.execute(
+                    f"""
+                    SELECT model, context_window
+                    FROM ai_price_catalog
+                    WHERE model IN ({placeholders})
+                      AND is_enabled = TRUE
+                      AND context_window >= %s
+                    ORDER BY array_position(ARRAY[{placeholders}]::text[], model)
+                    LIMIT 1
+                    """,
+                    (*cfg["targets"], required, *cfg["targets"]),
+                )
+                row = cur.fetchone()
+                if not row:
+                    logger.warning(
+                        "upscale: nessun modello con window >= %d tra %s",
+                        required, cfg["targets"],
+                    )
+                    return None
+                new_model = row[0]
+                new_window = row[1]
+                if new_model == current_model:
+                    return None
+                logger.info(
+                    "upscale: %s (window=%d) -> %s (window=%d) per est_tokens=%d",
+                    current_model, current_window, new_model, new_window, est_tokens,
+                )
+                return (new_model, f"context_overflow:est={est_tokens}:from_window={current_window}")
+    except Exception as exc:
+        logger.warning("upscale: lookup DB fallito (%s), no switch", exc)
+        return None
+
+
+def _estimate_context_tokens(messages: list) -> int:
+    """Stima token TOTALI del context, usando tiktoken (ADR 0016 Fase D).
+
+    Sostituisce `_estimate_context_chars(...) // 4` (che sottostima 3-5x su
+    JSON/CJK/base64). Stima accurata ±2% vs payload reale al provider.
+    """
+    total = 0
+    for m in messages:
+        if hasattr(m, "content"):
+            content = m.content
+            if isinstance(content, str):
+                total += _count_tokens(content)
+            elif isinstance(content, list):
+                # content puo' essere una lista di blocchi (es. tool_use/result)
+                for block in content:
+                    if isinstance(block, dict):
+                        for v in block.values():
+                            if isinstance(v, str):
+                                total += _count_tokens(v)
+        kwargs = getattr(m, "additional_kwargs", {}) or {}
+        for block in kwargs.get("anthropic_content", []):
+            if isinstance(block, dict):
+                c = block.get("content", "")
+                if isinstance(c, str):
+                    total += _count_tokens(c)
     return total
 
 
