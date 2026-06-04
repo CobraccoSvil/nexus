@@ -308,6 +308,37 @@ async fn ingest_message(
     );
     let body_hash = crate::wiki::vault::sha256_hex(&body_md);
 
+    // content_hash: hash del CONTENUTO UTENTE normalizzato (trim), NON del
+    // body_md arricchito. body_md include created_at/session_id/message_id e
+    // sarebbe sempre diverso anche per testi identici (mig 0314). Questo hash
+    // intercetta i duplicati reali (stesso testo, messaggi distinti).
+    let content_hash = crate::wiki::vault::sha256_hex(content.trim());
+
+    // Prevenzione duplicati di contenuto (mig 0314): se esiste gia' un chat_note
+    // con lo stesso (scope, project_id, content_hash) lo saltiamo. L'indice
+    // UNIQUE parziale uq_wiki_docs_chat_note_content e' la garanzia hard lato DB;
+    // questo SELECT evita di sprecare un embedding per un doc che non verra'
+    // creato. Il messaggio viene comunque marcato kb_ingested dal chiamante.
+    let existing_content_dup: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM wiki_docs \
+         WHERE kind = 'chat_note' AND scope = 'project' \
+           AND project_id = $1 AND content_hash = $2 \
+           AND slug <> $3 LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(&content_hash)
+    .bind(&slug)
+    .fetch_optional(&state.db)
+    .await
+    .context("SELECT content_hash duplicato chat_note")?;
+    if existing_content_dup.is_some() {
+        tracing::debug!(
+            message_id = %message_id,
+            "wiki.chat_note: contenuto duplicato (content_hash), skip ingest"
+        );
+        return Ok(false);
+    }
+
     // Embed + upsert Qdrant (best-effort).
     let snippet = if content.len() > 2000 {
         &content[..2000]
@@ -373,17 +404,18 @@ async fn ingest_message(
             kind, tags, qdrant_point_id, edited_by,
             edit_lock, protected_sections, manually_edited,
             generated_hash, edited_hash,
-            current_version, auto_generated, public_read
+            current_version, auto_generated, public_read, content_hash
         ) VALUES (
             $8, 'project', $1, $2, $3, $4, $5,
             'chat_note', $6, $7, 'chat_message',
             'none', '{}', FALSE,
             $5, NULL,
-            1, TRUE, FALSE
+            1, TRUE, FALSE, $9
         )
         ON CONFLICT (scope, COALESCE(project_id::text,''), slug) DO UPDATE SET
             -- Aggiorna solo metadati: il body chat non cambia (i messaggi sono immutabili).
             qdrant_point_id = COALESCE(wiki_docs.qdrant_point_id, EXCLUDED.qdrant_point_id),
+            content_hash = COALESCE(wiki_docs.content_hash, EXCLUDED.content_hash),
             updated_at = NOW()
         "#,
     )
@@ -395,6 +427,7 @@ async fn ingest_message(
     .bind(&tags)
     .bind(qdrant_point_id.as_deref())
     .bind(doc_uuid)
+    .bind(&content_hash)
     .execute(&state.db)
     .await
     .context("INSERT wiki_docs chat_note")?;
