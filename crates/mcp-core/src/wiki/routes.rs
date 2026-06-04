@@ -11,7 +11,9 @@
 use crate::auth::Claims;
 use crate::wiki::acl::WikiAcl;
 use crate::wiki::model::{WikiDocPatch, WikiScope};
-use crate::wiki::{links_worker, reingest, revisions, search as wiki_search, storage, triple_extractor};
+use crate::wiki::{
+    links_worker, reingest, revisions, search as wiki_search, storage, title_gen, triple_extractor,
+};
 use crate::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -81,6 +83,16 @@ pub struct RecomputeLinksQuery {
     pub scope: Option<String>,
     pub project_id: Option<Uuid>,
     /// Se settato, ignora `scope`/`project_id` e ricalcola solo questo doc.
+    pub doc_id: Option<Uuid>,
+    pub wait: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecomputeTitlesQuery {
+    /// `meta` | `project` | `all` (default `all`). Ignorato se `doc_id` settato.
+    pub scope: Option<String>,
+    pub project_id: Option<Uuid>,
+    /// Se settato, rigenera il titolo solo per questo doc (anche oltre il cap).
     pub doc_id: Option<Uuid>,
     pub wait: Option<bool>,
 }
@@ -557,6 +569,171 @@ pub async fn recompute_links_handler(
             "run_id": run_id.to_string(),
             "scope": scope_filter.map(|s| s.as_str()).unwrap_or("all"),
             "project_id": project_filter,
+            "wait": false,
+        })),
+    ))
+}
+
+/// `POST /api/wiki/recompute-titles?scope=&project_id=&doc_id=&wait=`
+///
+/// Admin-only. Rigenera via LLM i titoli descrittivi dei doc con titolo-
+/// artefatto (kind chat_note/run_summary/other), saltando quelli editati a mano
+/// e i veri documenti redatti. `wait=true` blocca fino al report; default async
+/// (202 + run_id opaco). Modellato su `recompute_links_handler`.
+pub async fn recompute_titles_handler(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<RecomputeTitlesQuery>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
+    let acl = build_acl(&state, &claims).await?;
+    if !acl.is_admin {
+        return Err(err403("solo admin puo' lanciare wiki.recompute-titles"));
+    }
+
+    let wait = q.wait.unwrap_or(false);
+
+    // Path "singolo documento" — ignora scope/project_id, bypassa il cap.
+    if let Some(doc_id) = q.doc_id {
+        if wait {
+            let report = title_gen::generate_title_for_doc(&state, doc_id)
+                .await
+                .map_err(err500)?;
+            return Ok((
+                StatusCode::OK,
+                Json(serde_json::to_value(report).unwrap_or_else(|_| json!({}))),
+            ));
+        }
+        let run_id = Uuid::new_v4();
+        let state_cloned = state.clone();
+        tokio::spawn(async move {
+            tracing::info!(
+                run_id = %run_id,
+                doc_id = %doc_id,
+                "wiki.recompute-titles: avvio task background (singolo doc)"
+            );
+            match title_gen::generate_title_for_doc(&state_cloned, doc_id).await {
+                Ok(rep) => tracing::info!(
+                    run_id = %run_id,
+                    updated = rep.updated,
+                    elapsed_ms = rep.elapsed_ms,
+                    "wiki.recompute-titles: completato (singolo doc)"
+                ),
+                Err(e) => tracing::error!(
+                    run_id = %run_id,
+                    error = %e,
+                    "wiki.recompute-titles: fallito (singolo doc)"
+                ),
+            }
+        });
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({ "ok": true, "run_id": run_id.to_string(), "wait": false })),
+        ));
+    }
+
+    // Path "scope-wide".
+    let scope_label = q.scope.as_deref().unwrap_or("all").to_lowercase();
+    let do_meta = scope_label == "meta" || scope_label == "all";
+    let do_project = scope_label == "project" || scope_label == "all";
+    if !do_meta && !do_project {
+        return Err(err400(format!(
+            "scope invalido: {scope_label} (atteso meta|project|all)"
+        )));
+    }
+
+    // Closure asincrona inline impossibile; helper inline tramite blocco.
+    let run_batch = {
+        let project_id = q.project_id;
+        move |state: AppState| async move {
+            let mut aggregated = serde_json::Map::new();
+            let mut overall_processed = 0usize;
+            let mut overall_updated = 0usize;
+
+            if do_meta {
+                let rep =
+                    title_gen::generate_titles_for_scope(&state, title_gen::TitleScope::Meta)
+                        .await?;
+                overall_processed += rep.processed_count;
+                overall_updated += rep.updated_count;
+                aggregated.insert(
+                    "meta".to_string(),
+                    serde_json::to_value(rep).unwrap_or(Value::Null),
+                );
+            }
+            if do_project {
+                let project_ids: Vec<Uuid> = if let Some(pid) = project_id {
+                    vec![pid]
+                } else {
+                    sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects")
+                        .fetch_all(&state.db)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("SELECT projects per recompute-titles: {e}"))?
+                };
+                let mut projects_map = serde_json::Map::new();
+                for pid in project_ids {
+                    let rep = title_gen::generate_titles_for_scope(
+                        &state,
+                        title_gen::TitleScope::Project(pid),
+                    )
+                    .await?;
+                    overall_processed += rep.processed_count;
+                    overall_updated += rep.updated_count;
+                    projects_map.insert(
+                        pid.to_string(),
+                        serde_json::to_value(rep).unwrap_or(Value::Null),
+                    );
+                }
+                aggregated.insert("projects".to_string(), Value::Object(projects_map));
+            }
+            Ok::<_, anyhow::Error>((overall_processed, overall_updated, aggregated))
+        }
+    };
+
+    if wait {
+        let (processed, updated, details) = run_batch(state.clone()).await.map_err(err500)?;
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "processed_total": processed,
+                "updated_total": updated,
+                "details": details,
+            })),
+        ));
+    }
+
+    let run_id = Uuid::new_v4();
+    let state_cloned = state.clone();
+    let scope_clone = scope_label.clone();
+    let project_filter = q.project_id;
+    tokio::spawn(async move {
+        tracing::info!(
+            run_id = %run_id,
+            scope = %scope_clone,
+            project_id = ?project_filter,
+            "wiki.recompute-titles: avvio task background (batch)"
+        );
+        match run_batch(state_cloned).await {
+            Ok((processed, updated, _)) => tracing::info!(
+                run_id = %run_id,
+                processed = processed,
+                updated = updated,
+                "wiki.recompute-titles: completato (batch)"
+            ),
+            Err(e) => tracing::error!(
+                run_id = %run_id,
+                error = %e,
+                "wiki.recompute-titles: fallito (batch)"
+            ),
+        }
+    });
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "ok": true,
+            "run_id": run_id.to_string(),
+            "scope": scope_label,
+            "project_id": q.project_id,
             "wait": false,
         })),
     ))
@@ -1383,6 +1560,13 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
         .route(
             "/api/wiki/recompute-links",
             post(recompute_links_handler).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
+        .route(
+            "/api/wiki/recompute-titles",
+            post(recompute_titles_handler).layer(axum_mw::from_fn_with_state(
                 state.clone(),
                 middleware::require_auth,
             )),

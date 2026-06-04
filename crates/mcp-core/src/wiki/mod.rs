@@ -28,6 +28,7 @@ pub mod revisions;
 pub mod routes;
 pub mod search;
 pub mod storage;
+pub mod title_gen;
 pub mod triple_extractor;
 pub mod vault;
 pub mod watcher;
