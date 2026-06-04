@@ -74,7 +74,9 @@ const KIND_MAP: Record<string, KindDescriptor> = {
   // (vedi brain/agents/nodes.py tool_dispatch_node). Card compatta, collassata:
   // l'utente vede il flusso dei tool in tempo reale durante run lunghi.
   tool_executed: {
-    icon: "▸",
+    // Icona distinta dal chevron di espansione (anch'esso "▸"): altrimenti la
+    // card tool mostrava due frecce identiche "▸▸".
+    icon: "◆",
     label: "Tool",
     tone: "text-emerald-700 dark:text-emerald-300",
     bg: "bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800",
@@ -190,6 +192,12 @@ export function AgentMetaStepCard({ data }: { data: AgentMetaStepData }) {
   const desc = KIND_MAP[data.kind] ?? DEFAULT_DESC;
   const [open, setOpen] = useState(desc.defaultOpen);
 
+  // I meta_step tool arrivano col title gia' prefissato "tool <nome>": col label
+  // "Tool" del descrittore diventerebbe "Tool tool <nome>" ("Tooltool"). Rimuovo
+  // il prefisso ridondante per i soli tool_executed.
+  const displayTitle =
+    data.kind === "tool_executed" ? data.title.replace(/^tool\s+/i, "") : data.title;
+
   // Provider/model per il turno (per il badge colorato per provider+costo).
   // - routing      -> popolato direttamente nel payload (provider/model)
   // - tool_executed -> idem
@@ -222,7 +230,7 @@ export function AgentMetaStepCard({ data }: { data: AgentMetaStepData }) {
         <span aria-hidden className="font-mono">{open ? "▾" : "▸"}</span>
         <span aria-hidden className="font-mono">{desc.icon}</span>
         <span className="font-medium">{desc.label}</span>
-        <span className="opacity-70 truncate text-left flex-1">{data.title}</span>
+        <span className="opacity-70 truncate text-left flex-1">{displayTitle}</span>
         {showBadge && <ProviderBadge provider={provider} model={model} />}
       </button>
       {open && (
