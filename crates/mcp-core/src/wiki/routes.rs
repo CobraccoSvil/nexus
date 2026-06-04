@@ -956,16 +956,17 @@ pub async fn get_graph(
         let kind: String = row.try_get("kind").unwrap_or_default();
         let degree: i64 = row.try_get("degree").unwrap_or(0);
         node_ids.insert(id);
+        // Formato RAW conforme al contratto TS WikiGraphNode (id/title/kind/...):
+        // NON wrappare in {data:{label}} (il frontend ricostruisce gli elementi
+        // Cytoscape da questi campi; con {data:{}} n.title era undefined -> crash).
         nodes_json.push(json!({
-            "data": {
-                "id": id.to_string(),
-                "label": title,
-                "slug": slug,
-                "kind": kind,
-                "scope": scope,
-                "project_id": project_id,
-                "degree": degree,
-            }
+            "id": id.to_string(),
+            "title": title,
+            "slug": slug,
+            "kind": kind,
+            "scope": scope,
+            "project_id": project_id,
+            "degree": degree,
         }));
     }
 
@@ -1016,16 +1017,14 @@ pub async fn get_graph(
         let confidence: f32 = row.try_get("confidence").unwrap_or(0.0);
         let created_by: String = row.try_get("created_by").unwrap_or_default();
         let evidence: Option<String> = row.try_get("evidence").ok();
+        // Formato RAW conforme al contratto TS WikiGraphEdge (from/to/rel_type/...).
         edges_json.push(json!({
-            "data": {
-                "id": format!("{}__{}__{}", from_id, to_id, rel_type),
-                "source": from_id.to_string(),
-                "target": to_id.to_string(),
-                "rel_type": rel_type,
-                "confidence": confidence,
-                "created_by": created_by,
-                "evidence": evidence,
-            }
+            "from": from_id.to_string(),
+            "to": to_id.to_string(),
+            "rel_type": rel_type,
+            "confidence": confidence,
+            "created_by": created_by,
+            "evidence": evidence,
         }));
     }
 
