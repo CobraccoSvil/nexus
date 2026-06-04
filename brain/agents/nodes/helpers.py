@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 import uuid
 from typing import Any
@@ -770,6 +771,23 @@ _INTENT_NARRATION_PATTERNS: tuple[str, ...] = (
     "the next step is", "the next file",
 )
 
+# Rilevamento MORFOLOGICO (regola H: robusto a verbi nuovi, evita la blacklist
+# che cresce a ogni caso). Complementa _INTENT_NARRATION_PATTERNS catturando:
+#   1. Futuro 1a persona italiano: qualunque verbo terminante in "-rò" accentato
+#      (creerò, estrarrò, scomporrò, dividerò, sposterò, rifattorizzerò, farò,
+#      andrò...). Cosi' non serve elencare ogni verbo. Unico falso positivo
+#      frequente escluso: "però".
+#   2. Trigger d'avvio + gerundio ("inizio creando", "sto procedendo", "ora
+#      generando"): il gerundio "-ndo" dopo un avverbio/verbo d'avvio segnala
+#      un'azione narrata e non ancora eseguita.
+# I falsi positivi residui costano solo un re-route, limitato dal cap
+# g1_reroute_count; un falso negativo invece lascia il task a meta'.
+_FUTURE_1P_RE = re.compile(r"\b(?!però\b)\w{2,}rò\b")
+_START_GERUND_RE = re.compile(
+    r"\b(inizio|comincio|sto|stiamo|iniziamo|cominciamo|ora|adesso|poi|quindi|"
+    r"prima|dopo)\s+\w*ndo\b"
+)
+
 
 def _detect_unfulfilled_intent(text: str | None) -> bool:
     """True se l'OUTPUT annuncia un'azione imminente ma non l'ha eseguita.
@@ -779,11 +797,18 @@ def _detect_unfulfilled_intent(text: str | None) -> bool:
     router G1 e dal nudge executor per ri-mandare all'executor quando un modello
     thinking narra il piano e chiude senza tool call. Il cap g1_reroute_count
     impedisce loop infiniti su eventuali falsi positivi.
+
+    Due livelli: la blacklist storica _INTENT_NARRATION_PATTERNS (frasi precise,
+    inclusi i casi inglesi) piu' il rilevamento morfologico (_FUTURE_1P_RE /
+    _START_GERUND_RE) che generalizza i futuri/gerundi italiani senza inseguire
+    ogni nuovo verbo.
     """
     if not text or not text.strip():
         return False
     tail = text.strip().lower()[-400:]
-    return any(p in tail for p in _INTENT_NARRATION_PATTERNS)
+    if any(p in tail for p in _INTENT_NARRATION_PATTERNS):
+        return True
+    return bool(_FUTURE_1P_RE.search(tail) or _START_GERUND_RE.search(tail))
 
 
 def _last_assistant_text(messages: list) -> str:
