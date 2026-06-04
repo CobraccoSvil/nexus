@@ -52,6 +52,10 @@ pub fn build_app_router(state: AppState, cors: CorsLayer) -> Router {
     let router = project_db::merge(router, &state);
     let router = knowledge::merge(router, &state);
     let router = meta_docs::merge(router, &state);
+    // ADR 0017 v2 — endpoint unificati `/api/wiki/*`. Convivono con i vecchi
+    // `/api/meta-docs/*` e `/api/projects/:id/knowledge/*` finche' F8 non
+    // rimuovera' i moduli legacy (`meta_docs/`, `knowledge/`, `docs_core/`).
+    let router = crate::wiki::routes::merge(router, &state);
     let router = change_drafts::merge(router, &state);
     let router = documents::merge(router, &state);
     let router = chat_commands::merge(router, &state);

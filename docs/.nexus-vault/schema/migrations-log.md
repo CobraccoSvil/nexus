@@ -6,12 +6,12 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: c5aeabb28cfd0186984ea494be6e8fc993e365a2
+source_commit: 7d9d1215a8bb89c888b5514784e554c431782edc
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T11:31:36Z
+updated_at: 2026-06-04T12:22:48Z
 nexus_meta_version: 1
 ---
 
@@ -305,7 +305,8 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0291_provider_empty_responses.sql` | Migrazione 0291 — Diagnostica empty/hollow completion provider (QW2). |
 | `0292_continuation_detection.sql` | Migrazione 0292 — Continuation detection settings (ADR 0017 Fix A). |
 | `0293_continuation_directive_system_prompt.sql` | Migrazione 0293 — Direttiva anti-narration nel system prompt (ADR 0017 Fix B). |
+| `0294_billing_currency_usd_and_reset.sql` | Migrazione 0294 — Allineamento billing currency a USD + reset ledger. |
 
-**Totale**: 284 migrazioni.
+**Totale**: 285 migrazioni.
 
-Ultima migrazione: `0293_continuation_directive_system_prompt.sql`.
+Ultima migrazione: `0294_billing_currency_usd_and_reset.sql`.

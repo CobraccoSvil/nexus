@@ -1535,9 +1535,19 @@ async fn handle_impact_brief(db: &PgPool, project_id: Uuid, arguments: &Value) -
         })
         .to_string();
     }
-    crate::knowledge::impact::impact_brief(db, project_id, &seed_paths)
-        .await
-        .to_string()
+    // ADR 0017 v2 F8: `knowledge::impact::impact_brief` rimosso assieme al
+    // modulo `knowledge/`. La feature "impact analysis" basata su grafo
+    // codice (`code_graph`) non e' stata reimplementata sul nuovo schema
+    // `wiki_docs`/`wiki_concept_triples` e va riprogettata. Per evitare
+    // confondere l'agente con dati arbitrari, ritorniamo un payload
+    // esplicito che ne segnala la dismissione.
+    let _ = (db, project_id, seed_paths);
+    json!({
+        "deprecated": true,
+        "reason": "impact_brief rimosso in ADR 0017 F8 (knowledge/impact). \
+                   Da reimplementare sul knowledge graph unificato.",
+    })
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------

@@ -1196,25 +1196,30 @@ pub fn conversation_point_id(session_id: Uuid, message_id: Uuid) -> String {
     format!("{:x}", hash)[..32].to_string()
 }
 
+
 // ═══════════════════════════════════════════════════════════════════════════
-// Knowledge Notes — collection Qdrant per la KB per-progetto
+// Wiki content (ADR 0017 v2) — collection Qdrant unificata per `wiki_docs`.
+//
+// Singola collection, niente partizionamento per scope: la discriminazione
+// tra meta/project vive nel payload (`scope` + `project_id`). Vector size e
+// distance identiche a `nexus_meta_docs` (384 / Cosine).
 // ═══════════════════════════════════════════════════════════════════════════
 
-const DEFAULT_KNOWLEDGE_COLLECTION: &str = "knowledge_notes";
+const DEFAULT_WIKI_CONTENT_COLLECTION: &str = "wiki_content";
 
-async fn qdrant_knowledge_config(db: &PgPool) -> anyhow::Result<(String, String)> {
+async fn qdrant_wiki_content_config(db: &PgPool) -> anyhow::Result<(String, String)> {
     let url = get_setting(db, "qdrant_url").await?.unwrap_or_else(|| {
         std::env::var("QDRANT_URL").unwrap_or_else(|_| DEFAULT_QDRANT_URL.to_string())
     });
-    let collection = get_setting(db, "qdrant_knowledge_collection")
+    let collection = get_setting(db, "agent.wiki.qdrant_collection")
         .await?
-        .unwrap_or_else(|| DEFAULT_KNOWLEDGE_COLLECTION.to_string());
+        .unwrap_or_else(|| DEFAULT_WIKI_CONTENT_COLLECTION.to_string());
     Ok((url, collection))
 }
 
-/// Crea la collection Qdrant `knowledge_notes` se non esiste (idempotente).
-pub async fn ensure_knowledge_collection(db: &PgPool) -> anyhow::Result<()> {
-    let (base_url, collection) = qdrant_knowledge_config(db).await?;
+/// Crea la collection Qdrant `wiki_content` se non esiste (idempotente).
+pub async fn ensure_wiki_content_collection(db: &PgPool) -> anyhow::Result<()> {
+    let (base_url, collection) = qdrant_wiki_content_config(db).await?;
     let client = nexus_http::build_client();
     let get_url = format!("{base_url}/collections/{collection}");
 
@@ -1222,7 +1227,7 @@ pub async fn ensure_knowledge_collection(db: &PgPool) -> anyhow::Result<()> {
         .get(&get_url)
         .send()
         .await
-        .context("impossibile verificare collection knowledge_notes")?;
+        .context("impossibile verificare collection wiki_content")?;
 
     if response.status().is_success() {
         return Ok(());
@@ -1241,27 +1246,29 @@ pub async fn ensure_knowledge_collection(db: &PgPool) -> anyhow::Result<()> {
         .json(&create_body)
         .send()
         .await
-        .context("impossibile creare collection knowledge_notes")?;
+        .context("impossibile creare collection wiki_content")?;
 
     if !create_response.status().is_success() {
         let payload = create_response.text().await.unwrap_or_default();
         return Err(anyhow!(
-            "creazione collection knowledge_notes fallita: {payload}"
+            "creazione collection wiki_content fallita: {payload}"
         ));
     }
 
     Ok(())
 }
 
-/// Inserisce/aggiorna un punto nella collection knowledge_notes.
-pub async fn upsert_knowledge_point(
+/// Inserisce/aggiorna un punto nella collection `wiki_content`. Il payload
+/// e' libero (vedi `wiki::reingest::build_payload`) ma ci si aspetta almeno
+/// `scope`, `doc_id`, `title`. La funzione non assume scope-specifico.
+pub async fn upsert_wiki_content_point(
     db: &PgPool,
     point_id: &str,
     vector: Vec<f32>,
     payload: Value,
 ) -> anyhow::Result<()> {
-    ensure_knowledge_collection(db).await?;
-    let (base_url, collection) = qdrant_knowledge_config(db).await?;
+    ensure_wiki_content_collection(db).await?;
+    let (base_url, collection) = qdrant_wiki_content_config(db).await?;
     let url = format!("{base_url}/collections/{collection}/points?wait=true");
     let body = json!({
         "points": [{
@@ -1277,259 +1284,115 @@ pub async fn upsert_knowledge_point(
         .json(&body)
         .send()
         .await
-        .context("knowledge upsert fallito")?;
+        .context("wiki_content upsert fallito")?;
 
     if !response.status().is_success() {
         let payload = response.text().await.unwrap_or_default();
-        return Err(anyhow!("knowledge upsert fallito: {payload}"));
+        return Err(anyhow!("wiki_content upsert fallito: {payload}"));
     }
     Ok(())
 }
 
-/// Cerca note simili nella collection knowledge_notes, filtrate per project_id.
-pub async fn search_knowledge_points(
-    db: &PgPool,
-    vector: Vec<f32>,
-    project_id: Uuid,
-    top_k: usize,
-) -> anyhow::Result<Vec<VectorPointHit>> {
-    ensure_knowledge_collection(db).await?;
-    let (base_url, collection) = qdrant_knowledge_config(db).await?;
-    let url = format!("{base_url}/collections/{collection}/points/search");
-    let body = json!({
-        "vector": vector,
-        "limit": top_k,
-        "with_payload": true,
-        "filter": {
-            "must": [
-                {
-                    "key": "project_id",
-                    "match": { "value": project_id.to_string() }
-                },
-                {
-                    "key": "status",
-                    "match": { "any": ["active", "draft"] }
-                }
-            ]
-        }
-    });
-
+/// Conta i punti nella collection `wiki_content`. Utile per smoke-test dopo
+/// il re-ingest. Restituisce 0 se la collection non esiste.
+pub async fn count_wiki_content_points(db: &PgPool) -> anyhow::Result<u64> {
+    let (base_url, collection) = qdrant_wiki_content_config(db).await?;
+    let url = format!("{base_url}/collections/{collection}/points/count");
     let client = nexus_http::build_client();
     let response = client
         .post(&url)
-        .json(&body)
+        .json(&json!({ "exact": true }))
         .send()
         .await
-        .context("knowledge search fallita")?;
-
+        .context("count wiki_content fallito")?;
     if !response.status().is_success() {
-        let text = response.text().await.unwrap_or_default();
-        return Err(anyhow!("knowledge search fallita: {text}"));
+        return Ok(0);
     }
-
-    let payload: Value = response
-        .json()
-        .await
-        .context("payload ricerca knowledge non valido")?;
-    let result = payload
-        .get("result")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    let mut hits = Vec::with_capacity(result.len());
-    for hit in result {
-        let score = hit.get("score").and_then(Value::as_f64).unwrap_or(0.0);
-        let point_id = match hit.get("id") {
-            Some(Value::String(v)) => v.clone(),
-            Some(Value::Number(v)) => v.to_string(),
-            _ => continue,
-        };
-        let pl = hit.get("payload").cloned().unwrap_or(json!({}));
-        hits.push(VectorPointHit {
-            point_id,
-            score,
-            payload: pl,
-        });
-    }
-    Ok(hits)
+    let v: Value = response.json().await.unwrap_or_else(|_| json!({}));
+    Ok(v.get("result")
+        .and_then(|r| r.get("count"))
+        .and_then(|c| c.as_u64())
+        .unwrap_or(0))
 }
 
-/// Elimina punti dalla collection knowledge_notes per lista di point_id.
-/// Recupera il vettore di un point Qdrant `knowledge_notes` per id.
-/// Permette il link inference senza ri-embedding via brain.
-pub async fn get_knowledge_point_vector(db: &PgPool, point_id: &str) -> anyhow::Result<Vec<f32>> {
-    let (base_url, collection) = qdrant_knowledge_config(db).await?;
+/// Recupera il vector di un point in `wiki_content` (id = doc UUID stringa).
+/// Permette il link semantico senza ri-embeddare il body. Errore se assente.
+pub async fn get_wiki_content_point_vector(
+    db: &PgPool,
+    point_id: &str,
+) -> anyhow::Result<Vec<f32>> {
+    let (base_url, collection) = qdrant_wiki_content_config(db).await?;
     let url = format!("{base_url}/collections/{collection}/points/{point_id}?with_vector=true");
     let client = nexus_http::build_client();
     let response = client
         .get(&url)
         .send()
         .await
-        .context("get_knowledge_point_vector: GET point fallito")?;
+        .context("get_wiki_content_point_vector: GET point fallito")?;
     if !response.status().is_success() {
         let text = response.text().await.unwrap_or_default();
-        return Err(anyhow!("get_knowledge_point_vector: HTTP error: {text}"));
+        return Err(anyhow!(
+            "get_wiki_content_point_vector: HTTP error: {text}"
+        ));
     }
     let payload: Value = response
         .json()
         .await
-        .context("get_knowledge_point_vector: parse JSON")?;
+        .context("get_wiki_content_point_vector: parse JSON")?;
     let vector = payload
         .get("result")
         .and_then(|r| r.get("vector"))
         .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("get_knowledge_point_vector: vector mancante"))?
+        .ok_or_else(|| anyhow!("get_wiki_content_point_vector: vector mancante"))?
         .iter()
         .filter_map(|x| x.as_f64().map(|f| f as f32))
         .collect::<Vec<f32>>();
     if vector.is_empty() {
-        return Err(anyhow!("get_knowledge_point_vector: vettore vuoto"));
+        return Err(anyhow!("get_wiki_content_point_vector: vettore vuoto"));
     }
     Ok(vector)
 }
 
-pub async fn delete_knowledge_points(db: &PgPool, point_ids: &[String]) -> anyhow::Result<()> {
-    if point_ids.is_empty() {
-        return Ok(());
-    }
-    ensure_knowledge_collection(db).await?;
-    let (base_url, collection) = qdrant_knowledge_config(db).await?;
-    let url = format!("{base_url}/collections/{collection}/points/delete?wait=true");
-    let body = json!({
-        "points": point_ids,
-    });
-
-    let client = nexus_http::build_client();
-    let response = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .context("eliminazione punti knowledge fallita")?;
-
-    if !response.status().is_success() {
-        let text = response.text().await.unwrap_or_default();
-        return Err(anyhow!("eliminazione punti knowledge fallita: {text}"));
-    }
-    Ok(())
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Meta-docs (Nexus self-documentation vault) — collection Qdrant
-// Pattern clonato da knowledge_notes, ma singleton (no project_id filter).
-// Filtro opzionale per `kind` (architecture/adr/api/schema/runbook/changelog/decision).
-// ═══════════════════════════════════════════════════════════════════════════
-
-const DEFAULT_META_DOCS_COLLECTION: &str = "nexus_meta_docs";
-
-async fn qdrant_meta_docs_config(db: &PgPool) -> anyhow::Result<(String, String)> {
-    let url = get_setting(db, "qdrant_url").await?.unwrap_or_else(|| {
-        std::env::var("QDRANT_URL").unwrap_or_else(|_| DEFAULT_QDRANT_URL.to_string())
-    });
-    let collection = get_setting(db, "qdrant_meta_docs_collection")
-        .await?
-        .unwrap_or_else(|| DEFAULT_META_DOCS_COLLECTION.to_string());
-    Ok((url, collection))
-}
-
-/// Crea la collection Qdrant `nexus_meta_docs` se non esiste (idempotente).
-pub async fn ensure_meta_docs_collection(db: &PgPool) -> anyhow::Result<()> {
-    let (base_url, collection) = qdrant_meta_docs_config(db).await?;
-    let client = nexus_http::build_client();
-    let get_url = format!("{base_url}/collections/{collection}");
-
-    let response = client
-        .get(&get_url)
-        .send()
-        .await
-        .context("impossibile verificare collection nexus_meta_docs")?;
-
-    if response.status().is_success() {
-        return Ok(());
-    }
-
-    let create_url = format!("{base_url}/collections/{collection}");
-    let create_body = json!({
-        "vectors": {
-            "size": 384,
-            "distance": "Cosine"
-        }
-    });
-
-    let create_response = client
-        .put(&create_url)
-        .json(&create_body)
-        .send()
-        .await
-        .context("impossibile creare collection nexus_meta_docs")?;
-
-    if !create_response.status().is_success() {
-        let payload = create_response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "creazione collection nexus_meta_docs fallita: {payload}"
-        ));
-    }
-
-    Ok(())
-}
-
-/// Inserisce/aggiorna un punto nella collection nexus_meta_docs.
-pub async fn upsert_meta_doc_point(
-    db: &PgPool,
-    point_id: &str,
-    vector: Vec<f32>,
-    payload: Value,
-) -> anyhow::Result<()> {
-    ensure_meta_docs_collection(db).await?;
-    let (base_url, collection) = qdrant_meta_docs_config(db).await?;
-    let url = format!("{base_url}/collections/{collection}/points?wait=true");
-    let body = json!({
-        "points": [{
-            "id": point_id,
-            "vector": vector,
-            "payload": payload,
-        }]
-    });
-
-    let client = nexus_http::build_client();
-    let response = client
-        .put(&url)
-        .json(&body)
-        .send()
-        .await
-        .context("meta-docs upsert fallito")?;
-
-    if !response.status().is_success() {
-        let payload = response.text().await.unwrap_or_default();
-        return Err(anyhow!("meta-docs upsert fallito: {payload}"));
-    }
-    Ok(())
-}
-
-/// Cerca note meta-docs simili. Se `kind_filter` e' Some, filtra per `kind` esatto.
-pub async fn search_meta_doc_points(
+/// Cerca in `wiki_content` per cosine similarity. Filtri ACL applicati a valle
+/// dal chiamante (il payload Qdrant contiene `scope` + `project_id`).
+/// `score_threshold` viene applicato lato Qdrant. Ritorna hit ordinati per score.
+pub async fn search_wiki_content_points(
     db: &PgPool,
     vector: Vec<f32>,
-    kind_filter: Option<&str>,
     top_k: usize,
+    score_threshold: f64,
 ) -> anyhow::Result<Vec<VectorPointHit>> {
-    ensure_meta_docs_collection(db).await?;
-    let (base_url, collection) = qdrant_meta_docs_config(db).await?;
-    let url = format!("{base_url}/collections/{collection}/points/search");
+    search_wiki_content_points_filtered(db, vector, top_k, score_threshold, None).await
+}
 
+/// Variante di `search_wiki_content_points` con filtro Qdrant arbitrario sul
+/// payload. Il `filter` (se `Some`) viene inoltrato nel body della query come
+/// `{ "filter": ... }` -> rispetta la sintassi Qdrant
+/// (es. `{ "must": [{ "key": "scope", "match": { "value": "meta" } }, ...] }`).
+///
+/// Usato da `wiki::search` per restringere lato server lo scope/progetto/kind/tags
+/// prima ancora del filtro ACL applicato in Postgres a valle.
+pub async fn search_wiki_content_points_filtered(
+    db: &PgPool,
+    vector: Vec<f32>,
+    top_k: usize,
+    score_threshold: f64,
+    filter: Option<Value>,
+) -> anyhow::Result<Vec<VectorPointHit>> {
+    ensure_wiki_content_collection(db).await?;
+    let (base_url, collection) = qdrant_wiki_content_config(db).await?;
+    let url = format!("{base_url}/collections/{collection}/points/search");
     let mut body = json!({
         "vector": vector,
         "limit": top_k,
+        "score_threshold": score_threshold,
         "with_payload": true,
+        "with_vector": false,
     });
-    if let Some(kind) = kind_filter {
-        body["filter"] = json!({
-            "must": [{
-                "key": "kind",
-                "match": { "value": kind }
-            }]
-        });
+    if let Some(f) = filter {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("filter".to_string(), f);
+        }
     }
 
     let client = nexus_http::build_client();
@@ -1538,17 +1401,15 @@ pub async fn search_meta_doc_points(
         .json(&body)
         .send()
         .await
-        .context("meta-docs search fallita")?;
-
+        .context("wiki_content search fallita")?;
     if !response.status().is_success() {
         let text = response.text().await.unwrap_or_default();
-        return Err(anyhow!("meta-docs search fallita: {text}"));
+        return Err(anyhow!("wiki_content search fallita: {text}"));
     }
-
     let payload: Value = response
         .json()
         .await
-        .context("payload ricerca meta-docs non valido")?;
+        .context("payload ricerca wiki_content non valido")?;
     let result = payload
         .get("result")
         .and_then(Value::as_array)
@@ -1571,31 +1432,4 @@ pub async fn search_meta_doc_points(
         });
     }
     Ok(hits)
-}
-
-/// Elimina punti dalla collection nexus_meta_docs per lista di point_id.
-pub async fn delete_meta_doc_points(db: &PgPool, point_ids: &[String]) -> anyhow::Result<()> {
-    if point_ids.is_empty() {
-        return Ok(());
-    }
-    ensure_meta_docs_collection(db).await?;
-    let (base_url, collection) = qdrant_meta_docs_config(db).await?;
-    let url = format!("{base_url}/collections/{collection}/points/delete?wait=true");
-    let body = json!({
-        "points": point_ids,
-    });
-
-    let client = nexus_http::build_client();
-    let response = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .context("eliminazione punti meta-docs fallita")?;
-
-    if !response.status().is_success() {
-        let text = response.text().await.unwrap_or_default();
-        return Err(anyhow!("eliminazione punti meta-docs fallita: {text}"));
-    }
-    Ok(())
 }

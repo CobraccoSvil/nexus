@@ -55,7 +55,8 @@ export function AdminSidebar({
       items: [
         { label: "Database Nexus", href: "/admin/nexus-database" as Route, icon: "DN" },
         { label: "Manutenzione Vettori", href: "/admin/vector-maintenance" as Route, icon: "MV" },
-        { label: "Doc Nexus (meta-vault)", href: "/admin/nexus-docs" as Route, icon: "DX" },
+        { label: "Knowledge Base", href: "/admin/kb" as Route, icon: "KB" },
+        { label: "Doc Nexus (legacy)", href: "/admin/nexus-docs" as Route, icon: "DX" },
         { label: "Porting Progetto", href: "/admin/project-porting" as Route, icon: "PP" },
       ],
     },

@@ -173,12 +173,21 @@ pub(crate) async fn build_knowledge_context(
         }
     };
 
-    // 3. Search Qdrant
-    let hits = match crate::vector_memory::search_knowledge_points(
+    // 3. Search Qdrant (ADR 0017 v2 F8: collection unificata `wiki_content`,
+    //    filtro Qdrant su scope=project + project_id esatto).
+    use serde_json::json;
+    let filter = json!({
+        "must": [
+            { "key": "scope", "match": { "value": "project" } },
+            { "key": "project_id", "match": { "value": project_id.to_string() } },
+        ]
+    });
+    let hits = match crate::vector_memory::search_wiki_content_points_filtered(
         &state.db,
         vector,
-        project_id,
         top_k * 2, // overfetch, filtreremo per score
+        min_score as f64,
+        Some(filter),
     )
     .await
     {
@@ -191,31 +200,27 @@ pub(crate) async fn build_knowledge_context(
     let note_ids: Vec<(Uuid, f32)> = hits
         .iter()
         .filter(|h| (h.score as f32) >= min_score)
-        .filter_map(|h| {
-            h.payload
-                .get("note_id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<Uuid>().ok())
-                .map(|id| (id, h.score as f32))
-        })
+        .filter_map(|h| h.point_id.parse::<Uuid>().ok().map(|id| (id, h.score as f32)))
         .take(top_k)
         .collect();
     if note_ids.is_empty() {
         return None;
     }
 
-    // 4. Carica title+body+tags+intent dalle note
+    // 4. Carica title+body+tags+intent dai wiki_docs (scope=project).
     use sqlx::Row;
     let ids: Vec<Uuid> = note_ids.iter().map(|(id, _)| *id).collect();
     let rows = sqlx::query(
         r#"
-        SELECT id, title, body_md, tags, intent, status
-        FROM project_knowledge_notes
+        SELECT id, title, body_md, tags, intent
+        FROM wiki_docs
         WHERE id = ANY($1)
-          AND status IN ('active', 'draft')
+          AND scope = 'project'
+          AND project_id = $2
         "#,
     )
     .bind(&ids)
+    .bind(project_id)
     .fetch_all(&state.db)
     .await
     .ok()?;
@@ -223,7 +228,9 @@ pub(crate) async fn build_knowledge_context(
         return None;
     }
 
-    // 5. Format markdown (ordinato per score)
+    // 5. Format markdown (ordinato per score). `status` non esiste piu' in
+    //    wiki_docs (ADR 0017 v2): manteniamo placeholder "active" per non
+    //    rompere il rendering del prompt.
     let mut by_id: std::collections::HashMap<
         Uuid,
         (String, String, Vec<String>, Option<String>, String),
@@ -233,8 +240,8 @@ pub(crate) async fn build_knowledge_context(
         let title: String = r.try_get("title").unwrap_or_default();
         let body: String = r.try_get("body_md").unwrap_or_default();
         let tags: Vec<String> = r.try_get("tags").unwrap_or_default();
-        let intent: Option<String> = r.try_get("intent").ok();
-        let status: String = r.try_get("status").unwrap_or_default();
+        let intent: Option<String> = r.try_get("intent").ok().flatten();
+        let status: String = "active".to_string();
         by_id.insert(id, (title, body, tags, intent, status));
     }
 
@@ -265,7 +272,7 @@ pub(crate) async fn build_knowledge_context(
         ));
     }
     out.push_str(
-        "_(Fonte: project_knowledge_notes — KB automatica del progetto. Aggiornata ad ogni messaggio utente.)_\n",
+        "_(Fonte: wiki_docs scope=project — KB unificata del progetto, ADR 0017 v2.)_\n",
     );
 
     tracing::info!(

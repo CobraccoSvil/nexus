@@ -47,7 +47,7 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
         // Python per RAG inline sulle note KB del progetto.
         .route(
             "/api/internal/knowledge/search",
-            post(knowledge::routes::internal_kb_search),
+            post(crate::wiki::internal::internal_kb_search),
         )
         // /api/internal/agent/backlog/:project_id — NO-AUTH, chiamato dal
         // brain (backlog_brief) per ereditare i todo carry_over nel planner.

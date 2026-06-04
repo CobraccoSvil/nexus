@@ -194,37 +194,12 @@ pub async fn send_chat_message(
     );
 
     // ── Hook: auto-creazione nota Knowledge Base ───────────────────────────
-    // Ogni messaggio utente genera una nota in background (non blocca il turno).
-    {
-        let db_clone = state.db.clone();
-        let neural_clone = state.orchestrator.neural.clone();
-        let channels_clone = state.project_channels.clone();
-        let pid = context.project_id;
-        let mid = user_message_id;
-        let cnt = content.to_string();
-        let intent_val: Option<String> = None; // l'intent verra' aggiornato dal classifier
-                                               // Recupera repo root per vault PUSH
-        let repo_root: Option<String> =
-            sqlx::query_scalar("SELECT repository_root_path FROM projects WHERE id = ")
-                .bind(pid)
-                .fetch_optional(&state.db)
-                .await
-                .ok()
-                .flatten();
-        tokio::spawn(async move {
-            crate::knowledge::create_note_from_user_message(
-                db_clone,
-                neural_clone,
-                pid,
-                mid,
-                cnt,
-                intent_val,
-                repo_root,
-                channels_clone,
-            )
-            .await;
-        });
-    }
+    // ADR 0017 v2 F8: la pipeline `knowledge::create_note_from_user_message`
+    // (auto-classificazione intent + INSERT su `project_knowledge_notes` +
+    // embedding + vault push) e' stata rimossa col modulo `knowledge/`. Va
+    // reimplementata su `wiki_docs` (scope=project) + `wiki_content` come
+    // worker dedicato (vedi `wiki::reingest` per il pattern). Per ora il
+    // turno chat NON popola piu' la KB automaticamente.
 
     // ── Rilevamento cambio modello esplicito ────────────────────────────────
     // Se il messaggio è un comando "usa mistral / cambia a claude / ecc." e
@@ -599,17 +574,17 @@ pub async fn send_chat_message(
                         )
                         .await;
 
-                        // M12.1: ingestione automatica del resoconto nella KB
-                        // (nota agent_summary + embedding + auto-link). Best-effort.
-                        if _run_completed {
-                            crate::knowledge::ingest_run::ingest_run_summary_to_kb(
-                                &db_clone2,
-                                &neural2,
-                                &proj_channels2,
-                                new_run_id,
-                            )
-                            .await;
-                        }
+                        // ADR 0017 v2 F8: `knowledge::ingest_run::ingest_run_summary_to_kb`
+                        // rimosso col modulo `knowledge/`. L'ingestione
+                        // automatica del resoconto run nella KB va
+                        // reimplementata su `wiki_docs` + `wiki_content`.
+                        let _ = (
+                            &db_clone2,
+                            &neural2,
+                            &proj_channels2,
+                            new_run_id,
+                            _run_completed,
+                        );
                     });
 
                     return Ok(Json(json!({

@@ -249,6 +249,41 @@ export default function NexusDocsAdminPage() {
 
   return (
     <div style={{ padding: 16, width: "100%" }}>
+      <div
+        style={{
+          padding: "10px 14px",
+          marginBottom: 12,
+          borderRadius: 6,
+          background: "#f59e0b22",
+          border: `1px solid #f59e0b`,
+          color: tc.text,
+          fontSize: 13,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 12,
+          flexWrap: "wrap",
+        }}
+      >
+        <span>
+          Pagina deprecata (ADR 0017 v2). Usa la nuova{" "}
+          <strong>Knowledge Base</strong> unificata.
+        </span>
+        <a
+          href="/admin/kb"
+          style={{
+            padding: "5px 12px",
+            background: tc.accent,
+            color: "#fff",
+            borderRadius: 4,
+            textDecoration: "none",
+            fontSize: 12,
+            fontWeight: 600,
+          }}
+        >
+          Apri /admin/kb →
+        </a>
+      </div>
       <header style={{ marginBottom: 12 }}>
         <h1 style={{ fontSize: 22, fontWeight: 700, margin: "0 0 4px" }}>
           Documentazione Nexus

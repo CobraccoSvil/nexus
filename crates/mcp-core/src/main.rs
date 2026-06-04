@@ -22,22 +22,15 @@ mod db;
 mod deepseek_balance_sync;
 mod dispatcher_routes;
 mod dlp;
-mod docs_core;
 mod documents;
 mod domain;
 mod environment;
 mod github;
 mod internal_learning;
 mod internal_routing;
-mod knowledge;
-mod knowledge_watcher;
-mod knowledge_workers;
 mod long_running;
 mod mcp_client;
 mod mcp_connectors;
-mod meta_docs;
-mod meta_docs_watcher;
-mod meta_docs_workers;
 mod middleware;
 mod model_catalog_sync;
 mod model_health_probe;
@@ -81,6 +74,7 @@ mod sudo_routes;
 mod task_watchdog;
 mod tool_runner_server;
 mod vector_memory;
+mod wiki;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -561,47 +555,10 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Pre-creazione collection Qdrant globali (best-effort, async).
-    // La collection `knowledge_notes` deve esistere prima del primo search/upsert.
-    // Senza questa chiamata, la creazione lazy alla prima chiamata `search_knowledge_points`
-    // puo' fallire se Qdrant e' temporaneamente irraggiungibile (race in startup),
-    // generando il toast "Operazione progetto (POST) fallita: Ricerca fallita:
-    // impossibile creare collection knowledge_notes" e bloccando a cascata
-    // l'orchestrator AI sui nuovi progetti.
-    {
-        let db_for_qdrant_init = db.clone();
-        tokio::spawn(async move {
-            let max_attempts = 8;
-            let mut delay_ms = 500u64;
-            for attempt in 1..=max_attempts {
-                match vector_memory::ensure_knowledge_collection(&db_for_qdrant_init).await {
-                    Ok(()) => {
-                        tracing::info!(
-                            "ensure_knowledge_collection: collection knowledge_notes pronta (tentativo {})",
-                            attempt
-                        );
-                        return;
-                    }
-                    Err(e) if attempt < max_attempts => {
-                        tracing::warn!(
-                            "ensure_knowledge_collection: tentativo {}/{} fallito ({}), retry tra {}ms",
-                            attempt, max_attempts, e, delay_ms
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        delay_ms = (delay_ms * 2).min(8000);
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "ensure_knowledge_collection: tutti i {} tentativi falliti, ultimo errore: {}. \
-                             La collection sara' creata lazily alla prima query knowledge — \
-                             verificare lo stato del container Qdrant.",
-                            max_attempts, e
-                        );
-                    }
-                }
-            }
-        });
-    }
+    // ADR 0017 v2 F8: rimosso `ensure_knowledge_collection` (collection
+    // legacy `knowledge_notes`). La collection unificata `wiki_content` viene
+    // garantita lazily dalle funzioni `vector_memory::ensure_wiki_content_collection`
+    // / `upsert_wiki_content_point` al primo write del re-ingest bootstrap.
 
     // URL gateway dalla porta nel DB (regola G: niente env/hardcoded).
     let gw_port = nexus_auth::resolve_port(&db, "nexus_gateway_port").await;
@@ -672,6 +629,117 @@ async fn main() -> anyhow::Result<()> {
     // Reindex semantico Qdrant dei tool MCP (fire-and-forget, +30s delay).
     // Indicizza solo i tool con embedding mancante o hash cambiato.
     nexus_builtin::spawn_tool_reindex(state.db.clone(), state.orchestrator.neural.clone());
+
+    // ── ADR 0017 v2 F3 — re-ingest automatico se `wiki_docs` e' vuota ─────
+    // Bootstrap one-shot: alla prima esecuzione dopo la migrazione 0295 la
+    // tabella e' vuota e i vault Markdown sono la sola fonte di verita'.
+    // Lo lanciamo come task background (non blocca lo startup HTTP) e logga
+    // il `ReingestReport` al termine.
+    {
+        let state_bootstrap = state.clone();
+        tokio::spawn(async move {
+            let empty: bool = match sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM wiki_docs",
+            )
+            .fetch_one(&state_bootstrap.db)
+            .await
+            {
+                Ok(n) => n == 0,
+                Err(e) => {
+                    tracing::warn!(error = %e, "wiki.bootstrap: COUNT wiki_docs fallita, skip");
+                    return;
+                }
+            };
+            if !empty {
+                tracing::debug!("wiki.bootstrap: wiki_docs gia' popolata, skip re-ingest auto");
+                return;
+            }
+            tracing::info!("wiki: tabella vuota, lancio re-ingest automatico dai vault");
+            match wiki::reingest::reingest_all(&state_bootstrap, None, None).await {
+                Ok(report) => {
+                    tracing::info!(
+                        meta = report.meta_docs_ingested,
+                        projects = report.project_docs_ingested_by_project.len(),
+                        skipped = report.files_skipped,
+                        errors = report.errors.len(),
+                        elapsed_ms = report.elapsed_ms,
+                        "wiki.bootstrap: re-ingest completato"
+                    );
+                    if !report.errors.is_empty() {
+                        for err in report.errors.iter().take(10) {
+                            tracing::warn!(error = %err, "wiki.bootstrap: errore re-ingest");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "wiki.bootstrap: re-ingest fallito");
+                }
+            }
+        });
+    }
+
+    // ── ADR 0017 v2 F4 — auto-recompute link al primo avvio post-F3 ───────
+    // Se `wiki_docs > 0` ma `wiki_links == 0` significa che la mig 0295 e' stata
+    // applicata, F3 ha popolato i doc, ma F4 non e' mai stato eseguito. Lo
+    // lanciamo in background per non bloccare l'HTTP. Il task aspetta 60s per
+    // dare tempo al re-ingest F3 di completare (se in corso).
+    {
+        let state_links = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let counts: Option<(i64, i64)> = sqlx::query_as::<_, (i64, i64)>(
+                "SELECT (SELECT COUNT(*) FROM wiki_docs), (SELECT COUNT(*) FROM wiki_links)",
+            )
+            .fetch_optional(&state_links.db)
+            .await
+            .ok()
+            .flatten();
+            let Some((docs, links)) = counts else {
+                tracing::warn!("wiki.links.bootstrap: COUNT fallita, skip");
+                return;
+            };
+            if docs == 0 {
+                tracing::debug!("wiki.links.bootstrap: wiki_docs vuota, skip recompute");
+                return;
+            }
+            if links > 0 {
+                tracing::debug!(
+                    links = links,
+                    "wiki.links.bootstrap: wiki_links gia' popolata, skip recompute auto"
+                );
+                return;
+            }
+            tracing::info!(
+                docs = docs,
+                "wiki.links.bootstrap: avvio recompute automatico (scope=meta)"
+            );
+            match wiki::links_worker::recompute_links_for_scope(
+                &state_links,
+                Some(wiki::model::WikiScope::Meta),
+                None,
+            )
+            .await
+            {
+                Ok(rep) => tracing::info!(
+                    scanned = rep.docs_scanned,
+                    wikilinks = rep.wikilinks_resolved,
+                    semantic_new = rep.semantic_links_created,
+                    semantic_upd = rep.semantic_links_updated,
+                    errors = rep.errors.len(),
+                    elapsed_ms = rep.elapsed_ms,
+                    "wiki.links.bootstrap: completato"
+                ),
+                Err(e) => tracing::error!(error = %e, "wiki.links.bootstrap: fallito"),
+            }
+        });
+    }
+
+    // ── ADR 0017 v2 F5 — worker periodico LLM triple extraction ───────────
+    // Non lanciamo full re-extract automatica al primo boot (costo ~$0.14):
+    // l'admin la triggera manualmente via POST /api/wiki/extract-triples?wait=true
+    // o lascia che il worker periodico processi un batch ogni interval_secs
+    // rispettando i cap diurni configurati in settings.
+    wiki::triple_extractor::start_triple_extractor_worker(state.clone());
 
     // ── PR hardening: avvio writer audit centralizzato + port enforcer ───
     // Audit writer: consuma il canale `record_audit(...)` e fa batch INSERT
@@ -996,39 +1064,15 @@ async fn main() -> anyhow::Result<()> {
         ap_interval,
     );
 
-    // Worker `knowledge_link_inference`: inferisce link automatici tra note
-    // Knowledge Base via similarita' vettoriale. Intervallo configurabile via
-    // settings.knowledge.link_worker_interval_secs (default 600s).
-    knowledge_workers::start_knowledge_link_worker(
-        state.db.clone(),
-        state.orchestrator.neural.clone(),
-        state.project_channels.clone(),
-    );
-
-    // Worker `knowledge_cleanup`: archivia note draft vecchie oltre la soglia
-    // configurabile via settings.knowledge.cleanup_draft_days (default 30 giorni).
-    // Intervallo giornaliero (86400s).
-    knowledge_workers::start_knowledge_cleanup_worker(state.db.clone());
+    // ADR 0017 v2 F8: i worker legacy `knowledge_workers::*` (link_inference,
+    // cleanup, promote) e `meta_docs_*` (watcher bidirezionale + refresh) sono
+    // stati rimossi assieme ai moduli `knowledge/` e `meta_docs/`. Le tabelle
+    // backing sono droppate dalla mig 0295. La funzione "auto-link" e' ora
+    // gestita da `wiki::links_worker` (vedi mod.rs F4); il "vault watcher"
+    // bidirezionale per `docs/.nexus-vault/` e' un TODO ADR 0017 — finche'
+    // non viene reimplementato come `wiki::watcher`, gli edit Obsidian
+    // restano in sincrono solo via `POST /api/wiki/reingest`.
     agent_tool_result_cache::start_cleanup_worker(state.db.clone());
-
-    // Recupero promote: promuove a 'active' le note chat di run completati (+
-    // risposta AI) se il promote inline a fine run non e' scattato. Rete di
-    // sicurezza, interval breve (default 60s). Vedi knowledge_promote_worker.
-    knowledge_workers::start_knowledge_promote_worker(state.db.clone());
-
-    // Meta-docs vault watcher: file watcher bidirezionale per docs/.nexus-vault/.
-    // Quando l'utente modifica un .md (es. via Obsidian), il watcher aggiorna il DB.
-    // Loop detection via SHA-256 per evitare reazioni ai propri write.
-    {
-        let vault_root = meta_docs::apply::resolve_vault_root(&state).await;
-        meta_docs_watcher::start_meta_docs_watcher(state.db.clone(), vault_root);
-    }
-    // Pre-crea la collection Qdrant `nexus_meta_docs` (idempotente).
-    if let Err(e) = vector_memory::ensure_meta_docs_collection(&state.db).await {
-        tracing::warn!(error = %e, "meta-docs: ensure collection Qdrant fallita");
-    }
-    // Worker periodico failsafe: recupera commit non ingeriti dall'hook lefthook.
-    meta_docs_workers::start_meta_docs_refresh_worker(state.clone());
 
     // NexusAutoFixAgent: intercetta E2E fallimenti e genera change_drafts.
     nexus_autofix_worker::start_nexus_autofix_worker(state.clone());

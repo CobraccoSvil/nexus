@@ -401,23 +401,21 @@ pub async fn deep_analyze_project(
             duration_ms
         );
 
-        // Se l'analisi e' completata con successo, popola la Knowledge Base
-        if status_str == "completed"
-            && !insights_payload
-                .as_object()
-                .map(|o| o.is_empty())
-                .unwrap_or(true)
-        {
-            crate::knowledge::seed_knowledge_from_insights(
-                db,
-                neural,
-                project_id,
-                insights_payload,
-                Some(repo_root_str),
-                project_channels,
-            )
-            .await;
-        }
+        // ADR 0017 v2 F8: `knowledge::seed_knowledge_from_insights` rimosso
+        // assieme al modulo `knowledge/`. Lo "seeding" automatico della KB
+        // dagli insights di deep-analyze va reimplementato come INSERT diretto
+        // su `wiki_docs` (scope=project) con embedding `wiki_content`. Per
+        // ora il deep-analyze produce solo `project_insights` come prima,
+        // ma non popola piu' note nel grafo.
+        let _ = (
+            db,
+            neural,
+            project_id,
+            insights_payload,
+            repo_root_str,
+            project_channels,
+            status_str.clone(),
+        );
     });
 
     // Risposta immediata 202 Accepted con run_id per polling client-side

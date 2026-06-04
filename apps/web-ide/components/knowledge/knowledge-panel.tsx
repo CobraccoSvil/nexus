@@ -36,6 +36,22 @@ export function KnowledgePanel({ project }: Props) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
+      <a
+        href={`/projects/${project.id}/kb`}
+        style={{
+          padding: "6px 10px",
+          background: "#f59e0b22",
+          borderBottom: "1px solid #f59e0b",
+          color: "#92400e",
+          fontSize: 11,
+          textDecoration: "none",
+          display: "block",
+          lineHeight: 1.3,
+        }}
+        title="Apri la nuova Knowledge Base unificata"
+      >
+        ⓘ Nuova Knowledge Base unificata disponibile. <strong>Apri →</strong>
+      </a>
       <div style={{ padding: "12px 12px 0", borderBottom: "1px solid #e5e5e5", overflow: "hidden", minWidth: 0 }}>
         <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: "#171717", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {t("knowledge.title")}

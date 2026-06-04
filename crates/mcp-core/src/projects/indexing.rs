@@ -756,18 +756,13 @@ pub async fn reindex_single_file(
         });
     }
 
-    // M13.1 — popola il code graph (nodi/edge import/test-mapping) per questo file.
-    // Best-effort: errori loggati internamente, mai propagati (regola: non rompe
-    // l'indicizzazione). Piggyback sul cambio-hash gia rilevato sopra.
-    crate::knowledge::code_graph::persist_code_graph(
-        db,
-        project_id,
-        root,
-        &relative_path,
-        &content,
-        &content_hash,
-    )
-    .await;
+    // ADR 0017 v2 F8: `knowledge::code_graph::persist_code_graph` rimosso
+    // assieme al modulo `knowledge/`. Le tabelle code-graph
+    // (`project_code_nodes`, `project_code_edges`) sono droppate dalla mig
+    // 0295. La feature va reimplementata sopra `wiki_concept_triples`
+    // (predicate `imports`, `implements`, `tests`) se necessaria; per ora
+    // il reindex prosegue senza popolare il grafo codice.
+    let _ = (db, project_id, root, &content, &content_hash);
 
     tracing::debug!("reindex_single_file: {relative_path} → {indexed} chunks");
     Ok(indexed)

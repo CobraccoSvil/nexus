@@ -44,7 +44,7 @@ use crate::{
     auth::Claims,
     chat_learning::{api_error, ensure_project_access, parse_user_id, ApiError, ApiResult},
     chat_messages::ChatAttachmentRequest,
-    knowledge::{extract_tags, title_from_content},
+    wiki::vault::{extract_tags, title_from_content},
     AppState,
 };
 
@@ -817,16 +817,32 @@ pub async fn index_attachments_to_kb(
             body_md.as_str()
         };
 
+        // ADR 0017 v2 F8: migrato su `wiki_docs` (scope=project) +
+        // collection Qdrant unificata `wiki_content`. Le vecchie tabelle
+        // `project_knowledge_notes` e `project_knowledge_tags` sono droppate.
+        // Slug derivato dal titolo per rispettare il vincolo
+        // uq_wiki_docs_slug (scope, project_id, slug).
+        let slug = {
+            let base = crate::wiki::vault::slugify(&title);
+            if base.is_empty() {
+                format!("attachment-{}", note_id.simple())
+            } else {
+                format!("{base}-{}", note_id.simple())
+            }
+        };
+
         let qdrant_point_id = match state.orchestrator.neural.embed_text("", embed_text).await {
             Ok(vector) => {
-                let point_id = Uuid::new_v4().to_string();
+                let point_id = note_id.to_string();
                 let payload = json!({
+                    "scope": "project",
                     "project_id": record.project_id.to_string(),
-                    "note_id": note_id.to_string(),
+                    "doc_id": note_id.to_string(),
+                    "title": title.clone(),
+                    "kind": "note",
                     "intent": intent,
-                    "status": "active",
                 });
-                match crate::vector_memory::upsert_knowledge_point(
+                match crate::vector_memory::upsert_wiki_content_point(
                     &state.db, &point_id, vector, payload,
                 )
                 .await
@@ -836,7 +852,7 @@ pub async fn index_attachments_to_kb(
                         tracing::warn!(
                             attachment_id = %record.id,
                             error = %e,
-                            "upsert Qdrant fallito per allegato (proseguo con nota DB)"
+                            "upsert wiki_content fallito per allegato (proseguo con nota DB)"
                         );
                         None
                     }
@@ -852,24 +868,25 @@ pub async fn index_attachments_to_kb(
             }
         };
 
-        // INSERT nota.
+        // INSERT doc unificato (scope=project).
+        let body_hash = crate::wiki::vault::sha256_hex(&body_md);
         let insert_res = sqlx::query(
             r#"
-            INSERT INTO project_knowledge_notes
-                (id, project_id, intent, title, body_md, status,
-                 qdrant_point_id, tags, file_paths, source_message_id, kind)
-            VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, $9, 'manual')
+            INSERT INTO wiki_docs
+                (id, scope, project_id, slug, title, body_md, body_hash, kind,
+                 intent, tags, qdrant_point_id, auto_generated)
+            VALUES ($1, 'project', $2, $3, $4, $5, $6, 'note', $7, $8, $9, FALSE)
             "#,
         )
         .bind(note_id)
         .bind(record.project_id)
-        .bind(intent)
+        .bind(&slug)
         .bind(&title)
         .bind(&body_md)
-        .bind(qdrant_point_id.as_deref())
+        .bind(&body_hash)
+        .bind(intent)
         .bind(&tags)
-        .bind(vec![record.file_path.clone()])
-        .bind(record.message_id)
+        .bind(qdrant_point_id.as_deref())
         .execute(&state.db)
         .await;
 
@@ -877,30 +894,13 @@ pub async fn index_attachments_to_kb(
             tracing::warn!(
                 attachment_id = %record.id,
                 error = %e,
-                "insert nota KB fallito"
+                "insert wiki_docs fallito per allegato"
             );
             skipped.push(SkippedAttachment {
                 attachment_id: raw_id.clone(),
-                reason: "Creazione nota KB fallita".into(),
+                reason: "Creazione doc wiki fallita".into(),
             });
             continue;
-        }
-
-        // Aggiorna tags aggregati (best-effort, non fatale).
-        for tag in &tags {
-            let _ = sqlx::query(
-                r#"
-                INSERT INTO project_knowledge_tags (project_id, tag, note_count, last_used_at)
-                VALUES ($1, $2, 1, NOW())
-                ON CONFLICT (project_id, tag) DO UPDATE
-                SET note_count = project_knowledge_tags.note_count + 1,
-                    last_used_at = NOW()
-                "#,
-            )
-            .bind(record.project_id)
-            .bind(tag)
-            .execute(&state.db)
-            .await;
         }
 
         // Aggiorna allegato con kb_note_id + indexed_at.

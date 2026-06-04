@@ -1,14 +1,19 @@
-//! Route meta-docs (Nexus self-documentation vault).
+//! Route meta-docs (Nexus self-documentation vault) — ADR 0017 v2 fase 6.
 //!
-//! Estratte da `main.rs` durante il refactor del god-file. Nessun
-//! cambiamento di path, metodo HTTP, handler o middleware.
+//! Tutte le rotte `/api/meta-docs/*` sono ora thin redirect 308 verso gli
+//! equivalenti `/api/wiki/*` (vedi `crate::wiki::redirects`). Le rotte senza
+//! equivalente (`ingest-commit`, `export-archive`) ritornano 410 Gone con
+//! `migration_adr: 0017`.
+//!
+//! Le rotte fuori dominio meta-docs (`/api/claude-agents/*`) restano invariate:
+//! non sono toccate da questa ADR.
 
 use crate::routes::prelude::*;
 use crate::*;
 
 pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
     router
-        // ── meta-docs (Nexus self-documentation vault) ────────
+        // ── claude-agents (NON parte di ADR 0017): invariate ──────────────
         .route(
             "/api/claude-agents/preview",
             get(claude_agents::preview_handler).layer(axum_mw::from_fn_with_state(
@@ -23,80 +28,50 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
                 middleware::require_auth,
             )),
         )
+        // ── meta-docs: redirect 308 verso /api/wiki/* ─────────────────────
         .route(
             "/api/meta-docs/list",
-            get(meta_docs::routes::list_meta_docs).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            get(crate::wiki::redirects::meta_docs_list),
         )
         .route(
             "/api/meta-docs/refresh-all",
-            post(meta_docs::routes::refresh_all_stub).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/meta-docs/ingest-commit",
-            post(meta_docs::routes::ingest_commit_stub),
+            post(crate::wiki::redirects::meta_docs_refresh_all),
         )
         .route(
             "/api/meta-docs/:id",
-            get(meta_docs::routes::get_meta_doc)
-                .patch(docs_core::routes::patch_meta_doc)
-                .layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+            get(crate::wiki::redirects::meta_docs_get).patch(crate::wiki::redirects::meta_docs_get),
         )
         .route(
             "/api/meta-docs/:id/revisions",
-            get(docs_core::revisions::meta_list_revisions).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            get(crate::wiki::redirects::meta_docs_revisions_list),
         )
         .route(
             "/api/meta-docs/:id/revisions/:version",
-            get(docs_core::revisions::meta_get_revision).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            get(crate::wiki::redirects::meta_docs_revisions_get),
         )
         .route(
             "/api/meta-docs/:id/diff",
-            get(docs_core::revisions::meta_diff).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            get(crate::wiki::redirects::meta_docs_diff),
         )
         .route(
             "/api/meta-docs/:id/restore",
-            post(docs_core::revisions::meta_restore).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            post(crate::wiki::redirects::meta_docs_restore),
         )
         .route(
             "/api/meta-docs/graph",
-            get(meta_docs::routes::graph_handler).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            get(crate::wiki::redirects::meta_docs_graph),
         )
         .route(
             "/api/meta-docs/recompute-links",
-            post(meta_docs::routes::recompute_meta_links).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            post(crate::wiki::redirects::meta_docs_recompute_links),
+        )
+        // ── meta-docs: 410 Gone (no replacement) ──────────────────────────
+        .route(
+            "/api/meta-docs/ingest-commit",
+            post(crate::wiki::redirects::gone_meta_docs_ingest_commit),
         )
         .route(
             "/api/meta-docs/export-archive",
-            get(meta_docs::routes::export_vault_archive).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            get(crate::wiki::redirects::gone_meta_docs_export_archive),
         )
 }

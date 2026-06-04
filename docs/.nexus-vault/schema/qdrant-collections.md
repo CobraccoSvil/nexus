@@ -6,12 +6,12 @@ slug: qdrant-collections
 tags:
   - schema
   - qdrant
-source_commit: c5aeabb28cfd0186984ea494be6e8fc993e365a2
+source_commit: 7d9d1215a8bb89c888b5514784e554c431782edc
 source_files:
   - crates/mcp-core/src/vector_memory.rs
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T11:31:36Z
+updated_at: 2026-06-04T12:22:48Z
 nexus_meta_version: 1
 ---
 

@@ -1,75 +1,56 @@
-//! Route knowledge base e code-wiki.
+//! Route knowledge base (project-scope) — ADR 0017 v2 fase 6.
 //!
-//! Estratte da `main.rs` durante il refactor del god-file. Nessun
-//! cambiamento di path, metodo HTTP, handler o middleware.
+//! Le rotte `/api/projects/:id/knowledge/*` con equivalente sono thin redirect
+//! 308 verso `/api/wiki/*` (vedi `crate::wiki::redirects`). Le altre (rebuild,
+//! generate-rich, extract-functional, init-or-refresh, manual-note,
+//! obsidian-vault, code-wiki/generate, similar, links, tags) tornano 410 Gone
+//! con `migration_adr: 0017`.
+//!
+//! `/api/projects/:id/agent/todos/:run_id/edit` non e' parte di knowledge graph
+//! e resta invariata.
 
 use crate::routes::prelude::*;
 use crate::*;
 
 pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
     router
-        // ── knowledge ─────────────────────────────────────────
+        // ── notes: redirect 308 ───────────────────────────────────────────
         .route(
             "/api/projects/:id/knowledge/notes",
-            get(knowledge::routes::list_notes).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/projects/:id/knowledge/notes/:note_id/revisions",
-            get(docs_core::routes::proj_list_revisions).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/projects/:id/knowledge/notes/:note_id/revisions/:version",
-            get(docs_core::routes::proj_get_revision).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/projects/:id/knowledge/notes/:note_id/diff",
-            get(docs_core::routes::proj_diff).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/projects/:id/knowledge/notes/:note_id/restore",
-            post(docs_core::routes::proj_restore).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            get(crate::wiki::redirects::knowledge_notes_list),
         )
         .route(
             "/api/projects/:id/knowledge/notes/:note_id",
-            get(knowledge::routes::get_note)
-                .patch(knowledge::routes::patch_note)
-                .delete(knowledge::routes::delete_note)
-                .layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+            get(crate::wiki::redirects::knowledge_note_get)
+                .patch(crate::wiki::redirects::knowledge_note_get)
+                .delete(crate::wiki::redirects::knowledge_note_get),
         )
         .route(
-            "/api/projects/:id/knowledge/similar",
-            post(knowledge::routes::similar_handler).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            "/api/projects/:id/knowledge/notes/:note_id/revisions",
+            get(crate::wiki::redirects::knowledge_note_revisions_list),
         )
-        // W2 code-wiki: genera la documentazione AI per-file del progetto.
         .route(
-            "/api/projects/:id/knowledge/code-wiki/generate",
-            post(knowledge::code_doc::generate_code_wiki_handler).layer(
-                axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
-            ),
+            "/api/projects/:id/knowledge/notes/:note_id/revisions/:version",
+            get(crate::wiki::redirects::knowledge_note_revision_get),
         )
-        // M15.3 — Edit manuale dei todo di un run (traccia edited_by, ri-emette
-        // TodoUpdated + PlanUpdated). Gated da agent.todos.user_editable.
+        .route(
+            "/api/projects/:id/knowledge/notes/:note_id/diff",
+            get(crate::wiki::redirects::knowledge_note_diff),
+        )
+        .route(
+            "/api/projects/:id/knowledge/notes/:note_id/restore",
+            post(crate::wiki::redirects::knowledge_note_restore),
+        )
+        // ── graph + recompute-links: redirect 308 ─────────────────────────
+        .route(
+            "/api/projects/:id/knowledge/graph",
+            get(crate::wiki::redirects::knowledge_graph),
+        )
+        .route(
+            "/api/projects/:id/knowledge/recompute-links",
+            post(crate::wiki::redirects::knowledge_recompute_links),
+        )
+        // ── agent todos (fuori dominio ADR 0017): invariata ───────────────
         .route(
             "/api/projects/:id/agent/todos/:run_id/edit",
             post(agent_todos_routes::edit_todo).layer(axum_mw::from_fn_with_state(
@@ -77,82 +58,50 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
                 middleware::require_auth,
             )),
         )
+        // ── knowledge: 410 Gone (no replacement) ──────────────────────────
+        .route(
+            "/api/projects/:id/knowledge/similar",
+            post(crate::wiki::redirects::gone_knowledge_similar),
+        )
+        .route(
+            "/api/projects/:id/knowledge/code-wiki/generate",
+            post(crate::wiki::redirects::gone_knowledge_code_wiki_generate),
+        )
         .route(
             "/api/projects/:id/knowledge/links",
-            post(knowledge::routes::create_link).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            post(crate::wiki::redirects::gone_knowledge_links_create),
         )
         .route(
             "/api/projects/:id/knowledge/links/:link_id",
-            axum::routing::delete(knowledge::routes::delete_link).layer(
-                axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
-            ),
+            axum::routing::delete(crate::wiki::redirects::gone_knowledge_links_delete),
         )
         .route(
             "/api/projects/:id/knowledge/tags",
-            get(knowledge::routes::list_tags).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/projects/:id/knowledge/graph",
-            get(knowledge::routes::graph_handler).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
-        )
-        .route(
-            "/api/projects/:id/knowledge/recompute-links",
-            post(knowledge::routes::recompute_links).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            get(crate::wiki::redirects::gone_knowledge_tags),
         )
         .route(
             "/api/projects/:id/knowledge/rebuild",
-            post(knowledge::routes::rebuild_knowledge).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            post(crate::wiki::redirects::gone_knowledge_rebuild),
         )
         .route(
             "/api/projects/:id/knowledge/generate-rich",
-            post(knowledge::routes::generate_rich_kb).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            post(crate::wiki::redirects::gone_knowledge_generate_rich),
         )
         .route(
             "/api/projects/:id/knowledge/extract-functional",
-            post(knowledge::routes::extract_functional_handler).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            post(crate::wiki::redirects::gone_knowledge_extract_functional),
         )
         .route(
             "/api/projects/:id/knowledge/init-or-refresh",
-            post(knowledge::routes::init_or_refresh_knowledge).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            post(crate::wiki::redirects::gone_knowledge_init_or_refresh),
         )
         .route(
             "/api/projects/:id/knowledge/notes/manual",
-            post(knowledge::routes::create_note_manual).layer(axum_mw::from_fn_with_state(
-                state.clone(),
-                middleware::require_auth,
-            )),
+            post(crate::wiki::redirects::gone_knowledge_notes_manual),
         )
         .route(
             "/api/projects/:id/knowledge/obsidian-vault",
-            get(knowledge::routes::get_obsidian_vault)
-                .put(knowledge::routes::put_obsidian_vault)
-                .layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+            get(crate::wiki::redirects::gone_knowledge_obsidian_vault)
+                .put(crate::wiki::redirects::gone_knowledge_obsidian_vault),
         )
 }
