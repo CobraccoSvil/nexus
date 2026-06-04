@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: ee22019f4f5739771259bbb3e71a653a058ebebb
+source_commit: 9589dff4464951c4c27a821246c0fdce1d5f7aa3
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T08:05:30Z
+updated_at: 2026-06-04T09:08:53Z
 nexus_meta_version: 1
 ---
 
@@ -121,6 +121,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.summarizer.temperature` | `0.0` | Temperature LLM call summarizer (H-49 b) |
 | `agent.summarizer.timeout_seconds` | `15` | Timeout LLM call summarizer (H-49 a) |
 | `agent.summarizer.trigger_fraction` | `0.60` | Fraction del context window oltre cui triggerare summary (H-46) |
+| `agent.testing.preflight_check_enabled` | `true` | Quando true, run_playwright_tests esegue ldd sul binary chromium-headless-shell prima di spawnare playwright. Se rileva librerie sistema not found, ritorna errore esplicito con istruzioni di fix invece di lasciare il browser fallire in loop. Default true. |
 | `agent.thinking_cfg_ttl_seconds` | `60` | TTL cache thinking_config (H-54) |
 | `agent.thinking_config_ttl_seconds` | `60` | TTL cache nexus_thinking config (H-29) |
 | `agent.todos.carry_over_enabled` | `true` | M15.4: a fine run i todo pending/blocked vengono marcati carry_over=true (con origin_run_id) invece di restare orfani, cosi' il planner del run successivo li eredita come backlog. |
@@ -712,4 +713,4 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 ---
 
-**Totale chiavi**: 510
+**Totale chiavi**: 511

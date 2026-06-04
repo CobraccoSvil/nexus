@@ -6,12 +6,12 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: ee22019f4f5739771259bbb3e71a653a058ebebb
+source_commit: 9589dff4464951c4c27a821246c0fdce1d5f7aa3
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T08:05:29Z
+updated_at: 2026-06-04T09:08:52Z
 nexus_meta_version: 1
 ---
 
@@ -299,7 +299,8 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0285_fk_indexes.sql` | 0285: indici sulle foreign key prive di indice di supporto. |
 | `0286_rag_pipeline_completion.sql` | Migrazione 0285 — ADR 0016: completamento pipeline RAG strutturale + safety net. |
 | `0287_agent_tool_result_cache.sql` | Migrazione 0287 — ADR 0016 Fase A.5: cache tool_result via Postgres. |
+| `0288_playwright_preflight_setting.sql` | Migrazione 0288 — Pre-flight check librerie chromium-headless-shell. |
 
-**Totale**: 278 migrazioni.
+**Totale**: 279 migrazioni.
 
-Ultima migrazione: `0287_agent_tool_result_cache.sql`.
+Ultima migrazione: `0288_playwright_preflight_setting.sql`.
