@@ -602,6 +602,79 @@ pub async fn recompute_links_for_scope(
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Worker periodico (scope Meta + tutti i progetti)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Avvia il loop periodico di recompute link. Ogni ciclo processa lo scope
+/// `Meta` e poi, uno alla volta, lo scope `Project` di ogni progetto
+/// registrato (`SELECT id FROM projects`). Interval e enabled sono DB-driven
+/// (settings `agent.wiki.link_worker_*`, cache 60s). Senza questo loop i
+/// progetti restavano senza link finche' non triggerati a mano via REST.
+pub fn start_links_worker(state: std::sync::Arc<AppState>) {
+    tokio::spawn(async move {
+        // Delay iniziale (120s): lascia tempo al bootstrap F4 (scope=Meta) e al
+        // re-ingest F3 di completare prima del primo giro periodico.
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        let init = current_settings(&state.db).await;
+        tracing::info!(
+            enabled = init.enabled,
+            interval_secs = init.interval_secs,
+            "wiki.links: worker periodico avviato (meta + progetti)"
+        );
+
+        loop {
+            let settings = current_settings(&state.db).await;
+            if !settings.enabled {
+                tokio::time::sleep(Duration::from_secs(settings.interval_secs)).await;
+                continue;
+            }
+
+            // Scope Meta
+            if let Err(e) =
+                recompute_links_for_scope(&state, Some(WikiScope::Meta), None).await
+            {
+                tracing::warn!(error = %e, "wiki.links: recompute periodico meta fallito");
+            }
+
+            // Scope Project: un giro per ogni progetto registrato.
+            match fetch_project_ids(&state.db).await {
+                Ok(ids) => {
+                    for pid in ids {
+                        if let Err(e) = recompute_links_for_scope(
+                            &state,
+                            Some(WikiScope::Project),
+                            Some(pid),
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                project_id = %pid,
+                                error = %e,
+                                "wiki.links: recompute periodico progetto fallito"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "wiki.links: SELECT projects fallita, skip giro progetti");
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(settings.interval_secs)).await;
+        }
+    });
+}
+
+/// Elenco id dei progetti registrati, per il giro periodico per-progetto.
+async fn fetch_project_ids(db: &PgPool) -> Result<Vec<Uuid>> {
+    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM projects")
+        .fetch_all(db)
+        .await
+        .context("SELECT id FROM projects (links worker)")?;
+    Ok(ids)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Tests
 // ───────────────────────────────────────────────────────────────────────────
 

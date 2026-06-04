@@ -583,6 +583,21 @@ pub async fn reindex_single_file(
     root: &Path,
     file_path: &Path,
 ) -> anyhow::Result<usize> {
+    reindex_single_file_inner(db, neural, project_id, root, file_path, false).await
+}
+
+/// Variante di `reindex_single_file` che, con `force=true`, ignora il check
+/// hash interno (`file_index_hashes`) e rigenera comunque chunk vettoriali e
+/// code-graph triple. Usato dal reindex forzato dell'intero progetto. Con
+/// `force=false` il comportamento e' identico a `reindex_single_file`.
+pub async fn reindex_single_file_inner(
+    db: &sqlx::PgPool,
+    neural: &crate::orchestrator::NeuralCoreClient,
+    project_id: Uuid,
+    root: &Path,
+    file_path: &Path,
+    force: bool,
+) -> anyhow::Result<usize> {
     const CODE_EXTENSIONS: &[&str] = &["tsx", "jsx", "ts", "js", "rs", "py", "cs", "go", "vue"];
     const MAX_FILE_BYTES: u64 = 200 * 1024;
     const MAX_CHUNKS_PER_FILE: usize = 10;
@@ -625,7 +640,7 @@ pub async fn reindex_single_file(
     .await
     .unwrap_or(None);
 
-    if stored_hash.as_deref() == Some(&content_hash) {
+    if !force && stored_hash.as_deref() == Some(&content_hash) {
         tracing::debug!("reindex_single_file: {relative_path} — hash invariato, skip");
         return Ok(0);
     }
@@ -870,11 +885,22 @@ pub async fn get_index_status(
     })))
 }
 
-/// Re-indicizza i file modificati rispetto all'ultimo hash salvato
+/// Query param per il reindex: `?force=true` ignora il check hash e
+/// reindicizza TUTTI i file di codice (rigenerando anche i code_doc del
+/// grafo-import). Default `false` = comportamento "stale" (solo file cambiati).
+#[derive(Debug, Default, Deserialize)]
+pub struct ReindexQuery {
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Re-indicizza i file modificati rispetto all'ultimo hash salvato.
+/// Con `?force=true` reindicizza TUTTI i file ignorando l'hash.
 pub async fn reindex_stale_files(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     AxumPath(project_id): AxumPath<Uuid>,
+    Query(q): Query<ReindexQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let row = sqlx::query_as::<_, (String, Option<Uuid>)>(
         "SELECT COALESCE(r.root_path, p.analysis_json->>'rootPath', ''), p.owner_user_id FROM projects p LEFT JOIN repositories r ON r.project_id = p.id WHERE p.id = $1"
@@ -944,21 +970,23 @@ pub async fn reindex_stale_files(
             Err(_) => continue,
         };
 
-        if stored_map
-            .get(&rel)
-            .map(|h| h == &current_hash)
-            .unwrap_or(false)
+        if !q.force
+            && stored_map
+                .get(&rel)
+                .map(|h| h == &current_hash)
+                .unwrap_or(false)
         {
             skipped += 1;
             continue;
         }
 
-        match reindex_single_file(
+        match reindex_single_file_inner(
             &state.db,
             &state.orchestrator.neural,
             project_id,
             root_path_obj,
             abs_path,
+            q.force,
         )
         .await
         {
@@ -973,6 +1001,7 @@ pub async fn reindex_stale_files(
         "reindexed": reindexed,
         "skipped": skipped,
         "total": source_files.len(),
+        "forced": q.force,
     })))
 }
 

@@ -63,6 +63,7 @@ pub struct TitleGenSettings {
     pub enabled: bool,
     pub daily_cap: u32,
     pub max_words: u32,
+    pub interval_secs: u64,
 }
 
 impl TitleGenSettings {
@@ -71,6 +72,7 @@ impl TitleGenSettings {
             enabled: true,
             daily_cap: 100,
             max_words: 10,
+            interval_secs: 1800,
         }
     }
 }
@@ -109,7 +111,8 @@ async fn load_settings(db: &PgPool) -> Result<TitleGenSettings> {
         "SELECT key, value FROM settings WHERE key IN ( \
             'agent.wiki.title_gen_enabled', \
             'agent.wiki.title_gen_daily_cap', \
-            'agent.wiki.title_gen_max_words' \
+            'agent.wiki.title_gen_max_words', \
+            'agent.wiki.title_gen_interval_secs' \
          )",
     )
     .fetch_all(db)
@@ -142,10 +145,16 @@ async fn load_settings(db: &PgPool) -> Result<TitleGenSettings> {
                     seen.insert("max_words");
                 }
             }
+            "agent.wiki.title_gen_interval_secs" => {
+                if let Ok(v) = trimmed.parse::<u64>() {
+                    out.interval_secs = v.max(60);
+                    seen.insert("interval");
+                }
+            }
             _ => {}
         }
     }
-    if seen.len() < 3 {
+    if seen.len() < 4 {
         tracing::info!(
             present = seen.len(),
             "wiki.title_gen: alcuni settings assenti, applico safe_defaults"
@@ -614,6 +623,76 @@ pub async fn generate_titles_for_scope(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     Ok(batch)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Worker periodico (scope Meta + tutti i progetti)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Avvia il loop periodico di generazione titoli. Ogni ciclo processa lo
+/// scope `Meta` e poi lo scope `Project` di ogni progetto registrato. Il cap
+/// diurno e' applicato per-scope dentro `generate_titles_for_scope`, quindi il
+/// loop non puo' spammare l'LLM oltre i cap configurati. Interval e enabled
+/// sono DB-driven (`agent.wiki.title_gen_*`, cache 60s). Senza questo loop i
+/// titoli dei progetti restavano da rigenerare finche' non triggerati a mano.
+pub fn start_title_gen_worker(state: std::sync::Arc<AppState>) {
+    tokio::spawn(async move {
+        // Delay iniziale (150s): dopo links/run_summary per non concentrare il
+        // carico LLM al boot.
+        tokio::time::sleep(Duration::from_secs(150)).await;
+        let init = current_settings(&state.db).await;
+        tracing::info!(
+            enabled = init.enabled,
+            interval_secs = init.interval_secs,
+            daily_cap = init.daily_cap,
+            "wiki.title_gen: worker periodico avviato (meta + progetti)"
+        );
+
+        loop {
+            let settings = current_settings(&state.db).await;
+            if !settings.enabled {
+                tokio::time::sleep(Duration::from_secs(settings.interval_secs)).await;
+                continue;
+            }
+
+            // Scope Meta
+            if let Err(e) = generate_titles_for_scope(&state, TitleScope::Meta).await {
+                tracing::warn!(error = %e, "wiki.title_gen: batch periodico meta fallito");
+            }
+
+            // Scope Project: un batch per ogni progetto registrato (cap diurno
+            // applicato per-scope dentro generate_titles_for_scope).
+            match fetch_project_ids(&state.db).await {
+                Ok(ids) => {
+                    for pid in ids {
+                        if let Err(e) =
+                            generate_titles_for_scope(&state, TitleScope::Project(pid)).await
+                        {
+                            tracing::warn!(
+                                project_id = %pid,
+                                error = %e,
+                                "wiki.title_gen: batch periodico progetto fallito"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "wiki.title_gen: SELECT projects fallita, skip giro progetti");
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(settings.interval_secs)).await;
+        }
+    });
+}
+
+/// Elenco id dei progetti registrati, per il giro periodico per-progetto.
+async fn fetch_project_ids(db: &PgPool) -> Result<Vec<Uuid>> {
+    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM projects")
+        .fetch_all(db)
+        .await
+        .context("SELECT id FROM projects (title_gen worker)")?;
+    Ok(ids)
 }
 
 // ───────────────────────────────────────────────────────────────────────────

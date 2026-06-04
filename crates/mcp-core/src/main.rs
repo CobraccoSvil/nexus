@@ -8,6 +8,7 @@ mod agent_types;
 mod auth;
 mod billing;
 mod brain_agent_client;
+mod build_graph;
 mod cache;
 mod catalog_sync_worker;
 mod change_drafts;
@@ -531,6 +532,11 @@ async fn main() -> anyhow::Result<()> {
     // Cache registro porte (mig 0114): porte TCP allocate ai progetti.
     // Non panica se tabella vuota (nessuna allocazione al primo avvio).
     let port_registry_cache = port_registry::PortRegistryCache::init(db.clone()).await;
+
+    // ADR 0020: cache build graph (mig 0312). Inizializzata come singleton
+    // globale, non panica se DB down (lazy: la prima get_or_compute provera').
+    build_graph::BuildGraphCache::init_global(db.clone()).await;
+    tracing::info!("build_graph::BuildGraphCache inizializzato (TTL configurabile via settings)");
     // Recovery: sincronizza registro con file .service esistenti su disco.
     port_registry_cache.startup_recovery().await;
     // GC periodico: rilascia le allocazioni porta dynamic orfane (nessun
@@ -756,6 +762,16 @@ async fn main() -> anyhow::Result<()> {
     // chiave `agent.wiki.chat_note_*` e `agent.wiki.run_summary_*` (mig 0305).
     wiki::chat_note_worker::start_chat_note_worker(std::sync::Arc::new(state.clone()));
     wiki::run_summary_worker::start_run_summary_worker(std::sync::Arc::new(state.clone()));
+
+    // ── ADR 0017 v2 — worker periodici link + titoli su TUTTI gli scope ───
+    // Loop DB-driven (interval `agent.wiki.link_worker_interval_secs` /
+    // `agent.wiki.title_gen_interval_secs`) che processano scope=meta E lo
+    // scope=project di ogni progetto registrato. Prima esisteva solo il
+    // bootstrap one-shot dei link (scope=meta) e gli endpoint manuali: i
+    // progetti restavano senza link/titoli finche' non triggerati a mano. Il
+    // cap diurno del title_gen resta applicato per-scope (no spam LLM).
+    wiki::links_worker::start_links_worker(std::sync::Arc::new(state.clone()));
+    wiki::title_gen::start_title_gen_worker(std::sync::Arc::new(state.clone()));
 
     // ── PR hardening: avvio writer audit centralizzato + port enforcer ───
     // Audit writer: consuma il canale `record_audit(...)` e fa batch INSERT
