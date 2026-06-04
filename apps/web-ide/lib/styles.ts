@@ -59,6 +59,40 @@ export const inputStyle = (tc: Theme): React.CSSProperties => ({
 });
 
 /**
+ * Badge style helper
+ * Fornisce gli stili del badge inline ricorrente (pillola colorata).
+ * variant -> color: success/error/warning -> omonimi tema,
+ * info -> textSecondary, default -> textMuted.
+ */
+export type BadgeVariant = "success" | "error" | "warning" | "info" | "default";
+
+export const badgeStyles = (
+  tc: Theme,
+  variant: BadgeVariant = "default"
+): React.CSSProperties => {
+  const colorByVariant: Record<BadgeVariant, string> = {
+    success: tc.success,
+    error: tc.error,
+    warning: tc.warning,
+    info: tc.textSecondary,
+    default: tc.textMuted,
+  };
+  const color = colorByVariant[variant];
+  return {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 4,
+    padding: "3px 8px",
+    borderRadius: 12,
+    background: `${color}18`,
+    border: `1px solid ${color}40`,
+    color,
+    fontSize: 11,
+    fontWeight: 600,
+  };
+};
+
+/**
  * Card style helper
  * Fornisce stili di base per card container
  */

@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { useTheme, useThemeColors } from "../../lib/theme";
 import { useI18n } from "../../lib/i18n";
+import { StatusBadge } from "../common/status-badge";
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
@@ -304,23 +305,7 @@ export function ProviderSettings({
                     // Se disabilitato: mostra sempre il LED grigio "Disabilitato"
                     if (isProviderApiKey && !isProviderEnabled) {
                       return (
-                        <span
-                          style={{
-                            display: "inline-flex",
-                            alignItems: "center",
-                            gap: 4,
-                            padding: "3px 8px",
-                            borderRadius: 12,
-                            background: `${tc.textMuted}18`,
-                            border: `1px solid ${tc.textMuted}40`,
-                            color: "var(--color-textMuted)",
-                            fontSize: 11,
-                            fontWeight: 600,
-                          }}
-                        >
-                          <span style={{ width: 6, height: 6, borderRadius: "50%", background: tc.textMuted, flexShrink: 0 }} />
-                          Disabilitato
-                        </span>
+                        <StatusBadge color={tc.textMuted} variant="both" label="Disabilitato" />
                       );
                     }
 
