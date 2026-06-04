@@ -1,0 +1,2045 @@
+use super::*;
+
+pub async fn list_chat_messages(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(session_id): AxumPath<String>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let session_id = Uuid::parse_str(&session_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
+    let context = load_session_context(&state.db, session_id, user_id).await?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT id, session_id, project_id, role, content, metadata, request_message_id, deleted_at, created_at
+        FROM chat_messages
+        WHERE session_id = $1
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(context.session_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut messages: Vec<Value> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let view = to_message_view(row)?;
+        messages.push(serde_json::to_value(view).unwrap_or_else(|_| json!({})));
+    }
+
+    // ── Carica in batch gli allegati per tutti i messaggi della sessione ──
+    // Una sola query con JOIN su chat_messages, poi raggruppiamo per message_id
+    // ed iniettiamo l'array `attachments` in ogni elemento di `messages`.
+    let attachments_rows = sqlx::query(
+        r#"
+        SELECT cma.id, cma.message_id, cma.project_id, cma.file_name, cma.file_path,
+               cma.mime_type, cma.size_bytes, cma.kind, cma.kb_note_id,
+               cma.indexed_at, cma.created_at
+        FROM chat_message_attachments cma
+        JOIN chat_messages cm ON cm.id = cma.message_id
+        WHERE cm.session_id = $1
+        ORDER BY cma.created_at ASC
+        "#,
+    )
+    .bind(context.session_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let mut attachments_by_msg: std::collections::HashMap<String, Vec<Value>> =
+        std::collections::HashMap::new();
+    for row in &attachments_rows {
+        let msg_id: Uuid = match row.try_get("message_id") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let att_id: Uuid = match row.try_get("id") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let project_id: Uuid = match row.try_get("project_id") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let file_name: String = row.try_get("file_name").unwrap_or_default();
+        let file_path: String = row.try_get("file_path").unwrap_or_default();
+        let mime_type: String = row.try_get("mime_type").unwrap_or_default();
+        let size_bytes: i64 = row.try_get("size_bytes").unwrap_or(0);
+        let kind: String = row.try_get("kind").unwrap_or_else(|_| "binary".to_string());
+        let kb_note_id: Option<Uuid> = row.try_get("kb_note_id").unwrap_or(None);
+        let indexed_at: Option<DateTime<Utc>> = row.try_get("indexed_at").unwrap_or(None);
+        let created_at: Option<DateTime<Utc>> = row.try_get("created_at").ok();
+
+        let entry = attachments_by_msg
+            .entry(msg_id.to_string())
+            .or_insert_with(Vec::new);
+        entry.push(json!({
+            "id": att_id.to_string(),
+            "messageId": msg_id.to_string(),
+            "projectId": project_id.to_string(),
+            "fileName": file_name,
+            "filePath": file_path,
+            "mimeType": mime_type,
+            "sizeBytes": size_bytes,
+            "kind": kind,
+            "kbNoteId": kb_note_id.map(|v| v.to_string()),
+            "indexedAt": indexed_at.map(|v| v.to_rfc3339()),
+            "createdAt": created_at.map(|v| v.to_rfc3339()),
+        }));
+    }
+
+    for msg in messages.iter_mut() {
+        let msg_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        let attachments = attachments_by_msg.remove(msg_id).unwrap_or_default();
+        if let Value::Object(map) = msg {
+            map.insert("attachments".to_string(), Value::Array(attachments));
+        }
+    }
+
+    Ok(Json(json!({
+        "sessionId": context.session_id.to_string(),
+        "projectId": context.project_id.to_string(),
+        "messages": messages
+    })))
+}
+pub async fn send_chat_message(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(body): Json<SendChatMessageRequest>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let session_id = Uuid::parse_str(&session_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
+    let context = load_session_context(&state.db, session_id, user_id).await?;
+
+    let content = body.content.trim();
+    if content.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Il contenuto del messaggio e' obbligatorio",
+        ));
+    }
+
+    let user_message_id = insert_message(
+        &state.db,
+        context.session_id,
+        context.project_id,
+        "user",
+        content,
+        json!({
+            "providerOverride": body.provider_override.clone(),
+            "modelOverride": body.model_override.clone(),
+            "automationMode": body.automation_mode.clone().unwrap_or_else(|| "confirm".to_string()),
+            "attachments": body.attachments.clone(),
+            // Marca i messaggi auto-generati dal sistema (es. auto-continuazione).
+            // Il frontend filtra questi messaggi dalla UI per non confondere l'utente
+            // facendogli credere di averli scritti lui.
+            "synthetic": body.synthetic,
+        }),
+        None,
+    )
+    .await?;
+    let user_row = load_message_by_id(&state.db, user_message_id).await?;
+    let user_message = to_message_view(&user_row)?;
+
+    // ── Persistenza allegati su filesystem + DB ──────────────────────────────
+    // Gli allegati vengono salvati subito dopo l'INSERT del messaggio user, cosi'
+    // tutti i return path successivi (model_reset, model_switch, resume, DLP,
+    // agent_run, run_turn) restituiscono `savedAttachments` al frontend.
+    // Errori filesystem singoli vengono loggati come WARN ma NON bloccano il
+    // turno: l'utente riceve la lista degli allegati effettivamente persistiti.
+    // Estraggo `saved_attachments_list` come variabile esplicita per riusarlo
+    // nei successivi `enrich_attachments_with_ids` (necessari per popolare gli
+    // UUID nel blocco <allegati> del prompt iniziale).
+    let mut saved_attachments_list: Vec<crate::chat_attachments::SavedAttachment> = Vec::new();
+    let saved_attachments_json: Value = if body.attachments.is_empty() {
+        json!([])
+    } else {
+        match crate::projects::load_project_context(&state.db, context.project_id, user_id).await {
+            Ok(project_ctx) => {
+                let saved = crate::chat_attachments::persist_message_attachments(
+                    &state.db,
+                    &project_ctx.repository_root_path,
+                    context.project_id,
+                    user_message_id,
+                    &body.attachments,
+                )
+                .await;
+                let json_view = crate::chat_attachments::attachments_to_json(&saved);
+                saved_attachments_list = saved;
+                json_view
+            }
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %context.project_id,
+                    message_id = %user_message_id,
+                    "load_project_context fallito durante persistenza allegati: {}",
+                    e.1["error"].as_str().unwrap_or("errore sconosciuto")
+                );
+                json!([])
+            }
+        }
+    };
+
+    spawn_embed_conversation_turn(
+        state.orchestrator.neural.clone(),
+        state.db.clone(),
+        context.session_id,
+        user_message_id,
+        "user".to_string(),
+        content.to_string(),
+    );
+
+    // ── Hook: auto-creazione nota Knowledge Base ───────────────────────────
+    // Ogni messaggio utente genera una nota in background (non blocca il turno).
+    {
+        let db_clone = state.db.clone();
+        let neural_clone = state.orchestrator.neural.clone();
+        let channels_clone = state.project_channels.clone();
+        let pid = context.project_id;
+        let mid = user_message_id;
+        let cnt = content.to_string();
+        let intent_val: Option<String> = None; // l'intent verra' aggiornato dal classifier
+                                               // Recupera repo root per vault PUSH
+        let repo_root: Option<String> =
+            sqlx::query_scalar("SELECT repository_root_path FROM projects WHERE id = ")
+                .bind(pid)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
+        tokio::spawn(async move {
+            crate::knowledge::create_note_from_user_message(
+                db_clone,
+                neural_clone,
+                pid,
+                mid,
+                cnt,
+                intent_val,
+                repo_root,
+                channels_clone,
+            )
+            .await;
+        });
+    }
+
+    // ── Rilevamento cambio modello esplicito ────────────────────────────────
+    // Se il messaggio è un comando "usa mistral / cambia a claude / ecc." e
+    // il client non ha già impostato un override manuale, gestiamo lo switch
+    // automaticamente: salviamo la preferenza nella sessione e rispondiamo con
+    // un messaggio di conferma senza coinvolgere l'AI.
+    if body.provider_override.is_none() {
+        // Reset al routing automatico
+        if detect_model_reset(content) {
+            let _ = sqlx::query(
+                "UPDATE chat_sessions SET preferred_provider = NULL, preferred_model = NULL WHERE id = $1",
+            )
+            .bind(context.session_id)
+            .execute(&state.db)
+            .await;
+
+            let ack_id = insert_message(
+                &state.db,
+                context.session_id,
+                context.project_id,
+                "assistant",
+                "Routing automatico ripristinato. Il sistema sceglierà il modello ottimale per ogni richiesta.",
+                json!({ "provider": "system", "model": "auto", "intent": "model_reset" }),
+                Some(user_message_id),
+            )
+            .await?;
+            let ack_row = load_message_by_id(&state.db, ack_id).await?;
+            let ack_message = to_message_view(&ack_row)?;
+            return Ok(Json(json!({
+                "sessionId": context.session_id.to_string(),
+                "userMessage": user_message,
+                "assistantMessage": ack_message,
+                "savedAttachments": saved_attachments_json.clone(),
+            })));
+        }
+
+        if let Some((switched_provider, switched_model)) =
+            detect_model_switch(&state.db, content).await
+        {
+            // Persiste la preferenza nella sessione per i messaggi futuri
+            let _ = sqlx::query(
+                "UPDATE chat_sessions SET preferred_provider = $1, preferred_model = $2 WHERE id = $3",
+            )
+            .bind(&switched_provider)
+            .bind(&switched_model)
+            .bind(context.session_id)
+            .execute(&state.db)
+            .await;
+
+            // Genera un messaggio assistant di conferma e salvalo nel DB
+            let model_label = switched_model
+                .clone()
+                .unwrap_or_else(|| switched_provider.clone());
+            let ack_content = format!(
+                "Modello impostato su **{}**{}. I prossimi messaggi in questa sessione useranno questo provider.",
+                switched_provider,
+                if switched_model.is_some() {
+                    format!(" ({})", model_label)
+                } else {
+                    String::new()
+                }
+            );
+            let ack_meta = json!({
+                "provider": switched_provider,
+                "model": model_label,
+                "intent": "model_switch",
+                "automationMode": "confirm",
+            });
+            let ack_id = insert_message(
+                &state.db,
+                context.session_id,
+                context.project_id,
+                "assistant",
+                &ack_content,
+                ack_meta,
+                Some(user_message_id),
+            )
+            .await?;
+            let ack_row = load_message_by_id(&state.db, ack_id).await?;
+            let ack_message = to_message_view(&ack_row)?;
+
+            return Ok(Json(json!({
+                "sessionId": context.session_id.to_string(),
+                "userMessage": user_message,
+                "assistantMessage": ack_message,
+                "savedAttachments": saved_attachments_json.clone(),
+            })));
+        }
+    }
+
+    // ── Carica preferenza modello della sessione ────────────────────────────
+    // Se l'utente aveva già impostato un provider preferito in questa sessione
+    // (tramite un comando precedente "usa mistral"), lo usa come override di default.
+    let (session_preferred_provider, session_preferred_model): (Option<String>, Option<String>) =
+        if body.provider_override.is_none() {
+            sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT preferred_provider, preferred_model FROM chat_sessions WHERE id = $1",
+            )
+            .bind(context.session_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .map(|(prov, model)| {
+                (
+                    prov.filter(|s| !s.is_empty()),
+                    model.filter(|s| !s.is_empty()),
+                )
+            })
+            .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+    // Override effettivo: esplicito dal client > preferenza di sessione
+    let effective_provider_override = body
+        .provider_override
+        .clone()
+        .or(session_preferred_provider);
+    let effective_model_override = body.model_override.clone().or(session_preferred_model);
+
+    let profile_id = body
+        .profile_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "default".to_string());
+
+    // Carica contesto profilo (system_prompt, provider/model/automation override)
+    // Passa il testo della richiesta per la selezione automatica (profile_id == "auto")
+    let (profile_prompt_block, profile_provider, profile_model, profile_automation) =
+        fetch_profile_context(&state.db, user_id, &profile_id, &body.content).await;
+
+    let automation_mode = parse_automation_mode(
+        body.automation_mode
+            .as_deref()
+            .or(profile_automation.as_deref()),
+    );
+    let supervisor_mode =
+        SupervisorMode::from_str(body.supervisor_mode.as_deref().unwrap_or("none"));
+
+    // Fetch user info to build system context
+    let github_username: Option<String> =
+        sqlx::query_scalar("SELECT github_username FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or(None)
+            .flatten();
+
+    let system_prompt = crate::prompt_templates::get_template_or_default(
+        &state.db,
+        &state.template_cache,
+        "system.nexus_base",
+    )
+    .await;
+
+    let system_context = {
+        let mut ctx = system_prompt;
+        if automation_mode != AutomationMode::Study {
+            ctx.push_str(crate::prompt_templates::AGENT_ACT_FIRST_SUFFIX);
+        }
+        if let Some(ref gh) = github_username {
+            ctx.push_str(&format!(" Account GitHub: @{gh}."));
+        }
+        // ── Iniezione Knowledge Base (top-K note semanticamente rilevanti) ──
+        // Embed del messaggio user → search Qdrant `knowledge_notes` filtrata per progetto
+        // → carica title+body delle top hit → prependi come "Contesto progetto" al system prompt.
+        // Failsafe: se brain down o KB vuota, il flow normale prosegue (no contesto KB).
+        if let Some(kb_block) = build_knowledge_context(&state, context.project_id, content).await {
+            ctx.push_str("\n\n");
+            ctx.push_str(&kb_block);
+        }
+        ctx
+    };
+
+    // ── Ripresa run interrotto (riprendi / continua / resume) ─────────────
+    if automation_mode != AutomationMode::Study {
+        let is_resume_request = {
+            let lower = content.trim().to_lowercase();
+            lower == "riprendi"
+                || lower == "continua"
+                || lower == "resume"
+                || lower == "riprendi dall'interruzione"
+                || lower.starts_with("riprendi ")
+                || lower.starts_with("continua da")
+        };
+
+        if is_resume_request {
+            // Cerca l'ultimo run interrupted di questa sessione con history salvata
+            let interrupted_run = sqlx::query(
+                r#"SELECT id, provider, model, messages_json, iteration_count, supervisor_mode
+                   FROM agent_runs
+                   WHERE session_id = $1
+                     AND status = 'interrupted'
+                     AND messages_json IS NOT NULL
+                     AND messages_json != ''
+                   ORDER BY created_at DESC
+                   LIMIT 1"#,
+            )
+            .bind(context.session_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+
+            if let Some(prev_run) = interrupted_run {
+                let prev_run_id: Uuid = prev_run.get("id");
+                let prev_provider: String = prev_run.get("provider");
+                let prev_model: String = prev_run.get("model");
+                let prev_messages_json: String = prev_run.get("messages_json");
+                let prev_iterations: i32 = prev_run.get("iteration_count");
+
+                tracing::info!(
+                    "Resuming interrupted run {} (iter={}, supervisor={}) for session {}",
+                    prev_run_id,
+                    prev_iterations,
+                    prev_run
+                        .try_get::<String, _>("supervisor_mode")
+                        .unwrap_or_else(|_| "none".into()),
+                    context.session_id
+                );
+
+                // Crea nuovo run collegato al precedente
+                let new_run_id = Uuid::new_v4();
+                let (tx, _rx) = broadcast::channel::<AgentStepEvent>(256);
+                state.agent_channels.insert(new_run_id, tx.clone());
+
+                let prev_supervisor_str: String = prev_run
+                    .try_get("supervisor_mode")
+                    .unwrap_or_else(|_| "none".to_string());
+                let prev_supervisor = SupervisorMode::from_str(&prev_supervisor_str);
+
+                let _ = sqlx::query(
+                    r#"INSERT INTO agent_runs
+                       (id, session_id, project_id, user_id, run_message_id, status,
+                        automation_mode, provider, model, supervisor_mode, iteration_count, parent_run_id, created_at)
+                       VALUES ($1,$2,$3,$4,$5,'running',$6,$7,$8,$9,0,$10,NOW())"#,
+                )
+                .bind(new_run_id)
+                .bind(context.session_id)
+                .bind(context.project_id)
+                .bind(user_id)
+                .bind(user_message_id)
+                .bind(automation_mode.as_str())
+                .bind(&prev_provider)
+                .bind(&prev_model)
+                .bind(prev_supervisor.as_str())
+                .bind(prev_run_id)
+                .execute(&state.db)
+                .await;
+
+                // Marca il vecchio run come ripreso
+                let _ = sqlx::query(
+                    "UPDATE agent_runs SET status='cancelled', final_answer='Ripreso da nuovo run.' WHERE id=$1"
+                )
+                .bind(prev_run_id)
+                .execute(&state.db)
+                .await;
+
+                // Carica contesto progetto per il nuovo run
+                if let Ok(proj) = load_project_context(&state.db, context.project_id, user_id).await
+                {
+                    let db_clone2 = state.db.clone();
+                    let channels2 = state.agent_channels.clone();
+                    let proj_channels2 = state.project_channels.clone();
+                    let neural2 = state.orchestrator.neural.clone();
+                    let term2 = state.terminal_consumers.clone();
+                    let session_id_r = context.session_id;
+                    let project_id_r = context.project_id;
+                    let msg_id_r = user_message_id;
+                    let provider_r = prev_provider.clone();
+                    let model_r = prev_model.clone();
+                    let automation_r = automation_mode.clone();
+                    let supervisor_r = prev_supervisor;
+                    let template_cache_r = state.template_cache.clone();
+                    let routing_thresholds_for_resume =
+                        state.orchestrator.routing_thresholds.clone();
+                    let user_role_r = claims.role.clone();
+
+                    let _ = (
+                        &neural2,
+                        &term2,
+                        &automation_r,
+                        &supervisor_r,
+                        &user_role_r,
+                        &proj,
+                        &prev_messages_json,
+                    );
+                    tokio::spawn(async move {
+                        let resume_tpl = crate::prompt_templates::get_template_or_default(
+                            &db_clone2,
+                            &template_cache_r,
+                            "automation.run_resume_instruction",
+                        )
+                        .await;
+                        let resume_prompt =
+                            resume_tpl.replace("{{prev_iterations}}", &prev_iterations.to_string());
+
+                        let resume_history =
+                            build_recent_conversation_history(&db_clone2, session_id_r, 8).await;
+
+                        let tools_for_resume =
+                            crate::brain_agent_client::build_tools_json_for_agent(
+                                &db_clone2,
+                                user_id,
+                                project_id_r,
+                                &automation_r,
+                                &provider_r,
+                                &model_r,
+                            )
+                            .await;
+
+                        // Re-leggo soglia SSE silence (mig 0132) — cache 60s.
+                        let sse_silence_resume: u64 =
+                            match routing_thresholds_for_resume.current_async().await {
+                                Ok(t) => t.sse_heartbeat_max_silence_secs,
+                                Err(_) => 120,
+                            };
+
+                        let result = crate::brain_agent_client::run_via_brain(
+                            new_run_id,
+                            session_id_r,
+                            provider_r,
+                            model_r,
+                            String::new(),
+                            resume_prompt,
+                            tx,
+                            resume_history,
+                            tools_for_resume,
+                            sse_silence_resume,
+                            true, // emit_final_event: caller singolo-shot, nessun retry loop
+                            automation_r.as_str().to_string(),
+                        )
+                        .await;
+                        channels2.remove(&new_run_id);
+
+                        if let Some(ref answer) = result.final_answer {
+                            let meta = serde_json::json!({
+                                "provider": &result.provider,
+                                "model": &result.model,
+                                "agentRunId": new_run_id.to_string(),
+                                "iterationCount": result.iteration_count,
+                                "automationMode": "automatic",
+                                "resumed": true,
+                                "promptTokens": result.prompt_tokens,
+                                "completionTokens": result.completion_tokens,
+                                "totalTokens": result.total_tokens,
+                                "totalCost": result.total_cost,
+                                "currency": "USD",
+                            });
+                            let _ = sqlx::query(
+                                r#"INSERT INTO chat_messages
+                                   (id, session_id, project_id, role, content, metadata, request_message_id, created_at)
+                                   VALUES (gen_random_uuid(),$1,$2,'assistant',$3,$4,$5,NOW())"#,
+                            )
+                            .bind(session_id_r)
+                            .bind(project_id_r)
+                            .bind(answer)
+                            .bind(meta)
+                            .bind(msg_id_r)
+                            .execute(&db_clone2)
+                            .await;
+                        }
+
+                        let _run_completed =
+                            matches!(result.status, crate::agent_types::AgentRunStatus::Completed);
+                        crate::agent_types::finalize_agent_run(
+                            &db_clone2,
+                            new_run_id,
+                            result.status,
+                            result.final_answer.as_deref(),
+                            result.iteration_count,
+                        )
+                        .await;
+
+                        // M12.1: ingestione automatica del resoconto nella KB
+                        // (nota agent_summary + embedding + auto-link). Best-effort.
+                        if _run_completed {
+                            crate::knowledge::ingest_run::ingest_run_summary_to_kb(
+                                &db_clone2,
+                                &neural2,
+                                &proj_channels2,
+                                new_run_id,
+                            )
+                            .await;
+                        }
+                    });
+
+                    return Ok(Json(json!({
+                        "sessionId": context.session_id.to_string(),
+                        "userMessage": user_message,
+                        "agentRun": {
+                            "runId": new_run_id.to_string(),
+                            "status": "running",
+                            "provider": prev_provider,
+                            "model": prev_model,
+                            "resumed": true,
+                        },
+                        "savedAttachments": saved_attachments_json.clone(),
+                    })));
+                }
+            }
+        }
+    }
+
+    // ── DLP check (Nexus Sicurezza & Privacy) ────────────────────────────────
+    // Classifica la sensibilità del contenuto utente prima di inviarlo al brain.
+    // Eseguito qui — prima sia di spawn_agent_run sia di run_turn — così copre
+    // tutti i percorsi (modalità agente + studio + fallback).
+    {
+        let tier = crate::dlp::classify_sensitivity(content);
+        if tier >= crate::dlp::SensitivityTier::Sensitive {
+            // Provider per il check DLP: usa l'override se presente, altrimenti
+            // il primo default dalla routing matrix (DB-driven, niente hardcoded).
+            let matrix_provider: Option<String> = state
+                .orchestrator
+                .routing_matrix
+                .current()
+                .ok()
+                .and_then(|m| m.default_models.keys().next().cloned());
+            let check_provider = effective_provider_override
+                .as_deref()
+                .or(matrix_provider.as_deref())
+                .unwrap_or("system");
+            if let Some(dlp_msg) =
+                crate::dlp::check_dlp_policy_db(check_provider, tier, &state.db).await
+            {
+                if dlp_msg.contains("DLP Block") {
+                    // Salva il messaggio di errore come risposta assistant in DB
+                    // così l'utente vede il motivo del blocco nell'interfaccia.
+                    let err_id = insert_message(
+                        &state.db,
+                        context.session_id,
+                        context.project_id,
+                        "assistant",
+                        &dlp_msg,
+                        json!({
+                            "provider": "system",
+                            "model": "dlp",
+                            "intent": "dlp_block",
+                        }),
+                        Some(user_message_id),
+                    )
+                    .await
+                    .ok();
+                    if let Some(err_msg_id) = err_id {
+                        if let Ok(err_row) = load_message_by_id(&state.db, err_msg_id).await {
+                            if let Ok(err_msg) = to_message_view(&err_row) {
+                                return Ok(Json(json!({
+                                    "sessionId": context.session_id.to_string(),
+                                    "userMessage": user_message,
+                                    "assistantMessage": err_msg,
+                                    "dlpBlocked": true,
+                                    "savedAttachments": saved_attachments_json.clone(),
+                                })));
+                            }
+                        }
+                    }
+                    return Err(api_error(StatusCode::FORBIDDEN, dlp_msg));
+                } else {
+                    tracing::warn!("DLP: {}", dlp_msg);
+                }
+            }
+        }
+    }
+
+    // ── Modalita' agente: dispatcha al loop agente invece del singolo turn ──
+    if automation_mode != AutomationMode::Study {
+        if let Some(result) = spawn_agent_run(
+            &state,
+            SpawnAgentParams {
+                user_id,
+                session_id: context.session_id,
+                project_id: context.project_id,
+                user_message_id,
+                content: content.to_string(),
+                automation_mode: automation_mode.clone(),
+                supervisor_mode,
+                profile_prompt_block,
+                system_context: system_context.clone(),
+                provider_override: effective_provider_override.clone(),
+                model_override: effective_model_override.clone(),
+                profile_provider: profile_provider.clone(),
+                profile_model: profile_model.clone(),
+                attachments: enrich_attachments_with_ids(
+                    normalize_attachments(&body.attachments),
+                    &saved_attachments_list,
+                ),
+                user_role: claims.role.clone(),
+                nexus_agent_type_hint: body.agent_type_hint.clone(),
+            },
+        )
+        .await
+        {
+            // Avvia il file watcher anche in modalita' agente asincrona.
+            update_user_active_project(&state, user_id, context.project_id).await;
+            return Ok(Json(json!({
+                "sessionId": context.session_id.to_string(),
+                "userMessage": user_message,
+                "agentRun": {
+                    "runId": result.run_id.to_string(),
+                    "status": "running",
+                    "provider": result.provider,
+                    "model": result.model,
+                },
+                "savedAttachments": saved_attachments_json.clone(),
+            })));
+        }
+        // Se il caricamento del progetto fallisce, fallback al singolo turn
+    }
+
+    let run_turn_result = run_turn(
+        &state,
+        user_id,
+        context.session_id,
+        context.project_id,
+        profile_id,
+        content.to_string(),
+        user_message_id,
+        body.active_files.clone(),
+        Some(system_context),
+        effective_provider_override,
+        effective_model_override,
+        automation_mode,
+        enrich_attachments_with_ids(
+            normalize_attachments(&body.attachments),
+            &saved_attachments_list,
+        ),
+    )
+    .await;
+
+    let (assistant_message, orchestrator) = match run_turn_result {
+        Ok(result) => result,
+        Err(error) => {
+            let fallback_metadata = json!({
+                "provider": "none",
+                "model": "none",
+                "intent": "chat",
+                "runId": "",
+                "error": error.1["error"].as_str().unwrap_or("generation_error"),
+                "promptTokens": 0,
+                "completionTokens": 0,
+                "totalTokens": 0,
+                "totalCost": 0.0,
+                "currency": "EUR",
+                "automationMode": automation_mode.as_str(),
+            });
+            let assistant_id = insert_message(
+                &state.db,
+                context.session_id,
+                context.project_id,
+                "assistant",
+                &format!(
+                    "Operazione non completata: {}",
+                    humanize_ai_error(
+                        error.1["error"]
+                            .as_str()
+                            .unwrap_or("Richiesta non completata")
+                    )
+                ),
+                fallback_metadata,
+                Some(user_message_id),
+            )
+            .await?;
+            let row = load_message_by_id(&state.db, assistant_id).await?;
+            let assistant = to_message_view(&row)?;
+            return Ok(Json(json!({
+                "sessionId": context.session_id.to_string(),
+                "userMessage": user_message,
+                "assistantMessage": assistant,
+                "savedAttachments": saved_attachments_json.clone(),
+            })));
+        }
+    };
+
+    let _ = sqlx::query(
+        r#"
+        UPDATE chat_sessions
+        SET
+            title = CASE
+                WHEN title = 'New Session' OR title = 'Nuova sessione' THEN $2
+                ELSE title
+            END,
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(context.session_id)
+    .bind(summarize_title(content))
+    .execute(&state.db)
+    .await;
+
+    update_user_active_project(&state, user_id, context.project_id).await;
+
+    Ok(Json(json!({
+        "sessionId": context.session_id.to_string(),
+        "userMessage": user_message,
+        "assistantMessage": assistant_message,
+        "run": {
+            "id": orchestrator.payload["run_id"].as_str().unwrap_or(""),
+            "provider": orchestrator.payload["provider"].as_str().unwrap_or(""),
+            "model": orchestrator.payload["model"].as_str().unwrap_or(""),
+            "intent": orchestrator.payload["intent"].as_str().unwrap_or("chat"),
+        },
+        "savedAttachments": saved_attachments_json,
+    })))
+}
+pub async fn resend_chat_message(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(message_id): AxumPath<String>,
+    Json(body): Json<SendChatMessageRequest>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let message_id = Uuid::parse_str(&message_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Message id non valido"))?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT
+            m.id,
+            m.session_id,
+            m.project_id,
+            m.role,
+            m.content,
+            m.request_message_id,
+            m.created_at,
+            s.user_id
+        FROM chat_messages m
+        JOIN chat_sessions s ON s.id = m.session_id
+        WHERE m.id = $1
+        "#,
+    )
+    .bind(message_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let Some(row) = row else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Messaggio non trovato"));
+    };
+
+    let owner: Option<Uuid> = row.try_get("user_id").unwrap_or(None);
+    if owner != Some(user_id) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Messaggio non accessibile",
+        ));
+    }
+
+    let session_id: Uuid = row
+        .try_get("session_id")
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let project_id: Uuid = row
+        .try_get("project_id")
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    let role: String = row
+        .try_get("role")
+        .unwrap_or_else(|_| "assistant".to_string());
+    let source_user_message_id: Uuid = if role == "user" {
+        message_id
+    } else if let Some(request_message_id) = row
+        .try_get::<Option<Uuid>, _>("request_message_id")
+        .unwrap_or(None)
+    {
+        request_message_id
+    } else {
+        let created_at: DateTime<Utc> = row
+            .try_get("created_at")
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        sqlx::query_scalar::<_, Uuid>(
+            r#"
+            SELECT id
+            FROM chat_messages
+            WHERE session_id = $1
+              AND role = 'user'
+              AND created_at <= $2
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(session_id)
+        .bind(created_at)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "Impossibile determinare il messaggio utente da reinviare",
+            )
+        })?
+    };
+
+    let source_prompt = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT content
+        FROM chat_messages
+        WHERE id = $1
+          AND role = 'user'
+        "#,
+    )
+    .bind(source_user_message_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "Messaggio utente originale non trovato",
+        )
+    })?;
+    let source_metadata = sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT metadata
+        FROM chat_messages
+        WHERE id = $1
+        "#,
+    )
+    .bind(source_user_message_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .unwrap_or_else(|| json!({}));
+
+    let profile_id = body
+        .profile_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    let provider_override = body.provider_override.clone().or_else(|| {
+        source_metadata
+            .get("providerOverride")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    });
+    let model_override = body.model_override.clone().or_else(|| {
+        source_metadata
+            .get("modelOverride")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    });
+    let automation_mode = if body.automation_mode.is_some() {
+        parse_automation_mode(body.automation_mode.as_deref())
+    } else {
+        parse_automation_mode(
+            source_metadata
+                .get("automationMode")
+                .and_then(Value::as_str),
+        )
+    };
+    let attachments_raw = if body.attachments.is_empty() {
+        serde_json::from_value::<Vec<ChatAttachmentRequest>>(
+            source_metadata
+                .get("attachments")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )
+        .map(|value| normalize_attachments(&value))
+        .unwrap_or_default()
+    } else {
+        normalize_attachments(&body.attachments)
+    };
+    // Resend: gli allegati sono gia' persistiti nel turno originale, recupero
+    // gli UUID dal DB per il source_user_message_id. Senza questo il blocco
+    // <allegati> nel prompt iniziale del retry non avrebbe gli ID e il modello
+    // re-incappa nel bug del fallback al filename (vedi
+    // enrich_attachments_with_ids_from_db).
+    let attachments =
+        enrich_attachments_with_ids_from_db(&state.db, attachments_raw, source_user_message_id)
+            .await;
+    let attachments_metadata = if body.attachments.is_empty() {
+        source_metadata
+            .get("attachments")
+            .cloned()
+            .unwrap_or_else(|| json!([]))
+    } else {
+        json!(body.attachments.clone())
+    };
+
+    let resent_user_message_id = insert_message(
+        &state.db,
+        session_id,
+        project_id,
+        "user",
+        &source_prompt,
+        json!({
+            "providerOverride": provider_override.clone(),
+            "modelOverride": model_override.clone(),
+            "automationMode": automation_mode.as_str(),
+            "attachments": attachments_metadata,
+            "resendOf": source_user_message_id.to_string(),
+        }),
+        None,
+    )
+    .await?;
+    let resent_user_row = load_message_by_id(&state.db, resent_user_message_id).await?;
+    let resent_user_message = to_message_view(&resent_user_row)?;
+
+    // ── Agent mode per resend (usa la stessa funzione condivisa di send) ──
+    if automation_mode != AutomationMode::Study {
+        let (profile_prompt_block, _, _, _) =
+            fetch_profile_context(&state.db, user_id, &profile_id, &source_prompt).await;
+        let github_username: Option<String> =
+            sqlx::query_scalar("SELECT github_username FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_optional(&state.db)
+                .await
+                .unwrap_or(None)
+                .flatten();
+        let system_context_str = {
+            let mut ctx = String::from(
+                "Sei Nexus, agente operativo di sviluppo. Regole:\n\
+                 Output: testo pulito, markdown standard (no emoji, no caratteri grafici).\n\
+                 Tool iniziali: read_file, list_files, search_in_files, write_file, edit_file, run_command.\n\
+                 Tool aggiuntivi: usa request_tools(categories) per sbloccare categorie extra:\n\
+                 - \"git\": git_status, git_stage, git_commit, git_push, git_pull\n\
+                 - \"service\": run_service, read_service_output, stop_service\n\
+                 - \"files_advanced\": delete_file, rename_file\n\
+                 - \"profile\": create_profile, update_profile\n\
+                 - \"subtask\": dispatch_subtask\n\
+                 - \"mcp\": tool da server MCP esterni\n\
+                 Autonomia: NON chiedere mai struttura, tecnologia, OS, comandi — ricava tutto dal contesto progetto o con list_files/read_file.\n\
+                 PERO' SE ti mancano informazioni che NON puoi ricavare autonomamente (connection string, API keys, credenziali, \
+                 configurazioni specifiche dell'ambiente, password, URL di servizi esterni), DEVI chiedere all'utente. \
+                 Non tentare di indovinare valori sensibili. Interrompi il flusso, spiega cosa ti serve e perche', e attendi la risposta.\n\
+                 File grandi — REGOLA CRITICA PER PERFORMANCE:\n\
+                 read_file restituisce solo le prime 300 righe. Se il file e' piu' grande, usa questo flusso:\n\
+                 1. read_file(path) — ottieni le prime 300 righe + totale righe\n\
+                 2. read_file_lines(path, start_line, end_line) — leggi un range specifico (max 400 righe per chiamata)\n\
+                 3. Se non sai dove si trova la sezione: usa search_in_files o search_codebase_semantic, poi read_file_lines\n\
+                 NON caricare file interi grandi. Usa sempre lettura chirurgica per sezioni specifiche.\n\
+                 Avvio servizi — REGOLE TASSATIVE:\n\
+                 1) Per avviare servizi (server, watcher, processi long-running), usa run_service con label descrittiva.\n\
+                 2) Dopo OGNI run_service, LEGGI l'output restituito. Se serve piu' output, usa read_service_output col process_id.\n\
+             ANTI-LOOP: non chiamare read_service_output piu' di 3 volte consecutive sullo stesso process_id. Se dopo 3 letture il servizio non e' pronto, smetti di aspettare e riferisci all'utente lo stato attuale. Non eseguire run_command in loop per monitorare uno stesso processo.\n\
+                 3) Se l'output contiene errori (exit code != 0, Error, Exception, failed), CORREGGI e RILANCIA (stop_service + run_service).\n\
+                 4) Dopo che i servizi sono avviati, VERIFICA con run_command(\"ss -tlnp | grep PORTA\") che le porte siano in ascolto.\n\
+                 5) Nella risposta finale, fornisci SEMPRE i link URL (es. http://localhost:5000, http://localhost:5173) dove l'utente puo' aprire i servizi.\n\
+                 Errori comuni e correzioni:\n\
+                 - Porta occupata: run_command(\"lsof -t -i:PORTA | xargs kill -9\") poi rilancia\n\
+                 - .NET TargetFramework errato: controlla con run_command(\"dotnet --list-sdks\"), aggiorna .csproj, rilancia\n\
+                 - Build fallita: leggi output, correggi con edit_file, rilancia\n\
+                 - npm module not found: run_command(\"npm install\") poi rilancia\n\
+                 - SEMPRE rilancia dopo una correzione. Mai fermarsi dopo un fix senza verificare.\n\
+                 Persistenza: se un'operazione fallisce, leggi l'errore, analizzalo e riprova. Non arrenderti al primo errore.\n\
+                 Git: usa credenziali utente autenticato. Per cloni parti da $NEXUS_TERMINAL_ROOT.\n\
+                 Profili: quando noti stack tecnico ricorrente, crea/aggiorna profilo con create_profile/update_profile.",
+            );
+            if automation_mode != AutomationMode::Study {
+                ctx.push_str(crate::prompt_templates::AGENT_ACT_FIRST_SUFFIX);
+            }
+            if let Some(ref gh) = github_username {
+                ctx.push_str(&format!(" Account GitHub: @{gh}."));
+            }
+            ctx
+        };
+
+        if let Some(result) = spawn_agent_run(
+            &state,
+            SpawnAgentParams {
+                user_id,
+                session_id,
+                project_id,
+                user_message_id: resent_user_message_id,
+                content: source_prompt.clone(),
+                automation_mode: automation_mode.clone(),
+                supervisor_mode: SupervisorMode::default(),
+                profile_prompt_block,
+                system_context: system_context_str,
+                provider_override: provider_override.clone(),
+                model_override: model_override.clone(),
+                profile_provider: None,
+                profile_model: None,
+                attachments: attachments.clone(),
+                user_role: claims.role.clone(),
+                nexus_agent_type_hint: None, // resend non usa hint
+            },
+        )
+        .await
+        {
+            update_user_active_project(&state, user_id, project_id).await;
+            return Ok(Json(json!({
+                "sessionId": session_id.to_string(),
+                "userMessage": resent_user_message,
+                "agentRun": {
+                    "runId": result.run_id.to_string(),
+                    "status": "running",
+                    "provider": result.provider,
+                    "model": result.model,
+                }
+            })));
+        }
+    }
+
+    // Fallback: orchestrator singolo turno (Study mode o progetto non trovato)
+    let (assistant_message, orchestrator) = run_turn(
+        &state,
+        user_id,
+        session_id,
+        project_id,
+        profile_id,
+        source_prompt.clone(),
+        resent_user_message_id,
+        body.active_files.clone(),
+        None,
+        provider_override,
+        model_override,
+        automation_mode,
+        attachments,
+    )
+    .await?;
+
+    update_user_active_project(&state, user_id, project_id).await;
+
+    Ok(Json(json!({
+        "sessionId": session_id.to_string(),
+        "userMessage": resent_user_message,
+        "assistantMessage": assistant_message,
+        "run": {
+            "id": orchestrator.payload["run_id"].as_str().unwrap_or(""),
+            "provider": orchestrator.payload["provider"].as_str().unwrap_or(""),
+            "model": orchestrator.payload["model"].as_str().unwrap_or(""),
+        }
+    })))
+}
+pub async fn delete_chat_message(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(message_id): AxumPath<String>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let message_id = Uuid::parse_str(&message_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Message id non valido"))?;
+
+    let row = sqlx::query(
+        r#"
+        UPDATE chat_messages m
+        SET deleted_at = NOW(),
+            deleted_by_user_id = $2,
+            updated_at = NOW()
+        FROM chat_sessions s
+        WHERE m.id = $1
+          AND m.session_id = s.id
+          AND s.user_id = $2
+        RETURNING m.id, m.session_id, s.project_id
+        "#,
+    )
+    .bind(message_id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let Some(row) = row else {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "Messaggio non trovato o non autorizzato",
+        ));
+    };
+
+    let project_id: Uuid = row
+        .try_get("project_id")
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    update_user_active_project(&state, user_id, project_id).await;
+
+    Ok(Json(json!({
+        "ok": true,
+        "messageId": message_id.to_string()
+    })))
+}
+pub async fn feedback_error(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(message_id): AxumPath<String>,
+    Json(body): Json<FeedbackErrorRequest>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let message_id = Uuid::parse_str(&message_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Message id non valido"))?;
+    let comment = body.comment.trim();
+    if comment.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Il commento di errore e' obbligatorio",
+        ));
+    }
+
+    let row = sqlx::query(
+        r#"
+        SELECT
+            m.id,
+            m.session_id,
+            m.project_id,
+            m.role,
+            m.content,
+            m.metadata,
+            s.user_id
+        FROM chat_messages m
+        JOIN chat_sessions s ON s.id = m.session_id
+        WHERE m.id = $1
+        "#,
+    )
+    .bind(message_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let Some(row) = row else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Messaggio non trovato"));
+    };
+
+    let owner: Option<Uuid> = row.try_get("user_id").unwrap_or(None);
+    if owner != Some(user_id) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Messaggio non accessibile",
+        ));
+    }
+
+    let role: String = row.try_get("role").unwrap_or_default();
+    if role != "assistant" {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Il feedback errore e' consentito solo sui messaggi AI",
+        ));
+    }
+
+    let session_id: Uuid = row
+        .try_get("session_id")
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let project_id: Uuid = row
+        .try_get("project_id")
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    let metadata: Value = row.try_get("metadata").unwrap_or_else(|_| json!({}));
+    let ai_response_content: String = row.try_get("content").unwrap_or_default();
+    let intent = metadata
+        .get("intent")
+        .and_then(Value::as_str)
+        .unwrap_or("chat")
+        .to_lowercase();
+    let provider = metadata
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let model = metadata
+        .get("model")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let raw_run_id = metadata
+        .get("runId")
+        .or_else(|| metadata.get("agentRunId"))
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    // Verifica esistenza in orchestrator_runs (FK target).
+    // I run agent moderni vivono in `agent_runs`, ma la FK del feedback punta
+    // a `orchestrator_runs`. Se l'ID non esiste li', settiamo NULL invece di
+    // far fallire l'insert (la colonna ammette NULL).
+    let run_id: Option<Uuid> = match raw_run_id {
+        Some(id) => {
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE id = $1)")
+                    .bind(id)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap_or(false);
+            if exists {
+                Some(id)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+
+    // Recupera il messaggio utente precedente nella stessa sessione:
+    // è la domanda che ha generato questa risposta AI — usata per costruire
+    // un embedding semanticamente ricco che matchi domande simili future.
+    let preceding_user_message: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT content FROM chat_messages
+        WHERE session_id = $1
+          AND role = 'user'
+          AND created_at < (SELECT created_at FROM chat_messages WHERE id = $2)
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(session_id)
+    .bind(message_id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    // ── Testo per l'embedding ──────────────────────────────────────────────
+    // Concatena domanda utente + commento di correzione.
+    // Così quando arriva una domanda semanticamente simile in futuro,
+    // il vettore viene trovato con alta similarità.
+    let embed_input = match &preceding_user_message {
+        Some(q) if !q.is_empty() => format!(
+            "{}\n\nCorrezione: {}",
+            q.chars().take(800).collect::<String>(),
+            comment
+        ),
+        _ => comment.to_string(),
+    };
+
+    // ── correction_text: testo che viene iniettato nel system prompt ───────
+    // Deve essere una istruzione chiara e azionabile per l'AI.
+    let correction_text = match &preceding_user_message {
+        Some(q) if !q.is_empty() => format!(
+            "[{}] Quando viene chiesto: «{}» — {}",
+            intent,
+            q.chars().take(200).collect::<String>(),
+            comment
+        ),
+        _ => format!("[{}] {}", intent, comment),
+    };
+
+    // Preview della risposta AI sbagliata (per audit/debug, max 500 chars)
+    let ai_response_preview: String = ai_response_content.chars().take(500).collect();
+
+    let feedback_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO ai_response_feedback (
+            id, project_id, session_id, message_id, orchestrator_run_id, user_id,
+            feedback_type, intent, provider, model, error_comment, status, created_at, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, 'error', $7, $8, $9, $10, 'open', NOW(), NOW())
+        "#,
+    )
+    .bind(feedback_id)
+    .bind(project_id)
+    .bind(session_id)
+    .bind(message_id)
+    .bind(run_id)
+    .bind(user_id)
+    .bind(&intent)
+    .bind(&provider)
+    .bind(&model)
+    .bind(comment)
+    .execute(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let correction_id = Uuid::new_v4();
+    let point_id = correction_id.to_string();
+    let normalized = normalize_text(&correction_text);
+    let normalized_hash = hash_hint(project_id, &intent, &normalized);
+
+    sqlx::query(
+        r#"
+        INSERT INTO prompt_corrections (
+            id, project_id, feedback_id, session_id, message_id, orchestrator_run_id,
+            intent, provider, model, correction_text, normalized_hint_hash, qdrant_point_id,
+            active, status, metadata, created_at, updated_at
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+            TRUE, 'open', $13, NOW(), NOW()
+        )
+        "#,
+    )
+    .bind(correction_id)
+    .bind(project_id)
+    .bind(feedback_id)
+    .bind(session_id)
+    .bind(message_id)
+    .bind(run_id)
+    .bind(&intent)
+    .bind(&provider)
+    .bind(&model)
+    .bind(&correction_text)
+    .bind(&normalized_hash)
+    .bind(&point_id)
+    .bind(json!({
+        "source": "chat_feedback",
+        "requestedBy": user_id.to_string(),
+        "userComment": comment,
+        "aiResponsePreview": ai_response_preview,
+        "userQuestionPreview": preceding_user_message.as_deref().unwrap_or("").chars().take(300).collect::<String>(),
+    }))
+    .execute(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Guard: se embedder/qdrant sono down, skip vettorializzazione (la correzione e' gia' in DB)
+    let qdrant_ok = state
+        .dependency_status
+        .qdrant
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let embedder_ok = state
+        .dependency_status
+        .embedder
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if !qdrant_ok || !embedder_ok {
+        tracing::info!(
+            "corrections: skip vettorializzazione (qdrant={}, embedder={})",
+            qdrant_ok,
+            embedder_ok
+        );
+    } else {
+        let vector = state
+            .orchestrator
+            .embed_text(&embed_input)
+            .await
+            .map_err(|e| api_error(StatusCode::BAD_GATEWAY, e.to_string()))?;
+        vector_memory::upsert_prompt_correction_point(
+            &state.db,
+            &point_id,
+            &vector,
+            json!({
+                "project_id": project_id.to_string(),
+                "correction_id": correction_id.to_string(),
+                "feedback_id": feedback_id.to_string(),
+                "intent": intent,
+                "provider": provider,
+                "model": model,
+                "text": correction_text,
+                "active": true,
+                "status": "open",
+                "created_at": Utc::now().to_rfc3339(),
+                "normalized_hint_hash": normalized_hash,
+            }),
+        )
+        .await
+        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, e.to_string()))?;
+    }
+
+    let dedup_count = dedup_on_write(
+        &state.db,
+        project_id,
+        &intent,
+        &normalized_hash,
+        correction_id,
+    )
+    .await?;
+    let learning_action =
+        apply_project_learning(&state.db, project_id, user_id, Some(&intent), false).await?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "feedbackId": feedback_id.to_string(),
+        "correctionId": correction_id.to_string(),
+        "deduplicatedCount": dedup_count,
+        "learning": learning_action
+    })))
+}
+/// Handler feedback positivo (pollice su): conferma esplicita che la risposta AI e' corretta.
+///
+/// A differenza di `feedback_error`:
+/// - registra in `ai_response_feedback` con `feedback_type='positive'`
+/// - NON genera `prompt_corrections` ne' embedding Qdrant (positivo = "lascia tutto com'e'")
+/// - rinforza il Q-value con reward=1.0 sul `NexusBridge` se il messaggio ha run_id + intent
+pub async fn feedback_positive(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(message_id): AxumPath<String>,
+    Json(body): Json<FeedbackPositiveRequest>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let message_id = Uuid::parse_str(&message_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Message id non valido"))?;
+    let comment = body
+        .comment
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+
+    let row = sqlx::query(
+        r#"
+        SELECT
+            m.id,
+            m.session_id,
+            m.project_id,
+            m.role,
+            m.metadata,
+            s.user_id
+        FROM chat_messages m
+        JOIN chat_sessions s ON s.id = m.session_id
+        WHERE m.id = $1
+        "#,
+    )
+    .bind(message_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let Some(row) = row else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Messaggio non trovato"));
+    };
+
+    let owner: Option<Uuid> = row.try_get("user_id").unwrap_or(None);
+    if owner != Some(user_id) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Messaggio non accessibile",
+        ));
+    }
+
+    let role: String = row.try_get("role").unwrap_or_default();
+    if role != "assistant" {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Il feedback positivo e' consentito solo sui messaggi AI",
+        ));
+    }
+
+    let session_id: Uuid = row
+        .try_get("session_id")
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let project_id: Uuid = row
+        .try_get("project_id")
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    let metadata: Value = row.try_get("metadata").unwrap_or_else(|_| json!({}));
+    let intent = metadata
+        .get("intent")
+        .and_then(Value::as_str)
+        .unwrap_or("chat")
+        .to_lowercase();
+    let provider = metadata
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let model = metadata
+        .get("model")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let raw_run_id = metadata
+        .get("runId")
+        .or_else(|| metadata.get("agentRunId"))
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    // Verifica esistenza in orchestrator_runs (FK target).
+    // I run agent moderni vivono in `agent_runs`, ma la FK del feedback punta
+    // a `orchestrator_runs`. Se l'ID non esiste li', settiamo NULL invece di
+    // far fallire l'insert (la colonna ammette NULL).
+    let run_id: Option<Uuid> = match raw_run_id {
+        Some(id) => {
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE id = $1)")
+                    .bind(id)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap_or(false);
+            if exists {
+                Some(id)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    let agent_type_hint = metadata
+        .get("agentType")
+        .or_else(|| metadata.get("profile"))
+        .and_then(Value::as_str)
+        .unwrap_or("chat_default")
+        .to_string();
+
+    // Idempotenza: se gia' esiste un feedback positivo per questo messaggio, ritorna quello.
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT id FROM ai_response_feedback
+        WHERE message_id = $1 AND user_id = $2 AND feedback_type = 'positive'
+        LIMIT 1
+        "#,
+    )
+    .bind(message_id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    if let Some(existing_id) = existing {
+        return Ok(Json(json!({
+            "ok": true,
+            "feedbackId": existing_id.to_string(),
+            "alreadyRecorded": true,
+            "newQValue": null,
+        })));
+    }
+
+    let feedback_id = Uuid::new_v4();
+    // `error_comment` e' NOT NULL nello schema: salva commento utente o sentinel.
+    let comment_to_store = if comment.is_empty() {
+        "[positive feedback senza commento]".to_string()
+    } else {
+        comment.to_string()
+    };
+    sqlx::query(
+        r#"
+        INSERT INTO ai_response_feedback (
+            id, project_id, session_id, message_id, orchestrator_run_id, user_id,
+            feedback_type, intent, provider, model, error_comment, status, created_at, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, 'positive', $7, $8, $9, $10, 'resolved', NOW(), NOW())
+        "#,
+    )
+    .bind(feedback_id)
+    .bind(project_id)
+    .bind(session_id)
+    .bind(message_id)
+    .bind(run_id)
+    .bind(user_id)
+    .bind(&intent)
+    .bind(&provider)
+    .bind(&model)
+    .bind(&comment_to_store)
+    .execute(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Rinforza Q-learning: reward=1.0 (successo confermato dall'utente).
+    let mut new_q_value: Option<f32> = None;
+    if let Some(bridge) = crate::nexus_bridge::NexusBridge::global() {
+        let task_id = run_id
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| message_id.to_string());
+        let pascal = crate::internal_learning::snake_to_pascal(&agent_type_hint);
+        let agent_type = nexus_orchestrator::AgentType::from_name(&pascal);
+        let q = bridge.record_outcome(
+            &task_id, &intent, agent_type, true, // success
+            1.0,  // reward massimo
+            0,    // duration_ms non disponibile qui
+            None,
+        );
+        new_q_value = Some(q);
+        tracing::info!(
+            "feedback_positive: Q-update task={} intent={} agent={} new_q={}",
+            task_id,
+            intent,
+            pascal,
+            q,
+        );
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "feedbackId": feedback_id.to_string(),
+        "alreadyRecorded": false,
+        "newQValue": new_q_value,
+    })))
+}
+pub async fn legacy_chat(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<LegacyChatRequest>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = parse_project_id(&body.project_id)?;
+    ensure_project_access(&state.db, user_id, project_id).await?;
+
+    let existing_session = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT id
+        FROM chat_sessions
+        WHERE project_id = $1
+          AND user_id = $2
+        ORDER BY updated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let session_id = if let Some(session_id) = existing_session {
+        session_id
+    } else {
+        let new_session_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO chat_sessions (id, project_id, user_id, title, status, created_at, updated_at)
+            VALUES ($1, $2, $3, 'Nuova sessione', 'active', NOW(), NOW())
+            "#,
+        )
+        .bind(new_session_id)
+        .bind(project_id)
+        .bind(user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        new_session_id
+    };
+
+    let user_message_id = insert_message(
+        &state.db,
+        session_id,
+        project_id,
+        "user",
+        &body.message,
+        json!({
+            "automationMode": "confirm",
+            "attachments": [],
+        }),
+        None,
+    )
+    .await?;
+
+    let (assistant_message, _) = run_turn(
+        &state,
+        user_id,
+        session_id,
+        project_id,
+        body.profile_id.clone(),
+        body.message.clone(),
+        user_message_id,
+        body.active_files.clone(),
+        None,
+        None,
+        None,
+        AutomationMode::Confirm,
+        Vec::new(),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "content": assistant_message.content,
+        "provider": assistant_message.provider,
+        "model": assistant_message.model,
+        "tokens_used": assistant_message.total_tokens.unwrap_or(0),
+        "prompt_tokens": assistant_message.prompt_tokens.unwrap_or(0),
+        "completion_tokens": assistant_message.completion_tokens.unwrap_or(0),
+        "total_tokens": assistant_message.total_tokens.unwrap_or(0),
+        "total_cost": assistant_message.total_cost.unwrap_or(0.0),
+        "currency": assistant_message.currency.unwrap_or_else(|| "EUR".to_string()),
+        "quota_status": "ok",
+        "session_id": session_id.to_string(),
+        "request_message_id": user_message_id.to_string(),
+        "assistant_message_id": assistant_message.id,
+    })))
+}
+
+// ── Pre-check messaggio ────────────────────────────────────────────────────
+// Analizza un messaggio prima dell'invio: rileva errori ortografici/grammaticali
+// e segnala richieste troppo vaghe che richiederebbero contesto aggiuntivo.
+// Usa un modello economico/veloce (gpt-4.1-nano) con risposta JSON stretta.
+
+#[derive(Debug, Deserialize)]
+pub struct PrecheckRequest {
+    pub message: String,
+    /// Sessione corrente: se presente, il precheck riceve la cronologia
+    /// recente per valutare il messaggio in contesto. Senza, valuta in
+    /// isolamento (comportamento pre-fix, marca contestuali come generici).
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<Uuid>,
+}
+pub async fn precheck_chat_message(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<PrecheckRequest>,
+) -> ApiResult {
+    let _user_id = parse_user_id(&claims)?;
+    let message = body.message.trim();
+
+    // Non fare il precheck per messaggi molto brevi
+    if message.len() < 15 || message.split_whitespace().count() < 3 {
+        return Ok(Json(json!({
+            "ok": true, "correctedText": null,
+            "contextSuggestion": null, "issues": [], "reason": null
+        })));
+    }
+
+    // Non fare il precheck se sembra codice
+    let looks_like_code = message.contains('`')
+        || message.contains("```")
+        || message.starts_with('/')
+        || message.contains("./")
+        || message.contains(":\\");
+    if looks_like_code {
+        return Ok(Json(json!({
+            "ok": true, "correctedText": null,
+            "contextSuggestion": null, "issues": [], "reason": null
+        })));
+    }
+
+    let system_prompt = crate::prompt_templates::get_template_or_default(
+        &state.db,
+        &state.template_cache,
+        "chat.precheck_message",
+    )
+    .await;
+
+    // Arricchimento contestuale: se il client passa session_id, il precheck
+    // riceve gli ultimi turni della conversazione. Risolve i falsi-positivi
+    // su follow-up contestuali (es. "riepiloga gli animali" dopo una chat
+    // sugli animali) che in isolamento sembrano "troppo generici" ma in
+    // contesto sono chiarissimi.
+    let effective_message = if let Some(sid) = body.session_id {
+        build_message_with_recent_context_for_classifier(&state.db, sid, message).await
+    } else {
+        message.to_string()
+    };
+
+    let messages_json = serde_json::to_string(&json!([
+        { "role": "user", "content": effective_message }
+    ]))
+    .unwrap_or_default();
+
+    // Modello purpose-specific letto da DB (purpose: chat_feedback_generator).
+    // Errore esplicito 503 se la matrice non e' caricata o il purpose non e' configurato.
+    let matrix_arc = state
+        .orchestrator
+        .routing_matrix
+        .current_async()
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("routing_matrix non disponibile: {e}. Verifica DB e migrazioni 0101/0102."),
+            )
+        })?;
+    let (provider_pf, model_pf) = matrix_arc
+        .purpose_model("chat_feedback_generator")
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "purpose 'chat_feedback_generator' non configurato in nexus_purpose_model. \
+             Esegui INSERT su nexus_purpose_model con il modello desiderato."
+                    .to_string(),
+            )
+        })?;
+    let raw = match state
+        .orchestrator
+        .neural
+        .generate_agent_turn(
+            &provider_pf,
+            &model_pf,
+            &messages_json,
+            "[]",
+            300,
+            &system_prompt,
+        )
+        .await
+    {
+        Ok(val) => val
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        Err(_) => {
+            // Se il modello non risponde non bloccare l'utente
+            return Ok(Json(json!({
+                "ok": true, "correctedText": null,
+                "contextSuggestion": null, "issues": [], "reason": null
+            })));
+        }
+    };
+
+    // Estrae il JSON anche se il modello ha aggiunto testo prima/dopo
+    let json_start = raw.find('{').unwrap_or(0);
+    let json_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
+    let parsed: Value = serde_json::from_str(&raw[json_start..json_end]).unwrap_or_else(|_| {
+        json!({
+            "ok": true, "correctedText": null,
+            "contextSuggestion": null, "issues": [], "reason": null
+        })
+    });
+
+    let ok = parsed.get("ok").and_then(Value::as_bool).unwrap_or(true);
+    let corrected_text = parsed
+        .get("correctedText")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        // Scarta solo se esattamente identico (byte-by-byte) o vuoto — non usare to_lowercase()
+        // perché perderebbe correzioni su accenti o caratteri speciali
+        .filter(|c| !c.trim().is_empty() && c.trim() != message.trim());
+    let context_suggestion = parsed
+        .get("contextSuggestion")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .filter(|s| !s.trim().is_empty());
+    let issues: Vec<String> = parsed
+        .get("issues")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let reason = parsed
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    // ok=false solo se c'è davvero qualcosa di utile da mostrare
+    let effective_ok =
+        if corrected_text.is_none() && context_suggestion.is_none() && issues.is_empty() {
+            true
+        } else {
+            ok
+        };
+
+    Ok(Json(json!({
+        "ok": effective_ok,
+        "correctedText": corrected_text,
+        "contextSuggestion": context_suggestion,
+        "issues": issues,
+        "reason": reason
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/chat/feedback-assist
+// Aiuta l'utente a formulare una descrizione precisa dell'anomalia nella
+// risposta AI. Usa un modello economico; restituisce il testo suggerito.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackAssistRequest {
+    /// Contenuto della risposta AI problematica (può essere troncato)
+    pub message_content: String,
+    /// Descrizione parziale già scritta dall'utente (può essere vuota)
+    #[serde(default)]
+    pub partial_description: String,
+}
+pub async fn feedback_assist_handler(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<FeedbackAssistRequest>,
+) -> ApiResult {
+    let _user_id = parse_user_id(&claims)?;
+
+    let system_prompt = crate::prompt_templates::get_template_or_default(
+        &state.db,
+        &state.template_cache,
+        "chat.feedback_assist",
+    )
+    .await;
+
+    if system_prompt.is_empty() {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Template non disponibile".to_string(),
+        ));
+    }
+
+    // Tronca il contenuto del messaggio per non eccedere il contesto
+    let msg_preview: String = body.message_content.chars().take(1200).collect();
+    let partial = body.partial_description.trim().to_string();
+
+    let user_content = if partial.is_empty() {
+        format!("RISPOSTA AI:\n{}", msg_preview)
+    } else {
+        format!(
+            "RISPOSTA AI:\n{}\n\nDESCRIZIONE PARZIALE DELL'UTENTE:\n{}",
+            msg_preview, partial
+        )
+    };
+
+    let messages_json = serde_json::to_string(&json!([
+        { "role": "user", "content": user_content }
+    ]))
+    .unwrap_or_default();
+
+    // Modello purpose-specific letto da DB (purpose: chat_title_generator).
+    // Errore esplicito 503 se la matrice non e' caricata o il purpose non e' configurato.
+    let matrix_arc = state
+        .orchestrator
+        .routing_matrix
+        .current_async()
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("routing_matrix non disponibile: {e}. Verifica DB e migrazioni 0101/0102."),
+            )
+        })?;
+    let (provider_pt, model_pt) = matrix_arc
+        .purpose_model("chat_title_generator")
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "purpose 'chat_title_generator' non configurato in nexus_purpose_model."
+                    .to_string(),
+            )
+        })?;
+    let raw = match state
+        .orchestrator
+        .neural
+        .generate_agent_turn(
+            &provider_pt,
+            &model_pt,
+            &messages_json,
+            "[]",
+            400,
+            &system_prompt,
+        )
+        .await
+    {
+        Ok(val) => val
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        Err(e) => {
+            tracing::warn!("feedback_assist LLM error: {}", e);
+            return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    };
+
+    let suggestion = raw.trim().trim_matches('"').to_string();
+
+    Ok(Json(json!({ "suggestion": suggestion })))
+}
