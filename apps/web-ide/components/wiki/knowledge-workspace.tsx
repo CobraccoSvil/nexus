@@ -13,6 +13,7 @@ import {
   listDocs,
   getDoc,
   patchDoc,
+  deleteDoc,
   getDocLinks,
   listRevisions,
   getRevision,
@@ -80,6 +81,7 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
   const [draftBody, setDraftBody] = React.useState("");
   const [saving, setSaving] = React.useState(false);
   const [editMode, setEditMode] = React.useState(false);
+  const [deleting, setDeleting] = React.useState(false);
 
   // ─── Stato history ───────────────────────────────────────────────────
   const [revisions, setRevisions] = React.useState<WikiRevision[]>([]);
@@ -198,6 +200,32 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
       setSaving(false);
     }
   }, [selected, dirty, draftTitle, draftBody, draftTags, loadList]);
+
+  // ─── Eliminazione documento ─────────────────────────────────────────
+  const onDelete = React.useCallback(async () => {
+    if (!selected || deleting) return;
+    const ok = await dialog.confirmDialog(
+      t("wiki.editor.confirm_delete", { title: selected.title }),
+    );
+    if (!ok) return;
+    const deletedId = selected.id;
+    setDeleting(true);
+    setError(null);
+    try {
+      await deleteDoc(deletedId);
+      // Rimuovi dalla lista locale e deseleziona.
+      setDocs((prev) => prev.filter((d) => d.id !== deletedId));
+      setSelectedId(null);
+      setSelected(null);
+      setLinks(null);
+      setTab("edit");
+      setEditMode(false);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleting(false);
+    }
+  }, [selected, deleting, dialog, t]);
 
   // Ctrl+S → save
   React.useEffect(() => {
@@ -553,6 +581,15 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
                 {t("wiki.editor.edit")}
               </button>
             )}
+            <button
+              type="button"
+              onClick={onDelete}
+              disabled={deleting}
+              style={dangerBtn(tc, deleting)}
+              title={t("wiki.editor.delete")}
+            >
+              {deleting ? t("wiki.editor.deleting") : t("wiki.editor.delete")}
+            </button>
           </>
         )}
         {(isTablet || isMobile) && (
@@ -785,6 +822,20 @@ function secondaryBtn(tc: ThemeColors): React.CSSProperties {
     borderRadius: 4,
     cursor: "pointer",
     fontSize: 12,
+  };
+}
+
+function dangerBtn(tc: ThemeColors, disabled: boolean): React.CSSProperties {
+  return {
+    padding: "5px 12px",
+    background: "transparent",
+    color: tc.error,
+    border: `1px solid ${tc.error}`,
+    borderRadius: 4,
+    cursor: disabled ? "not-allowed" : "pointer",
+    fontSize: 12,
+    fontWeight: 600,
+    opacity: disabled ? 0.6 : 1,
   };
 }
 

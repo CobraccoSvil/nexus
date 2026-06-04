@@ -371,6 +371,10 @@ export const es: PartialDictionary = {
     "wiki.editor.cancel": "Cancelar",
     "wiki.editor.edit": "Editar",
     "wiki.editor.unsaved": "Cambios sin guardar",
+    "wiki.editor.delete": "Eliminar",
+    "wiki.editor.deleting": "Eliminando...",
+    "wiki.editor.confirm_delete":
+      "¿Eliminar definitivamente el documento \"{title}\"? Esta acción no se puede deshacer.",
     "wiki.filter.any": "todos",
     "wiki.metadata.kind": "Tipo",
     "wiki.metadata.scope": "Scope",

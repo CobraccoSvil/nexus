@@ -380,6 +380,10 @@ export const en = {
     "wiki.editor.cancel": "Cancel",
     "wiki.editor.edit": "Edit",
     "wiki.editor.unsaved": "Unsaved changes",
+    "wiki.editor.delete": "Delete",
+    "wiki.editor.deleting": "Deleting...",
+    "wiki.editor.confirm_delete":
+      "Permanently delete the document \"{title}\"? This action cannot be undone.",
     "wiki.filter.any": "any",
     "wiki.metadata.kind": "Kind",
     "wiki.metadata.scope": "Scope",

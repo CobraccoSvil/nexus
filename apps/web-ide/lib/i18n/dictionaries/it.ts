@@ -373,6 +373,10 @@ export const it: PartialDictionary = {
     "wiki.editor.cancel": "Annulla",
     "wiki.editor.edit": "Modifica",
     "wiki.editor.unsaved": "Modifiche non salvate",
+    "wiki.editor.delete": "Elimina",
+    "wiki.editor.deleting": "Eliminazione...",
+    "wiki.editor.confirm_delete":
+      "Eliminare definitivamente il documento \"{title}\"? L'operazione non puo' essere annullata.",
     "wiki.filter.any": "tutti",
     "wiki.metadata.kind": "Tipo",
     "wiki.metadata.scope": "Scope",
