@@ -1134,6 +1134,29 @@ pub(crate) async fn spawn_agent_run(
                 }
             }
 
+            // ADR 0023 (Fix 3a): se il re-routing context-aware ha cambiato il
+            // modello rispetto a quello registrato a spawn (provider_clone/
+            // model_clone), allinea il record agent_runs al modello EFFETTIVO
+            // con cui il run partira'. Cosi' header e badge dei meta-step (che
+            // leggono agentRun.provider/model) convergono sul modello reale.
+            // Best-effort: un fallimento qui non deve bloccare il run.
+            if current_provider != provider_clone || current_model != model_clone {
+                let _ = sqlx::query("UPDATE agent_runs SET provider = $1, model = $2 WHERE id = $3")
+                    .bind(&current_provider)
+                    .bind(&current_model)
+                    .bind(run_id)
+                    .execute(&db_clone)
+                    .await;
+                tracing::info!(
+                    "agent_run {}: agent_runs.provider/model aggiornato al modello effettivo {}/{} (era {}/{})",
+                    run_id,
+                    current_provider,
+                    current_model,
+                    provider_clone,
+                    model_clone
+                );
+            }
+
             loop {
                 tried.insert(current_provider.to_lowercase());
                 tracing::info!(
@@ -1804,10 +1827,17 @@ pub(crate) async fn spawn_agent_run(
                 AgentRunStatus::LoopAborted => "loop_aborted",
                 AgentRunStatus::ProviderUnavailable => "provider_unavailable",
             };
+            // ADR 0023 (Fix 3a): aggiorna anche provider/model col valore
+            // EFFETTIVO usato dal run (result.provider/result.model). Cattura i
+            // cascade fallback avvenuti dentro il loop (es. primario -> openai
+            // su billing_error), che il blocco context-aware pre-loop non vede.
+            // L'header, leggendo agentRun dopo getAgentRun(), mostra il modello
+            // reale dell'esecuzione, non quello registrato a spawn.
             let _ = sqlx::query(
                 "UPDATE agent_runs SET status=$2, final_answer=$3, iteration_count=$4, \
              prompt_tokens=$5, completion_tokens=$6, total_tokens=$7, total_cost=$8, \
              nexus_override_applied=$9, nexus_agent_type=$10, nexus_task_type=$11, \
+             provider=$12, model=$13, \
              completed_at=NOW() WHERE id=$1",
             )
             .bind(run_id)
@@ -1821,6 +1851,8 @@ pub(crate) async fn spawn_agent_run(
             .bind(result.nexus_override_applied)
             .bind(result.nexus_agent_type.as_deref())
             .bind(result.nexus_task_type.as_deref())
+            .bind(&result.provider)
+            .bind(&result.model)
             .execute(&db_clone)
             .await;
 

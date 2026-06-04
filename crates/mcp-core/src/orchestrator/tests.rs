@@ -421,3 +421,72 @@ fn intent_candidate_e_serializzabile_a_json() {
     let parsed: IntentCandidate = serde_json::from_str(&json_str).unwrap();
     assert_eq!(parsed.intent, "fix");
 }
+
+// ─────────────────────────────────────────────────────────────────
+// Test ADR 0023: provider_for_model (model_override da solo -> provider)
+// ─────────────────────────────────────────────────────────────────
+//
+// Usano un pool sqlx isolato (DB temporaneo per test). Creano una tabella
+// minima ai_price_catalog con solo le colonne usate dalla query. Idempotenti
+// e indipendenti dall'ordine: ogni test ha il proprio DB.
+
+#[sqlx::test]
+async fn provider_for_model_modello_noto_ritorna_provider(pool: sqlx::PgPool) {
+    sqlx::query(
+        "CREATE TABLE ai_price_catalog (
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            is_enabled BOOLEAN NOT NULL DEFAULT true,
+            input_cost_per_million_tokens DOUBLE PRECISION
+        )",
+    )
+    .execute(&pool)
+    .await
+    .expect("create table");
+
+    // Stesso modello su due provider: deve vincere il piu' economico (mistral).
+    sqlx::query(
+        "INSERT INTO ai_price_catalog (provider, model, is_enabled, input_cost_per_million_tokens)
+         VALUES ('openai', 'shared-model', true, 5.0),
+                ('mistral', 'shared-model', true, 2.0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert rows");
+
+    let provider = provider_for_model(&pool, "shared-model").await;
+    assert_eq!(
+        provider,
+        Some("mistral".to_string()),
+        "deve scegliere il provider col costo input piu' basso (deterministico)"
+    );
+}
+
+#[sqlx::test]
+async fn provider_for_model_modello_disabilitato_o_ignoto_ritorna_none(pool: sqlx::PgPool) {
+    sqlx::query(
+        "CREATE TABLE ai_price_catalog (
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            is_enabled BOOLEAN NOT NULL DEFAULT true,
+            input_cost_per_million_tokens DOUBLE PRECISION
+        )",
+    )
+    .execute(&pool)
+    .await
+    .expect("create table");
+
+    // Un modello presente ma disabilitato non deve essere risolto.
+    sqlx::query(
+        "INSERT INTO ai_price_catalog (provider, model, is_enabled, input_cost_per_million_tokens)
+         VALUES ('mistral', 'disabled-model', false, 1.0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert rows");
+
+    // Modello ignoto -> None (il chiamante fa fallback al routing, regola G).
+    assert_eq!(provider_for_model(&pool, "unknown-model").await, None);
+    // Modello disabilitato -> None.
+    assert_eq!(provider_for_model(&pool, "disabled-model").await, None);
+}

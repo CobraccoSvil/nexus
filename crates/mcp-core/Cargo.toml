@@ -62,6 +62,13 @@ quick-xml = "0.36"
 # LRU cache per deduplica letture allegati (read_cache, vedi ADR 0012).
 # 256 entry, TTL 5 min configurabile via setting agent.attachment.read_cache_ttl_seconds.
 lru = "0.12"
+# ADR 0020 — Build graph resolver:
+# - toml: parsing Cargo.toml workspace e pyproject.toml
+# - json5: parsing tsconfig.json tollerante a commenti e trailing commas
+# - globset: compilazione include/exclude glob in regex set per lookup O(log n)
+toml = { version = "0.8", features = ["parse"] }
+json5 = "0.4"
+globset = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

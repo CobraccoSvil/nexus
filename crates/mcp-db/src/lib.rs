@@ -1,4 +1,3 @@
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
     Expr, FromTable, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
@@ -98,7 +97,6 @@ pub fn analyze_query(sql: &str) -> DbAnalysisReport {
         all_findings.extend(check_select_star(stmt));
         all_findings.extend(check_missing_where(stmt));
         all_findings.extend(check_n_plus_one_hints(stmt));
-        all_findings.extend(check_injection_patterns(sql));
         all_findings.extend(check_performance_issues(stmt));
     }
     // Principi DB-first: filtraggio, ordinamento, paginazione e aggregazioni nel DB
@@ -277,30 +275,13 @@ fn has_subquery(expr: &Expr) -> bool {
     }
 }
 
-fn check_injection_patterns(sql: &str) -> Vec<DbFinding> {
-    let mut findings = Vec::new();
-    let concat_re = Regex::new(r#"['"]?\s*\+\s*\w+\s*\+\s*['"]?"#).unwrap();
-    let format_re = Regex::new(r#"f['"].*\{.*\}.*['"]|format!\s*\("#).unwrap();
-    let interp_re = Regex::new(r#"\$\{?\w+\}?"#).unwrap();
-
-    // Rimuovi blocchi PL/pgSQL ($$...$$) e commenti SQL prima del check.
-    // Questi contengono legittimamente $variabili, format('%I', ...), quote_ident()
-    // che sono pattern sicuri in PostgreSQL ma matchano le regex sopra.
-    let plpgsql_block_re = Regex::new(r#"\$\$[\s\S]*?\$\$"#).unwrap();
-    let comment_re = Regex::new(r#"--[^\n]*"#).unwrap();
-    let no_plpgsql = plpgsql_block_re.replace_all(sql, " ");
-    let cleaned = comment_re.replace_all(&no_plpgsql, " ");
-
-    if concat_re.is_match(&cleaned) || format_re.is_match(&cleaned) || interp_re.is_match(&cleaned) {
-        findings.push(DbFinding {
-            category: "security".into(),
-            severity: "high".into(),
-            title: "Potential SQL injection".into(),
-            detail: "String interpolation/concatenation detected in query. Use parameterized queries instead".into(),
-        });
-    }
-    findings
-}
+// NOTA (ADR 0021): il vecchio `check_injection_patterns` e' stato RIMOSSO.
+// La SQL injection e' un difetto del codice applicativo che COSTRUISCE la query,
+// non del file `.sql` statico (un CREATE TABLE/INSERT con valori letterali non
+// puo' avere injection). Le regex testuali producevano falsi positivi su hash
+// bcrypt (`$2a$10$...`), parametri posizionali Postgres (`$1`/`$2`, che sono il
+// modo SICURO di parametrizzare) e dollar-quoting. Il detector unico ora vive in
+// `mcp_quality::injection::detect_sql_injection` e gira solo su file di codice.
 
 fn check_performance_issues(stmt: &Statement) -> Vec<DbFinding> {
     let mut findings = Vec::new();
@@ -456,6 +437,30 @@ mod tests {
             .findings
             .iter()
             .any(|f| f.title.contains("subquery") || f.title.contains("SELECT *")));
+    }
+
+    #[test]
+    fn test_no_injection_finding_on_ddl_with_bcrypt_hash() {
+        // E2E incident Beauty-Book (ADR 0021): il file DDL con hash bcrypt nella
+        // riga di seed NON deve piu' produrre alcun finding category="security".
+        // Prima del fix, la regex `\$\{?\w+\}?` matchava `$2a$10$...` 6 volte.
+        let sql = "CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT, password TEXT);\n\
+                   INSERT INTO users (email, password) VALUES \
+                   ('costantino@cobracco.it', '$2a$10$dummyhashfortestingonly');";
+        let report = analyze_query(sql);
+        assert!(
+            !report.findings.iter().any(|f| f.category == "security"),
+            "atteso 0 finding security su DDL con hash bcrypt, trovati: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn test_positional_params_not_flagged() {
+        // I parametri posizionali Postgres ($1/$2) sono il modo SICURO di
+        // parametrizzare: mai segnalati come injection.
+        let report = analyze_query("INSERT INTO t (a, b) VALUES ($1, $2)");
+        assert!(!report.findings.iter().any(|f| f.category == "security"));
     }
 
     #[test]

@@ -69,6 +69,9 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
   // ── Servizi systemd ──
   const [services,  setServices]  = useState<ProjectServiceEntry[]>([]);
   const [slug,      setSlug]      = useState("");
+  // ADR 0022: bus systemd utente irraggiungibile (servizi installati ma non elencabili).
+  const [managerUnavailable, setManagerUnavailable] = useState(false);
+  const [managerHint, setManagerHint] = useState<string | undefined>(undefined);
   const [svcBusy,   setSvcBusy]   = useState<Record<string,boolean>>({});
   const [svcMsg,    setSvcMsg]    = useState("");
 
@@ -121,6 +124,8 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
       const r = await getProjectServicesStatus(projectId);
       setServices(r.services ?? []);
       setSlug(r.slug ?? "");
+      setManagerUnavailable(r.manager_unavailable ?? false);
+      setManagerHint(r.manager_hint);
     } catch { /* ignora */ }
   }, [projectId]);
 
@@ -426,6 +431,8 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
         tc={tc}
         services={services}
         slug={slug}
+        managerUnavailable={managerUnavailable}
+        managerHint={managerHint}
         ports={ports}
         serviceUrlCache={serviceUrlCache}
         svcBusy={svcBusy}

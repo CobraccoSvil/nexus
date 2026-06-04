@@ -1330,6 +1330,11 @@ pub async fn execute(
         }
         "nexus_db_status" => handle_db_status(db, project_id).await,
 
+        // ── ADR 0020: build graph derivato dai config ──────────────────────
+        "nexus_build_graph_info" => {
+            crate::build_graph::handle_build_graph_info(project_id, &arguments).await
+        }
+
         _ => {
             let _ = (user_id, project_id);
             format!("[Nexus Builtin] Tool '{}' non riconosciuto.", tool_name)

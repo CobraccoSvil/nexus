@@ -939,4 +939,10 @@ pub(super) static NEXUS_TOOLS: &[ToolDef] = &[
         description: "Elenca le tabelle del database del progetto. Alias di nexus_db_table_list.",
         schema: r#"{"type":"object","properties":{"schema":{"type":"string"}}}"#,
     },
+    // ── ADR 0020: build graph derivato dai config ────────────────────────
+    ToolDef {
+        name: "nexus_build_graph_info",
+        description: "Ritorna la mappa autoritativa del build graph del progetto, derivata dai file di configurazione (tsconfig.json, Cargo.toml, pyproject.toml, go.mod). Output: language, include_globs[], exclude_globs[], entry_points[], monorepo_members[], generated_dirs[], sources[]. USA QUESTO STRUMENTO prima di modificare un file di codice (.ts, .tsx, .rs, .py, .go) quando hai dubbi su quale path sia 'quello vero' del progetto (es. file con stesso nome in src/ e in figma_export/).",
+        schema: r#"{"type":"object","properties":{"project_id":{"type":"string","description":"UUID del progetto (opzionale: se assente usa il progetto del contesto)"}}}"#,
+    },
 ];

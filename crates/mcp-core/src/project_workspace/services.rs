@@ -1,5 +1,31 @@
 use super::*;
 
+/// Rileva se `systemctl --user` non e' riuscito a contattare il manager utente
+/// (bus D-Bus non raggiungibile). In WSL e nei container il manager
+/// `user@<uid>.service` puo' restare inactive: in quel caso `systemctl --user`
+/// esce con codice != 0 e stderr contiene "Failed to connect to bus" /
+/// "Connection refused". Va distinto da "zero servizi configurati": con il bus
+/// giu' stdout e' vuoto e il chiamante, senza questo check, mostrerebbe il
+/// messaggio fuorviante "Nessun servizio trovato" anche quando i file .service
+/// esistono. Vedi ADR 0022.
+fn user_manager_unavailable(output: &std::process::Output) -> bool {
+    if output.status.success() {
+        return false;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    stderr.contains("failed to connect to bus")
+        || stderr.contains("connection refused")
+        || stderr.contains("failed to get d-bus connection")
+        || stderr.contains("refusing to operate")
+}
+
+/// Suggerimento operativo mostrato in UI quando il manager utente e' giu'.
+/// Niente uid hardcoded: `$(id -u)` viene risolto dalla shell dell'utente.
+const USER_MANAGER_HINT: &str = "Il manager systemd utente non e' attivo: \
+impossibile elencare i servizi. Avvialo con `sudo systemctl start user@$(id -u)` \
+oppure riavvia WSL con `wsl --shutdown`. I servizi installati ricompariranno \
+automaticamente (il file .service esiste gia' in ~/.config/systemd/user/).";
+
 // ── POST /api/projects/:id/services/:service/:action ─────────────────────────
 // service: "backend" | "brain" | "frontend"
 // action:  "start" | "stop" | "restart"
@@ -31,6 +57,18 @@ pub async fn get_project_services_status(
         .output()
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Distinzione critica (ADR 0022): bus systemd utente irraggiungibile vs zero
+    // servizi. Senza questo check il frontend mostrerebbe "Nessun servizio trovato"
+    // anche quando il manager `user@<uid>` e' semplicemente inactive (tipico WSL).
+    if user_manager_unavailable(&out) {
+        return Ok(Json(json!({
+            "services": [],
+            "slug": slug,
+            "manager_unavailable": true,
+            "manager_hint": USER_MANAGER_HINT,
+        })));
+    }
 
     let prefix = format!("{}-", slug);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -103,7 +141,11 @@ pub async fn get_project_services_status(
         services.push(entry);
     }
 
-    Ok(Json(json!({ "services": services, "slug": slug })))
+    Ok(Json(json!({
+        "services": services,
+        "slug": slug,
+        "manager_unavailable": false,
+    })))
 }
 
 /// Controlla un servizio del progetto: start | stop | restart.

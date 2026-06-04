@@ -9,6 +9,8 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+pub mod injection;
+
 pub struct RuleOverrides {
     pub disabled_rules: std::collections::HashSet<String>,
 }
@@ -138,6 +140,22 @@ pub fn analyze_source(file_path: &str, source: &str) -> QualityReport {
     findings.extend(check_repeated_literals(&lines, file_path));
     findings.extend(check_db_queries_in_loops(&lines, file_path, &RuleOverrides::empty()));
     findings.extend(check_duplicate_blocks_detailed(&lines));
+
+    // SQL injection nel codice applicativo (ADR 0021): detector unico condiviso
+    // con il tool MCP. Gira solo su file di codice (.rs/.py/.ts/.js); per i .sql
+    // ritorna sempre vuoto.
+    for inj in injection::detect_sql_injection(file_path, source) {
+        findings.push(QualityFinding {
+            category: "security".into(),
+            severity: inj.severity,
+            title: "Potential SQL injection".into(),
+            detail: inj.detail,
+            line: Some(inj.line),
+            suggested_comment: Some(
+                "// REFACTOR: usare query parametrizzata (placeholder $1/?/:name + bind)".into(),
+            ),
+        });
+    }
 
     let duplicate_blocks = find_duplicate_blocks(&lines);
 

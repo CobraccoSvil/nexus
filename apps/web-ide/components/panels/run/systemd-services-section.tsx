@@ -8,6 +8,9 @@ interface SystemdServicesSectionProps {
   tc: ReturnType<typeof useThemeColors>;
   services: ProjectServiceEntry[];
   slug: string;
+  // ADR 0022: il bus systemd utente e' giu' (servizi installati ma non elencabili).
+  managerUnavailable?: boolean;
+  managerHint?: string;
   ports: PortEntry[];
   serviceUrlCache: Record<string, string>;
   svcBusy: Record<string, boolean>;
@@ -33,6 +36,8 @@ export function SystemdServicesSection({
   tc,
   services,
   slug,
+  managerUnavailable,
+  managerHint,
   ports,
   serviceUrlCache,
   svcBusy,
@@ -60,7 +65,7 @@ export function SystemdServicesSection({
         <span>Servizi systemd persistenti{slug ? ` — ${slug}` : ""}</span>
         <div style={{ display:"flex", gap:6 }}>
           <button onClick={fetchServices} title="Aggiorna stato" disabled={batchBusy} style={{ background:"none",border:`1px solid ${tc.border}`,borderRadius:3,color:tc.textMuted,cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10 }}>↺</button>
-          <button onClick={handleRestartAll} title={services.length===0 ? "Nessun servizio systemd. Clicca per dettagli." : "Riavvia tutti i servizi del progetto"} disabled={batchBusy} style={{ background:"transparent",border:`1px solid #f59e0b`,borderRadius:3,color:"#f59e0b",cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10,opacity:batchBusy?0.5:1 }}>↻ Tutti</button>
+          <button onClick={handleRestartAll} title={managerUnavailable ? "Manager systemd utente non attivo — avvialo prima di gestire i servizi" : services.length===0 ? "Nessun servizio systemd. Clicca per dettagli." : "Riavvia tutti i servizi del progetto"} disabled={batchBusy} style={{ background:"transparent",border:`1px solid #f59e0b`,borderRadius:3,color:"#f59e0b",cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10,opacity:batchBusy?0.5:1 }}>↻ Tutti</button>
           <button onClick={handleCleanupPorts} title="Termina processi su porte conflittuali (esclude i servizi del progetto)" disabled={batchBusy} style={{ background:"transparent",border:`1px solid #ef4444`,borderRadius:3,color:"#ef4444",cursor:batchBusy?"wait":"pointer",padding:"1px 8px",fontSize:10,opacity:batchBusy?0.5:1 }}>✕ Porte</button>
           <button
             onClick={runWizard}
@@ -143,11 +148,35 @@ export function SystemdServicesSection({
 
       <div style={{ padding:"8px 12px", borderBottom:`1px solid ${tc.border}` }}>
         {services.length === 0 ? (
-          <div style={{ color:tc.textMuted, fontSize:12 }}>
-            {slug
-              ? <>Nessun servizio trovato con prefisso <code>{slug}-</code>. Usa <strong>+ Configura</strong> per crearne uno.</>
-              : "Caricamento…"}
-          </div>
+          managerUnavailable ? (
+            <div style={{
+              color: "#f59e0b",
+              fontSize: 12,
+              display: "flex",
+              flexDirection: "column",
+              gap: 4,
+              padding: "4px 0",
+            }}>
+              <div style={{ display:"flex", alignItems:"center", gap:6, fontWeight:600 }}>
+                <span>⚠️</span>
+                <span>Manager systemd utente non attivo</span>
+              </div>
+              <div style={{ color: tc.textSecondary, lineHeight: 1.5 }}>
+                {(managerHint ?? "Impossibile elencare i servizi: il bus systemd utente non e' raggiungibile. Avvia il manager o riavvia WSL.")
+                  // Rende leggibili i comandi shell wrappati tra backtick letterali (es. `sudo systemctl start user@$(id -u)`).
+                  .split("`")
+                  .map((seg, i) => (i % 2 === 1
+                    ? <code key={i} style={{ fontFamily:'"JetBrains Mono", monospace', fontSize:11 }}>{seg}</code>
+                    : <span key={i}>{seg}</span>))}
+              </div>
+            </div>
+          ) : (
+            <div style={{ color:tc.textMuted, fontSize:12 }}>
+              {slug
+                ? <>Nessun servizio trovato con prefisso <code>{slug}-</code>. Usa <strong>+ Configura</strong> per crearne uno.</>
+                : "Caricamento…"}
+            </div>
+          )
         ) : services.map(svc => {
           const hasDiag = !!svc.last_error;
           const col = hasDiag ? "#ef4444" : stateColor(svc.state);

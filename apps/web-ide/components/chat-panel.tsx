@@ -539,22 +539,19 @@ export function ChatPanel({
     // Se il provider e' "auto" e c'e' un hint esterno (es. generazione documenti),
     // usa il hint per forzare un provider/modello capace.
     const hint = providerHintOverride || externalProviderHint;
-    // Un provider selezionato esplicitamente (diverso da "auto") viene SEMPRE
-    // forzato come provider_override: sceglierlo nel dropdown significa "usa
-    // questo", senza dover anche premere "Forza". Solo "auto" lascia decidere al
-    // routing (eventuale hint esterno). Il toggle forceProvider resta come
-    // conferma visiva ma non e' piu' necessario per attivare l'override.
-    const shouldForce = selectedProvider !== "auto";
-    const effectiveProvider = shouldForce
+    // ADR 0023: provider e modello sono override indipendenti.
+    // Provider: forzato solo se selezionato esplicitamente (diverso da "auto");
+    // altrimenti lascia decidere al routing (eventuale hint esterno).
+    const effectiveProvider = selectedProvider !== "auto"
       ? selectedProvider
-      : selectedProvider === "auto"
-        ? hint?.provider
-        : undefined;
-    const effectiveModel = shouldForce
-      ? (selectedModel !== "auto" ? selectedModel : undefined)
-      : selectedProvider === "auto"
-        ? hint?.model
-        : undefined;
+      : hint?.provider;
+    // Modello: un modello scelto esplicitamente va SEMPRE inviato come override,
+    // anche se il provider e' "auto". Un modello identifica univocamente il suo
+    // provider (il backend lo ricava dal catalogo), quindi "auto" sul provider
+    // non deve azzerare la scelta esplicita del modello.
+    const effectiveModel = selectedModel !== "auto"
+      ? selectedModel
+      : (selectedProvider === "auto" ? hint?.model : undefined);
     const modeForSend = automationOnceRef.current ?? automationMode;
     automationOnceRef.current = null;
 

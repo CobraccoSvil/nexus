@@ -2,6 +2,79 @@
 
 use super::*;
 
+/// Risultato del preflight build graph (ADR 0020) applicato a write/edit.
+/// Variant `Block(msg)` blocca la scrittura (es. file generato); `Warn(msg)`
+/// lascia passare ma aggiunge un avviso testuale alla risposta del tool.
+enum BuildGraphPreflight {
+    Allow,
+    Warn(String),
+    Block(String),
+}
+
+/// Esegue il preflight ADR 0020 su `path_str`. Ritorna `Allow` se il file e'
+/// nel build graph o entry point o linguaggio non riconosciuto; `Warn` se
+/// e' fuori dal build graph (warning non bloccante); `Block` se in directory
+/// generata (es. node_modules, target, dist).
+async fn run_build_graph_preflight(ctx: &AgentToolContext, path_str: &str) -> BuildGraphPreflight {
+    // Estensioni codice rilevanti: l'enforcement parte solo per file
+    // sorgente, non per md/json/yaml/config.
+    let ext = std::path::Path::new(path_str)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    let is_code = matches!(
+        ext.as_deref(),
+        Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "rs" | "py" | "go" | "rb")
+    );
+    if !is_code {
+        return BuildGraphPreflight::Allow;
+    }
+
+    let rel = std::path::Path::new(path_str.trim_start_matches(['\\', '/']));
+    let membership = match crate::build_graph::is_in_build_graph(ctx.project_id, rel).await {
+        Ok(m) => m,
+        Err(e) => {
+            // Cache non disponibile o resolver fallito: lascio passare ma loggo.
+            tracing::debug!(
+                project_id = %ctx.project_id,
+                path = %path_str,
+                error = %e,
+                "build_graph.preflight: errore lookup, allow (best-effort)"
+            );
+            return BuildGraphPreflight::Allow;
+        }
+    };
+    match membership {
+        crate::build_graph::BuildGraphMembership::Generated { reason } => {
+            BuildGraphPreflight::Block(format!(
+                "Scrittura rifiutata: '{}' e' un file generato ({}). I file generati dalla build non vanno modificati manualmente.",
+                path_str, reason
+            ))
+        }
+        crate::build_graph::BuildGraphMembership::OutOfGraph { reason } => {
+            // Recupera info per messaggio diagnostico.
+            let info_msg = match crate::build_graph::BuildGraphCache::global() {
+                Some(cache) => match cache.get_or_compute(ctx.project_id).await {
+                    Ok(info) => format!(
+                        " Build graph derivato da: {}. Include patterns: {}.",
+                        info.sources.join(", "),
+                        info.include_globs.join(", ")
+                    ),
+                    Err(_) => String::new(),
+                },
+                None => String::new(),
+            };
+            BuildGraphPreflight::Warn(format!(
+                "ATTENZIONE: '{}' NON e' nel build graph del progetto ({}). I file fuori dal build graph non vengono compilati ne eseguiti.{} Se il tuo obiettivo e' modificare codice di produzione, usa `nexus_build_graph_info` per verificare quale path e' nel build graph.",
+                path_str, reason, info_msg
+            ))
+        }
+        crate::build_graph::BuildGraphMembership::Unknown { .. }
+        | crate::build_graph::BuildGraphMembership::InGraph { .. }
+        | crate::build_graph::BuildGraphMembership::Entrypoint { .. } => BuildGraphPreflight::Allow,
+    }
+}
+
 pub(super) async fn tool_read_file(ctx: &AgentToolContext, input: &Value) -> String {
     let path_str = match input.get("path").and_then(Value::as_str) {
         Some(s) => s,
@@ -179,6 +252,13 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
         }
     }
 
+    // Preflight build graph (ADR 0020): blocca file generati, avvisa OOG.
+    let bg_warning = match run_build_graph_preflight(ctx, path_str).await {
+        BuildGraphPreflight::Block(msg) => return format!("[Errore: {}]", msg),
+        BuildGraphPreflight::Warn(msg) => Some(msg),
+        BuildGraphPreflight::Allow => None,
+    };
+
     // Calcola il path assoluto con sicurezza path-traversal
     let clean = path_str.trim().trim_start_matches(['\\', '/']);
     let target = ctx.root_path.join(clean);
@@ -246,11 +326,16 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
                 )
                 .await;
             });
-            format!(
+            let base = format!(
                 "File '{}' scritto con successo ({} byte)",
                 path_str,
                 content.len()
-            )
+            );
+            if let Some(w) = bg_warning {
+                format!("{}\n\n{}", base, w)
+            } else {
+                base
+            }
         }
         Err(e) => format!("[Errore scrittura '{}': {}]", path_str, e),
     }
@@ -589,6 +674,13 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
         }
     }
 
+    // Preflight build graph (ADR 0020).
+    let bg_warning = match run_build_graph_preflight(ctx, path_str).await {
+        BuildGraphPreflight::Block(msg) => return format!("[Errore: {}]", msg),
+        BuildGraphPreflight::Warn(msg) => Some(msg),
+        BuildGraphPreflight::Allow => None,
+    };
+
     let target = match resolve_relative_path(&ctx.root_path, path_str) {
         Ok(p) => p,
         Err(e) => {
@@ -701,12 +793,17 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
                         let _ = crate::projects::reindex_single_file(&db_bg, &neural_bg, project_id_bg, &root_bg, &target_bg).await;
                         crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &target_bg).await;
                     });
-                    format!(
+                    let base = format!(
                         "File '{}' modificato con successo ({} byte → {} byte)",
                         path_str,
                         content.len(),
                         new_content.len()
-                    )
+                    );
+                    if let Some(w) = bg_warning {
+                        format!("{}\n\n{}", base, w)
+                    } else {
+                        base
+                    }
                 }
                 Err(e) => format!("[Errore scrittura '{}': {}]", path_str, e),
             }

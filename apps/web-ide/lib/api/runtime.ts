@@ -374,7 +374,14 @@ export interface ProjectServiceEntry {
 
 export async function getProjectServicesStatus(
   projectId: string
-): Promise<{ services: ProjectServiceEntry[]; slug: string }> {
+): Promise<{
+  services: ProjectServiceEntry[];
+  slug: string;
+  // ADR 0022: distingue "bus systemd utente giu'" da "zero servizi installati".
+  // Il JSON e' passato grezzo (snake_case), coerente con last_error/crash_loop.
+  manager_unavailable?: boolean;
+  manager_hint?: string;
+}> {
   return fetchJson(`${API_BASE}/api/projects/${projectId}/services`);
 }
 

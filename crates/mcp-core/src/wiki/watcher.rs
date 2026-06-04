@@ -39,6 +39,40 @@ use crate::wiki::reingest::reingest_path;
 use crate::wiki::vault::vault_root_for_scope;
 use crate::AppState;
 
+/// File di config che, se modificati, invalidano il build graph (ADR 0020).
+/// Match esatto sul nome file (case-insensitive).
+const BUILD_GRAPH_CONFIG_FILES: &[&str] = &[
+    "tsconfig.json",
+    "tsconfig.app.json",
+    "tsconfig.build.json",
+    "tsconfig.node.json",
+    "jsconfig.json",
+    "package.json",
+    "pnpm-workspace.yaml",
+    "cargo.toml",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "go.mod",
+    "go.work",
+];
+
+/// Mappatura root progetto (repository_root_path) → project_id, per
+/// l'invalidazione della cache build graph (ADR 0020).
+#[derive(Debug, Clone)]
+struct ProjectRootMap {
+    path: PathBuf,
+    project_id: Uuid,
+}
+
+/// True se il nome file appartiene ai config che invalidano il build graph.
+fn is_build_graph_config(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    BUILD_GRAPH_CONFIG_FILES
+        .iter()
+        .any(|c| c.to_ascii_lowercase() == lower)
+}
+
 /// Settings caricate al boot (con safe defaults se il DB non li ha ancora).
 #[derive(Debug, Clone, Copy)]
 struct WatcherSettings {
@@ -149,7 +183,7 @@ async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
         }
     }
 
-    // Vault per progetto.
+    // Vault per progetto + root progetto (per ADR 0020 build graph config).
     let project_rows: Vec<(Uuid, Option<String>)> = sqlx::query_as::<_, (Uuid, Option<String>)>(
         "SELECT id, repository_root_path FROM projects \
          WHERE repository_root_path IS NOT NULL AND repository_root_path <> ''",
@@ -158,7 +192,10 @@ async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
     .await
     .unwrap_or_default();
 
-    for (pid, _root) in project_rows {
+    // Mappa root → project_id per gli eventi di config (ADR 0020).
+    let mut project_root_map: Vec<ProjectRootMap> = Vec::new();
+
+    for (pid, repo_root) in project_rows {
         match vault_root_for_scope(&state, WikiScope::Project, Some(pid)).await {
             Ok(p) => {
                 let path = PathBuf::from(&p);
@@ -172,6 +209,16 @@ async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
             }
             Err(e) => {
                 tracing::debug!(project_id = %pid, error = %e, "wiki.watcher: vault_root_for_scope(project) skip");
+            }
+        }
+        // Registra root del repository per gli eventi di config (ADR 0020).
+        if let Some(r) = repo_root {
+            let p = PathBuf::from(&r);
+            if p.is_dir() {
+                project_root_map.push(ProjectRootMap {
+                    path: p,
+                    project_id: pid,
+                });
             }
         }
     }
@@ -201,6 +248,26 @@ async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
                 path = %r.path.display(),
                 error = %e,
                 "wiki.watcher: watch fallita su root"
+            ),
+        }
+    }
+
+    // Watch root progetto (ADR 0020: invalidazione build graph cache su
+    // change config). Profondita' limitata = non-ricorsivo per evitare di
+    // duplicare gli eventi dei vault gia' osservati e ridurre il rumore
+    // (i config sono al root del progetto, non in sub-dir profonde).
+    for m in &project_root_map {
+        match watcher.watch(&m.path, RecursiveMode::NonRecursive) {
+            Ok(_) => tracing::info!(
+                project_id = %m.project_id,
+                path = %m.path.display(),
+                "wiki.watcher: avviato (root progetto per config build graph)"
+            ),
+            Err(e) => tracing::debug!(
+                project_id = %m.project_id,
+                path = %m.path.display(),
+                error = %e,
+                "wiki.watcher: watch project root skip"
             ),
         }
     }
@@ -236,6 +303,9 @@ async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
                     None => break, // canale chiuso (shutdown)
                     Some(Ok(event)) => {
                         enqueue_event(&mut pending, &event);
+                        // ADR 0020: se l'evento tocca un file di config build
+                        // graph dentro una project root, invalida la cache.
+                        maybe_invalidate_build_graph(&event, &project_root_map).await;
                     }
                     Some(Err(e)) => {
                         tracing::debug!(error = %e, "wiki.watcher: notify error");
@@ -279,6 +349,61 @@ fn enqueue_event(pending: &mut HashMap<PathBuf, Instant>, event: &Event) {
                 continue;
             }
             pending.insert(p.clone(), now);
+        }
+    }
+}
+
+/// ADR 0020: se l'evento riguarda un file di config build graph dentro una
+/// project root, invalida la cache del progetto. Eventi multipli sullo stesso
+/// progetto sono idempotenti (la prossima `get_or_compute` riparsera' i config).
+async fn maybe_invalidate_build_graph(event: &Event, roots: &[ProjectRootMap]) {
+    if roots.is_empty() {
+        return;
+    }
+    // Filtra solo Create/Modify (i config rimangono validi su Access/Remove parziali).
+    match &event.kind {
+        EventKind::Create(_) => {}
+        EventKind::Modify(_) => {}
+        EventKind::Remove(_) => {}
+        _ => return,
+    }
+    let Some(cache) = crate::build_graph::BuildGraphCache::global() else {
+        return;
+    };
+    let mut already_invalidated: std::collections::HashSet<Uuid> =
+        std::collections::HashSet::new();
+    for p in &event.paths {
+        let Some(file_name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !is_build_graph_config(file_name) {
+            continue;
+        }
+        // Risolvi project_id: la project root col piu' lungo prefisso che e'
+        // ancestor del path.
+        let mut best: Option<&ProjectRootMap> = None;
+        for r in roots {
+            if p.starts_with(&r.path) {
+                match best {
+                    None => best = Some(r),
+                    Some(prev)
+                        if r.path.as_os_str().len() > prev.path.as_os_str().len() =>
+                    {
+                        best = Some(r)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(owner) = best {
+            if already_invalidated.insert(owner.project_id) {
+                cache.invalidate(owner.project_id).await;
+                tracing::info!(
+                    project_id = %owner.project_id,
+                    path = %p.display(),
+                    "build_graph: cache invalidata (watcher: config modificato)"
+                );
+            }
         }
     }
 }
@@ -386,6 +511,18 @@ mod tests {
         enqueue_event(&mut pending, &event);
         assert_eq!(pending.len(), 1);
         assert!(pending.contains_key(&PathBuf::from("/tmp/vault/a.md")));
+    }
+
+    #[test]
+    fn detects_build_graph_config_filenames() {
+        assert!(is_build_graph_config("tsconfig.json"));
+        assert!(is_build_graph_config("Cargo.toml"));
+        assert!(is_build_graph_config("CARGO.TOML"));
+        assert!(is_build_graph_config("pyproject.toml"));
+        assert!(is_build_graph_config("go.mod"));
+        assert!(is_build_graph_config("pnpm-workspace.yaml"));
+        assert!(!is_build_graph_config("random.md"));
+        assert!(!is_build_graph_config("App.tsx"));
     }
 
     #[test]
