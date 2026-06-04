@@ -412,7 +412,7 @@ def _model_has_vision_capability(provider: str, model: str) -> bool | None:
         try:
             cur = conn.cursor()
             cur.execute(
-                "SELECT (capabilities->>'vision')::bool "
+                "SELECT supports_vision "
                 "FROM ai_price_catalog "
                 "WHERE provider = %s AND model = %s AND is_enabled = true LIMIT 1",
                 (provider, model),
@@ -441,7 +441,7 @@ def _select_cheapest_vision_model() -> tuple[str, str] | None:
             cur = conn.cursor()
             cur.execute(
                 "SELECT provider, model FROM ai_price_catalog "
-                "WHERE (capabilities->>'vision')::bool = true AND is_enabled = true "
+                "WHERE supports_vision = true AND is_enabled = true "
                 "ORDER BY input_cost_per_million_tokens ASC NULLS LAST LIMIT 1"
             )
             row = cur.fetchone()

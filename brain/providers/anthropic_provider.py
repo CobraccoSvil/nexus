@@ -60,9 +60,11 @@ class ThinkingModelsUnavailable(Exception):
 def _load_thinking_models() -> frozenset[str]:
     """Ritorna il set di modelli che supportano extended thinking.
 
-    Letto da `ai_price_catalog.capabilities ->> 'thinking' = 'true'` (mig 0170).
-    Cache 60s, thread-safe. Solleva `ThinkingModelsUnavailable` se DB down o
-    tabella vuota (no fallback nascosto).
+    Letto dalla colonna canonica `ai_price_catalog.uses_thinking_mode` (ADR 0024,
+    mig 0318), unica fonte del concetto "thinking mode". Sostituisce la vecchia
+    lettura dal jsonb `capabilities ->> 'thinking'` (sempre vuoto -> thinking di
+    fatto disabilitato per Anthropic). Cache 60s, thread-safe. Solleva
+    `ThinkingModelsUnavailable` se DB down o tabella vuota (no fallback nascosto).
     """
     now = _time.monotonic()
     cached = _THINKING_MODELS_CACHE.get("value")
@@ -84,14 +86,7 @@ def _load_thinking_models() -> frozenset[str]:
                         "SELECT model FROM ai_price_catalog "
                         "WHERE provider = 'anthropic' "
                         "  AND is_enabled = TRUE "
-                        "  AND ("
-                        "    (capabilities ->> 'thinking')::boolean IS TRUE"
-                        "    OR EXISTS ("
-                        "      SELECT 1 FROM jsonb_array_elements(CASE jsonb_typeof(capabilities)"
-                        "        WHEN 'array' THEN capabilities ELSE '[]'::jsonb END) AS elem"
-                        "      WHERE (elem ->> 'thinking')::boolean IS TRUE"
-                        "    )"
-                        "  )"
+                        "  AND uses_thinking_mode IS TRUE"
                     )
                     rows = cur.fetchall()
             finally:
@@ -104,8 +99,8 @@ def _load_thinking_models() -> frozenset[str]:
             ) from exc
         if not rows:
             raise ThinkingModelsUnavailable(
-                "ai_price_catalog non contiene modelli anthropic con capability 'thinking'. "
-                "Applicare migrazione 0170_model_capabilities.sql."
+                "ai_price_catalog non contiene modelli anthropic con uses_thinking_mode=TRUE. "
+                "Verificare la classificazione (mig 0318 / catalog_sync)."
             )
         models = frozenset(r[0] for r in rows)
         _THINKING_MODELS_CACHE["value"] = models

@@ -96,14 +96,14 @@ def _load_from_db(provider: str, model: str) -> ProviderCapability | None:
     with psycopg2.connect(_db_url()) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"SELECT {_COLUMNS} FROM nexus_provider_capabilities "
+                f"SELECT {_COLUMNS} FROM v_model_capabilities "
                 "WHERE provider = %s AND model = %s",
                 (provider, model),
             )
             row = cur.fetchone()
             if row is None:
                 cur.execute(
-                    f"SELECT {_COLUMNS} FROM nexus_provider_capabilities "
+                    f"SELECT {_COLUMNS} FROM v_model_capabilities"
                     "WHERE provider = %s AND model = %s",
                     (provider, "*"),
                 )

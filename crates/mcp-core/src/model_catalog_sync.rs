@@ -191,6 +191,119 @@ pub(crate) fn infer_capabilities_from_name(provider: &str, model: &str) -> Vec<&
     caps
 }
 
+/// Flag di capability canonici di un modello (colonne reali di ai_price_catalog).
+/// Vedi ADR 0024 e migrazione 0318: il catalog e' l'UNICA fonte; il brain li
+/// legge derivati via vista `v_model_capabilities`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClassifiedCaps {
+    /// Il modello sa invocare tool (function calling).
+    pub supports_tool_use: bool,
+    /// Il modello accetta input immagine (vision).
+    pub supports_vision: bool,
+    /// Concetto A: ESCLUDI dal routing agentico. Modelli reasoning-only che
+    /// non reggono il loop a tool forzati (o-series, deepseek reasoner/v4,
+    /// magistral, gemini *-pro). NON include i modelli ibridi che fanno bene
+    /// l'agentico pur avendo una modalita' thinking (Claude, gpt non-o).
+    pub is_thinking: bool,
+    /// Concetto B: gira in thinking/extended-thinking mode -> l'adapter NON
+    /// deve forzare tool_choice e abilita il budget di ragionamento. Superset
+    /// di `is_thinking` (ogni reasoning-only e' anche thinking-mode, ma anche
+    /// gli ibridi come Claude opus/sonnet lo sono).
+    pub uses_thinking_mode: bool,
+}
+
+/// Classificatore UNICO delle capability di un modello (ADR 0024).
+///
+/// Invocato da OGNI path di aggiornamento del catalog (sync LiteLLM in
+/// `models::run_catalog_sync` e discovery provider in `sync_provider`), cosi'
+/// quando i modelli si aggiornano la classificazione si aggiorna con loro.
+/// Usa i metadata espliciti quando disponibili (LiteLLM: function_calling,
+/// vision, reasoning); altrimenti euristica sul nome. Niente nome modello
+/// hardcoded nella logica di business: qui classifichiamo per FAMIGLIA.
+///
+/// Le righe `capability_source='manual'` NON vengono toccate dai chiamanti
+/// (guard SQL nell'UPSERT): questa funzione produce solo il default 'auto'.
+pub(crate) fn classify_capabilities(
+    provider: &str,
+    model: &str,
+    meta_tool_use: Option<bool>,
+    meta_vision: Option<bool>,
+    meta_reasoning: Option<bool>,
+) -> ClassifiedCaps {
+    let p = provider.to_ascii_lowercase();
+    let m = model.to_ascii_lowercase();
+
+    // ── tool_use: metadata esplicito, altrimenti default true (la stragrande
+    //    maggioranza dei modelli chat moderni supporta function calling). ──
+    let supports_tool_use = meta_tool_use.unwrap_or(true);
+
+    // ── vision: metadata esplicito, altrimenti euristica per famiglia. ──
+    let supports_vision = meta_vision.unwrap_or_else(|| match p.as_str() {
+        "openai" => {
+            m.starts_with("gpt-4o")
+                || m.starts_with("gpt-4.1")
+                || m.starts_with("gpt-4-turbo")
+                || m.starts_with("o1")
+                || m.starts_with("o3")
+        }
+        "anthropic" => m.contains("opus") || m.contains("sonnet"),
+        "google" => m.contains("gemini"),
+        _ => false,
+    });
+
+    // ── Detection reasoning model (guida sia A sia B). ──
+    // Famiglie reasoning-only note (incompatibili col tool-forcing o col loop
+    // multi-turno nell'integrazione attuale).
+    let reasoning_only_family = match p.as_str() {
+        // OpenAI o-series: o1/o3/o4 (prefisso "o" + cifra).
+        "openai" => {
+            m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
+        }
+        // DeepSeek reasoner e V4 (richiede reasoning_content passback non
+        // implementato -> non regge il loop agentico, vedi mig 0317).
+        "deepseek" => m.contains("reasoner") || m.contains("v4"),
+        // Mistral magistral: linea reasoning.
+        "mistral" => m.contains("magistral"),
+        // Google: i *-pro 2.x sono thinking e danno MALFORMED sul tool-forcing
+        // (mig 0274). I flash NON lo sono.
+        "google" => m.contains("pro") && !m.contains("flash"),
+        _ => false,
+    };
+    // Marker generici nel nome, cross-provider.
+    let name_reasoning = m.contains("reasoner")
+        || m.contains("reasoning")
+        || m.contains("thinking")
+        || reasoning_only_family;
+    // Metadata esplicito reasoning (LiteLLM) ha priorita' come segnale positivo.
+    let is_reasoning_signal = meta_reasoning.unwrap_or(false) || name_reasoning;
+
+    // Concetto A (escludi da agentico): solo le famiglie reasoning-only. Gli
+    // ibridi (Claude opus/sonnet, gpt non-o) restano agentic-eligibili anche
+    // se hanno una modalita' thinking.
+    let is_thinking = reasoning_only_family
+        || (meta_reasoning.unwrap_or(false) && !is_hybrid_agentic(&p, &m));
+
+    // Concetto B (non forzare tool_choice): tutti i reasoning + gli ibridi con
+    // extended thinking (Claude opus/sonnet).
+    let uses_thinking_mode = is_reasoning_signal || is_hybrid_agentic(&p, &m);
+
+    ClassifiedCaps {
+        supports_tool_use,
+        supports_vision,
+        is_thinking,
+        uses_thinking_mode,
+    }
+}
+
+/// Modelli ibridi: ottimi per l'agentico (NON escludere, A=false) ma con
+/// extended thinking che impone tool_choice non forzato (B=true).
+fn is_hybrid_agentic(provider: &str, model_lc: &str) -> bool {
+    match provider {
+        "anthropic" => model_lc.contains("opus") || model_lc.contains("sonnet"),
+        _ => false,
+    }
+}
+
 /// Loop principale: chiamato da `main.rs` startup via `tokio::spawn(...)`.
 /// `orchestrator` (Option) e' usato per il probe-on-insert dei nuovi modelli
 /// scoperti dall'API discovery — se None, i nuovi modelli vengono inseriti
@@ -448,6 +561,13 @@ async fn sync_provider(
                                         let inferred_caps =
                                             infer_capabilities_from_name(provider, api_model);
                                         let caps_json = json!(inferred_caps);
+                                        // Classificazione flag canonici (ADR 0024):
+                                        // discovery -> solo euristica nome (niente
+                                        // metadata LiteLLM). Scritti SOLO su righe
+                                        // 'auto' (le 'manual' restano intatte).
+                                        let cc = classify_capabilities(
+                                            provider, api_model, None, None, None,
+                                        );
                                         let _ = sqlx::query(
                                             "UPDATE ai_price_catalog \
                                              SET is_enabled = true, auto_disabled_at = NULL, \
@@ -456,12 +576,20 @@ async fn sync_provider(
                                                      WHEN capabilities IS NULL OR capabilities = '[]'::jsonb \
                                                          THEN $3::jsonb \
                                                      ELSE capabilities \
-                                                 END \
+                                                 END, \
+                                                 supports_tool_use = CASE WHEN capability_source='auto' THEN $4 ELSE supports_tool_use END, \
+                                                 supports_vision = CASE WHEN capability_source='auto' THEN $5 ELSE supports_vision END, \
+                                                 is_thinking = CASE WHEN capability_source='auto' THEN $6 ELSE is_thinking END, \
+                                                 uses_thinking_mode = CASE WHEN capability_source='auto' THEN $7 ELSE uses_thinking_mode END \
                                              WHERE provider = $1 AND model = $2 AND is_enabled = false",
                                         )
                                         .bind(provider)
                                         .bind(api_model)
                                         .bind(&caps_json)
+                                        .bind(cc.supports_tool_use)
+                                        .bind(cc.supports_vision)
+                                        .bind(cc.is_thinking)
+                                        .bind(cc.uses_thinking_mode)
                                         .execute(db)
                                         .await;
                                         audit_log(
@@ -913,5 +1041,62 @@ mod tests {
         );
         // (sopra ha 2 digits-2 digits-2 digits, non matcha 8 digits)
         assert_eq!(strip_date_suffix("ministral-8b-2512"), "ministral-8b-2512");
+    }
+
+    // ── ADR 0024: classificatore unico delle capability ──
+
+    #[test]
+    fn classify_metadata_litellm_ha_priorita() {
+        // function_calling/vision espliciti vincono sull'euristica.
+        let c = classify_capabilities("openai", "gpt-4o", Some(true), Some(true), Some(false));
+        assert!(c.supports_tool_use);
+        assert!(c.supports_vision);
+        assert!(!c.is_thinking);
+        assert!(!c.uses_thinking_mode);
+    }
+
+    #[test]
+    fn classify_o_series_e_reasoning_only_escluso_da_agentico() {
+        // o-series: reasoning-only -> A (escludi) e B (non forzare) entrambi true.
+        let c = classify_capabilities("openai", "o3-mini", None, None, None);
+        assert!(c.is_thinking, "o-series deve essere escluso da agentico");
+        assert!(c.uses_thinking_mode);
+    }
+
+    #[test]
+    fn classify_deepseek_v4_reasoning_only() {
+        // deepseek-v4-pro: reasoning-only (no reasoning_content passback) -> A+B.
+        let c = classify_capabilities("deepseek", "deepseek-v4-pro", None, None, None);
+        assert!(c.is_thinking);
+        assert!(c.uses_thinking_mode);
+    }
+
+    #[test]
+    fn classify_claude_ibrido_agentico_ma_thinking_mode() {
+        // Claude opus/sonnet: NON escluso da agentico (A=false) ma extended
+        // thinking -> non forzare tool_choice (B=true). Caso che il merge naïf
+        // avrebbe rotto.
+        let c = classify_capabilities("anthropic", "claude-sonnet-4-6", None, None, None);
+        assert!(!c.is_thinking, "Claude deve restare agentic-eligibile");
+        assert!(c.uses_thinking_mode, "Claude usa extended thinking -> non forzare");
+        assert!(c.supports_vision);
+    }
+
+    #[test]
+    fn classify_modello_chat_standard_non_thinking() {
+        // mistral-large: tool-capable, non-thinking -> candidato agentico ideale.
+        let c = classify_capabilities("mistral", "mistral-large-2411", None, None, None);
+        assert!(c.supports_tool_use);
+        assert!(!c.is_thinking);
+        assert!(!c.uses_thinking_mode);
+    }
+
+    #[test]
+    fn classify_gemini_flash_non_e_reasoning() {
+        // gemini flash NON e' reasoning (solo i *-pro lo sono).
+        let c = classify_capabilities("google", "gemini-2.5-flash", None, None, None);
+        assert!(!c.is_thinking);
+        let pro = classify_capabilities("google", "gemini-2.5-pro", None, None, None);
+        assert!(pro.is_thinking, "gemini-2.5-pro e' thinking -> escluso da agentico");
     }
 }

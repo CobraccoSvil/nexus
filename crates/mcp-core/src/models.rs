@@ -243,21 +243,47 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
             .or_else(|| entry.get("max_tokens").and_then(Value::as_i64))
             .unwrap_or(8192) as i32;
 
-        let supports_tools = entry
+        // Classificazione capability UNICA (ADR 0024): metadata LiteLLM quando
+        // presenti (function_calling, vision, reasoning), altrimenti euristica
+        // per famiglia. Aggiornare i modelli aggiorna la classificazione.
+        let meta_tool_use = entry
             .get("supports_function_calling")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
+            .and_then(Value::as_bool);
+        let meta_vision = entry.get("supports_vision").and_then(Value::as_bool);
+        let meta_reasoning = entry.get("supports_reasoning").and_then(Value::as_bool);
+        let caps = crate::model_catalog_sync::classify_capabilities(
+            provider,
+            model_id,
+            meta_tool_use,
+            meta_vision,
+            meta_reasoning,
+        );
 
+        // UPSERT: l'UPDATE dei flag avviene SOLO se capability_source='auto'
+        // (le righe 'manual' curate da admin/migrazioni sono protette, ADR 0024).
+        // I costi/context si aggiornano sempre.
         let result = sqlx::query(
             r#"INSERT INTO ai_price_catalog (
                 provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens,
-                currency, context_window, supports_tool_use, is_enabled, display_name
-              ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, FALSE, $2)
+                currency, context_window, supports_tool_use, supports_vision,
+                is_thinking, uses_thinking_mode, capability_source, is_enabled, display_name
+              ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, $9, 'auto', FALSE, $2)
               ON CONFLICT (provider, model) DO UPDATE SET
                 input_cost_per_million_tokens = EXCLUDED.input_cost_per_million_tokens,
                 output_cost_per_million_tokens = EXCLUDED.output_cost_per_million_tokens,
                 context_window = EXCLUDED.context_window,
-                supports_tool_use = EXCLUDED.supports_tool_use,
+                supports_tool_use = CASE WHEN ai_price_catalog.capability_source = 'auto'
+                                         THEN EXCLUDED.supports_tool_use
+                                         ELSE ai_price_catalog.supports_tool_use END,
+                supports_vision = CASE WHEN ai_price_catalog.capability_source = 'auto'
+                                       THEN EXCLUDED.supports_vision
+                                       ELSE ai_price_catalog.supports_vision END,
+                is_thinking = CASE WHEN ai_price_catalog.capability_source = 'auto'
+                                   THEN EXCLUDED.is_thinking
+                                   ELSE ai_price_catalog.is_thinking END,
+                uses_thinking_mode = CASE WHEN ai_price_catalog.capability_source = 'auto'
+                                          THEN EXCLUDED.uses_thinking_mode
+                                          ELSE ai_price_catalog.uses_thinking_mode END,
                 updated_at = NOW()
               RETURNING (xmax = 0) AS inserted"#,
         )
@@ -266,7 +292,10 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
         .bind(input_cost)
         .bind(output_cost)
         .bind(context_window)
-        .bind(supports_tools)
+        .bind(caps.supports_tool_use)
+        .bind(caps.supports_vision)
+        .bind(caps.is_thinking)
+        .bind(caps.uses_thinking_mode)
         .fetch_one(db)
         .await;
 
