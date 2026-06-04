@@ -36,122 +36,23 @@ import {
 import { useThemeColors } from "../../lib/theme";
 import { MCP_CATALOG, type CatalogEntry } from "./mcp-catalog-data";
 import { useGlobalDialog } from "../global-dialog-provider";
-
-type ManagerTab = "installed" | "catalog" | "policy" | "legacy";
-
-interface PolicyDraft {
-  mode: PluginToolPolicy["mode"];
-  tools: string;
-  blockedTools: string;
-}
-
-function normalizeCsv(raw: string): string[] {
-  return raw
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-}
-
-function defaultReleaseVersion(item: PluginCatalogItem): string {
-  const stable = item.releases.find((release) => release.isStable !== false);
-  return stable?.version ?? item.releases[0]?.version ?? "1.0.0";
-}
-
-function dedupeInstalledPlugins(items: PluginInstance[]): PluginInstance[] {
-  const map = new Map<string, PluginInstance>();
-  for (const item of items) {
-    const key = (item.slug || item.catalogItemId || item.id).toLowerCase();
-    const existing = map.get(key);
-    if (!existing) {
-      map.set(key, item);
-      continue;
-    }
-    const existingTs = Date.parse(existing.updatedAt ?? existing.createdAt ?? "") || 0;
-    const currentTs = Date.parse(item.updatedAt ?? item.createdAt ?? "") || 0;
-    if (currentTs >= existingTs) {
-      map.set(key, item);
-    }
-  }
-  return Array.from(map.values());
-}
-
-function healthColor(status: string) {
-  if (status === "ok") return "#22c55e";
-  if (status === "error") return "#ef4444";
-  return "#94a3b8";
-}
-
-function isNexusBrowserBridgeLocal(server: McpServer): boolean {
-  if (server.transport !== "http") return false;
-  const url = (server.url ?? "").trim().toLowerCase();
-  return (
-    url === "http://127.0.0.1:4055/mcp" ||
-    url === "http://localhost:4055/mcp" ||
-    url === "http://0.0.0.0:4055/mcp"
-  );
-}
-
-function detectLegacyMigratableSlug(server: McpServer): string | null {
-  if (server.transport === "http") {
-    const url = (server.url ?? "").toLowerCase();
-    if (url.includes("mcp.figma.com/mcp")) return "figma-http";
-    if (url.includes("api.githubcopilot.com/mcp")) return "github-http";
-    return null;
-  }
-
-  const command = (server.command ?? "").toLowerCase();
-  const args = (server.args ?? []).map((item) => item.toLowerCase());
-  if (command === "npx" && args.some((item) => item.includes("@modelcontextprotocol/server-filesystem"))) {
-    return "filesystem-local";
-  }
-  if (command === "npx" && args.some((item) => item.includes("@playwright/mcp"))) {
-    return "playwright-stdio";
-  }
-  if (command === "npx" && args.some((item) => item.includes("@modelcontextprotocol/server-redis"))) {
-    return "redis-stdio";
-  }
-  if (command === "npx" && args.some((item) => item.includes("@modelcontextprotocol/server-sqlite"))) {
-    return "sqlite-stdio";
-  }
-  if (command === "npx" && args.some((item) => item.includes("@modelcontextprotocol/server-postgres"))) {
-    return "postgres-stdio";
-  }
-  if (command === "npx" && args.some((item) => item.includes("@modelcontextprotocol/server-gitlab"))) {
-    return "gitlab-stdio";
-  }
-  if (command === "npx" && args.some((item) => item.includes("@modelcontextprotocol/server-github"))) {
-    return "github-stdio";
-  }
-  if (command === "npx" && args.some((item) => item.includes("@modelcontextprotocol/server-memory"))) {
-    return "memory-stdio";
-  }
-  return null;
-}
-
-function toLegacyPayload(entry: CatalogEntry) {
-  const envVars =
-    entry.requiredEnvVars?.reduce<Record<string, string>>((acc, key) => {
-      acc[key] = "";
-      return acc;
-    }, {}) ?? {};
-
-  return {
-    name: entry.name,
-    description: entry.description,
-    transport: entry.transport,
-    url: entry.transport === "http" ? entry.url : undefined,
-    command: entry.transport === "stdio" ? entry.command : undefined,
-    args: entry.transport === "stdio" ? entry.args ?? [] : [],
-    envVars,
-    headers: {},
-    scope: "user" as const,
-  };
-}
+import { CatalogTab } from "./plugin-manager/catalog-tab";
+import { FigmaOAuthCard } from "./plugin-manager/figma-oauth-card";
+import { InstalledPluginsList } from "./plugin-manager/installed-plugins-list";
+import { LegacyMcpList } from "./plugin-manager/legacy-mcp-list";
+import {
+  dedupeInstalledPlugins,
+  defaultReleaseVersion,
+  detectLegacyMigratableSlug,
+  normalizeCsv,
+  toLegacyPayload,
+} from "./plugin-manager/plugin-helpers";
+import { PolicyTab } from "./plugin-manager/policy-tab";
+import type { ManagerTab, PluginTestStatus, PolicyDraft } from "./plugin-manager/types";
 
 export function PluginManager() {
   const tc = useThemeColors();
   const { confirmDialog, promptDialog } = useGlobalDialog();
-  const builtinToolHints = ["nexus_mcp_tool_search", "nexus_mcp_tool_call"];
 
   const [activeTab, setActiveTab] = useState<ManagerTab>("installed");
   const [catalog, setCatalog] = useState<PluginCatalogItem[]>([]);
@@ -164,15 +65,7 @@ export function PluginManager() {
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
   const [testStatusByPluginId, setTestStatusByPluginId] = useState<
-    Record<
-      string,
-      {
-        success: boolean;
-        toolCount: number;
-        error?: string;
-        at: string;
-      }
-    >
+    Record<string, PluginTestStatus>
   >({});
   const [catalogSearch, setCatalogSearch] = useState("");
   const [installScope, setInstallScope] = useState<"global" | "project" | "user">("global");
@@ -843,92 +736,14 @@ export function PluginManager() {
         </div>
       </div>
 
-      <div className="card-sm flex-col-gap-8" style={{ marginBottom: 14 }}>
-        <div className="flex-row-gap-8" style={{ flexWrap: "wrap" }}>
-          <div className="text-base font-bold">
-            Figma MCP OAuth
-          </div>
-          <span
-            style={{
-              fontSize: 10,
-              padding: "2px 6px",
-              borderRadius: 999,
-              border: `1px solid ${figmaOAuthStatus?.configured ? "#22c55e66" : tc.warning}`,
-              color: figmaOAuthStatus?.configured ? "#16a34a" : tc.warning,
-              textTransform: "uppercase",
-              fontWeight: 700,
-            }}
-          >
-            {figmaOAuthStatus?.configured ? "client ok" : "client mancante"}
-          </span>
-          <span
-            style={{
-              fontSize: 10,
-              padding: "2px 6px",
-              borderRadius: 999,
-              border: `1px solid ${figmaOAuthStatus?.hasAccessToken ? "#22c55e66" : tc.border}`,
-              color: figmaOAuthStatus?.hasAccessToken ? "#16a34a" : tc.textMuted,
-              textTransform: "uppercase",
-              fontWeight: 700,
-            }}
-          >
-            {figmaOAuthStatus?.hasAccessToken
-              ? `token ${figmaOAuthStatus.tokenType === "pat" ? "PAT" : "OAuth"}`
-              : "token assente"}
-          </span>
-          {figmaOAuthStatus?.tokenScope && (
-            <span style={{ fontSize: 11, color: tc.textMuted }}>
-              scope: {figmaOAuthStatus.tokenScope}
-            </span>
-          )}
-        </div>
-        <div className="text-sm text-muted">
-          Se usi Figma MCP remoto serve OAuth con scope <code>mcp:connect</code>. In alternativa puoi usare il fallback
-          locale <code>figma-developer-mcp</code>.
-        </div>
-        {figmaOAuthStatus?.lastError && (
-          <div className="text-sm" style={{ color: tc.error }}>
-            Ultimo errore OAuth: {figmaOAuthStatus.lastError}
-          </div>
-        )}
-        <div className="flex-row-gap-8" style={{ flexWrap: "wrap" }}>
-          <button
-            type="button"
-            onClick={() => void handleStartFigmaOAuth()}
-            disabled={busyKey === "figma-oauth-connect" || !(figmaOAuthStatus?.configured ?? false)}
-            className="btn btn-primary"
-            style={actionButtonStyle(
-              tc,
-              busyKey === "figma-oauth-connect" || !(figmaOAuthStatus?.configured ?? false),
-            )}
-            title={
-              figmaOAuthStatus?.configured
-                ? "Connetti Figma con OAuth (mcp:connect)"
-                : "Configura prima figma_client_id e figma_client_secret"
-            }
-          >
-            {busyKey === "figma-oauth-connect" ? "Avvio OAuth..." : "Connetti OAuth"}
-          </button>
-          <button
-            type="button"
-            onClick={() => void handleToggleFigmaStdioFallback(!figmaPreferStdio)}
-            disabled={busyKey === "figma-stdio-toggle"}
-            style={actionButtonStyle(tc, busyKey === "figma-stdio-toggle")}
-            title="Abilita/disabilita fallback stdio Figma"
-          >
-            {busyKey === "figma-stdio-toggle"
-              ? "Aggiorno..."
-              : figmaPreferStdio
-                ? "Fallback stdio: attivo"
-                : "Fallback stdio: disattivo"}
-          </button>
-          {figmaOAuthStatus?.redirectUri && (
-            <span style={{ fontSize: 11, color: tc.textMuted }}>
-              callback: {figmaOAuthStatus.redirectUri}
-            </span>
-          )}
-        </div>
-      </div>
+      <FigmaOAuthCard
+        tc={tc}
+        figmaOAuthStatus={figmaOAuthStatus}
+        figmaPreferStdio={figmaPreferStdio}
+        busyKey={busyKey}
+        onStartOAuth={() => void handleStartFigmaOAuth()}
+        onToggleStdioFallback={(enabled) => void handleToggleFigmaStdioFallback(enabled)}
+      />
 
       {/* Nota UX: le chiavi richieste ora sono richieste nel contesto del singolo plugin (tab "Installati"),
           così l'utente non deve cercarle in alto. */}
@@ -1007,710 +822,74 @@ export function PluginManager() {
       </div>
 
       {activeTab === "installed" && (
-        <div style={{ display: "grid", gap: 10 }}>
-          {installed.length === 0 && (
-            <div className="text-sm text-muted">
-              Nessun plugin installato.
-            </div>
-          )}
-          {installed.map((plugin) => {
-            const catalogItem = catalogById.get(plugin.catalogItemId ?? "");
-            const releases = catalogItem?.releases ?? [];
-            const selectedVersion = instanceReleaseChoice[plugin.id] || plugin.version || "";
-            const isBusy = busyKey?.includes(plugin.id) ?? false;
-            const requiredKeys = (catalogItem?.requiredSecretRefs ?? []).map((k) => k.trim()).filter(Boolean);
-            const missingKeys = requiredKeys.filter((key) => !(settingsByKey.get(key)?.has_value ?? false));
-            const lastTest = testStatusByPluginId[plugin.id];
-            return (
-              <div
-                key={plugin.id}
-                className="card-sm"
-                style={{
-                  opacity: plugin.enabled ? 1 : 0.72,
-                }}
-              >
-                <div className="flex-row" style={{ gap: 8, marginBottom: 5 }}>
-                  <span
-                    style={{
-                      width: 8,
-                      height: 8,
-                      borderRadius: "50%",
-                      background: healthColor(plugin.healthStatus),
-                    }}
-                  />
-                  <div className="text-lg font-bold">{plugin.name}</div>
-                  <span
-                    style={{
-                      fontSize: 10,
-                      padding: "2px 6px",
-                      borderRadius: 999,
-                      border: `1px solid ${tc.border}`,
-                      color: tc.textMuted,
-                      textTransform: "uppercase",
-                    }}
-                  >
-                    {plugin.transport}
-                  </span>
-                  <span
-                    style={{
-                      fontSize: 10,
-                      padding: "2px 6px",
-                      borderRadius: 999,
-                      border: `1px solid ${tc.border}`,
-                      color: tc.textMuted,
-                      textTransform: "uppercase",
-                    }}
-                  >
-                    {plugin.scope}
-                  </span>
-                </div>
-                <div className="text-sm text-muted" style={{ marginBottom: 8 }}>
-                  {plugin.catalogDescription}
-                </div>
-                <div className="text-xs text-muted" style={{ marginBottom: 10 }}>
-                  Versione: {plugin.version ?? "n/a"} · Health: {plugin.healthStatus}
-                  {plugin.lastHealthMessage ? ` · ${plugin.lastHealthMessage}` : ""}
-                </div>
-                {lastTest && (
-                  <div
-                    className="text-xs"
-                    style={{
-                      marginBottom: 10,
-                      color: lastTest.success ? "#16a34a" : tc.error,
-                      whiteSpace: "pre-wrap",
-                    }}
-                  >
-                    {lastTest.success
-                      ? `Test: ok (${lastTest.toolCount} tool) · ${new Date(lastTest.at).toLocaleString()}`
-                      : `Test: fallito (${lastTest.error ?? "errore sconosciuto"}) · ${new Date(lastTest.at).toLocaleString()}`}
-                  </div>
-                )}
-
-                {missingKeys.length > 0 && plugin.canManage && (
-                  <div
-                    style={{
-                      border: `1px solid ${tc.warning}`,
-                      background: `${tc.warning}10`,
-                      borderRadius: 10,
-                      padding: "10px 12px",
-                      marginBottom: 10,
-                      display: "grid",
-                      gap: 8,
-                    }}
-                  >
-                    <div style={{ fontWeight: 700, fontSize: 12, color: tc.warning }}>
-                      Chiavi mancanti per usare questo MCP
-                    </div>
-                    <div style={{ fontSize: 12, color: tc.textMuted }}>
-                      Inserisci le chiavi richieste qui sotto. Sono salvate lato server e non vengono restituite in chiaro.
-                    </div>
-                    {missingKeys.map((key) => (
-                      <div key={key} style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                        <span style={{ fontFamily: "monospace", fontSize: 12, color: tc.text, minWidth: 220 }}>
-                          {key}
-                        </span>
-                        <input
-                          type="password"
-                          value={secretDrafts[key] ?? ""}
-                          placeholder="Inserisci valore segreto"
-                          onChange={(event) => setSecretDrafts((prev) => ({ ...prev, [key]: event.target.value }))}
-                          style={inputStyle(tc)}
-                        />
-                        <button
-                          type="button"
-                          onClick={() => void handleSaveSecret(key)}
-                          disabled={busyKey === `secret:${key}` || !(secretDrafts[key] ?? "").trim()}
-                          style={actionButtonStyle(tc, busyKey === `secret:${key}` || !(secretDrafts[key] ?? "").trim())}
-                        >
-                          {busyKey === `secret:${key}` ? "Salvo..." : "Salva chiave"}
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                <div className="flex-row" style={{ flexWrap: "wrap", gap: 8 }}>
-                  <button
-                    type="button"
-                    disabled={isBusy || !plugin.canManage}
-                    onClick={() => void handleToggle(plugin)}
-                    style={actionButtonStyle(tc, isBusy || !plugin.canManage)}
-                  >
-                    {plugin.enabled ? "Disabilita" : "Abilita"}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={isBusy || !plugin.canManage}
-                    onClick={() => void handleTest(plugin)}
-                    style={actionButtonStyle(tc, isBusy || !plugin.canManage)}
-                  >
-                    Test
-                  </button>
-                  <select
-                    value={selectedVersion}
-                    disabled={!plugin.canManage || releases.length === 0}
-                    onChange={(event) =>
-                      setInstanceReleaseChoice((prev) => ({ ...prev, [plugin.id]: event.target.value }))
-                    }
-                    style={selectStyle(tc, 180)}
-                  >
-                    {releases.length === 0 && <option value="">Nessun rilascio</option>}
-                    {releases.map((release) => (
-                      <option key={release.version} value={release.version}>
-                        {release.version}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    disabled={isBusy || !plugin.canManage || !selectedVersion}
-                    onClick={() => void handleUpdateVersion(plugin)}
-                    style={actionButtonStyle(tc, isBusy || !plugin.canManage || !selectedVersion)}
-                  >
-                    Aggiorna
-                  </button>
-                  <button
-                    type="button"
-                    disabled={isBusy || !plugin.canManage}
-                    onClick={() => void handleRollback(plugin)}
-                    style={actionButtonStyle(tc, isBusy || !plugin.canManage)}
-                  >
-                    Rollback
-                  </button>
-                  <button
-                    type="button"
-                    disabled={isBusy || !plugin.canManage}
-                    onClick={() => void handleUninstallPlugin(plugin)}
-                    style={actionButtonStyle(tc, isBusy || !plugin.canManage)}
-                  >
-                    Disinstalla
-                  </button>
-                </div>
-              </div>
-            );
-          })}
-        </div>
+        <InstalledPluginsList
+          tc={tc}
+          installed={installed}
+          catalogById={catalogById}
+          instanceReleaseChoice={instanceReleaseChoice}
+          settingsByKey={settingsByKey}
+          testStatusByPluginId={testStatusByPluginId}
+          secretDrafts={secretDrafts}
+          busyKey={busyKey}
+          onInstanceReleaseChoiceChange={(pluginId, version) =>
+            setInstanceReleaseChoice((prev) => ({ ...prev, [pluginId]: version }))
+          }
+          onSecretDraftChange={(key, value) => setSecretDrafts((prev) => ({ ...prev, [key]: value }))}
+          onSaveSecret={(key) => void handleSaveSecret(key)}
+          onToggle={(plugin) => void handleToggle(plugin)}
+          onTest={(plugin) => void handleTest(plugin)}
+          onUpdateVersion={(plugin) => void handleUpdateVersion(plugin)}
+          onRollback={(plugin) => void handleRollback(plugin)}
+          onUninstall={(plugin) => void handleUninstallPlugin(plugin)}
+        />
       )}
 
       {activeTab === "catalog" && (
-        <div style={{ display: "grid", gap: 14 }}>
-          <div style={{ display: "flex", gap: 10, marginBottom: 4, alignItems: "center" }}>
-            <input
-              value={catalogSearch}
-              onChange={(event) => setCatalogSearch(event.target.value)}
-              placeholder="Cerca plugin/preset MCP..."
-              style={inputStyle(tc)}
-            />
-            <select
-              value={installScope}
-              onChange={(event) => setInstallScope(event.target.value as "global" | "project" | "user")}
-              style={selectStyle(tc)}
-            >
-              <option value="global">Scope globale</option>
-              <option value="project">Scope progetto</option>
-              <option value="user">Scope utente</option>
-            </select>
-            <button
-              type="button"
-              onClick={() => setShowAlreadyPresent((v) => !v)}
-              style={{
-                border: `1px solid ${tc.border}`,
-                background: showAlreadyPresent ? `${tc.accent}15` : tc.bgInput,
-                color: showAlreadyPresent ? tc.accent : tc.textMuted,
-                borderRadius: 999,
-                padding: "5px 10px",
-                fontSize: 12,
-                cursor: "pointer",
-                fontWeight: 600,
-                whiteSpace: "nowrap",
-              }}
-              title="Mostra/nasconde elementi già presenti (installati o già aggiunti come legacy)"
-            >
-              {showAlreadyPresent ? "Mostra: tutti" : "Mostra: non presenti"}
-            </button>
-          </div>
-
-          <div
-            style={{
-              border: `1px solid ${tc.border}`,
-              borderRadius: 10,
-              background: tc.bgCard,
-              padding: "10px 12px",
-              display: "grid",
-              gap: 10,
-            }}
-          >
-            <div style={{ fontWeight: 700, fontSize: 13, color: tc.text }}>
-              Catalogo plugin curato (installazione plugin)
-            </div>
-            <div style={{ display: "grid", gap: 10 }}>
-              {visibleCuratedCatalog.map((item) => {
-                const selectedVersion = catalogReleaseChoice[item.id] || defaultReleaseVersion(item);
-                const alreadyInstalled = installedSlugSet.has(item.slug.toLowerCase());
-                const missingSecrets = item.requiredSecretRefs.filter((key) => {
-                  const setting = settingsByKey.get(key);
-                  return !(setting?.has_value ?? false);
-                });
-                const cannotInstall = !item.isAllowlisted || alreadyInstalled;
-                return (
-                  <div
-                    key={item.id}
-                    style={{
-                      border: `1px solid ${alreadyInstalled ? "#f59e0b66" : tc.border}`,
-                      borderRadius: 10,
-                      background: alreadyInstalled ? "#f59e0b12" : tc.bgCard,
-                      padding: "10px 12px",
-                    }}
-                  >
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                      <div style={{ fontWeight: 700, color: tc.text }}>{item.name}</div>
-                      <span
-                        style={{
-                          fontSize: 10,
-                          padding: "2px 6px",
-                          borderRadius: 999,
-                          border: `1px solid ${item.isAllowlisted ? "#22c55e66" : tc.error}`,
-                          color: item.isAllowlisted ? "#16a34a" : tc.error,
-                          textTransform: "uppercase",
-                        }}
-                      >
-                        {item.isAllowlisted ? "allowlisted" : "blocked"}
-                      </span>
-                      {alreadyInstalled && (
-                        <span
-                          style={{
-                            fontSize: 10,
-                            padding: "2px 6px",
-                            borderRadius: 999,
-                            border: "1px solid #f59e0b66",
-                            color: "#b45309",
-                            textTransform: "uppercase",
-                          }}
-                          title="Plugin già installato: reinstallazione bloccata"
-                        >
-                          duplica bloccata
-                        </span>
-                      )}
-                      <span style={{ fontSize: 11, color: tc.textMuted }}>{item.slug}</span>
-                    </div>
-                    <div style={{ fontSize: 12, color: tc.textMuted, marginBottom: 6 }}>{item.description}</div>
-                    <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 8 }}>
-                      Secret richiesti:{" "}
-                      {item.requiredSecretRefs.length > 0 ? item.requiredSecretRefs.join(", ") : "nessuno"}
-                    </div>
-                    {missingSecrets.length > 0 && (
-                      <div style={{ fontSize: 11, color: tc.warning, marginBottom: 8 }}>
-                        Mancano chiavi: {missingSecrets.join(", ")}
-                      </div>
-                    )}
-                    {alreadyInstalled && (
-                      <div style={{ fontSize: 11, color: "#b45309", marginBottom: 8 }}>
-                        Questo plugin è già presente negli installati. Reinstallazione non consentita.
-                      </div>
-                    )}
-                    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                      <select
-                        value={selectedVersion}
-                        onChange={(event) =>
-                          setCatalogReleaseChoice((prev) => ({ ...prev, [item.id]: event.target.value }))
-                        }
-                        style={selectStyle(tc, 170)}
-                      >
-                        {item.releases.map((release) => (
-                          <option key={release.version} value={release.version}>
-                            {release.version}
-                          </option>
-                        ))}
-                      </select>
-                      <button
-                        type="button"
-                        disabled={busyKey === `install:${item.id}` || cannotInstall}
-                        onClick={() => void handleInstall(item)}
-                        style={actionButtonStyle(tc, busyKey === `install:${item.id}` || cannotInstall)}
-                        title={
-                          alreadyInstalled
-                            ? "Plugin già installato: reinstallazione bloccata"
-                            : !item.isAllowlisted
-                              ? "Plugin non allowlisted"
-                              : "Installa plugin"
-                        }
-                      >
-                        {alreadyInstalled
-                          ? "Già installato"
-                          : busyKey === `install:${item.id}`
-                            ? "Installo..."
-                            : "Installa"}
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-
-          <div
-            style={{
-              border: `1px solid ${tc.border}`,
-              borderRadius: 10,
-              background: tc.bgCard,
-              padding: "10px 12px",
-              display: "grid",
-              gap: 10,
-            }}
-          >
-            <div style={{ fontWeight: 700, fontSize: 13, color: tc.text }}>
-              Catalogo MCP esteso (preset legacy)
-            </div>
-            <div style={{ fontSize: 12, color: tc.textMuted }}>
-              Se un plugin non è nel catalogo curato, puoi aggiungerlo come MCP legacy e poi migrarlo quando disponibile.
-            </div>
-            <div style={{ display: "grid", gap: 8 }}>
-              {visibleLegacyPresetCatalog.map((entry) => {
-                const legacyKey = `${entry.name.toLowerCase()}::${entry.transport}`;
-                const alreadyAdded = legacyServerKeys.has(legacyKey);
-                return (
-                  <div
-                    key={entry.id}
-                    style={{
-                      border: `1px solid ${alreadyAdded ? "#f59e0b66" : tc.border}`,
-                      borderRadius: 10,
-                      background: alreadyAdded ? "#f59e0b12" : tc.bgCard,
-                      padding: "10px 12px",
-                    }}
-                  >
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                      <span style={{ fontSize: 16 }}>{entry.icon}</span>
-                      <div style={{ fontWeight: 700, color: tc.text }}>{entry.name}</div>
-                      <span
-                        style={{
-                          fontSize: 10,
-                          padding: "2px 6px",
-                          borderRadius: 999,
-                          border: `1px solid ${tc.border}`,
-                          color: tc.textMuted,
-                          textTransform: "uppercase",
-                        }}
-                      >
-                        {entry.transport}
-                      </span>
-                    </div>
-                    <div style={{ fontSize: 12, color: tc.textMuted, marginBottom: 8 }}>
-                      {entry.description}
-                    </div>
-                    <button
-                      type="button"
-                      disabled={busyKey === `legacy-add:${entry.id}` || alreadyAdded}
-                      onClick={() => void handleAddLegacyPreset(entry)}
-                      style={actionButtonStyle(
-                        tc,
-                        busyKey === `legacy-add:${entry.id}` || alreadyAdded,
-                      )}
-                    >
-                      {alreadyAdded
-                        ? "Già presente"
-                        : busyKey === `legacy-add:${entry.id}`
-                          ? "Aggiungo..."
-                          : "Aggiungi come legacy MCP"}
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        </div>
+        <CatalogTab
+          tc={tc}
+          catalogSearch={catalogSearch}
+          installScope={installScope}
+          showAlreadyPresent={showAlreadyPresent}
+          visibleCuratedCatalog={visibleCuratedCatalog}
+          visibleLegacyPresetCatalog={visibleLegacyPresetCatalog}
+          installedSlugSet={installedSlugSet}
+          legacyServerKeys={legacyServerKeys}
+          settingsByKey={settingsByKey}
+          catalogReleaseChoice={catalogReleaseChoice}
+          busyKey={busyKey}
+          onCatalogSearchChange={setCatalogSearch}
+          onInstallScopeChange={setInstallScope}
+          onToggleShowAlreadyPresent={() => setShowAlreadyPresent((v) => !v)}
+          onCatalogReleaseChoiceChange={(itemId, version) =>
+            setCatalogReleaseChoice((prev) => ({ ...prev, [itemId]: version }))
+          }
+          onInstall={(item) => void handleInstall(item)}
+          onAddLegacyPreset={(entry) => void handleAddLegacyPreset(entry)}
+        />
       )}
 
       {activeTab === "policy" && (
-        <div style={{ display: "grid", gap: 10 }}>
-          {installed.length === 0 && (
-            <div style={{ color: tc.textMuted, fontSize: 12 }}>Nessun plugin installato.</div>
-          )}
-          {installed.map((plugin) => {
-            const draft = policyDrafts[plugin.id] ?? {
-              mode: "all" as const,
-              tools: "",
-              blockedTools: "",
-            };
-            return (
-              <div
-                key={plugin.id}
-                style={{
-                  border: `1px solid ${tc.border}`,
-                  borderRadius: 10,
-                  background: tc.bgCard,
-                  padding: "12px 14px",
-                }}
-              >
-                <div style={{ fontWeight: 700, fontSize: 13, color: tc.text, marginBottom: 8 }}>
-                  {plugin.name}
-                </div>
-                <div style={{ display: "grid", gap: 8 }}>
-                  <select
-                    value={draft.mode}
-                    disabled={!plugin.canManage}
-                    onChange={(event) =>
-                      setPolicyDrafts((prev) => ({
-                        ...prev,
-                        [plugin.id]: { ...draft, mode: event.target.value as PluginToolPolicy["mode"] },
-                      }))
-                    }
-                    style={selectStyle(tc)}
-                  >
-                    <option value="all">All</option>
-                    <option value="allowlist">Allowlist</option>
-                    <option value="denylist">Denylist</option>
-                  </select>
-                  <input
-                    value={draft.tools}
-                    disabled={!plugin.canManage}
-                    onChange={(event) =>
-                      setPolicyDrafts((prev) => ({
-                        ...prev,
-                        [plugin.id]: { ...draft, tools: event.target.value },
-                      }))
-                    }
-                    placeholder="Tool consentiti (CSV)"
-                    style={inputStyle(tc)}
-                  />
-                  <input
-                    value={draft.blockedTools}
-                    disabled={!plugin.canManage}
-                    onChange={(event) =>
-                      setPolicyDrafts((prev) => ({
-                        ...prev,
-                        [plugin.id]: { ...draft, blockedTools: event.target.value },
-                      }))
-                    }
-                    placeholder="Tool bloccati (CSV)"
-                    style={inputStyle(tc)}
-                  />
-                  <div>
-                    <button
-                      type="button"
-                      disabled={!plugin.canManage || busyKey === `policy:${plugin.id}`}
-                      onClick={() => void handleSavePolicy(plugin)}
-                      style={actionButtonStyle(tc, !plugin.canManage || busyKey === `policy:${plugin.id}`)}
-                    >
-                      {busyKey === `policy:${plugin.id}` ? "Salvo..." : "Salva policy"}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
+        <PolicyTab
+          tc={tc}
+          installed={installed}
+          policyDrafts={policyDrafts}
+          busyKey={busyKey}
+          onPolicyDraftChange={(pluginId, draft) =>
+            setPolicyDrafts((prev) => ({ ...prev, [pluginId]: draft }))
+          }
+          onSavePolicy={(plugin) => void handleSavePolicy(plugin)}
+        />
       )}
 
       {activeTab === "legacy" && (
-        <div style={{ display: "grid", gap: 10 }}>
-          <div style={{ fontSize: 12, color: tc.textMuted }}>
-            MCP legacy rilevati. Se mappabili, puoi migrarli in plugin con un click.
-          </div>
-          {legacyConnectors.length === 0 && (
-            <div style={{ fontSize: 12, color: tc.textMuted }}>
-              Nessun connettore legacy rilevato.
-            </div>
-          )}
-          {legacyConnectors.map((server) => {
-            const slug = detectLegacyMigratableSlug(server);
-            const isBuiltin = (server.transport as string) === "builtin";
-            const isNexusBridge = isNexusBrowserBridgeLocal(server);
-            return (
-              <div
-                key={server.id}
-                style={{
-                  border: `1px solid ${tc.border}`,
-                  borderRadius: 10,
-                  background: tc.bgCard,
-                  padding: "10px 12px",
-                }}
-              >
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <div style={{ fontWeight: 700, fontSize: 13, color: tc.text }}>{server.name}</div>
-                  <span
-                    style={{
-                      fontSize: 10,
-                      border: `1px solid ${tc.border}`,
-                      borderRadius: 999,
-                      padding: "2px 6px",
-                      color: tc.textMuted,
-                      textTransform: "uppercase",
-                    }}
-                  >
-                    {server.transport}
-                  </span>
-                  <span style={{ fontSize: 11, color: tc.textMuted }}>
-                    {server.enabled ? "enabled" : "disabled"}
-                  </span>
-                  {isBuiltin && (
-                    <span
-                      style={{
-                        fontSize: 10,
-                        border: "1px solid #22c55e66",
-                        borderRadius: 999,
-                        padding: "2px 6px",
-                        color: "#16a34a",
-                        textTransform: "uppercase",
-                      }}
-                      title="MCP integrato nel core Nexus (non è un legacy da migrare)"
-                    >
-                      integrato
-                    </span>
-                  )}
-                  {isNexusBridge && !isBuiltin && (
-                    <span
-                      style={{
-                        fontSize: 10,
-                        border: "1px solid #22c55e66",
-                        borderRadius: 999,
-                        padding: "2px 6px",
-                        color: "#16a34a",
-                        textTransform: "uppercase",
-                      }}
-                      title="Connettore locale Nexus Browser Bridge: è già un MCP HTTP pronto all'uso (migrazione non necessaria)."
-                    >
-                      integrato
-                    </span>
-                  )}
-                  {slug && (
-                    <span
-                      style={{
-                        fontSize: 10,
-                        border: "1px solid #22c55e66",
-                        borderRadius: 999,
-                        padding: "2px 6px",
-                        color: "#16a34a",
-                        textTransform: "uppercase",
-                      }}
-                    >
-                      migrabile → {slug}
-                    </span>
-                  )}
-                </div>
-                <div style={{ marginTop: 4, fontSize: 11, color: tc.textMuted }}>
-                  {server.transport === "http"
-                    ? server.url
-                    : `${server.command ?? ""} ${(server.args ?? []).join(" ")}`.trim()}
-                </div>
-                {isBuiltin && (
-                  <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
-                    <div
-                      style={{
-                        fontSize: 12,
-                        color: tc.textMuted,
-                        fontWeight: 600,
-                      }}
-                      title="Tool esposti dal server integrato Nexus Builtin"
-                    >
-                      Tool disponibili (Nexus Builtin)
-                    </div>
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                      {builtinToolHints.map((name) => (
-                        <span
-                          key={name}
-                          style={{
-                            fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-                            fontSize: 11,
-                            padding: "3px 6px",
-                            borderRadius: 999,
-                            border: `1px solid ${tc.border}`,
-                            background: tc.bgInput,
-                            color: tc.text,
-                          }}
-                        >
-                          {name}
-                        </span>
-                      ))}
-                    </div>
-                    <div style={{ fontSize: 11, color: tc.textMuted }}>
-                      Questi tool servono per scoprire/eseguire tool MCP esterni a runtime (senza inviare tutta la lista al provider).
-                    </div>
-                    <div style={{ fontSize: 11, color: tc.textMuted }}>
-                      Elenco completo: <strong>Admin → Template Prompt → MCP Tools → Tool disponibili</strong>.
-                    </div>
-                  </div>
-                )}
-                <div style={{ marginTop: 8 }}>
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
-                    <button
-                      type="button"
-                      disabled={isBuiltin || isNexusBridge || !slug || busyKey === `legacy-migrate:${server.id}`}
-                      onClick={() => void handleMigrateLegacy(server)}
-                      style={actionButtonStyle(
-                        tc,
-                        isBuiltin || isNexusBridge || !slug || busyKey === `legacy-migrate:${server.id}`,
-                      )}
-                    >
-                      {isBuiltin
-                        ? "Già integrato"
-                        : isNexusBridge
-                          ? "Connettore Nexus"
-                        : !slug
-                          ? "Non migrabile automaticamente"
-                        : busyKey === `legacy-migrate:${server.id}`
-                          ? "Migrazione..."
-                          : "Migra a plugin"}
-                    </button>
-                    <button
-                      type="button"
-                      disabled={isBuiltin || busyKey === `legacy-delete:${server.id}`}
-                      onClick={() => void handleDeleteLegacyMcp(server)}
-                      style={actionButtonStyle(tc, isBuiltin || busyKey === `legacy-delete:${server.id}`)}
-                    >
-                      {isBuiltin ? "Integrato" : busyKey === `legacy-delete:${server.id}` ? "Elimino..." : "Elimina MCP"}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
+        <LegacyMcpList
+          tc={tc}
+          legacyConnectors={legacyConnectors}
+          busyKey={busyKey}
+          onMigrate={(server) => void handleMigrateLegacy(server)}
+          onDelete={(server) => void handleDeleteLegacyMcp(server)}
+        />
       )}
     </div>
   );
-}
-
-function actionButtonStyle(
-  tc: ReturnType<typeof useThemeColors>,
-  disabled = false,
-): React.CSSProperties {
-  return {
-    border: `1px solid ${tc.accent}`,
-    background: `${tc.accent}15`,
-    color: tc.accent,
-    borderRadius: 7,
-    padding: "5px 10px",
-    fontSize: 12,
-    cursor: disabled ? "not-allowed" : "pointer",
-    fontWeight: 600,
-    opacity: disabled ? 0.55 : 1,
-  };
-}
-
-function inputStyle(tc: ReturnType<typeof useThemeColors>): React.CSSProperties {
-  return {
-    width: "100%",
-    border: `1px solid ${tc.border}`,
-    background: tc.bgInput,
-    color: tc.text,
-    borderRadius: 8,
-    padding: "7px 10px",
-    fontSize: 12,
-    boxSizing: "border-box",
-  };
-}
-
-function selectStyle(
-  tc: ReturnType<typeof useThemeColors>,
-  width = 150,
-): React.CSSProperties {
-  return {
-    minWidth: width,
-    border: `1px solid ${tc.border}`,
-    background: tc.bgInput,
-    color: tc.text,
-    borderRadius: 8,
-    padding: "6px 8px",
-    fontSize: 12,
-  };
 }

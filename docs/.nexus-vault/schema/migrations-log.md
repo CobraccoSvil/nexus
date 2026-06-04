@@ -6,12 +6,12 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: 171c2da1220f4e3ea87358c54516a91feafa8061
+source_commit: 501c438b36541671b6ce6f0a562baeeacd4f835c
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T09:20:41Z
+updated_at: 2026-06-04T10:06:29Z
 nexus_meta_version: 1
 ---
 
@@ -301,7 +301,8 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0287_agent_tool_result_cache.sql` | Migrazione 0287 — ADR 0016 Fase A.5: cache tool_result via Postgres. |
 | `0288_playwright_preflight_setting.sql` | Migrazione 0288 — Pre-flight check librerie chromium-headless-shell. |
 | `0289_sudo_manager.sql` | Migrazione 0289 — Sudo Manager Livello 1 (whitelist). |
+| `0290_playwright_deps_ubuntu24.sql` | Migrazione 0290 — Fix command_template playwright-install-deps per Ubuntu 24.04 noble. |
 
-**Totale**: 280 migrazioni.
+**Totale**: 281 migrazioni.
 
-Ultima migrazione: `0289_sudo_manager.sql`.
+Ultima migrazione: `0290_playwright_deps_ubuntu24.sql`.

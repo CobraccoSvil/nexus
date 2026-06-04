@@ -1,0 +1,190 @@
+"use client";
+
+import type { McpServer } from "../../../lib/api-client";
+import type { Theme } from "../../../lib/theme";
+import { detectLegacyMigratableSlug, isNexusBrowserBridgeLocal } from "./plugin-helpers";
+import { actionButtonStyle } from "./plugin-styles";
+
+const BUILTIN_TOOL_HINTS = ["nexus_mcp_tool_search", "nexus_mcp_tool_call"];
+
+interface LegacyMcpListProps {
+  tc: Theme;
+  legacyConnectors: McpServer[];
+  busyKey: string | null;
+  onMigrate: (server: McpServer) => void;
+  onDelete: (server: McpServer) => void;
+}
+
+export function LegacyMcpList({
+  tc,
+  legacyConnectors,
+  busyKey,
+  onMigrate,
+  onDelete,
+}: LegacyMcpListProps) {
+  return (
+    <div style={{ display: "grid", gap: 10 }}>
+      <div style={{ fontSize: 12, color: tc.textMuted }}>
+        MCP legacy rilevati. Se mappabili, puoi migrarli in plugin con un click.
+      </div>
+      {legacyConnectors.length === 0 && (
+        <div style={{ fontSize: 12, color: tc.textMuted }}>
+          Nessun connettore legacy rilevato.
+        </div>
+      )}
+      {legacyConnectors.map((server) => {
+        const slug = detectLegacyMigratableSlug(server);
+        const isBuiltin = (server.transport as string) === "builtin";
+        const isNexusBridge = isNexusBrowserBridgeLocal(server);
+        return (
+          <div
+            key={server.id}
+            style={{
+              border: `1px solid ${tc.border}`,
+              borderRadius: 10,
+              background: tc.bgCard,
+              padding: "10px 12px",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ fontWeight: 700, fontSize: 13, color: tc.text }}>{server.name}</div>
+              <span
+                style={{
+                  fontSize: 10,
+                  border: `1px solid ${tc.border}`,
+                  borderRadius: 999,
+                  padding: "2px 6px",
+                  color: tc.textMuted,
+                  textTransform: "uppercase",
+                }}
+              >
+                {server.transport}
+              </span>
+              <span style={{ fontSize: 11, color: tc.textMuted }}>
+                {server.enabled ? "enabled" : "disabled"}
+              </span>
+              {isBuiltin && (
+                <span
+                  style={{
+                    fontSize: 10,
+                    border: "1px solid #22c55e66",
+                    borderRadius: 999,
+                    padding: "2px 6px",
+                    color: "#16a34a",
+                    textTransform: "uppercase",
+                  }}
+                  title="MCP integrato nel core Nexus (non è un legacy da migrare)"
+                >
+                  integrato
+                </span>
+              )}
+              {isNexusBridge && !isBuiltin && (
+                <span
+                  style={{
+                    fontSize: 10,
+                    border: "1px solid #22c55e66",
+                    borderRadius: 999,
+                    padding: "2px 6px",
+                    color: "#16a34a",
+                    textTransform: "uppercase",
+                  }}
+                  title="Connettore locale Nexus Browser Bridge: è già un MCP HTTP pronto all'uso (migrazione non necessaria)."
+                >
+                  integrato
+                </span>
+              )}
+              {slug && (
+                <span
+                  style={{
+                    fontSize: 10,
+                    border: "1px solid #22c55e66",
+                    borderRadius: 999,
+                    padding: "2px 6px",
+                    color: "#16a34a",
+                    textTransform: "uppercase",
+                  }}
+                >
+                  migrabile → {slug}
+                </span>
+              )}
+            </div>
+            <div style={{ marginTop: 4, fontSize: 11, color: tc.textMuted }}>
+              {server.transport === "http"
+                ? server.url
+                : `${server.command ?? ""} ${(server.args ?? []).join(" ")}`.trim()}
+            </div>
+            {isBuiltin && (
+              <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: tc.textMuted,
+                    fontWeight: 600,
+                  }}
+                  title="Tool esposti dal server integrato Nexus Builtin"
+                >
+                  Tool disponibili (Nexus Builtin)
+                </div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {BUILTIN_TOOL_HINTS.map((name) => (
+                    <span
+                      key={name}
+                      style={{
+                        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                        fontSize: 11,
+                        padding: "3px 6px",
+                        borderRadius: 999,
+                        border: `1px solid ${tc.border}`,
+                        background: tc.bgInput,
+                        color: tc.text,
+                      }}
+                    >
+                      {name}
+                    </span>
+                  ))}
+                </div>
+                <div style={{ fontSize: 11, color: tc.textMuted }}>
+                  Questi tool servono per scoprire/eseguire tool MCP esterni a runtime (senza inviare tutta la lista al provider).
+                </div>
+                <div style={{ fontSize: 11, color: tc.textMuted }}>
+                  Elenco completo: <strong>Admin → Template Prompt → MCP Tools → Tool disponibili</strong>.
+                </div>
+              </div>
+            )}
+            <div style={{ marginTop: 8 }}>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+                <button
+                  type="button"
+                  disabled={isBuiltin || isNexusBridge || !slug || busyKey === `legacy-migrate:${server.id}`}
+                  onClick={() => onMigrate(server)}
+                  style={actionButtonStyle(
+                    tc,
+                    isBuiltin || isNexusBridge || !slug || busyKey === `legacy-migrate:${server.id}`,
+                  )}
+                >
+                  {isBuiltin
+                    ? "Già integrato"
+                    : isNexusBridge
+                      ? "Connettore Nexus"
+                    : !slug
+                      ? "Non migrabile automaticamente"
+                    : busyKey === `legacy-migrate:${server.id}`
+                      ? "Migrazione..."
+                      : "Migra a plugin"}
+                </button>
+                <button
+                  type="button"
+                  disabled={isBuiltin || busyKey === `legacy-delete:${server.id}`}
+                  onClick={() => onDelete(server)}
+                  style={actionButtonStyle(tc, isBuiltin || busyKey === `legacy-delete:${server.id}`)}
+                >
+                  {isBuiltin ? "Integrato" : busyKey === `legacy-delete:${server.id}` ? "Elimino..." : "Elimina MCP"}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
