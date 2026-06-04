@@ -14,15 +14,13 @@ pub struct ProjectDeleteTool;
 
 #[async_trait]
 impl NexusToolHandler for ProjectDeleteTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let project_id_str = args
             .get("project_id")
             .and_then(Value::as_str)
-            .ok_or_else(|| NexusToolError::BadInput("Parametro 'project_id' obbligatorio".into()))?;
+            .ok_or_else(|| {
+                NexusToolError::BadInput("Parametro 'project_id' obbligatorio".into())
+            })?;
 
         let target_id = Uuid::parse_str(project_id_str)
             .map_err(|_| NexusToolError::BadInput("project_id non valido".into()))?;
@@ -43,13 +41,11 @@ impl NexusToolHandler for ProjectDeleteTool {
             .map_err(|e| NexusToolError::BadInput(format!("nexus db: {}", e)))?;
 
         // Verifica che il progetto esista e l'utente ne sia owner
-        let row = sqlx::query(
-            "SELECT name, owner_user_id FROM projects WHERE id = $1",
-        )
-        .bind(target_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| NexusToolError::BadInput(format!("lookup progetto: {}", e)))?;
+        let row = sqlx::query("SELECT name, owner_user_id FROM projects WHERE id = $1")
+            .bind(target_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| NexusToolError::BadInput(format!("lookup progetto: {}", e)))?;
 
         let row = match row {
             Some(r) => r,

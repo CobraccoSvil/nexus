@@ -116,7 +116,7 @@ pub async fn index_text(
         .await?;
 
     let mut points = Vec::with_capacity(chunks.len());
-    
+
     for (idx, (chunk_text, vector)) in chunks.iter().zip(vectors.iter()).enumerate() {
         let name = format!("{}::{}::{}", source_kind.as_str(), source_id, idx);
         let pid = stable_point_id(&name);

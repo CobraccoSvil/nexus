@@ -8,7 +8,11 @@ pub struct ApiRouteCountTool;
 
 #[async_trait]
 impl NexusToolHandler for ApiRouteCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(
             &ctx.project_root,
             &[
@@ -33,5 +37,7 @@ impl NexusToolHandler for ApiRouteCountTool {
             "total_routes": total,
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

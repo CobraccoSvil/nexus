@@ -22,11 +22,7 @@ fn type_name(v: &Value) -> &'static str {
 
 #[async_trait]
 impl NexusToolHandler for JsonParseTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let content = if let Some(c) = args.get("content").and_then(Value::as_str) {
             c.to_string()
         } else if let Some(path) = args.get("path").and_then(Value::as_str) {
@@ -95,11 +91,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_valid() {
-        let ctx = NexusToolContext::new(
-            std::env::temp_dir(),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-        );
+        let ctx = NexusToolContext::new(std::env::temp_dir(), uuid::Uuid::nil(), uuid::Uuid::nil());
         let out = JsonParseTool
             .execute(&ctx, &json!({"content": "{\"a\": 1}"}))
             .await
@@ -110,11 +102,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_invalid() {
-        let ctx = NexusToolContext::new(
-            std::env::temp_dir(),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-        );
+        let ctx = NexusToolContext::new(std::env::temp_dir(), uuid::Uuid::nil(), uuid::Uuid::nil());
         let out = JsonParseTool
             .execute(&ctx, &json!({"content": "{broken"}))
             .await

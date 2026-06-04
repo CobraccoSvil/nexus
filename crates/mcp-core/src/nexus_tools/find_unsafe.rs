@@ -9,13 +9,7 @@ use std::path::Path;
 
 pub struct FindUnsafeTool;
 
-fn walk_unsafe(
-    root: &Path,
-    dir: &Path,
-    out: &mut Vec<Value>,
-    limit: usize,
-    depth: usize,
-) {
+fn walk_unsafe(root: &Path, dir: &Path, out: &mut Vec<Value>, limit: usize, depth: usize) {
     if out.len() >= limit || depth > 8 {
         return;
     }
@@ -83,11 +77,7 @@ fn walk_unsafe(
 
 #[async_trait]
 impl NexusToolHandler for FindUnsafeTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let limit = args
             .get("max_results")
             .and_then(Value::as_u64)

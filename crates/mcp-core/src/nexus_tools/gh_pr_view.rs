@@ -11,11 +11,7 @@ pub struct GhPrViewTool;
 
 #[async_trait]
 impl NexusToolHandler for GhPrViewTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let number = args
             .get("number")
             .and_then(Value::as_u64)

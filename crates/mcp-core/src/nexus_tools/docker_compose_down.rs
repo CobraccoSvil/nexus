@@ -10,7 +10,10 @@ use serde_json::{json, Value};
 
 pub struct DockerComposeDownTool;
 
-fn validate_compose_path(root: &std::path::Path, compose_file: &str) -> Result<String, NexusToolError> {
+fn validate_compose_path(
+    root: &std::path::Path,
+    compose_file: &str,
+) -> Result<String, NexusToolError> {
     if compose_file.is_empty() {
         return Err(NexusToolError::BadInput(
             "Parametro 'compose_file' obbligatorio. Non e' permesso usare compose globali.".into(),
@@ -33,22 +36,26 @@ fn validate_compose_path(root: &std::path::Path, compose_file: &str) -> Result<S
 
 #[async_trait]
 impl NexusToolHandler for DockerComposeDownTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let compose_file = args
             .get("compose_file")
             .and_then(Value::as_str)
-            .ok_or_else(|| NexusToolError::BadInput("Parametro 'compose_file' obbligatorio".into()))?
+            .ok_or_else(|| {
+                NexusToolError::BadInput("Parametro 'compose_file' obbligatorio".into())
+            })?
             .trim()
             .to_string();
 
         let abs_compose = validate_compose_path(&ctx.project_root, &compose_file)?;
 
-        let remove_volumes = args.get("volumes").and_then(Value::as_bool).unwrap_or(false);
-        let remove_images = args.get("rmi").and_then(Value::as_str).map(|s| s.to_string());
+        let remove_volumes = args
+            .get("volumes")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let remove_images = args
+            .get("rmi")
+            .and_then(Value::as_str)
+            .map(|s| s.to_string());
 
         let mut cmd_args: Vec<String> = vec![
             "compose".to_string(),

@@ -40,7 +40,10 @@ fn build_rules() -> Vec<Rule> {
         },
         Rule {
             name: "aws_secret_key",
-            pattern: Regex::new(r#"(?i)aws_secret_access_key[^\n]{0,20}['"][A-Za-z0-9/+=]{40}['"]"#).unwrap(),
+            pattern: Regex::new(
+                r#"(?i)aws_secret_access_key[^\n]{0,20}['"][A-Za-z0-9/+=]{40}['"]"#,
+            )
+            .unwrap(),
         },
         Rule {
             name: "github_token",
@@ -52,7 +55,10 @@ fn build_rules() -> Vec<Rule> {
         },
         Rule {
             name: "jwt_token",
-            pattern: Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}").unwrap(),
+            pattern: Regex::new(
+                r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+            )
+            .unwrap(),
         },
         Rule {
             name: "hardcoded_password",
@@ -67,11 +73,7 @@ fn build_rules() -> Vec<Rule> {
 
 #[async_trait]
 impl NexusToolHandler for SecretScanTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let max_files = args
             .get("max_files")
             .and_then(Value::as_u64)
@@ -252,10 +254,7 @@ mod tests {
     #[test]
     fn test_rule_pem_private_key() {
         let rules = build_rules();
-        let pem = rules
-            .iter()
-            .find(|r| r.name == "private_key_pem")
-            .unwrap();
+        let pem = rules.iter().find(|r| r.name == "private_key_pem").unwrap();
         assert!(pem.pattern.is_match("-----BEGIN RSA PRIVATE KEY-----"));
         assert!(pem.pattern.is_match("-----BEGIN OPENSSH PRIVATE KEY-----"));
     }

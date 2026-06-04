@@ -54,9 +54,8 @@ impl MetaDocGenerator for ChangelogGenerator {
         };
         let commit_msg: String = row.try_get("commit_msg").unwrap_or_default();
         let files_changed: Vec<String> = row.try_get("files_changed").unwrap_or_default();
-        let processed_at: DateTime<Utc> = row
-            .try_get("processed_at")
-            .unwrap_or_else(|_| Utc::now());
+        let processed_at: DateTime<Utc> =
+            row.try_get("processed_at").unwrap_or_else(|_| Utc::now());
 
         // Soglia significance
         let threshold: f32 = sqlx::query_scalar::<_, String>(
@@ -138,23 +137,38 @@ impl MetaDocGenerator for ChangelogGenerator {
         if files_changed.iter().any(|f| f.starts_with("apps/")) {
             related.push("[[frontend-nextjs]]");
         }
-        if files_changed.iter().any(|f| f.starts_with("db/migrations/")) {
+        if files_changed
+            .iter()
+            .any(|f| f.starts_with("db/migrations/"))
+        {
             related.push("[[postgres-tables]]");
             related.push("[[migrations-log]]");
         }
-        if files_changed.iter().any(|f| f.contains("router") || f.contains("routes") || f.ends_with("_router.rs")) {
+        if files_changed
+            .iter()
+            .any(|f| f.contains("router") || f.contains("routes") || f.ends_with("_router.rs"))
+        {
             related.push("[[rest-endpoints]]");
         }
-        if files_changed.iter().any(|f| f.contains("vector_memory") || f.contains("qdrant")) {
+        if files_changed
+            .iter()
+            .any(|f| f.contains("vector_memory") || f.contains("qdrant"))
+        {
             related.push("[[qdrant-collections]]");
         }
         if files_changed.iter().any(|f| f.contains("knowledge")) {
             related.push("[[knowledge-base-funzionamento]]");
         }
-        if files_changed.iter().any(|f| f.contains("meta_docs") || f.contains("meta-docs")) {
+        if files_changed
+            .iter()
+            .any(|f| f.contains("meta_docs") || f.contains("meta-docs"))
+        {
             related.push("[[meta-vault-architettura]]");
         }
-        if files_changed.iter().any(|f| f.contains("routing") || f.contains("provider")) {
+        if files_changed
+            .iter()
+            .any(|f| f.contains("routing") || f.contains("provider"))
+        {
             related.push("[[multi-provider-routing]]");
             related.push("[[routing-matrix]]");
         }
@@ -238,7 +252,10 @@ mod tests {
 
     #[test]
     fn heuristic_feat_high() {
-        let s = compute_significance_heuristic("feat: add knowledge meta-docs vault", &["a.rs".into(), "b.rs".into()]);
+        let s = compute_significance_heuristic(
+            "feat: add knowledge meta-docs vault",
+            &["a.rs".into(), "b.rs".into()],
+        );
         assert!(s >= 0.45, "got {s}");
     }
 

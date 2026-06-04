@@ -8,8 +8,15 @@ pub struct TestBenchCountTool;
 
 #[async_trait]
 impl NexusToolHandler for TestBenchCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let (counts, files) = scan_substrings(&ctx.project_root, &["#[bench]", "criterion_group!", "criterion_main!"]);
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let (counts, files) = scan_substrings(
+            &ctx.project_root,
+            &["#[bench]", "criterion_group!", "criterion_main!"],
+        );
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -18,5 +25,7 @@ impl NexusToolHandler for TestBenchCountTool {
             "criterion_main": counts[2],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

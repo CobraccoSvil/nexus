@@ -143,7 +143,10 @@ mod tests {
     async fn test_ensure_binary_found() {
         // 'cargo' è sempre presente durante cargo test
         let r = ensure_binary("cargo").await;
-        assert!(r.is_ok(), "cargo dovrebbe essere sempre disponibile nei test");
+        assert!(
+            r.is_ok(),
+            "cargo dovrebbe essere sempre disponibile nei test"
+        );
     }
 
     #[tokio::test]

@@ -3,9 +3,9 @@
 //! Salva il backup in `project_root/.nexus/backups/<timestamp>.sql`.
 //! Supporta formato plain o custom, schema-only opzionale.
 
+use super::db_helper;
 use super::exec;
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
-use super::db_helper;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -19,7 +19,9 @@ pub struct ProjectDbBackupTool;
 /// - DSN senza porta (default 5432)
 /// - DSN senza credenziali
 /// - Query parameters (`?sslmode=require`) ignorati
-pub(crate) fn parse_dsn_parts(dsn: &str) -> Result<(String, String, String, String, String), NexusToolError> {
+pub(crate) fn parse_dsn_parts(
+    dsn: &str,
+) -> Result<(String, String, String, String, String), NexusToolError> {
     // Formato atteso: postgres://user:password@host:port/dbname?params
     let s = dsn
         .strip_prefix("postgres://")
@@ -73,7 +75,9 @@ pub(crate) fn parse_dsn_parts(dsn: &str) -> Result<(String, String, String, Stri
     let dbname = url_decode(dbname_raw);
 
     if dbname.is_empty() {
-        return Err(NexusToolError::BadInput("Nome database mancante nel DSN".into()));
+        return Err(NexusToolError::BadInput(
+            "Nome database mancante nel DSN".into(),
+        ));
     }
 
     Ok((host, port, dbname, user, password))
@@ -110,12 +114,11 @@ fn url_decode(s: &str) -> String {
 
 #[async_trait]
 impl NexusToolHandler for ProjectDbBackupTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
-        let schema_only = args.get("schema_only").and_then(Value::as_bool).unwrap_or(false);
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
+        let schema_only = args
+            .get("schema_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let format = args
             .get("format")
             .and_then(Value::as_str)
@@ -153,11 +156,16 @@ impl NexusToolHandler for ProjectDbBackupTool {
         let backup_path_str = backup_path.to_string_lossy().to_string();
 
         let mut cmd_args: Vec<String> = vec![
-            "-h".to_string(), host,
-            "-p".to_string(), port,
-            "-U".to_string(), user,
-            "-d".to_string(), dbname.clone(),
-            "-f".to_string(), backup_path_str.clone(),
+            "-h".to_string(),
+            host,
+            "-p".to_string(),
+            port,
+            "-U".to_string(),
+            user,
+            "-d".to_string(),
+            dbname.clone(),
+            "-f".to_string(),
+            backup_path_str.clone(),
         ];
 
         if format == "custom" {
@@ -283,7 +291,8 @@ mod tests {
 
     #[test]
     fn test_parse_dsn_simple() {
-        let (h, p, db, u, pw) = parse_dsn_parts("postgres://admin:secret@db.local:5433/mydb").unwrap();
+        let (h, p, db, u, pw) =
+            parse_dsn_parts("postgres://admin:secret@db.local:5433/mydb").unwrap();
         assert_eq!(h, "db.local");
         assert_eq!(p, "5433");
         assert_eq!(db, "mydb");
@@ -310,7 +319,8 @@ mod tests {
     #[test]
     fn test_parse_dsn_password_url_encoded() {
         // Password con caratteri speciali URL-encoded (%40 = @, %3A = :, %23 = #)
-        let (_, _, _, u, pw) = parse_dsn_parts("postgres://admin:p%40ss%3Aw%23rd@host:5432/db").unwrap();
+        let (_, _, _, u, pw) =
+            parse_dsn_parts("postgres://admin:p%40ss%3Aw%23rd@host:5432/db").unwrap();
         assert_eq!(u, "admin");
         assert_eq!(pw, "p@ss:w#rd");
     }
@@ -318,7 +328,8 @@ mod tests {
     #[test]
     fn test_parse_dsn_password_with_special_chars() {
         // Password complessa con molti caratteri speciali
-        let (_, _, _, _, pw) = parse_dsn_parts("postgres://u:My%21P%40ss%3Dw0rd%26x@host/db").unwrap();
+        let (_, _, _, _, pw) =
+            parse_dsn_parts("postgres://u:My%21P%40ss%3Dw0rd%26x@host/db").unwrap();
         assert_eq!(pw, "My!P@ss=w0rd&x");
     }
 
@@ -330,7 +341,8 @@ mod tests {
 
     #[test]
     fn test_parse_dsn_with_query_params() {
-        let (h, p, db, _, _) = parse_dsn_parts("postgres://u:p@host:5433/mydb?sslmode=require&timeout=30").unwrap();
+        let (h, p, db, _, _) =
+            parse_dsn_parts("postgres://u:p@host:5433/mydb?sslmode=require&timeout=30").unwrap();
         assert_eq!(h, "host");
         assert_eq!(p, "5433");
         assert_eq!(db, "mydb");

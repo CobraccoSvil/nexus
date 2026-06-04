@@ -60,7 +60,8 @@ pub async fn browser_check(
         let mut found = context.root_path.clone();
         for c in &candidates {
             let p = context.root_path.join(c);
-            if p.join("playwright.config.ts").is_file() || p.join("playwright.config.js").is_file() {
+            if p.join("playwright.config.ts").is_file() || p.join("playwright.config.js").is_file()
+            {
                 found = p;
                 break;
             }
@@ -84,13 +85,17 @@ pub async fn browser_check(
     let base_url = if let Some(u) = explicit_base_url {
         u.to_string()
     } else {
-        let port_rows = sqlx::query(
-            "SELECT port, label FROM nexus_port_allocations WHERE project_id=$1"
-        )
-        .bind(project_id)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB query ports: {}", e)))?;
+        let port_rows =
+            sqlx::query("SELECT port, label FROM nexus_port_allocations WHERE project_id=$1")
+                .bind(project_id)
+                .fetch_all(&state.db)
+                .await
+                .map_err(|e| {
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("DB query ports: {}", e),
+                    )
+                })?;
 
         // pick_dev_port semplificato
         let dev_kw = ["dev", "app", "http", "web", "frontend", "vite", "next"];
@@ -124,9 +129,12 @@ pub async fn browser_check(
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("spawn playwright: {}", e)))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("spawn playwright: {}", e),
+        )
+    })?;
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -136,8 +144,21 @@ pub async fn browser_check(
         child.wait(),
     )
     .await
-    .map_err(|_| api_error(StatusCode::REQUEST_TIMEOUT, format!("timeout {}s eseguendo browser-check", BROWSER_CHECK_TIMEOUT_SECS)))?
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("wait playwright: {}", e)))?;
+    .map_err(|_| {
+        api_error(
+            StatusCode::REQUEST_TIMEOUT,
+            format!(
+                "timeout {}s eseguendo browser-check",
+                BROWSER_CHECK_TIMEOUT_SECS
+            ),
+        )
+    })?
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("wait playwright: {}", e),
+        )
+    })?;
 
     let mut stdout_buf = String::new();
     let mut stderr_buf = String::new();
@@ -153,7 +174,10 @@ pub async fn browser_check(
         .lines()
         .filter(|l| {
             let lc = l.to_lowercase();
-            lc.contains("error") || lc.contains("syntaxerror") || lc.contains("typeerror") || lc.contains("referenceerror")
+            lc.contains("error")
+                || lc.contains("syntaxerror")
+                || lc.contains("typeerror")
+                || lc.contains("referenceerror")
         })
         .take(20)
         .map(|s| s.trim().to_string())

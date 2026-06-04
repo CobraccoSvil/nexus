@@ -34,10 +34,7 @@ struct InconsistentImport {
     suggested_path: Option<String>,
 }
 
-pub(super) async fn tool_nexus_verify_scaffold(
-    ctx: &AgentToolContext,
-    input: &Value,
-) -> String {
+pub(super) async fn tool_nexus_verify_scaffold(ctx: &AgentToolContext, input: &Value) -> String {
     let target_rel = input
         .get("target_dir")
         .and_then(Value::as_str)
@@ -81,9 +78,21 @@ pub(super) async fn tool_nexus_verify_scaffold(
 
     // ── 1. Check file critici ───────────────────────────────────────────────
     let critical: &[(&str, &str, Option<&'static str>)] = &[
-        ("index.html", "entry point HTML per Vite", Some("vite_basic_index_html")),
-        ("vite.config.ts", "config Vite (server, plugins, alias)", Some("vite_basic_config")),
-        ("src/main.tsx", "entry point React (createRoot)", Some("vite_basic_main_tsx")),
+        (
+            "index.html",
+            "entry point HTML per Vite",
+            Some("vite_basic_index_html"),
+        ),
+        (
+            "vite.config.ts",
+            "config Vite (server, plugins, alias)",
+            Some("vite_basic_config"),
+        ),
+        (
+            "src/main.tsx",
+            "entry point React (createRoot)",
+            Some("vite_basic_main_tsx"),
+        ),
     ];
     for (path, purpose, tmpl) in critical {
         let full = target.join(path);
@@ -97,16 +106,15 @@ pub(super) async fn tool_nexus_verify_scaffold(
     }
 
     // ── 2. Lettura package.json ────────────────────────────────────────────
-    let pkg_content = fs::read_to_string(&pkg_json_path)
-        .await
-        .unwrap_or_default();
+    let pkg_content = fs::read_to_string(&pkg_json_path).await.unwrap_or_default();
     let pkg: Value = serde_json::from_str(&pkg_content).unwrap_or(json!({}));
     let scripts = pkg.get("scripts").cloned().unwrap_or(json!({}));
     let has_dev = scripts.get("dev").is_some();
     let has_start = scripts.get("start").is_some();
     if !has_dev && !has_start {
         result.package_json_issues.push(
-            "Nessuno script 'dev' o 'start' in package.json: vite non parte con npm run dev/start".into(),
+            "Nessuno script 'dev' o 'start' in package.json: vite non parte con npm run dev/start"
+                .into(),
         );
         result.suggested_fixes.push(json!({
             "type": "edit_package_json",
@@ -130,10 +138,15 @@ pub(super) async fn tool_nexus_verify_scaffold(
     if main_tsx.exists() {
         if let Ok(content) = fs::read_to_string(&main_tsx).await {
             for cap in import_regex().captures_iter(&content) {
-                let path = cap.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+                let path = cap
+                    .get(1)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default();
                 if path.starts_with("./") || path.starts_with("../") {
                     // import relativo: verifica file
-                    if let Some(suggested) = resolve_relative_import(&main_tsx, &path, &target).await {
+                    if let Some(suggested) =
+                        resolve_relative_import(&main_tsx, &path, &target).await
+                    {
                         if suggested != path {
                             result.inconsistent_imports.push(InconsistentImport {
                                 file: "src/main.tsx".into(),
@@ -166,7 +179,10 @@ pub(super) async fn tool_nexus_verify_scaffold(
                         result.inconsistent_imports.push(InconsistentImport {
                             file: "src/main.tsx".into(),
                             import_path: path.clone(),
-                            reason: format!("pkg '{}' non in dependencies/devDependencies", pkg_root),
+                            reason: format!(
+                                "pkg '{}' non in dependencies/devDependencies",
+                                pkg_root
+                            ),
                             suggested_path: Some(format!("npm install {}", pkg_root)),
                         });
                     }

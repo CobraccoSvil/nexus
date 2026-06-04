@@ -169,7 +169,11 @@ pub async fn figma_oauth_callback(
         );
     }
 
-    let Some(code) = query.code.as_deref().filter(|value| !value.trim().is_empty()) else {
+    let Some(code) = query
+        .code
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
         return redirect_with_status(&return_to, "error", Some("Code OAuth mancante"));
     };
 

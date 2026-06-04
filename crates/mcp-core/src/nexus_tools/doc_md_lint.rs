@@ -9,7 +9,10 @@ pub struct DocMdLintTool;
 #[async_trait]
 impl NexusToolHandler for DocMdLintTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let path = args.get("path").and_then(Value::as_str).unwrap_or("README.md");
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("README.md");
         let max_len = args.get("max_line").and_then(Value::as_i64).unwrap_or(120) as usize;
         let pb = std::path::PathBuf::from(path);
         if pb.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -38,5 +41,7 @@ impl NexusToolHandler for DocMdLintTool {
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"},"max_line":{"type":"integer"}}})
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

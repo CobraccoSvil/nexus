@@ -12,13 +12,21 @@ pub struct CaComplexityEstimateTool;
 
 #[async_trait]
 impl NexusToolHandler for CaComplexityEstimateTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(
             &ctx.project_root,
             &["if ", "else if ", " => ", " && ", " || ", "?;"],
         );
         let total: usize = counts.iter().sum();
-        let avg = if files == 0 { 0.0 } else { total as f64 / files as f64 };
+        let avg = if files == 0 {
+            0.0
+        } else {
+            total as f64 / files as f64
+        };
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -32,5 +40,7 @@ impl NexusToolHandler for CaComplexityEstimateTool {
             "avg_per_file": (avg * 100.0).round() / 100.0,
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

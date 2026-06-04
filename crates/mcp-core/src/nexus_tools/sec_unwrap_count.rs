@@ -8,8 +8,15 @@ pub struct SecUnwrapCountTool;
 
 #[async_trait]
 impl NexusToolHandler for SecUnwrapCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let (counts, files) = scan_substrings(&ctx.project_root, &[".unwrap()", ".expect(", ".unwrap_or_else", ".unwrap_or("]);
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let (counts, files) = scan_substrings(
+            &ctx.project_root,
+            &[".unwrap()", ".expect(", ".unwrap_or_else", ".unwrap_or("],
+        );
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -19,5 +26,7 @@ impl NexusToolHandler for SecUnwrapCountTool {
             "unwrap_or": counts[3],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

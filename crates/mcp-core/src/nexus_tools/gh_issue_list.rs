@@ -23,11 +23,7 @@ pub struct GhIssueListTool;
 
 #[async_trait]
 impl NexusToolHandler for GhIssueListTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let state = args
             .get("state")
             .and_then(Value::as_str)

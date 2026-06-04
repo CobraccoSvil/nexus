@@ -92,7 +92,10 @@ pub fn serialize_meta_doc(
     if !related.is_empty() {
         out.push_str("\n## Note correlate\n\n");
         for link in related {
-            out.push_str(&format!("- [[{}]] _({})_\n", link.target_slug, link.rel_type));
+            out.push_str(&format!(
+                "- [[{}]] _({})_\n",
+                link.target_slug, link.rel_type
+            ));
         }
     }
 
@@ -125,7 +128,10 @@ mod tests {
         let (fm, body) = parse_frontmatter(&serialized).expect("parse frontmatter");
         assert_eq!(fm.get("kind").and_then(|v| v.as_str()), Some("adr"));
         assert_eq!(fm.get("slug").and_then(|v| v.as_str()), Some("adr-test"));
-        assert_eq!(fm.get("auto_generated").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            fm.get("auto_generated").and_then(|v| v.as_bool()),
+            Some(true)
+        );
         assert!(body.starts_with("Body content here."));
     }
 }

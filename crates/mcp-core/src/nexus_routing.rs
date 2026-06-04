@@ -72,7 +72,10 @@ pub static NEXUS_AB_FORCED_TOTAL: AtomicU64 = AtomicU64::new(0);
 ///
 /// Se un variant non e' in questa tabella o il tier non e' nel DB, il sito
 /// di chiamata incrementa `NEXUS_AB_FALLBACK_TOTAL` e mantiene la config originale.
-pub fn agent_type_to_model(agent_type: &AgentType, matrix: &RoutingMatrix) -> Option<(String, String)> {
+pub fn agent_type_to_model(
+    agent_type: &AgentType,
+    matrix: &RoutingMatrix,
+) -> Option<(String, String)> {
     let tier_key = agent_type_to_tier(agent_type)?;
     matrix.purpose_model(tier_key)
 }
@@ -82,7 +85,6 @@ const TIER_SONNET: &str = "agent_tier_sonnet";
 const TIER_HAIKU: &str = "agent_tier_haiku";
 
 fn agent_type_to_tier(agent_type: &AgentType) -> Option<&'static str> {
-
     match agent_type {
         // ── Core (4) ─────────────────────────────────────────────────────
         AgentType::Coder => Some(TIER_SONNET),
@@ -167,14 +169,13 @@ fn agent_type_to_tier(agent_type: &AgentType) -> Option<&'static str> {
 /// iniziale), quindi non serve caching aggressivo. Se in futuro serviranno
 /// cadence più alte, valutare una cache atomica con TTL ~5s.
 pub async fn read_nexus_active_routing_pct(db: &PgPool) -> u8 {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT value FROM settings WHERE key = $1 LIMIT 1",
-    )
-    .bind(SETTINGS_KEY_ACTIVE_ROUTING_PCT)
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten();
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM settings WHERE key = $1 LIMIT 1")
+            .bind(SETTINGS_KEY_ACTIVE_ROUTING_PCT)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
 
     let Some((raw,)) = row else {
         return 0;
@@ -211,72 +212,72 @@ pub fn should_override_ab(pct: u8) -> bool {
 pub fn agent_type_to_prompt_key(agent_type: &AgentType) -> &'static str {
     match agent_type {
         // ── Core (4) ─────────────────────────────────────────────────────
-        AgentType::Coder     => "agent.coder.base",
-        AgentType::Tester    => "agent.tester.base",
-        AgentType::Reviewer  => "agent.reviewer.general",
+        AgentType::Coder => "agent.coder.base",
+        AgentType::Tester => "agent.tester.base",
+        AgentType::Reviewer => "agent.reviewer.general",
         AgentType::Architect => "agent.architect.general",
 
         // ── Specializations ───────────────────────────────────────────────
-        AgentType::SecurityArchitect    => "agent.specialized.security_architect",
-        AgentType::PerformanceEngineer  => "agent.specialized.performance_engineer",
-        AgentType::DatabaseDesigner     => "agent.specialized.database_designer",
-        AgentType::FrontendSpecialist   => "agent.specialized.frontend_specialist",
-        AgentType::BackendSpecialist    => "agent.specialized.backend_specialist",
-        AgentType::DevOpsEngineer       => "agent.specialized.devops_engineer",
-        AgentType::CloudArchitect       => "agent.specialized.cloud_architect",
-        AgentType::MobileSpecialist     => "agent.specialized.mobile_specialist",
-        AgentType::DataScientist        => "agent.specialized.data_scientist",
-        AgentType::MLEngineer           => "agent.specialized.ml_engineer",
-        AgentType::QASpecialist         => "agent.specialized.qa_specialist",
-        AgentType::TechLead             => "agent.specialized.tech_lead",
-        AgentType::SREEngineer          => "agent.specialized.sre_engineer",
-        AgentType::APIDesigner          => "agent.specialized.api_designer",
-        AgentType::PromptEngineer       => "agent.specialized.prompt_engineer",
-        AgentType::AgentEngineer        => "agent.specialized.agent_engineer",
-        AgentType::Researcher           => "agent.specialized.researcher",
-        AgentType::Analyst              => "agent.specialized.analyst",
-        AgentType::Optimizer            => "agent.specialized.optimizer",
-        AgentType::Documenter           => "agent.specialized.documenter",
+        AgentType::SecurityArchitect => "agent.specialized.security_architect",
+        AgentType::PerformanceEngineer => "agent.specialized.performance_engineer",
+        AgentType::DatabaseDesigner => "agent.specialized.database_designer",
+        AgentType::FrontendSpecialist => "agent.specialized.frontend_specialist",
+        AgentType::BackendSpecialist => "agent.specialized.backend_specialist",
+        AgentType::DevOpsEngineer => "agent.specialized.devops_engineer",
+        AgentType::CloudArchitect => "agent.specialized.cloud_architect",
+        AgentType::MobileSpecialist => "agent.specialized.mobile_specialist",
+        AgentType::DataScientist => "agent.specialized.data_scientist",
+        AgentType::MLEngineer => "agent.specialized.ml_engineer",
+        AgentType::QASpecialist => "agent.specialized.qa_specialist",
+        AgentType::TechLead => "agent.specialized.tech_lead",
+        AgentType::SREEngineer => "agent.specialized.sre_engineer",
+        AgentType::APIDesigner => "agent.specialized.api_designer",
+        AgentType::PromptEngineer => "agent.specialized.prompt_engineer",
+        AgentType::AgentEngineer => "agent.specialized.agent_engineer",
+        AgentType::Researcher => "agent.specialized.researcher",
+        AgentType::Analyst => "agent.specialized.analyst",
+        AgentType::Optimizer => "agent.specialized.optimizer",
+        AgentType::Documenter => "agent.specialized.documenter",
 
         // ── GitHub Integration (13) ───────────────────────────────────────
-        AgentType::GitHubPRManager          => "agent.github.pr_manager",
-        AgentType::GitHubCodeReviewer       => "agent.github.code_reviewer",
-        AgentType::GitHubIssueAnalyzer      => "agent.github.issue_analyzer",
-        AgentType::GitHubReleaseManager     => "agent.github.release_manager",
-        AgentType::GitHubWorkflowManager    => "agent.github.workflow_manager",
-        AgentType::GitHubSecurityAnalyzer   => "agent.github.security_analyzer",
-        AgentType::GitHubDependencyManager  => "agent.github.dependency_manager",
-        AgentType::GitHubProjectManager     => "agent.github.project_manager",
-        AgentType::GitHubWikiManager        => "agent.github.wiki_manager",
+        AgentType::GitHubPRManager => "agent.github.pr_manager",
+        AgentType::GitHubCodeReviewer => "agent.github.code_reviewer",
+        AgentType::GitHubIssueAnalyzer => "agent.github.issue_analyzer",
+        AgentType::GitHubReleaseManager => "agent.github.release_manager",
+        AgentType::GitHubWorkflowManager => "agent.github.workflow_manager",
+        AgentType::GitHubSecurityAnalyzer => "agent.github.security_analyzer",
+        AgentType::GitHubDependencyManager => "agent.github.dependency_manager",
+        AgentType::GitHubProjectManager => "agent.github.project_manager",
+        AgentType::GitHubWikiManager => "agent.github.wiki_manager",
         AgentType::GitHubDiscussionModerator => "agent.github.discussion_moderator",
-        AgentType::GitHubActionsOptimizer   => "agent.github.actions_optimizer",
-        AgentType::GitHubStatusMonitor      => "agent.github.status_monitor",
-        AgentType::GitHubIntegrationBot     => "agent.github.integration_bot",
+        AgentType::GitHubActionsOptimizer => "agent.github.actions_optimizer",
+        AgentType::GitHubStatusMonitor => "agent.github.status_monitor",
+        AgentType::GitHubIntegrationBot => "agent.github.integration_bot",
 
         // ── General roles (23) ────────────────────────────────────────────
-        AgentType::Debugger               => "agent.general.debugger",
-        AgentType::Refactorer             => "agent.general.refactorer",
-        AgentType::Profiler               => "agent.general.profiler",
-        AgentType::InfraEngineer          => "agent.general.infra_engineer",
-        AgentType::DatabaseAdmin          => "agent.general.database_admin",
-        AgentType::SecurityAuditor        => "agent.general.security_auditor",
-        AgentType::ComplianceOfficer      => "agent.general.compliance_officer",
-        AgentType::UIDesigner             => "agent.general.ui_designer",
-        AgentType::AccessibilityEngineer  => "agent.general.accessibility_engineer",
-        AgentType::DataEngineer           => "agent.general.data_engineer",
-        AgentType::ETLEngineer            => "agent.general.etl_engineer",
-        AgentType::AutomationEngineer     => "agent.general.automation_engineer",
-        AgentType::IntegrationEngineer    => "agent.general.integration_engineer",
-        AgentType::MonitoringEngineer     => "agent.general.monitoring_engineer",
-        AgentType::MigrationEngineer      => "agent.general.migration_engineer",
-        AgentType::ChatbotEngineer        => "agent.general.chatbot_engineer",
-        AgentType::EmbeddingEngineer      => "agent.general.embedding_engineer",
-        AgentType::TechWriter             => "agent.general.tech_writer",
-        AgentType::ProductOwner           => "agent.general.product_owner",
-        AgentType::BenchmarkEngineer      => "agent.general.benchmark_engineer",
+        AgentType::Debugger => "agent.general.debugger",
+        AgentType::Refactorer => "agent.general.refactorer",
+        AgentType::Profiler => "agent.general.profiler",
+        AgentType::InfraEngineer => "agent.general.infra_engineer",
+        AgentType::DatabaseAdmin => "agent.general.database_admin",
+        AgentType::SecurityAuditor => "agent.general.security_auditor",
+        AgentType::ComplianceOfficer => "agent.general.compliance_officer",
+        AgentType::UIDesigner => "agent.general.ui_designer",
+        AgentType::AccessibilityEngineer => "agent.general.accessibility_engineer",
+        AgentType::DataEngineer => "agent.general.data_engineer",
+        AgentType::ETLEngineer => "agent.general.etl_engineer",
+        AgentType::AutomationEngineer => "agent.general.automation_engineer",
+        AgentType::IntegrationEngineer => "agent.general.integration_engineer",
+        AgentType::MonitoringEngineer => "agent.general.monitoring_engineer",
+        AgentType::MigrationEngineer => "agent.general.migration_engineer",
+        AgentType::ChatbotEngineer => "agent.general.chatbot_engineer",
+        AgentType::EmbeddingEngineer => "agent.general.embedding_engineer",
+        AgentType::TechWriter => "agent.general.tech_writer",
+        AgentType::ProductOwner => "agent.general.product_owner",
+        AgentType::BenchmarkEngineer => "agent.general.benchmark_engineer",
         AgentType::TestAutomationEngineer => "agent.general.test_automation_engineer",
-        AgentType::ReportingEngineer      => "agent.general.reporting_engineer",
-        AgentType::I18nEngineer           => "agent.general.i18n_engineer",
+        AgentType::ReportingEngineer => "agent.general.reporting_engineer",
+        AgentType::I18nEngineer => "agent.general.i18n_engineer",
 
         // Custom / unknown — nessun mapping
         _ => "",
@@ -343,15 +344,24 @@ mod tests {
         let mut purpose_models = HashMap::new();
         purpose_models.insert(
             TIER_OPUS.to_string(),
-            ("test_provider_opus".to_string(), "test_model_opus".to_string()),
+            (
+                "test_provider_opus".to_string(),
+                "test_model_opus".to_string(),
+            ),
         );
         purpose_models.insert(
             TIER_SONNET.to_string(),
-            ("test_provider_sonnet".to_string(), "test_model_sonnet".to_string()),
+            (
+                "test_provider_sonnet".to_string(),
+                "test_model_sonnet".to_string(),
+            ),
         );
         purpose_models.insert(
             TIER_HAIKU.to_string(),
-            ("test_provider_haiku".to_string(), "test_model_haiku".to_string()),
+            (
+                "test_provider_haiku".to_string(),
+                "test_model_haiku".to_string(),
+            ),
         );
         RoutingMatrix {
             by_intent_mode: HashMap::new(),
@@ -366,9 +376,18 @@ mod tests {
     #[test]
     fn test_agent_type_to_model_core_agents() {
         let m = test_matrix();
-        let sonnet = Some(("test_provider_sonnet".to_string(), "test_model_sonnet".to_string()));
-        let haiku = Some(("test_provider_haiku".to_string(), "test_model_haiku".to_string()));
-        let opus = Some(("test_provider_opus".to_string(), "test_model_opus".to_string()));
+        let sonnet = Some((
+            "test_provider_sonnet".to_string(),
+            "test_model_sonnet".to_string(),
+        ));
+        let haiku = Some((
+            "test_provider_haiku".to_string(),
+            "test_model_haiku".to_string(),
+        ));
+        let opus = Some((
+            "test_provider_opus".to_string(),
+            "test_model_opus".to_string(),
+        ));
 
         assert_eq!(agent_type_to_model(&AgentType::Coder, &m), sonnet);
         assert_eq!(agent_type_to_model(&AgentType::Tester, &m), haiku);
@@ -454,20 +473,41 @@ mod tests {
     #[test]
     fn test_agent_type_to_tier_assignments() {
         assert_eq!(agent_type_to_tier(&AgentType::Architect), Some(TIER_OPUS));
-        assert_eq!(agent_type_to_tier(&AgentType::SecurityArchitect), Some(TIER_OPUS));
+        assert_eq!(
+            agent_type_to_tier(&AgentType::SecurityArchitect),
+            Some(TIER_OPUS)
+        );
         assert_eq!(agent_type_to_tier(&AgentType::APIDesigner), Some(TIER_OPUS));
-        assert_eq!(agent_type_to_tier(&AgentType::AgentEngineer), Some(TIER_OPUS));
-        assert_eq!(agent_type_to_tier(&AgentType::SecurityAuditor), Some(TIER_OPUS));
-        assert_eq!(agent_type_to_tier(&AgentType::ComplianceOfficer), Some(TIER_OPUS));
+        assert_eq!(
+            agent_type_to_tier(&AgentType::AgentEngineer),
+            Some(TIER_OPUS)
+        );
+        assert_eq!(
+            agent_type_to_tier(&AgentType::SecurityAuditor),
+            Some(TIER_OPUS)
+        );
+        assert_eq!(
+            agent_type_to_tier(&AgentType::ComplianceOfficer),
+            Some(TIER_OPUS)
+        );
 
         assert_eq!(agent_type_to_tier(&AgentType::Coder), Some(TIER_SONNET));
-        assert_eq!(agent_type_to_tier(&AgentType::SREEngineer), Some(TIER_SONNET));
+        assert_eq!(
+            agent_type_to_tier(&AgentType::SREEngineer),
+            Some(TIER_SONNET)
+        );
         assert_eq!(agent_type_to_tier(&AgentType::Debugger), Some(TIER_SONNET));
 
         assert_eq!(agent_type_to_tier(&AgentType::Tester), Some(TIER_HAIKU));
         assert_eq!(agent_type_to_tier(&AgentType::TechWriter), Some(TIER_HAIKU));
-        assert_eq!(agent_type_to_tier(&AgentType::I18nEngineer), Some(TIER_HAIKU));
-        assert_eq!(agent_type_to_tier(&AgentType::MonitoringEngineer), Some(TIER_HAIKU));
+        assert_eq!(
+            agent_type_to_tier(&AgentType::I18nEngineer),
+            Some(TIER_HAIKU)
+        );
+        assert_eq!(
+            agent_type_to_tier(&AgentType::MonitoringEngineer),
+            Some(TIER_HAIKU)
+        );
     }
 
     #[test]
@@ -536,51 +576,98 @@ mod tests {
 
     #[test]
     fn test_agent_type_to_prompt_key_core_agents() {
-        assert_eq!(agent_type_to_prompt_key(&AgentType::Coder),     "agent.coder.base");
-        assert_eq!(agent_type_to_prompt_key(&AgentType::Tester),    "agent.tester.base");
-        assert_eq!(agent_type_to_prompt_key(&AgentType::Reviewer),  "agent.reviewer.general");
-        assert_eq!(agent_type_to_prompt_key(&AgentType::Architect), "agent.architect.general");
+        assert_eq!(
+            agent_type_to_prompt_key(&AgentType::Coder),
+            "agent.coder.base"
+        );
+        assert_eq!(
+            agent_type_to_prompt_key(&AgentType::Tester),
+            "agent.tester.base"
+        );
+        assert_eq!(
+            agent_type_to_prompt_key(&AgentType::Reviewer),
+            "agent.reviewer.general"
+        );
+        assert_eq!(
+            agent_type_to_prompt_key(&AgentType::Architect),
+            "agent.architect.general"
+        );
     }
 
     #[test]
     fn test_agent_type_to_prompt_key_all_60_non_empty() {
         // Tutti i 60 variant concreti devono avere una prompt key non vuota.
         let registered: Vec<AgentType> = vec![
-            AgentType::Coder, AgentType::Tester, AgentType::Reviewer, AgentType::Architect,
-            AgentType::SecurityArchitect, AgentType::PerformanceEngineer, AgentType::DatabaseDesigner,
-            AgentType::FrontendSpecialist, AgentType::BackendSpecialist, AgentType::DevOpsEngineer,
-            AgentType::CloudArchitect, AgentType::MobileSpecialist, AgentType::DataScientist,
-            AgentType::MLEngineer, AgentType::QASpecialist, AgentType::TechLead,
-            AgentType::GitHubPRManager, AgentType::GitHubCodeReviewer, AgentType::GitHubIssueAnalyzer,
-            AgentType::GitHubReleaseManager, AgentType::GitHubWorkflowManager,
-            AgentType::GitHubSecurityAnalyzer, AgentType::GitHubDependencyManager,
-            AgentType::GitHubProjectManager, AgentType::GitHubWikiManager,
-            AgentType::GitHubDiscussionModerator, AgentType::GitHubActionsOptimizer,
-            AgentType::GitHubStatusMonitor, AgentType::GitHubIntegrationBot,
-            AgentType::Researcher, AgentType::Analyst, AgentType::Optimizer, AgentType::Documenter,
-            AgentType::SREEngineer, AgentType::APIDesigner, AgentType::PromptEngineer,
+            AgentType::Coder,
+            AgentType::Tester,
+            AgentType::Reviewer,
+            AgentType::Architect,
+            AgentType::SecurityArchitect,
+            AgentType::PerformanceEngineer,
+            AgentType::DatabaseDesigner,
+            AgentType::FrontendSpecialist,
+            AgentType::BackendSpecialist,
+            AgentType::DevOpsEngineer,
+            AgentType::CloudArchitect,
+            AgentType::MobileSpecialist,
+            AgentType::DataScientist,
+            AgentType::MLEngineer,
+            AgentType::QASpecialist,
+            AgentType::TechLead,
+            AgentType::GitHubPRManager,
+            AgentType::GitHubCodeReviewer,
+            AgentType::GitHubIssueAnalyzer,
+            AgentType::GitHubReleaseManager,
+            AgentType::GitHubWorkflowManager,
+            AgentType::GitHubSecurityAnalyzer,
+            AgentType::GitHubDependencyManager,
+            AgentType::GitHubProjectManager,
+            AgentType::GitHubWikiManager,
+            AgentType::GitHubDiscussionModerator,
+            AgentType::GitHubActionsOptimizer,
+            AgentType::GitHubStatusMonitor,
+            AgentType::GitHubIntegrationBot,
+            AgentType::Researcher,
+            AgentType::Analyst,
+            AgentType::Optimizer,
+            AgentType::Documenter,
+            AgentType::SREEngineer,
+            AgentType::APIDesigner,
+            AgentType::PromptEngineer,
             AgentType::AgentEngineer,
-            AgentType::Debugger, AgentType::Refactorer, AgentType::Profiler,
-            AgentType::InfraEngineer, AgentType::DatabaseAdmin, AgentType::SecurityAuditor,
-            AgentType::ComplianceOfficer, AgentType::UIDesigner, AgentType::AccessibilityEngineer,
-            AgentType::DataEngineer, AgentType::ETLEngineer, AgentType::AutomationEngineer,
-            AgentType::IntegrationEngineer, AgentType::MonitoringEngineer, AgentType::MigrationEngineer,
-            AgentType::ChatbotEngineer, AgentType::EmbeddingEngineer, AgentType::TechWriter,
-            AgentType::ProductOwner, AgentType::BenchmarkEngineer, AgentType::TestAutomationEngineer,
-            AgentType::ReportingEngineer, AgentType::I18nEngineer,
+            AgentType::Debugger,
+            AgentType::Refactorer,
+            AgentType::Profiler,
+            AgentType::InfraEngineer,
+            AgentType::DatabaseAdmin,
+            AgentType::SecurityAuditor,
+            AgentType::ComplianceOfficer,
+            AgentType::UIDesigner,
+            AgentType::AccessibilityEngineer,
+            AgentType::DataEngineer,
+            AgentType::ETLEngineer,
+            AgentType::AutomationEngineer,
+            AgentType::IntegrationEngineer,
+            AgentType::MonitoringEngineer,
+            AgentType::MigrationEngineer,
+            AgentType::ChatbotEngineer,
+            AgentType::EmbeddingEngineer,
+            AgentType::TechWriter,
+            AgentType::ProductOwner,
+            AgentType::BenchmarkEngineer,
+            AgentType::TestAutomationEngineer,
+            AgentType::ReportingEngineer,
+            AgentType::I18nEngineer,
         ];
         assert_eq!(registered.len(), 60, "expected 60 registered variants");
         for variant in &registered {
             let key = agent_type_to_prompt_key(variant);
-            assert!(
-                !key.is_empty(),
-                "missing prompt key for {:?}",
-                variant
-            );
+            assert!(!key.is_empty(), "missing prompt key for {:?}", variant);
             assert!(
                 key.starts_with("agent."),
                 "prompt key should start with 'agent.' for {:?}, got '{}'",
-                variant, key
+                variant,
+                key
             );
         }
     }
@@ -588,14 +675,21 @@ mod tests {
     #[test]
     fn test_agent_type_to_prompt_key_custom_is_empty() {
         // Custom(_) non deve avere un mapping
-        assert_eq!(agent_type_to_prompt_key(&AgentType::Custom("foo".to_string())), "");
+        assert_eq!(
+            agent_type_to_prompt_key(&AgentType::Custom("foo".to_string())),
+            ""
+        );
     }
 
     #[test]
     fn test_get_agent_system_prompt_custom_returns_empty() {
         // Custom(_) → prompt key "" → deve ritornare stringa vuota senza panic
         let result = get_agent_system_prompt(&AgentType::Custom("foo".to_string()));
-        assert!(result.is_empty(), "Custom(_) should return empty prompt, got: {}", result);
+        assert!(
+            result.is_empty(),
+            "Custom(_) should return empty prompt, got: {}",
+            result
+        );
     }
 
     #[test]
@@ -605,8 +699,17 @@ mod tests {
         // La sostituzione placeholder è coperta dai test in nexus-agents stessi.
         let result = get_agent_system_prompt(&AgentType::Coder);
         // Non deve contenere placeholder non sostituiti, qualunque cosa ritorni
-        assert!(!result.contains("{{lang_hint}}"), "lang_hint placeholder not stripped");
-        assert!(!result.contains("{{type_hint}}"), "type_hint placeholder not stripped");
-        assert!(!result.contains("{{project}}"),   "project placeholder not stripped");
+        assert!(
+            !result.contains("{{lang_hint}}"),
+            "lang_hint placeholder not stripped"
+        );
+        assert!(
+            !result.contains("{{type_hint}}"),
+            "type_hint placeholder not stripped"
+        );
+        assert!(
+            !result.contains("{{project}}"),
+            "project placeholder not stripped"
+        );
     }
 }

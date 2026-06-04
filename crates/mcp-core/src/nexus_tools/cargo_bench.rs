@@ -14,19 +14,12 @@ pub struct CargoBenchTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoBenchTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let workspace_member = args
             .get("workspace_member")
             .and_then(Value::as_str)
             .map(String::from);
-        let filter = args
-            .get("filter")
-            .and_then(Value::as_str)
-            .map(String::from);
+        let filter = args.get("filter").and_then(Value::as_str).map(String::from);
 
         let mut cmd: Vec<String> = vec!["bench".into()];
         if let Some(m) = &workspace_member {

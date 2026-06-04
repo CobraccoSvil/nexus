@@ -12,11 +12,7 @@ pub struct DockerPsTool;
 
 #[async_trait]
 impl NexusToolHandler for DockerPsTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
 
         let slug = ctx
@@ -27,7 +23,13 @@ impl NexusToolHandler for DockerPsTool {
 
         let filter = format!("label=com.docker.compose.project={}", slug);
 
-        let mut cmd_args = vec!["ps", "--filter", &filter, "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}\t{{.CreatedAt}}"];
+        let mut cmd_args = vec![
+            "ps",
+            "--filter",
+            &filter,
+            "--format",
+            "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}\t{{.CreatedAt}}",
+        ];
 
         if all {
             cmd_args.insert(1, "-a");

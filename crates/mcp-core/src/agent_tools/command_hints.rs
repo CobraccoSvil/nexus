@@ -112,7 +112,10 @@ pub fn format_hints_prefix(hints: &[CommandHint]) -> String {
             "warning" => "[HINT — WARNING]",
             _ => "[HINT]",
         };
-        out.push_str(&format!("{} (pattern: `{}`)\n{}\n\n", tag, h.pattern, h.hint_text));
+        out.push_str(&format!(
+            "{} (pattern: `{}`)\n{}\n\n",
+            tag, h.pattern, h.hint_text
+        ));
     }
     out.push_str("---\n");
     out

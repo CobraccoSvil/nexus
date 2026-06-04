@@ -4,13 +4,13 @@
 //! "whole file" con chunking + embedding + similarity search su Qdrant.
 
 pub mod chunker;
-pub mod qdrant_client;
-pub mod indexer;
-pub mod search;
 mod config;
+pub mod indexer;
+pub mod qdrant_client;
+pub mod search;
 
-pub use config::{RagConfig, current_config};
-pub use indexer::{index_text, index_attachment, delete_source};
+pub use config::{current_config, RagConfig};
+pub use indexer::{delete_source, index_attachment, index_text};
 pub use search::{search_semantic, SearchHit};
 
 use serde::{Deserialize, Serialize};

@@ -25,11 +25,7 @@ fn validate_container_name(name: &str) -> Result<(), NexusToolError> {
 
 #[async_trait]
 impl NexusToolHandler for DockerRunTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let image = args
             .get("image")
             .and_then(Value::as_str)
@@ -41,7 +37,10 @@ impl NexusToolHandler for DockerRunTool {
             return Err(NexusToolError::BadInput("Immagine vuota".into()));
         }
 
-        let name = args.get("name").and_then(Value::as_str).map(|s| s.trim().to_string());
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string());
         if let Some(ref n) = name {
             validate_container_name(n)?;
         }
@@ -50,14 +49,24 @@ impl NexusToolHandler for DockerRunTool {
         // get_pool ritorna un pool short-lived verso Nexus (riusa env DATABASE_URL).
         // Best-effort: se il pool fallisce, salta il check (degrado graceful).
         if let Ok(nexus_pool) = super::db_helper::get_pool().await {
-            if let Err(reason) = crate::security::quotas::check_can_start_container(&nexus_pool, ctx.project_id).await {
+            if let Err(reason) =
+                crate::security::quotas::check_can_start_container(&nexus_pool, ctx.project_id)
+                    .await
+            {
                 crate::security::record_audit(
-                    crate::security::AuditEntry::blocked(ctx.project_id, "container_create", "container")
-                        .with_resource(image.clone())
-                        .with_details(json!({"reason": reason, "name": name})),
+                    crate::security::AuditEntry::blocked(
+                        ctx.project_id,
+                        "container_create",
+                        "container",
+                    )
+                    .with_resource(image.clone())
+                    .with_details(json!({"reason": reason, "name": name})),
                 );
                 nexus_pool.close().await;
-                return Err(NexusToolError::BadInput(format!("Quota container raggiunta: {}", reason)));
+                return Err(NexusToolError::BadInput(format!(
+                    "Quota container raggiunta: {}",
+                    reason
+                )));
             }
             nexus_pool.close().await;
         }
@@ -136,9 +145,13 @@ impl NexusToolHandler for DockerRunTool {
         if out.success() {
             let container_id = out.stdout.trim().to_string();
             crate::security::record_audit(
-                crate::security::AuditEntry::allowed(ctx.project_id, "container_create", "container")
-                    .with_resource(container_id.clone())
-                    .with_details(json!({"image": image, "name": name, "detach": detach})),
+                crate::security::AuditEntry::allowed(
+                    ctx.project_id,
+                    "container_create",
+                    "container",
+                )
+                .with_resource(container_id.clone())
+                .with_details(json!({"image": image, "name": name, "detach": detach})),
             );
             Ok(json!({
                 "ok": true,

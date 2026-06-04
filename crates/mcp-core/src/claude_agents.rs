@@ -21,8 +21,8 @@
 use crate::AppState;
 use anyhow::{Context, Result};
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use sha2::{Digest, Sha256};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 const MARKER: &str = "# AUTO-GENERATO dal DB Nexus";
 
@@ -46,8 +46,12 @@ fn map_mcp_to_claude(whitelist: &[String]) -> Vec<&'static str> {
             | "search_file_semantic"
             | "recall_context"
             | "nexus_search_semantic" => Some("Grep"),
-            "run_command" | "run_tests" | "run_specific_test" | "run_lint_fix"
-            | "format_file" | "run_playwright_tests" => Some("Bash"),
+            "run_command"
+            | "run_tests"
+            | "run_specific_test"
+            | "run_lint_fix"
+            | "format_file"
+            | "run_playwright_tests" => Some("Bash"),
             "nexus_todo_write" => Some("TodoWrite"),
             // knowledge_*, dispatch_subagent, request_port, ... : nessun analogo CLI
             _ => None,
@@ -158,7 +162,11 @@ pub async fn regenerate_all(
 
     let repo_root = std::env::var("NEXUS_REPO_ROOT")
         .unwrap_or_else(|_| "/home/administrator/ideai".to_string());
-    let base = format!("{}/{}", repo_root.trim_end_matches('/'), output_dir.trim_matches('/'));
+    let base = format!(
+        "{}/{}",
+        repo_root.trim_end_matches('/'),
+        output_dir.trim_matches('/')
+    );
 
     // Leggi le definizioni abilitate (read-only).
     let rows = sqlx::query_as::<_, (String, String, Vec<String>, String)>(
@@ -197,8 +205,18 @@ pub async fn regenerate_all(
         }
 
         let tools = map_mcp_to_claude(&whitelist);
-        let def_hash = &sha256_hex(&format!("{kind}|{description}|{:?}|{prompt_key}", whitelist))[..8];
-        let content = render_agent_file(&name, &kind, &description, &tools, prompt_body.trim(), def_hash);
+        let def_hash = &sha256_hex(&format!(
+            "{kind}|{description}|{:?}|{prompt_key}",
+            whitelist
+        ))[..8];
+        let content = render_agent_file(
+            &name,
+            &kind,
+            &description,
+            &tools,
+            prompt_body.trim(),
+            def_hash,
+        );
         let new_hash = sha256_hex(&content);
 
         // Controlla file esistente: marker + hash.
@@ -293,9 +311,15 @@ pub async fn regenerate_handler(
     State(state): State<AppState>,
     body: Option<Json<RegenerateBody>>,
 ) -> impl IntoResponse {
-    let force = body.map(|Json(b)| b.force_overwrite_unmanaged).unwrap_or(false);
+    let force = body
+        .map(|Json(b)| b.force_overwrite_unmanaged)
+        .unwrap_or(false);
     match regenerate_all(&state, false, force).await {
-        Ok(r) => (StatusCode::OK, Json(json!({"dry_run": false, "force": force, "agents": r}))).into_response(),
+        Ok(r) => (
+            StatusCode::OK,
+            Json(json!({"dry_run": false, "force": force, "agents": r})),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -307,26 +331,41 @@ mod tests {
     #[test]
     fn tool_map_degrada_semantici_a_grep_e_dedup() {
         let wl = vec![
-            "read_file".to_string(), "write_file".to_string(), "edit_file".to_string(),
-            "run_command".to_string(), "search_codebase_semantic".to_string(),
-            "search_in_files".to_string(), "list_files".to_string(),
-            "nexus_todo_write".to_string(), "knowledge_search".to_string(),
+            "read_file".to_string(),
+            "write_file".to_string(),
+            "edit_file".to_string(),
+            "run_command".to_string(),
+            "search_codebase_semantic".to_string(),
+            "search_in_files".to_string(),
+            "list_files".to_string(),
+            "nexus_todo_write".to_string(),
+            "knowledge_search".to_string(),
         ];
         let out = map_mcp_to_claude(&wl);
         // ordine canonico, dedup di Grep (search_codebase_semantic + search_in_files)
-        assert_eq!(out, vec!["Read", "Edit", "Write", "Grep", "Glob", "Bash", "TodoWrite"]);
+        assert_eq!(
+            out,
+            vec!["Read", "Edit", "Write", "Grep", "Glob", "Bash", "TodoWrite"]
+        );
         // knowledge_search non mappato
     }
 
     #[test]
     fn render_non_contiene_campo_model() {
         let c = render_agent_file(
-            "nexus-rust-implementer", "rust_implementer", "desc",
-            &["Read", "Edit", "Bash"], "<role>x</role>", "abcd1234",
+            "nexus-rust-implementer",
+            "rust_implementer",
+            "desc",
+            &["Read", "Edit", "Bash"],
+            "<role>x</role>",
+            "abcd1234",
         );
         assert!(c.contains(MARKER));
         assert!(c.contains("name: nexus-rust-implementer"));
         assert!(c.contains("tools: Read, Edit, Bash"));
-        assert!(!c.contains("\nmodel:"), "il file CLI non deve serializzare model");
+        assert!(
+            !c.contains("\nmodel:"),
+            "il file CLI non deve serializzare model"
+        );
     }
 }

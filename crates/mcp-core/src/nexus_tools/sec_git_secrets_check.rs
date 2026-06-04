@@ -7,7 +7,11 @@ pub struct SecGitSecretsCheckTool;
 
 #[async_trait]
 impl NexusToolHandler for SecGitSecretsCheckTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let cfg = ctx.project_root.join(".git").join("config");
         if !cfg.is_file() {
             return Ok(json!({"ok": true, "exists": false}));
@@ -37,5 +41,7 @@ impl NexusToolHandler for SecGitSecretsCheckTool {
             "details": suspicious,
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

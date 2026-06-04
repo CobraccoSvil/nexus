@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context};
-use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -282,11 +282,7 @@ pub async fn delete_prompt_correction_points(
 }
 
 /// Aggiorna il campo `active` nel payload di un punto Qdrant.
-pub async fn set_point_active(
-    db: &PgPool,
-    point_id: &str,
-    active: bool,
-) -> Result<(), String> {
+pub async fn set_point_active(db: &PgPool, point_id: &str, active: bool) -> Result<(), String> {
     let (base_url, collection) = qdrant_config(db).await.map_err(|e| e.to_string())?;
     let client = nexus_http::build_client();
 
@@ -434,12 +430,22 @@ pub async fn search_project_context_points(
         .context("failed qdrant project context search")?;
 
     if !response.status().is_success() {
-        let text = response.text().await.unwrap_or_else(|_| "unknown".to_string());
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "unknown".to_string());
         return Err(anyhow!("qdrant project context search failed: {text}"));
     }
 
-    let payload: Value = response.json().await.context("invalid qdrant project context payload")?;
-    let result = payload.get("result").and_then(Value::as_array).cloned().unwrap_or_default();
+    let payload: Value = response
+        .json()
+        .await
+        .context("invalid qdrant project context payload")?;
+    let result = payload
+        .get("result")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
     let mut hits = Vec::with_capacity(result.len());
     for hit in result {
@@ -450,7 +456,11 @@ pub async fn search_project_context_points(
             _ => continue,
         };
         let point_payload = hit.get("payload").cloned().unwrap_or_else(|| json!({}));
-        hits.push(VectorPointHit { point_id, score, payload: point_payload });
+        hits.push(VectorPointHit {
+            point_id,
+            score,
+            payload: point_payload,
+        });
     }
 
     Ok(hits)
@@ -669,14 +679,13 @@ pub async fn search_code_index(
 /// Query O(1) sull'indice — usata da `spawn_code_index_if_needed` per evitare
 /// di rilanciare l'indicizzazione su progetti gia' processati.
 pub async fn has_code_index(db: &PgPool, project_id: Uuid) -> bool {
-    let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT COUNT(*) FROM file_index_hashes WHERE project_id = $1 LIMIT 1",
-    )
-    .bind(project_id)
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten();
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT COUNT(*) FROM file_index_hashes WHERE project_id = $1 LIMIT 1")
+            .bind(project_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
     row.map(|(c,)| c > 0).unwrap_or(false)
 }
 
@@ -739,7 +748,10 @@ pub async fn delete_code_index_file_points(
         .context("failed to delete code index file points")?;
 
     if !response.status().is_success() {
-        let text = response.text().await.unwrap_or_else(|_| "unknown".to_string());
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "unknown".to_string());
         return Err(anyhow!("code index file delete failed: {text}"));
     }
 
@@ -807,7 +819,8 @@ pub async fn vectorize_document(
     let neural_url = crate::settings::get_setting(db, "neural_core_url")
         .await?
         .unwrap_or_else(|| {
-            std::env::var("NEURAL_CORE_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string())
+            std::env::var("NEURAL_CORE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string())
         });
     let neural = crate::orchestrator::NeuralCoreClient::connect(&neural_url).await?;
 
@@ -830,11 +843,18 @@ pub async fn vectorize_document(
     let flat = flatten_sections(sections);
     for (number, title, content) in &flat {
         let text_to_embed = format!("{number} {title}\n{content}");
-        let text_preview = if content.len() > 200 { &content[..200] } else { content.as_str() };
+        let text_preview = if content.len() > 200 {
+            &content[..200]
+        } else {
+            content.as_str()
+        };
 
         let vector = match neural.embed_text("", &text_to_embed).await {
             Ok(v) => v,
-            Err(e) => { tracing::warn!("Embed error for section {number}: {e}"); continue; }
+            Err(e) => {
+                tracing::warn!("Embed error for section {number}: {e}");
+                continue;
+            }
         };
 
         let point_id = format!(
@@ -858,24 +878,32 @@ pub async fn vectorize_document(
         let body = json!({ "points": [{ "id": point_id, "vector": vector, "payload": payload }] });
 
         match reqwest::Client::new().put(&url).json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => { point_ids.push(point_id); }
-            Ok(resp) => { let t = resp.text().await.unwrap_or_default(); tracing::warn!("Doc point upsert failed: {t}"); }
-            Err(e) => { tracing::warn!("Doc point upsert error: {e}"); }
+            Ok(resp) if resp.status().is_success() => {
+                point_ids.push(point_id);
+            }
+            Ok(resp) => {
+                let t = resp.text().await.unwrap_or_default();
+                tracing::warn!("Doc point upsert failed: {t}");
+            }
+            Err(e) => {
+                tracing::warn!("Doc point upsert error: {e}");
+            }
         }
     }
 
     // Save point IDs to DB
     if !point_ids.is_empty() {
-        let _ = sqlx::query(
-            "UPDATE project_documents SET qdrant_point_ids = $1 WHERE id = $2",
-        )
-        .bind(&point_ids)
-        .bind(document_id)
-        .execute(db)
-        .await;
+        let _ = sqlx::query("UPDATE project_documents SET qdrant_point_ids = $1 WHERE id = $2")
+            .bind(&point_ids)
+            .bind(document_id)
+            .execute(db)
+            .await;
     }
 
-    tracing::info!("Vectorized document {document_id}: {} points", point_ids.len());
+    tracing::info!(
+        "Vectorized document {document_id}: {} points",
+        point_ids.len()
+    );
     Ok(())
 }
 
@@ -884,9 +912,21 @@ fn flatten_sections(sections: &[Value]) -> Vec<(String, String, String)> {
     let mut result = Vec::new();
     let mut stack: Vec<&Value> = sections.iter().rev().collect();
     while let Some(section) = stack.pop() {
-        let number = section.get("number").and_then(Value::as_str).unwrap_or("").to_string();
-        let title = section.get("title").and_then(Value::as_str).unwrap_or("").to_string();
-        let content = section.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+        let number = section
+            .get("number")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let title = section
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let content = section
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         if !content.is_empty() {
             result.push((number, title, content));
         }
@@ -943,14 +983,22 @@ pub async fn search_doc_points(
     Ok(results
         .iter()
         .map(|r| VectorPointHit {
-            point_id: r.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+            point_id: r
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
             score: r.get("score").and_then(Value::as_f64).unwrap_or(0.0),
             payload: r.get("payload").cloned().unwrap_or(json!({})),
         })
         .collect())
 }
 
-pub async fn delete_doc_points(db: &PgPool, project_id: Uuid, document_id: Uuid) -> anyhow::Result<()> {
+pub async fn delete_doc_points(
+    db: &PgPool,
+    project_id: Uuid,
+    document_id: Uuid,
+) -> anyhow::Result<()> {
     ensure_docs_collection(db).await?;
     let (base_url, collection) = qdrant_docs_config(db).await?;
     let url = format!("{base_url}/collections/{collection}/points/delete?wait=true");
@@ -972,7 +1020,9 @@ pub async fn delete_doc_points(db: &PgPool, project_id: Uuid, document_id: Uuid)
 }
 
 pub async fn delete_doc_points_by_ids(db: &PgPool, point_ids: &[String]) -> anyhow::Result<()> {
-    if point_ids.is_empty() { return Ok(()); }
+    if point_ids.is_empty() {
+        return Ok(());
+    }
     ensure_docs_collection(db).await?;
     let (base_url, collection) = qdrant_docs_config(db).await?;
     let url = format!("{base_url}/collections/{collection}/points/delete?wait=true");
@@ -1004,7 +1054,11 @@ async fn ensure_conversation_context_collection(db: &PgPool) -> anyhow::Result<(
     let client = nexus_http::build_client();
     let get_url = format!("{base_url}/collections/{collection}");
 
-    let response = client.get(&get_url).send().await.context("check conversation_context collection")?;
+    let response = client
+        .get(&get_url)
+        .send()
+        .await
+        .context("check conversation_context collection")?;
     if response.status().is_success() {
         return Ok(());
     }
@@ -1020,7 +1074,9 @@ async fn ensure_conversation_context_collection(db: &PgPool) -> anyhow::Result<(
         .context("create conversation_context collection")?;
     if !create_response.status().is_success() {
         let text = create_response.text().await.unwrap_or_default();
-        return Err(anyhow!("create conversation_context collection failed: {text}"));
+        return Err(anyhow!(
+            "create conversation_context collection failed: {text}"
+        ));
     }
     Ok(())
 }
@@ -1103,8 +1159,15 @@ pub async fn search_conversation_context(
         return Err(anyhow!("conversation context search failed: {text}"));
     }
 
-    let payload: Value = response.json().await.context("invalid conversation context payload")?;
-    let result = payload.get("result").and_then(Value::as_array).cloned().unwrap_or_default();
+    let payload: Value = response
+        .json()
+        .await
+        .context("invalid conversation context payload")?;
+    let result = payload
+        .get("result")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
     let mut hits = Vec::with_capacity(result.len());
     for hit in result {
@@ -1115,7 +1178,11 @@ pub async fn search_conversation_context(
             _ => continue,
         };
         let pl = hit.get("payload").cloned().unwrap_or(json!({}));
-        hits.push(VectorPointHit { point_id, score, payload: pl });
+        hits.push(VectorPointHit {
+            point_id,
+            score,
+            payload: pl,
+        });
     }
     Ok(hits)
 }
@@ -1178,7 +1245,9 @@ pub async fn ensure_knowledge_collection(db: &PgPool) -> anyhow::Result<()> {
 
     if !create_response.status().is_success() {
         let payload = create_response.text().await.unwrap_or_default();
-        return Err(anyhow!("creazione collection knowledge_notes fallita: {payload}"));
+        return Err(anyhow!(
+            "creazione collection knowledge_notes fallita: {payload}"
+        ));
     }
 
     Ok(())
@@ -1258,7 +1327,10 @@ pub async fn search_knowledge_points(
         return Err(anyhow!("knowledge search fallita: {text}"));
     }
 
-    let payload: Value = response.json().await.context("payload ricerca knowledge non valido")?;
+    let payload: Value = response
+        .json()
+        .await
+        .context("payload ricerca knowledge non valido")?;
     let result = payload
         .get("result")
         .and_then(Value::as_array)
@@ -1274,7 +1346,11 @@ pub async fn search_knowledge_points(
             _ => continue,
         };
         let pl = hit.get("payload").cloned().unwrap_or(json!({}));
-        hits.push(VectorPointHit { point_id, score, payload: pl });
+        hits.push(VectorPointHit {
+            point_id,
+            score,
+            payload: pl,
+        });
     }
     Ok(hits)
 }
@@ -1282,10 +1358,7 @@ pub async fn search_knowledge_points(
 /// Elimina punti dalla collection knowledge_notes per lista di point_id.
 /// Recupera il vettore di un point Qdrant `knowledge_notes` per id.
 /// Permette il link inference senza ri-embedding via brain.
-pub async fn get_knowledge_point_vector(
-    db: &PgPool,
-    point_id: &str,
-) -> anyhow::Result<Vec<f32>> {
+pub async fn get_knowledge_point_vector(db: &PgPool, point_id: &str) -> anyhow::Result<Vec<f32>> {
     let (base_url, collection) = qdrant_knowledge_config(db).await?;
     let url = format!("{base_url}/collections/{collection}/points/{point_id}?with_vector=true");
     let client = nexus_http::build_client();
@@ -1316,10 +1389,7 @@ pub async fn get_knowledge_point_vector(
     Ok(vector)
 }
 
-pub async fn delete_knowledge_points(
-    db: &PgPool,
-    point_ids: &[String],
-) -> anyhow::Result<()> {
+pub async fn delete_knowledge_points(db: &PgPool, point_ids: &[String]) -> anyhow::Result<()> {
     if point_ids.is_empty() {
         return Ok(());
     }
@@ -1396,7 +1466,9 @@ pub async fn ensure_meta_docs_collection(db: &PgPool) -> anyhow::Result<()> {
 
     if !create_response.status().is_success() {
         let payload = create_response.text().await.unwrap_or_default();
-        return Err(anyhow!("creazione collection nexus_meta_docs fallita: {payload}"));
+        return Err(anyhow!(
+            "creazione collection nexus_meta_docs fallita: {payload}"
+        ));
     }
 
     Ok(())
@@ -1473,7 +1545,10 @@ pub async fn search_meta_doc_points(
         return Err(anyhow!("meta-docs search fallita: {text}"));
     }
 
-    let payload: Value = response.json().await.context("payload ricerca meta-docs non valido")?;
+    let payload: Value = response
+        .json()
+        .await
+        .context("payload ricerca meta-docs non valido")?;
     let result = payload
         .get("result")
         .and_then(Value::as_array)
@@ -1489,16 +1564,17 @@ pub async fn search_meta_doc_points(
             _ => continue,
         };
         let pl = hit.get("payload").cloned().unwrap_or(json!({}));
-        hits.push(VectorPointHit { point_id, score, payload: pl });
+        hits.push(VectorPointHit {
+            point_id,
+            score,
+            payload: pl,
+        });
     }
     Ok(hits)
 }
 
 /// Elimina punti dalla collection nexus_meta_docs per lista di point_id.
-pub async fn delete_meta_doc_points(
-    db: &PgPool,
-    point_ids: &[String],
-) -> anyhow::Result<()> {
+pub async fn delete_meta_doc_points(db: &PgPool, point_ids: &[String]) -> anyhow::Result<()> {
     if point_ids.is_empty() {
         return Ok(());
     }

@@ -29,11 +29,7 @@ fn detect_stack(root: &std::path::Path) -> Option<&'static str> {
 
 #[async_trait]
 impl NexusToolHandler for DepsTreeTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let depth = args.get("depth").and_then(Value::as_u64);
         let stack = match detect_stack(&ctx.project_root) {
             Some(s) => s,

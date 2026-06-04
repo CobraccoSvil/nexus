@@ -7,7 +7,11 @@ pub struct BuildLogTailTool;
 
 #[async_trait]
 impl NexusToolHandler for BuildLogTailTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let candidates = [
             "target/.rustc_info.json",
             "target/debug/.fingerprint/.cargo-lock",
@@ -23,5 +27,7 @@ impl NexusToolHandler for BuildLogTailTool {
         }
         Ok(json!({"ok": true, "files_found": found.len(), "files": found}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

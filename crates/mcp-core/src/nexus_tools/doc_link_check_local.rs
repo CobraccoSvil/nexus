@@ -33,7 +33,10 @@ fn extract_md_links(text: &str) -> Vec<String> {
 #[async_trait]
 impl NexusToolHandler for DocLinkCheckLocalTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let path = args.get("path").and_then(Value::as_str).unwrap_or("README.md");
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("README.md");
         let pb = PathBuf::from(path);
         if pb.components().any(|c| matches!(c, Component::ParentDir)) {
             return Err(NexusToolError::BadInput("path traversal denied".into()));
@@ -48,13 +51,20 @@ impl NexusToolHandler for DocLinkCheckLocalTool {
         let mut broken: Vec<Value> = vec![];
         for url in extract_md_links(&content) {
             let trimmed = url.split('#').next().unwrap_or(&url).trim();
-            if trimmed.is_empty() || trimmed.starts_with("http://") || trimmed.starts_with("https://")
-                || trimmed.starts_with("mailto:") {
+            if trimmed.is_empty()
+                || trimmed.starts_with("http://")
+                || trimmed.starts_with("https://")
+                || trimmed.starts_with("mailto:")
+            {
                 continue;
             }
             checked += 1;
             let target_pb = PathBuf::from(trimmed);
-            let resolved = if target_pb.is_absolute() { target_pb } else { parent.join(&target_pb) };
+            let resolved = if target_pb.is_absolute() {
+                target_pb
+            } else {
+                parent.join(&target_pb)
+            };
             if !resolved.exists() {
                 broken.push(json!({"url": url}));
             }
@@ -70,5 +80,7 @@ impl NexusToolHandler for DocLinkCheckLocalTool {
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"}}})
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

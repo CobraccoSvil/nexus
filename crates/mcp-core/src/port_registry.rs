@@ -69,7 +69,18 @@ impl PortRegistry {
 
 /// Carica il registro dal DB.
 async fn fetch_from_db(db: &PgPool) -> Result<PortRegistry, String> {
-    let rows = sqlx::query_as::<_, (Uuid, Uuid, i32, String, String, Option<Uuid>, Option<String>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Uuid,
+            i32,
+            String,
+            String,
+            Option<Uuid>,
+            Option<String>,
+        ),
+    >(
         r#"SELECT id, project_id, port, label, allocation_mode, run_config_id, service_unit
            FROM nexus_port_allocations
            ORDER BY project_id, port"#,
@@ -182,7 +193,10 @@ impl PortRegistryCache {
                         debug!("port_registry: refresh OK");
                     }
                     Err(e) => {
-                        warn!("port_registry: refresh fallito ({}). Mantengo cache precedente.", e);
+                        warn!(
+                            "port_registry: refresh fallito ({}). Mantengo cache precedente.",
+                            e
+                        );
                     }
                 }
             }
@@ -360,7 +374,10 @@ impl PortRegistryCache {
                         alloc.port, unit
                     );
                     if let Err(e) = self.release(alloc.port).await {
-                        warn!("port_registry recovery: rilascio porta {} fallito: {}", alloc.port, e);
+                        warn!(
+                            "port_registry recovery: rilascio porta {} fallito: {}",
+                            alloc.port, e
+                        );
                     }
                 }
             }
@@ -370,7 +387,7 @@ impl PortRegistryCache {
         // 2. Scansiona i .service, registra porte mancanti.
         // Mappa slug -> project_id per associare le porte ai progetti
         let project_map: HashMap<String, Uuid> = match sqlx::query_as::<_, (Uuid, String)>(
-            "SELECT id, LOWER(REPLACE(REPLACE(name, ' ', '-'), '_', '-')) FROM projects"
+            "SELECT id, LOWER(REPLACE(REPLACE(name, ' ', '-'), '_', '-')) FROM projects",
         )
         .fetch_all(&self.db)
         .await
@@ -393,7 +410,9 @@ impl PortRegistryCache {
             };
             for entry in entries.flatten() {
                 let fname = entry.file_name().to_string_lossy().to_string();
-                if !fname.ends_with(".service") { continue; }
+                if !fname.ends_with(".service") {
+                    continue;
+                }
                 let mut matched_project: Option<Uuid> = None;
                 for (slug, pid) in &project_map_clone {
                     let prefix = format!("{}-", slug);
@@ -417,7 +436,9 @@ impl PortRegistryCache {
                 }
             }
             results
-        }).await.unwrap_or_default();
+        })
+        .await
+        .unwrap_or_default();
 
         for (unit_name, project_id, ports) in discovered {
             for port in ports {
@@ -426,10 +447,14 @@ impl PortRegistryCache {
                         "port_registry recovery: registrazione porta {} da {} per progetto {}",
                         port, unit_name, project_id
                     );
-                    if let Err(e) = self.allocate(
-                        project_id, port, "", "auto", None, Some(&unit_name),
-                    ).await {
-                        warn!("port_registry recovery: allocazione porta {} fallita: {}", port, e);
+                    if let Err(e) = self
+                        .allocate(project_id, port, "", "auto", None, Some(&unit_name))
+                        .await
+                    {
+                        warn!(
+                            "port_registry recovery: allocazione porta {} fallita: {}",
+                            port, e
+                        );
                     }
                 }
             }
@@ -640,15 +665,20 @@ fn extract_ports_from_unit_content(content: &str) -> Vec<u16> {
             for segment in rest.split_whitespace() {
                 if let Some(val) = segment.split('=').nth(1) {
                     if let Ok(p) = val.parse::<u16>() {
-                        if p > 0 { ports.push(p); }
+                        if p > 0 {
+                            ports.push(p);
+                        }
                     } else {
                         // URL con porta (es. http://+:5215)
                         for part in val.split(';') {
                             if let Some(colon_pos) = part.rfind(':') {
                                 let after = &part[colon_pos + 1..];
-                                let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                                let num_str: String =
+                                    after.chars().take_while(|c| c.is_ascii_digit()).collect();
                                 if let Ok(p) = num_str.parse::<u16>() {
-                                    if p > 0 { ports.push(p); }
+                                    if p > 0 {
+                                        ports.push(p);
+                                    }
                                 }
                             }
                         }
@@ -663,7 +693,9 @@ fn extract_ports_from_unit_content(content: &str) -> Vec<u16> {
                     && i + 1 < tokens.len()
                 {
                     if let Ok(p) = tokens[i + 1].parse::<u16>() {
-                        if p > 0 { ports.push(p); }
+                        if p > 0 {
+                            ports.push(p);
+                        }
                     }
                 }
             }

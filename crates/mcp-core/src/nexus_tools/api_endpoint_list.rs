@@ -7,12 +7,16 @@ use std::path::Path;
 pub struct ApiEndpointListTool;
 
 fn walk(dir: &Path, depth: usize, out: &mut Vec<String>) {
-    if depth > 8 { return; }
+    if depth > 8 {
+        return;
+    }
     if let Ok(rd) = std::fs::read_dir(dir) {
         for entry in rd.flatten() {
             let p = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == "target" || name == "node_modules" || name.starts_with('.') { continue; }
+            if name == "target" || name == "node_modules" || name.starts_with('.') {
+                continue;
+            }
             if p.is_dir() {
                 walk(&p, depth + 1, out);
             } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
@@ -36,15 +40,23 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<String>) {
 
 #[async_trait]
 impl NexusToolHandler for ApiEndpointListTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let mut found: Vec<String> = vec![];
         for sub in ["src", "crates"] {
             let p = ctx.project_root.join(sub);
-            if p.is_dir() { walk(&p, 0, &mut found); }
+            if p.is_dir() {
+                walk(&p, 0, &mut found);
+            }
         }
         found.sort();
         found.dedup();
         Ok(json!({"ok": true, "count": found.len(), "endpoints": found}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

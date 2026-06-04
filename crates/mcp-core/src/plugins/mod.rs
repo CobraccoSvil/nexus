@@ -23,16 +23,16 @@ use crate::{
 
 pub mod catalog;
 pub mod figma;
-pub mod integrate;
 pub mod install;
+pub mod integrate;
 pub mod runtime;
 
 pub use catalog::{list_installed_plugins, list_plugin_catalog};
 pub use figma::{figma_oauth_callback, get_figma_oauth_status, start_figma_oauth};
-pub use integrate::{draft_plugin_integration, publish_plugin_integration};
 pub use install::{
     install_plugin, migrate_legacy_mcp_server, toggle_plugin, uninstall_plugin, update_plugin,
 };
+pub use integrate::{draft_plugin_integration, publish_plugin_integration};
 pub use runtime::{get_plugin_health, test_plugin, update_plugin_tool_policy};
 
 #[derive(Debug, Deserialize)]
@@ -725,22 +725,46 @@ pub(super) fn detect_legacy_catalog_slug(
             return Some("playwright-stdio");
         }
         // MCP standard servers (stdio) via npx @modelcontextprotocol/server-*
-        if command == "npx" && args.iter().any(|item| item.contains("@modelcontextprotocol/server-redis")) {
+        if command == "npx"
+            && args
+                .iter()
+                .any(|item| item.contains("@modelcontextprotocol/server-redis"))
+        {
             return Some("redis-stdio");
         }
-        if command == "npx" && args.iter().any(|item| item.contains("@modelcontextprotocol/server-sqlite")) {
+        if command == "npx"
+            && args
+                .iter()
+                .any(|item| item.contains("@modelcontextprotocol/server-sqlite"))
+        {
             return Some("sqlite-stdio");
         }
-        if command == "npx" && args.iter().any(|item| item.contains("@modelcontextprotocol/server-postgres")) {
+        if command == "npx"
+            && args
+                .iter()
+                .any(|item| item.contains("@modelcontextprotocol/server-postgres"))
+        {
             return Some("postgres-stdio");
         }
-        if command == "npx" && args.iter().any(|item| item.contains("@modelcontextprotocol/server-gitlab")) {
+        if command == "npx"
+            && args
+                .iter()
+                .any(|item| item.contains("@modelcontextprotocol/server-gitlab"))
+        {
             return Some("gitlab-stdio");
         }
-        if command == "npx" && args.iter().any(|item| item.contains("@modelcontextprotocol/server-github")) {
+        if command == "npx"
+            && args
+                .iter()
+                .any(|item| item.contains("@modelcontextprotocol/server-github"))
+        {
             return Some("github-stdio");
         }
-        if command == "npx" && args.iter().any(|item| item.contains("@modelcontextprotocol/server-memory")) {
+        if command == "npx"
+            && args
+                .iter()
+                .any(|item| item.contains("@modelcontextprotocol/server-memory"))
+        {
             return Some("memory-stdio");
         }
     }
@@ -792,7 +816,9 @@ pub(super) async fn resolve_plugin_runtime_config(
     mcp_server_row: &sqlx::postgres::PgRow,
     secret_bindings: &Value,
 ) -> McpServerConfig {
-    let mcp_server_id: Uuid = mcp_server_row.try_get("mcp_server_id").unwrap_or(Uuid::nil());
+    let mcp_server_id: Uuid = mcp_server_row
+        .try_get("mcp_server_id")
+        .unwrap_or(Uuid::nil());
     let mcp_server_name: String = mcp_server_row
         .try_get("mcp_server_name")
         .unwrap_or_else(|_| "Plugin MCP".to_string());
@@ -1102,9 +1128,12 @@ pub(super) async fn build_plugin_resolution(
     user_id: Uuid,
 ) -> Result<PluginResolution, (StatusCode, Json<Value>)> {
     let row = resolve_plugin_instance_for_user(db, plugin_instance_id, user_id).await?;
-    let mcp_server_id: Uuid = row
-        .try_get("mcp_server_id")
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Plugin senza adapter MCP collegato"))?;
+    let mcp_server_id: Uuid = row.try_get("mcp_server_id").map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "Plugin senza adapter MCP collegato",
+        )
+    })?;
     let secret_bindings: Value = row.try_get("secret_bindings").unwrap_or(json!({}));
     let mcp_server_name: String = row.try_get("mcp_server_name").unwrap_or_else(|_| {
         row.try_get::<String, _>("name")
@@ -1135,12 +1164,14 @@ pub(super) async fn figma_oauth_client_credentials(
             "figma_client_id non configurato in Admin > Connettori",
         )
     })?;
-    let client_secret = get_setting(db, "figma_client_secret").await.ok_or_else(|| {
-        api_error(
-            StatusCode::BAD_REQUEST,
-            "figma_client_secret non configurato in Admin > Connettori",
-        )
-    })?;
+    let client_secret = get_setting(db, "figma_client_secret")
+        .await
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "figma_client_secret non configurato in Admin > Connettori",
+            )
+        })?;
     let redirect_uri = get_setting(db, "figma_oauth_redirect_uri")
         .await
         .filter(|value| !value.trim().is_empty())

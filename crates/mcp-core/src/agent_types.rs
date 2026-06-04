@@ -58,7 +58,9 @@ impl SupervisorMode {
 
     /// Ogni quante iterazioni controllare (per Interleaved)
     #[allow(dead_code)]
-    fn check_interval(self) -> u32 { 5 }
+    fn check_interval(self) -> u32 {
+        5
+    }
 
     /// Se il supervisor deve essere chiamato a questa iterazione
     #[allow(dead_code)]
@@ -214,10 +216,10 @@ pub struct AITraceEvent {
     pub iteration: u32,
     pub provider: String,
     pub model: String,
-    pub messages_sent: u32,       // quanti messaggi nella conversazione
-    pub tools_count: u32,          // quanti tool disponibili
-    pub response_text: String,     // testo della risposta (troncato)
-    pub tool_calls: Vec<Value>,    // tool call names + inputs
+    pub messages_sent: u32,     // quanti messaggi nella conversazione
+    pub tools_count: u32,       // quanti tool disponibili
+    pub response_text: String,  // testo della risposta (troncato)
+    pub tool_calls: Vec<Value>, // tool call names + inputs
     pub stop_reason: String,
     pub timestamp: String,
     pub input_tokens: u32,
@@ -278,36 +280,81 @@ pub(crate) fn detect_action_request(text: &str) -> bool {
     let lower = text.to_lowercase();
     let action_patterns: &[&str] = &[
         // Italiano — imperativo / infinito / futuro
-        "avvia", "avviare", "lancia", "lanciare",
-        "esegui", "eseguire",
-        "builda", "buildare",
-        "crea ", "creare", "crea il", "crea la",
-        "installa", "installare",
-        "configura", "configurare",
-        "deploya", "deployare",
-        "compila", "compilare",
-        "fai partire", "metti in piedi", "porta in su", "metti online",
-        "avvia i servizi", "avvia il servizio", "avvia il backend", "avvia il frontend",
-        "avvia il server", "avvia i container",
-        "testa il", "testa la",
+        "avvia",
+        "avviare",
+        "lancia",
+        "lanciare",
+        "esegui",
+        "eseguire",
+        "builda",
+        "buildare",
+        "crea ",
+        "creare",
+        "crea il",
+        "crea la",
+        "installa",
+        "installare",
+        "configura",
+        "configurare",
+        "deploya",
+        "deployare",
+        "compila",
+        "compilare",
+        "fai partire",
+        "metti in piedi",
+        "porta in su",
+        "metti online",
+        "avvia i servizi",
+        "avvia il servizio",
+        "avvia il backend",
+        "avvia il frontend",
+        "avvia il server",
+        "avvia i container",
+        "testa il",
+        "testa la",
         // Inglese — imperativo / common forms
-        "start ", "start the", "launch ", "launch the",
-        " run ", "run the", "run it",
-        " build", "build the", "build it",
-        " create ", "create the",
-        "install ", "install the",
-        "setup ", "set up ", "configure ",
-        "deploy ", "deploy the",
-        "compile ", "compile the",
+        "start ",
+        "start the",
+        "launch ",
+        "launch the",
+        " run ",
+        "run the",
+        "run it",
+        " build",
+        "build the",
+        "build it",
+        " create ",
+        "create the",
+        "install ",
+        "install the",
+        "setup ",
+        "set up ",
+        "configure ",
+        "deploy ",
+        "deploy the",
+        "compile ",
+        "compile the",
         // Tool / tecnologie specifiche (alta probabilità d'azione)
-        "docker", "docker-compose", "docker compose",
-        "npm install", "npm run", "pnpm install", "pnpm run",
-        "cargo build", "cargo run",
-        "dotnet run", "dotnet build", "dotnet watch",
-        "pip install", "pip3 install",
-        "apt install", "apt-get install",
-        "systemctl start", "service start",
-        "make ", "make\t",
+        "docker",
+        "docker-compose",
+        "docker compose",
+        "npm install",
+        "npm run",
+        "pnpm install",
+        "pnpm run",
+        "cargo build",
+        "cargo run",
+        "dotnet run",
+        "dotnet build",
+        "dotnet watch",
+        "pip install",
+        "pip3 install",
+        "apt install",
+        "apt-get install",
+        "systemctl start",
+        "service start",
+        "make ",
+        "make\t",
     ];
     action_patterns.iter().any(|p| lower.contains(p))
 }
@@ -441,18 +488,21 @@ pub async fn finalize_agent_run(
 pub async fn auto_commit_project_changes(db: &PgPool, run_id: Uuid) {
     // M13.5 — se il regression gate ha bloccato il run, NON committare il codice
     // potenzialmente rotto. Legge l'esito registrato in project_impact_runs.
-    let gate_status: Option<String> = sqlx::query_scalar(
-        "SELECT gate_status FROM project_impact_runs WHERE run_id = $1",
-    )
-    .bind(run_id)
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten();
-    if matches!(gate_status.as_deref(), Some("blocked") | Some("blocked_capped")) {
+    let gate_status: Option<String> =
+        sqlx::query_scalar("SELECT gate_status FROM project_impact_runs WHERE run_id = $1")
+            .bind(run_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    if matches!(
+        gate_status.as_deref(),
+        Some("blocked") | Some("blocked_capped")
+    ) {
         tracing::warn!(
             "auto_commit: run {} bloccato dal regression gate (gate_status={:?}) -> commit saltato",
-            run_id, gate_status,
+            run_id,
+            gate_status,
         );
         return;
     }
@@ -596,10 +646,15 @@ Thumbs.db
     // 6. Commit con user.email/name fallback per evitare fail se git config vuota
     let output = tokio::process::Command::new("git")
         .args([
-            "-C", &root,
-            "-c", "user.email=nexus@local",
-            "-c", "user.name=Nexus Agent",
-            "commit", "-m", &msg,
+            "-C",
+            &root,
+            "-c",
+            "user.email=nexus@local",
+            "-c",
+            "user.name=Nexus Agent",
+            "commit",
+            "-m",
+            &msg,
         ])
         .output()
         .await;
@@ -607,7 +662,9 @@ Thumbs.db
         Ok(o) if o.status.success() => {
             tracing::info!(
                 "auto_commit: {} file committati nel run {} (root={})",
-                count, run_id, root
+                count,
+                run_id,
+                root
             );
         }
         Ok(o) => {
@@ -631,19 +688,12 @@ Thumbs.db
 /// lo mostrerà in "Memoria di progetto" → l'agente sa già cosa eseguire.
 ///
 /// Fire-and-forget: gli errori non bloccano il return del run.
-pub async fn save_startup_command_if_needed(
-    db: &PgPool,
-    project_id: Uuid,
-    steps: &[AgentStep],
-) {
+pub async fn save_startup_command_if_needed(db: &PgPool, project_id: Uuid, steps: &[AgentStep]) {
     // Cerca l'ultimo step shell_exec riuscito con `docker compose up`
     let docker_cmd = steps
         .iter()
         .rev()
-        .filter(|s| {
-            s.tool_name == "shell_exec"
-                && s.status == AgentStepStatus::Completed
-        })
+        .filter(|s| s.tool_name == "shell_exec" && s.status == AgentStepStatus::Completed)
         .find_map(|s| {
             let cmd = s.tool_input.get("command").and_then(|v| v.as_str())?;
             if cmd.contains("docker") && cmd.contains("compose") && cmd.contains("up") {
@@ -692,9 +742,7 @@ pub async fn save_startup_command_if_needed(
             {
                 Ok(Some(id)) => id,
                 _ => {
-                    tracing::debug!(
-                        "G4: impossibile creare/trovare namespace per {ns_key}"
-                    );
+                    tracing::debug!("G4: impossibile creare/trovare namespace per {ns_key}");
                     return;
                 }
             }
@@ -717,9 +765,7 @@ pub async fn save_startup_command_if_needed(
     .execute(db)
     .await
     .map(|_| {
-        tracing::info!(
-            "G4: startup_command salvato per progetto {project_id}: {cmd:?}"
-        );
+        tracing::info!("G4: startup_command salvato per progetto {project_id}: {cmd:?}");
     })
     .map_err(|e| tracing::warn!("G4: salvataggio startup_command fallito: {e}"));
 }

@@ -69,11 +69,7 @@ fn walk(
 
 #[async_trait]
 impl NexusToolHandler for FsListTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let dir = args.get("dir").and_then(Value::as_str).unwrap_or("");
         let pattern = args.get("pattern").and_then(Value::as_str);
         let max_results = args
@@ -82,7 +78,10 @@ impl NexusToolHandler for FsListTool {
             .map(|v| v as usize)
             .unwrap_or(500)
             .min(5000);
-        let recursive = args.get("recursive").and_then(Value::as_bool).unwrap_or(false);
+        let recursive = args
+            .get("recursive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         let full: PathBuf = ctx.project_root.join(dir);
         if !full.starts_with(&ctx.project_root) {
@@ -90,13 +89,23 @@ impl NexusToolHandler for FsListTool {
         }
         let re = match pattern {
             Some(p) => Some(
-                regex::Regex::new(p).map_err(|e| NexusToolError::BadInput(format!("bad regex: {}", e)))?,
+                regex::Regex::new(p)
+                    .map_err(|e| NexusToolError::BadInput(format!("bad regex: {}", e)))?,
             ),
             None => None,
         };
 
         let mut results: Vec<(String, u64, bool)> = Vec::new();
-        walk(&ctx.project_root, &full, re.as_ref(), recursive, 0, 10, &mut results, max_results);
+        walk(
+            &ctx.project_root,
+            &full,
+            re.as_ref(),
+            recursive,
+            0,
+            10,
+            &mut results,
+            max_results,
+        );
 
         let out: Vec<Value> = results
             .into_iter()

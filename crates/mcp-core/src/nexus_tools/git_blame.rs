@@ -17,11 +17,7 @@ pub struct GitBlameTool;
 
 #[async_trait]
 impl NexusToolHandler for GitBlameTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let path = args
             .get("path")
             .and_then(Value::as_str)

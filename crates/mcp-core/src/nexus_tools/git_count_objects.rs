@@ -8,10 +8,23 @@ pub struct GitCountObjectsTool;
 
 #[async_trait]
 impl NexusToolHandler for GitCountObjectsTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let out = run_cmd("git", &["count-objects", "-v"], &ctx.project_root, ctx.timeout_secs).await?;
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let out = run_cmd(
+            "git",
+            &["count-objects", "-v"],
+            &ctx.project_root,
+            ctx.timeout_secs,
+        )
+        .await?;
         if !out.success() {
-            return Err(NexusToolError::Exec { exit_code: out.exit_code, stderr: out.stderr });
+            return Err(NexusToolError::Exec {
+                exit_code: out.exit_code,
+                stderr: out.stderr,
+            });
         }
         let mut map = Map::new();
         for line in out.stdout.lines() {
@@ -25,5 +38,7 @@ impl NexusToolHandler for GitCountObjectsTool {
         }
         Ok(json!({"ok": true, "stats": Value::Object(map)}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only_subproc()
+    }
 }

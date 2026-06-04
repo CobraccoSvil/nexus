@@ -91,17 +91,15 @@ impl RoutingThresholds {
 }
 
 async fn fetch_thresholds_from_db(db: &PgPool) -> Result<RoutingThresholds, String> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        r#"SELECT key, value FROM settings WHERE key LIKE 'routing.%'"#,
-    )
-    .fetch_all(db)
-    .await
-    .map_err(|e| format!("query settings 'routing.*' fallita: {e}"))?;
+    let rows: Vec<(String, String)> =
+        sqlx::query_as(r#"SELECT key, value FROM settings WHERE key LIKE 'routing.%'"#)
+            .fetch_all(db)
+            .await
+            .map_err(|e| format!("query settings 'routing.*' fallita: {e}"))?;
 
     if rows.is_empty() {
         return Err(
-            "settings non contiene chiavi 'routing.*'. Applica la migrazione 0111."
-                .to_string(),
+            "settings non contiene chiavi 'routing.*'. Applica la migrazione 0111.".to_string(),
         );
     }
 
@@ -113,7 +111,10 @@ async fn fetch_thresholds_from_db(db: &PgPool) -> Result<RoutingThresholds, Stri
         match map.get(key).and_then(|v| v.parse::<f32>().ok()) {
             Some(v) => v,
             None => {
-                warn!("settings: chiave {} mancante o malformata, uso default {}", key, default);
+                warn!(
+                    "settings: chiave {} mancante o malformata, uso default {}",
+                    key, default
+                );
                 default
             }
         }
@@ -122,7 +123,10 @@ async fn fetch_thresholds_from_db(db: &PgPool) -> Result<RoutingThresholds, Stri
         match map.get(key).and_then(|v| v.parse::<u32>().ok()) {
             Some(v) => v,
             None => {
-                warn!("settings: chiave {} mancante o malformata, uso default {}", key, default);
+                warn!(
+                    "settings: chiave {} mancante o malformata, uso default {}",
+                    key, default
+                );
                 default
             }
         }
@@ -131,20 +135,25 @@ async fn fetch_thresholds_from_db(db: &PgPool) -> Result<RoutingThresholds, Stri
         match map.get(key).and_then(|v| v.parse::<u64>().ok()) {
             Some(v) => v,
             None => {
-                warn!("settings: chiave {} mancante o malformata, uso default {}", key, default);
+                warn!(
+                    "settings: chiave {} mancante o malformata, uso default {}",
+                    key, default
+                );
                 default
             }
         }
     };
     // Provider/modello del classifier: niente fallback hardcoded (CLAUDE.md §G).
     // Se mancano, errore esplicito che propaga al chiamante (HTTP 503 a runtime).
-    let classifier_provider = map.get("routing.classifier_provider")
+    let classifier_provider = map
+        .get("routing.classifier_provider")
         .filter(|v| !v.is_empty())
         .cloned()
         .ok_or_else(|| {
             "settings 'routing.classifier_provider' mancante (richiede mig 0111)".to_string()
         })?;
-    let classifier_model = map.get("routing.classifier_model")
+    let classifier_model = map
+        .get("routing.classifier_model")
         .filter(|v| !v.is_empty())
         .cloned()
         .ok_or_else(|| {
@@ -220,7 +229,9 @@ impl IntentCapabilityMap {
     /// Conveniente: tier effettivo per (intent, tokens). Ritorna None se
     /// l'intent non e' mappato.
     pub fn tier_for(&self, intent: &str, tokens: u32) -> Option<String> {
-        self.by_intent.get(intent).map(|c| c.tier_for_tokens(tokens))
+        self.by_intent
+            .get(intent)
+            .map(|c| c.tier_for_tokens(tokens))
     }
 
     pub fn capability_for(&self, intent: &str) -> Option<&str> {
@@ -251,11 +262,14 @@ async fn fetch_intent_capability_from_db(db: &PgPool) -> Result<IntentCapability
     )
     .fetch_all(db)
     .await
-    .map_err(|e| format!("query nexus_intent_capability fallita: {e}. Hai applicato la migrazione 0110?"))?;
+    .map_err(|e| {
+        format!("query nexus_intent_capability fallita: {e}. Hai applicato la migrazione 0110?")
+    })?;
 
     if rows.is_empty() {
         return Err(
-            "nexus_intent_capability vuota. Applica la migrazione 0110 o popola la tabella.".to_string(),
+            "nexus_intent_capability vuota. Applica la migrazione 0110 o popola la tabella."
+                .to_string(),
         );
     }
 
@@ -364,7 +378,10 @@ impl<T: Clone + Send + Sync + 'static> ConfigCache<T> {
                         debug!("{}: refresh OK", name_bg);
                     }
                     Err(e) => {
-                        warn!("{}: refresh fallito ({}). Mantengo cache precedente.", name_bg, e);
+                        warn!(
+                            "{}: refresh fallito ({}). Mantengo cache precedente.",
+                            name_bg, e
+                        );
                         let mut le = last_err_bg.write().await;
                         *le = Some(e);
                     }
@@ -414,8 +431,14 @@ impl IntentCapabilityCache {
 mod tests {
     use super::*;
 
-    fn cap(intent: &str, tier: &str, cap: &str, preferred: Option<&str>,
-           mt: Option<u32>, ht: Option<u32>) -> IntentCapability {
+    fn cap(
+        intent: &str,
+        tier: &str,
+        cap: &str,
+        preferred: Option<&str>,
+        mt: Option<u32>,
+        ht: Option<u32>,
+    ) -> IntentCapability {
         IntentCapability {
             intent: intent.to_string(),
             base_tier: tier.to_string(),
@@ -456,7 +479,14 @@ mod tests {
         let mut by_intent = HashMap::new();
         by_intent.insert(
             "system_admin".to_string(),
-            cap("system_admin", "heavy", "reasoning", Some("anthropic"), None, None),
+            cap(
+                "system_admin",
+                "heavy",
+                "reasoning",
+                Some("anthropic"),
+                None,
+                None,
+            ),
         );
         by_intent.insert(
             "test".to_string(),
@@ -480,15 +510,43 @@ mod tests {
         // di orchestrator.rs:444-461. Se questo test fallisce, la migrazione
         // ha alterato il comportamento di routing — bisogna correggere.
         let seed: &[(&str, &str, &str, Option<&str>, Option<u32>, Option<u32>)] = &[
-            ("debug",        "heavy",  "reasoning", Some("anthropic"), None,       None),
-            ("architecture", "heavy",  "reasoning", Some("anthropic"), None,       None),
-            ("system_admin", "heavy",  "reasoning", Some("anthropic"), None,       None),
-            ("file_ops",     "medium", "reasoning", Some("anthropic"), None,       None),
-            ("refactor",     "light",  "reasoning", Some("anthropic"), Some(3000), None),
-            ("fix",          "light",  "code",      None,              Some(3000), None),
-            ("test",         "light",  "code",      None,              None,       None),
-            ("docs",         "medium", "docs",      Some("openai"),    None,       None),
-            ("chat",         "light",  "chat",      Some("openai"),    None,       Some(6000)),
+            ("debug", "heavy", "reasoning", Some("anthropic"), None, None),
+            (
+                "architecture",
+                "heavy",
+                "reasoning",
+                Some("anthropic"),
+                None,
+                None,
+            ),
+            (
+                "system_admin",
+                "heavy",
+                "reasoning",
+                Some("anthropic"),
+                None,
+                None,
+            ),
+            (
+                "file_ops",
+                "medium",
+                "reasoning",
+                Some("anthropic"),
+                None,
+                None,
+            ),
+            (
+                "refactor",
+                "light",
+                "reasoning",
+                Some("anthropic"),
+                Some(3000),
+                None,
+            ),
+            ("fix", "light", "code", None, Some(3000), None),
+            ("test", "light", "code", None, None, None),
+            ("docs", "medium", "docs", Some("openai"), None, None),
+            ("chat", "light", "chat", Some("openai"), None, Some(6000)),
         ];
         // Test legacy compat: per ogni intent, tier@1000 e capability matchino
         // i valori del match Rust originale.

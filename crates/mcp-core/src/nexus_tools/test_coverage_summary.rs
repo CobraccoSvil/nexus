@@ -7,7 +7,11 @@ pub struct TestCoverageSummaryTool;
 
 #[async_trait]
 impl NexusToolHandler for TestCoverageSummaryTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let candidates = [
             "cobertura.xml",
             "tarpaulin-report.html",
@@ -25,5 +29,7 @@ impl NexusToolHandler for TestCoverageSummaryTool {
         }
         Ok(json!({"ok": true, "found": found.len(), "reports": found}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

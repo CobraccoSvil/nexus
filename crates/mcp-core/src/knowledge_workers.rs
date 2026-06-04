@@ -128,23 +128,19 @@ async fn link_inference_tick(
         };
 
         // Cerca note simili in Qdrant (top 10, esclusa se stessa).
-        let hits = match crate::vector_memory::search_knowledge_points(
-            db,
-            vector,
-            note.project_id,
-            10,
-        )
-        .await
-        {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::debug!(
-                    note_id = %note.id,
-                    "knowledge_link_worker: ricerca fallita, skip: {e}"
-                );
-                continue;
-            }
-        };
+        let hits =
+            match crate::vector_memory::search_knowledge_points(db, vector, note.project_id, 10)
+                .await
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::debug!(
+                        note_id = %note.id,
+                        "knowledge_link_worker: ricerca fallita, skip: {e}"
+                    );
+                    continue;
+                }
+            };
 
         for hit in &hits {
             if hit.score < threshold {
@@ -308,20 +304,16 @@ pub async fn recompute_links_for_project(
             }
         };
 
-        let hits = match crate::vector_memory::search_knowledge_points(
-            db,
-            vector,
-            note.project_id,
-            10,
-        )
-        .await
-        {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::warn!(note_id = %note.id, error = %e, "recompute: search failed");
-                continue;
-            }
-        };
+        let hits =
+            match crate::vector_memory::search_knowledge_points(db, vector, note.project_id, 10)
+                .await
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(note_id = %note.id, error = %e, "recompute: search failed");
+                    continue;
+                }
+            };
         tracing::info!(
             note_id = %note.id,
             hits_count = hits.len(),
@@ -607,6 +599,11 @@ async fn read_bool_setting(db: &PgPool, key: &str, default: bool) -> bool {
         .await
         .ok()
         .flatten()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }

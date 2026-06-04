@@ -18,7 +18,10 @@ impl NexusToolHandler for Base64EncodeTool {
             .get("input")
             .and_then(Value::as_str)
             .ok_or_else(|| NexusToolError::BadInput("input required".into()))?;
-        let url_safe = args.get("url_safe").and_then(Value::as_bool).unwrap_or(false);
+        let url_safe = args
+            .get("url_safe")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let encoded = if url_safe {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input.as_bytes())
         } else {
@@ -54,11 +57,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_b64_standard() {
-        let ctx = NexusToolContext::new(
-            std::env::temp_dir(),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-        );
+        let ctx = NexusToolContext::new(std::env::temp_dir(), uuid::Uuid::nil(), uuid::Uuid::nil());
         let out = Base64EncodeTool
             .execute(&ctx, &json!({"input": "hello"}))
             .await

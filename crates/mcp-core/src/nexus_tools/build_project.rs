@@ -51,12 +51,11 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[async_trait]
 impl NexusToolHandler for BuildProjectTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
-        let release = args.get("release").and_then(Value::as_bool).unwrap_or(false);
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
+        let release = args
+            .get("release")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let kind = match detect_build_kind(&ctx.project_root) {
             Some(k) => k,
             None => {

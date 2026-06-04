@@ -23,10 +23,7 @@ fn is_allowed_flag(key: &str) -> bool {
     FLAG_KEY_PREFIXES.iter().any(|p| key.starts_with(p))
 }
 
-pub(super) async fn tool_dispatcher_emit_event(
-    ctx: &AgentToolContext,
-    input: &Value,
-) -> String {
+pub(super) async fn tool_dispatcher_emit_event(ctx: &AgentToolContext, input: &Value) -> String {
     let event_name = match input.get("kind").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return "[Errore: parametro 'kind' obbligatorio]".to_string(),
@@ -36,10 +33,7 @@ pub(super) async fn tool_dispatcher_emit_event(
         .and_then(Value::as_str)
         .unwrap_or("custom")
         .to_string();
-    let payload = input
-        .get("payload")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let payload = input.get("payload").cloned().unwrap_or(Value::Null);
 
     let env = dispatcher::emit(
         &ctx.project_channels,
@@ -98,10 +92,7 @@ pub(super) async fn tool_dispatcher_post_notification(
     )
 }
 
-pub(super) async fn tool_dispatcher_set_flag(
-    ctx: &AgentToolContext,
-    input: &Value,
-) -> String {
+pub(super) async fn tool_dispatcher_set_flag(ctx: &AgentToolContext, input: &Value) -> String {
     if !ctx.can_write {
         return "[Errore: permesso di scrittura non concesso]".to_string();
     }

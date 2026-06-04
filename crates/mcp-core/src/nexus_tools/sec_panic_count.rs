@@ -8,8 +8,15 @@ pub struct SecPanicCountTool;
 
 #[async_trait]
 impl NexusToolHandler for SecPanicCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let (counts, files) = scan_substrings(&ctx.project_root, &["panic!(", "todo!(", "unimplemented!(", "unreachable!("]);
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let (counts, files) = scan_substrings(
+            &ctx.project_root,
+            &["panic!(", "todo!(", "unimplemented!(", "unreachable!("],
+        );
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -20,5 +27,7 @@ impl NexusToolHandler for SecPanicCountTool {
             "total": counts.iter().sum::<usize>(),
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

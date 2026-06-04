@@ -78,14 +78,16 @@ pub async fn list_all_projects(
 
     let projects = rows
         .into_iter()
-        .map(|(id, name, slug, owner_user_id, owner_email, member_count)| AdminProjectSummary {
-            id,
-            name,
-            slug,
-            owner_user_id,
-            owner_email,
-            member_count,
-        })
+        .map(
+            |(id, name, slug, owner_user_id, owner_email, member_count)| AdminProjectSummary {
+                id,
+                name,
+                slug,
+                owner_user_id,
+                owner_email,
+                member_count,
+            },
+        )
         .collect();
 
     Ok(Json(ListAllProjectsResponse { projects }))
@@ -99,11 +101,12 @@ pub async fn list_project_members(
     let project_uuid = Uuid::parse_str(&project_id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Verify project exists
-    let project_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)")
-        .bind(project_uuid)
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(false);
+    let project_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)")
+            .bind(project_uuid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(false);
 
     if !project_exists {
         return Err(StatusCode::NOT_FOUND);
@@ -155,11 +158,12 @@ pub async fn add_project_member(
     }
 
     // Verify project exists
-    let project_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)")
-        .bind(project_uuid)
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(false);
+    let project_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)")
+            .bind(project_uuid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(false);
 
     if !project_exists {
         return Err(StatusCode::NOT_FOUND);
@@ -190,15 +194,13 @@ pub async fn add_project_member(
     }
 
     // Add member
-    sqlx::query(
-        "INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, $3)",
-    )
-    .bind(project_uuid)
-    .bind(user_uuid)
-    .bind(&payload.role)
-    .execute(&state.db)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sqlx::query("INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, $3)")
+        .bind(project_uuid)
+        .bind(user_uuid)
+        .bind(&payload.role)
+        .execute(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(ProjectMemberResponse {
         user_id: user.0,
@@ -226,7 +228,14 @@ pub async fn update_project_member(
     }
 
     // Fetch user and member info
-    let member: (String, String, String, Option<String>, Option<String>, String) = sqlx::query_as(
+    let member: (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = sqlx::query_as(
         r#"
         SELECT u.id, u.email, u.display_name, u.github_username, u.avatar_url, pm.created_at::text
         FROM project_members pm
@@ -338,10 +347,14 @@ pub async fn port_projects(
     let new_base = payload.new_base.trim_end_matches('/');
 
     if old_base.is_empty() || new_base.is_empty() {
-        return Ok(Json(json!({ "error": "old_base e new_base sono obbligatori" })));
+        return Ok(Json(
+            json!({ "error": "old_base e new_base sono obbligatori" }),
+        ));
     }
     if old_base == new_base {
-        return Ok(Json(json!({ "error": "old_base e new_base sono identici" })));
+        return Ok(Json(
+            json!({ "error": "old_base e new_base sono identici" }),
+        ));
     }
 
     // Verifica che new_base esista come directory
@@ -352,13 +365,12 @@ pub async fn port_projects(
     }
 
     // Raccolta preview: workspaces da aggiornare
-    let ws_rows = sqlx::query(
-        "SELECT id::text, absolute_path FROM workspaces WHERE absolute_path LIKE $1"
-    )
-    .bind(format!("{}%", old_base))
-    .fetch_all(&state.db)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let ws_rows =
+        sqlx::query("SELECT id::text, absolute_path FROM workspaces WHERE absolute_path LIKE $1")
+            .bind(format!("{}%", old_base))
+            .fetch_all(&state.db)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let mut details: Vec<PortDetail> = Vec::new();
     for row in &ws_rows {
@@ -374,13 +386,12 @@ pub async fn port_projects(
     }
 
     // Raccolta preview: repositories da aggiornare
-    let repo_rows = sqlx::query(
-        "SELECT id::text, root_path FROM repositories WHERE root_path LIKE $1"
-    )
-    .bind(format!("{}%", old_base))
-    .fetch_all(&state.db)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let repo_rows =
+        sqlx::query("SELECT id::text, root_path FROM repositories WHERE root_path LIKE $1")
+            .bind(format!("{}%", old_base))
+            .fetch_all(&state.db)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     for row in &repo_rows {
         let id: String = row.get("id");
@@ -395,12 +406,11 @@ pub async fn port_projects(
     }
 
     // Controlla setting projects_base_root
-    let current_base_root: Option<String> = sqlx::query_scalar(
-        "SELECT value FROM settings WHERE key = 'projects_base_root'"
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let current_base_root: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'projects_base_root'")
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let base_root_needs_update = current_base_root
         .as_deref()
@@ -429,7 +439,11 @@ pub async fn port_projects(
     }
 
     // ── Esecuzione effettiva ──
-    let mut tx = state.db.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Aggiorna workspaces
     let ws_affected = sqlx::query(
@@ -445,7 +459,7 @@ pub async fn port_projects(
 
     // Aggiorna repositories
     let repo_affected = sqlx::query(
-        "UPDATE repositories SET root_path = REPLACE(root_path, $1, $2) WHERE root_path LIKE $3"
+        "UPDATE repositories SET root_path = REPLACE(root_path, $1, $2) WHERE root_path LIKE $3",
     )
     .bind(old_base)
     .bind(new_base)
@@ -470,11 +484,17 @@ pub async fn port_projects(
         false
     };
 
-    tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tx.commit()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     tracing::info!(
         "Project porting: '{}' → '{}' — workspaces: {}, repos: {}, base_root: {}",
-        old_base, new_base, ws_affected, repo_affected, base_updated
+        old_base,
+        new_base,
+        ws_affected,
+        repo_affected,
+        base_updated
     );
 
     Ok(Json(json!(PortProjectsResponse {

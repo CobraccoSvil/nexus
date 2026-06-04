@@ -11,11 +11,7 @@ pub struct CargoPkgidTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoPkgidTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let mut cmd_args: Vec<&str> = vec!["pkgid"];
         let pkg_arg;
         if let Some(p) = args.get("package").and_then(Value::as_str) {

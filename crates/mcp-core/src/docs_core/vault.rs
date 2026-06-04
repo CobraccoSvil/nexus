@@ -56,7 +56,9 @@ pub fn parse_frontmatter(content: &str) -> Option<(serde_json::Value, String)> {
     let after_first = &trimmed[3..];
     let end_idx = after_first.find("\n---")?;
     let yaml_str = &after_first[..end_idx];
-    let body = after_first[end_idx + 4..].trim_start_matches('\n').to_string();
+    let body = after_first[end_idx + 4..]
+        .trim_start_matches('\n')
+        .to_string();
     Some((parse_yaml_simple(yaml_str), body))
 }
 
@@ -165,7 +167,10 @@ mod tests {
     #[test]
     fn slugify_kebab() {
         assert_eq!(slugify("Fix Bug Nullpointer"), "fix-bug-nullpointer");
-        assert_eq!(slugify("Knowledge Base / Obsidian"), "knowledge-base-obsidian");
+        assert_eq!(
+            slugify("Knowledge Base / Obsidian"),
+            "knowledge-base-obsidian"
+        );
         assert_eq!(slugify("--leading dash---"), "leading-dash");
     }
 
@@ -191,7 +196,10 @@ mod tests {
     fn build_vault_path_kinds() {
         use chrono::TimeZone;
         let dt = Utc.with_ymd_and_hms(2026, 5, 23, 0, 0, 0).unwrap();
-        assert_eq!(build_vault_path("adr", "test-slug", &dt), "adr/test-slug.md");
+        assert_eq!(
+            build_vault_path("adr", "test-slug", &dt),
+            "adr/test-slug.md"
+        );
         assert_eq!(
             build_vault_path("changelog", "fix-bug", &dt),
             "changelog/2026/2026-05-23-fix-bug.md"

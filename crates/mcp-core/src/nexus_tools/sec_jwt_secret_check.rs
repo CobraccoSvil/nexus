@@ -8,7 +8,11 @@ pub struct SecJwtSecretCheckTool;
 
 #[async_trait]
 impl NexusToolHandler for SecJwtSecretCheckTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(
             &ctx.project_root,
             &[
@@ -32,5 +36,7 @@ impl NexusToolHandler for SecJwtSecretCheckTool {
             "warning": counts[4] > 0 || counts[5] > 0,
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

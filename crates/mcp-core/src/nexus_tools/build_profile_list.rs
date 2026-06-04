@@ -7,7 +7,11 @@ pub struct BuildProfileListTool;
 
 #[async_trait]
 impl NexusToolHandler for BuildProfileListTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let cargo = ctx.project_root.join("Cargo.toml");
         if !cargo.is_file() {
             return Ok(json!({"ok": true, "exists": false, "profiles": []}));
@@ -24,5 +28,7 @@ impl NexusToolHandler for BuildProfileListTool {
         }
         Ok(json!({"ok": true, "exists": true, "profiles": profiles, "count": profiles.len()}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

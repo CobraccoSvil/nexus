@@ -7,7 +7,11 @@ pub struct UtilHostnameTool;
 
 #[async_trait]
 impl NexusToolHandler for UtilHostnameTool {
-    async fn execute(&self, _ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        _ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let host = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("COMPUTERNAME"))
             .unwrap_or_else(|_| "unknown".to_string());
@@ -16,5 +20,7 @@ impl NexusToolHandler for UtilHostnameTool {
             .unwrap_or_else(|_| "unknown".to_string());
         Ok(json!({"ok": true, "hostname": host, "user": user}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

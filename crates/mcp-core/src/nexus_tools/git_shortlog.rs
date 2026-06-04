@@ -11,11 +11,7 @@ pub struct GitShortlogTool;
 
 #[async_trait]
 impl NexusToolHandler for GitShortlogTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)
@@ -51,9 +47,7 @@ impl NexusToolHandler for GitShortlogTool {
                 // parse "Name <email>"
                 let (name, email) = if let Some(start) = rest.rfind('<') {
                     let name = rest[..start].trim().to_string();
-                    let email = rest[start + 1..]
-                        .trim_end_matches('>')
-                        .to_string();
+                    let email = rest[start + 1..].trim_end_matches('>').to_string();
                     (name, email)
                 } else {
                     (rest.to_string(), String::new())

@@ -14,9 +14,33 @@ const DEFAULT_MARKERS: &[&str] = &["TODO", "FIXME", "HACK", "XXX", "BUG", "NOTE"
 fn is_source_ext(ext: &str) -> bool {
     matches!(
         ext,
-        "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "go" | "java" | "kt"
-        | "rb" | "c" | "cpp" | "cc" | "cxx" | "hpp" | "h" | "cs" | "php" | "swift"
-        | "sh" | "bash" | "sql" | "md" | "yaml" | "yml" | "toml"
+        "rs" | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "mjs"
+            | "cjs"
+            | "py"
+            | "go"
+            | "java"
+            | "kt"
+            | "rb"
+            | "c"
+            | "cpp"
+            | "cc"
+            | "cxx"
+            | "hpp"
+            | "h"
+            | "cs"
+            | "php"
+            | "swift"
+            | "sh"
+            | "bash"
+            | "sql"
+            | "md"
+            | "yaml"
+            | "yml"
+            | "toml"
     )
 }
 
@@ -57,7 +81,11 @@ fn walk_todos(
             walk_todos(root, &path, markers_re, out, limit, depth + 1);
             continue;
         }
-        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
         if !is_source_ext(&ext) {
             continue;
         }
@@ -89,11 +117,7 @@ fn walk_todos(
 
 #[async_trait]
 impl NexusToolHandler for FindTodosTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let custom_markers: Vec<String> = args
             .get("markers")
             .and_then(Value::as_array)
@@ -121,7 +145,14 @@ impl NexusToolHandler for FindTodosTool {
             .min(5000);
 
         let mut results = Vec::new();
-        walk_todos(&ctx.project_root, &ctx.project_root, &re, &mut results, limit, 0);
+        walk_todos(
+            &ctx.project_root,
+            &ctx.project_root,
+            &re,
+            &mut results,
+            limit,
+            0,
+        );
 
         // Group counts per marker
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();

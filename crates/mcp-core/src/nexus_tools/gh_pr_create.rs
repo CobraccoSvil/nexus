@@ -28,18 +28,12 @@ fn extract_pr_url(stdout: &str) -> Option<&str> {
 }
 
 fn extract_pr_number(url: &str) -> Option<u64> {
-    url.rsplit('/')
-        .next()
-        .and_then(|s| s.parse::<u64>().ok())
+    url.rsplit('/').next().and_then(|s| s.parse::<u64>().ok())
 }
 
 #[async_trait]
 impl NexusToolHandler for GhPrCreateTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let title = args
             .get("title")
             .and_then(Value::as_str)

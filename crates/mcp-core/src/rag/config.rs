@@ -61,11 +61,9 @@ pub async fn current_config(db: &PgPool) -> Result<Arc<RagConfig>, RagError> {
         }
     }
 
-    let rows = sqlx::query(
-        "SELECT key, value FROM settings WHERE key LIKE 'agent.rag.%'"
-    )
-    .fetch_all(db)
-    .await?;
+    let rows = sqlx::query("SELECT key, value FROM settings WHERE key LIKE 'agent.rag.%'")
+        .fetch_all(db)
+        .await?;
 
     if rows.is_empty() {
         // Se la cache vecchia esiste e il DB risponde con 0 righe, e' un
@@ -91,28 +89,16 @@ pub async fn current_config(db: &PgPool) -> Result<Arc<RagConfig>, RagError> {
 
     let cfg = RagConfig {
         enabled: get("agent.rag.enabled", "true") == "true",
-        chunk_size: get("agent.rag.chunk_size", "1000")
-            .parse()
-            .unwrap_or(1000),
-        chunk_overlap: get("agent.rag.chunk_overlap", "200")
-            .parse()
-            .unwrap_or(200),
+        chunk_size: get("agent.rag.chunk_size", "1000").parse().unwrap_or(1000),
+        chunk_overlap: get("agent.rag.chunk_overlap", "200").parse().unwrap_or(200),
         top_k_default: get("agent.rag.top_k_default", "8").parse().unwrap_or(8),
         embedding_endpoint: get("agent.rag.embedding_endpoint", "/embed"),
         qdrant_url: get("agent.rag.qdrant_url", "http://localhost:6333"),
-        embedding_dim: get("agent.rag.embedding_dim", "384")
-            .parse()
-            .unwrap_or(384),
+        embedding_dim: get("agent.rag.embedding_dim", "384").parse().unwrap_or(384),
         collection_attachments: get("agent.rag.collection_attachments", "attachment_chunks"),
         collection_kb: get("agent.rag.collection_kb", "kb_chunks"),
-        collection_chat_history: get(
-            "agent.rag.collection_chat_history",
-            "chat_history_chunks",
-        ),
-        collection_tool_results: get(
-            "agent.rag.collection_tool_results",
-            "tool_results_chunks",
-        ),
+        collection_chat_history: get("agent.rag.collection_chat_history", "chat_history_chunks"),
+        collection_tool_results: get("agent.rag.collection_tool_results", "tool_results_chunks"),
     };
 
     let arc = Arc::new(cfg);

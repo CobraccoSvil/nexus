@@ -21,11 +21,7 @@ const RECORD_SEP: char = '\x1e';
 
 #[async_trait]
 impl NexusToolHandler for GitLogTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20);
         let path = args.get("path").and_then(Value::as_str).map(String::from);
         let author = args.get("author").and_then(Value::as_str).map(String::from);

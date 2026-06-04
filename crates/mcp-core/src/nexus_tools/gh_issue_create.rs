@@ -9,7 +9,9 @@ pub struct GhIssueCreateTool;
 #[async_trait]
 impl NexusToolHandler for GhIssueCreateTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let title = args.get("title").and_then(Value::as_str)
+        let title = args
+            .get("title")
+            .and_then(Value::as_str)
             .ok_or_else(|| NexusToolError::BadInput("title required".into()))?;
         let body = args.get("body").and_then(Value::as_str).unwrap_or("");
         let out = run_cmd(
@@ -30,6 +32,11 @@ impl NexusToolHandler for GhIssueCreateTool {
         json!({"type":"object","required":["title"],"properties":{"title":{"type":"string"},"body":{"type":"string"}}})
     }
     fn safety(&self) -> NexusToolSafety {
-        NexusToolSafety { read_only: false, can_write_filesystem: false, can_execute_subproc: true, network_egress: true }
+        NexusToolSafety {
+            read_only: false,
+            can_write_filesystem: false,
+            can_execute_subproc: true,
+            network_egress: true,
+        }
     }
 }

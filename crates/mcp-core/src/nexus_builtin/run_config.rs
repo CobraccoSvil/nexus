@@ -16,7 +16,11 @@ pub(super) async fn get_project_root(db: &PgPool, project_id: Uuid) -> Result<St
         .fetch_optional(db)
         .await
         .map_err(|e| format!("[Errore DB] {e}"))?
-        .and_then(|r| r.try_get::<Option<String>, _>("repository_root_path").ok().flatten())
+        .and_then(|r| {
+            r.try_get::<Option<String>, _>("repository_root_path")
+                .ok()
+                .flatten()
+        })
         .ok_or_else(|| "[Errore] Progetto non trovato o path non configurata".to_string())
 }
 
@@ -49,26 +53,30 @@ pub(super) async fn handle_run_config_list(db: &PgPool, args: &Value) -> String 
 
     match sqlx::query(
         "SELECT id, label, kind, command, args, cwd, env, created_at
-         FROM run_configurations WHERE project_id=$1 ORDER BY created_at ASC"
+         FROM run_configurations WHERE project_id=$1 ORDER BY created_at ASC",
     )
     .bind(project_id)
     .fetch_all(db)
     .await
     {
         Ok(rows) => {
-            let configs: Vec<Value> = rows.iter().map(|r| {
-                let args_arr: Vec<String> = r.try_get::<Vec<String>, _>("args").unwrap_or_default();
-                let env: Value = r.try_get::<Value, _>("env").unwrap_or(json!({}));
-                json!({
-                    "id": r.try_get::<Uuid, _>("id").ok().map(|v| v.to_string()),
-                    "label": r.try_get::<String, _>("label").unwrap_or_default(),
-                    "kind": r.try_get::<String, _>("kind").unwrap_or_default(),
-                    "command": r.try_get::<String, _>("command").unwrap_or_default(),
-                    "args": args_arr,
-                    "cwd": r.try_get::<Option<String>, _>("cwd").unwrap_or(None),
-                    "env": env,
+            let configs: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    let args_arr: Vec<String> =
+                        r.try_get::<Vec<String>, _>("args").unwrap_or_default();
+                    let env: Value = r.try_get::<Value, _>("env").unwrap_or(json!({}));
+                    json!({
+                        "id": r.try_get::<Uuid, _>("id").ok().map(|v| v.to_string()),
+                        "label": r.try_get::<String, _>("label").unwrap_or_default(),
+                        "kind": r.try_get::<String, _>("kind").unwrap_or_default(),
+                        "command": r.try_get::<String, _>("command").unwrap_or_default(),
+                        "args": args_arr,
+                        "cwd": r.try_get::<Option<String>, _>("cwd").unwrap_or(None),
+                        "env": env,
+                    })
                 })
-            }).collect();
+                .collect();
             format_json(&json!({ "configs": configs, "count": configs.len() }))
         }
         Err(e) => format!("[Errore DB] {e}"),
@@ -87,7 +95,10 @@ pub(super) async fn handle_run_config_detect(db: &PgPool, args: &Value) -> Strin
         .fetch_optional(db)
         .await
     {
-        Ok(Some(r)) => r.try_get::<Option<String>, _>("repository_root_path").unwrap_or(None).unwrap_or_default(),
+        Ok(Some(r)) => r
+            .try_get::<Option<String>, _>("repository_root_path")
+            .unwrap_or(None)
+            .unwrap_or_default(),
         _ => return "[Errore] Progetto non trovato".to_string(),
     };
 
@@ -118,7 +129,9 @@ pub(super) async fn handle_run_config_detect(db: &PgPool, args: &Value) -> Strin
     let cargo_toml = root.join("Cargo.toml");
     if cargo_toml.exists() {
         suggestions.push(json!({"label":"cargo build","kind":"cargo","command":"cargo","args":["build"],"cwd":null}));
-        suggestions.push(json!({"label":"cargo run","kind":"cargo","command":"cargo","args":["run"],"cwd":null}));
+        suggestions.push(
+            json!({"label":"cargo run","kind":"cargo","command":"cargo","args":["run"],"cwd":null}),
+        );
         suggestions.push(json!({"label":"cargo test","kind":"cargo","command":"cargo","args":["test"],"cwd":null}));
     }
 
@@ -127,7 +140,11 @@ pub(super) async fn handle_run_config_detect(db: &PgPool, args: &Value) -> Strin
         suggestions.push(json!({"label":"Django runserver","kind":"python","command":"python","args":["manage.py","runserver"],"cwd":null}));
     }
     if root.join("main.py").exists() || root.join("app.py").exists() {
-        let entry = if root.join("main.py").exists() { "main.py" } else { "app.py" };
+        let entry = if root.join("main.py").exists() {
+            "main.py"
+        } else {
+            "app.py"
+        };
         suggestions.push(json!({"label":format!("python {}",entry),"kind":"python","command":"python","args":[entry],"cwd":null}));
     }
 
@@ -147,17 +164,28 @@ pub(super) async fn handle_run_config_create(db: &PgPool, args: &Value) -> Strin
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => return "[Errore] Parametro 'command' obbligatorio".to_string(),
     };
-    let run_args: Vec<String> = args.get("args").and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+    let run_args: Vec<String> = args
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
     let cwd: Option<String> = args.get("cwd").and_then(Value::as_str).map(str::to_string);
     let env: Value = args.get("env").cloned().unwrap_or(json!({}));
-    let kind = args.get("kind").and_then(Value::as_str).unwrap_or("shell").to_string();
+    let kind = args
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("shell")
+        .to_string();
 
     let config_id = Uuid::new_v4();
     match sqlx::query(
         "INSERT INTO run_configurations (id, project_id, label, kind, command, args, cwd, env)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
     )
     .bind(config_id)
     .bind(project_id)
@@ -207,18 +235,39 @@ pub(super) async fn handle_run_config_update(db: &PgPool, args: &Value) -> Strin
         return "[Errore] Configurazione non trovata".to_string();
     };
 
-    let label = args.get("label").and_then(Value::as_str)
-        .unwrap_or_else(|| cur.try_get("label").unwrap_or("")).to_string();
-    let kind = args.get("kind").and_then(Value::as_str)
-        .unwrap_or_else(|| cur.try_get("kind").unwrap_or("shell")).to_string();
-    let command = args.get("command").and_then(Value::as_str)
-        .unwrap_or_else(|| cur.try_get("command").unwrap_or("")).to_string();
-    let run_args: Vec<String> = args.get("args").and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+    let label = args
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| cur.try_get("label").unwrap_or(""))
+        .to_string();
+    let kind = args
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| cur.try_get("kind").unwrap_or("shell"))
+        .to_string();
+    let command = args
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| cur.try_get("command").unwrap_or(""))
+        .to_string();
+    let run_args: Vec<String> = args
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_else(|| cur.try_get::<Vec<String>, _>("args").unwrap_or_default());
-    let cwd: Option<String> = args.get("cwd").and_then(Value::as_str).map(str::to_string)
+    let cwd: Option<String> = args
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::to_string)
         .or_else(|| cur.try_get("cwd").ok().flatten());
-    let env: Value = args.get("env").cloned()
+    let env: Value = args
+        .get("env")
+        .cloned()
         .unwrap_or_else(|| cur.try_get::<Value, _>("env").unwrap_or(json!({})));
 
     match sqlx::query(
@@ -268,7 +317,7 @@ pub(super) async fn handle_run_config_launch(db: &PgPool, args: &Value) -> Strin
     };
 
     let row = sqlx::query(
-        "SELECT label, command, args, cwd FROM run_configurations WHERE id=$1 AND project_id=$2"
+        "SELECT label, command, args, cwd FROM run_configurations WHERE id=$1 AND project_id=$2",
     )
     .bind(config_id)
     .bind(project_id)
@@ -293,13 +342,25 @@ pub(super) async fn handle_run_config_launch(db: &PgPool, args: &Value) -> Strin
         .await
         .ok()
         .flatten()
-        .and_then(|r| r.try_get::<Option<String>, _>("repository_root_path").ok().flatten())
+        .and_then(|r| {
+            r.try_get::<Option<String>, _>("repository_root_path")
+                .ok()
+                .flatten()
+        })
         .unwrap_or_default();
 
-    let cwd = match config_cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let cwd = match config_cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(c) => {
             let p = std::path::PathBuf::from(c);
-            if p.is_absolute() { p } else { std::path::PathBuf::from(&root_path).join(p) }
+            if p.is_absolute() {
+                p
+            } else {
+                std::path::PathBuf::from(&root_path).join(p)
+            }
         }
         None => std::path::PathBuf::from(&root_path),
     };
@@ -328,7 +389,9 @@ pub(super) async fn handle_run_config_launch(db: &PgPool, args: &Value) -> Strin
         crate::sandbox::sandbox_enabled(),
         "service",
         None,
-    ).await {
+    )
+    .await
+    {
         Ok(process_id) => format_json(&json!({
             "ok": true,
             "processId": process_id.to_string(),

@@ -63,8 +63,13 @@ async fn read_bool_setting(db: &PgPool, key: &str, default: bool) -> bool {
         .await
         .ok()
         .flatten();
-    v.map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "false" | "0" | "off" | "no"))
-        .unwrap_or(default)
+    v.map(|s| {
+        !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "off" | "no"
+        )
+    })
+    .unwrap_or(default)
 }
 
 async fn read_int_setting(db: &PgPool, key: &str, default: i32) -> i32 {
@@ -74,7 +79,8 @@ async fn read_int_setting(db: &PgPool, key: &str, default: i32) -> i32 {
         .await
         .ok()
         .flatten();
-    v.and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(default)
+    v.and_then(|s| s.trim().parse::<i32>().ok())
+        .unwrap_or(default)
 }
 
 async fn read_float_setting(db: &PgPool, key: &str, default: f64) -> f64 {
@@ -84,7 +90,8 @@ async fn read_float_setting(db: &PgPool, key: &str, default: f64) -> f64 {
         .await
         .ok()
         .flatten();
-    v.and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(default)
+    v.and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(default)
 }
 
 /// Inserisce un link idempotente. Ritorna true se ha creato/aggiornato una riga.
@@ -135,7 +142,9 @@ pub async fn build_links_for_new_note(
 
     // ── Passo 1a: link followup verso la nota del parent run ────────────────
     if let Some(parent) = input.parent_run_id {
-        if let Some(parent_note) = find_note_by_run(db, input.project_id, parent, input.note_id).await {
+        if let Some(parent_note) =
+            find_note_by_run(db, input.project_id, parent, input.note_id).await
+        {
             if insert_link(db, input.note_id, parent_note, "followup", 1.0).await {
                 created += 1;
             }
@@ -145,9 +154,9 @@ pub async fn build_links_for_new_note(
 
     // ── Passo 1b: link relates verso note con file_paths in comune ──────────
     if !input.file_paths.is_empty() {
-        let related = find_notes_by_file_paths(
-            db, input.project_id, &input.file_paths, input.note_id, 5,
-        ).await;
+        let related =
+            find_notes_by_file_paths(db, input.project_id, &input.file_paths, input.note_id, 5)
+                .await;
         for nid in related {
             if linked.contains(&nid) {
                 continue;
@@ -161,7 +170,9 @@ pub async fn build_links_for_new_note(
 
     // ── Passo 2: link semantici via Qdrant top-K ────────────────────────────
     let threshold = read_float_setting(db, "kb.autolink.semantic_threshold", 0.65).await;
-    let top_k = read_int_setting(db, "kb.autolink.semantic_top_k", 3).await.max(0) as usize;
+    let top_k = read_int_setting(db, "kb.autolink.semantic_top_k", 3)
+        .await
+        .max(0) as usize;
     if top_k > 0 {
         let vector = match input.embed_vector.clone() {
             Some(v) => Some(v),
@@ -186,8 +197,13 @@ pub async fn build_links_for_new_note(
         if let Some(vector) = vector {
             // top_k + 1 perche' il self appare quasi sempre con score ~1.0.
             match crate::vector_memory::search_knowledge_points(
-                db, vector, input.project_id, top_k + 1,
-            ).await {
+                db,
+                vector,
+                input.project_id,
+                top_k + 1,
+            )
+            .await
+            {
                 Ok(hits) => {
                     for hit in hits {
                         if (hit.score as f64) < threshold {
@@ -205,7 +221,9 @@ pub async fn build_links_for_new_note(
                         if other_id == input.note_id || linked.contains(&other_id) {
                             continue;
                         }
-                        if insert_link(db, input.note_id, other_id, "relates", hit.score as f32).await {
+                        if insert_link(db, input.note_id, other_id, "relates", hit.score as f32)
+                            .await
+                        {
                             created += 1;
                         }
                         linked.insert(other_id);
@@ -222,7 +240,9 @@ pub async fn build_links_for_new_note(
     }
 
     // ── Passo 3: wikilink espliciti [[Titolo]] nel body ─────────────────────
-    let wikilink_cap = read_int_setting(db, "kb.autolink.wikilink_max_per_note", 10).await.max(0) as usize;
+    let wikilink_cap = read_int_setting(db, "kb.autolink.wikilink_max_per_note", 10)
+        .await
+        .max(0) as usize;
     if wikilink_cap > 0 {
         let mut titles_seen: HashSet<String> = HashSet::new();
         let mut wikilink_count = 0usize;
@@ -235,11 +255,18 @@ pub async fn build_links_for_new_note(
                 continue;
             }
             // Supporta `[[Titolo|alias]]`: usa solo la parte prima di `|`.
-            let title = raw_title.split('|').next().unwrap_or(raw_title).trim().to_lowercase();
+            let title = raw_title
+                .split('|')
+                .next()
+                .unwrap_or(raw_title)
+                .trim()
+                .to_lowercase();
             if title.is_empty() || !titles_seen.insert(title.clone()) {
                 continue;
             }
-            if let Some(target) = resolve_note_by_title(db, input.project_id, &title, input.note_id).await {
+            if let Some(target) =
+                resolve_note_by_title(db, input.project_id, &title, input.note_id).await
+            {
                 if linked.contains(&target) {
                     continue;
                 }

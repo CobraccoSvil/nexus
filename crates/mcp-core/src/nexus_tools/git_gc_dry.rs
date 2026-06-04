@@ -8,11 +8,24 @@ pub struct GitGcDryTool;
 
 #[async_trait]
 impl NexusToolHandler for GitGcDryTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         // count-objects -v: indica se gc è "needed"
-        let out = run_cmd("git", &["count-objects", "-v"], &ctx.project_root, ctx.timeout_secs).await?;
+        let out = run_cmd(
+            "git",
+            &["count-objects", "-v"],
+            &ctx.project_root,
+            ctx.timeout_secs,
+        )
+        .await?;
         if !out.success() {
-            return Err(NexusToolError::Exec { exit_code: out.exit_code, stderr: out.stderr });
+            return Err(NexusToolError::Exec {
+                exit_code: out.exit_code,
+                stderr: out.stderr,
+            });
         }
         let mut loose: u64 = 0;
         let mut packs: u64 = 0;
@@ -29,5 +42,7 @@ impl NexusToolHandler for GitGcDryTool {
         let needed = loose > 6700;
         Ok(json!({"ok": true, "loose_objects": loose, "in_pack": packs, "gc_needed": needed}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only_subproc()
+    }
 }

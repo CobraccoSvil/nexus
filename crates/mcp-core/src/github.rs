@@ -6,9 +6,9 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use nexus_http::build_client as nexus_build_client;
 use rand::Rng;
 use reqwest::Client;
-use nexus_http::build_client as nexus_build_client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
@@ -381,10 +381,7 @@ async fn github_exchange_token(db: &PgPool, payload: Value) -> anyhow::Result<Gi
 
     let token_response = response.json::<GitHubTokenResponse>().await?;
     if let Some(error) = token_response.error.clone() {
-        anyhow::bail!(
-            "{}",
-            token_response.error_description.unwrap_or(error)
-        );
+        anyhow::bail!("{}", token_response.error_description.unwrap_or(error));
     }
     Ok(token_response)
 }
@@ -399,13 +396,19 @@ async fn fetch_github_user(access_token: &str) -> anyhow::Result<GitHubUserRespo
         .await?;
 
     if !response.status().is_success() {
-        anyhow::bail!("GitHub user profile fetch failed with {}", response.status());
+        anyhow::bail!(
+            "GitHub user profile fetch failed with {}",
+            response.status()
+        );
     }
 
     Ok(response.json::<GitHubUserResponse>().await?)
 }
 
-async fn resolve_github_email(access_token: &str, current_email: Option<&str>) -> anyhow::Result<String> {
+async fn resolve_github_email(
+    access_token: &str,
+    current_email: Option<&str>,
+) -> anyhow::Result<String> {
     if let Some(email) = current_email.filter(|value| !value.trim().is_empty()) {
         return Ok(email.to_string());
     }
@@ -578,13 +581,22 @@ async fn load_github_connection_record(
                     .ok()
                     .flatten()
             }),
-        avatar_url: row.try_get::<Option<String>, _>("avatar_url").ok().flatten(),
+        avatar_url: row
+            .try_get::<Option<String>, _>("avatar_url")
+            .ok()
+            .flatten(),
         connection_status: row
             .try_get::<Option<String>, _>("connection_status")
             .ok()
             .flatten(),
-        access_token: row.try_get::<Option<String>, _>("access_token").ok().flatten(),
-        refresh_token: row.try_get::<Option<String>, _>("refresh_token").ok().flatten(),
+        access_token: row
+            .try_get::<Option<String>, _>("access_token")
+            .ok()
+            .flatten(),
+        refresh_token: row
+            .try_get::<Option<String>, _>("refresh_token")
+            .ok()
+            .flatten(),
         token_scope: row
             .try_get::<Option<String>, _>("token_scope")
             .ok()
@@ -659,7 +671,9 @@ pub(crate) async fn ensure_github_authorized_user(
 
     if is_expired(record.access_token_expires_at) {
         if let Some(refresh_token) = record.refresh_token.as_deref() {
-            return refresh_github_connection(db, user_id, refresh_token).await.map(Some);
+            return refresh_github_connection(db, user_id, refresh_token)
+                .await
+                .map(Some);
         }
         return Ok(None);
     }
@@ -709,7 +723,9 @@ pub(crate) async fn github_account_summary(
             },
             connected: false,
             scopes,
-            expires_at: record.access_token_expires_at.map(|value| value.to_rfc3339()),
+            expires_at: record
+                .access_token_expires_at
+                .map(|value| value.to_rfc3339()),
         });
     }
 
@@ -720,7 +736,9 @@ pub(crate) async fn github_account_summary(
             status: "upgrade_required".to_string(),
             connected: false,
             scopes,
-            expires_at: record.access_token_expires_at.map(|value| value.to_rfc3339()),
+            expires_at: record
+                .access_token_expires_at
+                .map(|value| value.to_rfc3339()),
         });
     }
 
@@ -739,7 +757,9 @@ pub(crate) async fn github_account_summary(
             status: "reconnect_required".to_string(),
             connected: false,
             scopes,
-            expires_at: record.access_token_expires_at.map(|value| value.to_rfc3339()),
+            expires_at: record
+                .access_token_expires_at
+                .map(|value| value.to_rfc3339()),
         }),
         Err(error) => {
             tracing::warn!("GitHub connection refresh failed for {user_id}: {error}");
@@ -749,7 +769,9 @@ pub(crate) async fn github_account_summary(
                 status: "reconnect_required".to_string(),
                 connected: false,
                 scopes,
-                expires_at: record.access_token_expires_at.map(|value| value.to_rfc3339()),
+                expires_at: record
+                    .access_token_expires_at
+                    .map(|value| value.to_rfc3339()),
             })
         }
     }
@@ -896,7 +918,11 @@ async fn github_api_post<T: for<'de> Deserialize<'de>>(
     if !response.status().is_success() {
         let status = response.status();
         let payload = response.text().await.unwrap_or_default();
-        anyhow::bail!("GitHub API {}: {}", status, extract_github_message(&payload));
+        anyhow::bail!(
+            "GitHub API {}: {}",
+            status,
+            extract_github_message(&payload)
+        );
     }
 
     Ok(response.json::<T>().await?)
@@ -1048,7 +1074,9 @@ async fn build_remote_status(
                 published: branch_status.upstream.is_some(),
                 default_branch: None,
                 can_push_pull: false,
-                suggested_pr_title: last_commit_title.clone().or_else(|| branch_status.branch.clone()),
+                suggested_pr_title: last_commit_title
+                    .clone()
+                    .or_else(|| branch_status.branch.clone()),
                 last_commit_title,
                 pull_request: None,
                 api_error: None,
@@ -1056,9 +1084,13 @@ async fn build_remote_status(
 
             if let Some(authorized) = ensure_github_authorized_user(db, user_id).await? {
                 response.can_push_pull = true;
-                let repo_url =
-                    format!("https://api.github.com/repos/{}/{}", remote.owner, remote.repo);
-                match github_api_get::<GitHubRepoResponse>(&authorized.access_token, &repo_url).await {
+                let repo_url = format!(
+                    "https://api.github.com/repos/{}/{}",
+                    remote.owner, remote.repo
+                );
+                match github_api_get::<GitHubRepoResponse>(&authorized.access_token, &repo_url)
+                    .await
+                {
                     Ok(repo_info) => {
                         response.default_branch = Some(repo_info.default_branch);
                     }
@@ -1068,8 +1100,10 @@ async fn build_remote_status(
                 }
 
                 if response.api_error.is_none() {
-                    if let Some(branch) =
-                        branch_status.branch.as_deref().filter(|value| !value.is_empty())
+                    if let Some(branch) = branch_status
+                        .branch
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
                     {
                         let pulls_url = format!(
                             "https://api.github.com/repos/{}/{}/pulls?head={}:{}&state=open&per_page=1",
@@ -1128,7 +1162,8 @@ pub(crate) async fn resolve_github_git_command_options(
                 ));
             };
 
-            let basic = BASE64_STANDARD.encode(format!("x-access-token:{}", authorized.access_token));
+            let basic =
+                BASE64_STANDARD.encode(format!("x-access-token:{}", authorized.access_token));
             Ok(GitCommandOptions {
                 configs: vec![
                     (
@@ -1190,8 +1225,9 @@ async fn list_github_repositories(
             {
                 Ok(value) => value,
                 Err(fallback_error) => {
-                    let mut public_fallback =
-                        reqwest::Url::parse(&format!("https://api.github.com/users/{username}/repos"))?;
+                    let mut public_fallback = reqwest::Url::parse(&format!(
+                        "https://api.github.com/users/{username}/repos"
+                    ))?;
                     public_fallback
                         .query_pairs_mut()
                         .append_pair("type", "owner")
@@ -1214,19 +1250,19 @@ async fn list_github_repositories(
     };
 
     let mut repos = repos_response
-    .into_iter()
-    .map(|repo| GitHubRepositorySummary {
-        id: repo.id,
-        name: repo.name,
-        full_name: repo.full_name,
-        owner_login: repo.owner.login,
-        html_url: repo.html_url,
-        clone_url: repo.clone_url,
-        private: repo.private,
-        default_branch: repo.default_branch,
-        updated_at: repo.updated_at,
-    })
-    .collect::<Vec<_>>();
+        .into_iter()
+        .map(|repo| GitHubRepositorySummary {
+            id: repo.id,
+            name: repo.name,
+            full_name: repo.full_name,
+            owner_login: repo.owner.login,
+            html_url: repo.html_url,
+            clone_url: repo.clone_url,
+            private: repo.private,
+            default_branch: repo.default_branch,
+            updated_at: repo.updated_at,
+        })
+        .collect::<Vec<_>>();
 
     repos.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     Ok(repos)
@@ -1354,7 +1390,11 @@ pub async fn github_clone_repository(
             .chars()
             .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
             .collect::<String>();
-        let dir_name = if dir_name.is_empty() { "repo".to_string() } else { dir_name };
+        let dir_name = if dir_name.is_empty() {
+            "repo".to_string()
+        } else {
+            dir_name
+        };
 
         let base_root = crate::projects::load_projects_base_root(&state.db).await?;
         let dest = base_root.join(&dir_name);
@@ -1582,7 +1622,12 @@ pub async fn github_publish_branch(
 
     let (stdout, stderr) = run_git_command_with_options(
         &context.repository_root_path,
-        &["push", "--set-upstream", remote_name.as_str(), branch.as_str()],
+        &[
+            "push",
+            "--set-upstream",
+            remote_name.as_str(),
+            branch.as_str(),
+        ],
         &git_options,
     )
     .await
@@ -1734,7 +1779,10 @@ pub async fn github_create_repo(
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'name' obbligatorio"))?;
 
     // Validazione name: solo alfanumerico/dash/underscore/punto (GitHub allow)
-    if !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "Nome repository non valido (solo alfanumerico, '-', '_', '.')",
@@ -1758,7 +1806,12 @@ pub async fn github_create_repo(
     let client = Client::builder()
         .user_agent("nexus-mcp-core")
         .build()
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("http client: {}", e)))?;
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("http client: {}", e),
+            )
+        })?;
 
     let resp = client
         .post("https://api.github.com/user/repos")
@@ -1883,7 +1936,10 @@ pub async fn github_publish_project(
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'name' obbligatorio"))?
         .to_string();
 
-    if !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "Nome repository non valido (solo alfanumerico, '-', '_', '.')",
@@ -1918,7 +1974,10 @@ pub async fn github_publish_project(
 
     // .gitignore di default se manca
     let gitignore_path = root.join(".gitignore");
-    if !tokio::fs::try_exists(&gitignore_path).await.unwrap_or(false) {
+    if !tokio::fs::try_exists(&gitignore_path)
+        .await
+        .unwrap_or(false)
+    {
         let default_gitignore = "# Dependencies\nnode_modules/\n.pnpm-store/\n\n# Build output\ndist/\nbuild/\n.next/\n.turbo/\nout/\ntarget/\n\n# Environment\n.env\n.env.local\n.env.*.local\n!.env.example\n\n# Logs\n*.log\nnpm-debug.log*\npnpm-debug.log*\n\n# Editor\n.vscode/\n.idea/\n*.swp\n*.swo\n.DS_Store\n\n# Test artifacts\nplaywright-report/\ntest-results/\ncoverage/\n\n# OS\nThumbs.db\n";
         let _ = tokio::fs::write(&gitignore_path, default_gitignore).await;
     }
@@ -1936,7 +1995,12 @@ pub async fn github_publish_project(
     let client = Client::builder()
         .user_agent("nexus-mcp-core")
         .build()
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("http client: {}", e)))?;
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("http client: {}", e),
+            )
+        })?;
 
     let resp = client
         .post("https://api.github.com/user/repos")
@@ -1990,7 +2054,12 @@ pub async fn github_publish_project(
                     ),
                 ));
             }
-            Some(lookup.json::<serde_json::Value>().await.unwrap_or_else(|_| json!({})))
+            Some(
+                lookup
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap_or_else(|_| json!({})),
+            )
         } else {
             None
         }
@@ -2013,17 +2082,38 @@ pub async fn github_publish_project(
         resp_body
     };
 
-    let clone_url = resp_body.get("clone_url").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-    let html_url = resp_body.get("html_url").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-    let full_name = resp_body.get("full_name").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-    let default_branch = resp_body.get("default_branch").and_then(serde_json::Value::as_str).unwrap_or("main").to_string();
+    let clone_url = resp_body
+        .get("clone_url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let html_url = resp_body
+        .get("html_url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let full_name = resp_body
+        .get("full_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let default_branch = resp_body
+        .get("default_branch")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("main")
+        .to_string();
 
     // ── 4. Configura origin (idempotente) ────────────────────────────────
     if !clone_url.is_empty() {
         let _ = run_git_command(&root, &["remote", "remove", "origin"]).await;
         run_git_command(&root, &["remote", "add", "origin", &clone_url])
             .await
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("remote add: {e}")))?;
+            .map_err(|e| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("remote add: {e}"),
+                )
+            })?;
     }
 
     // ── 5. Push con token iniettato ──────────────────────────────────────

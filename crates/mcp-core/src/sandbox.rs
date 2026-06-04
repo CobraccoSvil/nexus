@@ -10,12 +10,12 @@
 //! - **Risorse**: limiti memory/cpu applicati via Docker cgroups.
 //! - **Processo**: ogni container ha il proprio PID, IPC, UTS namespace.
 
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Nome dell'immagine Docker usata come base per la sandbox.
@@ -46,7 +46,7 @@ pub async fn load_project_sandbox_config(
     project_id: uuid::Uuid,
 ) -> ProjectSandboxConfig {
     let row = sqlx::query_scalar::<_, Option<serde_json::Value>>(
-        "SELECT sandbox_config FROM projects WHERE id = $1"
+        "SELECT sandbox_config FROM projects WHERE id = $1",
     )
     .bind(project_id)
     .fetch_optional(db)
@@ -69,14 +69,12 @@ pub async fn save_project_sandbox_config(
 ) -> Result<(), String> {
     let json = serde_json::to_value(config)
         .map_err(|e| format!("serializzazione sandbox config fallita: {e}"))?;
-    sqlx::query(
-        "UPDATE projects SET sandbox_config = $1 WHERE id = $2"
-    )
-    .bind(json)
-    .bind(project_id)
-    .execute(db)
-    .await
-    .map_err(|e| format!("aggiornamento sandbox config fallito: {e}"))?;
+    sqlx::query("UPDATE projects SET sandbox_config = $1 WHERE id = $2")
+        .bind(json)
+        .bind(project_id)
+        .execute(db)
+        .await
+        .map_err(|e| format!("aggiornamento sandbox config fallito: {e}"))?;
     Ok(())
 }
 
@@ -161,7 +159,11 @@ impl SandboxConfig {
     /// Rollback temporaneo: bandiera ENV `NEXUS_SANDBOX_LEGACY_NETWORK=1` ripristina
     /// il vecchio default (Docker bridge). Rimuovere dopo 1 settimana di rollout.
     pub fn new(project_root: PathBuf, process_id: Uuid) -> Self {
-        let default_network = if std::env::var("NEXUS_SANDBOX_LEGACY_NETWORK").ok().as_deref() == Some("1") {
+        let default_network = if std::env::var("NEXUS_SANDBOX_LEGACY_NETWORK")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             None
         } else {
             Some("none".to_string())
@@ -184,9 +186,15 @@ impl SandboxConfig {
 
     /// Applica gli override dalla configurazione per-progetto.
     pub fn with_project_config(mut self, cfg: &ProjectSandboxConfig) -> Self {
-        if let Some(mb) = cfg.memory_mb { self.memory_mb = mb; }
-        if let Some(c) = cfg.cpus { self.cpus = c; }
-        if cfg.network_mode.is_some() { self.network_mode = cfg.network_mode.clone(); }
+        if let Some(mb) = cfg.memory_mb {
+            self.memory_mb = mb;
+        }
+        if let Some(c) = cfg.cpus {
+            self.cpus = c;
+        }
+        if cfg.network_mode.is_some() {
+            self.network_mode = cfg.network_mode.clone();
+        }
         if let Some(env) = &cfg.extra_env {
             self.extra_env.extend(env.clone());
         }
@@ -222,11 +230,17 @@ impl HostMount {
     /// Monta lo stesso path dell'host anche dentro il container.
     fn same(path: impl Into<PathBuf>) -> Self {
         let p = path.into();
-        HostMount { host: p.clone(), container: p }
+        HostMount {
+            host: p.clone(),
+            container: p,
+        }
     }
     /// Monta `host` come `container` (path diversi).
     fn remap(host: impl Into<PathBuf>, container: impl Into<PathBuf>) -> Self {
-        HostMount { host: host.into(), container: container.into() }
+        HostMount {
+            host: host.into(),
+            container: container.into(),
+        }
     }
 }
 
@@ -245,21 +259,35 @@ fn host_mounts() -> &'static Vec<HostMount> {
             "/usr/lib/x86_64-linux-gnu",
         ] {
             let p = PathBuf::from(lib);
-            if p.exists() { m.push(HostMount::same(p)); }
+            if p.exists() {
+                m.push(HostMount::same(p));
+            }
         }
 
         // ── Node.js ───────────────────────────────────────────────────────────
         for bin in &["/usr/bin/node", "/usr/bin/nodejs"] {
-            if PathBuf::from(bin).exists() { m.push(HostMount::same(*bin)); break; }
+            if PathBuf::from(bin).exists() {
+                m.push(HostMount::same(*bin));
+                break;
+            }
         }
         for bin in &["/usr/bin/npm", "/usr/local/bin/npm"] {
-            if PathBuf::from(bin).exists() { m.push(HostMount::same(*bin)); break; }
+            if PathBuf::from(bin).exists() {
+                m.push(HostMount::same(*bin));
+                break;
+            }
         }
         for bin in &["/usr/bin/npx", "/usr/local/bin/npx"] {
-            if PathBuf::from(bin).exists() { m.push(HostMount::same(*bin)); break; }
+            if PathBuf::from(bin).exists() {
+                m.push(HostMount::same(*bin));
+                break;
+            }
         }
         for bin in &["/usr/bin/pnpm", "/usr/local/bin/pnpm"] {
-            if PathBuf::from(bin).exists() { m.push(HostMount::same(*bin)); break; }
+            if PathBuf::from(bin).exists() {
+                m.push(HostMount::same(*bin));
+                break;
+            }
         }
         // pnpm può essere uno script CJS
         for p in &[
@@ -267,19 +295,24 @@ fn host_mounts() -> &'static Vec<HostMount> {
             "/usr/local/bin/pnpm.cjs",
             "/usr/local/lib/node_modules/pnpm/bin/pnpm.cjs",
         ] {
-            if PathBuf::from(p).exists() { m.push(HostMount::same(*p)); }
+            if PathBuf::from(p).exists() {
+                m.push(HostMount::same(*p));
+            }
         }
         // Moduli globali node
         for gm in &["/usr/local/lib/node_modules", "/usr/lib/node_modules"] {
             let p = PathBuf::from(gm);
-            if p.exists() { m.push(HostMount::same(p)); }
+            if p.exists() {
+                m.push(HostMount::same(p));
+            }
         }
 
         // ── Cargo / Rust ──────────────────────────────────────────────────────
         let cargo_home = std::env::var("CARGO_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
-                PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into())).join(".cargo")
+                PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
+                    .join(".cargo")
             });
         let cargo_bin = cargo_home.join("bin");
         if cargo_bin.exists() {
@@ -288,12 +321,16 @@ fn host_mounts() -> &'static Vec<HostMount> {
         }
         let cargo_registry = cargo_home.join("registry");
         if cargo_registry.exists() {
-            m.push(HostMount::remap(&cargo_registry, "/usr/local/cargo/registry"));
+            m.push(HostMount::remap(
+                &cargo_registry,
+                "/usr/local/cargo/registry",
+            ));
         }
         let rustup_home = std::env::var("RUSTUP_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
-                PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into())).join(".rustup")
+                PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
+                    .join(".rustup")
             });
         if rustup_home.exists() {
             m.push(HostMount::remap(&rustup_home, "/usr/local/rustup"));
@@ -301,23 +338,39 @@ fn host_mounts() -> &'static Vec<HostMount> {
 
         // ── Python ────────────────────────────────────────────────────────────
         for py in &["/usr/bin/python3", "/usr/bin/python3.12", "/usr/bin/python"] {
-            if PathBuf::from(py).exists() { m.push(HostMount::same(*py)); break; }
+            if PathBuf::from(py).exists() {
+                m.push(HostMount::same(*py));
+                break;
+            }
         }
-        for stdlib in &["/usr/lib/python3", "/usr/lib/python3.12", "/usr/lib/python3/dist-packages"] {
+        for stdlib in &[
+            "/usr/lib/python3",
+            "/usr/lib/python3.12",
+            "/usr/lib/python3/dist-packages",
+        ] {
             let p = PathBuf::from(stdlib);
-            if p.exists() { m.push(HostMount::same(p)); }
+            if p.exists() {
+                m.push(HostMount::same(p));
+            }
         }
 
         // ── Git ───────────────────────────────────────────────────────────────
         for git in &["/usr/bin/git", "/usr/local/bin/git"] {
-            if PathBuf::from(git).exists() { m.push(HostMount::same(*git)); break; }
+            if PathBuf::from(git).exists() {
+                m.push(HostMount::same(*git));
+                break;
+            }
         }
         let git_core = PathBuf::from("/usr/lib/git-core");
-        if git_core.exists() { m.push(HostMount::same(git_core)); }
+        if git_core.exists() {
+            m.push(HostMount::same(git_core));
+        }
 
         // ── Shell extras ──────────────────────────────────────────────────────
         for sh in &["/bin/bash", "/usr/bin/bash"] {
-            if PathBuf::from(sh).exists() { m.push(HostMount::same(*sh)); }
+            if PathBuf::from(sh).exists() {
+                m.push(HostMount::same(*sh));
+            }
         }
 
         info!(mounts = m.len(), "sandbox: host tool mounts calcolati");
@@ -378,7 +431,11 @@ pub fn build_sandboxed_command(
 
     // Filesystem: project dir montata in /workspace (rw)
     let workspace = "/workspace";
-    docker.arg(format!("-v={}:{}:rw", config.project_root.display(), workspace));
+    docker.arg(format!(
+        "-v={}:{}:rw",
+        config.project_root.display(),
+        workspace
+    ));
 
     let using_project_image = config.project_image.is_some();
 
@@ -599,14 +656,17 @@ pub async fn validate_env_overrides(
         }
         // 2. PORT deve essere nel bucket del progetto
         if k.eq_ignore_ascii_case("PORT") {
-            let port: u16 = v.parse().map_err(|_| format!("PORT='{v}' non valido (atteso u16)"))?;
+            let port: u16 = v
+                .parse()
+                .map_err(|_| format!("PORT='{v}' non valido (atteso u16)"))?;
             validate_port_for_project(db, project_id, port).await?;
         }
         // 3. DATABASE_URL non deve puntare a DB Nexus
         if k.eq_ignore_ascii_case("DATABASE_URL") || k.eq_ignore_ascii_case("POSTGRES_URL") {
             let low = v.to_lowercase();
             // pattern: ...@<host>[:port]/nexus oppure /postgres oppure :5432
-            let bad_db = low.contains("/nexus") || low.ends_with("/postgres") || low.contains("/postgres?");
+            let bad_db =
+                low.contains("/nexus") || low.ends_with("/postgres") || low.contains("/postgres?");
             let bad_port = low.contains(":5432");
             if bad_db || bad_port {
                 return Err(format!(
@@ -682,4 +742,3 @@ mod tests_validate_env {
         assert!(!is_blocked_env("HOST"));
     }
 }
-

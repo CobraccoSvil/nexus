@@ -49,9 +49,8 @@ impl NexusToolHandler for DbQueryExplainTool {
             ));
         }
 
-        let db_url = std::env::var("DATABASE_URL").map_err(|_| {
-            NexusToolError::BadInput("DATABASE_URL not set in environment".into())
-        })?;
+        let db_url = std::env::var("DATABASE_URL")
+            .map_err(|_| NexusToolError::BadInput("DATABASE_URL not set in environment".into()))?;
 
         let pool = PgPoolOptions::new()
             .max_connections(2)
@@ -76,9 +75,7 @@ impl NexusToolHandler for DbQueryExplainTool {
             // pg restituisce text row: il primo columno è JSON text o tipo JSON
             let line: String = row
                 .try_get::<String, _>(0)
-                .or_else(|_| {
-                    row.try_get::<Value, _>(0).map(|v| v.to_string())
-                })
+                .or_else(|_| row.try_get::<Value, _>(0).map(|v| v.to_string()))
                 .unwrap_or_default();
             plan.push(serde_json::from_str(&line).unwrap_or(Value::String(line)));
         }

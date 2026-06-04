@@ -32,7 +32,11 @@ pub fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> 
             while k > min_k && !chars[k - 1].is_whitespace() {
                 k -= 1;
             }
-            if k > min_k { k } else { end }
+            if k > min_k {
+                k
+            } else {
+                end
+            }
         } else {
             end
         };

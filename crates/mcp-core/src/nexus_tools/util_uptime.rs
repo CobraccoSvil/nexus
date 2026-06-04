@@ -11,10 +11,16 @@ pub struct UtilUptimeTool;
 
 #[async_trait]
 impl NexusToolHandler for UtilUptimeTool {
-    async fn execute(&self, _ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        _ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let start = START.get_or_init(Instant::now);
         let secs = start.elapsed().as_secs();
         Ok(json!({"ok": true, "uptime_secs": secs}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

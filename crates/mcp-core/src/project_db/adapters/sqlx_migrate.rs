@@ -1,9 +1,11 @@
 //! Adapter sqlx-migrate (Rust) — crea migration tramite `sqlx migrate add`.
 
+use super::{sha256_hex, MigrationAdapter};
+use crate::project_db::{
+    AppliedMigration, Migration, ProjectDbContext, ProjectDbError, RolledBackMigration,
+};
 use async_trait::async_trait;
 use std::path::PathBuf;
-use crate::project_db::{Migration, AppliedMigration, RolledBackMigration, ProjectDbError, ProjectDbContext};
-use super::{MigrationAdapter, sha256_hex};
 
 pub struct SqlxMigrateAdapter;
 
@@ -11,7 +13,9 @@ pub struct SqlxMigrateAdapter;
 impl MigrationAdapter for SqlxMigrateAdapter {
     async fn list_pending(&self, ctx: &ProjectDbContext) -> Result<Vec<Migration>, ProjectDbError> {
         let dir = ctx.project_root.join(&ctx.migration_path);
-        if !dir.exists() { return Ok(vec![]); }
+        if !dir.exists() {
+            return Ok(vec![]);
+        }
         let mut files: Vec<_> = std::fs::read_dir(&dir)?
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().ends_with(".sql"))
@@ -21,7 +25,11 @@ impl MigrationAdapter for SqlxMigrateAdapter {
         for entry in files {
             let path = entry.path();
             let content = std::fs::read_to_string(&path).unwrap_or_default();
-            let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let filename = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             result.push(Migration {
                 filename: filename.clone(),
                 checksum: sha256_hex(&content),
@@ -38,8 +46,15 @@ impl MigrationAdapter for SqlxMigrateAdapter {
         name: &str,
         sql: &str,
     ) -> Result<PathBuf, ProjectDbError> {
-        let safe_name: String = name.chars()
-            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        let safe_name: String = name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         // Prova sqlx CLI
         let output = std::process::Command::new("sqlx")
@@ -66,7 +81,10 @@ impl MigrationAdapter for SqlxMigrateAdapter {
         let dir = ctx.project_root.join(&ctx.migration_path);
         std::fs::create_dir_all(&dir)?;
         use std::time::{SystemTime, UNIX_EPOCH};
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let filename = format!("{}_{}.sql", ts, safe_name);
         let path = dir.join(&filename);
         std::fs::write(&path, sql)?;
@@ -86,7 +104,10 @@ impl MigrationAdapter for SqlxMigrateAdapter {
             .map_err(|e| ProjectDbError::Adapter(format!("sqlx migrate run: {}", e)))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ProjectDbError::Adapter(format!("sqlx migrate run fallita: {}", stderr)));
+            return Err(ProjectDbError::Adapter(format!(
+                "sqlx migrate run fallita: {}",
+                stderr
+            )));
         }
         Ok(vec![])
     }
@@ -104,8 +125,13 @@ impl MigrationAdapter for SqlxMigrateAdapter {
             .map_err(|e| ProjectDbError::Adapter(format!("sqlx migrate revert: {}", e)))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ProjectDbError::Adapter(format!("sqlx migrate revert fallita: {}", stderr)));
+            return Err(ProjectDbError::Adapter(format!(
+                "sqlx migrate revert fallita: {}",
+                stderr
+            )));
         }
-        Ok(Some(RolledBackMigration { filename: "sqlx:last".into() }))
+        Ok(Some(RolledBackMigration {
+            filename: "sqlx:last".into(),
+        }))
     }
 }

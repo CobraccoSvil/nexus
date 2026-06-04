@@ -82,26 +82,49 @@ pub async fn list_users(
     let limit = params.limit.unwrap_or(20).min(100).max(1);
     let offset = (page - 1) * limit;
 
-    tracing::warn!("list_users: page={}, limit={}, offset={}", page, limit, offset);
+    tracing::warn!(
+        "list_users: page={}, limit={}, offset={}",
+        page,
+        limit,
+        offset
+    );
 
-    let total_result = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE deleted_at IS NULL")
-        .fetch_one(&state.db)
-        .await;
+    let total_result =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE deleted_at IS NULL")
+            .fetch_one(&state.db)
+            .await;
 
     let total: i32 = match total_result {
         Ok(count) => {
             tracing::warn!("list_users: COUNT returned {}", count);
             count as i32
-        },
+        }
         Err(e) => {
             tracing::error!("list_users: COUNT query failed: {}", e);
             0
         }
     };
 
-    tracing::warn!("list_users: total={}, page={}, limit={}, offset={}", total, page, limit, offset);
+    tracing::warn!(
+        "list_users: total={}, page={}, limit={}, offset={}",
+        total,
+        page,
+        limit,
+        offset
+    );
 
-    let users_result = sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>, String, String)>(
+    let users_result = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        ),
+    >(
         r#"
         SELECT id::text, email, display_name, github_username, avatar_url, role, created_at::text
         FROM users
@@ -118,19 +141,22 @@ pub async fn list_users(
     let users: Vec<UserResponse> = match users_result {
         Ok(rows) => {
             tracing::info!("list_users: fetched {} rows", rows.len());
-            rows
-                .into_iter()
-                .map(|(id, email, display_name, github_username, avatar_url, role, created_at)| UserResponse {
-                    id,
-                    email,
-                    display_name,
-                    github_username,
-                    avatar_url,
-                    role,
-                    created_at,
-                })
+            rows.into_iter()
+                .map(
+                    |(id, email, display_name, github_username, avatar_url, role, created_at)| {
+                        UserResponse {
+                            id,
+                            email,
+                            display_name,
+                            github_username,
+                            avatar_url,
+                            role,
+                            created_at,
+                        }
+                    },
+                )
                 .collect()
-        },
+        }
         Err(e) => {
             tracing::error!("list_users: query error: {}", e);
             Vec::new()
@@ -298,11 +324,13 @@ pub async fn delete_user(
     let user_uuid = Uuid::parse_str(&user_id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Verify user exists
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND deleted_at IS NULL)")
-        .bind(user_uuid)
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(false);
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND deleted_at IS NULL)",
+    )
+    .bind(user_uuid)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(false);
 
     if !exists {
         return Err(StatusCode::NOT_FOUND);
@@ -324,7 +352,18 @@ pub async fn search_users(
 ) -> Result<Json<Vec<UserResponse>>, StatusCode> {
     let query_pattern = format!("%{}%", params.q.to_lowercase());
 
-    let users: Vec<UserResponse> = sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>, String, String)>(
+    let users: Vec<UserResponse> = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        ),
+    >(
         r#"
         SELECT id::text, email, display_name, github_username, avatar_url, role, created_at::text
         FROM users
@@ -342,15 +381,17 @@ pub async fn search_users(
     .await
     .unwrap_or_default()
     .into_iter()
-    .map(|(id, email, display_name, github_username, avatar_url, role, created_at)| UserResponse {
-        id,
-        email,
-        display_name,
-        github_username,
-        avatar_url,
-        role,
-        created_at,
-    })
+    .map(
+        |(id, email, display_name, github_username, avatar_url, role, created_at)| UserResponse {
+            id,
+            email,
+            display_name,
+            github_username,
+            avatar_url,
+            role,
+            created_at,
+        },
+    )
     .collect();
 
     Ok(Json(users))

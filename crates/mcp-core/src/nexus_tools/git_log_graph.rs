@@ -9,7 +9,12 @@ pub struct GitLogGraphTool;
 #[async_trait]
 impl NexusToolHandler for GitLogGraphTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let n = args.get("n").and_then(Value::as_u64).unwrap_or(30).min(500).to_string();
+        let n = args
+            .get("n")
+            .and_then(Value::as_u64)
+            .unwrap_or(30)
+            .min(500)
+            .to_string();
         let out = run_cmd(
             "git",
             &["log", "--oneline", "--graph", "--decorate", "-n", &n],
@@ -18,7 +23,10 @@ impl NexusToolHandler for GitLogGraphTool {
         )
         .await?;
         if !out.success() {
-            return Err(NexusToolError::Exec { exit_code: out.exit_code, stderr: out.stderr });
+            return Err(NexusToolError::Exec {
+                exit_code: out.exit_code,
+                stderr: out.stderr,
+            });
         }
         let lines: Vec<&str> = out.stdout.lines().collect();
         Ok(json!({"ok": true, "count": lines.len(), "lines": lines}))
@@ -26,5 +34,7 @@ impl NexusToolHandler for GitLogGraphTool {
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"n":{"type":"integer"}}})
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only_subproc()
+    }
 }

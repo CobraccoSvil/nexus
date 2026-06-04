@@ -64,24 +64,8 @@ fn is_boilerplate(content: &str) -> bool {
         return true;
     }
     let boilerplate_starters = [
-        "ok",
-        "okay",
-        "perfetto",
-        "perfect",
-        "grazie",
-        "thanks",
-        "continua",
-        "continue",
-        "riprendi",
-        "resume",
-        "vai",
-        "go",
-        "procedi",
-        "proceed",
-        "si",
-        "yes",
-        "no",
-        "stop",
+        "ok", "okay", "perfetto", "perfect", "grazie", "thanks", "continua", "continue",
+        "riprendi", "resume", "vai", "go", "procedi", "proceed", "si", "yes", "no", "stop",
         "annulla",
     ];
     let first_word = lower.split_whitespace().next().unwrap_or("");
@@ -183,7 +167,12 @@ Se nessuna specifica funzionale e' presente, rispondi: []"#
 
 /// Risolve il modello LLM da usare per l'extractor via routing matrix.
 async fn resolve_llm(state: &AppState) -> Option<(String, String)> {
-    let matrix = state.orchestrator.routing_matrix.current_async().await.ok()?;
+    let matrix = state
+        .orchestrator
+        .routing_matrix
+        .current_async()
+        .await
+        .ok()?;
     matrix.purpose_model("functional_spec_extractor")
 }
 
@@ -557,14 +546,13 @@ pub async fn extract_functional_specs_for_project(
     let chat_limit = chat_limit.unwrap_or(50).clamp(1, 500);
     let files_limit = files_limit.unwrap_or(80).clamp(1, 300);
 
-    let project_name: String =
-        sqlx::query_scalar("SELECT name FROM projects WHERE id = $1")
-            .bind(project_id)
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "(unknown)".to_string());
+    let project_name: String = sqlx::query_scalar("SELECT name FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "(unknown)".to_string());
 
     let Some((provider, model)) = resolve_llm(state).await else {
         anyhow::bail!(
@@ -575,14 +563,13 @@ pub async fn extract_functional_specs_for_project(
     let mut stats = ExtractStats::default();
 
     if include_files {
-        let repo_root: Option<String> = sqlx::query_scalar(
-            "SELECT repository_root_path FROM projects WHERE id = $1",
-        )
-        .bind(project_id)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten();
+        let repo_root: Option<String> =
+            sqlx::query_scalar("SELECT repository_root_path FROM projects WHERE id = $1")
+                .bind(project_id)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
 
         if let Some(root) = repo_root {
             if let Err(e) = extract_from_repo_files(

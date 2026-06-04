@@ -13,15 +13,8 @@ pub struct CargoUpdateTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoUpdateTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
-        let crate_name = args
-            .get("crate")
-            .and_then(Value::as_str)
-            .map(String::from);
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
+        let crate_name = args.get("crate").and_then(Value::as_str).map(String::from);
         let dry_run = args
             .get("dry_run")
             .and_then(Value::as_bool)

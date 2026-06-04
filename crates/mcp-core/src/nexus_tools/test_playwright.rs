@@ -54,7 +54,8 @@ fn parse_playwright_output(stdout: &str, stderr: &str) -> PlaywrightStats {
 
         // Righe tipo "    ✓  1 [chromium] › auth.spec.ts:10:3 › should login"
         if trimmed.starts_with('✓') || trimmed.starts_with("  ✓") || trimmed.contains("] ›") {
-            if trimmed.contains("FAILED") || trimmed.starts_with('✘') || trimmed.starts_with("  ✘") {
+            if trimmed.contains("FAILED") || trimmed.starts_with('✘') || trimmed.starts_with("  ✘")
+            {
                 stats.failed_tests.push(trimmed.to_string());
             }
         }
@@ -93,11 +94,7 @@ struct PlaywrightStats {
 
 #[async_trait]
 impl NexusToolHandler for TestPlaywrightTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let root = &ctx.project_root;
 
         // ── Rilevamento configurazione ───────────────────────────────────────
@@ -122,7 +119,10 @@ impl NexusToolHandler for TestPlaywrightTool {
 
         // ── Costruzione argomenti ────────────────────────────────────────────
         let filter = args.get("filter").and_then(Value::as_str).map(String::from);
-        let project = args.get("project").and_then(Value::as_str).map(String::from);
+        let project = args
+            .get("project")
+            .and_then(Value::as_str)
+            .map(String::from);
         let workers = args
             .get("workers")
             .and_then(Value::as_u64)

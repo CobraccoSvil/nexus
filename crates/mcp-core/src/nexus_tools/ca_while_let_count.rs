@@ -8,8 +8,15 @@ pub struct CaWhileLetCountTool;
 
 #[async_trait]
 impl NexusToolHandler for CaWhileLetCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let (counts, files) = scan_substrings(&ctx.project_root, &["while let ", "while ", "for ", "loop "]);
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let (counts, files) = scan_substrings(
+            &ctx.project_root,
+            &["while let ", "while ", "for ", "loop "],
+        );
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -19,5 +26,7 @@ impl NexusToolHandler for CaWhileLetCountTool {
             "loop_kw": counts[3],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

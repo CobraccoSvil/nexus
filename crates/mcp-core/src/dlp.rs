@@ -6,10 +6,10 @@
 //! viene gestita tramite Admin → Sicurezza → DLP (chiavi dlp_enabled,
 //! dlp_allow_cloud_tier2, dlp_allow_cloud_tier3).
 
+use sqlx::PgPool;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use sqlx::PgPool;
 use tracing::{debug, warn};
 
 const DLP_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -57,7 +57,10 @@ async fn fetch_dlp_config_from_db(db: &PgPool) -> DlpConfigCache {
     let rows = match rows {
         Ok(r) => r,
         Err(e) => {
-            warn!("DLP: impossibile caricare config dal DB ({}). Uso valori conservativi.", e);
+            warn!(
+                "DLP: impossibile caricare config dal DB ({}). Uso valori conservativi.",
+                e
+            );
             return DlpConfigCache {
                 enabled: true,
                 allow_cloud_tier2: true,
@@ -81,7 +84,12 @@ async fn fetch_dlp_config_from_db(db: &PgPool) -> DlpConfigCache {
         }
     }
 
-    DlpConfigCache { enabled, allow_cloud_tier2: allow_tier2, allow_cloud_tier3: allow_tier3, loaded_at: Instant::now() }
+    DlpConfigCache {
+        enabled,
+        allow_cloud_tier2: allow_tier2,
+        allow_cloud_tier3: allow_tier3,
+        loaded_at: Instant::now(),
+    }
 }
 
 /// Invalida la cache DLP: il prossimo check ricaricherà dal DB.
@@ -104,7 +112,11 @@ pub fn invalidate_dlp_cache() {
 /// Il caller decide come gestire `Some`:
 /// - Messaggio contenente "DLP Block" → ritornare errore 403
 /// - Messaggio contenente "DLP Warning"/"DLP Notice" → loggare e proseguire
-pub async fn check_dlp_policy_db(provider: &str, tier: SensitivityTier, db: &PgPool) -> Option<String> {
+pub async fn check_dlp_policy_db(
+    provider: &str,
+    tier: SensitivityTier,
+    db: &PgPool,
+) -> Option<String> {
     let cache = get_cache();
     let config = {
         let guard = cache.lock().await;
@@ -120,7 +132,13 @@ pub async fn check_dlp_policy_db(provider: &str, tier: SensitivityTier, db: &PgP
         }
     };
 
-    check_dlp_policy_with_config(provider, tier, config.enabled, config.allow_cloud_tier2, config.allow_cloud_tier3)
+    check_dlp_policy_with_config(
+        provider,
+        tier,
+        config.enabled,
+        config.allow_cloud_tier2,
+        config.allow_cloud_tier3,
+    )
 }
 
 /// Tier di sensibilità dei dati inviati al provider LLM.
@@ -226,7 +244,10 @@ pub fn check_dlp_policy_with_config(
         return None;
     }
 
-    let is_local_or_eu = matches!(provider.to_lowercase().as_str(), "ollama" | "mistral" | "onprem");
+    let is_local_or_eu = matches!(
+        provider.to_lowercase().as_str(),
+        "ollama" | "mistral" | "onprem"
+    );
     if is_local_or_eu {
         return None;
     }

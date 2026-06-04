@@ -9,18 +9,33 @@ pub struct GitMergeBaseTool;
 #[async_trait]
 impl NexusToolHandler for GitMergeBaseTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let a = args.get("a").and_then(Value::as_str)
+        let a = args
+            .get("a")
+            .and_then(Value::as_str)
             .ok_or_else(|| NexusToolError::BadInput("a required".into()))?;
-        let b = args.get("b").and_then(Value::as_str)
+        let b = args
+            .get("b")
+            .and_then(Value::as_str)
             .ok_or_else(|| NexusToolError::BadInput("b required".into()))?;
-        let out = run_cmd("git", &["merge-base", a, b], &ctx.project_root, ctx.timeout_secs).await?;
+        let out = run_cmd(
+            "git",
+            &["merge-base", a, b],
+            &ctx.project_root,
+            ctx.timeout_secs,
+        )
+        .await?;
         if !out.success() {
-            return Err(NexusToolError::Exec { exit_code: out.exit_code, stderr: out.stderr });
+            return Err(NexusToolError::Exec {
+                exit_code: out.exit_code,
+                stderr: out.stderr,
+            });
         }
         Ok(json!({"ok": true, "a": a, "b": b, "merge_base": out.stdout.trim()}))
     }
     fn input_schema(&self) -> Value {
         json!({"type":"object","required":["a","b"],"properties":{"a":{"type":"string"},"b":{"type":"string"}}})
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only_subproc()
+    }
 }

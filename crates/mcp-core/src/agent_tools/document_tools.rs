@@ -24,7 +24,8 @@ use super::AgentToolContext;
 /// l'INTERO testo, nessun troncamento. Usa spawn_blocking perche' pdf-extract
 /// e' sync.
 pub async fn extract_pdf_text_inline(file_path: &std::path::Path) -> Result<String, String> {
-    let bytes = tokio::fs::read(file_path).await
+    let bytes = tokio::fs::read(file_path)
+        .await
         .map_err(|e| format!("read PDF '{}' fallita: {e}", file_path.display()))?;
     let result = tokio::task::spawn_blocking(move || {
         pdf_extract::extract_text_from_mem(&bytes)
@@ -38,11 +39,14 @@ pub async fn extract_pdf_text_inline(file_path: &std::path::Path) -> Result<Stri
 /// Pre-extract testo da un DOCX (ZIP + word/document.xml). Estrae l'INTERO
 /// testo, nessun troncamento.
 pub async fn extract_docx_text_inline(file_path: &std::path::Path) -> Result<String, String> {
-    let bytes = tokio::fs::read(file_path).await
+    let bytes = tokio::fs::read(file_path)
+        .await
         .map_err(|e| format!("read DOCX '{}' fallita: {e}", file_path.display()))?;
-    let result = tokio::task::spawn_blocking(move || extract_docx(&bytes)).await
+    let result = tokio::task::spawn_blocking(move || extract_docx(&bytes))
+        .await
         .map_err(|e| format!("spawn_blocking fallita: {e}"))??;
-    let text = result.get("text")
+    let text = result
+        .get("text")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
@@ -54,10 +58,7 @@ pub async fn extract_docx_text_inline(file_path: &std::path::Path) -> Result<Str
 // ──────────────────────────────────────────────────────────────────────────
 
 /// `nexus_extract_pdf_text(attachment_id, page_start?, page_end?)`.
-pub(super) async fn tool_nexus_extract_pdf_text(
-    ctx: &AgentToolContext,
-    input: &Value,
-) -> String {
+pub(super) async fn tool_nexus_extract_pdf_text(ctx: &AgentToolContext, input: &Value) -> String {
     let attachment_id = match input
         .get("attachment_id")
         .and_then(Value::as_str)
@@ -79,7 +80,8 @@ pub(super) async fn tool_nexus_extract_pdf_text(
         Err(e) => return json!({ "error": format!("read fallita: {e}") }).to_string(),
     };
 
-    let result = tokio::task::spawn_blocking(move || extract_pdf(&bytes, page_start, page_end)).await;
+    let result =
+        tokio::task::spawn_blocking(move || extract_pdf(&bytes, page_start, page_end)).await;
 
     match result {
         Ok(Ok(v)) => v.to_string(),
@@ -124,8 +126,8 @@ fn extract_pdf(
     }
 
     // Heuristica PDF scansionato: pochissimo testo / pagina.
-    let is_scanned = !extracted.is_empty()
-        && extracted.trim().len() < 50 * (end_idx - start_idx).max(1);
+    let is_scanned =
+        !extracted.is_empty() && extracted.trim().len() < 50 * (end_idx - start_idx).max(1);
     let mut out = json!({
         "total_pages": total_pages,
         "pages_extracted": end_idx - start_idx,
@@ -133,8 +135,9 @@ fn extract_pdf(
     });
     if is_scanned {
         out["is_scanned_pdf"] = json!(true);
-        out["hint"] =
-            json!("PDF probabilmente scansionato (poco testo estratto). Usa un modello vision/OCR.");
+        out["hint"] = json!(
+            "PDF probabilmente scansionato (poco testo estratto). Usa un modello vision/OCR."
+        );
     }
     Ok(out)
 }
@@ -144,10 +147,7 @@ fn extract_pdf(
 // ──────────────────────────────────────────────────────────────────────────
 
 /// `nexus_extract_docx_text(attachment_id)`.
-pub(super) async fn tool_nexus_extract_docx_text(
-    ctx: &AgentToolContext,
-    input: &Value,
-) -> String {
+pub(super) async fn tool_nexus_extract_docx_text(ctx: &AgentToolContext, input: &Value) -> String {
     let attachment_id = match input
         .get("attachment_id")
         .and_then(Value::as_str)
@@ -177,8 +177,8 @@ pub(super) async fn tool_nexus_extract_docx_text(
 
 fn extract_docx(bytes: &[u8]) -> Result<Value, String> {
     let reader = Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(reader)
-        .map_err(|e| format!("apertura DOCX (zip) fallita: {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("apertura DOCX (zip) fallita: {e}"))?;
     let mut doc_xml = Vec::new();
     {
         let mut entry = archive
@@ -237,10 +237,7 @@ fn extract_docx(bytes: &[u8]) -> Result<Value, String> {
 // ──────────────────────────────────────────────────────────────────────────
 
 /// `nexus_extract_xlsx_data(attachment_id, sheet_name?)`.
-pub(super) async fn tool_nexus_extract_xlsx_data(
-    ctx: &AgentToolContext,
-    input: &Value,
-) -> String {
+pub(super) async fn tool_nexus_extract_xlsx_data(ctx: &AgentToolContext, input: &Value) -> String {
     let attachment_id = match input
         .get("attachment_id")
         .and_then(Value::as_str)
@@ -273,8 +270,8 @@ pub(super) async fn tool_nexus_extract_xlsx_data(
 
 fn extract_xlsx(bytes: &[u8], sheet_name: Option<String>) -> Result<Value, String> {
     let reader = Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(reader)
-        .map_err(|e| format!("apertura XLSX fallita: {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("apertura XLSX fallita: {e}"))?;
 
     // 1) sharedStrings (opzionale).
     let shared_strings = if let Ok(mut entry) = archive.by_name("xl/sharedStrings.xml") {
@@ -343,10 +340,7 @@ fn parse_shared_strings(bytes: &[u8]) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-fn parse_worksheet(
-    bytes: &[u8],
-    shared_strings: &[String],
-) -> Result<Vec<Vec<String>>, String> {
+fn parse_worksheet(bytes: &[u8], shared_strings: &[String]) -> Result<Vec<Vec<String>>, String> {
     let mut xml = Reader::from_reader(bytes);
     xml.config_mut().trim_text(false);
     let mut buf = Vec::new();

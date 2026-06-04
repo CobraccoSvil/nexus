@@ -18,11 +18,7 @@ pub struct RustcExplainTool;
 
 #[async_trait]
 impl NexusToolHandler for RustcExplainTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let error_code = args
             .get("error_code")
             .and_then(Value::as_str)
@@ -77,9 +73,7 @@ impl NexusToolHandler for RustcExplainTool {
 }
 
 fn is_valid_error_code(code: &str) -> bool {
-    code.len() == 5
-        && code.starts_with('E')
-        && code[1..].chars().all(|c| c.is_ascii_digit())
+    code.len() == 5 && code.starts_with('E') && code[1..].chars().all(|c| c.is_ascii_digit())
 }
 
 #[cfg(test)]

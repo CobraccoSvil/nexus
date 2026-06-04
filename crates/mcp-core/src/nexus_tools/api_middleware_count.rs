@@ -8,10 +8,21 @@ pub struct ApiMiddlewareCountTool;
 
 #[async_trait]
 impl NexusToolHandler for ApiMiddlewareCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(
             &ctx.project_root,
-            &[".layer(", "tower::ServiceBuilder", "from_fn(", "TraceLayer", "CorsLayer", "AuthLayer"],
+            &[
+                ".layer(",
+                "tower::ServiceBuilder",
+                "from_fn(",
+                "TraceLayer",
+                "CorsLayer",
+                "AuthLayer",
+            ],
         );
         Ok(json!({
             "ok": true,
@@ -24,5 +35,7 @@ impl NexusToolHandler for ApiMiddlewareCountTool {
             "auth_layer": counts[5],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

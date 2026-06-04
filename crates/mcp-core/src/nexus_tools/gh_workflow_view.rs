@@ -9,9 +9,17 @@ pub struct GhWorkflowViewTool;
 #[async_trait]
 impl NexusToolHandler for GhWorkflowViewTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let name = args.get("name").and_then(Value::as_str)
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
             .ok_or_else(|| NexusToolError::BadInput("name required".into()))?;
-        let out = run_cmd("gh", &["workflow", "view", name], &ctx.project_root, ctx.timeout_secs).await?;
+        let out = run_cmd(
+            "gh",
+            &["workflow", "view", name],
+            &ctx.project_root,
+            ctx.timeout_secs,
+        )
+        .await?;
         Ok(json!({
             "ok": out.success(),
             "exit_code": out.exit_code,
@@ -22,6 +30,11 @@ impl NexusToolHandler for GhWorkflowViewTool {
         json!({"type":"object","required":["name"],"properties":{"name":{"type":"string"}}})
     }
     fn safety(&self) -> NexusToolSafety {
-        NexusToolSafety { read_only: true, can_write_filesystem: false, can_execute_subproc: true, network_egress: true }
+        NexusToolSafety {
+            read_only: true,
+            can_write_filesystem: false,
+            can_execute_subproc: true,
+            network_egress: true,
+        }
     }
 }

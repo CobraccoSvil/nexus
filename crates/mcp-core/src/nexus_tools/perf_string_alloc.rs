@@ -8,8 +8,15 @@ pub struct PerfStringAllocTool;
 
 #[async_trait]
 impl NexusToolHandler for PerfStringAllocTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let (counts, files) = scan_substrings(&ctx.project_root, &["String::new(", "String::from(", "format!(", ".to_string()"]);
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let (counts, files) = scan_substrings(
+            &ctx.project_root,
+            &["String::new(", "String::from(", "format!(", ".to_string()"],
+        );
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -19,5 +26,7 @@ impl NexusToolHandler for PerfStringAllocTool {
             "to_string": counts[3],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

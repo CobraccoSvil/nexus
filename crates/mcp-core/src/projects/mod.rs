@@ -6,8 +6,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use mcp_quality;
 use mcp_db;
+use mcp_quality;
 
 use axum::{
     extract::{Extension, Path as AxumPath, Query, State},
@@ -476,9 +476,7 @@ pub(crate) async fn load_projects_base_root(db: &PgPool) -> Result<PathBuf, ApiE
 
 pub(crate) fn resolve_relative_path(root: &Path, relative: &str) -> Result<PathBuf, ApiError> {
     let raw = relative.trim();
-    let root_canonical = root
-        .canonicalize()
-        .unwrap_or_else(|_| root.to_path_buf());
+    let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
     let target = if raw.is_empty() {
         root_canonical.clone()
@@ -503,7 +501,10 @@ pub(crate) fn resolve_relative_path(root: &Path, relative: &str) -> Result<PathB
     Ok(canonical)
 }
 
-pub(crate) fn resolve_workspace_target(root: &Path, relative: &str) -> Result<(String, PathBuf), ApiError> {
+pub(crate) fn resolve_workspace_target(
+    root: &Path,
+    relative: &str,
+) -> Result<(String, PathBuf), ApiError> {
     let clean = relative
         .trim()
         .trim_start_matches(['\\', '/'])
@@ -535,9 +536,7 @@ pub(crate) async fn run_git_command_with_options(
     options: &GitCommandOptions,
 ) -> Result<(String, String), anyhow::Error> {
     let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(root);
+    command.arg("-C").arg(root);
 
     for (key, value) in &options.configs {
         command.arg("-c").arg(format!("{key}={value}"));
@@ -561,7 +560,10 @@ pub(crate) async fn run_git_command_with_options(
     }
 }
 
-pub(crate) async fn run_git_command(root: &Path, args: &[&str]) -> Result<(String, String), anyhow::Error> {
+pub(crate) async fn run_git_command(
+    root: &Path,
+    args: &[&str],
+) -> Result<(String, String), anyhow::Error> {
     run_git_command_with_options(root, args, &GitCommandOptions::default()).await
 }
 
@@ -828,17 +830,14 @@ pub(crate) async fn load_project_context(
             is_git_repo = true;
             repository_root_path = detected.root_path.clone();
             current_branch = detected.current_branch.clone().or(current_branch);
-            let remote_url = detected
-                .remotes
-                .iter()
-                .find_map(|(_, fetch_url, _)| {
-                    let trimmed = fetch_url.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed.to_string())
-                    }
-                });
+            let remote_url = detected.remotes.iter().find_map(|(_, fetch_url, _)| {
+                let trimmed = fetch_url.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            });
 
             let update_result = sqlx::query(
                 r#"
@@ -981,7 +980,10 @@ pub(crate) async fn upsert_open_session(
     Ok(())
 }
 
-pub(crate) fn list_directory_nodes(root: &Path, target: &Path) -> Result<Vec<WorkspaceTreeNode>, ApiError> {
+pub(crate) fn list_directory_nodes(
+    root: &Path,
+    target: &Path,
+) -> Result<Vec<WorkspaceTreeNode>, ApiError> {
     let read_dir = std::fs::read_dir(target)
         .map_err(|_| api_error(StatusCode::NOT_FOUND, "Directory non trovata"))?;
 
@@ -1543,29 +1545,29 @@ pub(super) async fn detect_git_repo(path: &Path) -> GitRepoInfo {
 
 // ── Dichiarazioni sotto-moduli ────────────────────────────────────────────────
 
-pub mod crud;
-pub mod browse;
-pub mod clone;
 pub mod analyze;
+pub mod browse;
 pub mod cleanup;
-pub mod deep_analyze;
+pub mod clone;
+pub mod crud;
 pub mod custom_instructions;
-pub mod indexing;
+pub mod deep_analyze;
+pub mod deep_review;
 pub mod file_watcher;
+pub mod indexing;
 pub mod quality;
 pub mod terminal;
-pub mod deep_review;
 
 // ── Re-export di tutti i simboli pubblici ─────────────────────────────────────
 
-pub use crud::*;
+pub use analyze::*;
 pub use browse::*;
 pub use clone::*;
-pub use analyze::*;
-pub use deep_analyze::*;
+pub use crud::*;
 pub use custom_instructions::*;
-pub use indexing::*;
+pub use deep_analyze::*;
+pub use deep_review::*;
 pub use file_watcher::spawn_file_watcher;
+pub use indexing::*;
 pub use quality::*;
 pub use terminal::*;
-pub use deep_review::*;

@@ -29,7 +29,12 @@ async fn verify_container_label(
 ) -> Result<(), NexusToolError> {
     let out = exec::run_cmd(
         "docker",
-        &["inspect", "--format", "{{index .Config.Labels \"com.docker.compose.project\"}}", name],
+        &[
+            "inspect",
+            "--format",
+            "{{index .Config.Labels \"com.docker.compose.project\"}}",
+            name,
+        ],
         project_root,
         10,
     )
@@ -47,11 +52,7 @@ async fn verify_container_label(
 
 #[async_trait]
 impl NexusToolHandler for DockerRmTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let container = args
             .get("container")
             .and_then(Value::as_str)
@@ -74,7 +75,10 @@ impl NexusToolHandler for DockerRmTool {
         verify_container_label(&container, &slug, &ctx.project_root).await?;
 
         let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
-        let volumes = args.get("volumes").and_then(Value::as_bool).unwrap_or(false);
+        let volumes = args
+            .get("volumes")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         let mut cmd_args = vec!["rm"];
         if force {

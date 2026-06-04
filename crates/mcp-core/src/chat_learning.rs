@@ -13,14 +13,13 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use crate::{
-    auth::Claims,
-    vector_memory, AppState,
-};
+use crate::{auth::Claims, vector_memory, AppState};
 
 // ── Shared types and helpers — re-exported from nexus-types crate ──
 
-pub use nexus_types::{ApiError, ApiResult, api_error, parse_user_id, parse_project_id, ensure_project_access};
+pub use nexus_types::{
+    api_error, ensure_project_access, parse_project_id, parse_user_id, ApiError, ApiResult,
+};
 
 pub(crate) fn normalize_text(input: &str) -> String {
     input
@@ -1091,7 +1090,11 @@ pub async fn admin_run_vector_compaction(
     Json(body): Json<CompactVectorRequest>,
 ) -> ApiResult {
     // Guard: se Qdrant e' down, ritorna errore chiaro invece di timeout
-    if !state.dependency_status.qdrant.load(std::sync::atomic::Ordering::Relaxed) {
+    if !state
+        .dependency_status
+        .qdrant
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Qdrant non disponibile — compaction non avviabile".to_string(),
@@ -1195,9 +1198,11 @@ pub fn spawn_vector_compaction_scheduler(state: AppState) {
 
             let now = Local::now();
             let today = now.date_naive();
-            let mut next = today
-                .and_hms_opt(hour, minute, 0)
-                .unwrap_or_else(|| today.and_hms_milli_opt(hour, minute, 0, 0).expect("valid time"));
+            let mut next = today.and_hms_opt(hour, minute, 0).unwrap_or_else(|| {
+                today
+                    .and_hms_milli_opt(hour, minute, 0, 0)
+                    .expect("valid time")
+            });
 
             if now.naive_local() >= next {
                 next += chrono::Duration::days(1);
@@ -1215,7 +1220,11 @@ pub fn spawn_vector_compaction_scheduler(state: AppState) {
             tokio::time::sleep(wait).await;
 
             // Guard: se Qdrant e' down, skip compaction (il watchdog la marcherebbe comunque stale)
-            if !state.dependency_status.qdrant.load(std::sync::atomic::Ordering::Relaxed) {
+            if !state
+                .dependency_status
+                .qdrant
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 tracing::info!("vector_compaction_scheduler: skip — Qdrant non disponibile");
                 continue;
             }
@@ -1274,16 +1283,12 @@ pub async fn admin_create_prompt_correction(
     };
 
     // Genera embedding tramite l'orchestrator.
-    let embedding = state
-        .orchestrator
-        .embed_text(&text)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("embedding fallito: {e}")})),
-            )
-        })?;
+    let embedding = state.orchestrator.embed_text(&text).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("embedding fallito: {e}")})),
+        )
+    })?;
 
     // Hash per deduplicazione.
     let hash = {
@@ -1303,19 +1308,14 @@ pub async fn admin_create_prompt_correction(
         "project_id": project_id.to_string(),
     });
 
-    vector_memory::upsert_prompt_correction_point(
-        &state.db,
-        &point_id,
-        &embedding,
-        payload,
-    )
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("upsert Qdrant fallito: {e}")})),
-        )
-    })?;
+    vector_memory::upsert_prompt_correction_point(&state.db, &point_id, &embedding, payload)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("upsert Qdrant fallito: {e}")})),
+            )
+        })?;
 
     // Persiste in PostgreSQL.
     let correction_id: Uuid = sqlx::query_scalar(
@@ -1395,7 +1395,9 @@ pub async fn admin_list_prompt_corrections(
         })
         .collect();
 
-    Ok(Json(json!({"corrections": corrections, "total": corrections.len()})))
+    Ok(Json(
+        json!({"corrections": corrections, "total": corrections.len()}),
+    ))
 }
 
 /// DELETE /api/admin/prompt-corrections/:id

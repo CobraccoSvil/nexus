@@ -144,27 +144,92 @@ impl RoutingMatrix {
             ("chat_breve", "veloce", "google", "gemini-2.5-flash-lite"),
             ("chat_breve", "economica", "openai", "gpt-4.1-nano"),
             ("chat_breve", "bilanciata", "google", "gemini-2.5-flash"),
-            ("chat_breve", "approfondita", "anthropic", "claude-haiku-4-5-20251001"),
+            (
+                "chat_breve",
+                "approfondita",
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+            ),
             ("chat_media", "bilanciata", "openai", "gpt-4.1-mini"),
-            ("chat_media", "approfondita", "anthropic", "claude-sonnet-4-6"),
-            ("chat_lunga", "bilanciata", "anthropic", "claude-haiku-4-5-20251001"),
-            ("chat_lunga", "approfondita", "anthropic", "claude-sonnet-4-6"),
+            (
+                "chat_media",
+                "approfondita",
+                "anthropic",
+                "claude-sonnet-4-6",
+            ),
+            (
+                "chat_lunga",
+                "bilanciata",
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+            ),
+            (
+                "chat_lunga",
+                "approfondita",
+                "anthropic",
+                "claude-sonnet-4-6",
+            ),
             // intent agentici (richiedono modelli capable)
             ("file_ops", "veloce", "openai", "gpt-4.1-mini"),
-            ("file_ops", "bilanciata", "anthropic", "claude-haiku-4-5-20251001"),
+            (
+                "file_ops",
+                "bilanciata",
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+            ),
             ("file_ops", "approfondita", "anthropic", "claude-sonnet-4-6"),
-            ("system_admin", "veloce", "anthropic", "claude-haiku-4-5-20251001"),
-            ("system_admin", "bilanciata", "anthropic", "claude-sonnet-4-6"),
-            ("system_admin", "approfondita", "anthropic", "claude-sonnet-4-6"),
+            (
+                "system_admin",
+                "veloce",
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+            ),
+            (
+                "system_admin",
+                "bilanciata",
+                "anthropic",
+                "claude-sonnet-4-6",
+            ),
+            (
+                "system_admin",
+                "approfondita",
+                "anthropic",
+                "claude-sonnet-4-6",
+            ),
             ("debug", "bilanciata", "anthropic", "claude-sonnet-4-6"),
             ("debug", "approfondita", "anthropic", "claude-opus-4-6"),
-            ("architecture", "bilanciata", "anthropic", "claude-sonnet-4-6"),
-            ("architecture", "approfondita", "anthropic", "claude-opus-4-6"),
-            ("refactor", "bilanciata", "anthropic", "claude-haiku-4-5-20251001"),
+            (
+                "architecture",
+                "bilanciata",
+                "anthropic",
+                "claude-sonnet-4-6",
+            ),
+            (
+                "architecture",
+                "approfondita",
+                "anthropic",
+                "claude-opus-4-6",
+            ),
+            (
+                "refactor",
+                "bilanciata",
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+            ),
             ("refactor", "approfondita", "anthropic", "claude-sonnet-4-6"),
             ("fix_semplice", "bilanciata", "openai", "gpt-4.1-mini"),
-            ("fix_complesso", "bilanciata", "anthropic", "claude-haiku-4-5-20251001"),
-            ("fix_complesso", "approfondita", "anthropic", "claude-sonnet-4-6"),
+            (
+                "fix_complesso",
+                "bilanciata",
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+            ),
+            (
+                "fix_complesso",
+                "approfondita",
+                "anthropic",
+                "claude-sonnet-4-6",
+            ),
             ("test", "bilanciata", "openai", "gpt-4.1-mini"),
             ("docs", "bilanciata", "openai", "gpt-4.1"),
         ];
@@ -230,7 +295,9 @@ async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
     )
     .fetch_all(db)
     .await
-    .map_err(|e| format!("query nexus_purpose_model fallita: {e}. Hai applicato la migrazione 0102?"))?;
+    .map_err(|e| {
+        format!("query nexus_purpose_model fallita: {e}. Hai applicato la migrazione 0102?")
+    })?;
 
     // Regole tier-based per purpose (mig 0203). GRACEFUL: se le colonne non
     // esistono (migrazione non ancora applicata) ignoriamo senza bloccare —
@@ -252,12 +319,14 @@ async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
 
     if matrix_rows.is_empty() {
         return Err(
-            "nexus_routing_matrix vuota. Applica la migrazione 0101 o popola la tabella.".to_string(),
+            "nexus_routing_matrix vuota. Applica la migrazione 0101 o popola la tabella."
+                .to_string(),
         );
     }
     if default_rows.is_empty() {
         return Err(
-            "nexus_provider_default_model vuota. Applica la migrazione 0101 o popola la tabella.".to_string(),
+            "nexus_provider_default_model vuota. Applica la migrazione 0101 o popola la tabella."
+                .to_string(),
         );
     }
 
@@ -399,7 +468,10 @@ impl RoutingMatrixCache {
                         debug!("routing_matrix: refresh OK");
                     }
                     Err(e) => {
-                        warn!("routing_matrix: refresh fallito ({}). Mantengo cache precedente.", e);
+                        warn!(
+                            "routing_matrix: refresh fallito ({}). Mantengo cache precedente.",
+                            e
+                        );
                         let mut le = last_err_bg.write().await;
                         *le = Some(e);
                     }
@@ -422,7 +494,10 @@ impl RoutingMatrixCache {
             },
             Err(_) => {
                 // Lock occupato dal refresh background. Riprova async.
-                Err("routing_matrix: cache temporaneamente non disponibile (refresh in corso)".to_string())
+                Err(
+                    "routing_matrix: cache temporaneamente non disponibile (refresh in corso)"
+                        .to_string(),
+                )
             }
         }
     }
@@ -477,7 +552,10 @@ mod tests {
     fn lookup_returns_some_for_existing_entry() {
         let m = make_test_matrix();
         let r = m.lookup("file_ops", "approfondita");
-        assert_eq!(r, Some(("anthropic".to_string(), "claude-sonnet-4-6".to_string())));
+        assert_eq!(
+            r,
+            Some(("anthropic".to_string(), "claude-sonnet-4-6".to_string()))
+        );
     }
 
     #[test]
@@ -556,7 +634,8 @@ mod tests {
                 assert!(
                     !light_models.contains(&model.as_str()),
                     "intent '{}' mode 'approfondita' non puo' usare modello light '{}'",
-                    intent, model
+                    intent,
+                    model
                 );
             }
         }
@@ -601,10 +680,7 @@ mod tests {
     fn purpose_model_ritorna_tupla_provider_modello() {
         let m = make_test_matrix();
         let pm = m.purpose_model("chat_title_generator");
-        assert_eq!(
-            pm,
-            Some(("openai".to_string(), "gpt-4.1-nano".to_string()))
-        );
+        assert_eq!(pm, Some(("openai".to_string(), "gpt-4.1-nano".to_string())));
         assert_eq!(m.purpose_model("inesistente"), None);
     }
 
@@ -635,12 +711,22 @@ mod tests {
         // mode "bilanciata" (mode di default per la maggior parte dei turni).
         let m = RoutingMatrix::fallback_safe();
         let intent_critici = [
-            "chat_breve", "chat_media", "chat_lunga",
-            "file_ops", "system_admin", "debug", "architecture",
-            "refactor", "fix_complesso",
+            "chat_breve",
+            "chat_media",
+            "chat_lunga",
+            "file_ops",
+            "system_admin",
+            "debug",
+            "architecture",
+            "refactor",
+            "fix_complesso",
         ];
         for intent in &intent_critici {
-            let mode = if intent.starts_with("chat") { "bilanciata" } else { "bilanciata" };
+            let mode = if intent.starts_with("chat") {
+                "bilanciata"
+            } else {
+                "bilanciata"
+            };
             assert!(
                 m.lookup(intent, mode).is_some(),
                 "intent critico '{}' senza routing in mode 'bilanciata' — fallback chain rotta",
@@ -677,7 +763,10 @@ mod tests {
         );
         // Sotto soglia: modello base
         let base = m.lookup_with_budget("refactor", "bilanciata", 10_000);
-        assert_eq!(base, Some(("openai".to_string(), "gpt-4.1-mini".to_string())));
+        assert_eq!(
+            base,
+            Some(("openai".to_string(), "gpt-4.1-mini".to_string()))
+        );
         // Sopra soglia: modello escalation
         let esc = m.lookup_with_budget("refactor", "bilanciata", 60_000);
         assert_eq!(

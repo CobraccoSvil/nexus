@@ -25,7 +25,10 @@ fn release_binary() -> std::path::PathBuf {
 fn binary_contiene_tutti_i_pattern_safety_attesi() {
     let bin = release_binary();
     if !bin.exists() {
-        eprintln!("skip: binary {} non trovato (esegui 'cargo build -p mcp-core --release' prima)", bin.display());
+        eprintln!(
+            "skip: binary {} non trovato (esegui 'cargo build -p mcp-core --release' prima)",
+            bin.display()
+        );
         return;
     }
     let out = Command::new("strings")

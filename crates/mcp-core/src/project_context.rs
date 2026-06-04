@@ -8,9 +8,9 @@
 //! Budget hard cap: 10_000 caratteri ≈ 2500 token.
 //! Non fallisce mai: qualsiasi errore produce stringa vuota.
 
+use serde_json::Value;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
-use serde_json::Value;
 
 use crate::orchestrator::NeuralCoreClient;
 
@@ -67,16 +67,15 @@ pub async fn build_project_context_block(
 }
 
 async fn query_project_facts(db: &PgPool, project_id: Uuid) -> Option<String> {
-    let row: Option<(String, Option<Value>, Option<String>, Option<String>)> =
-        sqlx::query_as(
-            "SELECT name, analysis_json, custom_instructions, repository_root_path \
+    let row: Option<(String, Option<Value>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT name, analysis_json, custom_instructions, repository_root_path \
              FROM projects WHERE id = $1",
-        )
-        .bind(project_id)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten();
+    )
+    .bind(project_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
 
     let mut lines: Vec<String> = vec!["## Project Facts".to_string()];
     let mut has_content = false;
@@ -260,7 +259,11 @@ fn extract_languages(analysis: &Value) -> Option<String> {
                 .join(", ")
         })
         .unwrap_or_default();
-    if langs.is_empty() { None } else { Some(langs) }
+    if langs.is_empty() {
+        None
+    } else {
+        Some(langs)
+    }
 }
 
 fn extract_frameworks(analysis: &Value) -> Option<String> {
@@ -275,7 +278,11 @@ fn extract_frameworks(analysis: &Value) -> Option<String> {
                 .join(", ")
         })
         .unwrap_or_default();
-    if fws.is_empty() { None } else { Some(fws) }
+    if fws.is_empty() {
+        None
+    } else {
+        Some(fws)
+    }
 }
 
 fn extract_scripts(analysis: &Value) -> Option<String> {
@@ -292,7 +299,11 @@ fn extract_scripts(analysis: &Value) -> Option<String> {
                 .join("\n")
         })
         .unwrap_or_default();
-    if scripts.is_empty() { None } else { Some(scripts) }
+    if scripts.is_empty() {
+        None
+    } else {
+        Some(scripts)
+    }
 }
 
 /// Sezione fissa con le porte riservate dall'infrastruttura Nexus.

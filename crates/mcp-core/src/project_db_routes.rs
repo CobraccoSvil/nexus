@@ -23,7 +23,9 @@ use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::project_db::exec::{archive_ddl, execute_query, open_pool, resolve_project_conn, QueryExecError};
+use crate::project_db::exec::{
+    archive_ddl, execute_query, open_pool, resolve_project_conn, QueryExecError,
+};
 use crate::{auth::Claims, AppState};
 
 type ApiError = (StatusCode, Json<Value>);
@@ -165,22 +167,32 @@ pub async fn get_project_db_config(
     .await
     .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let (engine, hosting_mode, migration_tool, migration_path, allow_ddl_override, detection_metadata) =
-        if let Some(r) = row {
-            let allow: bool = r.try_get("allow_ddl_override").unwrap_or(false);
-            let meta: Value = r.try_get::<serde_json::Value, _>("detection_metadata")
-                .unwrap_or(json!({}));
-            (
-                r.try_get::<Option<String>, _>("engine").unwrap_or(None),
-                r.try_get::<Option<String>, _>("hosting_mode").unwrap_or(None),
-                r.try_get::<Option<String>, _>("migration_tool").unwrap_or(None),
-                r.try_get::<Option<String>, _>("migration_path").unwrap_or(None),
-                allow,
-                meta,
-            )
-        } else {
-            (None, None, None, None, false, json!({}))
-        };
+    let (
+        engine,
+        hosting_mode,
+        migration_tool,
+        migration_path,
+        allow_ddl_override,
+        detection_metadata,
+    ) = if let Some(r) = row {
+        let allow: bool = r.try_get("allow_ddl_override").unwrap_or(false);
+        let meta: Value = r
+            .try_get::<serde_json::Value, _>("detection_metadata")
+            .unwrap_or(json!({}));
+        (
+            r.try_get::<Option<String>, _>("engine").unwrap_or(None),
+            r.try_get::<Option<String>, _>("hosting_mode")
+                .unwrap_or(None),
+            r.try_get::<Option<String>, _>("migration_tool")
+                .unwrap_or(None),
+            r.try_get::<Option<String>, _>("migration_path")
+                .unwrap_or(None),
+            allow,
+            meta,
+        )
+    } else {
+        (None, None, None, None, false, json!({}))
+    };
 
     // Conteggi migrazioni
     let pending_count: i64 = sqlx::query_scalar(
@@ -258,13 +270,12 @@ pub async fn set_project_db_config(
         .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Se e' la prima connessione del progetto, is_primary default true.
-    let existing_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM project_database_config WHERE project_id = $1",
-    )
-    .bind(project_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let existing_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM project_database_config WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let is_primary = body.is_primary.unwrap_or(existing_count == 0);
 
@@ -279,13 +290,11 @@ pub async fn set_project_db_config(
     .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if is_primary {
-        sqlx::query(
-            "UPDATE project_database_config SET is_primary = false WHERE project_id = $1",
-        )
-        .bind(project_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        sqlx::query("UPDATE project_database_config SET is_primary = false WHERE project_id = $1")
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
 
     match existing_id {
@@ -349,29 +358,52 @@ pub async fn set_project_db_config(
     // (appsettings.*.json, .env, ecc.) se fornita e se il progetto e` su disco locale.
     // Tutto il filesystem I/O e' spostato in spawn_blocking per non bloccare tokio.
     let mut writeback_error: Option<String> = None;
-    if let Some(conn_str) = body.connection_string.as_deref().filter(|s| !s.trim().is_empty()) {
-        let project_root: Option<String> = sqlx::query_scalar("SELECT repository_root_path FROM projects WHERE id=$1")
-            .bind(project_id)
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten()
-            .filter(|s: &String| !s.is_empty());
+    if let Some(conn_str) = body
+        .connection_string
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let project_root: Option<String> =
+            sqlx::query_scalar("SELECT repository_root_path FROM projects WHERE id=$1")
+                .bind(project_id)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten()
+                .filter(|s: &String| !s.is_empty());
         if let Some(root) = project_root {
             let conn_str_owned = conn_str.to_string();
             let wb_result = tokio::task::spawn_blocking(move || {
                 let root_path = std::path::Path::new(&root);
-                if !root_path.exists() { return None; }
+                if !root_path.exists() {
+                    return None;
+                }
                 let mut wb_error: Option<String> = None;
                 let candidates = ["appsettings.Development.json", "appsettings.json"];
                 let mut config_files: Vec<std::path::PathBuf> = Vec::new();
-                fn find_configs(dir: &std::path::Path, names: &[&str], out: &mut Vec<std::path::PathBuf>, depth: u8) {
-                    if depth > 4 { return; }
-                    let Ok(entries) = std::fs::read_dir(dir) else { return };
+                fn find_configs(
+                    dir: &std::path::Path,
+                    names: &[&str],
+                    out: &mut Vec<std::path::PathBuf>,
+                    depth: u8,
+                ) {
+                    if depth > 4 {
+                        return;
+                    }
+                    let Ok(entries) = std::fs::read_dir(dir) else {
+                        return;
+                    };
                     for entry in entries.filter_map(|e| e.ok()) {
                         let path = entry.path();
                         let fname = entry.file_name().to_string_lossy().to_string();
-                        if fname.starts_with('.') || fname == "node_modules" || fname == "bin" || fname == "obj" || fname == "target" { continue; }
+                        if fname.starts_with('.')
+                            || fname == "node_modules"
+                            || fname == "bin"
+                            || fname == "obj"
+                            || fname == "target"
+                        {
+                            continue;
+                        }
                         if path.is_file() && names.contains(&fname.as_str()) {
                             out.push(path);
                         } else if path.is_dir() {
@@ -383,28 +415,47 @@ pub async fn set_project_db_config(
                 for config_file in &config_files {
                     match std::fs::read_to_string(config_file) {
                         Ok(content) => {
-                            if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&content) {
+                            if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&content)
+                            {
                                 let updated = if let Some(cs) = doc.get_mut("ConnectionStrings") {
                                     if let Some(obj) = cs.as_object_mut() {
                                         for (_key, val) in obj.iter_mut() {
-                                            *val = serde_json::Value::String(conn_str_owned.clone());
+                                            *val =
+                                                serde_json::Value::String(conn_str_owned.clone());
                                         }
                                         true
-                                    } else { false }
-                                } else { false };
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
                                 if updated {
                                     if let Ok(pretty) = serde_json::to_string_pretty(&doc) {
                                         if let Err(e) = std::fs::write(config_file, pretty + "\n") {
-                                            tracing::warn!("write-back {} fallito: {}", config_file.display(), e);
-                                            wb_error = Some(format!("Scrittura {} fallita: {}", config_file.display(), e));
+                                            tracing::warn!(
+                                                "write-back {} fallito: {}",
+                                                config_file.display(),
+                                                e
+                                            );
+                                            wb_error = Some(format!(
+                                                "Scrittura {} fallita: {}",
+                                                config_file.display(),
+                                                e
+                                            ));
                                         } else {
-                                            tracing::info!("write-back connection string in {}", config_file.display());
+                                            tracing::info!(
+                                                "write-back connection string in {}",
+                                                config_file.display()
+                                            );
                                         }
                                     }
                                 }
                             }
                         }
-                        Err(e) => { tracing::warn!("lettura {} fallita: {}", config_file.display(), e); }
+                        Err(e) => {
+                            tracing::warn!("lettura {} fallita: {}", config_file.display(), e);
+                        }
                     }
                 }
                 let env_files = ["env", ".env", ".env.local", ".env.development"];
@@ -412,14 +463,20 @@ pub async fn set_project_db_config(
                     let env_path = root_path.join(env_name);
                     if env_path.is_file() {
                         if let Ok(content) = std::fs::read_to_string(&env_path) {
-                            let mut lines: Vec<String> = content.lines().map(String::from).collect();
+                            let mut lines: Vec<String> =
+                                content.lines().map(String::from).collect();
                             let mut found = false;
                             for line in &mut lines {
                                 let trimmed = line.trim();
-                                if trimmed.starts_with('#') { continue; }
+                                if trimmed.starts_with('#') {
+                                    continue;
+                                }
                                 if let Some((k, _)) = trimmed.split_once('=') {
                                     let kl = k.trim().to_lowercase();
-                                    if kl.contains("database_url") || kl.contains("connection") || kl.contains("db_url") {
+                                    if kl.contains("database_url")
+                                        || kl.contains("connection")
+                                        || kl.contains("db_url")
+                                    {
                                         *line = format!("{}={}", k.trim(), conn_str_owned);
                                         found = true;
                                     }
@@ -427,13 +484,18 @@ pub async fn set_project_db_config(
                             }
                             if found {
                                 let _ = std::fs::write(&env_path, lines.join("\n") + "\n");
-                                tracing::info!("write-back connection string in {}", env_path.display());
+                                tracing::info!(
+                                    "write-back connection string in {}",
+                                    env_path.display()
+                                );
                             }
                         }
                     }
                 }
                 wb_error
-            }).await.unwrap_or(None);
+            })
+            .await
+            .unwrap_or(None);
             writeback_error = wb_result;
         }
     }
@@ -494,7 +556,11 @@ fn derive_app_db_name(slug: Option<&str>, project_id: Uuid) -> String {
     if sanitized.is_empty() {
         sanitized = project_id.simple().to_string();
     }
-    if sanitized.chars().next().map_or(true, |c| c.is_ascii_digit()) {
+    if sanitized
+        .chars()
+        .next()
+        .map_or(true, |c| c.is_ascii_digit())
+    {
         sanitized.insert(0, 'p');
     }
     if sanitized.len() > 56 {
@@ -526,7 +592,11 @@ pub async fn provision_project_db(
     }
 
     let raw_name = body.name.as_deref().unwrap_or("primary").trim().to_string();
-    let name = if raw_name.is_empty() { "primary".to_string() } else { raw_name };
+    let name = if raw_name.is_empty() {
+        "primary".to_string()
+    } else {
+        raw_name
+    };
     let mode = body.mode.trim().to_lowercase();
 
     match mode.as_str() {
@@ -584,7 +654,11 @@ pub async fn provision_project_db(
             .await?;
 
             let test_val = test.0;
-            if !test_val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if !test_val
+                .get("ok")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 return Ok(Json(json!({
                     "ok": false,
                     "mode": "external",
@@ -714,7 +788,9 @@ pub async fn provision_internal_core(
         created = true;
         tracing::info!(
             "provision_project_db: created db={} owner={} project_id={}",
-            db_name, user, project_id
+            db_name,
+            user,
+            project_id
         );
     }
     admin_pool.close().await;
@@ -723,10 +799,7 @@ pub async fn provision_internal_core(
 
     let new_target = pg_physical_target(&url);
 
-    let mut tx = db
-        .begin()
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut tx = db.begin().await.map_err(|e| e.to_string())?;
 
     // ── Idempotenza (regola H): se esiste gia' una connessione del progetto che
     // punta allo STESSO database fisico (host+port+dbname), RIUSALA invece di
@@ -822,9 +895,7 @@ pub async fn provision_internal_core(
 
     let reused = reused_name.is_some();
 
-    tx.commit()
-        .await
-        .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
 
     nexus_events::dispatcher::emit_global(
         project_id,
@@ -1111,11 +1182,19 @@ pub async fn apply_project_migrations(
     // `None` -> connessione is_primary, comportamento storico delle migrazioni.
     let db_url = resolve_project_conn(&state.db, project_id, None)
         .await
-        .map_err(|e| api_err(StatusCode::BAD_GATEWAY, format!("Connessione DB progetto fallita: {e}")))?;
+        .map_err(|e| {
+            api_err(
+                StatusCode::BAD_GATEWAY,
+                format!("Connessione DB progetto fallita: {e}"),
+            )
+        })?;
 
-    let project_pool = open_pool(&db_url)
-        .await
-        .map_err(|e| api_err(StatusCode::BAD_GATEWAY, format!("Connessione DB progetto fallita: {e}")))?;
+    let project_pool = open_pool(&db_url).await.map_err(|e| {
+        api_err(
+            StatusCode::BAD_GATEWAY,
+            format!("Connessione DB progetto fallita: {e}"),
+        )
+    })?;
 
     let mut applied = Vec::new();
     let mut errors = Vec::new();
@@ -1208,7 +1287,11 @@ pub async fn rollback_project_migration(
     .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let row = match last {
-        None => return Ok(Json(json!({ "ok": false, "error": "Nessuna migration applicata da rollbackare" }))),
+        None => {
+            return Ok(Json(
+                json!({ "ok": false, "error": "Nessuna migration applicata da rollbackare" }),
+            ))
+        }
         Some(r) => r,
     };
 
@@ -1220,15 +1303,28 @@ pub async fn rollback_project_migration(
         if !sql.trim().is_empty() {
             let db_url = resolve_project_conn(&state.db, project_id, None)
                 .await
-                .map_err(|e| api_err(StatusCode::BAD_GATEWAY, format!("Connessione DB progetto fallita: {e}")))?;
-            let project_pool = open_pool(&db_url)
-                .await
-                .map_err(|e| api_err(StatusCode::BAD_GATEWAY, format!("Connessione DB progetto fallita: {e}")))?;
+                .map_err(|e| {
+                    api_err(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Connessione DB progetto fallita: {e}"),
+                    )
+                })?;
+            let project_pool = open_pool(&db_url).await.map_err(|e| {
+                api_err(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Connessione DB progetto fallita: {e}"),
+                )
+            })?;
 
             sqlx::raw_sql(&sql)
                 .execute(&project_pool)
                 .await
-                .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Rollback SQL fallito: {e}")))?;
+                .map_err(|e| {
+                    api_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Rollback SQL fallito: {e}"),
+                    )
+                })?;
         }
     }
 
@@ -1261,7 +1357,10 @@ pub async fn request_ddl_override(
         return Err(api_err(StatusCode::BAD_REQUEST, "sql obbligatorio"));
     }
     if body.reason.trim().len() < 10 {
-        return Err(api_err(StatusCode::BAD_REQUEST, "reason deve avere almeno 10 caratteri"));
+        return Err(api_err(
+            StatusCode::BAD_REQUEST,
+            "reason deve avere almeno 10 caratteri",
+        ));
     }
 
     // Verifica che allow_ddl_override sia true
@@ -1291,7 +1390,11 @@ pub async fn request_ddl_override(
     let checksum = format!("{:016x}", h.finish());
 
     let now = chrono::Utc::now();
-    let filename = format!("override_{}_{}.sql", now.format("%Y%m%d_%H%M%S"), &checksum[..8]);
+    let filename = format!(
+        "override_{}_{}.sql",
+        now.format("%Y%m%d_%H%M%S"),
+        &checksum[..8]
+    );
 
     // Inserisce con status pending_override
     let migration_id = sqlx::query_scalar::<_, Uuid>(
@@ -1356,7 +1459,10 @@ pub async fn request_ddl_override(
             .bind(&msg)
             .execute(&state.db)
             .await;
-            return Err(api_err(StatusCode::INTERNAL_SERVER_ERROR, format!("DDL override fallito: {msg}")));
+            return Err(api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DDL override fallito: {msg}"),
+            ));
         }
     }
 
@@ -1388,8 +1494,12 @@ fn normalize_pg_connection_string(raw: &str) -> String {
     let mut ssl_mode = "";
     for part in trimmed.split(';') {
         let part = part.trim();
-        if part.is_empty() { continue; }
-        let Some((k, v)) = part.split_once('=') else { continue };
+        if part.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
         let key_lower = k.trim().to_lowercase();
         let val = v.trim();
         match key_lower.as_str() {
@@ -1403,7 +1513,10 @@ fn normalize_pg_connection_string(raw: &str) -> String {
         }
     }
     let encoded_pass = urlencoding::encode(password);
-    let mut url = format!("postgres://{}:{}@{}:{}/{}", username, encoded_pass, host, port, database);
+    let mut url = format!(
+        "postgres://{}:{}@{}:{}/{}",
+        username, encoded_pass, host, port, database
+    );
     if !ssl_mode.is_empty() {
         url.push_str(&format!("?sslmode={}", ssl_mode));
     }
@@ -1475,11 +1588,17 @@ fn detect_from_env_content(content: &str) -> Option<(String, String)> {
     let mut env_vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for line in content.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
-        let Some((k, v)) = line.split_once('=') else { continue };
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         let k = k.trim();
         let v = v.trim().trim_matches('"').trim_matches('\'');
-        if v.is_empty() { continue; }
+        if v.is_empty() {
+            continue;
+        }
         env_vars.insert(k.to_ascii_uppercase(), v.to_string());
 
         let engine = if v.starts_with("postgres://") || v.starts_with("postgresql://") {
@@ -1494,9 +1613,12 @@ fn detect_from_env_content(content: &str) -> Option<(String, String)> {
             continue;
         };
         let upper = k.to_ascii_uppercase();
-        if upper.contains("DATABASE_URL") || upper.contains("POSTGRES_URL")
-            || upper.contains("MYSQL_URL") || upper.contains("DB_URL")
-            || upper.contains("MONGO_URL") || upper.contains("MONGODB_URI")
+        if upper.contains("DATABASE_URL")
+            || upper.contains("POSTGRES_URL")
+            || upper.contains("MYSQL_URL")
+            || upper.contains("DB_URL")
+            || upper.contains("MONGO_URL")
+            || upper.contains("MONGODB_URI")
         {
             return Some((engine.to_string(), v.to_string()));
         }
@@ -1513,7 +1635,9 @@ fn detect_from_env_content(content: &str) -> Option<(String, String)> {
 /// Costruisce una connection string da variabili d'ambiente separate
 /// come POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
 /// o varianti come DB_HOST, PGHOST, MYSQL_HOST, ecc.
-fn build_connection_from_env_vars(vars: &std::collections::HashMap<String, String>) -> Option<(String, String)> {
+fn build_connection_from_env_vars(
+    vars: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
     // Pattern di variabili per engine noti
     struct EnvPattern {
         engine: &'static str,
@@ -1530,9 +1654,27 @@ fn build_connection_from_env_vars(vars: &std::collections::HashMap<String, Strin
             engine: "postgres",
             host_keys: &["POSTGRES_HOST", "PGHOST", "DB_HOST", "DATABASE_HOST"],
             port_keys: &["POSTGRES_PORT", "PGPORT", "DB_PORT", "DATABASE_PORT"],
-            db_keys: &["POSTGRES_DB", "PGDATABASE", "DB_NAME", "DATABASE_NAME", "POSTGRES_DATABASE"],
-            user_keys: &["POSTGRES_USER", "PGUSER", "DB_USER", "DATABASE_USER", "POSTGRES_USERNAME"],
-            pass_keys: &["POSTGRES_PASSWORD", "PGPASSWORD", "DB_PASSWORD", "DATABASE_PASSWORD", "POSTGRES_PASS"],
+            db_keys: &[
+                "POSTGRES_DB",
+                "PGDATABASE",
+                "DB_NAME",
+                "DATABASE_NAME",
+                "POSTGRES_DATABASE",
+            ],
+            user_keys: &[
+                "POSTGRES_USER",
+                "PGUSER",
+                "DB_USER",
+                "DATABASE_USER",
+                "POSTGRES_USERNAME",
+            ],
+            pass_keys: &[
+                "POSTGRES_PASSWORD",
+                "PGPASSWORD",
+                "DB_PASSWORD",
+                "DATABASE_PASSWORD",
+                "POSTGRES_PASS",
+            ],
             default_port: "5432",
         },
         EnvPattern {
@@ -1552,18 +1694,30 @@ fn build_connection_from_env_vars(vars: &std::collections::HashMap<String, Strin
 
         // Serve almeno host + database per costruire una connection string utile
         if let (Some(host), Some(db)) = (host, db) {
-            let port = pat.port_keys.iter().find_map(|k| vars.get(*k))
+            let port = pat
+                .port_keys
+                .iter()
+                .find_map(|k| vars.get(*k))
                 .map(|s| s.as_str())
                 .unwrap_or(pat.default_port);
-            let user = pat.user_keys.iter().find_map(|k| vars.get(*k))
+            let user = pat
+                .user_keys
+                .iter()
+                .find_map(|k| vars.get(*k))
                 .map(|s| s.as_str())
                 .unwrap_or("");
-            let pass = pat.pass_keys.iter().find_map(|k| vars.get(*k))
+            let pass = pat
+                .pass_keys
+                .iter()
+                .find_map(|k| vars.get(*k))
                 .map(|s| s.as_str())
                 .unwrap_or("");
 
             let conn_str = if !user.is_empty() && !pass.is_empty() {
-                format!("{}://{}:{}@{}:{}/{}", pat.engine, user, pass, host, port, db)
+                format!(
+                    "{}://{}:{}@{}:{}/{}",
+                    pat.engine, user, pass, host, port, db
+                )
             } else if !user.is_empty() {
                 format!("{}://{}@{}:{}/{}", pat.engine, user, host, port, db)
             } else {
@@ -1587,26 +1741,43 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
             if let Some((engine, url)) = detect_from_env_content(&content) {
                 r.evidence.push(json!({"file": name, "matched": true}));
                 r.hints.push(format!("{name}: rilevato {engine}"));
-                if r.engine.is_none() { r.engine = Some(engine); }
-                if r.connection_string.is_none() { r.connection_string = Some(url); }
+                if r.engine.is_none() {
+                    r.engine = Some(engine);
+                }
+                if r.connection_string.is_none() {
+                    r.connection_string = Some(url);
+                }
             }
         }
     }
 
     // 2) docker-compose
-    for name in ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"] {
+    for name in [
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+    ] {
         let p = root.join(name);
         if let Some(content) = read_text(&p, 128 * 1024) {
             let lc = content.to_ascii_lowercase();
             if lc.contains("image: postgres") || lc.contains("image: \"postgres") {
-                if r.engine.is_none() { r.engine = Some("postgres".into()); }
+                if r.engine.is_none() {
+                    r.engine = Some("postgres".into());
+                }
                 r.hints.push(format!("{name}: servizio postgres"));
-                if r.hosting_mode.is_none() { r.hosting_mode = Some("internal".into()); }
+                if r.hosting_mode.is_none() {
+                    r.hosting_mode = Some("internal".into());
+                }
             }
             if lc.contains("image: mysql") || lc.contains("image: mariadb") {
-                if r.engine.is_none() { r.engine = Some("mysql".into()); }
+                if r.engine.is_none() {
+                    r.engine = Some("mysql".into());
+                }
                 r.hints.push(format!("{name}: servizio mysql/mariadb"));
-                if r.hosting_mode.is_none() { r.hosting_mode = Some("internal".into()); }
+                if r.hosting_mode.is_none() {
+                    r.hosting_mode = Some("internal".into());
+                }
             }
         }
     }
@@ -1644,7 +1815,12 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
         r.migration_path = Some("db/migration".into());
         r.hints.push("Flyway rilevato".into());
     }
-    for dir in ["migrations", "db/migrations", "database/migrations", "sql/migrations"] {
+    for dir in [
+        "migrations",
+        "db/migrations",
+        "database/migrations",
+        "sql/migrations",
+    ] {
         if root.join(dir).is_dir() {
             if r.migration_path.is_none() {
                 r.migration_path = Some(dir.into());
@@ -1657,12 +1833,23 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
     // 4) package.json dependencies
     if let Some(content) = read_text(&root.join("package.json"), 128 * 1024) {
         let lc = content.to_ascii_lowercase();
-        if lc.contains("\"prisma\"") && r.migration_tool.is_none() { r.migration_tool = Some("prisma".into()); }
-        if lc.contains("\"knex\"") && r.migration_tool.is_none() { r.migration_tool = Some("knex".into()); }
-        if lc.contains("\"typeorm\"") && r.migration_tool.is_none() { r.migration_tool = Some("generic_sql".into()); r.hints.push("TypeORM rilevato".into()); }
-        if lc.contains("\"pg\"") && r.engine.is_none() { r.engine = Some("postgres".into()); r.hints.push("dep pg".into()); }
+        if lc.contains("\"prisma\"") && r.migration_tool.is_none() {
+            r.migration_tool = Some("prisma".into());
+        }
+        if lc.contains("\"knex\"") && r.migration_tool.is_none() {
+            r.migration_tool = Some("knex".into());
+        }
+        if lc.contains("\"typeorm\"") && r.migration_tool.is_none() {
+            r.migration_tool = Some("generic_sql".into());
+            r.hints.push("TypeORM rilevato".into());
+        }
+        if lc.contains("\"pg\"") && r.engine.is_none() {
+            r.engine = Some("postgres".into());
+            r.hints.push("dep pg".into());
+        }
         if (lc.contains("\"mysql2\"") || lc.contains("\"mysql\"")) && r.engine.is_none() {
-            r.engine = Some("mysql".into()); r.hints.push("dep mysql".into());
+            r.engine = Some("mysql".into());
+            r.hints.push("dep mysql".into());
         }
     }
 
@@ -1670,12 +1857,16 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
     for f in ["pyproject.toml", "requirements.txt", "Pipfile"] {
         if let Some(content) = read_text(&root.join(f), 64 * 1024) {
             let lc = content.to_ascii_lowercase();
-            if lc.contains("alembic") && r.migration_tool.is_none() { r.migration_tool = Some("alembic".into()); }
+            if lc.contains("alembic") && r.migration_tool.is_none() {
+                r.migration_tool = Some("alembic".into());
+            }
             if (lc.contains("psycopg") || lc.contains("asyncpg")) && r.engine.is_none() {
-                r.engine = Some("postgres".into()); r.hints.push(format!("{f}: driver postgres"));
+                r.engine = Some("postgres".into());
+                r.hints.push(format!("{f}: driver postgres"));
             }
             if lc.contains("pymysql") && r.engine.is_none() {
-                r.engine = Some("mysql".into()); r.hints.push(format!("{f}: driver mysql"));
+                r.engine = Some("mysql".into());
+                r.hints.push(format!("{f}: driver mysql"));
             }
         }
     }
@@ -1684,9 +1875,15 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
     if let Some(content) = read_text(&root.join("Cargo.toml"), 64 * 1024) {
         let lc = content.to_ascii_lowercase();
         if lc.contains("sqlx") || lc.contains("diesel") {
-            if lc.contains("postgres") && r.engine.is_none() { r.engine = Some("postgres".into()); }
-            if lc.contains("mysql") && r.engine.is_none() { r.engine = Some("mysql".into()); }
-            if lc.contains("sqlite") && r.engine.is_none() { r.engine = Some("sqlite".into()); }
+            if lc.contains("postgres") && r.engine.is_none() {
+                r.engine = Some("postgres".into());
+            }
+            if lc.contains("mysql") && r.engine.is_none() {
+                r.engine = Some("mysql".into());
+            }
+            if lc.contains("sqlite") && r.engine.is_none() {
+                r.engine = Some("sqlite".into());
+            }
             r.hints.push("Cargo.toml: driver DB rilevato".into());
         }
     }
@@ -1705,8 +1902,16 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
                 if let Some(content) = read_text(candidate, 64 * 1024) {
                     for line in content.lines() {
                         let line = line.trim();
-                        if !line.contains("Connection") || !line.contains(':') { continue; }
-                        let value = line.split(':').skip(1).collect::<Vec<_>>().join(":").trim().to_string();
+                        if !line.contains("Connection") || !line.contains(':') {
+                            continue;
+                        }
+                        let value = line
+                            .split(':')
+                            .skip(1)
+                            .collect::<Vec<_>>()
+                            .join(":")
+                            .trim()
+                            .to_string();
                         let value = value.trim_matches('"').trim_matches(',').trim_matches('"');
                         let lc = value.to_ascii_lowercase();
 
@@ -1714,34 +1919,35 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
                         // di Postgres (Host=, Port=5432, postgres://) PRIMA di SQL Server.
                         // Necessario perche' Npgsql usa "Server=host;Port=5432;Database=...",
                         // stessi token usati da SQL Server (Server=host,1433;Database=...).
-                        let detected: Option<&'static str> = if
-                            lc.contains("postgresql://") || lc.contains("postgres://")
-                        {
-                            Some("postgres")
-                        } else if lc.contains("host=") {
-                            Some("postgres")
-                        } else if lc.contains("port=5432") {
-                            Some("postgres")
-                        } else if lc.contains("port=3306") {
-                            Some("mysql")
-                        } else if lc.contains("mysql://") {
-                            Some("mysql")
-                        } else if lc.contains("initial catalog=") {
-                            // Univocamente SQL Server
-                            Some("sqlserver")
-                        } else if lc.contains("server=") && (lc.contains(",1433") || lc.contains(",1434")) {
-                            // Sintassi SQL Server con porta inline
-                            Some("sqlserver")
-                        } else if lc.contains(";port=") || lc.starts_with("port=") {
-                            // `Port=` keyword separato (non SQL Server) ma porta non 5432/3306
-                            // -> probabile Postgres su porta non standard
-                            Some("postgres")
-                        } else if lc.contains("server=") && lc.contains("database=") {
-                            // Fallback legacy: nessun segnale Postgres/MySQL trovato
-                            Some("sqlserver")
-                        } else {
-                            None
-                        };
+                        let detected: Option<&'static str> =
+                            if lc.contains("postgresql://") || lc.contains("postgres://") {
+                                Some("postgres")
+                            } else if lc.contains("host=") {
+                                Some("postgres")
+                            } else if lc.contains("port=5432") {
+                                Some("postgres")
+                            } else if lc.contains("port=3306") {
+                                Some("mysql")
+                            } else if lc.contains("mysql://") {
+                                Some("mysql")
+                            } else if lc.contains("initial catalog=") {
+                                // Univocamente SQL Server
+                                Some("sqlserver")
+                            } else if lc.contains("server=")
+                                && (lc.contains(",1433") || lc.contains(",1434"))
+                            {
+                                // Sintassi SQL Server con porta inline
+                                Some("sqlserver")
+                            } else if lc.contains(";port=") || lc.starts_with("port=") {
+                                // `Port=` keyword separato (non SQL Server) ma porta non 5432/3306
+                                // -> probabile Postgres su porta non standard
+                                Some("postgres")
+                            } else if lc.contains("server=") && lc.contains("database=") {
+                                // Fallback legacy: nessun segnale Postgres/MySQL trovato
+                                Some("sqlserver")
+                            } else {
+                                None
+                            };
 
                         match detected {
                             Some("postgres") => {
@@ -1771,10 +1977,14 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
                             _ => {}
                         }
                     }
-                    if r.engine.is_some() { break; }
+                    if r.engine.is_some() {
+                        break;
+                    }
                 }
             }
-            if r.engine.is_some() { break; }
+            if r.engine.is_some() {
+                break;
+            }
         }
     }
 
@@ -1784,10 +1994,14 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
             if let Ok(entries) = std::fs::read_dir(search_dir) {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if !name.ends_with(".csproj") { continue; }
+                    if !name.ends_with(".csproj") {
+                        continue;
+                    }
                     if let Some(content) = read_text(&entry.path(), 32 * 1024) {
                         let lc = content.to_ascii_lowercase();
-                        if lc.contains("entityframeworkcore.sqlserver") || lc.contains("microsoft.data.sqlclient") {
+                        if lc.contains("entityframeworkcore.sqlserver")
+                            || lc.contains("microsoft.data.sqlclient")
+                        {
                             r.engine = Some("sqlserver".into());
                             r.hints.push(format!("{name}: EF Core SQL Server"));
                             break 'csproj;
@@ -1813,14 +2027,20 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
             // Cerca anche un livello più in profondità
             if let Ok(subdirs) = std::fs::read_dir(search_dir) {
                 for sub in subdirs.flatten() {
-                    if !sub.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
+                    if !sub.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
                     if let Ok(entries) = std::fs::read_dir(sub.path()) {
                         for entry in entries.flatten() {
                             let name = entry.file_name().to_string_lossy().to_string();
-                            if !name.ends_with(".csproj") { continue; }
+                            if !name.ends_with(".csproj") {
+                                continue;
+                            }
                             if let Some(content) = read_text(&entry.path(), 32 * 1024) {
                                 let lc = content.to_ascii_lowercase();
-                                if lc.contains("entityframeworkcore.sqlserver") || lc.contains("microsoft.data.sqlclient") {
+                                if lc.contains("entityframeworkcore.sqlserver")
+                                    || lc.contains("microsoft.data.sqlclient")
+                                {
                                     r.engine = Some("sqlserver".into());
                                     r.hints.push(format!("{name}: EF Core SQL Server"));
                                     break 'csproj;
@@ -1838,9 +2058,15 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
         }
     }
 
-    if r.migration_tool.is_none() { r.migration_tool = Some("generic_sql".into()); }
-    if r.migration_path.is_none() { r.migration_path = Some("migrations".into()); }
-    if r.hosting_mode.is_none() { r.hosting_mode = Some("external".into()); }
+    if r.migration_tool.is_none() {
+        r.migration_tool = Some("generic_sql".into());
+    }
+    if r.migration_path.is_none() {
+        r.migration_path = Some("migrations".into());
+    }
+    if r.hosting_mode.is_none() {
+        r.hosting_mode = Some("external".into());
+    }
     r
 }
 
@@ -1861,11 +2087,17 @@ pub async fn detect_project_db(
 
     let root_path = root_path.unwrap_or_default();
     if root_path.is_empty() {
-        return Err(api_err(StatusCode::BAD_REQUEST, "Root path progetto non disponibile. Rianalizza il progetto."));
+        return Err(api_err(
+            StatusCode::BAD_REQUEST,
+            "Root path progetto non disponibile. Rianalizza il progetto.",
+        ));
     }
     let root = std::path::PathBuf::from(&root_path);
     if !root.is_dir() {
-        return Err(api_err(StatusCode::BAD_REQUEST, format!("Root path non trovato: {}", root.display())));
+        return Err(api_err(
+            StatusCode::BAD_REQUEST,
+            format!("Root path non trovato: {}", root.display()),
+        ));
     }
 
     let result = tokio::task::spawn_blocking(move || scan_project_db(&root))
@@ -1918,7 +2150,11 @@ pub async fn test_project_db_connection(
 ) -> ApiResult {
     // URL: dal body (override esplicito) oppure dalla connessione salvata
     // individuata da connection_id / name / primary.
-    let url = if let Some(u) = body.connection_string.as_deref().filter(|s| !s.trim().is_empty()) {
+    let url = if let Some(u) = body
+        .connection_string
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
         u.to_string()
     } else {
         let saved: Option<Vec<u8>> = if let Some(id) = body.connection_id {
@@ -1976,17 +2212,23 @@ pub async fn test_project_db_connection(
         }
     };
 
-    let engine = body
-        .engine
-        .unwrap_or_else(|| {
-            if url.starts_with("mysql") { "mysql".into() }
-            else if url.starts_with("sqlite") { "sqlite".into() }
-            else if url.starts_with("jdbc:sqlserver") || {
-                let lc = url.to_lowercase();
-                lc.contains("server=") && (lc.contains("initial catalog=") || lc.contains("database=") || lc.contains("data source="))
-            } { "sqlserver".into() }
-            else { "postgres".into() }
-        });
+    let engine = body.engine.unwrap_or_else(|| {
+        if url.starts_with("mysql") {
+            "mysql".into()
+        } else if url.starts_with("sqlite") {
+            "sqlite".into()
+        } else if url.starts_with("jdbc:sqlserver") || {
+            let lc = url.to_lowercase();
+            lc.contains("server=")
+                && (lc.contains("initial catalog=")
+                    || lc.contains("database=")
+                    || lc.contains("data source="))
+        } {
+            "sqlserver".into()
+        } else {
+            "postgres".into()
+        }
+    });
 
     let started = std::time::Instant::now();
     match engine.as_str() {
@@ -2000,8 +2242,8 @@ pub async fn test_project_db_connection(
                 .await
             {
                 Ok(pool) => {
-                    let ver: Result<(String,), _> = sqlx::query_as("SELECT version()")
-                        .fetch_one(&pool).await;
+                    let ver: Result<(String,), _> =
+                        sqlx::query_as("SELECT version()").fetch_one(&pool).await;
                     let count: Result<(i64,), _> = sqlx::query_as(
                         "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public'"
                     ).fetch_one(&pool).await;
@@ -2021,20 +2263,16 @@ pub async fn test_project_db_connection(
                 }))),
             }
         }
-        "mysql" => {
-            Ok(Json(json!({
-                "ok": false,
-                "engine": "mysql",
-                "error": "Driver MySQL non abilitato in mcp-core; configurare sqlx feature 'mysql' per abilitarlo.",
-            })))
-        }
-        "sqlite" => {
-            Ok(Json(json!({
-                "ok": false,
-                "engine": "sqlite",
-                "error": "Driver SQLite non abilitato in mcp-core; configurare sqlx feature 'sqlite' per abilitarlo.",
-            })))
-        }
+        "mysql" => Ok(Json(json!({
+            "ok": false,
+            "engine": "mysql",
+            "error": "Driver MySQL non abilitato in mcp-core; configurare sqlx feature 'mysql' per abilitarlo.",
+        }))),
+        "sqlite" => Ok(Json(json!({
+            "ok": false,
+            "engine": "sqlite",
+            "error": "Driver SQLite non abilitato in mcp-core; configurare sqlx feature 'sqlite' per abilitarlo.",
+        }))),
         "sqlserver" => {
             match test_sqlserver_connection(&url).await {
                 Ok((version, table_count)) => Ok(Json(json!({
@@ -2047,11 +2285,20 @@ pub async fn test_project_db_connection(
                 Err(e) => {
                     let msg = e.to_string();
                     // Aggiunge un suggerimento contestuale per gli errori SQL Server più comuni
-                    let hint = if msg.contains("4060") || msg.contains("non è possibile aprire il database") || msg.contains("Cannot open database") {
+                    let hint = if msg.contains("4060")
+                        || msg.contains("non è possibile aprire il database")
+                        || msg.contains("Cannot open database")
+                    {
                         Some("Il database esiste ma l'utente non ha accesso: verifica che l'account SQL abbia il permesso 'db_datareader' (o superiore) sul database specificato.")
-                    } else if msg.contains("18456") || msg.contains("L'accesso non è riuscito") || msg.contains("Login failed") {
+                    } else if msg.contains("18456")
+                        || msg.contains("L'accesso non è riuscito")
+                        || msg.contains("Login failed")
+                    {
                         Some("Credenziali non valide: verifica utente e password nella connection string.")
-                    } else if msg.contains("Impossibile raggiungere") || msg.contains("Connection refused") || msg.contains("timed out") {
+                    } else if msg.contains("Impossibile raggiungere")
+                        || msg.contains("Connection refused")
+                        || msg.contains("timed out")
+                    {
                         Some("Server non raggiungibile: verifica host, porta e che il servizio SQL Server sia in ascolto.")
                     } else {
                         None
@@ -2111,7 +2358,9 @@ async fn test_sqlserver_connection(conn_str: &str) -> anyhow::Result<(String, i6
                     inner.trim_end_matches('\'')
                 };
                 anyhow::anyhow!("{}", clean)
-            } else if raw.to_lowercase().contains("tls") || raw.to_lowercase().contains("certificate") {
+            } else if raw.to_lowercase().contains("tls")
+                || raw.to_lowercase().contains("certificate")
+            {
                 anyhow::anyhow!("Errore TLS/certificato: {raw}")
             } else {
                 anyhow::anyhow!("Login SQL Server fallito: {raw}")
@@ -2352,10 +2601,13 @@ pub async fn execute_project_db_query(
             project_id,
             nexus_events::ProjectEvent::KnowledgeNoteCreated {
                 note_id: archived.note_id,
-                title: format!("DDL archiviata · {}", archived
-                    .migration_filename
-                    .clone()
-                    .unwrap_or_else(|| "(senza file)".into())),
+                title: format!(
+                    "DDL archiviata · {}",
+                    archived
+                        .migration_filename
+                        .clone()
+                        .unwrap_or_else(|| "(senza file)".into())
+                ),
                 intent: Some("database_migration".to_string()),
             },
         );
@@ -2523,36 +2775,43 @@ pub async fn import_project_db_schema(
     let root = project_root_path(&state.db, project_id).await?;
     let connection = body.connection.as_deref();
 
-    let chosen = match body.file_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(fp) => fp.to_string(),
-        None => {
-            let candidates = discover_schema_candidates(&root).await;
-            match candidates.len() {
-                0 => {
-                    return Err(api_err(
+    let chosen =
+        match body
+            .file_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(fp) => fp.to_string(),
+            None => {
+                let candidates = discover_schema_candidates(&root).await;
+                match candidates.len() {
+                    0 => return Err(api_err(
                         StatusCode::NOT_FOUND,
                         "Nessun file schema trovato nel progetto. Indica file_path esplicitamente.",
-                    ))
-                }
-                1 => candidates[0].clone(),
-                _ => {
-                    return Ok(Json(json!({
-                        "ok": false,
-                        "ambiguous": true,
-                        "candidates": candidates,
-                        "message": "Piu file schema trovati. Specifica file_path.",
-                    })));
+                    )),
+                    1 => candidates[0].clone(),
+                    _ => {
+                        return Ok(Json(json!({
+                            "ok": false,
+                            "ambiguous": true,
+                            "candidates": candidates,
+                            "message": "Piu file schema trovati. Specifica file_path.",
+                        })));
+                    }
                 }
             }
-        }
-    };
+        };
 
     let (rel_file, sql) = read_schema_file(&root, &chosen)
         .await
         .map_err(|e| api_err(StatusCode::BAD_REQUEST, e))?;
 
     if sql.trim().is_empty() {
-        return Err(api_err(StatusCode::UNPROCESSABLE_ENTITY, "Il file schema e vuoto."));
+        return Err(api_err(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Il file schema e vuoto.",
+        ));
     }
 
     let outcome = execute_query(&state.db, project_id, &sql, &[], None, connection)
@@ -2598,18 +2857,23 @@ mod tests {
     fn pg_physical_target_estrae_host_port_db() {
         let t = pg_physical_target("postgresql://nexus_app:secret@localhost:5434/beauty_book_app")
             .unwrap();
-        assert_eq!(t, ("localhost".to_string(), 5434, "beauty_book_app".to_string()));
+        assert_eq!(
+            t,
+            ("localhost".to_string(), 5434, "beauty_book_app".to_string())
+        );
     }
 
     #[test]
     fn pg_physical_target_ignora_userinfo_e_query() {
         // Stesso DB fisico nonostante credenziali e parametri diversi.
         let a = pg_physical_target("postgresql://u1:p1@localhost:5434/beauty_book_app").unwrap();
-        let b = pg_physical_target(
-            "postgres://u2:p2@localhost:5434/beauty_book_app?sslmode=disable",
-        )
-        .unwrap();
-        assert_eq!(a, b, "userinfo e query string non devono influenzare il target");
+        let b =
+            pg_physical_target("postgres://u2:p2@localhost:5434/beauty_book_app?sslmode=disable")
+                .unwrap();
+        assert_eq!(
+            a, b,
+            "userinfo e query string non devono influenzare il target"
+        );
     }
 
     #[test]
@@ -2628,9 +2892,13 @@ mod tests {
     #[test]
     fn pg_physical_target_ado_net() {
         // Stringa ADO.NET normalizzata internamente.
-        let t = pg_physical_target("Host=localhost;Port=5434;Database=beauty_book_app;Username=u;Password=p")
-            .unwrap();
-        assert_eq!(t, ("localhost".to_string(), 5434, "beauty_book_app".to_string()));
+        let t = pg_physical_target(
+            "Host=localhost;Port=5434;Database=beauty_book_app;Username=u;Password=p",
+        )
+        .unwrap();
+        assert_eq!(
+            t,
+            ("localhost".to_string(), 5434, "beauty_book_app".to_string())
+        );
     }
 }
-

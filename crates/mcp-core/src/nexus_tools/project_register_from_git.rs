@@ -15,11 +15,7 @@ pub struct ProjectRegisterFromGitTool;
 
 #[async_trait]
 impl NexusToolHandler for ProjectRegisterFromGitTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let url = args
             .get("url")
             .and_then(Value::as_str)
@@ -98,14 +94,13 @@ impl NexusToolHandler for ProjectRegisterFromGitTool {
         let repository_id = Uuid::new_v4();
 
         // Trova team_id dell'utente
-        let team_id: Uuid = sqlx::query_scalar(
-            "SELECT id FROM teams WHERE owner_user_id = $1 LIMIT 1",
-        )
-        .bind(ctx.user_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| NexusToolError::BadInput(format!("lookup team: {}", e)))?
-        .unwrap_or_else(Uuid::new_v4);
+        let team_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM teams WHERE owner_user_id = $1 LIMIT 1")
+                .bind(ctx.user_id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| NexusToolError::BadInput(format!("lookup team: {}", e)))?
+                .unwrap_or_else(Uuid::new_v4);
 
         let default_branch = branch.unwrap_or_else(|| "main".to_string());
         let abs_path = target_dir.to_string_lossy().to_string();
@@ -256,10 +251,7 @@ mod tests {
 
     #[test]
     fn test_dir_name_from_url_ssh() {
-        assert_eq!(
-            dir_name_from_url("git@github.com:user/repo.git"),
-            "repo"
-        );
+        assert_eq!(dir_name_from_url("git@github.com:user/repo.git"), "repo");
     }
 
     #[test]

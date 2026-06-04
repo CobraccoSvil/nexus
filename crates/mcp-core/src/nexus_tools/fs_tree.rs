@@ -65,16 +65,9 @@ fn build_tree(
 
 #[async_trait]
 impl NexusToolHandler for FsTreeTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let dir = args.get("dir").and_then(Value::as_str).unwrap_or("");
-        let max_depth = args
-            .get("max_depth")
-            .and_then(Value::as_u64)
-            .unwrap_or(4) as usize;
+        let max_depth = args.get("max_depth").and_then(Value::as_u64).unwrap_or(4) as usize;
         let max_entries = args
             .get("max_entries")
             .and_then(Value::as_u64)

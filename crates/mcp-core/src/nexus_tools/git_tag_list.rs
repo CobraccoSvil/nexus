@@ -9,11 +9,7 @@ pub struct GitTagListTool;
 
 #[async_trait]
 impl NexusToolHandler for GitTagListTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)

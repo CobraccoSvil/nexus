@@ -21,12 +21,15 @@ pub async fn open_project(
     // entry + sub-read_dir per has_children). Va eseguito su spawn_blocking per non
     // bloccare il runtime tokio (causa di freeze mcp-core su progetti grandi).
     let root_for_tree = context.root_path.clone();
-    let tree = tokio::task::spawn_blocking(move || {
-        list_directory_nodes(&root_for_tree, &root_for_tree)
-    })
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("spawn_blocking tree: {e}")))?
-    ?;
+    let tree =
+        tokio::task::spawn_blocking(move || list_directory_nodes(&root_for_tree, &root_for_tree))
+            .await
+            .map_err(|e| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("spawn_blocking tree: {e}"),
+                )
+            })??;
     let git_state = refresh_git_snapshot(&state.db, &context).await?;
 
     Ok(Json(json!({
@@ -66,11 +69,19 @@ pub async fn get_workbench_state(
 
     let active_file_paths = session
         .as_ref()
-        .and_then(|row| row.try_get::<Option<Value>, _>("active_file_paths").ok().flatten())
+        .and_then(|row| {
+            row.try_get::<Option<Value>, _>("active_file_paths")
+                .ok()
+                .flatten()
+        })
         .unwrap_or_else(|| json!([]));
     let terminal_cwd = session
         .as_ref()
-        .and_then(|row| row.try_get::<Option<String>, _>("terminal_cwd").ok().flatten())
+        .and_then(|row| {
+            row.try_get::<Option<String>, _>("terminal_cwd")
+                .ok()
+                .flatten()
+        })
         .or_else(|| context.details.root_path.clone());
     let updated_at = session
         .as_ref()

@@ -9,11 +9,7 @@ pub struct GhWorkflowListTool;
 
 #[async_trait]
 impl NexusToolHandler for GhWorkflowListTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)
@@ -42,8 +38,7 @@ impl NexusToolHandler for GhWorkflowListTool {
             });
         }
 
-        let parsed: Value = serde_json::from_str(&out.stdout)
-            .unwrap_or_else(|_| json!([]));
+        let parsed: Value = serde_json::from_str(&out.stdout).unwrap_or_else(|_| json!([]));
         let count = parsed.as_array().map(|a| a.len()).unwrap_or(0);
 
         Ok(json!({

@@ -92,7 +92,9 @@ impl NexusToolHandler for HttpRequestTool {
             .danger_accept_invalid_certs(true) // ambienti dev con cert self-signed
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()
-            .map_err(|e| NexusToolError::BadInput(format!("Errore creazione client HTTP: {}", e)))?;
+            .map_err(|e| {
+                NexusToolError::BadInput(format!("Errore creazione client HTTP: {}", e))
+            })?;
 
         let mut req = match method.as_str() {
             "GET" => client.get(&url),
@@ -125,13 +127,18 @@ impl NexusToolHandler for HttpRequestTool {
 
         // ── Esegui richiesta ─────────────────────────────────────────────
         let start = std::time::Instant::now();
-        let response = req.send().await.map_err(|e| {
-            NexusToolError::BadInput(format!("Richiesta HTTP fallita: {}", e))
-        })?;
+        let response = req
+            .send()
+            .await
+            .map_err(|e| NexusToolError::BadInput(format!("Richiesta HTTP fallita: {}", e)))?;
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         let status = response.status().as_u16();
-        let status_text = response.status().canonical_reason().unwrap_or("").to_string();
+        let status_text = response
+            .status()
+            .canonical_reason()
+            .unwrap_or("")
+            .to_string();
 
         // Raccolta headers risposta
         let resp_headers: HashMap<String, String> = response

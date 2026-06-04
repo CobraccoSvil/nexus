@@ -30,7 +30,10 @@ use sqlx::PgPool;
 use tokio::time::sleep;
 
 use crate::orchestrator::{default_model_for_provider, Orchestrator};
-use crate::provider_cooldown::{is_provider_in_cooldown, provider_health_timings, put_provider_in_long_cooldown, remove_cooldown};
+use crate::provider_cooldown::{
+    is_provider_in_cooldown, provider_health_timings, put_provider_in_long_cooldown,
+    remove_cooldown,
+};
 // `put_provider_in_cooldown` e' `pub(crate)` -> accessibile, ma la signature
 // e' `(provider: &str, retry_after_seconds: Option<u64>)`. Per slow/timeout
 // usiamo l'overload corto.
@@ -57,7 +60,12 @@ const PROBE_PROMPT: &str = "hi";
 /// Chiamato da `main.rs` con i valori letti dal DB (tabella settings).
 /// Override di emergenza via env: `NEXUS_PROVIDER_HEALTH_PROBE_ENABLED`,
 /// `NEXUS_PROVIDER_HEALTH_PROBE_INTERVAL_S` (priorita' piu' alta del DB).
-pub fn spawn_health_probe(orchestrator: Arc<Orchestrator>, db: PgPool, enabled: bool, interval_s: u64) {
+pub fn spawn_health_probe(
+    orchestrator: Arc<Orchestrator>,
+    db: PgPool,
+    enabled: bool,
+    interval_s: u64,
+) {
     // L'env var resta come override di emergenza (priorita' > DB).
     let enabled = match std::env::var("NEXUS_PROVIDER_HEALTH_PROBE_ENABLED").as_deref() {
         Ok("false") | Ok("0") => false,
@@ -75,7 +83,8 @@ pub fn spawn_health_probe(orchestrator: Arc<Orchestrator>, db: PgPool, enabled: 
         .max(60);
     tracing::info!(
         "provider_health_probe: avvio worker (interval={}s, providers={:?})",
-        interval_s, PROBED_PROVIDERS,
+        interval_s,
+        PROBED_PROVIDERS,
     );
     tokio::spawn(async move {
         // Aspetta 30s al primo avvio per dare tempo agli altri servizi
@@ -213,7 +222,9 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
     let result: Result<anyhow::Result<serde_json::Value>, tokio::time::error::Elapsed> =
         tokio::time::timeout(
             Duration::from_secs(probe_timeout_s),
-            orchestrator.neural.generate_completion(provider, &model, PROBE_PROMPT),
+            orchestrator
+                .neural
+                .generate_completion(provider, &model, PROBE_PROMPT),
         )
         .await;
     let latency_ms = started.elapsed().as_millis() as i32;
@@ -255,9 +266,7 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
                     orchestrator.neural.classify_error(inner, provider).await
                 };
                 let kind = kind_from_error_class(&ec);
-                tracing::warn!(
-                    "provider_health_probe: {provider} errore provider (class={kind})"
-                );
+                tracing::warn!("provider_health_probe: {provider} errore provider (class={kind})");
                 // billing/auth: persistenti -> long cooldown (servono soldi/key).
                 let billing = matches!(
                     kind.as_str(),
@@ -268,7 +277,11 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
                 } else {
                     put_provider_in_cooldown(provider, Some(slow_cooldown_s));
                 }
-                let detail = if inner.is_empty() { content_text.as_str() } else { inner };
+                let detail = if inner.is_empty() {
+                    content_text.as_str()
+                } else {
+                    inner
+                };
                 (false, Some(kind), Some(truncate(detail, 500)))
             } else {
                 // Probe-OK con "hi" (1-2 token output): NON garantisce che
@@ -281,16 +294,21 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
                 //   - se in SHORT cooldown (rate_limit/timeout): rimuovo,
                 //     perche' "hi" e' sufficiente a verificare che il provider
                 //     non sia piu' rate-limited.
-                let long_kinds = ["billing_error", "quota_exceeded",
-                    "credit_balance_too_low", "billing_required"];
+                let long_kinds = [
+                    "billing_error",
+                    "quota_exceeded",
+                    "credit_balance_too_low",
+                    "billing_required",
+                ];
                 let is_in_long = crate::provider_cooldown::cooldown_snapshot()
                     .iter()
                     .find(|(name, _, _)| name == provider)
                     .map(|(_, _, reason)| {
                         reason.as_ref().is_some_and(|r| {
-                            long_kinds.iter().any(|k| r.contains(k)) ||
-                            r.contains("credit") || r.contains("quota") ||
-                            r.contains("billing")
+                            long_kinds.iter().any(|k| r.contains(k))
+                                || r.contains("credit")
+                                || r.contains("quota")
+                                || r.contains("billing")
                         })
                     })
                     .unwrap_or(false);
@@ -306,9 +324,7 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
                         remove_cooldown(provider);
                     }
                 }
-                tracing::debug!(
-                    "provider_health_probe: {provider} OK in {latency_ms}ms"
-                );
+                tracing::debug!("provider_health_probe: {provider} OK in {latency_ms}ms");
                 (true, None, None)
             }
         }
@@ -317,7 +333,8 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
             // Classifico per decidere il tipo di cooldown.
             let msg = e.to_string();
             // Classificazione via il punto UNICO (brain gRPC); niente pattern locali.
-            let kind = kind_from_error_class(&orchestrator.neural.classify_error(&msg, provider).await);
+            let kind =
+                kind_from_error_class(&orchestrator.neural.classify_error(&msg, provider).await);
             tracing::warn!(
                 "provider_health_probe: {provider} ERROR ({kind}) in {latency_ms}ms: {msg}",
                 msg = &msg[..msg.len().min(200)],
@@ -330,8 +347,7 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
             //     di rete locale marcava simultaneamente tutti i provider come
             //     down (visto in produzione: 5 provider falliti in 8 secondi).
             //   - altri (rate_limit/timeout/auth/unknown) → cooldown breve 60s
-            let is_local_infra =
-                matches!(kind.as_str(), "connection_error")
+            let is_local_infra = matches!(kind.as_str(), "connection_error")
                 || msg.contains("tcp connect error")
                 || msg.contains("Unavailable")
                 || msg.contains("ECONNREFUSED");
@@ -357,9 +373,7 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
         }
         Err(_timeout_elapsed) => {
             // Timeout: provider troppo lento. Cooldown breve.
-            tracing::warn!(
-                "provider_health_probe: {provider} TIMEOUT (>{probe_timeout_s}s)"
-            );
+            tracing::warn!("provider_health_probe: {provider} TIMEOUT (>{probe_timeout_s}s)");
             put_provider_in_cooldown(provider, Some(slow_cooldown_s));
             // Timeout: spesso e' anch'esso un sintomo di outage locale
             // (brain bridge lento, WSL DNS lento, internet bloccato). Conta
@@ -377,7 +391,11 @@ async fn probe_one(orchestrator: &Orchestrator, db: &PgPool, provider: &str) {
     nexus_events::dispatcher::broadcast_all_global(
         nexus_events::ProjectEvent::ProviderHealthChanged {
             provider: provider.to_string(),
-            status: if healthy { "up".to_string() } else { "down".to_string() },
+            status: if healthy {
+                "up".to_string()
+            } else {
+                "down".to_string()
+            },
             latency_ms: Some(latency_ms as i64),
         },
     );
@@ -431,7 +449,9 @@ pub async fn probe_provider_once(
     let model = default_model_for_provider(&matrix_arc, provider);
     let result = tokio::time::timeout(
         Duration::from_secs(timeout_s.max(1)),
-        orchestrator.neural.generate_completion(provider, &model, PROBE_PROMPT),
+        orchestrator
+            .neural
+            .generate_completion(provider, &model, PROBE_PROMPT),
     )
     .await;
 
@@ -463,9 +483,12 @@ pub async fn probe_provider_once(
                 ProbeOutcome::Healthy
             }
         }
-        Ok(Err(e)) => {
-            outcome_from_error_class(&orchestrator.neural.classify_error(&e.to_string(), provider).await)
-        }
+        Ok(Err(e)) => outcome_from_error_class(
+            &orchestrator
+                .neural
+                .classify_error(&e.to_string(), provider)
+                .await,
+        ),
         Err(_elapsed) => ProbeOutcome::Transient("timeout".to_string()),
     }
 }
@@ -542,7 +565,10 @@ mod tests {
 
     #[test]
     fn kind_from_error_class_mappa_billing() {
-        assert_eq!(kind_from_error_class("billing_error"), "credit_balance_too_low");
+        assert_eq!(
+            kind_from_error_class("billing_error"),
+            "credit_balance_too_low"
+        );
         assert_eq!(kind_from_error_class("auth_error"), "auth_error");
         assert_eq!(kind_from_error_class("rate_limit"), "rate_limit");
         // Regressione: 403 forbidden (es. Mistral labs_not_enabled) NON deve
@@ -552,13 +578,25 @@ mod tests {
 
     #[test]
     fn outcome_from_error_class_billing_e_transient() {
-        assert!(matches!(outcome_from_error_class("billing_error"), ProbeOutcome::Billing(_)));
-        assert!(matches!(outcome_from_error_class("rate_limit"), ProbeOutcome::Transient(_)));
+        assert!(matches!(
+            outcome_from_error_class("billing_error"),
+            ProbeOutcome::Billing(_)
+        ));
+        assert!(matches!(
+            outcome_from_error_class("rate_limit"),
+            ProbeOutcome::Transient(_)
+        ));
         // 401 auth_error: il provider e' inutilizzabile -> Billing (long cooldown).
-        assert!(matches!(outcome_from_error_class("auth_error"), ProbeOutcome::Billing(_)));
+        assert!(matches!(
+            outcome_from_error_class("auth_error"),
+            ProbeOutcome::Billing(_)
+        ));
         // 403 forbidden: per-modello/per-risorsa -> Transient (short cooldown),
         // non spegne l'intero provider.
-        assert!(matches!(outcome_from_error_class("forbidden"), ProbeOutcome::Transient(_)));
+        assert!(matches!(
+            outcome_from_error_class("forbidden"),
+            ProbeOutcome::Transient(_)
+        ));
     }
 
     #[test]

@@ -113,7 +113,12 @@ async fn run_meta_docs_watcher(db: PgPool, vault_root: PathBuf) -> anyhow::Resul
 
 fn should_track(path: &Path) -> bool {
     // Solo file .md, escludi .obsidian/ e altre dir di config
-    if !path.extension().and_then(|e| e.to_str()).map(|s| s.eq_ignore_ascii_case("md")).unwrap_or(false) {
+    if !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("md"))
+        .unwrap_or(false)
+    {
         return false;
     }
     let p = path.to_string_lossy();
@@ -152,7 +157,7 @@ async fn process_event(
             // Leggi file da disco
             let content = match tokio::fs::read_to_string(path).await {
                 Ok(c) => c,
-                Err(_) => return Ok(()),  // file gia' rimosso o non leggibile
+                Err(_) => return Ok(()), // file gia' rimosso o non leggibile
             };
             let file_hash = vault::sha256_hex(&content);
 
@@ -182,7 +187,11 @@ async fn process_event(
                 let tags: Vec<String> = fm
                     .get("tags")
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 sqlx::query(
                     r#"
@@ -213,10 +222,7 @@ async fn process_event(
                     .and_then(|v| v.as_str())
                     .and_then(|s| Uuid::parse_str(s).ok())
                     .unwrap_or_else(Uuid::new_v4);
-                let kind_str = fm
-                    .get("kind")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("other");
+                let kind_str = fm.get("kind").and_then(|v| v.as_str()).unwrap_or("other");
                 let title = fm
                     .get("title")
                     .and_then(|v| v.as_str())
@@ -230,7 +236,11 @@ async fn process_event(
                 let tags: Vec<String> = fm
                     .get("tags")
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
 
                 sqlx::query(

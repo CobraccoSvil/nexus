@@ -62,7 +62,12 @@ pub async fn index_project_bootstrap_vectors(
     let frameworks_summary = if frameworks.is_empty() {
         "nessuno rilevato".to_string()
     } else {
-        frameworks.iter().take(8).cloned().collect::<Vec<_>>().join(", ")
+        frameworks
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     let node_deps = dependencies
         .get("node")
@@ -158,12 +163,18 @@ pub async fn index_project_bootstrap_vectors(
             });
             if let Some(sln) = sln_file {
                 let rel = sln.strip_prefix(root).unwrap_or(&sln);
-                cmd_lines.push(format!("dotnet run --project {} → avvia backend .NET", rel.display()));
+                cmd_lines.push(format!(
+                    "dotnet run --project {} → avvia backend .NET",
+                    rel.display()
+                ));
                 cmd_lines.push("dotnet build → compila il progetto .NET".to_string());
                 cmd_lines.push("dotnet test → esegui i test .NET".to_string());
             } else if let Some(csproj) = csproj_file {
                 let rel = csproj.strip_prefix(root).unwrap_or(&csproj);
-                cmd_lines.push(format!("dotnet run --project {} → avvia backend .NET", rel.display()));
+                cmd_lines.push(format!(
+                    "dotnet run --project {} → avvia backend .NET",
+                    rel.display()
+                ));
             }
         }
         // Python
@@ -228,11 +239,7 @@ pub async fn index_project_bootstrap_vectors(
                 .filter(|line| !line.is_empty())
                 .collect::<Vec<_>>();
             for (chunk_idx, chunk) in lines.chunks(20).take(4).enumerate() {
-                let body = format!(
-                    "Git history chunk {}\n{}",
-                    chunk_idx + 1,
-                    chunk.join("\n")
-                );
+                let body = format!("Git history chunk {}\n{}", chunk_idx + 1, chunk.join("\n"));
                 documents.push((
                     format!("history-{}", chunk_idx + 1),
                     format!("Git History {}", chunk_idx + 1),
@@ -260,7 +267,8 @@ pub async fn index_project_bootstrap_vectors(
     let mut indexed_points = 0usize;
     let mut failed_points = 0usize;
 
-    if let Err(error) = vector_memory::delete_project_bootstrap_points(&state.db, project_id).await {
+    if let Err(error) = vector_memory::delete_project_bootstrap_points(&state.db, project_id).await
+    {
         first_error = Some(format!("cleanup index precedente: {error}"));
     }
 
@@ -307,7 +315,11 @@ pub async fn index_project_bootstrap_vectors(
     }
 
     let status = if indexed_points > 0 {
-        if failed_points > 0 { "partial" } else { "indexed" }
+        if failed_points > 0 {
+            "partial"
+        } else {
+            "indexed"
+        }
     } else if failed_points > 0 {
         "error"
     } else {
@@ -327,18 +339,19 @@ pub async fn index_project_bootstrap_vectors(
 
 // ── Indicizzazione file codice ────────────────────────────────────────────────
 
-pub async fn index_project_code_files(
-    state: &AppState,
-    project_id: Uuid,
-    root: &Path,
-) -> Value {
+pub async fn index_project_code_files(state: &AppState, project_id: Uuid, root: &Path) -> Value {
     const SKIP_DIRS: &[&str] = &[
-        "node_modules", ".git", "target", "obj", "bin", "dist", ".next",
-        "__pycache__", ".deploy",
+        "node_modules",
+        ".git",
+        "target",
+        "obj",
+        "bin",
+        "dist",
+        ".next",
+        "__pycache__",
+        ".deploy",
     ];
-    const CODE_EXTENSIONS: &[&str] = &[
-        "tsx", "jsx", "ts", "js", "rs", "py", "cs", "go", "vue",
-    ];
+    const CODE_EXTENSIONS: &[&str] = &["tsx", "jsx", "ts", "js", "rs", "py", "cs", "go", "vue"];
     const MAX_FILE_BYTES: u64 = 200 * 1024;
     const MAX_FILES: usize = 500;
     const MAX_CHUNKS_PER_FILE: usize = 10;
@@ -404,7 +417,11 @@ pub async fn index_project_code_files(
     }
 
     for file_path in &file_list {
-        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_string();
+        let ext = file_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_string();
         let relative_path = file_path
             .strip_prefix(root)
             .map(|p| p.to_string_lossy().replace('\\', "/"))
@@ -433,7 +450,10 @@ pub async fn index_project_code_files(
                 }
             }
             if labels.len() < 20 {
-                let re_props = regex::Regex::new(r#"(?:title|label|placeholder|aria-label)=["']([^"']{3,60})["']"#).unwrap();
+                let re_props = regex::Regex::new(
+                    r#"(?:title|label|placeholder|aria-label)=["']([^"']{3,60})["']"#,
+                )
+                .unwrap();
                 for cap in re_props.captures_iter(&content) {
                     let label = cap[1].trim().to_string();
                     if !labels.contains(&label) {
@@ -450,9 +470,7 @@ pub async fn index_project_code_files(
         };
 
         let labels_str = ui_labels.join(", ");
-        let header = format!(
-            "File: {relative_path}\nTipo: {ext}\nLabels UI: {labels_str}\n\n"
-        );
+        let header = format!("File: {relative_path}\nTipo: {ext}\nLabels UI: {labels_str}\n\n");
 
         let chunks: Vec<String> = if content.len() <= CHUNK_SIZE {
             let text = format!("{header}{}", &content[..content.len().min(2000)]);
@@ -483,7 +501,9 @@ pub async fn index_project_code_files(
             let embedding = match state.orchestrator.embed_text(chunk_text).await {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!("code index: embed failed for {relative_path} chunk {chunk_index}: {e}");
+                    tracing::warn!(
+                        "code index: embed failed for {relative_path} chunk {chunk_index}: {e}"
+                    );
                     failed += 1;
                     if first_error.is_none() {
                         first_error = Some(format!("embed fallito per '{relative_path}': {e}"));
@@ -514,10 +534,14 @@ pub async fn index_project_code_files(
                 "indexed_at": chrono::Utc::now().to_rfc3339(),
             });
 
-            match vector_memory::upsert_code_index_point(&state.db, &point_id, &embedding, payload).await {
+            match vector_memory::upsert_code_index_point(&state.db, &point_id, &embedding, payload)
+                .await
+            {
                 Ok(()) => chunks_indexed += 1,
                 Err(e) => {
-                    tracing::warn!("code index: upsert failed for {relative_path} chunk {chunk_index}: {e}");
+                    tracing::warn!(
+                        "code index: upsert failed for {relative_path} chunk {chunk_index}: {e}"
+                    );
                     failed += 1;
                     if first_error.is_none() {
                         first_error = Some(format!("upsert fallito per '{relative_path}': {e}"));
@@ -530,7 +554,11 @@ pub async fn index_project_code_files(
     }
 
     let status = if chunks_indexed > 0 {
-        if failed > 0 { "partial" } else { "indexed" }
+        if failed > 0 {
+            "partial"
+        } else {
+            "indexed"
+        }
     } else if failed > 0 {
         "error"
     } else {
@@ -589,7 +617,7 @@ pub async fn reindex_single_file(
         format!("{:x}", h.finalize())
     };
     let stored_hash: Option<String> = sqlx::query_scalar(
-        "SELECT content_hash FROM file_index_hashes WHERE project_id = $1 AND file_path = $2"
+        "SELECT content_hash FROM file_index_hashes WHERE project_id = $1 AND file_path = $2",
     )
     .bind(project_id)
     .bind(&relative_path)
@@ -603,8 +631,11 @@ pub async fn reindex_single_file(
     }
 
     // Cancella i chunk precedenti di questo file
-    vector_memory::delete_code_index_file_points(db, project_id, &relative_path).await
-        .unwrap_or_else(|e| tracing::warn!("reindex_single_file: cleanup failed for {relative_path}: {e}"));
+    vector_memory::delete_code_index_file_points(db, project_id, &relative_path)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("reindex_single_file: cleanup failed for {relative_path}: {e}")
+        });
 
     // Estrai UI labels per tsx/jsx/vue
     let ui_labels: Vec<String> = if matches!(ext, "tsx" | "jsx" | "vue") {
@@ -612,15 +643,26 @@ pub async fn reindex_single_file(
         let re_jsx = regex::Regex::new(r">\s*([A-Za-zÀ-ÿ][^<>{}\n]{3,60})\s*<").unwrap();
         for cap in re_jsx.captures_iter(&content) {
             let label = cap[1].trim().to_string();
-            if !labels.contains(&label) { labels.push(label); }
-            if labels.len() >= 20 { break; }
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+            if labels.len() >= 20 {
+                break;
+            }
         }
         if labels.len() < 20 {
-            let re_props = regex::Regex::new(r#"(?:title|label|placeholder|aria-label)=["']([^"']{3,60})["']"#).unwrap();
+            let re_props = regex::Regex::new(
+                r#"(?:title|label|placeholder|aria-label)=["']([^"']{3,60})["']"#,
+            )
+            .unwrap();
             for cap in re_props.captures_iter(&content) {
                 let label = cap[1].trim().to_string();
-                if !labels.contains(&label) { labels.push(label); }
-                if labels.len() >= 20 { break; }
+                if !labels.contains(&label) {
+                    labels.push(label);
+                }
+                if labels.len() >= 20 {
+                    break;
+                }
             }
         }
         labels
@@ -647,7 +689,9 @@ pub async fn reindex_single_file(
                 format!("File: {relative_path}\nChunk: {idx}\n\n{chunk_content}")
             };
             result.push(text);
-            if end >= chars.len() { break; }
+            if end >= chars.len() {
+                break;
+            }
             start = end.saturating_sub(CHUNK_OVERLAP);
         }
         result
@@ -658,7 +702,9 @@ pub async fn reindex_single_file(
         let embedding = match neural.embed_text("", chunk_text).await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("reindex_single_file: embed failed for {relative_path}:{chunk_index}: {e}");
+                tracing::warn!(
+                    "reindex_single_file: embed failed for {relative_path}:{chunk_index}: {e}"
+                );
                 continue;
             }
         };
@@ -684,7 +730,9 @@ pub async fn reindex_single_file(
             "indexed_at": chrono::Utc::now().to_rfc3339(),
         });
 
-        if let Ok(()) = vector_memory::upsert_code_index_point(db, &point_id, &embedding, payload).await {
+        if let Ok(()) =
+            vector_memory::upsert_code_index_point(db, &point_id, &embedding, payload).await
+        {
             indexed += 1;
         }
     }
@@ -695,7 +743,7 @@ pub async fn reindex_single_file(
             "INSERT INTO file_index_hashes (project_id, file_path, content_hash, indexed_at)
              VALUES ($1, $2, $3, NOW())
              ON CONFLICT (project_id, file_path) DO UPDATE
-               SET content_hash = EXCLUDED.content_hash, indexed_at = NOW()"
+               SET content_hash = EXCLUDED.content_hash, indexed_at = NOW()",
         )
         .bind(project_id)
         .bind(&relative_path)
@@ -712,7 +760,12 @@ pub async fn reindex_single_file(
     // Best-effort: errori loggati internamente, mai propagati (regola: non rompe
     // l'indicizzazione). Piggyback sul cambio-hash gia rilevato sopra.
     crate::knowledge::code_graph::persist_code_graph(
-        db, project_id, root, &relative_path, &content, &content_hash,
+        db,
+        project_id,
+        root,
+        &relative_path,
+        &content,
+        &content_hash,
     )
     .await;
 
@@ -736,17 +789,27 @@ pub async fn get_index_status(
     .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Project not found".to_string()))?;
 
     let (root_path, owner_id) = row;
-    let caller_id = parse_user_id(&claims)
-        .map_err(|e| api_error(StatusCode::UNAUTHORIZED, e.1.0["error"].as_str().unwrap_or("Unauthorized").to_string()))?;
+    let caller_id = parse_user_id(&claims).map_err(|e| {
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            e.1 .0["error"]
+                .as_str()
+                .unwrap_or("Unauthorized")
+                .to_string(),
+        )
+    })?;
     if owner_id != Some(caller_id) {
-        return Err(api_error(StatusCode::FORBIDDEN, "Access denied".to_string()));
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Access denied".to_string(),
+        ));
     }
 
     const CODE_EXTENSIONS: &[&str] = &["tsx", "jsx", "ts", "js", "rs", "py", "cs", "go", "vue"];
     const MAX_FILE_BYTES: u64 = 200 * 1024;
 
     let stored: Vec<(String, String)> = sqlx::query_as(
-        "SELECT file_path, content_hash FROM file_index_hashes WHERE project_id = $1"
+        "SELECT file_path, content_hash FROM file_index_hashes WHERE project_id = $1",
     )
     .bind(project_id)
     .fetch_all(&state.db)
@@ -769,7 +832,9 @@ pub async fn get_index_status(
         let rel = rel.replace('\\', "/");
 
         if let Ok(meta) = std::fs::metadata(abs_path) {
-            if meta.len() > MAX_FILE_BYTES { continue; }
+            if meta.len() > MAX_FILE_BYTES {
+                continue;
+            }
         } else {
             continue;
         }
@@ -784,9 +849,16 @@ pub async fn get_index_status(
         };
 
         match stored_map.get(&rel) {
-            Some(h) if h == &current_hash => { up_to_date += 1; }
-            Some(_) => { stale.push(rel); }
-            None => { not_indexed += 1; stale.push(rel); }
+            Some(h) if h == &current_hash => {
+                up_to_date += 1;
+            }
+            Some(_) => {
+                stale.push(rel);
+            }
+            None => {
+                not_indexed += 1;
+                stale.push(rel);
+            }
         }
     }
 
@@ -815,17 +887,27 @@ pub async fn reindex_stale_files(
     .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Project not found".to_string()))?;
 
     let (root_path, owner_id) = row;
-    let caller_id = parse_user_id(&claims)
-        .map_err(|e| api_error(StatusCode::UNAUTHORIZED, e.1.0["error"].as_str().unwrap_or("Unauthorized").to_string()))?;
+    let caller_id = parse_user_id(&claims).map_err(|e| {
+        api_error(
+            StatusCode::UNAUTHORIZED,
+            e.1 .0["error"]
+                .as_str()
+                .unwrap_or("Unauthorized")
+                .to_string(),
+        )
+    })?;
     if owner_id != Some(caller_id) {
-        return Err(api_error(StatusCode::FORBIDDEN, "Access denied".to_string()));
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Access denied".to_string(),
+        ));
     }
 
     const CODE_EXTENSIONS: &[&str] = &["tsx", "jsx", "ts", "js", "rs", "py", "cs", "go", "vue"];
     const MAX_FILE_BYTES: u64 = 200 * 1024;
 
     let stored: Vec<(String, String)> = sqlx::query_as(
-        "SELECT file_path, content_hash FROM file_index_hashes WHERE project_id = $1"
+        "SELECT file_path, content_hash FROM file_index_hashes WHERE project_id = $1",
     )
     .bind(project_id)
     .fetch_all(&state.db)
@@ -842,8 +924,12 @@ pub async fn reindex_stale_files(
     for abs_path_str in &source_files {
         let abs_path = std::path::Path::new(abs_path_str);
         if let Ok(meta) = std::fs::metadata(abs_path) {
-            if meta.len() > MAX_FILE_BYTES { continue; }
-        } else { continue; }
+            if meta.len() > MAX_FILE_BYTES {
+                continue;
+            }
+        } else {
+            continue;
+        }
 
         let rel = abs_path
             .strip_prefix(root_path_obj)
@@ -859,13 +945,27 @@ pub async fn reindex_stale_files(
             Err(_) => continue,
         };
 
-        if stored_map.get(&rel).map(|h| h == &current_hash).unwrap_or(false) {
+        if stored_map
+            .get(&rel)
+            .map(|h| h == &current_hash)
+            .unwrap_or(false)
+        {
             skipped += 1;
             continue;
         }
 
-        match reindex_single_file(&state.db, &state.orchestrator.neural, project_id, root_path_obj, abs_path).await {
-            Ok(n) if n > 0 => { reindexed += 1; }
+        match reindex_single_file(
+            &state.db,
+            &state.orchestrator.neural,
+            project_id,
+            root_path_obj,
+            abs_path,
+        )
+        .await
+        {
+            Ok(n) if n > 0 => {
+                reindexed += 1;
+            }
             _ => {}
         }
     }
@@ -892,7 +992,9 @@ pub async fn spawn_code_index_if_needed(state: &AppState, project_id: Uuid) {
     // 1. Infrastruttura pronta?
     let dep = &state.dependency_status;
     if !dep.qdrant.load(Ordering::Relaxed) || !dep.embedder.load(Ordering::Relaxed) {
-        tracing::debug!("spawn_code_index_if_needed: skip project={project_id} (qdrant/embedder non pronti)");
+        tracing::debug!(
+            "spawn_code_index_if_needed: skip project={project_id} (qdrant/embedder non pronti)"
+        );
         return;
     }
 
@@ -921,7 +1023,9 @@ pub async fn spawn_code_index_if_needed(state: &AppState, project_id: Uuid) {
 
     let root = std::path::PathBuf::from(&root_str);
     if !root.exists() {
-        tracing::warn!("spawn_code_index_if_needed: project={project_id} root={root_str} non esiste, skip");
+        tracing::warn!(
+            "spawn_code_index_if_needed: project={project_id} root={root_str} non esiste, skip"
+        );
         return;
     }
 
@@ -943,7 +1047,9 @@ pub async fn spawn_code_index_if_needed(state: &AppState, project_id: Uuid) {
     state.indexing_projects.insert(project_id);
     let state_bg = state.clone();
     let root_bg = root.clone();
-    tracing::info!("spawn_code_index_if_needed: avvio indicizzazione project={project_id} root={root_str}");
+    tracing::info!(
+        "spawn_code_index_if_needed: avvio indicizzazione project={project_id} root={root_str}"
+    );
     tokio::spawn(async move {
         let result = index_project_code_files(&state_bg, project_id, &root_bg).await;
         state_bg.indexing_projects.remove(&project_id);

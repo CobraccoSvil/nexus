@@ -16,12 +16,16 @@ pub fn scan_substrings(root: &Path, patterns: &[&str]) -> (Vec<usize>, usize) {
 }
 
 fn walk(dir: &Path, counts: &mut [usize], patterns: &[&str], files: &mut usize, depth: usize) {
-    if depth > 8 { return; }
+    if depth > 8 {
+        return;
+    }
     if let Ok(rd) = std::fs::read_dir(dir) {
         for entry in rd.flatten() {
             let p = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == "target" || name.starts_with('.') || name == "node_modules" { continue; }
+            if name == "target" || name.starts_with('.') || name == "node_modules" {
+                continue;
+            }
             if p.is_dir() {
                 walk(&p, counts, patterns, files, depth + 1);
             } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {

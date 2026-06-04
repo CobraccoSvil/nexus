@@ -36,7 +36,11 @@ impl NexusToolHandler for GitRemoteListTool {
             let name = parts.next().unwrap_or("").to_string();
             let rest = parts.next().unwrap_or("");
             let mut inner = rest.rsplitn(2, ' ');
-            let kind = inner.next().unwrap_or("").trim_start_matches('(').trim_end_matches(')');
+            let kind = inner
+                .next()
+                .unwrap_or("")
+                .trim_start_matches('(')
+                .trim_end_matches(')');
             let url = inner.next().unwrap_or("");
             if name.is_empty() || url.is_empty() {
                 continue;

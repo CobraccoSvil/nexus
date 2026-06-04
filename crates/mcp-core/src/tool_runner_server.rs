@@ -37,7 +37,11 @@ pub struct ToolRunnerDeps {
     pub template_cache: TemplateCache,
     pub dependency_status: crate::task_watchdog::DependencyStatusRef,
     pub project_channels: nexus_events::ProjectChannels,
-    pub monitor_registry: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, serde_json::Value>>>>,
+    pub monitor_registry: std::sync::Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<Uuid, std::collections::HashMap<String, serde_json::Value>>,
+        >,
+    >,
     pub port_registry: crate::port_registry::PortRegistryCache,
 }
 
@@ -56,10 +60,7 @@ impl ToolRunnerService {
     /// Il brain e' trusted: non applichiamo qui il check di accesso
     /// (avviene gia' a monte in chat-service al momento dell'invio
     /// del messaggio utente).
-    async fn resolve_session(
-        &self,
-        session_id: Uuid,
-    ) -> Result<SessionInfo, Status> {
+    async fn resolve_session(&self, session_id: Uuid) -> Result<SessionInfo, Status> {
         let row = sqlx::query(
             r#"
             SELECT
@@ -113,8 +114,7 @@ impl ToolRunnerService {
 
     async fn build_ctx(&self, session_id: Uuid) -> Result<AgentToolContext, Status> {
         let info = self.resolve_session(session_id).await?;
-        let long_running_patterns =
-            crate::long_running::load_enabled_patterns(&self.deps.db).await;
+        let long_running_patterns = crate::long_running::load_enabled_patterns(&self.deps.db).await;
         Ok(AgentToolContext {
             root_path: info.root_path,
             user_id: info.user_id,
@@ -267,7 +267,8 @@ pub async fn spawn_tool_runner_server(
                 Err(e) => {
                     tracing::error!(
                         "ToolRunner server terminato con errore (tentativo {}/{}): {e}",
-                        attempt, MAX_ATTEMPTS
+                        attempt,
+                        MAX_ATTEMPTS
                     );
                     if attempt >= MAX_ATTEMPTS {
                         tracing::error!(

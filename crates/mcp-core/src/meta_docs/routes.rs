@@ -74,7 +74,12 @@ pub async fn list_meta_docs(
     .bind(offset)
     .fetch_all(&state.db)
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("query error: {e}")))?;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("query error: {e}"),
+        )
+    })?;
 
     let items: Vec<MetaDocSummary> = rows
         .into_iter()
@@ -127,7 +132,12 @@ pub async fn get_meta_doc(
     .bind(id)
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("query error: {e}")))?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("query error: {e}"),
+        )
+    })?
     .ok_or((StatusCode::NOT_FOUND, "meta-doc non trovata".to_string()))?;
 
     let kind: String = row.try_get("kind").unwrap_or_default();
@@ -354,7 +364,13 @@ pub async fn ingest_commit_stub(
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
 
     let files_out = tokio::process::Command::new("git")
-        .args(["diff-tree", "--no-commit-id", "--name-only", "-r", &commit_sha])
+        .args([
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            &commit_sha,
+        ])
         .current_dir(&repo_root)
         .output()
         .await
@@ -409,7 +425,9 @@ pub async fn ingest_commit_stub(
             match gen.generate(&ctx).await {
                 Ok(docs) => {
                     for doc in &docs {
-                        if let Ok((_, true)) = apply_generated_doc(&state_for_apply, &vault_root_clone, doc).await {
+                        if let Ok((_, true)) =
+                            apply_generated_doc(&state_for_apply, &vault_root_clone, doc).await
+                        {
                             applied += 1;
                         }
                     }
@@ -459,16 +477,22 @@ pub async fn export_vault_archive(
     let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     let tmp_archive = format!("/tmp/nexus-vault-{timestamp}.tar.gz");
 
-    let parent = std::path::Path::new(&vault_root)
-        .parent()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "parent vault path mancante".to_string()))?;
+    let parent = std::path::Path::new(&vault_root).parent().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "parent vault path mancante".to_string(),
+    ))?;
 
     let output = tokio::process::Command::new("tar")
         .args(["-czf", &tmp_archive, ".nexus-vault"])
         .current_dir(parent)
         .output()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tar exec error: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("tar exec error: {e}"),
+            )
+        })?;
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
@@ -478,9 +502,12 @@ pub async fn export_vault_archive(
         ));
     }
 
-    let bytes = tokio::fs::read(&tmp_archive)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read archive: {e}")))?;
+    let bytes = tokio::fs::read(&tmp_archive).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("read archive: {e}"),
+        )
+    })?;
 
     let _ = tokio::fs::remove_file(&tmp_archive).await;
 
@@ -493,7 +520,12 @@ pub async fn export_vault_archive(
             format!("attachment; filename=\"{filename}\""),
         )
         .body(Body::from(bytes))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("response build: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("response build: {e}"),
+            )
+        })?;
 
     Ok(response)
 }
@@ -522,7 +554,9 @@ pub async fn recompute_meta_links(
         std::collections::HashMap::new();
     let mut all_notes: Vec<(uuid::Uuid, String, String)> = Vec::new();
     for r in &notes {
-        let id: uuid::Uuid = r.try_get("id").map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("id: {e}")))?;
+        let id: uuid::Uuid = r
+            .try_get("id")
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("id: {e}")))?;
         let slug: String = r.try_get("slug").unwrap_or_default();
         let body: String = r.try_get("body_md").unwrap_or_default();
         slug_to_id.insert(slug.clone(), id);
@@ -550,7 +584,12 @@ pub async fn recompute_meta_links(
             // Tenta match diretto, poi case-insensitive
             let target_id = slug_to_id
                 .get(&key)
-                .or_else(|| slug_to_id.iter().find(|(k, _)| k.to_lowercase() == key).map(|(_, v)| v))
+                .or_else(|| {
+                    slug_to_id
+                        .iter()
+                        .find(|(k, _)| k.to_lowercase() == key)
+                        .map(|(_, v)| v)
+                })
                 .copied();
 
             let Some(to_id) = target_id else {
@@ -586,7 +625,11 @@ pub async fn recompute_meta_links(
     let mut semantic_created = 0usize;
     let semantic_threshold: f32 = 0.55;
     for (from_id, _slug, body) in &all_notes {
-        let embed_text = if body.len() > 2000 { &body[..2000] } else { body };
+        let embed_text = if body.len() > 2000 {
+            &body[..2000]
+        } else {
+            body
+        };
         if embed_text.trim().is_empty() {
             continue;
         }
@@ -594,10 +637,11 @@ pub async fn recompute_meta_links(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let hits = match crate::vector_memory::search_meta_doc_points(&state.db, vector, None, 6).await {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
+        let hits =
+            match crate::vector_memory::search_meta_doc_points(&state.db, vector, None, 6).await {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
         for hit in &hits {
             if (hit.score as f32) < semantic_threshold {
                 continue;

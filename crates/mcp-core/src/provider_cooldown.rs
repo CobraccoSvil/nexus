@@ -68,7 +68,8 @@ static PROVIDER_COOLDOWN: OnceLock<Mutex<HashMap<String, std::time::Instant>>> =
 // Traccia gli istanti dei fallimenti recenti per provider. Se la soglia di
 // fallimenti viene superata entro la finestra, entriamo in stato OPEN con
 // cooldown esteso (durate da `provider_health_timings()`).
-static PROVIDER_FAILURES: OnceLock<Mutex<HashMap<String, Vec<std::time::Instant>>>> = OnceLock::new();
+static PROVIDER_FAILURES: OnceLock<Mutex<HashMap<String, Vec<std::time::Instant>>>> =
+    OnceLock::new();
 
 pub fn is_provider_in_cooldown(provider: &str) -> bool {
     let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
@@ -133,7 +134,10 @@ pub fn remove_cooldown(provider: &str) {
                 .await;
         });
     }
-    tracing::info!("Provider '{}' cooldown rimosso manualmente (admin)", provider);
+    tracing::info!(
+        "Provider '{}' cooldown rimosso manualmente (admin)",
+        provider
+    );
 }
 
 /// Mette un provider in cooldown. Se `retry_after_seconds` e' fornito dal
@@ -156,12 +160,17 @@ pub(crate) fn put_provider_in_cooldown(provider: &str, retry_after_seconds: Opti
         if breaker_tripped {
             tracing::warn!(
                 "Provider '{}' circuit breaker OPEN: cooldown esteso {}s (>= {} fallimenti in {}s)",
-                provider, secs, t.circuit_breaker_threshold, t.circuit_breaker_window_s
+                provider,
+                secs,
+                t.circuit_breaker_threshold,
+                t.circuit_breaker_window_s
             );
         } else {
             tracing::warn!(
                 "Provider '{}' in cooldown per {}s (retry_after={:?})",
-                provider, secs, retry_after_seconds
+                provider,
+                secs,
+                retry_after_seconds
             );
         }
         map.insert(provider.to_lowercase(), until);
@@ -212,7 +221,8 @@ pub async fn propagate_billing_disable_to_db(db: &sqlx::PgPool, provider: &str) 
     if let Err(ref e) = catalog_res {
         tracing::warn!(
             "propagate_billing_disable: catalog UPDATE fallita per '{}': {}",
-            provider, e
+            provider,
+            e
         );
     }
 
@@ -231,7 +241,8 @@ pub async fn propagate_billing_disable_to_db(db: &sqlx::PgPool, provider: &str) 
     if let Err(ref e) = matrix_res {
         tracing::warn!(
             "propagate_billing_disable: matrix UPDATE fallita per '{}': {}",
-            provider, e
+            provider,
+            e
         );
     }
 
@@ -401,7 +412,10 @@ pub fn put_provider_in_long_cooldown(provider: &str, reason: &str) {
         map.insert(provider.to_lowercase(), until);
         tracing::warn!(
             "Provider '{}' in COOLDOWN LUNGO ({}s, {} ore) per: {}",
-            provider, long_secs, long_secs / 3600, reason,
+            provider,
+            long_secs,
+            long_secs / 3600,
+            reason,
         );
     }
     // Salva anche il motivo nel registro motivazioni
@@ -438,11 +452,13 @@ pub fn put_provider_in_long_cooldown(provider: &str, reason: &str) {
             match &res {
                 Ok(()) => tracing::info!(
                     "put_provider_in_long_cooldown: Redis SET ok per '{}' (chiave={})",
-                    provider, key,
+                    provider,
+                    key,
                 ),
                 Err(e) => tracing::warn!(
                     "put_provider_in_long_cooldown: persistenza Redis fallita per '{}': {}",
-                    provider, e,
+                    provider,
+                    e,
                 ),
             }
         });
@@ -466,7 +482,9 @@ pub fn put_provider_in_short_cooldown(provider: &str, reason: &str, duration_sec
         map.insert(provider.to_lowercase(), until);
         tracing::warn!(
             "Provider '{}' in COOLDOWN BREVE ({}s) per: {}",
-            provider, duration_secs, reason
+            provider,
+            duration_secs,
+            reason
         );
     }
     let reasons = PROVIDER_COOLDOWN_REASONS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -486,7 +504,10 @@ pub fn cooldown_snapshot() -> Vec<(String, u64, Option<String>)> {
         Some(s) => s,
         None => return Vec::new(),
     };
-    let map = match store.lock() { Ok(m) => m, Err(_) => return Vec::new() };
+    let map = match store.lock() {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
     let reasons = PROVIDER_COOLDOWN_REASONS.get().and_then(|s| s.lock().ok());
     let now = std::time::Instant::now();
     let mut out = Vec::new();
@@ -509,7 +530,9 @@ pub fn restore_cooldown(provider: &str, remaining_secs: u64, reason: &str) {
         map.insert(provider.to_lowercase(), until);
         tracing::info!(
             "Provider '{}' cooldown ripristinato da Redis: {}s rimanenti, motivo: {}",
-            provider, remaining_secs, reason
+            provider,
+            remaining_secs,
+            reason
         );
     }
     let reasons = PROVIDER_COOLDOWN_REASONS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -522,9 +545,14 @@ pub fn restore_cooldown(provider: &str, remaining_secs: u64, reason: &str) {
 /// Restituisce `Some(secondi_rimanenti)` se tutti sono in cooldown, `None` se almeno uno è disponibile.
 #[allow(dead_code)]
 pub(crate) fn all_providers_in_cooldown(provider_order: &[String]) -> Option<u64> {
-    if provider_order.is_empty() { return None; }
+    if provider_order.is_empty() {
+        return None;
+    }
     let store = PROVIDER_COOLDOWN.get_or_init(|| Mutex::new(HashMap::new()));
-    let map = match store.lock() { Ok(m) => m, Err(_) => return None };
+    let map = match store.lock() {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
     let now = std::time::Instant::now();
     let mut min_remaining: Option<u64> = None;
     for p in provider_order {
@@ -703,11 +731,7 @@ mod tests {
         let snap = cooldown_snapshot();
         let entry_hi = snap.iter().find(|(name, _, _)| name == p_hi);
         if let Some((_, secs, _)) = entry_hi {
-            assert!(
-                *secs <= 3600,
-                "cap superiore violato: {}s > 3600s",
-                secs
-            );
+            assert!(*secs <= 3600, "cap superiore violato: {}s > 3600s", secs);
         }
     }
 

@@ -8,13 +8,18 @@ pub struct MetaCategoriesListTool;
 
 #[async_trait]
 impl NexusToolHandler for MetaCategoriesListTool {
-    async fn execute(&self, _ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        _ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         match NexusToolCatalog::global() {
             Some(cat) => {
                 let breakdown = cat.breakdown();
-                let items: Vec<Value> = breakdown.iter().map(|(c, n)| {
-                    json!({"category": c.name(), "count": n})
-                }).collect();
+                let items: Vec<Value> = breakdown
+                    .iter()
+                    .map(|(c, n)| json!({"category": c.name(), "count": n}))
+                    .collect();
                 Ok(json!({
                     "ok": true,
                     "category_count": items.len(),
@@ -24,5 +29,7 @@ impl NexusToolHandler for MetaCategoriesListTool {
             None => Ok(json!({"ok": false, "error": "catalog not initialized"})),
         }
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

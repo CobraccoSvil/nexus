@@ -6,7 +6,7 @@
 // Riferimento ADR: docs/.nexus-vault/adr/0005-meta-docs-vault.md
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub mod vault;
-pub mod routes;
-pub mod generators;
 pub mod apply;
+pub mod generators;
+pub mod routes;
+pub mod vault;

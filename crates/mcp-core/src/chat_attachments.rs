@@ -514,7 +514,6 @@ pub async fn persist_message_attachments(
                 }
             });
         }
-
     }
 
     saved
@@ -760,32 +759,30 @@ pub async fn index_attachments_to_kb(
 
         // Per text leggiamo il file da disco; per image creiamo nota metadata-only.
         let body_md = match record.kind.as_str() {
-            "text" => {
-                match tokio::fs::read(&record.file_path).await {
-                    Ok(bytes) => {
-                        let truncated = if bytes.len() > KB_EXCERPT_MAX_BYTES {
-                            &bytes[..KB_EXCERPT_MAX_BYTES]
-                        } else {
-                            &bytes[..]
-                        };
-                        let mut excerpt = String::from_utf8_lossy(truncated).to_string();
-                        if bytes.len() > KB_EXCERPT_MAX_BYTES {
-                            excerpt.push_str("\n\n... [troncato a 16 KB per indicizzazione KB]");
-                        }
-                        format!(
-                            "Allegato chat: {}\nMime: {}\nDimensione: {} byte\n\n```\n{}\n```",
-                            record.file_name, record.mime_type, record.size_bytes, excerpt
-                        )
+            "text" => match tokio::fs::read(&record.file_path).await {
+                Ok(bytes) => {
+                    let truncated = if bytes.len() > KB_EXCERPT_MAX_BYTES {
+                        &bytes[..KB_EXCERPT_MAX_BYTES]
+                    } else {
+                        &bytes[..]
+                    };
+                    let mut excerpt = String::from_utf8_lossy(truncated).to_string();
+                    if bytes.len() > KB_EXCERPT_MAX_BYTES {
+                        excerpt.push_str("\n\n... [troncato a 16 KB per indicizzazione KB]");
                     }
-                    Err(e) => {
-                        skipped.push(SkippedAttachment {
-                            attachment_id: raw_id.clone(),
-                            reason: format!("Lettura file fallita: {e}"),
-                        });
-                        continue;
-                    }
+                    format!(
+                        "Allegato chat: {}\nMime: {}\nDimensione: {} byte\n\n```\n{}\n```",
+                        record.file_name, record.mime_type, record.size_bytes, excerpt
+                    )
                 }
-            }
+                Err(e) => {
+                    skipped.push(SkippedAttachment {
+                        attachment_id: raw_id.clone(),
+                        reason: format!("Lettura file fallita: {e}"),
+                    });
+                    continue;
+                }
+            },
             "image" => format!(
                 "Allegato immagine: {}\nMime: {}\nDimensione: {} byte\n\nNota metadata-only: \
                 il contenuto binario dell'immagine non viene indicizzato in V1. \
@@ -830,10 +827,7 @@ pub async fn index_attachments_to_kb(
                     "status": "active",
                 });
                 match crate::vector_memory::upsert_knowledge_point(
-                    &state.db,
-                    &point_id,
-                    vector,
-                    payload,
+                    &state.db, &point_id, vector, payload,
                 )
                 .await
                 {
@@ -990,9 +984,15 @@ pub async fn get_attachment_raw(
     // Content-Disposition: inline per immagini (renderizzate dal browser),
     // attachment per il resto (forza il download con il nome originale).
     let disposition = if record.kind == "image" {
-        format!("inline; filename=\"{}\"", sanitize_attachment_filename(&record.file_name))
+        format!(
+            "inline; filename=\"{}\"",
+            sanitize_attachment_filename(&record.file_name)
+        )
     } else {
-        format!("attachment; filename=\"{}\"", sanitize_attachment_filename(&record.file_name))
+        format!(
+            "attachment; filename=\"{}\"",
+            sanitize_attachment_filename(&record.file_name)
+        )
     };
 
     let response = Response::builder()
@@ -1000,11 +1000,15 @@ pub async fn get_attachment_raw(
         .header(header::CONTENT_TYPE, content_type)
         .header(
             header::CONTENT_DISPOSITION,
-            HeaderValue::from_str(&disposition).unwrap_or_else(|_| HeaderValue::from_static("inline")),
+            HeaderValue::from_str(&disposition)
+                .unwrap_or_else(|_| HeaderValue::from_static("inline")),
         )
         // Cache moderata: i file sono immutabili una volta scritti, ma l'utente
         // potrebbe cancellare il messaggio (ON DELETE CASCADE) -> 5 min basta.
-        .header(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=300"))
+        .header(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, max-age=300"),
+        )
         .body(Body::from(bytes))
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -1049,7 +1053,10 @@ mod tests {
         assert_eq!(classify_attachment_kind("image/JPEG"), "image");
         assert_eq!(classify_attachment_kind("text/plain"), "text");
         assert_eq!(classify_attachment_kind("application/json"), "text");
-        assert_eq!(classify_attachment_kind("application/octet-stream"), "binary");
+        assert_eq!(
+            classify_attachment_kind("application/octet-stream"),
+            "binary"
+        );
         assert_eq!(classify_attachment_kind(""), "binary");
     }
 
@@ -1090,8 +1097,12 @@ mod tests {
             .await
             .expect("resolve 1");
         assert!(!first.preexisting, "prima volta non pre-esistente");
-        tokio::fs::create_dir_all(&first.dir).await.expect("mkdir dir");
-        tokio::fs::write(&first.final_path, bytes).await.expect("write");
+        tokio::fs::create_dir_all(&first.dir)
+            .await
+            .expect("mkdir dir");
+        tokio::fs::write(&first.final_path, bytes)
+            .await
+            .expect("write");
 
         // Path leggibile: contiene il safe_name e l'hash8, sotto la root.
         let dir_name = first

@@ -24,10 +24,11 @@ impl MetaDocGenerator for ApiGenerator {
     fn relevant_for(&self, files: &[String]) -> bool {
         files.is_empty()
             || files.iter().any(|f| {
-                f.contains("router") || f.contains("routes")
+                f.contains("router")
+                    || f.contains("routes")
                     || f.starts_with("crates/mcp-core/src/")
                     || f.ends_with("main.rs")
-                    || f.starts_with("db/migrations/")  // settings cambiano via migrazioni
+                    || f.starts_with("db/migrations/") // settings cambiano via migrazioni
             })
     }
 
@@ -70,7 +71,9 @@ impl MetaDocGenerator for ApiGenerator {
 async fn generate_rest_endpoints(ctx: &MetaDocContext<'_>) -> Result<String> {
     // Scansiona crates/mcp-core/src/main.rs e file *router*.rs
     let main_path = format!("{}/crates/mcp-core/src/main.rs", ctx.repo_root);
-    let main_content = tokio::fs::read_to_string(&main_path).await.unwrap_or_default();
+    let main_content = tokio::fs::read_to_string(&main_path)
+        .await
+        .unwrap_or_default();
 
     // Pattern: .route("PATH", METHOD(handler))
     // Supporta anche .route(PATH, METHOD(handler).patch(other))
@@ -79,9 +82,18 @@ async fn generate_rest_endpoints(ctx: &MetaDocContext<'_>) -> Result<String> {
 
     let mut endpoints: Vec<(String, String, String)> = Vec::new();
     for caps in re.captures_iter(&main_content) {
-        let path = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
-        let method = caps.get(2).map(|m| m.as_str().to_uppercase()).unwrap_or_default();
-        let handler = caps.get(3).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let path = caps
+            .get(1)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        let method = caps
+            .get(2)
+            .map(|m| m.as_str().to_uppercase())
+            .unwrap_or_default();
+        let handler = caps
+            .get(3)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
         endpoints.push((method, path, handler));
     }
     endpoints.sort();
@@ -89,7 +101,9 @@ async fn generate_rest_endpoints(ctx: &MetaDocContext<'_>) -> Result<String> {
     let mut out = String::new();
     out.push_str("Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src/main.rs`.\n\n");
     out.push_str(&format!("**Totale endpoint**: {}\n\n", endpoints.len()));
-    out.push_str("Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]].\n\n");
+    out.push_str(
+        "Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]].\n\n",
+    );
 
     // Raggruppa per prefisso (/api/projects, /api/chat, ...)
     let mut groups: std::collections::BTreeMap<String, Vec<(String, String, String)>> =
@@ -127,8 +141,12 @@ async fn generate_settings_keys(ctx: &MetaDocContext<'_>) -> Result<String> {
     .await?;
 
     let mut out = String::new();
-    out.push_str("Tutte le chiavi di configurazione di Nexus (tabella `settings`). Generato dal DB.\n\n");
-    out.push_str("Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]].\n\n");
+    out.push_str(
+        "Tutte le chiavi di configurazione di Nexus (tabella `settings`). Generato dal DB.\n\n",
+    );
+    out.push_str(
+        "Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]].\n\n",
+    );
 
     let mut current_cat = String::new();
     for r in &rows {

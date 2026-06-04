@@ -1,3 +1,4 @@
+use crate::AppState;
 use axum::{
     extract::{Query, State},
     Json,
@@ -6,7 +7,6 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::Row;
-use crate::AppState;
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -101,7 +101,11 @@ pub async fn routing_preview(
 ) -> Json<Value> {
     let mode = params.mode.as_deref().unwrap_or("bilanciata").to_string();
     let valid_modes = ["veloce", "economica", "bilanciata", "approfondita"];
-    let mode = if valid_modes.contains(&mode.as_str()) { mode } else { "bilanciata".to_string() };
+    let mode = if valid_modes.contains(&mode.as_str()) {
+        mode
+    } else {
+        "bilanciata".to_string()
+    };
 
     // Legge la matrice da DB (cache 60s). Se non disponibile ritorna preview vuota
     // con error: il chiamante (admin UI) mostra il messaggio.
@@ -152,7 +156,11 @@ pub async fn routing_preview(
         }));
     }
 
-    let avg_cost = if count > 0 { total_cost / count as f64 } else { 0.0 };
+    let avg_cost = if count > 0 {
+        total_cost / count as f64
+    } else {
+        0.0
+    };
 
     Json(json!({
         "mode": mode,
@@ -171,22 +179,26 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
         .build()
         .map_err(|e| format!("client build: {e}"))?;
 
-    let resp = client.get(LITELLM_URL).send().await
+    let resp = client
+        .get(LITELLM_URL)
+        .send()
+        .await
         .map_err(|e| format!("fetch: {e}"))?;
-    let data: Value = resp.json().await
-        .map_err(|e| format!("parse: {e}"))?;
-    let obj = data.as_object().ok_or_else(|| "JSON non oggetto".to_string())?;
+    let data: Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+    let obj = data
+        .as_object()
+        .ok_or_else(|| "JSON non oggetto".to_string())?;
 
     let provider_map: &[(&str, &str)] = &[
-        ("claude-",           "anthropic"),
-        ("gpt-",              "openai"),
-        ("o1",                "openai"),
-        ("o3",                "openai"),
-        ("o4",                "openai"),
-        ("gemini/",           "google"),
-        ("deepseek/",         "deepseek"),
-        ("mistral/",          "mistral"),
-        ("codestral/",        "mistral"),
+        ("claude-", "anthropic"),
+        ("gpt-", "openai"),
+        ("o1", "openai"),
+        ("o3", "openai"),
+        ("o4", "openai"),
+        ("gemini/", "google"),
+        ("deepseek/", "deepseek"),
+        ("mistral/", "mistral"),
+        ("codestral/", "mistral"),
     ];
 
     let mut updated = 0i32;
@@ -194,25 +206,47 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
     let mut skipped = 0i32;
 
     for (key, entry) in obj {
-        let Some(provider) = provider_map.iter()
+        let Some(provider) = provider_map
+            .iter()
             .find(|(prefix, _)| key.starts_with(prefix))
-            .map(|(_, p)| *p) else {
-            skipped += 1; continue;
+            .map(|(_, p)| *p)
+        else {
+            skipped += 1;
+            continue;
         };
 
-        let input_cost = entry.get("input_cost_per_token").and_then(Value::as_f64).map(|c| c * 1_000_000.0).unwrap_or(0.0);
-        let output_cost = entry.get("output_cost_per_token").and_then(Value::as_f64).map(|c| c * 1_000_000.0).unwrap_or(0.0);
+        let input_cost = entry
+            .get("input_cost_per_token")
+            .and_then(Value::as_f64)
+            .map(|c| c * 1_000_000.0)
+            .unwrap_or(0.0);
+        let output_cost = entry
+            .get("output_cost_per_token")
+            .and_then(Value::as_f64)
+            .map(|c| c * 1_000_000.0)
+            .unwrap_or(0.0);
 
-        if input_cost == 0.0 && output_cost == 0.0 { skipped += 1; continue; }
+        if input_cost == 0.0 && output_cost == 0.0 {
+            skipped += 1;
+            continue;
+        }
 
-        let model_id = if let Some(pos) = key.find('/') { &key[pos + 1..] } else { key.as_str() };
+        let model_id = if let Some(pos) = key.find('/') {
+            &key[pos + 1..]
+        } else {
+            key.as_str()
+        };
 
-        let context_window = entry.get("max_input_tokens")
+        let context_window = entry
+            .get("max_input_tokens")
             .and_then(Value::as_i64)
             .or_else(|| entry.get("max_tokens").and_then(Value::as_i64))
             .unwrap_or(8192) as i32;
 
-        let supports_tools = entry.get("supports_function_calling").and_then(Value::as_bool).unwrap_or(true);
+        let supports_tools = entry
+            .get("supports_function_calling")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
 
         let result = sqlx::query(
             r#"INSERT INTO ai_price_catalog (
@@ -227,27 +261,44 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
                 updated_at = NOW()
               RETURNING (xmax = 0) AS inserted"#,
         )
-        .bind(provider).bind(model_id).bind(input_cost).bind(output_cost)
-        .bind(context_window).bind(supports_tools)
-        .fetch_one(db).await;
+        .bind(provider)
+        .bind(model_id)
+        .bind(input_cost)
+        .bind(output_cost)
+        .bind(context_window)
+        .bind(supports_tools)
+        .fetch_one(db)
+        .await;
 
         match result {
             Ok(row) => {
                 let inserted: bool = row.try_get("inserted").unwrap_or(false);
-                if inserted { added += 1; } else { updated += 1; }
+                if inserted {
+                    added += 1;
+                } else {
+                    updated += 1;
+                }
             }
-            Err(_) => { skipped += 1; }
+            Err(_) => {
+                skipped += 1;
+            }
         }
     }
 
     let _ = sqlx::query(
         "INSERT INTO settings (key, value) VALUES ('model_catalog_last_sync', $1)
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
     )
     .bind(chrono::Utc::now().to_rfc3339())
-    .execute(db).await;
+    .execute(db)
+    .await;
 
-    tracing::info!("run_catalog_sync: added={} updated={} skipped={}", added, updated, skipped);
+    tracing::info!(
+        "run_catalog_sync: added={} updated={} skipped={}",
+        added,
+        updated,
+        skipped
+    );
 
     // Fix M53-auto: post-sync auto-promotion. Identifica per ogni "famiglia"
     // di modelli (es. gpt-5-mini, claude-opus-4-7, mistral-large-3) il piu
@@ -265,45 +316,85 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
 /// matcha tutti i modelli appartenenti alla stessa categoria funzionale
 /// (es. mini, nano, opus, ecc.). L'ordinamento semantico individua il piu
 /// recente: vengono confrontate le parti numeriche separate da "-" o ".".
-const FAMILY_RULES: &[(&str /* provider */, &str /* regex */, &str /* label */)] = &[
+const FAMILY_RULES: &[(
+    &str, /* provider */
+    &str, /* regex */
+    &str, /* label */
+)] = &[
     // OpenAI
-    ("openai",    r"^gpt-\d+(\.\d+)?$",                       "gpt-frontier"),
-    ("openai",    r"^gpt-\d+(\.\d+)?-pro$",                   "gpt-pro"),
-    ("openai",    r"^gpt-\d+(\.\d+)?-mini$",                  "gpt-mini"),
-    ("openai",    r"^gpt-\d+(\.\d+)?-nano$",                  "gpt-nano"),
-    ("openai",    r"^gpt-\d+(\.\d+)?-codex$",                 "gpt-codex"),
-    ("openai",    r"^gpt-\d+(\.\d+)?-codex-mini$",            "gpt-codex-mini"),
+    ("openai", r"^gpt-\d+(\.\d+)?$", "gpt-frontier"),
+    ("openai", r"^gpt-\d+(\.\d+)?-pro$", "gpt-pro"),
+    ("openai", r"^gpt-\d+(\.\d+)?-mini$", "gpt-mini"),
+    ("openai", r"^gpt-\d+(\.\d+)?-nano$", "gpt-nano"),
+    ("openai", r"^gpt-\d+(\.\d+)?-codex$", "gpt-codex"),
+    ("openai", r"^gpt-\d+(\.\d+)?-codex-mini$", "gpt-codex-mini"),
     // Anthropic
-    ("anthropic", r"^claude-opus-\d+-\d+$",                   "claude-opus"),
-    ("anthropic", r"^claude-sonnet-\d+-\d+$",                 "claude-sonnet"),
-    ("anthropic", r"^claude-haiku-\d+-\d+$",                  "claude-haiku"),
+    ("anthropic", r"^claude-opus-\d+-\d+$", "claude-opus"),
+    ("anthropic", r"^claude-sonnet-\d+-\d+$", "claude-sonnet"),
+    ("anthropic", r"^claude-haiku-\d+-\d+$", "claude-haiku"),
     // Google
     // Famiglie stable (suffisso vuoto). I preview/customtools sono famiglie
     // separate: tipicamente piu' capable ma instabili (possono sparire),
     // quindi vengono promossi solo all'interno della propria famiglia, mai
     // sovrascrivono lo stable a parita' di versione major.
-    ("google",    r"^gemini-\d+(\.\d+)?-flash$",                            "gemini-flash"),
-    ("google",    r"^gemini-\d+(\.\d+)?-flash-lite$",                       "gemini-flash-lite"),
-    ("google",    r"^gemini-\d+(\.\d+)?-pro$",                              "gemini-pro"),
+    ("google", r"^gemini-\d+(\.\d+)?-flash$", "gemini-flash"),
+    (
+        "google",
+        r"^gemini-\d+(\.\d+)?-flash-lite$",
+        "gemini-flash-lite",
+    ),
+    ("google", r"^gemini-\d+(\.\d+)?-pro$", "gemini-pro"),
     // Preview families: includono -preview / -preview-customtools / -preview-NN-YYYY
-    ("google",    r"^gemini-\d+(\.\d+)?-pro-preview(-[a-z0-9-]+)?$",        "gemini-pro-preview"),
-    ("google",    r"^gemini-\d+(\.\d+)?-flash-preview(-[a-z0-9-]+)?$",      "gemini-flash-preview"),
-    ("google",    r"^gemini-\d+(\.\d+)?-flash-lite-preview(-[a-z0-9-]+)?$", "gemini-flash-lite-preview"),
+    (
+        "google",
+        r"^gemini-\d+(\.\d+)?-pro-preview(-[a-z0-9-]+)?$",
+        "gemini-pro-preview",
+    ),
+    (
+        "google",
+        r"^gemini-\d+(\.\d+)?-flash-preview(-[a-z0-9-]+)?$",
+        "gemini-flash-preview",
+    ),
+    (
+        "google",
+        r"^gemini-\d+(\.\d+)?-flash-lite-preview(-[a-z0-9-]+)?$",
+        "gemini-flash-lite-preview",
+    ),
     // Latest aliases (Google rolling alias)
-    ("google",    r"^gemini-pro-latest$",                                   "gemini-pro-latest-alias"),
-    ("google",    r"^gemini-flash-latest$",                                 "gemini-flash-latest-alias"),
-    ("google",    r"^gemini-flash-lite-latest$",                            "gemini-flash-lite-latest-alias"),
+    ("google", r"^gemini-pro-latest$", "gemini-pro-latest-alias"),
+    (
+        "google",
+        r"^gemini-flash-latest$",
+        "gemini-flash-latest-alias",
+    ),
+    (
+        "google",
+        r"^gemini-flash-lite-latest$",
+        "gemini-flash-lite-latest-alias",
+    ),
     // Mistral: matcha sia il formato data abbreviata (large-2411) sia
     // la nuova nomenclatura semantica (large-3). parse_version skippa
     // i YYMM date, quindi "large-3" [3] vince su "large-2411" [].
-    ("mistral",   r"^mistral-large-\d+$",                     "mistral-large"),
-    ("mistral",   r"^mistral-medium-\d+(-\d+-\d+)?$",         "mistral-medium"),
-    ("mistral",   r"^mistral-small-\d+(-\d+-\d+)?$",          "mistral-small"),
-    ("mistral",   r"^magistral-medium-\d+(-\d+-\d+)?$",       "magistral-medium"),
-    ("mistral",   r"^codestral-\d+$",                         "codestral"),
-    ("mistral",   r"^devstral-medium-\d+$",                   "devstral-medium"),
+    ("mistral", r"^mistral-large-\d+$", "mistral-large"),
+    (
+        "mistral",
+        r"^mistral-medium-\d+(-\d+-\d+)?$",
+        "mistral-medium",
+    ),
+    (
+        "mistral",
+        r"^mistral-small-\d+(-\d+-\d+)?$",
+        "mistral-small",
+    ),
+    (
+        "mistral",
+        r"^magistral-medium-\d+(-\d+-\d+)?$",
+        "magistral-medium",
+    ),
+    ("mistral", r"^codestral-\d+$", "codestral"),
+    ("mistral", r"^devstral-medium-\d+$", "devstral-medium"),
     // DeepSeek
-    ("deepseek",  r"^deepseek-v\d+(\.\d+)?$",                 "deepseek-v"),
+    ("deepseek", r"^deepseek-v\d+(\.\d+)?$", "deepseek-v"),
 ];
 
 /// Parsa una versione embedded in un nome modello in una tupla di interi.
@@ -421,7 +512,7 @@ pub async fn auto_upgrade_models_and_routing(db: &sqlx::PgPool) -> Result<(), St
             let a_ct = a.contains("customtools");
             let b_ct = b.contains("customtools");
             match (a_ct, b_ct) {
-                (true, false) => return std::cmp::Ordering::Less,   // a vince
+                (true, false) => return std::cmp::Ordering::Less, // a vince
                 (false, true) => return std::cmp::Ordering::Greater, // b vince
                 _ => {}
             }
@@ -456,11 +547,7 @@ pub async fn auto_upgrade_models_and_routing(db: &sqlx::PgPool) -> Result<(), St
         // vengono toccati dall'auto-upgrade. Bug osservato 30/05/2026: senza
         // questo, ogni restart di mcp-core ri-sostituiva il preview scelto a
         // mano con lo stable top family.
-        let to_replace: Vec<String> = candidates
-            .iter()
-            .filter(|m| **m != top)
-            .cloned()
-            .collect();
+        let to_replace: Vec<String> = candidates.iter().filter(|m| **m != top).cloned().collect();
         if !to_replace.is_empty() {
             let res = sqlx::query(
                 "UPDATE nexus_routing_matrix \
@@ -477,7 +564,10 @@ pub async fn auto_upgrade_models_and_routing(db: &sqlx::PgPool) -> Result<(), St
                 if r.rows_affected() > 0 {
                     tracing::info!(
                         "auto_upgrade: routing_matrix [{}/{}] {} record -> {}",
-                        provider, family_label, r.rows_affected(), top
+                        provider,
+                        family_label,
+                        r.rows_affected(),
+                        top
                     );
                 }
             }
@@ -503,7 +593,8 @@ pub async fn auto_upgrade_models_and_routing(db: &sqlx::PgPool) -> Result<(), St
 
     tracing::info!(
         "auto_upgrade_models_and_routing: enabled={} promotions={}",
-        enabled_count, promotions.len()
+        enabled_count,
+        promotions.len()
     );
     for (p, fam, top) in &promotions {
         tracing::debug!("  {} / {} -> top = {}", p, fam, top);
@@ -543,11 +634,11 @@ async fn auto_populate_escalations(
 ) -> Result<(), String> {
     // (provider, base_family_label, upgrade_family_label, threshold)
     const ESCALATION_PAIRS: &[(&str, &str, &str, i32)] = &[
-        ("google",    "gemini-pro",      "gemini-pro-preview", 8000),
-        ("google",    "gemini-flash",    "gemini-pro",         6000),
-        ("anthropic", "claude-sonnet",   "claude-opus",        50000),
-        ("anthropic", "claude-haiku",    "claude-sonnet",      30000),
-        ("openai",    "gpt-mini",        "gpt-frontier",       20000),
+        ("google", "gemini-pro", "gemini-pro-preview", 8000),
+        ("google", "gemini-flash", "gemini-pro", 6000),
+        ("anthropic", "claude-sonnet", "claude-opus", 50000),
+        ("anthropic", "claude-haiku", "claude-sonnet", 30000),
+        ("openai", "gpt-mini", "gpt-frontier", 20000),
     ];
     let mut populated = 0_usize;
     for (provider, base_label, upgrade_label, threshold) in ESCALATION_PAIRS {
@@ -592,7 +683,11 @@ async fn auto_populate_escalations(
             populated += res.rows_affected() as usize;
             tracing::info!(
                 "auto_populate_escalations: [{}] {} -> {} ({}+) | {} righe",
-                provider, base_top, upgrade_top, threshold, res.rows_affected()
+                provider,
+                base_top,
+                upgrade_top,
+                threshold,
+                res.rows_affected()
             );
         }
     }
@@ -649,4 +744,3 @@ pub async fn probe_models_now(State(state): State<AppState>) -> Json<Value> {
         "failure_threshold": threshold,
     }))
 }
-

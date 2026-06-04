@@ -8,8 +8,13 @@ pub struct CaTodoFixmeCountTool;
 
 #[async_trait]
 impl NexusToolHandler for CaTodoFixmeCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let (counts, files) = scan_substrings(&ctx.project_root, &["TODO", "FIXME", "XXX", "HACK", "NOTE"]);
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let (counts, files) =
+            scan_substrings(&ctx.project_root, &["TODO", "FIXME", "XXX", "HACK", "NOTE"]);
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -21,5 +26,7 @@ impl NexusToolHandler for CaTodoFixmeCountTool {
             "total": counts.iter().sum::<usize>(),
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

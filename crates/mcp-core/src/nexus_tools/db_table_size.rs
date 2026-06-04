@@ -13,10 +13,19 @@ fn ident_ok(s: &str) -> bool {
 
 #[async_trait]
 impl NexusToolHandler for DbTableSizeTool {
-    async fn execute(&self, _ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let table = args.get("table").and_then(Value::as_str)
+    async fn execute(
+        &self,
+        _ctx: &NexusToolContext,
+        args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let table = args
+            .get("table")
+            .and_then(Value::as_str)
             .ok_or_else(|| NexusToolError::BadInput("table required".into()))?;
-        let schema = args.get("schema").and_then(Value::as_str).unwrap_or("public");
+        let schema = args
+            .get("schema")
+            .and_then(Value::as_str)
+            .unwrap_or("public");
         if !ident_ok(table) || !ident_ok(schema) {
             return Err(NexusToolError::BadInput("invalid identifier".into()));
         }
@@ -48,6 +57,11 @@ impl NexusToolHandler for DbTableSizeTool {
         json!({"type":"object","required":["table"],"properties":{"schema":{"type":"string"},"table":{"type":"string"}}})
     }
     fn safety(&self) -> NexusToolSafety {
-        NexusToolSafety { read_only: true, can_write_filesystem: false, can_execute_subproc: false, network_egress: true }
+        NexusToolSafety {
+            read_only: true,
+            can_write_filesystem: false,
+            can_execute_subproc: false,
+            network_egress: true,
+        }
     }
 }

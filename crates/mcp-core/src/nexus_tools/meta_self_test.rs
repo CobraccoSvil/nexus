@@ -8,7 +8,11 @@ pub struct MetaSelfTestTool;
 
 #[async_trait]
 impl NexusToolHandler for MetaSelfTestTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let cat = match NexusToolCatalog::global() {
             Some(c) => c,
             None => return Ok(json!({"ok": false, "error": "catalog not initialized"})),
@@ -26,7 +30,9 @@ impl NexusToolHandler for MetaSelfTestTool {
         for name in probes.iter() {
             let r = cat.execute(name, ctx, &json!({})).await;
             let ok = r.is_ok();
-            if ok { passed += 1; }
+            if ok {
+                passed += 1;
+            }
             results.push(json!({
                 "tool": name,
                 "ok": ok,
@@ -40,5 +46,7 @@ impl NexusToolHandler for MetaSelfTestTool {
             "results": results,
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

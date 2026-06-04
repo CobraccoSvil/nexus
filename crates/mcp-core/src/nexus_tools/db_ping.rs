@@ -9,14 +9,22 @@ pub struct DbPingTool;
 
 #[async_trait]
 impl NexusToolHandler for DbPingTool {
-    async fn execute(&self, _ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        _ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let db_url = match std::env::var("DATABASE_URL") {
             Ok(u) => u,
             Err(_) => return Ok(json!({"ok": false, "error": "DATABASE_URL not set"})),
         };
         let start = std::time::Instant::now();
-        let pool = match PgPoolOptions::new().max_connections(1)
-            .acquire_timeout(std::time::Duration::from_secs(5)).connect(&db_url).await {
+        let pool = match PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(&db_url)
+            .await
+        {
             Ok(p) => p,
             Err(e) => return Ok(json!({"ok": false, "error": format!("connect: {}", e)})),
         };
@@ -28,6 +36,11 @@ impl NexusToolHandler for DbPingTool {
         Ok(json!({"ok": one == 1, "one": one, "latency_ms": start.elapsed().as_millis() as u64}))
     }
     fn safety(&self) -> NexusToolSafety {
-        NexusToolSafety { read_only: true, can_write_filesystem: false, can_execute_subproc: false, network_egress: true }
+        NexusToolSafety {
+            read_only: true,
+            can_write_filesystem: false,
+            can_execute_subproc: false,
+            network_egress: true,
+        }
     }
 }

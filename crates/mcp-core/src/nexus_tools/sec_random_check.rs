@@ -8,7 +8,11 @@ pub struct SecRandomCheckTool;
 
 #[async_trait]
 impl NexusToolHandler for SecRandomCheckTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(
             &ctx.project_root,
             &[
@@ -37,5 +41,7 @@ impl NexusToolHandler for SecRandomCheckTool {
             "crypto_total": secure,
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

@@ -40,13 +40,13 @@ pub struct CreateMcpServerRequest {
     pub name: String,
     pub description: Option<String>,
     pub icon_url: Option<String>,
-    pub transport: String,        // "http" | "stdio"
-    pub url: Option<String>,      // per HTTP
-    pub command: Option<String>,  // per stdio
+    pub transport: String,       // "http" | "stdio"
+    pub url: Option<String>,     // per HTTP
+    pub command: Option<String>, // per stdio
     pub args: Option<Vec<String>>,
     pub env_vars: Option<HashMap<String, String>>,
     pub headers: Option<HashMap<String, String>>,
-    pub scope: Option<String>,    // "user" | "project"
+    pub scope: Option<String>, // "user" | "project"
     pub project_id: Option<String>,
 }
 
@@ -98,20 +98,19 @@ fn row_to_json(r: &sqlx::postgres::PgRow, can_manage: bool) -> Value {
     })
 }
 
-fn can_manage_server(
-    row: &sqlx::postgres::PgRow,
-    user_id: Uuid,
-    role: &str,
-) -> bool {
+fn can_manage_server(row: &sqlx::postgres::PgRow, user_id: Uuid, role: &str) -> bool {
     let owner_user_id: Option<Uuid> = row.try_get("user_id").unwrap_or(None);
-    let scope: String = row
-        .try_get("scope")
-        .unwrap_or_else(|_| "user".to_string());
+    let scope: String = row.try_get("scope").unwrap_or_else(|_| "user".to_string());
 
     owner_user_id == Some(user_id) || (scope == "global" && role == "admin")
 }
 
-fn build_config(id: &Uuid, name: &str, transport: &str, row: &sqlx::postgres::PgRow) -> McpServerConfig {
+fn build_config(
+    id: &Uuid,
+    name: &str,
+    transport: &str,
+    row: &sqlx::postgres::PgRow,
+) -> McpServerConfig {
     // Nexus Builtin: nessuna rete, nessun processo esterno
     if transport == "builtin" {
         return McpServerConfig {
@@ -133,11 +132,19 @@ fn build_config(id: &Uuid, name: &str, transport: &str, row: &sqlx::postgres::Pg
             command: command.unwrap_or_default(),
             args: args
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default(),
             env_vars: env_vars
                 .as_object()
-                .map(|o| o.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
                 .unwrap_or_default(),
         }
     } else {
@@ -145,7 +152,11 @@ fn build_config(id: &Uuid, name: &str, transport: &str, row: &sqlx::postgres::Pg
             url: url.unwrap_or_default(),
             headers: headers
                 .as_object()
-                .map(|o| o.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
                 .unwrap_or_default(),
         }
     };
@@ -247,13 +258,22 @@ pub async fn create_mcp_server(
     let user_id = parse_user_id(&claims)?;
 
     if body.transport != "http" && body.transport != "stdio" {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Transport deve essere 'http' o 'stdio'"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Transport deve essere 'http' o 'stdio'",
+        ));
     }
     if body.transport == "http" && body.url.is_none() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "URL richiesto per transport HTTP"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "URL richiesto per transport HTTP",
+        ));
     }
     if body.transport == "stdio" && body.command.is_none() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Command richiesto per transport stdio"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Command richiesto per transport stdio",
+        ));
     }
 
     let scope = body.scope.as_deref().unwrap_or("user");
@@ -320,38 +340,70 @@ pub async fn update_mcp_server(
     // Aggiorna solo i campi forniti
     if let Some(name) = &body.name {
         sqlx::query("UPDATE mcp_servers SET name=$2, updated_at=NOW() WHERE id=$1")
-            .bind(server_id).bind(name).execute(&state.db).await.ok();
+            .bind(server_id)
+            .bind(name)
+            .execute(&state.db)
+            .await
+            .ok();
     }
     if let Some(desc) = &body.description {
         sqlx::query("UPDATE mcp_servers SET description=$2, updated_at=NOW() WHERE id=$1")
-            .bind(server_id).bind(desc).execute(&state.db).await.ok();
+            .bind(server_id)
+            .bind(desc)
+            .execute(&state.db)
+            .await
+            .ok();
     }
     if let Some(url) = &body.url {
         sqlx::query("UPDATE mcp_servers SET url=$2, updated_at=NOW() WHERE id=$1")
-            .bind(server_id).bind(url).execute(&state.db).await.ok();
+            .bind(server_id)
+            .bind(url)
+            .execute(&state.db)
+            .await
+            .ok();
     }
     if let Some(cmd) = &body.command {
         sqlx::query("UPDATE mcp_servers SET command=$2, updated_at=NOW() WHERE id=$1")
-            .bind(server_id).bind(cmd).execute(&state.db).await.ok();
+            .bind(server_id)
+            .bind(cmd)
+            .execute(&state.db)
+            .await
+            .ok();
     }
     if let Some(args) = &body.args {
         let v = json!(args);
         sqlx::query("UPDATE mcp_servers SET args=$2, updated_at=NOW() WHERE id=$1")
-            .bind(server_id).bind(v).execute(&state.db).await.ok();
+            .bind(server_id)
+            .bind(v)
+            .execute(&state.db)
+            .await
+            .ok();
     }
     if let Some(env) = &body.env_vars {
         let v = json!(env);
         sqlx::query("UPDATE mcp_servers SET env_vars=$2, updated_at=NOW() WHERE id=$1")
-            .bind(server_id).bind(v).execute(&state.db).await.ok();
+            .bind(server_id)
+            .bind(v)
+            .execute(&state.db)
+            .await
+            .ok();
     }
     if let Some(headers) = &body.headers {
         let v = json!(headers);
         sqlx::query("UPDATE mcp_servers SET headers=$2, updated_at=NOW() WHERE id=$1")
-            .bind(server_id).bind(v).execute(&state.db).await.ok();
+            .bind(server_id)
+            .bind(v)
+            .execute(&state.db)
+            .await
+            .ok();
     }
     if let Some(enabled) = body.enabled {
         sqlx::query("UPDATE mcp_servers SET enabled=$2, updated_at=NOW() WHERE id=$1")
-            .bind(server_id).bind(enabled).execute(&state.db).await.ok();
+            .bind(server_id)
+            .bind(enabled)
+            .execute(&state.db)
+            .await
+            .ok();
     }
 
     let row = sqlx::query(
@@ -428,11 +480,11 @@ pub async fn toggle_mcp_server(
          SET enabled = $2, updated_at = NOW()
          WHERE id = $1",
     )
-        .bind(server_id)
-        .bind(body.enabled)
-        .execute(&state.db)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .bind(server_id)
+    .bind(body.enabled)
+    .execute(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if result.rows_affected() == 0 {
         return Err(api_error(
@@ -441,7 +493,9 @@ pub async fn toggle_mcp_server(
         ));
     }
 
-    Ok(Json(json!({ "id": server_id.to_string(), "enabled": body.enabled })))
+    Ok(Json(
+        json!({ "id": server_id.to_string(), "enabled": body.enabled }),
+    ))
 }
 
 /// POST /api/mcp-servers/:id/test
@@ -540,14 +594,17 @@ pub async fn test_mcp_server(
                     .unwrap_or_else(|| "user".to_string());
                     for (tname, tdesc) in &tools_meta {
                         if let Err(e) = crate::nexus_builtin::index_tool(
-                            &db_idx, &neural_idx, server_id, &sname_idx, tname, tdesc, &scope,
+                            &db_idx,
+                            &neural_idx,
+                            server_id,
+                            &sname_idx,
+                            tname,
+                            tdesc,
+                            &scope,
                         )
                         .await
                         {
-                            tracing::debug!(
-                                "index_tool {}/{}: {}",
-                                sname_idx, tname, e
-                            );
+                            tracing::debug!("index_tool {}/{}: {}", sname_idx, tname, e);
                         }
                     }
                 });
@@ -555,11 +612,13 @@ pub async fn test_mcp_server(
 
             let tool_list: Vec<Value> = tools
                 .iter()
-                .map(|t| json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "inputSchema": t.input_schema,
-                }))
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.input_schema,
+                    })
+                })
                 .collect();
 
             Ok(Json(json!({
@@ -673,7 +732,10 @@ pub async fn execute_mcp_tool(
     .flatten();
 
     let Some(row) = row else {
-        return format!("Errore: server MCP {} non trovato o disabilitato", server_id);
+        return format!(
+            "Errore: server MCP {} non trovato o disabilitato",
+            server_id
+        );
     };
 
     let transport: String = row.try_get("transport").unwrap_or_default();

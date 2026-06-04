@@ -82,9 +82,16 @@ fn classify_response(response: &str, original_task: &str) -> QualityLabel {
     // Risposta troppo corta (<80 char) e senza tool eseguiti → probabilmente vaga
     if resp_len < 80 && !response.contains("```") {
         // Eccetto se è una conferma di completamento ("fatto", "completato", ecc.)
-        let is_completion = ["completato", "fatto", "risolto", "terminato", "ok", "pronto"]
-            .iter()
-            .any(|w| resp_lower.contains(w));
+        let is_completion = [
+            "completato",
+            "fatto",
+            "risolto",
+            "terminato",
+            "ok",
+            "pronto",
+        ]
+        .iter()
+        .any(|w| resp_lower.contains(w));
         if !is_completion {
             return QualityLabel::Vague;
         }
@@ -103,9 +110,7 @@ fn classify_response(response: &str, original_task: &str) -> QualityLabel {
         "puoi confermare",
         "hai un preferenza",
     ];
-    if clarifying_patterns.iter().any(|p| resp_lower.contains(p))
-        && response.contains('?')
-    {
+    if clarifying_patterns.iter().any(|p| resp_lower.contains(p)) && response.contains('?') {
         return QualityLabel::ClarifyingQuestion;
     }
 

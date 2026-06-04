@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use crate::{
     auth::Claims,
-    chat_learning::{api_error, ensure_project_access, parse_project_id, parse_user_id, ApiError, ApiResult},
+    chat_learning::{
+        api_error, ensure_project_access, parse_project_id, parse_user_id, ApiError, ApiResult,
+    },
     AppState,
 };
 
@@ -116,10 +118,12 @@ pub async fn list_chat_sessions(
     Query(query): Query<ChatSessionsQuery>,
 ) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
-    let project_id_raw = query
-        .project_id
-        .as_deref()
-        .ok_or_else(|| api_error(axum::http::StatusCode::BAD_REQUEST, "projectId e' obbligatorio"))?;
+    let project_id_raw = query.project_id.as_deref().ok_or_else(|| {
+        api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "projectId e' obbligatorio",
+        )
+    })?;
     let project_id = parse_project_id(project_id_raw)?;
     ensure_project_access(&state.db, user_id, project_id).await?;
 
@@ -269,17 +273,18 @@ pub async fn rename_chat_session(
 
     let title = body.title.trim().to_string();
     if title.is_empty() {
-        return Err(api_error(axum::http::StatusCode::BAD_REQUEST, "Il titolo non puo' essere vuoto"));
+        return Err(api_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "Il titolo non puo' essere vuoto",
+        ));
     }
 
-    sqlx::query(
-        "UPDATE chat_sessions SET title = $1, updated_at = NOW() WHERE id = $2",
-    )
-    .bind(&title)
-    .bind(ctx.session_id)
-    .execute(&state.db)
-    .await
-    .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sqlx::query("UPDATE chat_sessions SET title = $1, updated_at = NOW() WHERE id = $2")
+        .bind(&title)
+        .bind(ctx.session_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({ "ok": true, "title": title })))
 }
@@ -405,27 +410,30 @@ pub(crate) async fn compact_session_core(
         "content": "Riassumi questa conversazione estraendo: le decisioni chiave prese, i cambiamenti al codice effettuati, i contesti e le conoscenze apprese utili per il progetto. Sii conciso e strutturato con bullet points."
     }));
 
-    let messages_json = serde_json::to_string(&msgs)
-        .map_err(|e| CompactError::internal(e.to_string()))?;
+    let messages_json =
+        serde_json::to_string(&msgs).map_err(|e| CompactError::internal(e.to_string()))?;
 
     // Risolvi provider/modello dalla routing matrix (purpose 'conversation_summary')
     // cosi' la compattazione usa lo stesso router dei modelli della chat.
-    let (summary_provider, summary_model) = match state
-        .orchestrator
-        .routing_matrix
-        .current_async()
-        .await
-    {
-        Ok(matrix) => matrix
-            .purpose_model("conversation_summary")
-            .unwrap_or(("openai".to_string(), "gpt-4.1-mini".to_string())),
-        Err(_) => ("openai".to_string(), "gpt-4.1-mini".to_string()),
-    };
+    let (summary_provider, summary_model) =
+        match state.orchestrator.routing_matrix.current_async().await {
+            Ok(matrix) => matrix
+                .purpose_model("conversation_summary")
+                .unwrap_or(("openai".to_string(), "gpt-4.1-mini".to_string())),
+            Err(_) => ("openai".to_string(), "gpt-4.1-mini".to_string()),
+        };
 
     let summary_resp = state
         .orchestrator
         .neural
-        .generate_agent_turn(&summary_provider, &summary_model, &messages_json, "[]", 1500, "")
+        .generate_agent_turn(
+            &summary_provider,
+            &summary_model,
+            &messages_json,
+            "[]",
+            1500,
+            "",
+        )
         .await
         .map_err(|e| CompactError::internal(format!("Neural Core error: {e}")))?;
 
@@ -467,13 +475,20 @@ pub(crate) async fn compact_session_core(
     }
 
     // Embed the summary — guard: se dipendenze vettoriali down, skip (non bloccante)
-    let qdrant_ok = state.dependency_status.qdrant.load(std::sync::atomic::Ordering::Relaxed);
-    let embedder_ok = state.dependency_status.embedder.load(std::sync::atomic::Ordering::Relaxed);
+    let qdrant_ok = state
+        .dependency_status
+        .qdrant
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let embedder_ok = state
+        .dependency_status
+        .embedder
+        .load(std::sync::atomic::Ordering::Relaxed);
     let point_id = Uuid::new_v4().to_string();
     if !qdrant_ok || !embedder_ok {
         tracing::info!(
             "chat_sessions: skip embed summary (qdrant={}, embedder={})",
-            qdrant_ok, embedder_ok
+            qdrant_ok,
+            embedder_ok
         );
     } else {
         let vector = state
@@ -491,10 +506,7 @@ pub(crate) async fn compact_session_core(
             "text": summary_text,
         });
         crate::vector_memory::upsert_prompt_correction_point(
-            &state.db,
-            &point_id,
-            &vector,
-            payload,
+            &state.db, &point_id, &vector, payload,
         )
         .await
         .map_err(|e| CompactError::internal(e.to_string()))?;
@@ -502,12 +514,14 @@ pub(crate) async fn compact_session_core(
 
     // Persist to prompt_corrections table
     let correction_id = Uuid::new_v4();
-    sqlx::query(r#"
+    sqlx::query(
+        r#"
         INSERT INTO prompt_corrections
             (id, project_id, session_id, intent, correction_text,
              normalized_hint_hash, qdrant_point_id, active, status, type)
         VALUES ($1, $2, $3, 'session_memory', $4, $5, $6, false, 'saved', 'session_memory')
-    "#)
+    "#,
+    )
     .bind(correction_id)
     .bind(project_id)
     .bind(session_id)
@@ -565,13 +579,11 @@ pub(crate) async fn compact_session_core(
     .map_err(|e| CompactError::internal(e.to_string()))?;
 
     // Mark session as compacted
-    sqlx::query(
-        "UPDATE chat_sessions SET status = 'compacted', updated_at = NOW() WHERE id = $1"
-    )
-    .bind(session_id)
-    .execute(&state.db)
-    .await
-    .map_err(|e| CompactError::internal(e.to_string()))?;
+    sqlx::query("UPDATE chat_sessions SET status = 'compacted', updated_at = NOW() WHERE id = $1")
+        .bind(session_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| CompactError::internal(e.to_string()))?;
 
     // Dopo il soft-delete, il totale token mostrato dalla TokenUsageBar e'
     // solo quello del summary nuovo (i precedenti sono deleted_at NOT NULL e
@@ -659,22 +671,25 @@ pub async fn list_project_memories(
     .await
     .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let memories: Vec<serde_json::Value> = rows.iter().map(|row| {
-        let id: Uuid = row.try_get("id").unwrap_or_default();
-        let session_id: Option<Uuid> = row.try_get("session_id").ok().flatten();
-        let text: String = row.try_get("correction_text").unwrap_or_default();
-        let active: bool = row.try_get("active").unwrap_or(false);
-        let created_at: DateTime<Utc> = row.try_get("created_at").unwrap_or_default();
-        let session_title: Option<String> = row.try_get("session_title").ok().flatten();
-        json!({
-            "id": id,
-            "sessionId": session_id,
-            "sessionTitle": session_title.unwrap_or_else(|| "Sessione rimossa".to_string()),
-            "summary": text,
-            "active": active,
-            "createdAt": created_at,
+    let memories: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let id: Uuid = row.try_get("id").unwrap_or_default();
+            let session_id: Option<Uuid> = row.try_get("session_id").ok().flatten();
+            let text: String = row.try_get("correction_text").unwrap_or_default();
+            let active: bool = row.try_get("active").unwrap_or(false);
+            let created_at: DateTime<Utc> = row.try_get("created_at").unwrap_or_default();
+            let session_title: Option<String> = row.try_get("session_title").ok().flatten();
+            json!({
+                "id": id,
+                "sessionId": session_id,
+                "sessionTitle": session_title.unwrap_or_else(|| "Sessione rimossa".to_string()),
+                "summary": text,
+                "active": active,
+                "createdAt": created_at,
+            })
         })
-    }).collect();
+        .collect();
 
     Ok(Json(json!({ "memories": memories })))
 }
@@ -692,7 +707,7 @@ pub async fn toggle_project_memory(
     let new_active: bool = sqlx::query_scalar(
         "UPDATE prompt_corrections SET active = NOT active, updated_at = NOW()
          WHERE id = $1 AND type = 'session_memory'
-         RETURNING active"
+         RETURNING active",
     )
     .bind(memory_id)
     .fetch_one(&state.db)
@@ -700,17 +715,17 @@ pub async fn toggle_project_memory(
     .map_err(|e| api_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Sync to Qdrant: retrieve point_id, then update payload
-    let qdrant_point_id: String = sqlx::query_scalar(
-        "SELECT qdrant_point_id FROM prompt_corrections WHERE id = $1"
-    )
-    .bind(memory_id)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or_default();
+    let qdrant_point_id: String =
+        sqlx::query_scalar("SELECT qdrant_point_id FROM prompt_corrections WHERE id = $1")
+            .bind(memory_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or_default();
 
     if !qdrant_point_id.is_empty() {
         // Best-effort Qdrant payload update — ignore errors (DB is source of truth)
-        let _ = crate::vector_memory::set_point_active(&state.db, &qdrant_point_id, new_active).await;
+        let _ =
+            crate::vector_memory::set_point_active(&state.db, &qdrant_point_id, new_active).await;
     }
 
     Ok(Json(json!({ "ok": true, "active": new_active })))

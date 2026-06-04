@@ -40,12 +40,17 @@ impl NexusToolHandler for ProjectDbDumpSchemaTool {
 
         let child = tokio::process::Command::new("pg_dump")
             .args([
-                "-h", &host,
-                "-p", &port,
-                "-U", &user,
-                "-d", &dbname,
+                "-h",
+                &host,
+                "-p",
+                &port,
+                "-U",
+                &user,
+                "-d",
+                &dbname,
                 "--schema-only",
-                "-f", &backup_path_str,
+                "-f",
+                &backup_path_str,
             ])
             .env("PGPASSWORD", &password)
             .stdin(std::process::Stdio::null())

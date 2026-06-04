@@ -17,12 +17,12 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 mod catalog;
-mod run_config;
+mod docs;
 mod git;
+mod mcp_runtime;
 mod project;
 mod prompt_admin;
-mod mcp_runtime;
-mod docs;
+mod run_config;
 mod services;
 
 // Re-export pubblico delle costanti e della funzione server-id
@@ -30,36 +30,32 @@ pub use catalog::{nexus_builtin_server_id, NEXUS_BUILTIN_SERVER_ID_STR};
 
 // Import privati usati dai sotto-moduli tramite `use super::*`
 use catalog::NEXUS_TOOLS;
-use run_config::{
-    get_project_root, run_git,
-    handle_run_config_list, handle_run_config_detect, handle_run_config_create,
-    handle_run_config_update, handle_run_config_delete, handle_run_config_launch,
+use docs::{
+    bump_version, get_project_slug, handle_doc_generate, handle_doc_list, handle_doc_search,
+    handle_doc_status, handle_doc_update,
 };
 use git::{
-    handle_git_log, handle_git_diff, handle_git_branches,
-    handle_git_checkout, handle_git_create_branch,
-};
-use project::{
-    handle_project_list, handle_project_analyze,
-    handle_project_quality_scan, handle_project_quality_findings,
-    handle_profile_list, handle_profile_delete, handle_profile_set_default,
-};
-use prompt_admin::{
-    parse_uuid, format_json,
-    handle_prompt_template_list, handle_prompt_template_update,
-    handle_admin_setting_get, handle_admin_setting_update,
-};
-use mcp_runtime::{
-    handle_mcp_tool_search, handle_mcp_tool_search_with_neural,
-    handle_mcp_tool_call, handle_mcp_tool_reindex,
+    handle_git_branches, handle_git_checkout, handle_git_create_branch, handle_git_diff,
+    handle_git_log,
 };
 pub use mcp_runtime::index_tool;
-use docs::{
-    bump_version, get_project_slug,
-    handle_doc_generate, handle_doc_update, handle_doc_list,
-    handle_doc_search, handle_doc_status,
+use mcp_runtime::{
+    handle_mcp_tool_call, handle_mcp_tool_reindex, handle_mcp_tool_search,
+    handle_mcp_tool_search_with_neural,
 };
-use services::{handle_service_status, handle_service_control};
+use project::{
+    handle_profile_delete, handle_profile_list, handle_profile_set_default, handle_project_analyze,
+    handle_project_list, handle_project_quality_findings, handle_project_quality_scan,
+};
+use prompt_admin::{
+    format_json, handle_admin_setting_get, handle_admin_setting_update,
+    handle_prompt_template_list, handle_prompt_template_update, parse_uuid,
+};
+use run_config::{
+    get_project_root, handle_run_config_create, handle_run_config_delete, handle_run_config_detect,
+    handle_run_config_launch, handle_run_config_list, handle_run_config_update, run_git,
+};
+use services::{handle_service_control, handle_service_status};
 
 // ---------------------------------------------------------------------------
 // Seeding: upsert server row e tool definitions al startup
@@ -82,7 +78,8 @@ pub async fn seed_tools_and_server(db: &PgPool) {
 
     // Upsert tool definitions nel cache DB
     for tool in NEXUS_TOOLS {
-        let schema: Value = serde_json::from_str(tool.schema).unwrap_or(json!({"type":"object","properties":{}}));
+        let schema: Value =
+            serde_json::from_str(tool.schema).unwrap_or(json!({"type":"object","properties":{}}));
         let _ = sqlx::query(
             "INSERT INTO mcp_server_tools (server_id, tool_name, description, input_schema, discovered_at)
              VALUES ($1, $2, $3, $4, NOW())
@@ -97,7 +94,10 @@ pub async fn seed_tools_and_server(db: &PgPool) {
         .await;
     }
 
-    tracing::info!("Nexus Builtin MCP server: {} tool registrati", NEXUS_TOOLS.len());
+    tracing::info!(
+        "Nexus Builtin MCP server: {} tool registrati",
+        NEXUS_TOOLS.len()
+    );
 }
 
 /// Scatena il reindex semantico dei tool builtin (e di tutti i tool MCP abilitati)
@@ -154,7 +154,9 @@ pub async fn execute(
         "nexus_prompt_template_list" => handle_prompt_template_list(db, &arguments).await,
         "nexus_prompt_template_update" => handle_prompt_template_update(db, &arguments).await,
         // ── mcp_runtime (discovery + call + reindex) ──────────────────
-        "nexus_mcp_tool_search" => handle_mcp_tool_search(db, user_id, project_id, &arguments).await,
+        "nexus_mcp_tool_search" => {
+            handle_mcp_tool_search(db, user_id, project_id, &arguments).await
+        }
         "nexus_mcp_tool_call" => handle_mcp_tool_call(db, user_id, project_id, &arguments).await,
         "nexus_mcp_tool_reindex" => {
             if user_role != "admin" {
@@ -165,13 +167,15 @@ pub async fn execute(
         // ── admin_settings ────────────────────────────────────────────
         "nexus_admin_setting_get" => {
             if user_role != "admin" {
-                return "[Accesso negato] nexus_admin_setting_get richiede ruolo admin.".to_string();
+                return "[Accesso negato] nexus_admin_setting_get richiede ruolo admin."
+                    .to_string();
             }
             handle_admin_setting_get(db, &arguments).await
         }
         "nexus_admin_setting_update" => {
             if user_role != "admin" {
-                return "[Accesso negato] nexus_admin_setting_update richiede ruolo admin.".to_string();
+                return "[Accesso negato] nexus_admin_setting_update richiede ruolo admin."
+                    .to_string();
             }
             handle_admin_setting_update(db, &arguments).await
         }
@@ -457,8 +461,7 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "cargo_doc", &arguments).await
         }
         "nexus_cargo_locate_project" => {
-            dispatch_catalog_tool(db, user_id, project_id, "cargo_locate_project", &arguments)
-                .await
+            dispatch_catalog_tool(db, user_id, project_id, "cargo_locate_project", &arguments).await
         }
         "nexus_cargo_pkgid" => {
             dispatch_catalog_tool(db, user_id, project_id, "cargo_pkgid", &arguments).await
@@ -522,15 +525,13 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "cargo_dep_versions", &arguments).await
         }
         "nexus_cargo_lockfile_check" => {
-            dispatch_catalog_tool(db, user_id, project_id, "cargo_lockfile_check", &arguments)
-                .await
+            dispatch_catalog_tool(db, user_id, project_id, "cargo_lockfile_check", &arguments).await
         }
         "nexus_cargo_msrv_detect" => {
             dispatch_catalog_tool(db, user_id, project_id, "cargo_msrv_detect", &arguments).await
         }
         "nexus_cargo_edition_detect" => {
-            dispatch_catalog_tool(db, user_id, project_id, "cargo_edition_detect", &arguments)
-                .await
+            dispatch_catalog_tool(db, user_id, project_id, "cargo_edition_detect", &arguments).await
         }
         "nexus_cargo_env_overrides" => {
             dispatch_catalog_tool(db, user_id, project_id, "cargo_env_overrides", &arguments).await
@@ -740,7 +741,8 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "db_active_queries", &arguments).await
         }
         "nexus_db_replication_status" => {
-            dispatch_catalog_tool(db, user_id, project_id, "db_replication_status", &arguments).await
+            dispatch_catalog_tool(db, user_id, project_id, "db_replication_status", &arguments)
+                .await
         }
 
         // ── Fase 9L: Documentation extras (20) ──────────────────────────
@@ -757,10 +759,18 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "doc_codeowners_check", &arguments).await
         }
         "nexus_doc_contributing_check" => {
-            dispatch_catalog_tool(db, user_id, project_id, "doc_contributing_check", &arguments).await
+            dispatch_catalog_tool(
+                db,
+                user_id,
+                project_id,
+                "doc_contributing_check",
+                &arguments,
+            )
+            .await
         }
         "nexus_doc_security_md_check" => {
-            dispatch_catalog_tool(db, user_id, project_id, "doc_security_md_check", &arguments).await
+            dispatch_catalog_tool(db, user_id, project_id, "doc_security_md_check", &arguments)
+                .await
         }
         "nexus_doc_toc_extract" => {
             dispatch_catalog_tool(db, user_id, project_id, "doc_toc_extract", &arguments).await
@@ -778,7 +788,8 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "doc_image_list", &arguments).await
         }
         "nexus_doc_frontmatter_parse" => {
-            dispatch_catalog_tool(db, user_id, project_id, "doc_frontmatter_parse", &arguments).await
+            dispatch_catalog_tool(db, user_id, project_id, "doc_frontmatter_parse", &arguments)
+                .await
         }
         "nexus_doc_md_lint" => {
             dispatch_catalog_tool(db, user_id, project_id, "doc_md_lint", &arguments).await
@@ -793,7 +804,14 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "doc_heading_depth", &arguments).await
         }
         "nexus_doc_codeblocks_extract" => {
-            dispatch_catalog_tool(db, user_id, project_id, "doc_codeblocks_extract", &arguments).await
+            dispatch_catalog_tool(
+                db,
+                user_id,
+                project_id,
+                "doc_codeblocks_extract",
+                &arguments,
+            )
+            .await
         }
         "nexus_doc_codeblocks_count" => {
             dispatch_catalog_tool(db, user_id, project_id, "doc_codeblocks_count", &arguments).await
@@ -807,7 +825,8 @@ pub async fn execute(
 
         // ── Fase 9M: Performance extras (20) ────────────────────────────
         "nexus_perf_cargo_build_time" => {
-            dispatch_catalog_tool(db, user_id, project_id, "perf_cargo_build_time", &arguments).await
+            dispatch_catalog_tool(db, user_id, project_id, "perf_cargo_build_time", &arguments)
+                .await
         }
         "nexus_perf_binary_size" => {
             dispatch_catalog_tool(db, user_id, project_id, "perf_binary_size", &arguments).await
@@ -858,7 +877,14 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "perf_compile_units", &arguments).await
         }
         "nexus_perf_optimization_check" => {
-            dispatch_catalog_tool(db, user_id, project_id, "perf_optimization_check", &arguments).await
+            dispatch_catalog_tool(
+                db,
+                user_id,
+                project_id,
+                "perf_optimization_check",
+                &arguments,
+            )
+            .await
         }
         "nexus_perf_lto_check" => {
             dispatch_catalog_tool(db, user_id, project_id, "perf_lto_check", &arguments).await
@@ -887,7 +913,14 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "test_ignored_count", &arguments).await
         }
         "nexus_test_should_panic_count" => {
-            dispatch_catalog_tool(db, user_id, project_id, "test_should_panic_count", &arguments).await
+            dispatch_catalog_tool(
+                db,
+                user_id,
+                project_id,
+                "test_should_panic_count",
+                &arguments,
+            )
+            .await
         }
         "nexus_test_module_count" => {
             dispatch_catalog_tool(db, user_id, project_id, "test_module_count", &arguments).await
@@ -899,7 +932,8 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "test_proptest_count", &arguments).await
         }
         "nexus_test_quickcheck_count" => {
-            dispatch_catalog_tool(db, user_id, project_id, "test_quickcheck_count", &arguments).await
+            dispatch_catalog_tool(db, user_id, project_id, "test_quickcheck_count", &arguments)
+                .await
         }
         "nexus_test_mock_count" => {
             dispatch_catalog_tool(db, user_id, project_id, "test_mock_count", &arguments).await
@@ -920,7 +954,8 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "test_stale_snapshots", &arguments).await
         }
         "nexus_test_coverage_summary" => {
-            dispatch_catalog_tool(db, user_id, project_id, "test_coverage_summary", &arguments).await
+            dispatch_catalog_tool(db, user_id, project_id, "test_coverage_summary", &arguments)
+                .await
         }
         "nexus_test_failed_log" => {
             dispatch_catalog_tool(db, user_id, project_id, "test_failed_log", &arguments).await
@@ -952,25 +987,54 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "sec_eval_check", &arguments).await
         }
         "nexus_sec_sql_injection_check" => {
-            dispatch_catalog_tool(db, user_id, project_id, "sec_sql_injection_check", &arguments).await
+            dispatch_catalog_tool(
+                db,
+                user_id,
+                project_id,
+                "sec_sql_injection_check",
+                &arguments,
+            )
+            .await
         }
         "nexus_sec_cmd_injection_check" => {
-            dispatch_catalog_tool(db, user_id, project_id, "sec_cmd_injection_check", &arguments).await
+            dispatch_catalog_tool(
+                db,
+                user_id,
+                project_id,
+                "sec_cmd_injection_check",
+                &arguments,
+            )
+            .await
         }
         "nexus_sec_dependency_count" => {
             dispatch_catalog_tool(db, user_id, project_id, "sec_dependency_count", &arguments).await
         }
         "nexus_sec_git_secrets_check" => {
-            dispatch_catalog_tool(db, user_id, project_id, "sec_git_secrets_check", &arguments).await
+            dispatch_catalog_tool(db, user_id, project_id, "sec_git_secrets_check", &arguments)
+                .await
         }
         "nexus_sec_env_files_check" => {
             dispatch_catalog_tool(db, user_id, project_id, "sec_env_files_check", &arguments).await
         }
         "nexus_sec_dockerfile_user_check" => {
-            dispatch_catalog_tool(db, user_id, project_id, "sec_dockerfile_user_check", &arguments).await
+            dispatch_catalog_tool(
+                db,
+                user_id,
+                project_id,
+                "sec_dockerfile_user_check",
+                &arguments,
+            )
+            .await
         }
         "nexus_sec_workflow_perms_check" => {
-            dispatch_catalog_tool(db, user_id, project_id, "sec_workflow_perms_check", &arguments).await
+            dispatch_catalog_tool(
+                db,
+                user_id,
+                project_id,
+                "sec_workflow_perms_check",
+                &arguments,
+            )
+            .await
         }
         "nexus_sec_cors_check" => {
             dispatch_catalog_tool(db, user_id, project_id, "sec_cors_check", &arguments).await
@@ -1035,7 +1099,14 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "ca_doc_comment_count", &arguments).await
         }
         "nexus_ca_inline_comment_count" => {
-            dispatch_catalog_tool(db, user_id, project_id, "ca_inline_comment_count", &arguments).await
+            dispatch_catalog_tool(
+                db,
+                user_id,
+                project_id,
+                "ca_inline_comment_count",
+                &arguments,
+            )
+            .await
         }
         "nexus_ca_todo_fixme_count" => {
             dispatch_catalog_tool(db, user_id, project_id, "ca_todo_fixme_count", &arguments).await
@@ -1050,7 +1121,14 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "ca_while_let_count", &arguments).await
         }
         "nexus_ca_complexity_estimate" => {
-            dispatch_catalog_tool(db, user_id, project_id, "ca_complexity_estimate", &arguments).await
+            dispatch_catalog_tool(
+                db,
+                user_id,
+                project_id,
+                "ca_complexity_estimate",
+                &arguments,
+            )
+            .await
         }
 
         // ── Fase 9Q: Build / Deploy (21) ────────────────────────────────
@@ -1067,7 +1145,8 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "build_debug_size", &arguments).await
         }
         "nexus_build_incremental_dir" => {
-            dispatch_catalog_tool(db, user_id, project_id, "build_incremental_dir", &arguments).await
+            dispatch_catalog_tool(db, user_id, project_id, "build_incremental_dir", &arguments)
+                .await
         }
         "nexus_build_lockfile_age" => {
             dispatch_catalog_tool(db, user_id, project_id, "build_lockfile_age", &arguments).await
@@ -1082,13 +1161,21 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "build_script_count", &arguments).await
         }
         "nexus_build_workspace_check" => {
-            dispatch_catalog_tool(db, user_id, project_id, "build_workspace_check", &arguments).await
+            dispatch_catalog_tool(db, user_id, project_id, "build_workspace_check", &arguments)
+                .await
         }
         "nexus_build_profile_list" => {
             dispatch_catalog_tool(db, user_id, project_id, "build_profile_list", &arguments).await
         }
         "nexus_deploy_dockerfile_count" => {
-            dispatch_catalog_tool(db, user_id, project_id, "deploy_dockerfile_count", &arguments).await
+            dispatch_catalog_tool(
+                db,
+                user_id,
+                project_id,
+                "deploy_dockerfile_count",
+                &arguments,
+            )
+            .await
         }
         "nexus_deploy_compose_check" => {
             dispatch_catalog_tool(db, user_id, project_id, "deploy_compose_check", &arguments).await
@@ -1100,7 +1187,14 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "deploy_helm_check", &arguments).await
         }
         "nexus_deploy_terraform_check" => {
-            dispatch_catalog_tool(db, user_id, project_id, "deploy_terraform_check", &arguments).await
+            dispatch_catalog_tool(
+                db,
+                user_id,
+                project_id,
+                "deploy_terraform_check",
+                &arguments,
+            )
+            .await
         }
         "nexus_deploy_ansible_check" => {
             dispatch_catalog_tool(db, user_id, project_id, "deploy_ansible_check", &arguments).await
@@ -1112,10 +1206,24 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "deploy_nginx_check", &arguments).await
         }
         "nexus_deploy_env_files_count" => {
-            dispatch_catalog_tool(db, user_id, project_id, "deploy_env_files_count", &arguments).await
+            dispatch_catalog_tool(
+                db,
+                user_id,
+                project_id,
+                "deploy_env_files_count",
+                &arguments,
+            )
+            .await
         }
         "nexus_deploy_release_artifacts" => {
-            dispatch_catalog_tool(db, user_id, project_id, "deploy_release_artifacts", &arguments).await
+            dispatch_catalog_tool(
+                db,
+                user_id,
+                project_id,
+                "deploy_release_artifacts",
+                &arguments,
+            )
+            .await
         }
 
         // ── Fase 9R — API / Memory / Other (20) ───────────────────────────
@@ -1144,7 +1252,14 @@ pub async fn execute(
             dispatch_catalog_tool(db, user_id, project_id, "api_middleware_count", &arguments).await
         }
         "nexus_memory_namespace_count" => {
-            dispatch_catalog_tool(db, user_id, project_id, "memory_namespace_count", &arguments).await
+            dispatch_catalog_tool(
+                db,
+                user_id,
+                project_id,
+                "memory_namespace_count",
+                &arguments,
+            )
+            .await
         }
         "nexus_memory_size_estimate" => {
             dispatch_catalog_tool(db, user_id, project_id, "memory_size_estimate", &arguments).await
@@ -1210,7 +1325,9 @@ pub async fn execute(
         "nexus_db_execute_sql" => handle_db_execute_sql(db, project_id, &arguments).await,
         // alias: nome spesso allucinato dall agente (regola H: stesso handler, niente duplicazione)
         "nexus_db_query" => handle_db_execute_sql(db, project_id, &arguments).await,
-        "nexus_db_apply_schema_file" => handle_db_apply_schema_file(db, project_id, &arguments).await,
+        "nexus_db_apply_schema_file" => {
+            handle_db_apply_schema_file(db, project_id, &arguments).await
+        }
         "nexus_db_status" => handle_db_status(db, project_id).await,
 
         _ => {
@@ -1323,17 +1440,18 @@ async fn dispatch_catalog_tool(
 /// Sicurezza: il `path` deve essere relativo alla root del progetto e non
 /// contenere `..` per evitare directory traversal. Verifichiamo anche che il
 /// file esista realmente nel workspace del progetto.
-async fn handle_open_file_in_editor(
-    db: &PgPool,
-    project_id: Uuid,
-    arguments: &Value,
-) -> String {
-    let path = arguments.get("path").and_then(Value::as_str).unwrap_or("").trim();
+async fn handle_open_file_in_editor(db: &PgPool, project_id: Uuid, arguments: &Value) -> String {
+    let path = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     if path.is_empty() {
         return json!({
             "ok": false,
             "error": "Parametro 'path' mancante o vuoto",
-        }).to_string();
+        })
+        .to_string();
     }
     // Security: rifiuta path assoluti o con ".." per traversal.
     if path.starts_with('/') || path.starts_with('\\') {
@@ -1346,7 +1464,8 @@ async fn handle_open_file_in_editor(
         return json!({
             "ok": false,
             "error": format!("Path '{path}' contiene '..', non ammesso"),
-        }).to_string();
+        })
+        .to_string();
     }
     // Verifica esistenza file nel workspace del progetto.
     let root_path = match get_project_root(db, project_id).await {
@@ -1355,7 +1474,8 @@ async fn handle_open_file_in_editor(
             return json!({
                 "ok": false,
                 "error": format!("Workspace del progetto non disponibile: {e}"),
-            }).to_string();
+            })
+            .to_string();
         }
     };
     let full_path = std::path::Path::new(&root_path).join(path);
@@ -1365,13 +1485,15 @@ async fn handle_open_file_in_editor(
             "error": format!("File '{path}' non esiste nel workspace ({root_path})"),
             "_ui_action": "open_file",
             "path": path,
-        }).to_string();
+        })
+        .to_string();
     }
     if !full_path.is_file() {
         return json!({
             "ok": false,
             "error": format!("Path '{path}' esiste ma non e' un file"),
-        }).to_string();
+        })
+        .to_string();
     }
     let line = arguments.get("line").and_then(Value::as_i64);
     // Risposta strutturata: il frontend intercetta `_ui_action: "open_file"` nel
@@ -1384,7 +1506,8 @@ async fn handle_open_file_in_editor(
         "_ui_action": "open_file",
         "path": path,
         "line": line,
-    }).to_string()
+    })
+    .to_string()
 }
 
 /// M13.2 — nexus_impact_brief: dato un seed (file modificati), ritorna impact
@@ -1425,8 +1548,18 @@ async fn handle_impact_brief(db: &PgPool, project_id: Uuid, arguments: &Value) -
 // helpers). project_id viene dal contesto del run agente. Nessun segreto loggato.
 
 async fn handle_db_provision(db: &PgPool, project_id: Uuid, arguments: &Value) -> String {
-    let mode = arguments.get("mode").and_then(Value::as_str).unwrap_or("internal").trim().to_lowercase();
-    let name = arguments.get("name").and_then(Value::as_str).map(|s| s.trim()).filter(|s| !s.is_empty()).unwrap_or("primary");
+    let mode = arguments
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("internal")
+        .trim()
+        .to_lowercase();
+    let name = arguments
+        .get("name")
+        .and_then(Value::as_str)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("primary");
     match mode.as_str() {
         "internal" => {
             let db_name = arguments.get("db_name").and_then(Value::as_str);
@@ -1456,13 +1589,20 @@ async fn handle_db_provision(db: &PgPool, project_id: Uuid, arguments: &Value) -
 }
 
 async fn handle_db_execute_sql(db: &PgPool, project_id: Uuid, arguments: &Value) -> String {
-    let Some(sql) = arguments.get("sql").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else {
+    let Some(sql) = arguments
+        .get("sql")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
         return json!({ "ok": false, "error": "Campo sql obbligatorio." }).to_string();
     };
     let connection = arguments.get("connection").and_then(Value::as_str);
     match crate::project_db::exec::execute_query(db, project_id, sql, &[], None, connection).await {
         Ok(outcome) => {
-            let archive = crate::project_db::exec::archive_ddl(db, project_id, sql, &outcome, connection).await;
+            let archive =
+                crate::project_db::exec::archive_ddl(db, project_id, sql, &outcome, connection)
+                    .await;
             let mut payload = crate::project_db::exec::outcome_to_json(&outcome);
             if let (Some(a), Value::Object(ref mut map)) = (archive, &mut payload) {
                 map.insert("archived_ddl".to_string(), json!({ "note_id": a.note_id.to_string(), "migration_filename": a.migration_filename }));
@@ -1479,7 +1619,12 @@ async fn handle_db_apply_schema_file(db: &PgPool, project_id: Uuid, arguments: &
         Err(e) => return json!({ "ok": false, "error": e }).to_string(),
     };
     let connection = arguments.get("connection").and_then(Value::as_str);
-    let chosen = match arguments.get("file_path").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+    let chosen = match arguments
+        .get("file_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(fp) => fp.to_string(),
         None => {
             let candidates = crate::project_db_routes::discover_schema_candidates(&root).await;
@@ -1497,9 +1642,12 @@ async fn handle_db_apply_schema_file(db: &PgPool, project_id: Uuid, arguments: &
     if sql.trim().is_empty() {
         return json!({ "ok": false, "error": "Il file schema e vuoto." }).to_string();
     }
-    match crate::project_db::exec::execute_query(db, project_id, &sql, &[], None, connection).await {
+    match crate::project_db::exec::execute_query(db, project_id, &sql, &[], None, connection).await
+    {
         Ok(outcome) => {
-            let archive = crate::project_db::exec::archive_ddl(db, project_id, &sql, &outcome, connection).await;
+            let archive =
+                crate::project_db::exec::archive_ddl(db, project_id, &sql, &outcome, connection)
+                    .await;
             json!({ "ok": true, "file": rel_file, "statements_run": outcome.statements_executed, "archived_ddl": archive.as_ref().map(|a| json!({ "note_id": a.note_id.to_string(), "migration_filename": a.migration_filename })) }).to_string()
         }
         Err(e) => json!({ "ok": false, "file": rel_file, "error": e.message() }).to_string(),
@@ -1509,13 +1657,21 @@ async fn handle_db_apply_schema_file(db: &PgPool, project_id: Uuid, arguments: &
 async fn handle_db_status(db: &PgPool, project_id: Uuid) -> String {
     let rows = sqlx::query("SELECT name, engine, hosting_mode, is_primary FROM project_database_config WHERE project_id = $1 ORDER BY is_primary DESC, LOWER(name)").bind(project_id).fetch_all(db).await;
     let connections: Vec<Value> = match rows {
-        Ok(rs) => rs.into_iter().map(|r| json!({
-            "name": r.try_get::<String, _>("name").unwrap_or_default(),
-            "engine": r.try_get::<Option<String>, _>("engine").unwrap_or(None),
-            "hosting_mode": r.try_get::<Option<String>, _>("hosting_mode").unwrap_or(None),
-            "is_primary": r.try_get::<bool, _>("is_primary").unwrap_or(false),
-        })).collect(),
-        Err(e) => return json!({ "ok": false, "error": format!("query connessioni fallita: {e}") }).to_string(),
+        Ok(rs) => rs
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "name": r.try_get::<String, _>("name").unwrap_or_default(),
+                    "engine": r.try_get::<Option<String>, _>("engine").unwrap_or(None),
+                    "hosting_mode": r.try_get::<Option<String>, _>("hosting_mode").unwrap_or(None),
+                    "is_primary": r.try_get::<bool, _>("is_primary").unwrap_or(false),
+                })
+            })
+            .collect(),
+        Err(e) => {
+            return json!({ "ok": false, "error": format!("query connessioni fallita: {e}") })
+                .to_string()
+        }
     };
     if connections.is_empty() {
         return json!({ "ok": true, "connections": [], "tables": [], "hint": "Nessun database configurato. Usa nexus_db_provision (mode=internal) per crearne uno." }).to_string();

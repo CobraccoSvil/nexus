@@ -17,8 +17,8 @@
 //! source_message_id, che e' il messaggio utente gia' usato dalla nota 'chat').
 
 use serde_json::json;
-use sqlx::Row;
 use sqlx::PgPool;
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::knowledge::auto_link::{self, NewNoteLinkInput};
@@ -31,8 +31,13 @@ async fn read_bool_setting(db: &PgPool, key: &str, default: bool) -> bool {
         .await
         .ok()
         .flatten();
-    v.map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "false" | "0" | "off" | "no"))
-        .unwrap_or(default)
+    v.map(|s| {
+        !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "off" | "no"
+        )
+    })
+    .unwrap_or(default)
 }
 
 async fn read_int_setting(db: &PgPool, key: &str, default: i64) -> i64 {
@@ -42,7 +47,8 @@ async fn read_int_setting(db: &PgPool, key: &str, default: i64) -> i64 {
         .await
         .ok()
         .flatten();
-    v.and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(default)
+    v.and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(default)
 }
 
 /// True se la frazione di caratteri CJK supera la soglia (allucinazione lingua).
@@ -103,7 +109,11 @@ async fn extract_modified_files(db: &PgPool, run_id: Uuid) -> Vec<String> {
 
 fn title_from_answer(task_type: &str, answer: &str) -> String {
     let first_line = answer.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let base = if task_type.is_empty() { "Run" } else { task_type };
+    let base = if task_type.is_empty() {
+        "Run"
+    } else {
+        task_type
+    };
     let mut t = format!("{}: {}", base, first_line.trim());
     if t.chars().count() > 120 {
         t = t.chars().take(117).collect::<String>() + "...";
@@ -143,7 +153,11 @@ pub async fn ingest_run_summary_to_kb(
         Ok(p) => p,
         Err(_) => return,
     };
-    let final_answer: String = row.try_get("final_answer").ok().flatten().unwrap_or_default();
+    let final_answer: String = row
+        .try_get("final_answer")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let iteration_count: i32 = row.try_get("iteration_count").unwrap_or(0);
     let task_type: String = row.try_get("task_type").unwrap_or_default();
     let agent_type: String = row.try_get("agent_type").unwrap_or_default();
@@ -175,7 +189,12 @@ pub async fn ingest_run_summary_to_kb(
 
         if read_bool_setting(db, "kb.lifecycle.promote_enabled", true).await {
             crate::knowledge::promote_notes_on_run_completed(
-                db, run_id, &file_paths, channels, project_id, &final_answer,
+                db,
+                run_id,
+                &file_paths,
+                channels,
+                project_id,
+                &final_answer,
             )
             .await;
         }
@@ -208,7 +227,8 @@ pub async fn ingest_run_summary_to_kb(
         return;
     }
     let min_chars = read_int_setting(db, "kb.ingest.min_chars", 300).await as usize;
-    if final_answer.chars().count() < min_chars || final_answer.starts_with("[brain error")
+    if final_answer.chars().count() < min_chars
+        || final_answer.starts_with("[brain error")
         || final_answer.starts_with("[Error")
     {
         return;
@@ -264,7 +284,8 @@ pub async fn ingest_run_summary_to_kb(
                 "status": "active",
                 "kind": "agent_summary",
             });
-            match crate::vector_memory::upsert_knowledge_point(db, &point_id, vector, payload).await {
+            match crate::vector_memory::upsert_knowledge_point(db, &point_id, vector, payload).await
+            {
                 Ok(_) => Some(point_id),
                 Err(e) => {
                     tracing::warn!(run_id = %run_id, error = %e, "kb.ingest: Qdrant upsert fallito (procedo senza embedding)");
@@ -316,7 +337,11 @@ pub async fn ingest_run_summary_to_kb(
     // Gated da kb.lifecycle.auto_deprecate_on_correction.
     if read_bool_setting(db, "kb.lifecycle.auto_deprecate_on_correction", true).await {
         crate::knowledge::deprecate_notes_on_correction(
-            db, project_id, note_id, &file_paths, channels,
+            db,
+            project_id,
+            note_id,
+            &file_paths,
+            channels,
         )
         .await;
     }

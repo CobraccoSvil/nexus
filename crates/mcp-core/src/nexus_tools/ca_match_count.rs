@@ -8,7 +8,11 @@ pub struct CaMatchCountTool;
 
 #[async_trait]
 impl NexusToolHandler for CaMatchCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(&ctx.project_root, &["match ", " => ", "_ =>"]);
         Ok(json!({
             "ok": true,
@@ -18,5 +22,7 @@ impl NexusToolHandler for CaMatchCountTool {
             "wildcard_arm": counts[2],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

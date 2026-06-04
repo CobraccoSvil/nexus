@@ -18,11 +18,7 @@ pub struct AstParseTool;
 
 #[async_trait]
 impl NexusToolHandler for AstParseTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let (content, file_path) = if let Some(c) = args.get("content").and_then(Value::as_str) {
             let lang_hint = args
                 .get("language")
@@ -97,11 +93,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_inline_rust() {
-        let ctx = NexusToolContext::new(
-            std::env::temp_dir(),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-        );
+        let ctx = NexusToolContext::new(std::env::temp_dir(), uuid::Uuid::nil(), uuid::Uuid::nil());
         let args = json!({
             "content": "pub fn hello() {}\npub struct Foo;",
             "language": "rust"

@@ -8,10 +8,23 @@ pub struct GitWorktreeListTool;
 
 #[async_trait]
 impl NexusToolHandler for GitWorktreeListTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let out = run_cmd("git", &["worktree", "list", "--porcelain"], &ctx.project_root, ctx.timeout_secs).await?;
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let out = run_cmd(
+            "git",
+            &["worktree", "list", "--porcelain"],
+            &ctx.project_root,
+            ctx.timeout_secs,
+        )
+        .await?;
         if !out.success() {
-            return Err(NexusToolError::Exec { exit_code: out.exit_code, stderr: out.stderr });
+            return Err(NexusToolError::Exec {
+                exit_code: out.exit_code,
+                stderr: out.stderr,
+            });
         }
         let mut worktrees: Vec<Value> = Vec::new();
         let mut current = Map::new();
@@ -33,5 +46,7 @@ impl NexusToolHandler for GitWorktreeListTool {
         }
         Ok(json!({"ok": true, "count": worktrees.len(), "worktrees": worktrees}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only_subproc()
+    }
 }

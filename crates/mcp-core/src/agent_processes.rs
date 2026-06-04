@@ -1,6 +1,6 @@
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use sqlx::PgPool;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use uuid::Uuid;
@@ -86,19 +86,19 @@ pub async fn spawn_agent_process(
     //    non disponibile.
 
     // I servizi senza immagine dedicata girano direttamente sull'host.
-    let use_docker = will_use_docker
-        && (kind != "service" || service_image.is_some());
+    let use_docker = will_use_docker && (kind != "service" || service_image.is_some());
 
     let mut child = if use_docker {
         // use_docker e' true SOLO se will_use_docker E (kind != "service"
         // OR service_image.is_some()). Ma project_root resta Option; se
         // assente il caller ha sbagliato a invocare: errore esplicito.
-        let root = project_root.as_ref()
+        let root = project_root
+            .as_ref()
             .ok_or_else(|| "project_root mancante con use_docker=true".to_string())?;
         let cwd = PathBuf::from(working_dir);
         let project_cfg = sandbox::load_project_sandbox_config(db, project_id).await;
-        let mut config = SandboxConfig::new(root.clone(), process_id)
-            .with_project_config(&project_cfg);
+        let mut config =
+            SandboxConfig::new(root.clone(), process_id).with_project_config(&project_cfg);
         if let Some(img) = service_image {
             config = config.with_image(img);
         }
@@ -111,7 +111,9 @@ pub async fn spawn_agent_process(
         let mut docker_cmd = sandbox::build_sandboxed_command(command, &cwd, &env_vars, &config);
 
         #[cfg(unix)]
-        { docker_cmd.process_group(0); }
+        {
+            docker_cmd.process_group(0);
+        }
 
         docker_cmd
             .spawn()
@@ -268,7 +270,12 @@ pub async fn spawn_agent_process(
 }
 
 /// Flush buffered output to DB (append-only, cap at 50KB per field)
-async fn flush_output(db: &PgPool, process_id: Uuid, stdout_buf: &mut String, stderr_buf: &mut String) {
+async fn flush_output(
+    db: &PgPool,
+    process_id: Uuid,
+    stdout_buf: &mut String,
+    stderr_buf: &mut String,
+) {
     if stdout_buf.is_empty() && stderr_buf.is_empty() {
         return;
     }
@@ -312,8 +319,16 @@ pub async fn read_process_output(
     let pid: Option<i32> = row.try_get("pid").unwrap_or(None);
 
     // Take last max_chars
-    let out_tail = if output.len() > max_chars { &output[output.len() - max_chars..] } else { &output };
-    let err_tail = if error_output.len() > max_chars { &error_output[error_output.len() - max_chars..] } else { &error_output };
+    let out_tail = if output.len() > max_chars {
+        &output[output.len() - max_chars..]
+    } else {
+        &output
+    };
+    let err_tail = if error_output.len() > max_chars {
+        &error_output[error_output.len() - max_chars..]
+    } else {
+        &error_output
+    };
 
     Ok(ProcessOutput {
         process_id,
@@ -382,10 +397,7 @@ pub async fn stop_process(db: &PgPool, process_id: Uuid) -> Result<String, Strin
 }
 
 /// List recent processes for a project
-pub async fn list_processes(
-    db: &PgPool,
-    project_id: Uuid,
-) -> Result<Vec<ProcessSummary>, String> {
+pub async fn list_processes(db: &PgPool, project_id: Uuid) -> Result<Vec<ProcessSummary>, String> {
     let rows = sqlx::query(
         r#"SELECT id, label, command, pid, status, exit_code, created_at
            FROM agent_processes

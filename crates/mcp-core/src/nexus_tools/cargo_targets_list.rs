@@ -8,7 +8,11 @@ pub struct CargoTargetsListTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoTargetsListTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let out = run_cmd(
             "cargo",
             &["metadata", "--format-version=1", "--no-deps"],
@@ -17,7 +21,10 @@ impl NexusToolHandler for CargoTargetsListTool {
         )
         .await?;
         if !out.success() {
-            return Err(NexusToolError::Exec { exit_code: out.exit_code, stderr: out.stderr });
+            return Err(NexusToolError::Exec {
+                exit_code: out.exit_code,
+                stderr: out.stderr,
+            });
         }
         let parsed: Value = serde_json::from_str(&out.stdout).unwrap_or_else(|_| json!({}));
         let mut bins = 0usize;
@@ -30,8 +37,14 @@ impl NexusToolHandler for CargoTargetsListTool {
             for p in pkgs {
                 if let Some(ts) = p.get("targets").and_then(Value::as_array) {
                     for t in ts {
-                        let kinds: Vec<String> = t.get("kind").and_then(Value::as_array)
-                            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        let kinds: Vec<String> = t
+                            .get("kind")
+                            .and_then(Value::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default();
                         for k in &kinds {
                             match k.as_str() {
@@ -59,5 +72,7 @@ impl NexusToolHandler for CargoTargetsListTool {
             "duration_ms": out.duration_ms,
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only_subproc()
+    }
 }

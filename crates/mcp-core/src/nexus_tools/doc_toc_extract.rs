@@ -9,7 +9,10 @@ pub struct DocTocExtractTool;
 #[async_trait]
 impl NexusToolHandler for DocTocExtractTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let path = args.get("path").and_then(Value::as_str).unwrap_or("README.md");
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("README.md");
         let pb = std::path::PathBuf::from(path);
         if pb.components().any(|c| matches!(c, Component::ParentDir)) {
             return Err(NexusToolError::BadInput("path traversal denied".into()));
@@ -35,5 +38,7 @@ impl NexusToolHandler for DocTocExtractTool {
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"}}})
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

@@ -35,22 +35,41 @@ const INSTALL_TIMEOUT_SECS: u64 = 600;
 /// Esclude esplicitamente label che contengono "backend" / "api" / "fastify" / "express".
 /// Fallback: porte >= 5000 (dev typical), poi porta minore tra non-backend, poi 5173 (Vite default).
 fn pick_dev_port(allocations: &[(i32, String)]) -> i32 {
-    let dev_kw = ["dev", "app", "http", "web", "frontend", "serve", "server", "vite", "next", "react"];
-    let backend_kw = ["backend", "api", "fastify", "express", "server-api", "dotnet", "graphql"];
+    let dev_kw = [
+        "dev", "app", "http", "web", "frontend", "serve", "server", "vite", "next", "react",
+    ];
+    let backend_kw = [
+        "backend",
+        "api",
+        "fastify",
+        "express",
+        "server-api",
+        "dotnet",
+        "graphql",
+    ];
 
-    let is_backend = |label: &str| backend_kw.iter().any(|bk| label.to_lowercase().contains(bk));
+    let is_backend = |label: &str| {
+        backend_kw
+            .iter()
+            .any(|bk| label.to_lowercase().contains(bk))
+    };
 
     for kw in &dev_kw {
-        if let Some((port, _)) = allocations.iter().find(|(_, l)| {
-            l.to_lowercase().contains(kw) && !is_backend(l)
-        }) {
+        if let Some((port, _)) = allocations
+            .iter()
+            .find(|(_, l)| l.to_lowercase().contains(kw) && !is_backend(l))
+        {
             return *port;
         }
     }
 
     // Tra non-backend, prefer porte >= 5000
     let non_backend: Vec<_> = allocations.iter().filter(|(_, l)| !is_backend(l)).collect();
-    if let Some((port, _)) = non_backend.iter().filter(|(p, _)| *p >= 5000).min_by_key(|(p, _)| *p) {
+    if let Some((port, _)) = non_backend
+        .iter()
+        .filter(|(p, _)| *p >= 5000)
+        .min_by_key(|(p, _)| *p)
+    {
         return *port;
     }
     if let Some((port, _)) = non_backend.iter().min_by_key(|(p, _)| *p) {
@@ -108,13 +127,11 @@ async fn run_with_timeout(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let exit_status = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        child.wait(),
-    )
-    .await
-    .map_err(|_| format!("timeout dopo {}s eseguendo {}", timeout_secs, cmd))?
-    .map_err(|e| format!("wait {}: {}", cmd, e))?;
+    let exit_status =
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child.wait())
+            .await
+            .map_err(|_| format!("timeout dopo {}s eseguendo {}", timeout_secs, cmd))?
+            .map_err(|e| format!("wait {}: {}", cmd, e))?;
 
     if let Some(mut s) = stdout {
         let _ = s.read_to_string(&mut stdout_buf).await;
@@ -185,7 +202,12 @@ pub async fn install_playwright(
         INSTALL_TIMEOUT_SECS,
     )
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("npm install fallito: {}", e)))?;
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("npm install fallito: {}", e),
+        )
+    })?;
 
     if install_result.2 != 0 {
         return Err(api_error(
@@ -193,7 +215,12 @@ pub async fn install_playwright(
             format!(
                 "npm install -D @playwright/test fallito (exit {}): {}",
                 install_result.2,
-                install_result.1.lines().take(10).collect::<Vec<_>>().join(" | ")
+                install_result
+                    .1
+                    .lines()
+                    .take(10)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
             ),
         ));
     }
@@ -220,7 +247,14 @@ pub async fn install_playwright(
     let browser_result = if passwordless_sudo {
         run_with_timeout(
             "sudo",
-            &["-n", "npx", "playwright", "install", "--with-deps", "chromium"],
+            &[
+                "-n",
+                "npx",
+                "playwright",
+                "install",
+                "--with-deps",
+                "chromium",
+            ],
             &target_dir,
             INSTALL_TIMEOUT_SECS,
         )
@@ -234,8 +268,12 @@ pub async fn install_playwright(
         )
         .await
     };
-    let browser_result = browser_result
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("playwright install fallito: {}", e)))?;
+    let browser_result = browser_result.map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("playwright install fallito: {}", e),
+        )
+    })?;
 
     let browser_status = browser_result.2;
 
@@ -252,13 +290,17 @@ pub async fn install_playwright(
     };
 
     // ── 4. Leggi port allocations e scegli dev port ──────────────────────
-    let port_rows = sqlx::query(
-        "SELECT port, label FROM nexus_port_allocations WHERE project_id=$1"
-    )
-    .bind(project_id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB query ports: {}", e)))?;
+    let port_rows =
+        sqlx::query("SELECT port, label FROM nexus_port_allocations WHERE project_id=$1")
+            .bind(project_id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("DB query ports: {}", e),
+                )
+            })?;
 
     let allocations: Vec<(i32, String)> = port_rows
         .iter()
@@ -300,13 +342,21 @@ export default defineConfig({{
 
     tokio::fs::write(&config_path, &config_content)
         .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("scrittura config: {}", e)))?;
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("scrittura config: {}", e),
+            )
+        })?;
 
     // ── 6. Crea e2e/smoke.spec.ts ────────────────────────────────────────
     let e2e_dir = target_dir.join("e2e");
-    tokio::fs::create_dir_all(&e2e_dir)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir e2e: {}", e)))?;
+    tokio::fs::create_dir_all(&e2e_dir).await.map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("mkdir e2e: {}", e),
+        )
+    })?;
 
     let smoke_path = e2e_dir.join("smoke.spec.ts");
     let smoke_exists = smoke_path.is_file();
@@ -333,7 +383,12 @@ test('app root risponde senza errori console', async ({ page }) => {
 "#;
         tokio::fs::write(&smoke_path, smoke_content)
             .await
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("scrittura smoke: {}", e)))?;
+            .map_err(|e| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("scrittura smoke: {}", e),
+                )
+            })?;
     }
 
     // ── 7. INSERT in settings: playwright_enabled per il progetto ────────
@@ -411,8 +466,12 @@ async fn detect_missing_chromium_libs() -> Vec<String> {
         None => return Vec::new(),
     };
     // Trova l'eseguibile (chrome-headless-shell o chrome)
-    let candidates = ["chrome-headless-shell-linux64/chrome-headless-shell", "chrome-linux/chrome"];
-    let exe = candidates.iter()
+    let candidates = [
+        "chrome-headless-shell-linux64/chrome-headless-shell",
+        "chrome-linux/chrome",
+    ];
+    let exe = candidates
+        .iter()
         .map(|c| chromium_dir.join(c))
         .find(|p| std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false));
     let exe = match exe {
@@ -421,7 +480,9 @@ async fn detect_missing_chromium_libs() -> Vec<String> {
     };
     // Esegui ldd
     let output = match Command::new("ldd").arg(&exe).output().await {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr),
+        Ok(o) => {
+            String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)
+        }
         Err(_) => return Vec::new(),
     };
     let mut missing = Vec::new();
@@ -445,34 +506,76 @@ fn chromium_apt_packages_for(missing: &[String]) -> Vec<&'static str> {
     for m in missing {
         let lib = m.split('.').next().unwrap_or(m);
         match lib {
-            "libnspr4" => { pkgs.insert("libnspr4"); }
-            "libnss3" | "libnssutil3" | "libsmime3" => { pkgs.insert("libnss3"); }
+            "libnspr4" => {
+                pkgs.insert("libnspr4");
+            }
+            "libnss3" | "libnssutil3" | "libsmime3" => {
+                pkgs.insert("libnss3");
+            }
             "libatk-bridge-2" | "libatk-1" => {
                 pkgs.insert("libatk-bridge2.0-0");
                 pkgs.insert("libatk1.0-0");
             }
-            "libxkbcommon" => { pkgs.insert("libxkbcommon0"); }
-            "libxcomposite" => { pkgs.insert("libxcomposite1"); }
-            "libxdamage" => { pkgs.insert("libxdamage1"); }
-            "libxfixes" => { pkgs.insert("libxfixes3"); }
-            "libxrandr" => { pkgs.insert("libxrandr2"); }
-            "libgbm" => { pkgs.insert("libgbm1"); }
-            "libasound" => { pkgs.insert("libasound2t64"); }
-            "libcairo" => { pkgs.insert("libcairo2"); }
-            "libpango-1" => { pkgs.insert("libpango-1.0-0"); }
-            "libdrm" => { pkgs.insert("libdrm2"); }
-            "libcups" => { pkgs.insert("libcups2"); }
-            "libatspi" => { pkgs.insert("libatspi2.0-0"); }
+            "libxkbcommon" => {
+                pkgs.insert("libxkbcommon0");
+            }
+            "libxcomposite" => {
+                pkgs.insert("libxcomposite1");
+            }
+            "libxdamage" => {
+                pkgs.insert("libxdamage1");
+            }
+            "libxfixes" => {
+                pkgs.insert("libxfixes3");
+            }
+            "libxrandr" => {
+                pkgs.insert("libxrandr2");
+            }
+            "libgbm" => {
+                pkgs.insert("libgbm1");
+            }
+            "libasound" => {
+                pkgs.insert("libasound2t64");
+            }
+            "libcairo" => {
+                pkgs.insert("libcairo2");
+            }
+            "libpango-1" => {
+                pkgs.insert("libpango-1.0-0");
+            }
+            "libdrm" => {
+                pkgs.insert("libdrm2");
+            }
+            "libcups" => {
+                pkgs.insert("libcups2");
+            }
+            "libatspi" => {
+                pkgs.insert("libatspi2.0-0");
+            }
             _ => {}
         }
     }
     // Default sicuro: se anche un singolo .so manca, aggiungo set completo
     // (apt e' idempotent, costa poco).
     if !missing.is_empty() {
-        for p in ["libnspr4", "libnss3", "libatk-bridge2.0-0", "libatk1.0-0",
-                  "libxkbcommon0", "libxcomposite1", "libxdamage1", "libxfixes3",
-                  "libxrandr2", "libgbm1", "libasound2t64", "libcairo2",
-                  "libpango-1.0-0", "libdrm2", "libcups2", "libatspi2.0-0"] {
+        for p in [
+            "libnspr4",
+            "libnss3",
+            "libatk-bridge2.0-0",
+            "libatk1.0-0",
+            "libxkbcommon0",
+            "libxcomposite1",
+            "libxdamage1",
+            "libxfixes3",
+            "libxrandr2",
+            "libgbm1",
+            "libasound2t64",
+            "libcairo2",
+            "libpango-1.0-0",
+            "libdrm2",
+            "libcups2",
+            "libatspi2.0-0",
+        ] {
             pkgs.insert(p);
         }
     }

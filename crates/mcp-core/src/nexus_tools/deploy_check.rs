@@ -75,7 +75,8 @@ impl NexusToolHandler for DeployCheckTool {
                     "detail": if synced { "in sync with upstream".to_string() } else { format!("HEAD {} vs upstream {}", &head_sha[..7.min(head_sha.len())], &ups_sha[..7.min(ups_sha.len())]) }
                 }));
                 if !synced {
-                    warnings.push("HEAD diverge da upstream — ricordati push prima del deploy".into());
+                    warnings
+                        .push("HEAD diverge da upstream — ricordati push prima del deploy".into());
                 }
             }
             _ => {
@@ -126,20 +127,20 @@ impl NexusToolHandler for DeployCheckTool {
         }
 
         // 5. Lockfile tracking
-        let lockfiles = ["Cargo.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"];
+        let lockfiles = [
+            "Cargo.lock",
+            "package-lock.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+        ];
         let mut lockfile_issues: Vec<String> = Vec::new();
         for lf in &lockfiles {
             let p = ctx.project_root.join(lf);
             if p.exists() {
                 // Verifica se è tracked con git check-ignore
-                let check = run_cmd(
-                    "git",
-                    &["check-ignore", lf],
-                    &ctx.project_root,
-                    10,
-                )
-                .await
-                .ok();
+                let check = run_cmd("git", &["check-ignore", lf], &ctx.project_root, 10)
+                    .await
+                    .ok();
                 // check-ignore exit=0 significa "è ignorato" → problema
                 if let Some(c) = check {
                     if c.exit_code == 0 {
@@ -198,10 +199,8 @@ mod tests {
     struct TmpDir(std::path::PathBuf);
     impl TmpDir {
         fn new() -> Self {
-            let p = std::env::temp_dir().join(format!(
-                "nexus-deploycheck-{}",
-                uuid::Uuid::new_v4()
-            ));
+            let p =
+                std::env::temp_dir().join(format!("nexus-deploycheck-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&p).unwrap();
             TmpDir(p)
         }

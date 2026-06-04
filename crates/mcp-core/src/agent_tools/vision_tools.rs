@@ -161,10 +161,7 @@ pub(super) async fn tool_nexus_describe_image_attachment(
 }
 
 fn is_image_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "png" | "jpeg" | "gif" | "webp" | "svg" | "image"
-    )
+    matches!(kind, "png" | "jpeg" | "gif" | "webp" | "svg" | "image")
 }
 
 /// Legge agent.attachment.image_max_bytes da settings. Se mancante o DB

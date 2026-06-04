@@ -1,32 +1,43 @@
 //! `runner` — orchestratore migration: delega all'adapter del progetto,
 //! blocca DDL diretto e gestisce il guardrail con errore strutturato.
 
-use std::sync::Arc;
-use uuid::Uuid;
 use crate::project_db::{
     adapters::{
-        MigrationAdapter,
-        alembic::AlembicAdapter,
-        django::DjangoAdapter,
-        flyway::FlywayAdapter,
-        generic_sql::GenericSqlAdapter,
-        knex::KnexAdapter,
-        liquibase::LiquibaseAdapter,
-        prisma::PrismaAdapter,
-        sqlx_migrate::SqlxMigrateAdapter,
+        alembic::AlembicAdapter, django::DjangoAdapter, flyway::FlywayAdapter,
+        generic_sql::GenericSqlAdapter, knex::KnexAdapter, liquibase::LiquibaseAdapter,
+        prisma::PrismaAdapter, sqlx_migrate::SqlxMigrateAdapter, MigrationAdapter,
     },
-    AppliedMigration, Migration, MigrationTool, ProjectDbContext, ProjectDbError, RolledBackMigration,
+    AppliedMigration, Migration, MigrationTool, ProjectDbContext, ProjectDbError,
+    RolledBackMigration,
 };
+use std::sync::Arc;
+use uuid::Uuid;
 
 /// Parole chiave DDL da bloccare quando il target è un progetto utente.
 const DDL_KEYWORDS: &[&str] = &[
-    "CREATE TABLE", "CREATE INDEX", "CREATE VIEW", "CREATE SEQUENCE",
-    "CREATE TYPE", "CREATE FUNCTION", "CREATE TRIGGER", "CREATE SCHEMA",
-    "ALTER TABLE", "ALTER COLUMN", "ALTER INDEX",
-    "DROP TABLE", "DROP INDEX", "DROP VIEW", "DROP COLUMN",
-    "DROP SCHEMA", "DROP SEQUENCE", "DROP TYPE", "DROP FUNCTION",
+    "CREATE TABLE",
+    "CREATE INDEX",
+    "CREATE VIEW",
+    "CREATE SEQUENCE",
+    "CREATE TYPE",
+    "CREATE FUNCTION",
+    "CREATE TRIGGER",
+    "CREATE SCHEMA",
+    "ALTER TABLE",
+    "ALTER COLUMN",
+    "ALTER INDEX",
+    "DROP TABLE",
+    "DROP INDEX",
+    "DROP VIEW",
+    "DROP COLUMN",
+    "DROP SCHEMA",
+    "DROP SEQUENCE",
+    "DROP TYPE",
+    "DROP FUNCTION",
     "DROP TRIGGER",
-    "TRUNCATE", "RENAME TABLE", "RENAME COLUMN",
+    "TRUNCATE",
+    "RENAME TABLE",
+    "RENAME COLUMN",
 ];
 
 /// Verifica se il SQL contiene istruzioni DDL.
@@ -107,12 +118,18 @@ impl MigrationRunner {
     }
 
     /// Applica tutte le migration pending al DB del progetto.
-    pub async fn apply_pending(&self, connection_url: &str) -> Result<Vec<AppliedMigration>, ProjectDbError> {
+    pub async fn apply_pending(
+        &self,
+        connection_url: &str,
+    ) -> Result<Vec<AppliedMigration>, ProjectDbError> {
         self.adapter.apply_pending(&self.ctx, connection_url).await
     }
 
     /// Annulla l'ultima migration.
-    pub async fn rollback_last(&self, connection_url: &str) -> Result<Option<RolledBackMigration>, ProjectDbError> {
+    pub async fn rollback_last(
+        &self,
+        connection_url: &str,
+    ) -> Result<Option<RolledBackMigration>, ProjectDbError> {
         self.adapter.rollback_last(&self.ctx, connection_url).await
     }
 }

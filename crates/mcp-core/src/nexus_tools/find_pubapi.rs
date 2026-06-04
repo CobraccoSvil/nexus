@@ -12,8 +12,15 @@ use std::path::Path;
 pub struct FindPubApiTool;
 
 const KINDS: &[&str] = &[
-    "pub fn", "pub struct", "pub enum", "pub trait", "pub mod", "pub const", "pub type",
-    "pub static", "pub use",
+    "pub fn",
+    "pub struct",
+    "pub enum",
+    "pub trait",
+    "pub mod",
+    "pub const",
+    "pub type",
+    "pub static",
+    "pub use",
 ];
 
 fn walk(
@@ -82,11 +89,7 @@ fn walk(
 
 #[async_trait]
 impl NexusToolHandler for FindPubApiTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let top = args
             .get("top")
             .and_then(Value::as_u64)

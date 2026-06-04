@@ -6,12 +6,12 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: 8903d1f21d0ce7368e9eef518b9a2a248dbb2287
+source_commit: a1dd3a174318e8a92a0808d9e39a37ac06afdf8a
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T04:26:47Z
+updated_at: 2026-06-04T04:27:55Z
 nexus_meta_version: 1
 ---
 
@@ -293,11 +293,11 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0279_db_tools_strict_naming.sql` | Migrazione 0279: elenco esatto dei tool DB e divieto di inventarne i nomi. |
 | `0280_context_token_brake.sql` | Mig 0280 — Freno TOKEN-based intra-turno (estensione FIX A-D ADR 0014). |
 | `0281_db_provision_idempotency_directive.sql` | Migrazione 0281: rafforza la direttiva di provisioning DB con il check |
-| `0282_fk_indexes.sql` | 0282: indici sulle foreign key prive di indice di supporto. |
 | `0282_wiki_unification_expand.sql` | Migrazione 0282: fase EXPAND dell'unificazione wiki (meta-docs + KB progetto). |
 | `0283_wiki_backfill_revisions.sql` | Migrazione 0283: fase MIGRATE dell'unificazione wiki. |
 | `0284_wiki_unified_view.sql` | Migrazione 0284: VIEW unificata wiki_docs (read-only). |
+| `0285_fk_indexes.sql` | 0285: indici sulle foreign key prive di indice di supporto. |
 
 **Totale**: 276 migrazioni.
 
-Ultima migrazione: `0284_wiki_unified_view.sql`.
+Ultima migrazione: `0285_fk_indexes.sql`.

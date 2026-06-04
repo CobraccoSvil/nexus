@@ -105,10 +105,7 @@ pub async fn register_project(
     let user_id = parse_user_id(&claims)?;
     let raw_input = body.absolute_path.trim();
     if raw_input.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Nome cartella mancante",
-        ));
+        return Err(api_error(StatusCode::BAD_REQUEST, "Nome cartella mancante"));
     }
     let raw_path = if raw_input.starts_with('/') {
         PathBuf::from(raw_input)
@@ -352,11 +349,15 @@ pub async fn register_project(
         let pid = project_id;
         tokio::spawn(async move {
             crate::project_workspace::run_configs::auto_populate_run_configs(
-                &db_clone, pid, &root_clone,
+                &db_clone,
+                pid,
+                &root_clone,
             )
             .await;
             crate::project_workspace::scan_ports::auto_populate_port_allocations(
-                &db_clone, pid, &root_clone,
+                &db_clone,
+                pid,
+                &root_clone,
             )
             .await;
         });
@@ -427,7 +428,10 @@ pub async fn delete_project(
     let context = load_project_context(&state.db, project_id, user_id).await?;
 
     if !context.access.can_manage_git && !context.access.can_write {
-        return Err(api_error(StatusCode::FORBIDDEN, "Non hai permessi per eliminare questo progetto"));
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "Non hai permessi per eliminare questo progetto",
+        ));
     }
 
     let force = params.get("force").map(|v| v == "true").unwrap_or(false);
@@ -637,6 +641,11 @@ pub async fn patch_project_default_profile(
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    tracing::info!("default_profile_id aggiornato per project_id={}", project_id);
-    Ok(Json(json!({ "ok": true, "profileId": profile_id.map(|id| id.to_string()) })))
+    tracing::info!(
+        "default_profile_id aggiornato per project_id={}",
+        project_id
+    );
+    Ok(Json(
+        json!({ "ok": true, "profileId": profile_id.map(|id| id.to_string()) }),
+    ))
 }

@@ -8,8 +8,15 @@ pub struct TestModuleCountTool;
 
 #[async_trait]
 impl NexusToolHandler for TestModuleCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let (counts, files) = scan_substrings(&ctx.project_root, &["mod tests {", "mod tests;", "#[cfg(test)]"]);
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let (counts, files) = scan_substrings(
+            &ctx.project_root,
+            &["mod tests {", "mod tests;", "#[cfg(test)]"],
+        );
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -18,5 +25,7 @@ impl NexusToolHandler for TestModuleCountTool {
             "cfg_test": counts[2],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

@@ -20,11 +20,7 @@ pub struct FormatCodeTool;
 
 #[async_trait]
 impl NexusToolHandler for FormatCodeTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let apply = args.get("apply").and_then(Value::as_bool).unwrap_or(false);
         let workspace_member = args
             .get("workspace_member")

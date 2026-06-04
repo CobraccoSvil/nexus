@@ -5,10 +5,10 @@
 //! tabelle Nexus direttamente.
 
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
+use crate::nexus_tools::db_helper::get_pool;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::Row;
-use crate::nexus_tools::db_helper::get_pool;
 
 pub struct ProjectDbSetConnectionTool;
 
@@ -43,13 +43,9 @@ impl NexusToolHandler for ProjectDbSetConnectionTool {
             .and_then(|v| v.as_str())
             .unwrap_or("internal");
 
-        let migration_tool = args
-            .get("migration_tool")
-            .and_then(|v| v.as_str());
+        let migration_tool = args.get("migration_tool").and_then(|v| v.as_str());
 
-        let migration_path = args
-            .get("migration_path")
-            .and_then(|v| v.as_str());
+        let migration_path = args.get("migration_path").and_then(|v| v.as_str());
 
         let is_primary = args
             .get("is_primary")
@@ -63,11 +59,12 @@ impl NexusToolHandler for ProjectDbSetConnectionTool {
         let project_id = ctx.project_id;
 
         // Verifica che il progetto esista
-        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)")
-            .bind(project_id)
-            .fetch_one(&pool)
-            .await
-            .map_err(|e| NexusToolError::BadInput(format!("verifica progetto: {}", e)))?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)")
+                .bind(project_id)
+                .fetch_one(&pool)
+                .await
+                .map_err(|e| NexusToolError::BadInput(format!("verifica progetto: {}", e)))?;
 
         if !exists {
             pool.close().await;
@@ -82,8 +79,12 @@ impl NexusToolHandler for ProjectDbSetConnectionTool {
         // ruolo e database dedicato per il progetto con REVOKE sui DB infrastruttura.
         let effective_dsn = if hosting_mode == "internal" && engine == "postgres" {
             match super::db_helper::ensure_project_db_isolation(
-                &pool, project_id, connection_string,
-            ).await {
+                &pool,
+                project_id,
+                connection_string,
+            )
+            .await
+            {
                 Ok(isolated) => isolated,
                 Err(e) => {
                     tracing::warn!(
@@ -182,7 +183,11 @@ impl NexusToolHandler for ProjectDbSetConnectionTool {
                 let saved_name: String = r.try_get("name").unwrap_or_default();
                 let saved_engine: Option<String> = r.try_get("engine").unwrap_or(None);
                 let saved_dsn: Option<String> = r.try_get("connection_string").unwrap_or(None);
-                let action_str = if existing_id.is_some() { "updated" } else { "created" };
+                let action_str = if existing_id.is_some() {
+                    "updated"
+                } else {
+                    "created"
+                };
 
                 // Notifica il pannello DB frontend via dispatcher SSE
                 nexus_events::dispatcher::emit_global(

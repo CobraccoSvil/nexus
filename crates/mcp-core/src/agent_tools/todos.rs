@@ -41,10 +41,16 @@ pub async fn tool_nexus_todo_write(ctx: &AgentToolContext, input: &Value) -> Str
         None => return err("parametro 'action' obbligatorio (create|check|add|update)"),
     };
     if !matches!(action, "create" | "check" | "add" | "update") {
-        return err(&format!("action '{action}' non valida (create|check|add|update)"));
+        return err(&format!(
+            "action '{action}' non valida (create|check|add|update)"
+        ));
     }
 
-    let run_id = match input.get("run_id").and_then(Value::as_str).and_then(|s| Uuid::parse_str(s).ok()) {
+    let run_id = match input
+        .get("run_id")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
         Some(r) => r,
         None => return err("parametro 'run_id' obbligatorio (uuid dell'agent_run corrente)"),
     };
@@ -58,17 +64,18 @@ pub async fn tool_nexus_todo_write(ctx: &AgentToolContext, input: &Value) -> Str
     let project_id = ctx.project_id;
 
     // 2. Verifica che il run_id appartenga al project_id (isolation multi-tenant).
-    let run_check: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT project_id FROM agent_runs WHERE id = $1 LIMIT 1",
-    )
-    .bind(run_id)
-    .fetch_optional(&*ctx.db)
-    .await
-    .ok()
-    .flatten();
+    let run_check: Option<(Uuid,)> =
+        sqlx::query_as("SELECT project_id FROM agent_runs WHERE id = $1 LIMIT 1")
+            .bind(run_id)
+            .fetch_optional(&*ctx.db)
+            .await
+            .ok()
+            .flatten();
     match run_check {
         Some((p,)) if p == project_id => {} // OK
-        Some(_) => return err("run_id non appartiene al project_id corrente (isolation violation)"),
+        Some(_) => {
+            return err("run_id non appartiene al project_id corrente (isolation violation)")
+        }
         None => return err(&format!("run_id {run_id} non trovato in agent_runs")),
     };
 
@@ -89,7 +96,10 @@ async fn create_plan(
     todos_in: &[Value],
     input: &Value,
 ) -> String {
-    let planner_model = input.get("planner_model").and_then(Value::as_str).unwrap_or("unknown");
+    let planner_model = input
+        .get("planner_model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
 
     // Ricava thread_id (sessione) per indicizzazione.
     let thread_id = ctx
@@ -175,7 +185,10 @@ async fn create_plan(
         if !VALID_STATUSES.contains(&status) {
             return err(&format!("todo[{idx}]: status '{status}' non valido"));
         }
-        let priority = t.get("priority").and_then(Value::as_str).unwrap_or("normal");
+        let priority = t
+            .get("priority")
+            .and_then(Value::as_str)
+            .unwrap_or("normal");
         if !VALID_PRIORITIES.contains(&priority) {
             return err(&format!("todo[{idx}]: priority '{priority}' non valida"));
         }
@@ -188,11 +201,18 @@ async fn create_plan(
             .cloned()
             .unwrap_or_else(|| json!([]));
         // Comp.3a: chiave logica del nodo + chiavi delle dipendenze.
-        let node_key = t.get("node_key").and_then(Value::as_str).filter(|s| !s.is_empty());
+        let node_key = t
+            .get("node_key")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
         let dep_keys: Vec<String> = t
             .get("dep_keys")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let row = sqlx::query(
@@ -253,26 +273,24 @@ async fn add_todos(
     todos_in: &[Value],
 ) -> String {
     // Verifica che il plan esista.
-    let plan_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM nexus_agent_plans WHERE run_id = $1)",
-    )
-    .bind(run_id)
-    .fetch_one(&*ctx.db)
-    .await
-    .unwrap_or(false);
+    let plan_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM nexus_agent_plans WHERE run_id = $1)")
+            .bind(run_id)
+            .fetch_one(&*ctx.db)
+            .await
+            .unwrap_or(false);
     if !plan_exists {
         return err(&format!(
             "plan inesistente per run_id={run_id}: chiama action='create' prima"
         ));
     }
 
-    let max_seq: Option<i32> = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(seq), 0) FROM nexus_agent_todos WHERE run_id = $1",
-    )
-    .bind(run_id)
-    .fetch_one(&*ctx.db)
-    .await
-    .ok();
+    let max_seq: Option<i32> =
+        sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM nexus_agent_todos WHERE run_id = $1")
+            .bind(run_id)
+            .fetch_one(&*ctx.db)
+            .await
+            .ok();
     let base = max_seq.unwrap_or(0);
 
     let mut tx = match ctx.db.begin().await {
@@ -289,7 +307,10 @@ async fn add_todos(
         if !VALID_STATUSES.contains(&status) {
             return err(&format!("todo[{idx}]: status '{status}' non valido"));
         }
-        let priority = t.get("priority").and_then(Value::as_str).unwrap_or("normal");
+        let priority = t
+            .get("priority")
+            .and_then(Value::as_str)
+            .unwrap_or("normal");
         let acceptance = t
             .get("acceptance_criteria")
             .cloned()
@@ -348,9 +369,17 @@ async fn update_status(
     // M15.1: traccia (id, status) aggiornati per emettere TodoUpdated dopo il commit.
     let mut updated: Vec<(Uuid, String)> = Vec::new();
     for (idx, t) in todos_in.iter().enumerate() {
-        let id = match t.get("id").and_then(Value::as_str).and_then(|s| Uuid::parse_str(s).ok()) {
+        let id = match t
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|s| Uuid::parse_str(s).ok())
+        {
             Some(u) => u,
-            None => return err(&format!("todo[{idx}]: 'id' uuid obbligatorio per check/update")),
+            None => {
+                return err(&format!(
+                    "todo[{idx}]: 'id' uuid obbligatorio per check/update"
+                ))
+            }
         };
         let new_status = if check_mode {
             "completed".to_string()
@@ -399,7 +428,12 @@ async fn update_status(
     .await
     .ok()
     .flatten()
-    .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "false" | "0" | "off" | "no"))
+    .map(|s| {
+        !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "off" | "no"
+        )
+    })
     .unwrap_or(true);
     if live_events {
         for (id, status) in &updated {

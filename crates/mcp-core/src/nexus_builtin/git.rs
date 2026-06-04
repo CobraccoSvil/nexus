@@ -10,24 +10,42 @@ pub(super) async fn handle_git_log(db: &PgPool, args: &Value) -> String {
         Ok(id) => id,
         Err(e) => return e,
     };
-    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20).min(100);
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(20)
+        .min(100);
     let root = match get_project_root(db, project_id).await {
         Ok(r) => r,
         Err(e) => return e,
     };
     let n_str = limit.to_string();
-    match run_git(&root, &["log", &format!("-{}", n_str), "--pretty=format:%H|%an|%ae|%ai|%s", "--no-merges"]).await {
+    match run_git(
+        &root,
+        &[
+            "log",
+            &format!("-{}", n_str),
+            "--pretty=format:%H|%an|%ae|%ai|%s",
+            "--no-merges",
+        ],
+    )
+    .await
+    {
         Ok(out) => {
-            let commits: Vec<Value> = out.lines().filter(|l| !l.is_empty()).map(|l| {
-                let parts: Vec<&str> = l.splitn(5, '|').collect();
-                json!({
-                    "hash": parts.first().copied().unwrap_or(""),
-                    "author": parts.get(1).copied().unwrap_or(""),
-                    "email": parts.get(2).copied().unwrap_or(""),
-                    "date": parts.get(3).copied().unwrap_or(""),
-                    "message": parts.get(4).copied().unwrap_or(""),
+            let commits: Vec<Value> = out
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| {
+                    let parts: Vec<&str> = l.splitn(5, '|').collect();
+                    json!({
+                        "hash": parts.first().copied().unwrap_or(""),
+                        "author": parts.get(1).copied().unwrap_or(""),
+                        "email": parts.get(2).copied().unwrap_or(""),
+                        "date": parts.get(3).copied().unwrap_or(""),
+                        "message": parts.get(4).copied().unwrap_or(""),
+                    })
                 })
-            }).collect();
+                .collect();
             format_json(&json!({ "commits": commits, "count": commits.len() }))
         }
         Err(e) => e,
@@ -65,14 +83,28 @@ pub(super) async fn handle_git_branches(db: &PgPool, args: &Value) -> String {
         Ok(r) => r,
         Err(e) => return e,
     };
-    match run_git(&root, &["branch", "-a", "--format=%(refname:short)|%(HEAD)"]).await {
+    match run_git(
+        &root,
+        &["branch", "-a", "--format=%(refname:short)|%(HEAD)"],
+    )
+    .await
+    {
         Ok(out) => {
-            let branches: Vec<Value> = out.lines().filter(|l| !l.is_empty()).map(|l| {
-                let parts: Vec<&str> = l.splitn(2, '|').collect();
-                let name = parts.first().copied().unwrap_or("").trim_start_matches("* ").to_string();
-                let is_current = parts.get(1).copied().unwrap_or("") == "*";
-                json!({ "name": name, "current": is_current })
-            }).collect();
+            let branches: Vec<Value> = out
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| {
+                    let parts: Vec<&str> = l.splitn(2, '|').collect();
+                    let name = parts
+                        .first()
+                        .copied()
+                        .unwrap_or("")
+                        .trim_start_matches("* ")
+                        .to_string();
+                    let is_current = parts.get(1).copied().unwrap_or("") == "*";
+                    json!({ "name": name, "current": is_current })
+                })
+                .collect();
             format_json(&json!({ "branches": branches }))
         }
         Err(e) => e,

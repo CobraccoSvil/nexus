@@ -21,11 +21,7 @@ pub struct RenameSymbolTool;
 
 #[async_trait]
 impl NexusToolHandler for RenameSymbolTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let path = args
             .get("path")
             .and_then(Value::as_str)
@@ -125,7 +121,11 @@ mod tests {
     async fn test_rename_preview() {
         let tmp = std::env::temp_dir().join(format!("rs_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(tmp.join("x.rs"), "pub fn foo() { foo_helper(); }\nfn foo_helper() {}").unwrap();
+        std::fs::write(
+            tmp.join("x.rs"),
+            "pub fn foo() { foo_helper(); }\nfn foo_helper() {}",
+        )
+        .unwrap();
         let ctx = NexusToolContext::new(tmp.clone(), uuid::Uuid::nil(), uuid::Uuid::nil());
         let out = RenameSymbolTool
             .execute(

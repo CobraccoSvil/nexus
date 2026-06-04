@@ -8,7 +8,11 @@ pub struct MetaCatalogCountTool;
 
 #[async_trait]
 impl NexusToolHandler for MetaCatalogCountTool {
-    async fn execute(&self, _ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        _ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         match NexusToolCatalog::global() {
             Some(cat) => Ok(json!({
                 "ok": true,
@@ -18,5 +22,7 @@ impl NexusToolHandler for MetaCatalogCountTool {
             None => Ok(json!({"ok": false, "error": "catalog not initialized"})),
         }
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

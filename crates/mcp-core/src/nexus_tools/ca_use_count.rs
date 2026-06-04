@@ -8,10 +8,20 @@ pub struct CaUseCountTool;
 
 #[async_trait]
 impl NexusToolHandler for CaUseCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(
             &ctx.project_root,
-            &["use ", "use crate::", "use super::", "use std::", "pub use "],
+            &[
+                "use ",
+                "use crate::",
+                "use super::",
+                "use std::",
+                "pub use ",
+            ],
         );
         Ok(json!({
             "ok": true,
@@ -23,5 +33,7 @@ impl NexusToolHandler for CaUseCountTool {
             "pub_use": counts[4],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

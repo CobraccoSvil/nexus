@@ -77,9 +77,8 @@ pub async fn list_notes(
         bind_idx + 1
     );
 
-    let count_sql = format!(
-        "SELECT COUNT(*) as cnt FROM project_knowledge_notes WHERE {where_clause}"
-    );
+    let count_sql =
+        format!("SELECT COUNT(*) as cnt FROM project_knowledge_notes WHERE {where_clause}");
 
     // Usiamo query raw per la flessibilita' dei bind dinamici
     let mut query = sqlx::query(&sql).bind(project_id);
@@ -109,10 +108,7 @@ pub async fn list_notes(
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let total = count_query
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(0);
+    let total = count_query.fetch_one(&state.db).await.unwrap_or(0);
 
     let notes: Vec<Value> = rows
         .iter()
@@ -390,14 +386,12 @@ pub async fn patch_note(
     // record_revision (vedi docs_core/revisions.rs). Una SOLA query SELECT
     // legge title+tags correnti in un colpo (no N+1).
     if let Some(ref new_body) = body.body_md {
-        let row = sqlx::query(
-            "SELECT title, tags FROM project_knowledge_notes WHERE id = $1",
-        )
-        .bind(note_id)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten();
+        let row = sqlx::query("SELECT title, tags FROM project_knowledge_notes WHERE id = $1")
+            .bind(note_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
         if let Some(r) = row {
             let title_now: String = r.try_get("title").unwrap_or_default();
             let tags_now: Vec<String> = body
@@ -445,14 +439,15 @@ pub async fn similar_handler(
     }
 
     // Leggi soglia da settings
-    let threshold: f64 = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind("knowledge.similarity_banner_threshold")
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.80);
+    let threshold: f64 =
+        sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
+            .bind("knowledge.similarity_banner_threshold")
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.80);
 
     let embed_text = if body.text.len() > 2000 {
         &body.text[..2000]
@@ -464,14 +459,21 @@ pub async fn similar_handler(
         .neural
         .embed_text("", embed_text)
         .await
-        .map_err(|e| api_error(StatusCode::SERVICE_UNAVAILABLE, format!("Embedding non disponibile: {e}")))?;
+        .map_err(|e| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Embedding non disponibile: {e}"),
+            )
+        })?;
 
-    let raw_hits =
-        crate::vector_memory::search_knowledge_points(&state.db, vector, project_id, 5)
-            .await
-            .map_err(|e| {
-                api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Ricerca fallita: {e}"))
-            })?;
+    let raw_hits = crate::vector_memory::search_knowledge_points(&state.db, vector, project_id, 5)
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Ricerca fallita: {e}"),
+            )
+        })?;
 
     // Filtra per threshold e arricchisci con dati DB
     let mut hits = Vec::new();
@@ -561,7 +563,10 @@ pub async fn create_link(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "to_note_id non valido"))?;
 
     if from_id == to_id {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Una nota non puo' linkare se stessa"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Una nota non puo' linkare se stessa",
+        ));
     }
 
     let valid_types = [
@@ -636,7 +641,10 @@ pub async fn delete_link(
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if deleted.rows_affected() == 0 {
-        return Err(api_error(StatusCode::NOT_FOUND, "Link non trovato o non eliminabile"));
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "Link non trovato o non eliminabile",
+        ));
     }
 
     Ok(Json(json!({ "ok": true })))
@@ -679,14 +687,13 @@ pub async fn delete_note(
 
     // DELETE: i link in/out cascadono via FK ON DELETE CASCADE
     // (vedi project_knowledge_links_{from,to}_note_id_fkey).
-    let deleted = sqlx::query(
-        "DELETE FROM project_knowledge_notes WHERE id = $1 AND project_id = $2",
-    )
-    .bind(note_id)
-    .bind(project_id)
-    .execute(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let deleted =
+        sqlx::query("DELETE FROM project_knowledge_notes WHERE id = $1 AND project_id = $2")
+            .bind(note_id)
+            .bind(project_id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if deleted.rows_affected() == 0 {
         return Err(api_error(StatusCode::NOT_FOUND, "Nota non trovata"));
@@ -699,15 +706,13 @@ pub async fn delete_note(
     if let Some(pid) = point_id {
         let db_clone = state.db.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::vector_memory::delete_knowledge_points(
-                &db_clone,
-                &[pid.clone()],
-            )
-            .await
+            if let Err(e) =
+                crate::vector_memory::delete_knowledge_points(&db_clone, &[pid.clone()]).await
             {
                 tracing::warn!(
                     "delete_note: cancellazione point Qdrant '{}' fallita: {}",
-                    pid, e
+                    pid,
+                    e
                 );
             }
         });
@@ -784,7 +789,11 @@ pub async fn internal_kb_search(
     let top_k = body.top_k.unwrap_or(5).clamp(1, 20);
     let min_score = body.min_score.unwrap_or(0.4);
 
-    let embed_text = if query.len() > 2000 { &query[..2000] } else { query };
+    let embed_text = if query.len() > 2000 {
+        &query[..2000]
+    } else {
+        query
+    };
     let vector = match state.orchestrator.neural.embed_text("", embed_text).await {
         Ok(v) => v,
         Err(e) => {
@@ -953,17 +962,21 @@ pub async fn rebuild_knowledge(
     .bind(project_id)
     .fetch_all(&state.db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("query messages: {e}")))?;
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("query messages: {e}"),
+        )
+    })?;
 
     // Trova la repo root del progetto per il vault path
-    let repo_root: Option<String> = sqlx::query_scalar(
-        "SELECT repository_root_path FROM projects WHERE id = $1",
-    )
-    .bind(project_id)
-    .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten();
+    let repo_root: Option<String> =
+        sqlx::query_scalar("SELECT repository_root_path FROM projects WHERE id = $1")
+            .bind(project_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
 
     let total = rows.len();
     let mut processed = 0usize;
@@ -976,9 +989,7 @@ pub async fn rebuild_knowledge(
             skipped_short += 1;
             continue;
         }
-        let metadata: serde_json::Value = row
-            .try_get("metadata")
-            .unwrap_or(serde_json::json!({}));
+        let metadata: serde_json::Value = row.try_get("metadata").unwrap_or(serde_json::json!({}));
         let intent = metadata
             .get("intent")
             .and_then(|v| v.as_str())
@@ -1011,7 +1022,12 @@ pub async fn rebuild_knowledge(
         project_id,
     )
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("recompute links: {e}")))?;
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("recompute links: {e}"),
+        )
+    })?;
 
     Ok(Json(json!({
         "ok": true,
@@ -1160,14 +1176,13 @@ pub async fn init_or_refresh_knowledge(
 
         match rows_res {
             Ok(rows) => {
-                let repo_root: Option<String> = sqlx::query_scalar(
-                    "SELECT repository_root_path FROM projects WHERE id = $1",
-                )
-                .bind(project_id)
-                .fetch_optional(&state.db)
-                .await
-                .ok()
-                .flatten();
+                let repo_root: Option<String> =
+                    sqlx::query_scalar("SELECT repository_root_path FROM projects WHERE id = $1")
+                        .bind(project_id)
+                        .fetch_optional(&state.db)
+                        .await
+                        .ok()
+                        .flatten();
 
                 let total = rows.len();
                 let mut processed = 0usize;
@@ -1177,8 +1192,7 @@ pub async fn init_or_refresh_knowledge(
                     if content.trim().is_empty() {
                         continue;
                     }
-                    let metadata: serde_json::Value =
-                        row.try_get("metadata").unwrap_or(json!({}));
+                    let metadata: serde_json::Value = row.try_get("metadata").unwrap_or(json!({}));
                     let intent = metadata
                         .get("intent")
                         .and_then(|v| v.as_str())
@@ -1256,10 +1270,9 @@ pub async fn generate_rich_kb(
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
     ensure_project_access(&state.db, user_id, project_id).await?;
 
-    let (total, applied) =
-        crate::knowledge::generators::generate_and_apply_all(&state, project_id)
-            .await
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("generate: {e}")))?;
+    let (total, applied) = crate::knowledge::generators::generate_and_apply_all(&state, project_id)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("generate: {e}")))?;
 
     // Dopo aver creato le note, ricalcola anche i link automatici
     let (linked_notes, links_created) = crate::knowledge_workers::recompute_links_for_project(
@@ -1269,7 +1282,12 @@ pub async fn generate_rich_kb(
         project_id,
     )
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("recompute links: {e}")))?;
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("recompute links: {e}"),
+        )
+    })?;
 
     Ok(Json(json!({
         "ok": true,
@@ -1356,7 +1374,11 @@ pub async fn create_note_manual(
     let intent = body.intent.unwrap_or_else(|| "feature".to_string());
 
     // Genera embedding e popola Qdrant
-    let embed_text = if body_md.len() > 2000 { &body_md[..2000] } else { body_md };
+    let embed_text = if body_md.len() > 2000 {
+        &body_md[..2000]
+    } else {
+        body_md
+    };
     let qdrant_point_id = match state.orchestrator.neural.embed_text("", embed_text).await {
         Ok(vector) => {
             let point_id = Uuid::new_v4().to_string();
@@ -1366,7 +1388,11 @@ pub async fn create_note_manual(
                 "intent": intent,
                 "status": "active",
             });
-            match crate::vector_memory::upsert_knowledge_point(&state.db, &point_id, vector, payload).await {
+            match crate::vector_memory::upsert_knowledge_point(
+                &state.db, &point_id, vector, payload,
+            )
+            .await
+            {
                 Ok(_) => Some(point_id),
                 Err(e) => {
                     tracing::warn!(error = %e, "knowledge create_note_manual: upsert Qdrant fallito");
@@ -1397,7 +1423,12 @@ pub async fn create_note_manual(
     .bind(&file_paths)
     .execute(&state.db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("insert nota: {e}")))?;
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("insert nota: {e}"),
+        )
+    })?;
 
     // Aggiorna tag aggregati
     for tag in &tags {
@@ -1552,7 +1583,12 @@ pub async fn extract_functional_handler(
         project_id,
     )
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("recompute links: {e}")))?;
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("recompute links: {e}"),
+        )
+    })?;
 
     Ok(Json(json!({
         "ok": true,
@@ -1617,7 +1653,12 @@ pub async fn graph_handler(
     .bind(&status_filter)
     .fetch_all(&state.db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("nodes query: {e}")))?;
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("nodes query: {e}"),
+        )
+    })?;
 
     let nodes_json: Vec<Value> = nodes
         .iter()
@@ -1650,7 +1691,12 @@ pub async fn graph_handler(
     .bind(min_conf)
     .fetch_all(&state.db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("edges query: {e}")))?;
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("edges query: {e}"),
+        )
+    })?;
 
     let edges_json: Vec<Value> = edges
         .iter()

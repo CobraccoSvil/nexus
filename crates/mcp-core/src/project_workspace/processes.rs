@@ -23,7 +23,8 @@ pub async fn set_sandbox_config_api(
     let project_id = Uuid::parse_str(&id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
     load_project_context(&state.db, project_id, user_id).await?;
-    crate::sandbox::save_project_sandbox_config(&state.db, project_id, &body).await
+    crate::sandbox::save_project_sandbox_config(&state.db, project_id, &body)
+        .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -59,14 +60,16 @@ pub async fn clear_finished_processes(
     let _context = load_project_context(&state.db, project_id, user_id).await?;
 
     let result = sqlx::query(
-        "DELETE FROM agent_processes WHERE project_id = $1 AND status IN ('stopped', 'failed')"
+        "DELETE FROM agent_processes WHERE project_id = $1 AND status IN ('stopped', 'failed')",
     )
     .bind(project_id)
     .execute(&state.db)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(json!({ "ok": true, "deleted": result.rows_affected() })))
+    Ok(Json(
+        json!({ "ok": true, "deleted": result.rows_affected() }),
+    ))
 }
 
 /// GET /api/projects/:id/agent-processes/:process_id/stream
@@ -96,11 +99,14 @@ pub async fn stream_agent_process_logs(
         Err(_) => return (StatusCode::BAD_REQUEST, "Process id non valido").into_response(),
     };
     // Verifica che il processo appartenga al progetto dell'utente
-    if load_project_context(&state.db, project_id, user_id).await.is_err() {
+    if load_project_context(&state.db, project_id, user_id)
+        .await
+        .is_err()
+    {
         return (StatusCode::FORBIDDEN, "Accesso negato").into_response();
     }
     let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM agent_processes WHERE id=$1 AND project_id=$2)"
+        "SELECT EXISTS(SELECT 1 FROM agent_processes WHERE id=$1 AND project_id=$2)",
     )
     .bind(process_id)
     .bind(project_id)
@@ -121,7 +127,7 @@ pub async fn stream_agent_process_logs(
             }
             tokio::time::sleep(Duration::from_millis(400)).await;
             let row: Option<(String, String, String)> = sqlx::query_as(
-                "SELECT status, output, error_output FROM agent_processes WHERE id=$1"
+                "SELECT status, output, error_output FROM agent_processes WHERE id=$1",
             )
             .bind(process_id)
             .fetch_optional(&db)
@@ -150,8 +156,7 @@ pub async fn stream_agent_process_logs(
                 "text": new_text,
                 "status": status,
             });
-            let event = Event::default()
-                .data(event_data.to_string());
+            let event = Event::default().data(event_data.to_string());
             Some((
                 Ok::<Event, Infallible>(event),
                 (db, process_id, new_offset, is_done),

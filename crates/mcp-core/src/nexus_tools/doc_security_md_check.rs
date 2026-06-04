@@ -7,7 +7,11 @@ pub struct DocSecurityMdCheckTool;
 
 #[async_trait]
 impl NexusToolHandler for DocSecurityMdCheckTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let candidates = ["SECURITY.md", ".github/SECURITY.md", "docs/SECURITY.md"];
         for c in &candidates {
             let p = ctx.project_root.join(c);
@@ -26,5 +30,7 @@ impl NexusToolHandler for DocSecurityMdCheckTool {
         }
         Ok(json!({"ok": true, "exists": false}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

@@ -31,8 +31,8 @@ impl NexusToolHandler for CargoLocateProjectTool {
             });
         }
 
-        let root_parsed: Value = serde_json::from_str(out_root.stdout.trim())
-            .unwrap_or_else(|_| json!({}));
+        let root_parsed: Value =
+            serde_json::from_str(out_root.stdout.trim()).unwrap_or_else(|_| json!({}));
         let root_manifest = root_parsed
             .get("root")
             .and_then(Value::as_str)
@@ -46,8 +46,8 @@ impl NexusToolHandler for CargoLocateProjectTool {
         )
         .await?;
         let workspace_manifest = if out_ws.success() {
-            let parsed: Value = serde_json::from_str(out_ws.stdout.trim())
-                .unwrap_or_else(|_| json!({}));
+            let parsed: Value =
+                serde_json::from_str(out_ws.stdout.trim()).unwrap_or_else(|_| json!({}));
             parsed
                 .get("root")
                 .and_then(Value::as_str)

@@ -45,24 +45,23 @@ pub async fn apply_generated_doc(
     .await
     .context("query nexus_meta_docs by path")?;
 
-    let (doc_id, created_at_existing, manually_edited, edit_lock) =
-        if let Some(row) = &existing_row {
-            let id: Uuid = row.try_get("id")?;
-            let me: bool = row.try_get("manually_edited").unwrap_or(false);
-            let lock: String = row
-                .try_get("edit_lock")
-                .unwrap_or_else(|_| "none".to_string());
-            let created_at_existing: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
-                "SELECT created_at FROM nexus_meta_docs WHERE id = $1",
-            )
-            .bind(id)
-            .fetch_one(&state.db)
-            .await
-            .unwrap_or(now);
-            (id, created_at_existing, me, lock)
-        } else {
-            (doc_id_new, now, false, "none".to_string())
-        };
+    let (doc_id, created_at_existing, manually_edited, edit_lock) = if let Some(row) = &existing_row
+    {
+        let id: Uuid = row.try_get("id")?;
+        let me: bool = row.try_get("manually_edited").unwrap_or(false);
+        let lock: String = row
+            .try_get("edit_lock")
+            .unwrap_or_else(|_| "none".to_string());
+        let created_at_existing: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT created_at FROM nexus_meta_docs WHERE id = $1")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or(now);
+        (id, created_at_existing, me, lock)
+    } else {
+        (doc_id_new, now, false, "none".to_string())
+    };
 
     // Protezione rigenerazione:
     //   - edit_lock=frozen  -> mai sovrascrivere (skip totale)
@@ -115,7 +114,11 @@ pub async fn apply_generated_doc(
     }
 
     // Scrivi su disco
-    let full_path = format!("{}/{}", vault_root.trim_end_matches('/'), doc.vault_file_path);
+    let full_path = format!(
+        "{}/{}",
+        vault_root.trim_end_matches('/'),
+        doc.vault_file_path
+    );
     if let Some(parent) = std::path::Path::new(&full_path).parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
@@ -217,23 +220,18 @@ pub async fn apply_generated_doc(
                 "slug": doc.slug,
                 "title": doc.title,
             });
-            if let Err(e) = crate::vector_memory::upsert_meta_doc_point(
-                &state.db,
-                &point_id,
-                vector,
-                payload,
-            )
-            .await
+            if let Err(e) =
+                crate::vector_memory::upsert_meta_doc_point(&state.db, &point_id, vector, payload)
+                    .await
             {
                 tracing::debug!(slug = %doc.slug, error = %e, "meta-doc embed upsert fallito");
             } else {
-                let _ = sqlx::query(
-                    "UPDATE nexus_meta_docs SET qdrant_point_id = $1 WHERE id = $2",
-                )
-                .bind(&point_id)
-                .bind(doc_id)
-                .execute(&state.db)
-                .await;
+                let _ =
+                    sqlx::query("UPDATE nexus_meta_docs SET qdrant_point_id = $1 WHERE id = $2")
+                        .bind(&point_id)
+                        .bind(doc_id)
+                        .execute(&state.db)
+                        .await;
             }
         }
         Err(e) => {
@@ -246,14 +244,13 @@ pub async fn apply_generated_doc(
 
 /// Risolve il vault_root assoluto dalle settings + repo root (di default `/home/administrator/ideai/`).
 pub async fn resolve_vault_root(state: &AppState) -> String {
-    let vault_rel: String = sqlx::query_scalar(
-        "SELECT value FROM settings WHERE key = 'meta_docs.vault_path'",
-    )
-    .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| "docs/.nexus-vault".to_string());
+    let vault_rel: String =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'meta_docs.vault_path'")
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "docs/.nexus-vault".to_string());
 
     let repo_root = std::env::var("NEXUS_REPO_ROOT")
         .unwrap_or_else(|_| "/home/administrator/ideai".to_string());

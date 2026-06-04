@@ -36,7 +36,8 @@ fn shell_command_bypasses_migration_policy(cmd: &str) -> bool {
         || c.contains("manage.py migrate")
         || c.contains("rails db:migrate")
         || c.contains("rake db:migrate")
-        || (c.contains("-f ") && (c.contains("migrat") || c.contains("/migrations/") || c.contains("\\migrations\\")))
+        || (c.contains("-f ")
+            && (c.contains("migrat") || c.contains("/migrations/") || c.contains("\\migrations\\")))
 }
 
 fn shell_looks_like_sql_cli_with_ddl(cmd: &str) -> bool {
@@ -110,7 +111,10 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
         );
     }
 
-    let explicit_bg = input.get("background").and_then(Value::as_bool).unwrap_or(false);
+    let explicit_bg = input
+        .get("background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     // ── Livello 1: parametro background esplicito dall'AI ──
     if explicit_bg {
@@ -134,7 +138,12 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
     let work_dir = if let Some(sub) = input.get("working_dir").and_then(Value::as_str) {
         match resolve_relative_path(&ctx.root_path, sub) {
             Ok(p) => p,
-            Err(e) => return format!("[Errore percorso working_dir: {}]", e.1["error"].as_str().unwrap_or("path error")),
+            Err(e) => {
+                return format!(
+                    "[Errore percorso working_dir: {}]",
+                    e.1["error"].as_str().unwrap_or("path error")
+                )
+            }
         }
     } else {
         ctx.root_path.clone()
@@ -217,7 +226,8 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
                  Per grep/sed questo significa che il pattern non è stato trovato o il file è vuoto. \
                  Non riprovare lo stesso comando — prova un pattern diverso o usa read_file.]".to_string()
             } else if exit_code == 1 && stdout.trim().is_empty() {
-                "\n[EXIT CODE 1 + output vuoto: per grep significa nessuna corrispondenza trovata.]".to_string()
+                "\n[EXIT CODE 1 + output vuoto: per grep significa nessuna corrispondenza trovata.]"
+                    .to_string()
             } else {
                 String::new()
             };
@@ -246,7 +256,10 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
                 hints_prefix, exit_code, stdout, stderr, hint
             );
             if combined.chars().count() > 8000 {
-                format!("{}\n[OUTPUT TRONCATO A 8000 CARATTERI]", combined.chars().take(8000).collect::<String>())
+                format!(
+                    "{}\n[OUTPUT TRONCATO A 8000 CARATTERI]",
+                    combined.chars().take(8000).collect::<String>()
+                )
             } else {
                 combined
             }
@@ -274,7 +287,11 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
 
 /// Esegue i test del progetto in modo sincrono con timeout esteso.
 /// Chiamato direttamente da agent_loop.rs (non via execute_agent_tool).
-pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value, test_run_number: usize) -> String {
+pub(crate) async fn tool_run_tests(
+    ctx: &AgentToolContext,
+    input: &Value,
+    test_run_number: usize,
+) -> String {
     // 1. Determina comando test
     let explicit_cmd = input.get("command").and_then(Value::as_str);
     let filter = input.get("filter").and_then(Value::as_str);
@@ -290,21 +307,28 @@ pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value, test_r
 
     if command.is_empty() {
         return "[Errore: impossibile rilevare il comando test per questo progetto. \
-                Specifica il parametro 'command' (es. 'npm test', 'cargo test', 'pytest').]".to_string();
+                Specifica il parametro 'command' (es. 'npm test', 'cargo test', 'pytest').]"
+            .to_string();
     }
 
     // 2. Working directory
     let work_dir = if let Some(sub) = input.get("working_dir").and_then(Value::as_str) {
         match resolve_relative_path(&ctx.root_path, sub) {
             Ok(p) => p,
-            Err(e) => return format!("[Errore percorso working_dir: {}]", e.1["error"].as_str().unwrap_or("path error")),
+            Err(e) => {
+                return format!(
+                    "[Errore percorso working_dir: {}]",
+                    e.1["error"].as_str().unwrap_or("path error")
+                )
+            }
         }
     } else {
         ctx.root_path.clone()
     };
 
     // 3. Timeout (default 120s, max 300s)
-    let timeout = input.get("timeout_secs")
+    let timeout = input
+        .get("timeout_secs")
         .and_then(Value::as_u64)
         .unwrap_or(RUN_TESTS_DEFAULT_TIMEOUT)
         .min(RUN_TESTS_MAX_TIMEOUT);
@@ -341,11 +365,7 @@ pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value, test_r
         buf
     });
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout),
-        child.wait(),
-    )
-    .await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(timeout), child.wait()).await;
 
     match result {
         Ok(Ok(exit_status)) => {
@@ -379,12 +399,21 @@ pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value, test_r
                 });
             }
 
-            let status_label = if exit_code == 0 { "TUTTI I TEST PASSATI" } else { "TEST FALLITI" };
+            let status_label = if exit_code == 0 {
+                "TUTTI I TEST PASSATI"
+            } else {
+                "TEST FALLITI"
+            };
             format!(
                 "=== RUN TEST #{} ===\nComando: {}\nStato: {} (exit code: {})\n\n\
                  --- STDOUT ---\n{}\n\n--- STDERR ---\n{}\n=== FINE RUN TEST #{} ===",
-                test_run_number, command, status_label, exit_code,
-                truncated_stdout, truncated_stderr, test_run_number
+                test_run_number,
+                command,
+                status_label,
+                exit_code,
+                truncated_stdout,
+                truncated_stderr,
+                test_run_number
             )
         }
         Ok(Err(e)) => format!("[Errore attesa test '{}': {}]", command, e),
@@ -522,31 +551,52 @@ fn parse_playwright_summary(stdout: &str, stderr: &str, exit_code: i32) -> Playw
     for line in output.lines() {
         let lower = line.to_lowercase();
         if lower.contains("passed") {
-            if let Some(n) = extract_test_count(&lower, "passed") { passed = n; }
+            if let Some(n) = extract_test_count(&lower, "passed") {
+                passed = n;
+            }
         }
         if lower.contains("failed") {
-            if let Some(n) = extract_test_count(&lower, "failed") { failed = n; }
+            if let Some(n) = extract_test_count(&lower, "failed") {
+                failed = n;
+            }
         }
         if lower.contains("skipped") {
-            if let Some(n) = extract_test_count(&lower, "skipped") { skipped = n; }
+            if let Some(n) = extract_test_count(&lower, "skipped") {
+                skipped = n;
+            }
         }
     }
     let total = passed + failed + skipped;
     let label = if total > 0 {
-        format!("Playwright: {} test ({} ok, {} ko, {} skip)", total, passed, failed, skipped)
+        format!(
+            "Playwright: {} test ({} ok, {} ko, {} skip)",
+            total, passed, failed, skipped
+        )
     } else if exit_code == 0 {
         "Playwright: test completati".to_string()
     } else {
         "Playwright: esecuzione fallita".to_string()
     };
-    let message = output.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+    let message = output
+        .lines()
+        .rev()
+        .take(5)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
     PlaywrightSummary { label, message }
 }
 
 fn extract_test_count(line: &str, keyword: &str) -> Option<u32> {
     let pos = line.find(keyword)?;
     let before = &line[..pos];
-    before.rsplit(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+    before
+        .rsplit(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Persiste l'evento di blocco su `nexus_security_audit` (mig 0154).
@@ -598,14 +648,13 @@ async fn persist_security_audit(
 /// così l'env injection avviene — l'agente vedra' un errore di connessione
 /// che NON contaminera' il DB Nexus.
 async fn ensure_project_db_url(ctx: &AgentToolContext) -> (String, String) {
-    let slug: Option<String> = sqlx::query_scalar(
-        "SELECT slug FROM projects WHERE id = $1 LIMIT 1",
-    )
-    .bind(ctx.project_id)
-    .fetch_optional(&*ctx.db)
-    .await
-    .ok()
-    .flatten();
+    let slug: Option<String> =
+        sqlx::query_scalar("SELECT slug FROM projects WHERE id = $1 LIMIT 1")
+            .bind(ctx.project_id)
+            .fetch_optional(&*ctx.db)
+            .await
+            .ok()
+            .flatten();
 
     let base = slug.unwrap_or_else(|| ctx.project_id.simple().to_string());
     let mut sanitized: String = base
@@ -619,7 +668,11 @@ async fn ensure_project_db_url(ctx: &AgentToolContext) -> (String, String) {
     if sanitized.is_empty() {
         sanitized = ctx.project_id.simple().to_string();
     }
-    if sanitized.chars().next().map_or(true, |c| c.is_ascii_digit()) {
+    if sanitized
+        .chars()
+        .next()
+        .map_or(true, |c| c.is_ascii_digit())
+    {
         sanitized.insert(0, 'p');
     }
     if sanitized.len() > 56 {
@@ -631,21 +684,21 @@ async fn ensure_project_db_url(ctx: &AgentToolContext) -> (String, String) {
     let host = load_setting_or(&ctx.db, "nexus_app_db_host", "localhost").await;
     let port = load_setting_or(&ctx.db, "nexus_app_db_port", "5434").await;
     let user = load_setting_or(&ctx.db, "nexus_app_db_user", "nexus_app").await;
-    let pwd  = load_setting_or(&ctx.db, "nexus_app_db_password", "nexus_app_dev_secret").await;
+    let pwd = load_setting_or(&ctx.db, "nexus_app_db_password", "nexus_app_dev_secret").await;
     let admin_user = load_setting_or(&ctx.db, "nexus_app_admin_user", "nexus_admin").await;
-    let admin_pwd  = load_setting_or(&ctx.db, "nexus_app_admin_password", "nexus_admin_secret").await;
+    let admin_pwd =
+        load_setting_or(&ctx.db, "nexus_app_admin_password", "nexus_admin_secret").await;
 
     // CREATE DATABASE idempotente sul container postgres-app via admin role.
     let admin_url = format!("postgresql://{admin_user}:{admin_pwd}@{host}:{port}/postgres");
     match sqlx::PgPool::connect(&admin_url).await {
         Ok(admin_pool) => {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
-            )
-            .bind(&db_name)
-            .fetch_one(&admin_pool)
-            .await
-            .unwrap_or(false);
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+                    .bind(&db_name)
+                    .fetch_one(&admin_pool)
+                    .await
+                    .unwrap_or(false);
             if !exists {
                 // OWNER = nexus_app cosi' il role applicativo ha pieni poteri
                 // sul SUO DB (e solo quello).
@@ -661,7 +714,9 @@ async fn ensure_project_db_url(ctx: &AgentToolContext) -> (String, String) {
                 } else {
                     tracing::info!(
                         "ensure_project_db_url: provisioned db=\"{}\" owner=\"{}\" project_id={}",
-                        db_name, user, ctx.project_id
+                        db_name,
+                        user,
+                        ctx.project_id
                     );
                 }
             }
@@ -709,11 +764,17 @@ async fn ensure_project_db_url(ctx: &AgentToolContext) -> (String, String) {
     match upsert_res {
         Ok(r) => {
             if r.rows_affected() > 0 {
-                let action = if r.rows_affected() == 1 { "created_or_updated" } else { "updated" };
+                let action = if r.rows_affected() == 1 {
+                    "created_or_updated"
+                } else {
+                    "updated"
+                };
                 tracing::info!(
                     "ensure_project_db_url: project_database_config registered \
                      project_id={} db_name={} action={}",
-                    ctx.project_id, db_name, action
+                    ctx.project_id,
+                    db_name,
+                    action
                 );
                 // Notifica il pannello DB frontend via dispatcher SSE.
                 nexus_events::dispatcher::emit_global(

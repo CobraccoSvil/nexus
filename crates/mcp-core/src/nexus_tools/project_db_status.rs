@@ -1,22 +1,27 @@
 //! `project_db_status` — stato del database e migration pending per un progetto utente.
 
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
+use crate::nexus_tools::db_helper::get_pool;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::Row;
-use crate::nexus_tools::db_helper::get_pool;
 
 pub struct ProjectDbStatusTool;
 
 #[async_trait]
 impl NexusToolHandler for ProjectDbStatusTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let pool = get_pool().await
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let pool = get_pool()
+            .await
             .map_err(|e| NexusToolError::BadInput(format!("db connect: {}", e)))?;
 
         let config_row = sqlx::query(
             r#"SELECT engine, hosting_mode, migration_tool, migration_path, allow_ddl_override
-               FROM project_database_config WHERE project_id = $1"#
+               FROM project_database_config WHERE project_id = $1"#,
         )
         .bind(ctx.project_id)
         .fetch_optional(&pool)
@@ -40,7 +45,7 @@ impl NexusToolHandler for ProjectDbStatusTool {
 
         let counts = sqlx::query(
             r#"SELECT status, COUNT(*)::bigint as cnt
-               FROM project_migration_history WHERE project_id = $1 GROUP BY status"#
+               FROM project_migration_history WHERE project_id = $1 GROUP BY status"#,
         )
         .bind(ctx.project_id)
         .fetch_all(&pool)
@@ -52,7 +57,9 @@ impl NexusToolHandler for ProjectDbStatusTool {
         for row in &counts {
             let status: String = row.try_get("status").unwrap_or_default();
             let cnt: i64 = row.try_get("cnt").unwrap_or(0);
-            if status == "pending" { pending_count = cnt; }
+            if status == "pending" {
+                pending_count = cnt;
+            }
             by_status.insert(status, json!(cnt));
         }
 
@@ -76,6 +83,11 @@ impl NexusToolHandler for ProjectDbStatusTool {
     }
 
     fn safety(&self) -> NexusToolSafety {
-        NexusToolSafety { read_only: true, can_write_filesystem: false, can_execute_subproc: false, network_egress: true }
+        NexusToolSafety {
+            read_only: true,
+            can_write_filesystem: false,
+            can_execute_subproc: false,
+            network_egress: true,
+        }
     }
 }

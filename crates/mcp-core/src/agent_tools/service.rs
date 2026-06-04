@@ -17,35 +17,63 @@ fn looks_like_web_service(command: &str) -> bool {
     let lc = command.to_lowercase();
     // Lista di token che indicano "sto avviando un server web"
     const WEB_TOKENS: &[&str] = &[
-        "next dev", "next start",
-        "vite", "vite dev", "vite preview",
-        "webpack-dev-server", "webpack serve",
-        "astro dev", "astro start", "astro preview",
-        "nuxt dev", "nuxt start",
+        "next dev",
+        "next start",
+        "vite",
+        "vite dev",
+        "vite preview",
+        "webpack-dev-server",
+        "webpack serve",
+        "astro dev",
+        "astro start",
+        "astro preview",
+        "nuxt dev",
+        "nuxt start",
         "svelte-kit dev",
         "ng serve",            // Angular
         "react-scripts start", // CRA
         "expo start",          // React Native web
         "remix dev",
-        "gunicorn", "uvicorn", "hypercorn", "daphne",
+        "gunicorn",
+        "uvicorn",
+        "hypercorn",
+        "daphne",
         "flask run",
-        "django runserver", "manage.py runserver",
-        "rails server", "rails s ",
+        "django runserver",
+        "manage.py runserver",
+        "rails server",
+        "rails s ",
         "sinatra",
-        "node server", "node app", "node index", "node main",
-        "ts-node server", "tsx server",
+        "node server",
+        "node app",
+        "node index",
+        "node main",
+        "ts-node server",
+        "tsx server",
         "deno serve",
-        "bun --hot", "bun run dev", "bun run start",
-        "cargo run", "cargo watch",
+        "bun --hot",
+        "bun run dev",
+        "bun run start",
+        "cargo run",
+        "cargo watch",
         "go run",
-        "dotnet run", "dotnet watch",
+        "dotnet run",
+        "dotnet watch",
         "php -S",
         "ruby -run",
-        "live-server", "http-server", "browser-sync",
+        "live-server",
+        "http-server",
+        "browser-sync",
         // Make/script wrapper noti
-        "npm run dev", "npm run start", "npm run serve",
-        "pnpm dev", "pnpm start", "pnpm serve",
-        "yarn dev", "yarn start", "yarn serve",
+        "npm run dev",
+        "npm run start",
+        "npm run serve",
+        "pnpm dev",
+        "pnpm start",
+        "pnpm serve",
+        "yarn dev",
+        "yarn start",
+        "yarn serve",
     ];
     WEB_TOKENS.iter().any(|t| lc.contains(t))
 }
@@ -93,7 +121,12 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         if !sub.is_empty() {
             match resolve_relative_path(&ctx.root_path, sub) {
                 Ok(p) => p,
-                Err(e) => return format!("[Errore percorso: {}]", e.1["error"].as_str().unwrap_or("path error")),
+                Err(e) => {
+                    return format!(
+                        "[Errore percorso: {}]",
+                        e.1["error"].as_str().unwrap_or("path error")
+                    )
+                }
             }
         } else {
             ctx.root_path.clone()
@@ -109,17 +142,25 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
     //    Tipologia: deriva dal command (vite/express/etc) o dal label.
     let label_lower_top = label.to_lowercase();
     let command_lower_top = command.to_lowercase();
-    let kind_hint = if command_lower_top.contains("vite") || command_lower_top.contains("svelte")
-        || label_lower_top.contains("frontend") || label_lower_top.contains("vite")
-        || label_lower_top.contains("react") || label_lower_top.contains("svelte")
-        || label_lower_top.contains("nuxt") || label_lower_top.contains("astro")
+    let kind_hint = if command_lower_top.contains("vite")
+        || command_lower_top.contains("svelte")
+        || label_lower_top.contains("frontend")
+        || label_lower_top.contains("vite")
+        || label_lower_top.contains("react")
+        || label_lower_top.contains("svelte")
+        || label_lower_top.contains("nuxt")
+        || label_lower_top.contains("astro")
     {
         Some("frontend")
-    } else if command_lower_top.contains("express") || command_lower_top.contains("fastify")
-        || command_lower_top.contains("uvicorn") || command_lower_top.contains("gunicorn")
-        || command_lower_top.contains("rails") || command_lower_top.contains("django")
+    } else if command_lower_top.contains("express")
+        || command_lower_top.contains("fastify")
+        || command_lower_top.contains("uvicorn")
+        || command_lower_top.contains("gunicorn")
+        || command_lower_top.contains("rails")
+        || command_lower_top.contains("django")
         || command_lower_top.contains(" run ") && command_lower_top.contains("backend")
-        || label_lower_top.contains("backend") || label_lower_top.contains("api")
+        || label_lower_top.contains("backend")
+        || label_lower_top.contains("api")
     {
         Some("backend")
     } else {
@@ -137,8 +178,25 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         for (port, alloc_label) in &rows {
             let al = alloc_label.to_lowercase();
             let matches = match kind {
-                "frontend" => al.contains("frontend") || al.contains("vite") || al.contains("react") || al.contains("svelte") || al.contains("ui") || al.contains("nuxt") || al.contains("astro") || al.contains("web") || al.contains("client") || al.contains("dev server"),
-                "backend" => al.contains("backend") || al.contains("api") || (al.contains("server") && !al.contains("frontend") && !al.contains("dev")),
+                "frontend" => {
+                    al.contains("frontend")
+                        || al.contains("vite")
+                        || al.contains("react")
+                        || al.contains("svelte")
+                        || al.contains("ui")
+                        || al.contains("nuxt")
+                        || al.contains("astro")
+                        || al.contains("web")
+                        || al.contains("client")
+                        || al.contains("dev server")
+                }
+                "backend" => {
+                    al.contains("backend")
+                        || al.contains("api")
+                        || (al.contains("server")
+                            && !al.contains("frontend")
+                            && !al.contains("dev"))
+                }
                 _ => false,
             };
             if matches {
@@ -156,34 +214,58 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         // ma l'allocazione di porta puo' avere label generica ("Service").
         // Query diretta systemctl: list-units --user --state=active per
         // unit con prefisso slug del progetto.
-        let project_slug_q = sqlx::query_scalar::<_, String>(
-            "SELECT slug FROM projects WHERE id = $1",
-        )
-        .bind(ctx.project_id)
-        .fetch_optional(&*ctx.db)
-        .await
-        .ok()
-        .flatten();
+        let project_slug_q =
+            sqlx::query_scalar::<_, String>("SELECT slug FROM projects WHERE id = $1")
+                .bind(ctx.project_id)
+                .fetch_optional(&*ctx.db)
+                .await
+                .ok()
+                .flatten();
         if let Some(slug) = project_slug_q {
             let slug_norm = slug.to_lowercase().replace([' ', '_'], "-");
             let systemd_output = tokio::process::Command::new("systemctl")
-                .args(["--user", "list-units", "--type=service", "--state=active",
-                       "--no-legend", "--no-pager"])
+                .args([
+                    "--user",
+                    "list-units",
+                    "--type=service",
+                    "--state=active",
+                    "--no-legend",
+                    "--no-pager",
+                ])
                 .output()
                 .await;
             if let Ok(out) = systemd_output {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let prefix = format!("{}-", slug_norm);
                 for line in stdout.lines() {
-                    let unit = line.split_whitespace().next().unwrap_or("").trim_start_matches('●').trim();
-                    if !unit.starts_with(&prefix) || !unit.ends_with(".service") { continue; }
+                    let unit = line
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_start_matches('●')
+                        .trim();
+                    if !unit.starts_with(&prefix) || !unit.ends_with(".service") {
+                        continue;
+                    }
                     let short = unit
-                        .strip_prefix(&prefix).unwrap_or(unit)
-                        .strip_suffix(".service").unwrap_or(unit)
+                        .strip_prefix(&prefix)
+                        .unwrap_or(unit)
+                        .strip_suffix(".service")
+                        .unwrap_or(unit)
                         .to_lowercase();
                     let matches = match kind {
-                        "frontend" => short.contains("frontend") || short.contains("vite") || short.contains("ui") || short.contains("web") || short.contains("client"),
-                        "backend" => short.contains("backend") || short.contains("api") || short.contains("server"),
+                        "frontend" => {
+                            short.contains("frontend")
+                                || short.contains("vite")
+                                || short.contains("ui")
+                                || short.contains("web")
+                                || short.contains("client")
+                        }
+                        "backend" => {
+                            short.contains("backend")
+                                || short.contains("api")
+                                || short.contains("server")
+                        }
                         _ => false,
                     };
                     if matches {
@@ -208,15 +290,20 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
         let label_lower = label.to_lowercase();
         let label_words: std::collections::HashSet<&str> = label_lower.split_whitespace().collect();
 
-        for proc in existing.iter().filter(|p| p.status == "running" || p.status == "starting") {
+        for proc in existing
+            .iter()
+            .filter(|p| p.status == "running" || p.status == "starting")
+        {
             let proc_lower = proc.label.to_lowercase();
-            let proc_words: std::collections::HashSet<&str> = proc_lower.split_whitespace().collect();
+            let proc_words: std::collections::HashSet<&str> =
+                proc_lower.split_whitespace().collect();
 
             // Match esatto o similarita': almeno una parola significativa in comune
             // (escludiamo parole generiche come "service", "server", "run")
             let dominated = proc.label == label || {
                 const GENERIC: &[&str] = &["service", "server", "run", "dev", "start"];
-                let meaningful_common = label_words.intersection(&proc_words)
+                let meaningful_common = label_words
+                    .intersection(&proc_words)
                     .filter(|w| !GENERIC.contains(w) && w.len() > 2)
                     .count();
                 meaningful_common > 0
@@ -241,11 +328,17 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
     // Solo per kind="service": i tool agente short-lived non contano contro
     // la quota container del progetto.
     if kind == "service" {
-        if let Err(reason) = crate::security::quotas::check_can_start_container(&ctx.db, ctx.project_id).await {
+        if let Err(reason) =
+            crate::security::quotas::check_can_start_container(&ctx.db, ctx.project_id).await
+        {
             crate::security::record_audit(
-                crate::security::AuditEntry::blocked(ctx.project_id, "container_create", "container")
-                    .with_resource(label.clone())
-                    .with_details(serde_json::json!({"reason": reason, "command": command})),
+                crate::security::AuditEntry::blocked(
+                    ctx.project_id,
+                    "container_create",
+                    "container",
+                )
+                .with_resource(label.clone())
+                .with_details(serde_json::json!({"reason": reason, "command": command})),
             );
             return format!("[Quota raggiunta: {}]", reason);
         }
@@ -279,10 +372,7 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
                 );
             }
             Err(e) => {
-                return format!(
-                    "[Errore allocazione porta per servizio '{}': {}]",
-                    label, e
-                );
+                return format!("[Errore allocazione porta per servizio '{}': {}]", label, e);
             }
         }
     }
@@ -347,7 +437,9 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
                         "Servizio '{}' avviato (process_id: {}, pid: {}, status: {})\n",
                         label,
                         process_id,
-                        info.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                        info.pid
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "?".into()),
                         info.status,
                     );
                     if !info.stdout.is_empty() {
@@ -389,7 +481,7 @@ async fn cleanup_dead_process_ports(
     // Prendi le porte allocate dinamicamente per questo progetto
     let rows = sqlx::query_as::<_, (i32, String)>(
         "SELECT port, label FROM nexus_port_allocations \
-         WHERE project_id = $1 AND allocation_mode = 'dynamic'"
+         WHERE project_id = $1 AND allocation_mode = 'dynamic'",
     )
     .bind(project_id)
     .fetch_all(db)
@@ -405,7 +497,7 @@ async fn cleanup_dead_process_ports(
                     .is_err();
                 if !port_in_use {
                     let _ = sqlx::query(
-                        "DELETE FROM nexus_port_allocations WHERE project_id = $1 AND port = $2"
+                        "DELETE FROM nexus_port_allocations WHERE project_id = $1 AND port = $2",
                     )
                     .bind(project_id)
                     .bind(port)
@@ -424,7 +516,10 @@ async fn cleanup_dead_process_ports(
 
 /// Legge l'output di un servizio avviato con run_service
 pub(super) async fn tool_read_service_output(ctx: &AgentToolContext, input: &Value) -> String {
-    let process_id_str = input.get("process_id").and_then(Value::as_str).unwrap_or("");
+    let process_id_str = input
+        .get("process_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
 
     if process_id_str.is_empty() {
         // Se non specificato, leggi l'ultimo processo del progetto
@@ -511,12 +606,10 @@ pub(super) async fn tool_service_restart(ctx: &AgentToolContext, input: &Value) 
     let original_command = matching[0].command.clone();
 
     // Leggi working_dir dal record completo via DB
-    let work_dir_row = sqlx::query(
-        "SELECT working_dir FROM agent_processes WHERE id = $1",
-    )
-    .bind(matching[0].id)
-    .fetch_optional(&*ctx.db)
-    .await;
+    let work_dir_row = sqlx::query("SELECT working_dir FROM agent_processes WHERE id = $1")
+        .bind(matching[0].id)
+        .fetch_optional(&*ctx.db)
+        .await;
 
     let work_dir = match work_dir_row {
         Ok(Some(row)) => {
@@ -531,7 +624,10 @@ pub(super) async fn tool_service_restart(ctx: &AgentToolContext, input: &Value) 
     };
 
     // Ferma tutti i processi attivi con questa label
-    for proc in matching.iter().filter(|p| p.status == "running" || p.status == "starting") {
+    for proc in matching
+        .iter()
+        .filter(|p| p.status == "running" || p.status == "starting")
+    {
         let _ = crate::agent_processes::stop_process(&ctx.db, proc.id).await;
     }
 
@@ -552,7 +648,10 @@ pub(super) async fn tool_service_restart(ctx: &AgentToolContext, input: &Value) 
 /// Legge le ultime N righe di output di un servizio, con opzione di attesa
 /// per catturare output aggiuntivo (simula follow per X secondi).
 pub(super) async fn tool_tail_service_logs(ctx: &AgentToolContext, input: &Value) -> String {
-    let process_id_str = input.get("process_id").and_then(Value::as_str).unwrap_or("");
+    let process_id_str = input
+        .get("process_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let max_chars = input
         .get("max_chars")
         .and_then(Value::as_u64)
@@ -672,7 +771,9 @@ pub(super) async fn tool_list_active_services(ctx: &AgentToolContext, _input: &V
             status_icon,
             proc.label,
             proc.id,
-            proc.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+            proc.pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "?".into()),
             proc.status,
         ));
 
@@ -695,7 +796,10 @@ pub(super) async fn tool_list_active_services(ctx: &AgentToolContext, _input: &V
 /// Fase 1: aspetta che il frontend confermi la ricezione del comando (delivered/failed).
 /// Molto veloce: il frontend risponde quasi subito.
 #[allow(dead_code)]
-async fn wait_for_terminal_delivery(db: &PgPool, command_id: Uuid) -> Option<(String, Option<String>)> {
+async fn wait_for_terminal_delivery(
+    db: &PgPool,
+    command_id: Uuid,
+) -> Option<(String, Option<String>)> {
     for _ in 0..33 {
         // max ~10s
         if let Ok(Some(row)) = sqlx::query(
@@ -705,7 +809,9 @@ async fn wait_for_terminal_delivery(db: &PgPool, command_id: Uuid) -> Option<(St
         .fetch_optional(db)
         .await
         {
-            let status: String = row.try_get("status").unwrap_or_else(|_| "pending".to_string());
+            let status: String = row
+                .try_get("status")
+                .unwrap_or_else(|_| "pending".to_string());
             if status == "delivered" || status == "finished" {
                 let output_preview: Option<String> = row.try_get("output_preview").unwrap_or(None);
                 return Some((status, output_preview));
@@ -731,7 +837,11 @@ struct TerminalFinishResult {
 /// Fase 2: aspetta che il frontend segnali "finished" (output stabile o processo terminato).
 /// Aspetta fino a max_secs — il frontend debounce è 3s, quindi il finish arriva in ~5-8s.
 #[allow(dead_code)]
-async fn wait_for_terminal_finish(db: &PgPool, command_id: Uuid, max_secs: u32) -> TerminalFinishResult {
+async fn wait_for_terminal_finish(
+    db: &PgPool,
+    command_id: Uuid,
+    max_secs: u32,
+) -> TerminalFinishResult {
     for _ in 0..max_secs {
         if let Ok(Some(row)) = sqlx::query(
             "SELECT finished_at, exit_code, full_output FROM terminal_commands WHERE id = $1",
@@ -764,7 +874,10 @@ async fn wait_for_terminal_finish(db: &PgPool, command_id: Uuid, max_secs: u32) 
 
 #[allow(dead_code)]
 async fn tool_read_terminal_output(ctx: &AgentToolContext, input: &Value) -> String {
-    let command_id_str = input.get("command_id").and_then(Value::as_str).unwrap_or("");
+    let command_id_str = input
+        .get("command_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
 
     let row = if command_id_str.is_empty() {
         // Leggi l'ultimo comando finito del progetto

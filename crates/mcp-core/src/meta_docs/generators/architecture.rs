@@ -88,7 +88,9 @@ async fn generate_crates_rust(ctx: &MetaDocContext<'_>) -> Result<String> {
 
     // Legge il Cargo.toml workspace per ottenere i members
     let workspace_path = format!("{}/Cargo.toml", ctx.repo_root);
-    let workspace_content = tokio::fs::read_to_string(&workspace_path).await.unwrap_or_default();
+    let workspace_content = tokio::fs::read_to_string(&workspace_path)
+        .await
+        .unwrap_or_default();
 
     let mut members: Vec<String> = Vec::new();
     let mut in_members = false;
@@ -122,7 +124,9 @@ async fn generate_crates_rust(ctx: &MetaDocContext<'_>) -> Result<String> {
 
     for m in &members {
         let cargo_path = format!("{}/{m}/Cargo.toml", ctx.repo_root);
-        let cargo_content = tokio::fs::read_to_string(&cargo_path).await.unwrap_or_default();
+        let cargo_content = tokio::fs::read_to_string(&cargo_path)
+            .await
+            .unwrap_or_default();
         // Estrae `name` (puo' differire dal path) e `description`
         let name = extract_toml_field(&cargo_content, "name").unwrap_or_else(|| m.clone());
         let desc = extract_toml_field(&cargo_content, "description")
@@ -142,7 +146,9 @@ fn extract_toml_field(content: &str, field: &str) -> Option<String> {
             in_package = t == "[package]";
             continue;
         }
-        if in_package && t.starts_with(&format!("{field} ")) || in_package && t.starts_with(&format!("{field}=")) {
+        if in_package && t.starts_with(&format!("{field} "))
+            || in_package && t.starts_with(&format!("{field}="))
+        {
             let value = t.split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
             let value = value.trim_matches('"').trim_matches('\'').to_string();
             return Some(value);
@@ -173,7 +179,9 @@ async fn generate_brain_python(ctx: &MetaDocContext<'_>) -> Result<String> {
     top_modules.sort();
 
     let mut out = String::new();
-    out.push_str("Mappa modulare di `brain/` (Python + FastAPI + LangGraph). Generato automaticamente.\n\n");
+    out.push_str(
+        "Mappa modulare di `brain/` (Python + FastAPI + LangGraph). Generato automaticamente.\n\n",
+    );
     out.push_str("Vedi anche: [[crates-rust]], [[overview]], [[multi-provider-routing]], [[nexus-architetturale]].\n\n");
     out.push_str("## Top-level modules\n\n");
     for m in &top_modules {
@@ -185,7 +193,10 @@ async fn generate_brain_python(ctx: &MetaDocContext<'_>) -> Result<String> {
         if let Some(r) = readme {
             // Prendi i primi 200 char come summary
             let summary: String = r.chars().take(200).collect();
-            out.push_str(&format!("{summary}{}\n\n", if r.len() > 200 { "..." } else { "" }));
+            out.push_str(&format!(
+                "{summary}{}\n\n",
+                if r.len() > 200 { "..." } else { "" }
+            ));
         } else if let Ok(init) = tokio::fs::read_to_string(&init_path).await {
             // Estrai docstring del modulo
             if let Some(doc) = extract_python_docstring(&init) {
@@ -234,14 +245,28 @@ async fn generate_frontend(ctx: &MetaDocContext<'_>) -> Result<String> {
             let pkg_path = format!("{apps_dir}/{app}/package.json");
             let pkg = tokio::fs::read_to_string(&pkg_path).await.ok();
             let (name, version, desc) = if let Some(p) = pkg {
-                let v: serde_json::Value = serde_json::from_str(&p).unwrap_or(serde_json::json!({}));
+                let v: serde_json::Value =
+                    serde_json::from_str(&p).unwrap_or(serde_json::json!({}));
                 (
-                    v.get("name").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
-                    v.get("version").and_then(|x| x.as_str()).unwrap_or("?").to_string(),
-                    v.get("description").and_then(|x| x.as_str()).unwrap_or("—").to_string(),
+                    v.get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    v.get("version")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    v.get("description")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("—")
+                        .to_string(),
                 )
             } else {
-                ("(no package.json)".to_string(), "—".to_string(), "—".to_string())
+                (
+                    "(no package.json)".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                )
             };
             out.push_str(&format!("| `{app}` | `{name}` | {version} | {desc} |\n"));
         }

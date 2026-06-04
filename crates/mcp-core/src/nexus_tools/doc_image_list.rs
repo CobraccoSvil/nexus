@@ -34,7 +34,10 @@ fn extract_md_images(text: &str) -> Vec<(String, String)> {
 #[async_trait]
 impl NexusToolHandler for DocImageListTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let path = args.get("path").and_then(Value::as_str).unwrap_or("README.md");
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("README.md");
         let pb = std::path::PathBuf::from(path);
         if pb.components().any(|c| matches!(c, Component::ParentDir)) {
             return Err(NexusToolError::BadInput("path traversal denied".into()));
@@ -44,7 +47,8 @@ impl NexusToolHandler for DocImageListTool {
             return Err(NexusToolError::BadInput("path traversal denied".into()));
         }
         let content = std::fs::read_to_string(&full).map_err(NexusToolError::Io)?;
-        let images: Vec<Value> = extract_md_images(&content).into_iter()
+        let images: Vec<Value> = extract_md_images(&content)
+            .into_iter()
             .map(|(a, u)| json!({"alt": a, "url": u}))
             .collect();
         Ok(json!({"ok": true, "path": path, "count": images.len(), "images": images}))
@@ -52,5 +56,7 @@ impl NexusToolHandler for DocImageListTool {
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"}}})
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

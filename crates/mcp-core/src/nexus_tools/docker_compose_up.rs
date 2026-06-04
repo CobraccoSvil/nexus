@@ -10,7 +10,10 @@ use serde_json::{json, Value};
 
 pub struct DockerComposeUpTool;
 
-fn validate_compose_path(root: &std::path::Path, compose_file: &str) -> Result<String, NexusToolError> {
+fn validate_compose_path(
+    root: &std::path::Path,
+    compose_file: &str,
+) -> Result<String, NexusToolError> {
     if compose_file.is_empty() {
         return Err(NexusToolError::BadInput(
             "Parametro 'compose_file' obbligatorio. Non e' permesso usare compose globali.".into(),
@@ -33,15 +36,13 @@ fn validate_compose_path(root: &std::path::Path, compose_file: &str) -> Result<S
 
 #[async_trait]
 impl NexusToolHandler for DockerComposeUpTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let compose_file = args
             .get("compose_file")
             .and_then(Value::as_str)
-            .ok_or_else(|| NexusToolError::BadInput("Parametro 'compose_file' obbligatorio".into()))?
+            .ok_or_else(|| {
+                NexusToolError::BadInput("Parametro 'compose_file' obbligatorio".into())
+            })?
             .trim()
             .to_string();
 

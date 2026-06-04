@@ -8,7 +8,10 @@ pub struct CargoBuildArtifactCheckTool;
 #[async_trait]
 impl NexusToolHandler for CargoBuildArtifactCheckTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let profile = args.get("profile").and_then(Value::as_str).unwrap_or("release");
+        let profile = args
+            .get("profile")
+            .and_then(Value::as_str)
+            .unwrap_or("release");
         let dir = ctx.project_root.join("target").join(profile);
         if !dir.exists() {
             return Ok(json!({"ok": true, "exists": false, "profile": profile}));
@@ -42,5 +45,7 @@ impl NexusToolHandler for CargoBuildArtifactCheckTool {
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"profile":{"type":"string"}}})
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

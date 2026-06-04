@@ -8,8 +8,15 @@ pub struct PerfPanicCountTool;
 
 #[async_trait]
 impl NexusToolHandler for PerfPanicCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let (counts, files) = scan_substrings(&ctx.project_root, &["panic!", ".unwrap()", ".expect(", "todo!", "unimplemented!"]);
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let (counts, files) = scan_substrings(
+            &ctx.project_root,
+            &["panic!", ".unwrap()", ".expect(", "todo!", "unimplemented!"],
+        );
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -20,5 +27,7 @@ impl NexusToolHandler for PerfPanicCountTool {
             "unimplemented": counts[4],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

@@ -14,20 +14,16 @@ pub struct CargoTestTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoTestTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let workspace_member = args
             .get("workspace_member")
             .and_then(Value::as_str)
             .map(String::from);
-        let filter = args
-            .get("filter")
-            .and_then(Value::as_str)
-            .map(String::from);
-        let release = args.get("release").and_then(Value::as_bool).unwrap_or(false);
+        let filter = args.get("filter").and_then(Value::as_str).map(String::from);
+        let release = args
+            .get("release")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         let mut cmd: Vec<String> = vec!["test".into(), "--no-fail-fast".into()];
         if release {

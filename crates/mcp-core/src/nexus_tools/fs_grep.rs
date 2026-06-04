@@ -87,11 +87,7 @@ fn walk_grep(
 
 #[async_trait]
 impl NexusToolHandler for FsGrepTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let pattern = args
             .get("pattern")
             .and_then(Value::as_str)

@@ -8,8 +8,15 @@ pub struct CaImplCountTool;
 
 #[async_trait]
 impl NexusToolHandler for CaImplCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let (counts, files) = scan_substrings(&ctx.project_root, &["impl ", "impl<", "impl Drop", "impl Default"]);
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let (counts, files) = scan_substrings(
+            &ctx.project_root,
+            &["impl ", "impl<", "impl Drop", "impl Default"],
+        );
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -19,5 +26,7 @@ impl NexusToolHandler for CaImplCountTool {
             "impl_default": counts[3],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

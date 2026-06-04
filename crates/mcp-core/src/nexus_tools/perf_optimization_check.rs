@@ -8,7 +8,10 @@ pub struct PerfOptimizationCheckTool;
 fn extract_section<'a>(toml: &'a str, header: &str) -> Option<&'a str> {
     let idx = toml.find(header)?;
     let rest = &toml[idx + header.len()..];
-    let end = rest.find("\n[").map(|p| idx + header.len() + p).unwrap_or(toml.len());
+    let end = rest
+        .find("\n[")
+        .map(|p| idx + header.len() + p)
+        .unwrap_or(toml.len());
     Some(&toml[idx..end])
 }
 
@@ -26,7 +29,11 @@ fn get_kv(section: &str, key: &str) -> Option<String> {
 
 #[async_trait]
 impl NexusToolHandler for PerfOptimizationCheckTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let cargo = ctx.project_root.join("Cargo.toml");
         if !cargo.is_file() {
             return Ok(json!({"ok": false, "error": "Cargo.toml not found"}));
@@ -43,8 +50,12 @@ impl NexusToolHandler for PerfOptimizationCheckTool {
                 "panic": get_kv(section, "panic"),
                 "debug": get_kv(section, "debug"),
             })),
-            None => Ok(json!({"ok": true, "exists": false, "note": "Default release profile in use"})),
+            None => {
+                Ok(json!({"ok": true, "exists": false, "note": "Default release profile in use"}))
+            }
         }
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

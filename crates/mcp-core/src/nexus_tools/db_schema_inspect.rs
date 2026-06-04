@@ -26,10 +26,7 @@ impl NexusToolHandler for DbSchemaInspectTool {
             .and_then(Value::as_str)
             .unwrap_or("public")
             .to_string();
-        let table_filter = args
-            .get("table")
-            .and_then(Value::as_str)
-            .map(String::from);
+        let table_filter = args.get("table").and_then(Value::as_str).map(String::from);
 
         let db_url = match std::env::var("DATABASE_URL") {
             Ok(u) => u,

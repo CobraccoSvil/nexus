@@ -7,7 +7,11 @@ pub struct BuildReleaseSizeTool;
 
 #[async_trait]
 impl NexusToolHandler for BuildReleaseSizeTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let dir = ctx.project_root.join("target").join("release");
         if !dir.is_dir() {
             return Ok(json!({"ok": true, "exists": false, "total_bytes": 0}));
@@ -29,7 +33,11 @@ impl NexusToolHandler for BuildReleaseSizeTool {
                 }
             }
         }
-        Ok(json!({"ok": true, "exists": true, "total_bytes": total, "binary_count": binaries.len(), "binaries": binaries}))
+        Ok(
+            json!({"ok": true, "exists": true, "total_bytes": total, "binary_count": binaries.len(), "binaries": binaries}),
+        )
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

@@ -21,11 +21,7 @@ const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 #[async_trait]
 impl NexusToolHandler for FsWriteTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let path = args
             .get("path")
             .and_then(Value::as_str)
@@ -35,7 +31,10 @@ impl NexusToolHandler for FsWriteTool {
             .and_then(Value::as_str)
             .ok_or_else(|| NexusToolError::BadInput("content required".into()))?;
         let append = args.get("append").and_then(Value::as_bool).unwrap_or(false);
-        let create_dirs = args.get("create_dirs").and_then(Value::as_bool).unwrap_or(true);
+        let create_dirs = args
+            .get("create_dirs")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let max_bytes = args
             .get("max_bytes")
             .and_then(Value::as_u64)
@@ -79,7 +78,8 @@ impl NexusToolHandler for FsWriteTool {
                 .append(true)
                 .open(&full)
                 .map_err(NexusToolError::Io)?;
-            f.write_all(content.as_bytes()).map_err(NexusToolError::Io)?;
+            f.write_all(content.as_bytes())
+                .map_err(NexusToolError::Io)?;
         } else {
             std::fs::write(&full, content).map_err(NexusToolError::Io)?;
         }
@@ -146,7 +146,10 @@ mod tests {
             .await
             .unwrap();
         FsWriteTool
-            .execute(&ctx, &json!({"path": "x.txt", "content": "b", "append": true}))
+            .execute(
+                &ctx,
+                &json!({"path": "x.txt", "content": "b", "append": true}),
+            )
             .await
             .unwrap();
         let v = std::fs::read_to_string(tmp.join("x.txt")).unwrap();

@@ -14,11 +14,7 @@ pub struct CargoAuditTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoAuditTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let deny_warnings = args
             .get("deny_warnings")
             .and_then(Value::as_bool)

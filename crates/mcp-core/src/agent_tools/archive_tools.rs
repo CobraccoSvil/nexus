@@ -46,7 +46,9 @@ pub(super) async fn tool_nexus_list_archive_entries(
         .and_then(|s| Uuid::parse_str(s).ok())
     {
         Some(id) => id,
-        None => return json!({ "error": "Parametro 'attachment_id' obbligatorio (UUID)." }).to_string(),
+        None => {
+            return json!({ "error": "Parametro 'attachment_id' obbligatorio (UUID)." }).to_string()
+        }
     };
 
     let record = match load_attachment(&ctx.db, attachment_id, ctx.project_id).await {
@@ -66,7 +68,9 @@ pub(super) async fn tool_nexus_list_archive_entries(
         ArchiveFormat::Zip => list_zip_entries(&bytes),
         ArchiveFormat::Tar => list_tar_entries(&bytes, /*gz=*/ false),
         ArchiveFormat::TarGz => list_tar_entries(&bytes, /*gz=*/ true),
-        ArchiveFormat::Unknown => Err("formato archivio non riconosciuto (atteso ZIP/TAR/TAR.GZ)".into()),
+        ArchiveFormat::Unknown => {
+            Err("formato archivio non riconosciuto (atteso ZIP/TAR/TAR.GZ)".into())
+        }
     })
     .await;
 
@@ -79,8 +83,8 @@ pub(super) async fn tool_nexus_list_archive_entries(
 
 fn list_zip_entries(bytes: &[u8]) -> Result<Value, String> {
     let reader = Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(reader)
-        .map_err(|e| format!("apertura ZIP fallita: {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("apertura ZIP fallita: {e}"))?;
     let total = archive.len();
     // Politica "mai troncare-e-buttare": elenca TUTTE le entry, nessun cap.
     let mut entries: Vec<Value> = Vec::with_capacity(total);
@@ -113,7 +117,10 @@ fn list_tar_entries(bytes: &[u8], gz: bool) -> Result<Value, String> {
     // Politica "mai troncare-e-buttare": elenca TUTTE le entry, nessun cap.
     let mut entries: Vec<Value> = Vec::new();
     let mut total = 0usize;
-    for entry in ar.entries().map_err(|e| format!("apertura TAR fallita: {e}"))? {
+    for entry in ar
+        .entries()
+        .map_err(|e| format!("apertura TAR fallita: {e}"))?
+    {
         let entry = entry.map_err(|e| format!("entry non leggibile: {e}"))?;
         total += 1;
         let header = entry.header();
@@ -138,10 +145,7 @@ fn list_tar_entries(bytes: &[u8], gz: bool) -> Result<Value, String> {
 }
 
 /// `nexus_read_archive_entry(attachment_id, entry_path, encoding?)`.
-pub(super) async fn tool_nexus_read_archive_entry(
-    ctx: &AgentToolContext,
-    input: &Value,
-) -> String {
+pub(super) async fn tool_nexus_read_archive_entry(ctx: &AgentToolContext, input: &Value) -> String {
     let attachment_id = match input
         .get("attachment_id")
         .and_then(Value::as_str)
@@ -201,19 +205,26 @@ pub(super) async fn tool_nexus_read_archive_entry(
         let (payload, total_size) = match result {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return json!({ "error": e }).to_string(),
-            Err(e) => return json!({ "error": format!("spawn_blocking fallita: {e}") }).to_string(),
+            Err(e) => {
+                return json!({ "error": format!("spawn_blocking fallita: {e}") }).to_string()
+            }
         };
 
         let _ = db; // shut up unused
-        encode_payload(&entry_path_for_compute, payload, total_size, &encoding_for_compute)
+        encode_payload(
+            &entry_path_for_compute,
+            payload,
+            total_size,
+            &encoding_for_compute,
+        )
     })
     .await
 }
 
 fn extract_zip_entry(bytes: &[u8], entry_path: &str) -> Result<(Vec<u8>, u64), String> {
     let reader = Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(reader)
-        .map_err(|e| format!("apertura ZIP fallita: {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("apertura ZIP fallita: {e}"))?;
     let mut entry = archive
         .by_name(entry_path)
         .map_err(|e| format!("entry '{entry_path}' non trovata: {e}"))?;
@@ -233,7 +244,10 @@ fn extract_tar_entry(bytes: &[u8], entry_path: &str, gz: bool) -> Result<(Vec<u8
         Box::new(Cursor::new(bytes))
     };
     let mut ar = tar::Archive::new(inner);
-    for entry in ar.entries().map_err(|e| format!("apertura TAR fallita: {e}"))? {
+    for entry in ar
+        .entries()
+        .map_err(|e| format!("apertura TAR fallita: {e}"))?
+    {
         let mut entry = entry.map_err(|e| format!("entry non leggibile: {e}"))?;
         let path = entry
             .path()
@@ -249,13 +263,15 @@ fn extract_tar_entry(bytes: &[u8], entry_path: &str, gz: bool) -> Result<(Vec<u8
             return Ok((buf, total));
         }
     }
-    Err(format!("entry '{entry_path}' non trovata nell'archivio TAR"))
+    Err(format!(
+        "entry '{entry_path}' non trovata nell'archivio TAR"
+    ))
 }
 
 fn encode_payload(entry_path: &str, payload: Vec<u8>, total_size: u64, encoding: &str) -> String {
     let is_text_like = encoding == "text"
-        || (encoding == "auto" && super::attachment_inspector::detect_kind(&payload, entry_path, "").0
-            == "text"
+        || (encoding == "auto"
+            && super::attachment_inspector::detect_kind(&payload, entry_path, "").0 == "text"
             || (encoding == "auto" && is_likely_text(&payload)));
     let read_bytes = payload.len();
     let (content, encoding_label) = if is_text_like {

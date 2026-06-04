@@ -9,7 +9,11 @@ pub struct MemoryEvictStatsTool;
 
 #[async_trait]
 impl NexusToolHandler for MemoryEvictStatsTool {
-    async fn execute(&self, _ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        _ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let pool = match db_helper::get_pool().await {
             Ok(p) => p,
             Err(e) => return Ok(json!({"ok": false, "error": e})),
@@ -26,5 +30,7 @@ impl NexusToolHandler for MemoryEvictStatsTool {
             Err(_) => Ok(json!({"ok": true, "evictable_old_rows": 0, "note": "table missing"})),
         }
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

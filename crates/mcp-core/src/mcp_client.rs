@@ -260,14 +260,7 @@ pub async fn list_tools_stdio(
         }),
     );
     let list_msg = build_jsonrpc_with_id(2, "tools/list", json!({}));
-    let output = run_stdio_jsonrpc(
-        command,
-        args,
-        env_vars,
-        2,
-        &[init_msg, list_msg],
-    )
-    .await?;
+    let output = run_stdio_jsonrpc(command, args, env_vars, 2, &[init_msg, list_msg]).await?;
 
     // Prende l'ultima risposta JSON valida con "result"
     for line in output.lines().rev() {
@@ -307,14 +300,7 @@ pub async fn call_tool_stdio(
         "tools/call",
         json!({ "name": tool_name, "arguments": arguments }),
     );
-    let output = run_stdio_jsonrpc(
-        command,
-        args,
-        env_vars,
-        2,
-        &[init_msg, call_msg],
-    )
-    .await?;
+    let output = run_stdio_jsonrpc(command, args, env_vars, 2, &[init_msg, call_msg]).await?;
 
     for line in output.lines().rev() {
         if let Ok(v) = serde_json::from_str::<Value>(line) {
@@ -324,7 +310,9 @@ pub async fn call_tool_stdio(
         }
     }
 
-    Err(McpError::Protocol("Nessun risultato dal server stdio".to_string()))
+    Err(McpError::Protocol(
+        "Nessun risultato dal server stdio".to_string(),
+    ))
 }
 
 // ── Helpers interni ────────────────────────────────────────────────────────
@@ -368,15 +356,24 @@ async fn run_stdio_jsonrpc(
     let mut child = cmd.spawn().map_err(McpError::Io)?;
     // stdin/stdout/stderr sono Some per costruzione (Stdio::piped() impostato
     // sopra), ma esprimiamo l'invariante esplicitamente per non panicare.
-    let mut stdin = child.stdin.take()
+    let mut stdin = child
+        .stdin
+        .take()
         .ok_or_else(|| McpError::Protocol("child stdin non disponibile dopo spawn".into()))?;
-    let stdout = child.stdout.take()
+    let stdout = child
+        .stdout
+        .take()
         .ok_or_else(|| McpError::Protocol("child stdout non disponibile dopo spawn".into()))?;
-    let stderr = child.stderr.take()
+    let stderr = child
+        .stderr
+        .take()
         .ok_or_else(|| McpError::Protocol("child stderr non disponibile dopo spawn".into()))?;
 
     for msg in messages {
-        stdin.write_all(msg.as_bytes()).await.map_err(McpError::Io)?;
+        stdin
+            .write_all(msg.as_bytes())
+            .await
+            .map_err(McpError::Io)?;
         stdin.write_all(b"\n").await.map_err(McpError::Io)?;
     }
     drop(stdin);
@@ -441,7 +438,10 @@ fn parse_tools_response(result: Value) -> Result<Vec<McpTool>, McpError> {
         .map(|t| McpTool {
             name: t["name"].as_str().unwrap_or("").to_string(),
             description: t["description"].as_str().map(str::to_string),
-            input_schema: t.get("inputSchema").cloned().unwrap_or(json!({ "type": "object", "properties": {} })),
+            input_schema: t
+                .get("inputSchema")
+                .cloned()
+                .unwrap_or(json!({ "type": "object", "properties": {} })),
         })
         .collect())
 }
@@ -479,13 +479,17 @@ pub async fn call_tool(
         McpTransport::Http { url, headers } => {
             call_tool_http(url, headers, tool_name, arguments).await
         }
-        McpTransport::Stdio { command, args, env_vars } => {
-            call_tool_stdio(command, args, env_vars, tool_name, arguments).await
-        }
+        McpTransport::Stdio {
+            command,
+            args,
+            env_vars,
+        } => call_tool_stdio(command, args, env_vars, tool_name, arguments).await,
         McpTransport::Builtin => {
             // I tool builtin vengono dispatchati direttamente in agent_loop.rs
             // prima di arrivare qui — questo branch non dovrebbe mai essere raggiunto.
-            Err(McpError::Protocol("Builtin transport non deve passare per mcp_client".to_string()))
+            Err(McpError::Protocol(
+                "Builtin transport non deve passare per mcp_client".to_string(),
+            ))
         }
     }
 }
@@ -494,9 +498,11 @@ pub async fn call_tool(
 pub async fn list_tools(config: &McpServerConfig) -> Result<Vec<McpTool>, McpError> {
     match &config.transport {
         McpTransport::Http { url, headers } => list_tools_http(url, headers).await,
-        McpTransport::Stdio { command, args, env_vars } => {
-            list_tools_stdio(command, args, env_vars).await
-        }
+        McpTransport::Stdio {
+            command,
+            args,
+            env_vars,
+        } => list_tools_stdio(command, args, env_vars).await,
         McpTransport::Builtin => {
             // I tool builtin sono caricati da mcp_server_tools tramite seed_tools_and_server()
             Ok(vec![])

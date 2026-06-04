@@ -8,8 +8,15 @@ pub struct PerfUnsafeBlocksTool;
 
 #[async_trait]
 impl NexusToolHandler for PerfUnsafeBlocksTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let (counts, files) = scan_substrings(&ctx.project_root, &["unsafe {", "unsafe fn ", "unsafe impl "]);
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let (counts, files) = scan_substrings(
+            &ctx.project_root,
+            &["unsafe {", "unsafe fn ", "unsafe impl "],
+        );
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -18,5 +25,7 @@ impl NexusToolHandler for PerfUnsafeBlocksTool {
             "unsafe_impl": counts[2],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

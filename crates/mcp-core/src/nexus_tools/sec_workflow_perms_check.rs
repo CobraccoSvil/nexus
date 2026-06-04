@@ -8,7 +8,11 @@ pub struct SecWorkflowPermsCheckTool;
 
 #[async_trait]
 impl NexusToolHandler for SecWorkflowPermsCheckTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let dir = ctx.project_root.join(".github").join("workflows");
         if !dir.is_dir() {
             return Ok(json!({"ok": true, "exists": false}));
@@ -17,7 +21,9 @@ impl NexusToolHandler for SecWorkflowPermsCheckTool {
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for entry in rd.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if !(name.ends_with(".yml") || name.ends_with(".yaml")) { continue; }
+                if !(name.ends_with(".yml") || name.ends_with(".yaml")) {
+                    continue;
+                }
                 let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
                 files.push(json!({
                     "name": name,
@@ -29,5 +35,7 @@ impl NexusToolHandler for SecWorkflowPermsCheckTool {
         }
         Ok(json!({"ok": true, "exists": true, "count": files.len(), "files": files}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

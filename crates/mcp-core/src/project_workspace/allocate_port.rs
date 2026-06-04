@@ -14,8 +14,8 @@
 //! 4. Scrive `nexus_resource_audit` (allowed/blocked).
 //! 5. Ritorna `{port, label, allocation_mode}` per uso dell'agente.
 
-use super::*;
 use super::services::find_free_project_port;
+use super::*;
 use crate::port_registry::PortRegistryCache;
 use crate::security::{record_audit, AuditEntry};
 use sqlx::PgPool;
@@ -63,7 +63,10 @@ pub async fn find_or_allocate(
     {
         let p = existing_port as u16;
         if super::port_recovery::tcp_probe(p, 300).await {
-            return Ok(AllocatedPort { port: p, mode: "existing" });
+            return Ok(AllocatedPort {
+                port: p,
+                mode: "existing",
+            });
         }
         // Allocazione "stale": nessuno in ascolto. Cerca processi orfani del
         // bucket (utente li ha lanciati manualmente con .env hardcoded, oppure
@@ -95,17 +98,19 @@ pub async fn find_or_allocate(
                         "label": label, "stale_port": p, "pid": pid, "program": program
                     })),
             );
-            return Ok(AllocatedPort { port: *found_port, mode: "adopted" });
+            return Ok(AllocatedPort {
+                port: *found_port,
+                mode: "adopted",
+            });
         }
         // Nessun orfano adottabile: rimuovi la riga stale e prosegui ad
         // allocare ex novo nel bucket.
-        let _ = sqlx::query(
-            "DELETE FROM nexus_port_allocations WHERE project_id = $1 AND label = $2",
-        )
-        .bind(project_id)
-        .bind(label)
-        .execute(db)
-        .await;
+        let _ =
+            sqlx::query("DELETE FROM nexus_port_allocations WHERE project_id = $1 AND label = $2")
+                .bind(project_id)
+                .bind(label)
+                .execute(db)
+                .await;
         tracing::info!(
             label = %label, stale_port = p,
             "find_or_allocate: allocazione stale rimossa, procedo con nuova allocazione"
@@ -139,7 +144,12 @@ pub async fn find_or_allocate(
     .execute(db)
     .await;
     if let Err(e) = insert_result {
-        tracing::warn!("allocate_port: INSERT fallito (porta {} label {}): {}", port, label, e);
+        tracing::warn!(
+            "allocate_port: INSERT fallito (porta {} label {}): {}",
+            port,
+            label,
+            e
+        );
     }
 
     // 5. Audit allocato
@@ -200,15 +210,14 @@ pub async fn kill_port_process(
     let _ctx = load_project_context(&state.db, project_id, user_id).await?;
 
     let freed = super::port_recovery::try_free_port(body.port).await;
-    let deleted = sqlx::query(
-        "DELETE FROM nexus_port_allocations WHERE project_id = $1 AND port = $2",
-    )
-    .bind(project_id)
-    .bind(body.port as i32)
-    .execute(&state.db)
-    .await
-    .map(|r| r.rows_affected())
-    .unwrap_or(0);
+    let deleted =
+        sqlx::query("DELETE FROM nexus_port_allocations WHERE project_id = $1 AND port = $2")
+            .bind(project_id)
+            .bind(body.port as i32)
+            .execute(&state.db)
+            .await
+            .map(|r| r.rows_affected())
+            .unwrap_or(0);
 
     record_audit(
         AuditEntry::allowed(project_id, "port_kill", "port")

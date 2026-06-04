@@ -8,8 +8,15 @@ pub struct TestMockCountTool;
 
 #[async_trait]
 impl NexusToolHandler for TestMockCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let (counts, files) = scan_substrings(&ctx.project_root, &["use mockall", "mock!", "MockServer", "wiremock"]);
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let (counts, files) = scan_substrings(
+            &ctx.project_root,
+            &["use mockall", "mock!", "MockServer", "wiremock"],
+        );
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -19,5 +26,7 @@ impl NexusToolHandler for TestMockCountTool {
             "wiremock": counts[3],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

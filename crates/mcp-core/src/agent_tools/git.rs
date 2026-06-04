@@ -58,14 +58,20 @@ pub(super) async fn tool_git_commit(ctx: &AgentToolContext, input: &Value) -> St
     match run_git_command(&ctx.root_path, &["commit", "-m", message]).await {
         Ok((stdout, _)) => {
             // Dispatcher: notifica GitStatusChanged → pannello Git aggiorna branch + counts
-            if let Ok((status_out, _)) = run_git_command(&ctx.root_path, &["status", "--porcelain=v1", "-b"]).await {
+            if let Ok((status_out, _)) =
+                run_git_command(&ctx.root_path, &["status", "--porcelain=v1", "-b"]).await
+            {
                 let branch = status_out
                     .lines()
                     .next()
                     .and_then(|l| l.strip_prefix("## "))
                     .map(|s| s.split("...").next().unwrap_or(s).to_string())
                     .unwrap_or_default();
-                let modified_count = status_out.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
+                let modified_count = status_out
+                    .lines()
+                    .skip(1)
+                    .filter(|l| !l.trim().is_empty())
+                    .count();
                 nexus_events::dispatcher::emit(
                     &ctx.project_channels,
                     ctx.project_id,
@@ -87,13 +93,20 @@ pub(super) async fn tool_git_commit(ctx: &AgentToolContext, input: &Value) -> St
                 if let Ok((diff_out, _)) = run_git_command(
                     &root_bg,
                     &["diff-tree", "--no-commit-id", "-r", "--name-only", "HEAD"],
-                ).await {
+                )
+                .await
+                {
                     for line in diff_out.lines() {
                         let file_path = root_bg.join(line.trim());
                         if file_path.exists() {
                             let _ = crate::projects::reindex_single_file(
-                                &db_bg, &neural_bg, project_id_bg, &root_bg, &file_path,
-                            ).await;
+                                &db_bg,
+                                &neural_bg,
+                                project_id_bg,
+                                &root_bg,
+                                &file_path,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -113,7 +126,11 @@ pub(super) async fn tool_git_push(ctx: &AgentToolContext) -> String {
     }
     match run_git_command(&ctx.root_path, &["push"]).await {
         Ok((stdout, stderr)) => {
-            let out = if stdout.trim().is_empty() { stderr } else { stdout };
+            let out = if stdout.trim().is_empty() {
+                stderr
+            } else {
+                stdout
+            };
             out.trim().to_string()
         }
         Err(e) => format!("[git push error: {}]", e),
@@ -140,15 +157,25 @@ pub(super) async fn tool_git_remote_add(ctx: &AgentToolContext, input: &Value) -
     if !ctx.can_write {
         return "[Errore: permesso di scrittura non concesso]".to_string();
     }
-    let name = input.get("name").and_then(Value::as_str).unwrap_or("origin").trim();
+    let name = input
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("origin")
+        .trim();
     let url = match input.get("url").and_then(Value::as_str) {
         Some(u) if !u.trim().is_empty() => u.trim(),
         _ => return "[Errore: parametro 'url' obbligatorio]".to_string(),
     };
 
     // Validazione: name puro alfanumerico/underscore/dash, no path traversal
-    if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
-        return format!("[Errore: nome remote non valido '{}' (solo alfanumerico/-/_)]", name);
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
+        return format!(
+            "[Errore: nome remote non valido '{}' (solo alfanumerico/-/_)]",
+            name
+        );
     }
 
     // Validazione: url deve essere https:// o git@ (no file:// path locali per evitare leak)
@@ -166,7 +193,12 @@ pub(super) async fn tool_git_remote_add(ctx: &AgentToolContext, input: &Value) -
         Ok(_) => {
             // Verifica con git remote -v
             match run_git_command(&ctx.root_path, &["remote", "-v"]).await {
-                Ok((stdout, _)) => format!("Remote '{}' configurato verso {}.\n\nStato remote:\n{}", name, url, stdout.trim()),
+                Ok((stdout, _)) => format!(
+                    "Remote '{}' configurato verso {}.\n\nStato remote:\n{}",
+                    name,
+                    url,
+                    stdout.trim()
+                ),
                 Err(_) => format!("Remote '{}' configurato verso {}.", name, url),
             }
         }

@@ -9,8 +9,16 @@ pub struct DbForeignKeysTool;
 
 #[async_trait]
 impl NexusToolHandler for DbForeignKeysTool {
-    async fn execute(&self, _ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let schema = args.get("schema").and_then(Value::as_str).unwrap_or("public").to_string();
+    async fn execute(
+        &self,
+        _ctx: &NexusToolContext,
+        args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let schema = args
+            .get("schema")
+            .and_then(Value::as_str)
+            .unwrap_or("public")
+            .to_string();
         let pool = match db_helper::get_pool().await {
             Ok(p) => p,
             Err(e) => return Ok(json!({"ok": false, "error": e})),
@@ -28,19 +36,29 @@ impl NexusToolHandler for DbForeignKeysTool {
             Ok(r) => r,
             Err(e) => return Ok(json!({"ok": false, "error": format!("query: {}", e)})),
         };
-        let items: Vec<Value> = rows.iter().map(|r| json!({
-            "table": r.try_get::<String, _>("table_name").unwrap_or_default(),
-            "constraint": r.try_get::<String, _>("constraint_name").unwrap_or_default(),
-            "column": r.try_get::<String, _>("column_name").unwrap_or_default(),
-            "ref_table": r.try_get::<String, _>("ref_table").unwrap_or_default(),
-            "ref_column": r.try_get::<String, _>("ref_column").unwrap_or_default(),
-        })).collect();
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "table": r.try_get::<String, _>("table_name").unwrap_or_default(),
+                    "constraint": r.try_get::<String, _>("constraint_name").unwrap_or_default(),
+                    "column": r.try_get::<String, _>("column_name").unwrap_or_default(),
+                    "ref_table": r.try_get::<String, _>("ref_table").unwrap_or_default(),
+                    "ref_column": r.try_get::<String, _>("ref_column").unwrap_or_default(),
+                })
+            })
+            .collect();
         Ok(json!({"ok": true, "schema": schema, "count": items.len(), "foreign_keys": items}))
     }
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"schema":{"type":"string"}}})
     }
     fn safety(&self) -> NexusToolSafety {
-        NexusToolSafety { read_only: true, can_write_filesystem: false, can_execute_subproc: false, network_egress: true }
+        NexusToolSafety {
+            read_only: true,
+            can_write_filesystem: false,
+            can_execute_subproc: false,
+            network_egress: true,
+        }
     }
 }

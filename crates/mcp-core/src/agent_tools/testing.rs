@@ -14,9 +14,9 @@
 //! 6. Salva il risultato in `jobs` (kind = "playwright_test") per il pannello Playwright.
 
 use super::*;
+use chrono;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use chrono;
 
 const PLAYWRIGHT_DEFAULT_TIMEOUT: u64 = 600;
 const PLAYWRIGHT_MAX_TIMEOUT: u64 = 900;
@@ -57,9 +57,11 @@ fn pick_backend_port(allocations: &[(i32, String)], dev_port: Option<i32>) -> Op
 
 /// Verifica (non-blocking) se una porta TCP è aperta sull'host locale.
 async fn port_reachable(port: i32) -> bool {
-    use tokio::net::TcpStream;
     use std::net::SocketAddr;
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
+    use tokio::net::TcpStream;
+    let addr: SocketAddr = format!("127.0.0.1:{}", port)
+        .parse()
+        .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
     tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(addr))
         .await
         .is_ok_and(|r| r.is_ok())
@@ -158,13 +160,15 @@ fn collect_playwright_artifacts(pw_root: &Path, project_root: &Path) -> Vec<serd
     }
 
     // Ordina: prima images (di solito screenshot dei test falliti), poi video, trace, report
-    out.sort_by_key(|v| match v.get("kind").and_then(|k| k.as_str()).unwrap_or("") {
-        "image" => 0,
-        "video" => 1,
-        "trace" => 2,
-        "report" => 3,
-        _ => 4,
-    });
+    out.sort_by_key(
+        |v| match v.get("kind").and_then(|k| k.as_str()).unwrap_or("") {
+            "image" => 0,
+            "video" => 1,
+            "trace" => 2,
+            "report" => 3,
+            _ => 4,
+        },
+    );
 
     out.truncate(50);
     out
@@ -216,11 +220,24 @@ fn pick_playwright_root(base: &Path) -> std::path::PathBuf {
 
 pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Value) -> String {
     // ── 1. Parametri ─────────────────────────────────────────────────────────
-    let filter = input.get("filter").and_then(Value::as_str).map(str::to_string);
-    let project_arg = input.get("project").and_then(Value::as_str).map(str::to_string);
+    let filter = input
+        .get("filter")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let project_arg = input
+        .get("project")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let workers = input.get("workers").and_then(Value::as_u64).unwrap_or(1);
-    let reporter = input.get("reporter").and_then(Value::as_str).unwrap_or("list").to_string();
-    let explicit_base_url = input.get("base_url").and_then(Value::as_str).map(str::to_string);
+    let reporter = input
+        .get("reporter")
+        .and_then(Value::as_str)
+        .unwrap_or("list")
+        .to_string();
+    let explicit_base_url = input
+        .get("base_url")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let timeout = input
         .get("timeout_secs")
         .and_then(Value::as_u64)
@@ -234,9 +251,18 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         .and_then(Value::as_u64)
         .unwrap_or(10_000)
         .min(60_000);
-    let auto_start = input.get("auto_start_server").and_then(Value::as_bool).unwrap_or(false);
-    let config_path_override = input.get("config_path").and_then(Value::as_str).map(str::to_string);
-    let cleanup_stale = input.get("cleanup_stale_configs").and_then(Value::as_bool).unwrap_or(true);
+    let auto_start = input
+        .get("auto_start_server")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let config_path_override = input
+        .get("config_path")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let cleanup_stale = input
+        .get("cleanup_stale_configs")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
 
     // ── 2. Controllo presenza Playwright ─────────────────────────────────────
     let (playwright_root, stale_configs): (std::path::PathBuf, Vec<std::path::PathBuf>) =
@@ -269,7 +295,8 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
                     if let Err(e) = std::fs::remove_file(&cfg) {
                         tracing::warn!(path = %cfg.display(), error = %e, "cleanup stale config: errore");
                     } else {
-                        cleanup_notes.push(format!("Rimossa config wrapper stale: {}", cfg.display()));
+                        cleanup_notes
+                            .push(format!("Rimossa config wrapper stale: {}", cfg.display()));
                         tracing::info!(path = %cfg.display(), "cleanup stale config: rimossa");
                     }
                 }
@@ -280,12 +307,18 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
                 if let Ok(entries) = std::fs::read_dir(&e2e_dir) {
                     let files: Vec<_> = entries.flatten().collect();
                     let only_example = files.len() == 1
-                        && files[0].file_name().to_string_lossy().starts_with("example.spec");
+                        && files[0]
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("example.spec");
                     if only_example {
                         if let Err(e) = std::fs::remove_dir_all(&e2e_dir) {
                             tracing::warn!(path = %e2e_dir.display(), error = %e, "cleanup stale e2e/: errore");
                         } else {
-                            cleanup_notes.push(format!("Rimossa directory e2e/ wrapper: {}", e2e_dir.display()));
+                            cleanup_notes.push(format!(
+                                "Rimossa directory e2e/ wrapper: {}",
+                                e2e_dir.display()
+                            ));
                         }
                     }
                 }
@@ -296,7 +329,11 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     let has_config = root.join("playwright.config.ts").is_file()
         || root.join("playwright.config.js").is_file()
         || root.join("playwright.config.mjs").is_file();
-    let has_playwright_nm = root.join("node_modules").join("@playwright").join("test").is_dir();
+    let has_playwright_nm = root
+        .join("node_modules")
+        .join("@playwright")
+        .join("test")
+        .is_dir();
 
     if !has_config && !has_playwright_nm {
         return format!(
@@ -338,7 +375,11 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
                 for (p, _label) in &port_rows {
                     if *p != cp && port_reachable(*p).await {
                         base_url = Some(format!("http://localhost:{}", p));
-                        tracing::info!(chosen = cp, fallback = p, "run_playwright_tests: porta scelta non raggiungibile, uso fallback");
+                        tracing::info!(
+                            chosen = cp,
+                            fallback = p,
+                            "run_playwright_tests: porta scelta non raggiungibile, uso fallback"
+                        );
                         break;
                     }
                 }
@@ -355,8 +396,7 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
                 .next()
                 .and_then(|s| s.parse::<i32>().ok())
         });
-        pick_backend_port(&port_rows, dev_port)
-            .map(|p| format!("http://127.0.0.1:{}", p))
+        pick_backend_port(&port_rows, dev_port).map(|p| format!("http://127.0.0.1:{}", p))
     };
 
     // ── 5. Verifica se il server è raggiungibile; suggerisci avvio se no ─────
@@ -380,7 +420,8 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
                         "command": cmd,
                         "label": "Dev Server (auto-start Playwright)",
                     });
-                    let svc_result = super::service::tool_run_service(ctx, &service_input, "service").await;
+                    let svc_result =
+                        super::service::tool_run_service(ctx, &service_input, "service").await;
                     // Attendi che il server sia pronto (max 15s)
                     let mut attempts = 0;
                     while attempts < 15 && !port_reachable(p).await {
@@ -388,7 +429,10 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
                         attempts += 1;
                     }
                     if port_reachable(p).await {
-                        format!("Dev server avviato automaticamente su {url}. Output: {}", svc_result.chars().take(200).collect::<String>())
+                        format!(
+                            "Dev server avviato automaticamente su {url}. Output: {}",
+                            svc_result.chars().take(200).collect::<String>()
+                        )
                     } else {
                         format!("ATTENZIONE: Dev server avviato ma {url} non risponde ancora dopo 15s. I test potrebbero fallire.")
                     }
@@ -402,7 +446,8 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
             format!("BASE_URL impostata a {url}")
         }
     } else {
-        "Nessuna porta allocata trovata: Playwright userà la baseURL da playwright.config.ts".to_string()
+        "Nessuna porta allocata trovata: Playwright userà la baseURL da playwright.config.ts"
+            .to_string()
     };
 
     // ── 6. Costruisci il comando Playwright ───────────────────────────────────
@@ -438,7 +483,7 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         .current_dir(root)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .env("CI", "1")          // headless browser guarantee
+        .env("CI", "1") // headless browser guarantee
         .env("FORCE_COLOR", "0"); // no ANSI codes nell'output
 
     // Inietta BASE_URL solo se l'abbiamo determinata
@@ -482,7 +527,7 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     let job_id = Uuid::new_v4();
     let _ = sqlx::query(
         "INSERT INTO jobs (id, project_id, kind, status, input, progress, output_log) \
-         VALUES ($1, $2, 'playwright_test', 'running', $3, '{}'::jsonb, '')"
+         VALUES ($1, $2, 'playwright_test', 'running', $3, '{}'::jsonb, '')",
     )
     .bind(job_id)
     .bind(ctx.project_id)
@@ -566,28 +611,25 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
 
                 // Flush DB a intervalli (max 500ms tra UPDATE)
                 if last_db_flush.elapsed() >= FLUSH_INTERVAL {
-                    let _ = sqlx::query(
-                        "UPDATE jobs SET output_log = $1, progress = $2 WHERE id = $3"
-                    )
-                    .bind(&acc_log)
-                    .bind(serde_json::to_value(&progress).unwrap_or(serde_json::json!({})))
-                    .bind(job_id)
-                    .execute(&*db_for_stdout)
-                    .await;
+                    let _ =
+                        sqlx::query("UPDATE jobs SET output_log = $1, progress = $2 WHERE id = $3")
+                            .bind(&acc_log)
+                            .bind(serde_json::to_value(&progress).unwrap_or(serde_json::json!({})))
+                            .bind(job_id)
+                            .execute(&*db_for_stdout)
+                            .await;
                     last_db_flush = std::time::Instant::now();
                 }
             }
         }
 
         // Flush finale (cattura le ultime righe sotto la soglia interval)
-        let _ = sqlx::query(
-            "UPDATE jobs SET output_log = $1, progress = $2 WHERE id = $3"
-        )
-        .bind(&acc_log)
-        .bind(serde_json::to_value(&progress).unwrap_or(serde_json::json!({})))
-        .bind(job_id)
-        .execute(&*db_for_stdout)
-        .await;
+        let _ = sqlx::query("UPDATE jobs SET output_log = $1, progress = $2 WHERE id = $3")
+            .bind(&acc_log)
+            .bind(serde_json::to_value(&progress).unwrap_or(serde_json::json!({})))
+            .bind(job_id)
+            .execute(&*db_for_stdout)
+            .await;
 
         (full_bytes, progress)
     });
@@ -599,11 +641,7 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         buf
     });
 
-    let timeout_result = tokio::time::timeout(
-        Duration::from_secs(timeout),
-        child.wait(),
-    )
-    .await;
+    let timeout_result = tokio::time::timeout(Duration::from_secs(timeout), child.wait()).await;
 
     let exit_code = match timeout_result {
         Ok(Ok(status)) => {
@@ -628,9 +666,12 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
     };
 
     // I task lettura terminano quando le pipe si chiudono (alla fine del processo).
-    let (stdout_bytes, live_progress) = stdout_task
-        .await
-        .unwrap_or_else(|_| (Vec::new(), crate::playwright_live::PlaywrightProgress::default()));
+    let (stdout_bytes, live_progress) = stdout_task.await.unwrap_or_else(|_| {
+        (
+            Vec::new(),
+            crate::playwright_live::PlaywrightProgress::default(),
+        )
+    });
     let stderr_bytes = stderr_task.await.unwrap_or_default();
     let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
     let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
@@ -656,7 +697,16 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
             stats.passed,
             stats.passed + stats.failed + stats.skipped,
             if stats.failed > 0 {
-                format!(". Falliti: {}", stats.failed_tests.iter().take(5).cloned().collect::<Vec<_>>().join(", "))
+                format!(
+                    ". Falliti: {}",
+                    stats
+                        .failed_tests
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             } else {
                 String::new()
             }
@@ -665,7 +715,9 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         // Progress finale: usa stats parser-completo (piu' affidabile del parser live)
         // ma preserva failed_specs/current_spec accumulati live se disponibili.
         let final_progress = crate::playwright_live::PlaywrightProgress {
-            total: live_progress.total.or(Some((stats.passed + stats.failed + stats.skipped) as u32)),
+            total: live_progress
+                .total
+                .or(Some((stats.passed + stats.failed + stats.skipped) as u32)),
             passed: stats.passed as u32,
             failed: stats.failed as u32,
             skipped: stats.skipped as u32,
@@ -678,24 +730,26 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
             },
         };
 
-        match sqlx::query(
-            "UPDATE jobs SET status = $1, input = $2, progress = $3 WHERE id = $4"
-        )
-        .bind(status)
-        .bind(serde_json::json!({
-            "label": label,
-            "message": msg,
-            "artifacts": artifacts,
-            "command": command_str,
-            "exit_code": exit_code,
-        }))
-        .bind(serde_json::to_value(&final_progress).unwrap_or(serde_json::json!({})))
-        .bind(job_id)
-        .execute(&*db)
-        .await
+        match sqlx::query("UPDATE jobs SET status = $1, input = $2, progress = $3 WHERE id = $4")
+            .bind(status)
+            .bind(serde_json::json!({
+                "label": label,
+                "message": msg,
+                "artifacts": artifacts,
+                "command": command_str,
+                "exit_code": exit_code,
+            }))
+            .bind(serde_json::to_value(&final_progress).unwrap_or(serde_json::json!({})))
+            .bind(job_id)
+            .execute(&*db)
+            .await
         {
-            Ok(r) => tracing::info!(rows = r.rows_affected(), project_id = %pid, status = %status, artifacts = artifacts.len(), "playwright_test job aggiornato"),
-            Err(e) => tracing::error!(error = %e, project_id = %pid, "playwright_test job UPDATE fallito"),
+            Ok(r) => {
+                tracing::info!(rows = r.rows_affected(), project_id = %pid, status = %status, artifacts = artifacts.len(), "playwright_test job aggiornato")
+            }
+            Err(e) => {
+                tracing::error!(error = %e, project_id = %pid, "playwright_test job UPDATE fallito")
+            }
         }
 
         // Dispatcher: notifica esito finale → toast + highlight pannello Playwright
@@ -750,10 +804,20 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         .collect::<Vec<_>>()
         .join("\n");
 
-    let status_label = if exit_code == 0 { "TUTTI I TEST PASSATI" } else { "TEST FALLITI" };
+    let status_label = if exit_code == 0 {
+        "TUTTI I TEST PASSATI"
+    } else {
+        "TEST FALLITI"
+    };
     let port_info = port_rows
         .iter()
-        .map(|(p, l)| if l.is_empty() { format!(":{}", p) } else { format!(":{} ({})", p, l) })
+        .map(|(p, l)| {
+            if l.is_empty() {
+                format!(":{}", p)
+            } else {
+                format!(":{} ({})", p, l)
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -784,9 +848,15 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         },
         status_label = status_label,
         exit_code = exit_code,
-        port_info = if port_info.is_empty() { "nessuna porta allocata".to_string() } else { port_info },
+        port_info = if port_info.is_empty() {
+            "nessuna porta allocata".to_string()
+        } else {
+            port_info
+        },
         base_url_display = base_url.as_deref().unwrap_or("(da playwright.config.ts)"),
-        backend_api_url_display = backend_api_url.as_deref().unwrap_or("(non trovata — verifica label 'backend-*' in nexus_port_allocations)"),
+        backend_api_url_display = backend_api_url
+            .as_deref()
+            .unwrap_or("(non trovata — verifica label 'backend-*' in nexus_port_allocations)"),
         server_status = server_status,
         command_str = command_str,
         passed = stats.passed,
@@ -796,7 +866,15 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
         failed_list = if stats.failed_tests.is_empty() {
             String::new()
         } else {
-            format!("Test falliti:\n{}", stats.failed_tests.iter().map(|t| format!("  - {t}")).collect::<Vec<_>>().join("\n"))
+            format!(
+                "Test falliti:\n{}",
+                stats
+                    .failed_tests
+                    .iter()
+                    .map(|t| format!("  - {t}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
         },
         stdout_tail = stdout_tail,
         stderr_section = if stderr_excerpt.is_empty() {
@@ -906,7 +984,12 @@ pub(super) async fn tool_run_specific_test(ctx: &AgentToolContext, input: &Value
     } else {
         match resolve_relative_path(&ctx.root_path, working_dir) {
             Ok(p) => p,
-            Err(e) => return format!("[Errore percorso: {}]", e.1["error"].as_str().unwrap_or("path error")),
+            Err(e) => {
+                return format!(
+                    "[Errore percorso: {}]",
+                    e.1["error"].as_str().unwrap_or("path error")
+                )
+            }
         }
     };
 
@@ -970,7 +1053,12 @@ pub(super) async fn tool_run_lint_fix(ctx: &AgentToolContext, input: &Value) -> 
     } else {
         match resolve_relative_path(&ctx.root_path, working_dir) {
             Ok(p) => p,
-            Err(e) => return format!("[Errore percorso: {}]", e.1["error"].as_str().unwrap_or("path error")),
+            Err(e) => {
+                return format!(
+                    "[Errore percorso: {}]",
+                    e.1["error"].as_str().unwrap_or("path error")
+                )
+            }
         }
     };
 
@@ -1022,7 +1110,12 @@ pub(super) async fn tool_format_file(ctx: &AgentToolContext, input: &Value) -> S
 
     let target = match resolve_relative_path(&ctx.root_path, path_str) {
         Ok(p) => p,
-        Err(e) => return format!("[Errore percorso: {}]", e.1["error"].as_str().unwrap_or("path error")),
+        Err(e) => {
+            return format!(
+                "[Errore percorso: {}]",
+                e.1["error"].as_str().unwrap_or("path error")
+            )
+        }
     };
     if !target.is_file() {
         return format!("[Errore: '{}' non e' un file]", path_str);
@@ -1112,11 +1205,8 @@ async fn run_test_command(
         buf
     });
 
-    let timeout_result = tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        child.wait(),
-    )
-    .await;
+    let timeout_result =
+        tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
 
     let exit_code = match timeout_result {
         Ok(Ok(status)) => status.code().unwrap_or(-1),

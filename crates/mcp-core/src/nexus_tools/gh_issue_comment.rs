@@ -9,10 +9,14 @@ pub struct GhIssueCommentTool;
 #[async_trait]
 impl NexusToolHandler for GhIssueCommentTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let num = args.get("number").and_then(Value::as_u64)
+        let num = args
+            .get("number")
+            .and_then(Value::as_u64)
             .ok_or_else(|| NexusToolError::BadInput("number required".into()))?
             .to_string();
-        let body = args.get("body").and_then(Value::as_str)
+        let body = args
+            .get("body")
+            .and_then(Value::as_str)
             .ok_or_else(|| NexusToolError::BadInput("body required".into()))?;
         let out = run_cmd(
             "gh",
@@ -31,6 +35,11 @@ impl NexusToolHandler for GhIssueCommentTool {
         json!({"type":"object","required":["number","body"],"properties":{"number":{"type":"integer"},"body":{"type":"string"}}})
     }
     fn safety(&self) -> NexusToolSafety {
-        NexusToolSafety { read_only: false, can_write_filesystem: false, can_execute_subproc: true, network_egress: true }
+        NexusToolSafety {
+            read_only: false,
+            can_write_filesystem: false,
+            can_execute_subproc: true,
+            network_egress: true,
+        }
     }
 }

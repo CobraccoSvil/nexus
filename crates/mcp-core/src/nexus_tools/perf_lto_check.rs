@@ -7,7 +7,11 @@ pub struct PerfLtoCheckTool;
 
 #[async_trait]
 impl NexusToolHandler for PerfLtoCheckTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let cargo = ctx.project_root.join("Cargo.toml");
         if !cargo.is_file() {
             return Ok(json!({"ok": false, "error": "Cargo.toml not found"}));
@@ -34,5 +38,7 @@ impl NexusToolHandler for PerfLtoCheckTool {
             "enabled": value.as_deref().map(|v| v != "false" && v != "off").unwrap_or(false),
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

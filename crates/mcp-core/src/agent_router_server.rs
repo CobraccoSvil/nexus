@@ -21,7 +21,7 @@ use nexus_orchestrator::AgentType;
 use nexus_orchestrator::SelectionStrategy;
 use tonic::{transport::Server, Request, Response, Status};
 
-use crate::nexus_bridge::{NexusBridge, AgentMetrics};
+use crate::nexus_bridge::{AgentMetrics, NexusBridge};
 
 /// Converte un nome "brain-style" (snake_case, es. "coder", "github_pr_manager")
 /// nel nome PascalCase atteso da `AgentType::from_name`. Idempotente: se il
@@ -148,7 +148,11 @@ impl AgentRouter for AgentRouterService {
             // context_json puo' contenere project_id: best-effort estrazione.
             serde_json::from_str::<serde_json::Value>(&req.context_json)
                 .ok()
-                .and_then(|v| v.get("project_id").and_then(|x| x.as_str()).map(String::from))
+                .and_then(|v| {
+                    v.get("project_id")
+                        .and_then(|x| x.as_str())
+                        .map(String::from)
+                })
                 .unwrap_or_else(|| "default".to_string())
         };
 
@@ -192,9 +196,7 @@ impl AgentRouter for AgentRouterService {
         let bridge = match NexusBridge::global() {
             Some(b) => b,
             None => {
-                tracing::debug!(
-                    "agent_router: feedback ricevuto ma NexusBridge assente, no-op"
-                );
+                tracing::debug!("agent_router: feedback ricevuto ma NexusBridge assente, no-op");
                 return Ok(Response::new(FeedbackResponse { new_q_value: 0.0 }));
             }
         };
@@ -210,7 +212,11 @@ impl AgentRouter for AgentRouterService {
             success,
             reward,
             req.duration_ms,
-            if success { None } else { Some("reward<0.5".to_string()) },
+            if success {
+                None
+            } else {
+                Some("reward<0.5".to_string())
+            },
         );
 
         Ok(Response::new(FeedbackResponse { new_q_value: new_q }))
@@ -291,7 +297,10 @@ mod tests {
     #[test]
     fn test_snake_to_pascal_github() {
         assert_eq!(snake_to_pascal("github_pr_manager"), "GitHubPRManager");
-        assert_eq!(snake_to_pascal("github_code_reviewer"), "GitHubCodeReviewer");
+        assert_eq!(
+            snake_to_pascal("github_code_reviewer"),
+            "GitHubCodeReviewer"
+        );
     }
 
     #[test]

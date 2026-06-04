@@ -59,12 +59,7 @@ pub async fn apply_project_note(
         &note.body_md
     };
     let combined = format!("{}\n\n{}", note.title, embed_text);
-    let qdrant_point_id = match state
-        .orchestrator
-        .neural
-        .embed_text("", &combined)
-        .await
-    {
+    let qdrant_point_id = match state.orchestrator.neural.embed_text("", &combined).await {
         Ok(vector) => {
             let point_id = Uuid::new_v4().to_string();
             let payload = json!({
@@ -157,12 +152,11 @@ pub async fn generate_technical_notes(
     let mut notes: Vec<GeneratedProjectNote> = Vec::new();
 
     // 1. Lingue + framework (da `projects.analysis_json` se popolato)
-    let row = sqlx::query(
-        "SELECT name, repository_root_path, analysis_json FROM projects WHERE id = $1",
-    )
-    .bind(project_id)
-    .fetch_optional(&state.db)
-    .await?;
+    let row =
+        sqlx::query("SELECT name, repository_root_path, analysis_json FROM projects WHERE id = $1")
+            .bind(project_id)
+            .fetch_optional(&state.db)
+            .await?;
     if let Some(row) = row {
         let proj_name: String = row.try_get("name").unwrap_or_default();
         let repo_root: String = row.try_get("repository_root_path").unwrap_or_default();
@@ -197,14 +191,20 @@ pub async fn generate_technical_notes(
             for r in &count_by_ext {
                 let ext: String = r.try_get("ext").unwrap_or_default();
                 let files: i64 = r.try_get("files").unwrap_or(0);
-                let ext_disp = if ext.is_empty() { "(no-ext)".to_string() } else { ext.clone() };
+                let ext_disp = if ext.is_empty() {
+                    "(no-ext)".to_string()
+                } else {
+                    ext.clone()
+                };
                 body.push_str(&format!("| `{ext_disp}` | {files} |\n"));
                 total += files;
                 if !ext.is_empty() {
                     exts.push(ext);
                 }
             }
-            body.push_str(&format!("\n**Totale file indicizzati**: {total}\n**Repository root**: `{repo_root}`\n"));
+            body.push_str(&format!(
+                "\n**Totale file indicizzati**: {total}\n**Repository root**: `{repo_root}`\n"
+            ));
             notes.push(GeneratedProjectNote {
                 kind: "technical".to_string(),
                 title: format!("File structure del progetto {proj_name}"),
@@ -265,7 +265,10 @@ pub async fn generate_technical_notes(
                 paths.push(p);
             }
             if api_files.len() > 30 {
-                body.push_str(&format!("\n_({} file aggiuntivi non mostrati)_\n", api_files.len() - 30));
+                body.push_str(&format!(
+                    "\n_({} file aggiuntivi non mostrati)_\n",
+                    api_files.len() - 30
+                ));
             }
             notes.push(GeneratedProjectNote {
                 kind: "technical".to_string(),
@@ -299,7 +302,11 @@ pub async fn generate_technical_notes(
                 title: format!("Schema database del progetto {proj_name}"),
                 body_md: body,
                 intent: Some("schema".to_string()),
-                tags: vec!["technical".to_string(), "database".to_string(), "schema".to_string()],
+                tags: vec![
+                    "technical".to_string(),
+                    "database".to_string(),
+                    "schema".to_string(),
+                ],
                 file_paths: paths,
             });
         }
@@ -320,7 +327,9 @@ pub async fn generate_technical_notes(
         .unwrap_or_default();
         if !component_files.is_empty() {
             let mut body = String::new();
-            body.push_str("Componenti frontend identificati (pattern path components/pages/views).\n\n");
+            body.push_str(
+                "Componenti frontend identificati (pattern path components/pages/views).\n\n",
+            );
             let mut paths: Vec<String> = Vec::new();
             for r in component_files.iter().take(40) {
                 let p: String = r.try_get("file_path").unwrap_or_default();
@@ -328,14 +337,21 @@ pub async fn generate_technical_notes(
                 paths.push(p);
             }
             if component_files.len() > 40 {
-                body.push_str(&format!("\n_({} componenti aggiuntivi)_\n", component_files.len() - 40));
+                body.push_str(&format!(
+                    "\n_({} componenti aggiuntivi)_\n",
+                    component_files.len() - 40
+                ));
             }
             notes.push(GeneratedProjectNote {
                 kind: "technical".to_string(),
                 title: format!("Componenti frontend del progetto {proj_name}"),
                 body_md: body,
                 intent: Some("frontend".to_string()),
-                tags: vec!["technical".to_string(), "frontend".to_string(), "ui".to_string()],
+                tags: vec![
+                    "technical".to_string(),
+                    "frontend".to_string(),
+                    "ui".to_string(),
+                ],
                 file_paths: paths,
             });
         }
@@ -371,7 +387,11 @@ pub async fn generate_technical_notes(
                 title: format!("Config & build files del progetto {proj_name}"),
                 body_md: body,
                 intent: Some("config".to_string()),
-                tags: vec!["technical".to_string(), "config".to_string(), "build".to_string()],
+                tags: vec![
+                    "technical".to_string(),
+                    "config".to_string(),
+                    "build".to_string(),
+                ],
                 file_paths: paths,
             });
         }
@@ -394,7 +414,11 @@ pub async fn generate_technical_notes(
                         title: format!("Framework e dipendenze del progetto {proj_name}"),
                         body_md: body,
                         intent: Some("architecture".to_string()),
-                        tags: vec!["technical".to_string(), "framework".to_string(), "dependencies".to_string()],
+                        tags: vec![
+                            "technical".to_string(),
+                            "framework".to_string(),
+                            "dependencies".to_string(),
+                        ],
                         file_paths: vec![],
                     });
                 }
@@ -443,7 +467,9 @@ pub async fn generate_functional_notes(
     let mut intent_total: HashMap<String, i64> = HashMap::new();
 
     for r in &rows {
-        let intent: String = r.try_get("intent").unwrap_or_else(|_| "unknown".to_string());
+        let intent: String = r
+            .try_get("intent")
+            .unwrap_or_else(|_| "unknown".to_string());
         let count: i64 = r.try_get("msg_count").unwrap_or(0);
         let samples: Vec<String> = r.try_get("samples").unwrap_or_default();
         intent_total.insert(intent.clone(), count);
@@ -468,7 +494,11 @@ pub async fn generate_functional_notes(
             title,
             body_md: body,
             intent: Some(intent.clone()),
-            tags: vec!["functional".to_string(), "cluster".to_string(), intent.clone()],
+            tags: vec![
+                "functional".to_string(),
+                "cluster".to_string(),
+                intent.clone(),
+            ],
             file_paths: vec![],
         });
     }
@@ -559,10 +589,16 @@ pub async fn generate_test_notes(
         } else {
             "other"
         };
-        by_lang.entry(lang.to_string()).or_default().push(path.clone());
+        by_lang
+            .entry(lang.to_string())
+            .or_default()
+            .push(path.clone());
 
         let p_lower = path.to_lowercase();
-        let test_type = if p_lower.contains("e2e") || p_lower.contains("playwright") || p_lower.contains("cypress") {
+        let test_type = if p_lower.contains("e2e")
+            || p_lower.contains("playwright")
+            || p_lower.contains("cypress")
+        {
             "e2e"
         } else if p_lower.contains("integration") || p_lower.contains("/it/") {
             "integration"
@@ -611,7 +647,10 @@ pub async fn generate_test_notes(
             body.push_str(&format!("- `{p}`\n"));
         }
         if paths.len() > 50 {
-            body.push_str(&format!("\n_(...{} file aggiuntivi non mostrati)_\n", paths.len() - 50));
+            body.push_str(&format!(
+                "\n_(...{} file aggiuntivi non mostrati)_\n",
+                paths.len() - 50
+            ));
         }
         notes.push(GeneratedProjectNote {
             kind: "test".to_string(),
@@ -628,10 +667,7 @@ pub async fn generate_test_notes(
 
 /// Wrapper che chiama tutti e 3 i generator + applica le note.
 /// Ritorna `(generated_count, applied_count)`.
-pub async fn generate_and_apply_all(
-    state: &AppState,
-    project_id: Uuid,
-) -> Result<(usize, usize)> {
+pub async fn generate_and_apply_all(state: &AppState, project_id: Uuid) -> Result<(usize, usize)> {
     let mut all_notes: Vec<GeneratedProjectNote> = Vec::new();
     if let Ok(mut n) = generate_technical_notes(state, project_id).await {
         all_notes.append(&mut n);

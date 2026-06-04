@@ -39,9 +39,15 @@ pub async fn list_documents(
         if let Ok(mut entries) = fs::read_dir(&docs_dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
-                let Some(ext) = path.extension().and_then(|e| e.to_str()) else { continue };
-                if ext != "md" { continue; }
-                let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+                let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                    continue;
+                };
+                if ext != "md" {
+                    continue;
+                }
+                let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
                 let path_str = path.to_string_lossy().to_string();
 
                 // Inferisci doc_type dal nome file.
@@ -110,7 +116,10 @@ fn infer_doc_type(file_stem: &str) -> String {
         "functional_analysis".to_string()
     } else if lower.contains("er") && (lower.contains("diagram") || lower.contains("model")) {
         "er_diagram".to_string()
-    } else if lower.contains("project_management") || lower.contains("gestione") || lower.contains("piano") {
+    } else if lower.contains("project_management")
+        || lower.contains("gestione")
+        || lower.contains("piano")
+    {
         "project_management".to_string()
     } else if lower.contains("release") {
         "release_notes".to_string()
@@ -186,13 +195,15 @@ pub async fn download_document(
     let document_id = Uuid::parse_str(&doc_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Document id non valido"))?;
 
-    let row = sqlx::query("SELECT file_path, title FROM project_documents WHERE id = $1 AND project_id = $2")
-        .bind(document_id)
-        .bind(project_id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("DB error: {e}")))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Documento non trovato"))?;
+    let row = sqlx::query(
+        "SELECT file_path, title FROM project_documents WHERE id = $1 AND project_id = $2",
+    )
+    .bind(document_id)
+    .bind(project_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("DB error: {e}")))?
+    .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Documento non trovato"))?;
 
     let file_path: String = row.get("file_path");
     let _title: String = row.get("title");
@@ -202,12 +213,18 @@ pub async fn download_document(
     let abs_path = context.root_path.join(&file_path);
 
     if !abs_path.exists() {
-        return Err(api_error(StatusCode::NOT_FOUND, "File documento non trovato sul filesystem"));
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "File documento non trovato sul filesystem",
+        ));
     }
 
-    let bytes = fs::read(&abs_path)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Errore lettura file: {e}")))?;
+    let bytes = fs::read(&abs_path).await.map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Errore lettura file: {e}"),
+        )
+    })?;
 
     let filename = abs_path
         .file_name()
@@ -225,7 +242,12 @@ pub async fn download_document(
             format!("attachment; filename=\"{}\"", filename),
         )
         .body(Body::from(bytes))
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Response error: {e}")))?;
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Response error: {e}"),
+            )
+        })?;
 
     Ok(response)
 }

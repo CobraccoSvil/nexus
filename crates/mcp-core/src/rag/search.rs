@@ -173,7 +173,11 @@ pub async fn search_semantic(
             });
         }
     }
-    all_hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    all_hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     all_hits.truncate(top_k);
     tracing::info!(
         "rag.search_semantic: query_len={} hits={}",

@@ -33,21 +33,13 @@ struct Finding {
 
 fn rules() -> Vec<(&'static str, &'static str, Regex)> {
     vec![
-        (
-            "py-eval",
-            "high",
-            Regex::new(r"\beval\s*\(").unwrap(),
-        ),
+        ("py-eval", "high", Regex::new(r"\beval\s*\(").unwrap()),
         (
             "py-shell-true",
             "high",
             Regex::new(r"shell\s*=\s*True").unwrap(),
         ),
-        (
-            "js-eval",
-            "high",
-            Regex::new(r"\beval\s*\(").unwrap(),
-        ),
+        ("js-eval", "high", Regex::new(r"\beval\s*\(").unwrap()),
         (
             "sql-concat",
             "medium",
@@ -66,7 +58,12 @@ fn rules() -> Vec<(&'static str, &'static str, Regex)> {
     ]
 }
 
-fn scan_file(path: &Path, rel: &str, acc: &mut Vec<Finding>, rules: &[(&'static str, &'static str, Regex)]) {
+fn scan_file(
+    path: &Path,
+    rel: &str,
+    acc: &mut Vec<Finding>,
+    rules: &[(&'static str, &'static str, Regex)],
+) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return,
@@ -102,8 +99,16 @@ fn walk_and_scan(root: &Path) -> Vec<Finding> {
         };
         for entry in entries.flatten() {
             let p = entry.path();
-            let name = p.file_name().map(|o| o.to_string_lossy().into_owned()).unwrap_or_default();
-            if name.starts_with('.') || name == "target" || name == "node_modules" || name == "dist" || name == "build" {
+            let name = p
+                .file_name()
+                .map(|o| o.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if name.starts_with('.')
+                || name == "target"
+                || name == "node_modules"
+                || name == "dist"
+                || name == "build"
+            {
                 continue;
             }
             if p.is_dir() {
@@ -111,7 +116,11 @@ fn walk_and_scan(root: &Path) -> Vec<Finding> {
             } else if let Some(ext) = p.extension().and_then(|o| o.to_str()) {
                 if exts.contains(&ext) {
                     files_seen += 1;
-                    let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().into_owned();
+                    let rel = p
+                        .strip_prefix(root)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .into_owned();
                     scan_file(&p, &rel, &mut out, &rules);
                 }
             }
@@ -122,11 +131,7 @@ fn walk_and_scan(root: &Path) -> Vec<Finding> {
 
 #[async_trait]
 impl NexusToolHandler for SastScanTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let prefer_semgrep = args
             .get("prefer_semgrep")
             .and_then(Value::as_bool)
@@ -209,7 +214,10 @@ mod tests {
     #[test]
     fn test_regex_hardcoded_password() {
         let rs = rules();
-        let (_, _, re) = rs.iter().find(|(r, _, _)| *r == "hardcoded-password").unwrap();
+        let (_, _, re) = rs
+            .iter()
+            .find(|(r, _, _)| *r == "hardcoded-password")
+            .unwrap();
         assert!(re.is_match("password = \"topsecret42\""));
         assert!(!re.is_match("password = None"));
     }
@@ -218,7 +226,11 @@ mod tests {
     fn test_walk_detects_unsafe() {
         let tmp = std::env::temp_dir().join(format!("sast_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(tmp.join("x.rs"), "fn main() { unsafe { *(0 as *mut u8) = 1; } }").unwrap();
+        std::fs::write(
+            tmp.join("x.rs"),
+            "fn main() { unsafe { *(0 as *mut u8) = 1; } }",
+        )
+        .unwrap();
         let findings = walk_and_scan(&tmp);
         assert!(findings.iter().any(|f| f.rule == "rust-unsafe"));
         let _ = std::fs::remove_dir_all(&tmp);

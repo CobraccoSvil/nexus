@@ -18,12 +18,16 @@ fn count_doctests(content: &str) -> usize {
 }
 
 fn walk(dir: &Path, depth: usize, total: &mut usize, files: &mut usize) {
-    if depth > 8 { return; }
+    if depth > 8 {
+        return;
+    }
     if let Ok(rd) = std::fs::read_dir(dir) {
         for entry in rd.flatten() {
             let p = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == "target" || name.starts_with('.') { continue; }
+            if name == "target" || name.starts_with('.') {
+                continue;
+            }
             if p.is_dir() {
                 walk(&p, depth + 1, total, files);
             } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
@@ -38,14 +42,22 @@ fn walk(dir: &Path, depth: usize, total: &mut usize, files: &mut usize) {
 
 #[async_trait]
 impl NexusToolHandler for TestDocCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let mut total = 0usize;
         let mut files = 0usize;
         for sub in &["src", "crates"] {
             let p = ctx.project_root.join(sub);
-            if p.is_dir() { walk(&p, 0, &mut total, &mut files); }
+            if p.is_dir() {
+                walk(&p, 0, &mut total, &mut files);
+            }
         }
         Ok(json!({"ok": true, "files_scanned": files, "doctests": total}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

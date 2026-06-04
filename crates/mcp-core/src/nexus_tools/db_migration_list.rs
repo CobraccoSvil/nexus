@@ -7,7 +7,11 @@ pub struct DbMigrationListTool;
 
 #[async_trait]
 impl NexusToolHandler for DbMigrationListTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let candidates = ["db/migrations", "migrations"];
         let mut found_dir: Option<String> = None;
         let mut files: Vec<String> = vec![];
@@ -17,7 +21,9 @@ impl NexusToolHandler for DbMigrationListTool {
                 if let Ok(rd) = std::fs::read_dir(&p) {
                     for e in rd.flatten() {
                         let name = e.file_name().to_string_lossy().to_string();
-                        if name.ends_with(".sql") { files.push(name); }
+                        if name.ends_with(".sql") {
+                            files.push(name);
+                        }
                     }
                 }
                 files.sort();
@@ -27,5 +33,7 @@ impl NexusToolHandler for DbMigrationListTool {
         }
         Ok(json!({"ok": true, "dir": found_dir, "count": files.len(), "files": files}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

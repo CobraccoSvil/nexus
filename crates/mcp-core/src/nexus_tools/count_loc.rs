@@ -59,7 +59,12 @@ struct Stat {
     comments: usize,
 }
 
-fn walk_count(root: &Path, stats: &mut HashMap<String, Stat>, total: &mut (usize, usize), cap: usize) {
+fn walk_count(
+    root: &Path,
+    stats: &mut HashMap<String, Stat>,
+    total: &mut (usize, usize),
+    cap: usize,
+) {
     if total.0 >= cap {
         return;
     }
@@ -130,11 +135,7 @@ fn walk_count(root: &Path, stats: &mut HashMap<String, Stat>, total: &mut (usize
 
 #[async_trait]
 impl NexusToolHandler for CountLocTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let dir = args.get("dir").and_then(Value::as_str).unwrap_or("");
         let cap = args
             .get("max_files")
@@ -166,7 +167,10 @@ impl NexusToolHandler for CountLocTool {
             })
             .collect();
         by_language.sort_by(|a, b| {
-            b["lines"].as_u64().unwrap_or(0).cmp(&a["lines"].as_u64().unwrap_or(0))
+            b["lines"]
+                .as_u64()
+                .unwrap_or(0)
+                .cmp(&a["lines"].as_u64().unwrap_or(0))
         });
 
         Ok(json!({

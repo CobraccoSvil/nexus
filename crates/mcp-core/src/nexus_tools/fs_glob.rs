@@ -43,14 +43,7 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     rec(&p, &s)
 }
 
-fn walk(
-    root: &Path,
-    dir: &Path,
-    pattern: &str,
-    out: &mut Vec<Value>,
-    limit: usize,
-    depth: usize,
-) {
+fn walk(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<Value>, limit: usize, depth: usize) {
     if out.len() >= limit || depth > 10 {
         return;
     }
@@ -93,11 +86,7 @@ fn walk(
 
 #[async_trait]
 impl NexusToolHandler for FsGlobTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let pattern = args
             .get("pattern")
             .and_then(Value::as_str)

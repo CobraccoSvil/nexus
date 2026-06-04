@@ -1,9 +1,11 @@
 //! Adapter Knex (Node.js) — crea migration tramite `npx knex migrate:make`.
 
+use super::{sha256_hex, MigrationAdapter};
+use crate::project_db::{
+    AppliedMigration, Migration, ProjectDbContext, ProjectDbError, RolledBackMigration,
+};
 use async_trait::async_trait;
 use std::path::PathBuf;
-use crate::project_db::{Migration, AppliedMigration, RolledBackMigration, ProjectDbError, ProjectDbContext};
-use super::{MigrationAdapter, sha256_hex};
 
 pub struct KnexAdapter;
 
@@ -11,7 +13,9 @@ pub struct KnexAdapter;
 impl MigrationAdapter for KnexAdapter {
     async fn list_pending(&self, ctx: &ProjectDbContext) -> Result<Vec<Migration>, ProjectDbError> {
         let dir = ctx.project_root.join(&ctx.migration_path);
-        if !dir.exists() { return Ok(vec![]); }
+        if !dir.exists() {
+            return Ok(vec![]);
+        }
         let mut files: Vec<_> = std::fs::read_dir(&dir)?
             .flatten()
             .filter(|e| {
@@ -24,7 +28,11 @@ impl MigrationAdapter for KnexAdapter {
         for entry in files {
             let path = entry.path();
             let content = std::fs::read_to_string(&path).unwrap_or_default();
-            let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let filename = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             result.push(Migration {
                 filename: filename.clone(),
                 checksum: sha256_hex(&content),
@@ -41,8 +49,15 @@ impl MigrationAdapter for KnexAdapter {
         name: &str,
         _sql: &str,
     ) -> Result<PathBuf, ProjectDbError> {
-        let safe_name: String = name.chars()
-            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        let safe_name: String = name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let output = std::process::Command::new("npx")
             .args(["knex", "migrate:make", &safe_name])
@@ -51,7 +66,10 @@ impl MigrationAdapter for KnexAdapter {
             .map_err(|e| ProjectDbError::Adapter(format!("knex migrate:make: {}", e)))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ProjectDbError::Adapter(format!("knex migrate:make fallita: {}", stderr)));
+            return Err(ProjectDbError::Adapter(format!(
+                "knex migrate:make fallita: {}",
+                stderr
+            )));
         }
         Ok(ctx.project_root.join(&ctx.migration_path))
     }
@@ -68,7 +86,10 @@ impl MigrationAdapter for KnexAdapter {
             .map_err(|e| ProjectDbError::Adapter(format!("knex migrate:latest: {}", e)))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ProjectDbError::Adapter(format!("knex migrate:latest fallita: {}", stderr)));
+            return Err(ProjectDbError::Adapter(format!(
+                "knex migrate:latest fallita: {}",
+                stderr
+            )));
         }
         Ok(vec![])
     }
@@ -85,8 +106,13 @@ impl MigrationAdapter for KnexAdapter {
             .map_err(|e| ProjectDbError::Adapter(format!("knex migrate:rollback: {}", e)))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ProjectDbError::Adapter(format!("knex migrate:rollback fallita: {}", stderr)));
+            return Err(ProjectDbError::Adapter(format!(
+                "knex migrate:rollback fallita: {}",
+                stderr
+            )));
         }
-        Ok(Some(RolledBackMigration { filename: "knex:last".into() }))
+        Ok(Some(RolledBackMigration {
+            filename: "knex:last".into(),
+        }))
     }
 }

@@ -17,10 +17,10 @@ use sqlx::PgPool;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::agent_tools::AGENT_TOOLS_JSON;
 use crate::agent_types::{
     AgentMetaStep, AgentRunResult, AgentRunStatus, AgentStep, AgentStepEvent, AgentStepStatus,
 };
-use crate::agent_tools::AGENT_TOOLS_JSON;
 
 /// URL REST del brain (FastAPI). Default allineato al port di `--rest` del brain.
 /// Gerarchia: env var BRAIN_REST_URL (override emergenza) > hardcoded.
@@ -106,7 +106,7 @@ pub fn is_o_series_model_pub(model: &str) -> bool {
 /// usa il fallback hardcoded `O_SERIES_ESSENTIAL_TOOLS_FALLBACK`.
 async fn load_o_series_essential_tools(db: &PgPool) -> Vec<String> {
     let csv: Option<String> = sqlx::query_scalar(
-        "SELECT value FROM settings WHERE key = 'automation.o_series_essential_tools'"
+        "SELECT value FROM settings WHERE key = 'automation.o_series_essential_tools'",
     )
     .fetch_optional(db)
     .await
@@ -118,12 +118,10 @@ async fn load_o_series_essential_tools(db: &PgPool) -> Vec<String> {
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .collect(),
-        _ => {
-            O_SERIES_ESSENTIAL_TOOLS_FALLBACK
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        }
+        _ => O_SERIES_ESSENTIAL_TOOLS_FALLBACK
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
     }
 }
 
@@ -137,8 +135,13 @@ async fn is_discovery_first_enabled(db: &PgPool) -> bool {
     .await
     .ok()
     .flatten();
-    v.map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "false" | "0" | "off" | "no" | ""))
-        .unwrap_or(false)
+    v.map(|s| {
+        !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "off" | "no" | ""
+        )
+    })
+    .unwrap_or(false)
 }
 
 /// M16 — Whitelist dei tool del primo turno discovery-only (CSV in
@@ -212,7 +215,7 @@ const STUDY_MODE_READONLY_TOOLS_FALLBACK: &[&str] = &[
 /// usa il fallback hardcoded `STUDY_MODE_READONLY_TOOLS_FALLBACK`.
 async fn load_study_mode_readonly_tools(db: &PgPool) -> Vec<String> {
     let csv: Option<String> = sqlx::query_scalar(
-        "SELECT value FROM settings WHERE key = 'automation.study_mode_readonly_tools'"
+        "SELECT value FROM settings WHERE key = 'automation.study_mode_readonly_tools'",
     )
     .fetch_optional(db)
     .await
@@ -316,16 +319,17 @@ pub async fn build_tools_json_for_agent(
     .await
     .unwrap_or(0_i64);
 
-    let base_tools: Value =
-        serde_json::from_str(AGENT_TOOLS_JSON).unwrap_or_else(|_| json!([]));
+    let base_tools: Value = serde_json::from_str(AGENT_TOOLS_JSON).unwrap_or_else(|_| json!([]));
 
     let full_tools = if mcp_tool_count < hard_limit && mcp_tool_count > 0 {
         // Catalogo piccolo: include le definizioni MCP direttamente
         tracing::debug!(
             "build_tools_json: {} tool MCP < soglia {}, includo definizioni dirette",
-            mcp_tool_count, hard_limit
+            mcp_tool_count,
+            hard_limit
         );
-        let mcp_tools = crate::mcp_connectors::load_mcp_tools_for_agent(db, user_id, Some(project_id)).await;
+        let mcp_tools =
+            crate::mcp_connectors::load_mcp_tools_for_agent(db, user_id, Some(project_id)).await;
         if mcp_tools.is_empty() {
             base_tools
         } else {
@@ -339,7 +343,8 @@ pub async fn build_tools_json_for_agent(
         if mcp_tool_count >= hard_limit {
             tracing::debug!(
                 "build_tools_json: discovery mode ({} tool MCP >= soglia {})",
-                mcp_tool_count, hard_limit
+                mcp_tool_count,
+                hard_limit
             );
         }
         base_tools
@@ -350,7 +355,8 @@ pub async fn build_tools_json_for_agent(
     // La whitelist e' letta da `settings.automation.study_mode_readonly_tools`
     // (mig 0132) — niente lista hardcoded nel codice (regola G CLAUDE.md).
     let readonly_whitelist = load_study_mode_readonly_tools(db).await;
-    let after_mode = filter_tools_by_automation_mode(full_tools, automation_mode, &readonly_whitelist);
+    let after_mode =
+        filter_tools_by_automation_mode(full_tools, automation_mode, &readonly_whitelist);
 
     // M16 — Progressive tool disclosure: se discovery-first e' attivo, il set
     // INIZIALE passato al brain contiene SOLO i 2 tool di discovery
@@ -432,8 +438,11 @@ fn classify_provider_error(
 
     // Step 1: error_class esplicito propagato dal brain.
     match error_class {
-        Some("billing_error") | Some("billing_required") | Some("quota_exceeded")
-        | Some("credit_balance_too_low") | Some("insufficient_quota") => {
+        Some("billing_error")
+        | Some("billing_required")
+        | Some("quota_exceeded")
+        | Some("credit_balance_too_low")
+        | Some("insufficient_quota") => {
             return Some(("billing_error", CooldownKind::Long, BILLING_REASON));
         }
         Some("rate_limit") => {
@@ -447,8 +456,12 @@ fn classify_provider_error(
             }
             return Some(("rate_limit", CooldownKind::Short, "Rate limit raggiunto"));
         }
-        Some("overloaded") | Some("provider_error") | Some("server_error")
-        | Some("service_unavailable") | Some("bad_gateway") | Some("internal_server_error") => {
+        Some("overloaded")
+        | Some("provider_error")
+        | Some("server_error")
+        | Some("service_unavailable")
+        | Some("bad_gateway")
+        | Some("internal_server_error") => {
             return Some((
                 "provider_error",
                 CooldownKind::Short,
@@ -467,11 +480,7 @@ fn classify_provider_error(
         || lower.contains("too many requests")
         || lower.contains("429")
     {
-        return Some((
-            "rate_limit",
-            CooldownKind::Short,
-            "Rate limit raggiunto",
-        ));
+        return Some(("rate_limit", CooldownKind::Short, "Rate limit raggiunto"));
     }
     if lower.contains("overloaded")
         || lower.contains("service unavailable")
@@ -523,7 +532,10 @@ pub async fn run_via_brain(
     automation_mode: String,
 ) -> AgentRunResult {
     let run_id_str = run_id.to_string();
-    let url = format!("{}/agent/run/stream", brain_rest_url().trim_end_matches('/'));
+    let url = format!(
+        "{}/agent/run/stream",
+        brain_rest_url().trim_end_matches('/')
+    );
 
     let body = json!({
         "thread_id": run_id_str,
@@ -550,7 +562,14 @@ pub async fn run_via_brain(
         .build()
     {
         Ok(c) => c,
-        Err(e) => return fail_result(&run_id_str, &provider, &model, format!("reqwest build: {e}")),
+        Err(e) => {
+            return fail_result(
+                &run_id_str,
+                &provider,
+                &model,
+                format!("reqwest build: {e}"),
+            )
+        }
     };
 
     let resp = match client.post(&url).json(&body).send().await {
@@ -661,12 +680,29 @@ pub async fn run_via_brain(
                                 let provider_key = provider.split('/').next().unwrap_or(&provider);
                                 match kind {
                                     CooldownKind::Long => {
-                                        crate::provider_cooldown::put_provider_in_long_cooldown(provider_key, human_reason);
-                                        tracing::warn!("Provider '{}' COOLDOWN LUNGO ({}): {}", provider, err_class, human_reason);
+                                        crate::provider_cooldown::put_provider_in_long_cooldown(
+                                            provider_key,
+                                            human_reason,
+                                        );
+                                        tracing::warn!(
+                                            "Provider '{}' COOLDOWN LUNGO ({}): {}",
+                                            provider,
+                                            err_class,
+                                            human_reason
+                                        );
                                     }
                                     CooldownKind::Short => {
-                                        crate::provider_cooldown::put_provider_in_short_cooldown(provider_key, human_reason, 60);
-                                        tracing::warn!("Provider '{}' COOLDOWN BREVE 60s ({}): {}", provider, err_class, human_reason);
+                                        crate::provider_cooldown::put_provider_in_short_cooldown(
+                                            provider_key,
+                                            human_reason,
+                                            60,
+                                        );
+                                        tracing::warn!(
+                                            "Provider '{}' COOLDOWN BREVE 60s ({}): {}",
+                                            provider,
+                                            err_class,
+                                            human_reason
+                                        );
                                     }
                                 }
                                 last_error_class = Some(err_class.to_string());
@@ -778,12 +814,27 @@ pub async fn run_via_brain(
                 }
                 "end_turn" => {
                     ended = true;
-                    acc_prompt_tokens = evt.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    acc_completion_tokens = evt.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    acc_total_tokens = evt.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    acc_total_cost = evt.get("total_cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    acc_prompt_tokens = evt
+                        .get("prompt_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    acc_completion_tokens = evt
+                        .get("completion_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    acc_total_tokens = evt
+                        .get("total_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    acc_total_cost = evt
+                        .get("total_cost")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
                     // Token prompt dell'ultima iterazione (per context ratio UI)
-                    last_prompt_tokens = evt.get("last_prompt_tokens").and_then(|v| v.as_u64()).map(|v| v as u32);
+                    last_prompt_tokens = evt
+                        .get("last_prompt_tokens")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32);
                     // B5: legge metadata routing propagati dal brain Python
                     if let Some(tt) = evt.get("nexus_task_type").and_then(|v| v.as_str()) {
                         nexus_task_type = Some(tt.to_string());
@@ -793,7 +844,10 @@ pub async fn run_via_brain(
                     }
                     if last_stop_reason.is_none() {
                         last_stop_reason = Some(
-                            evt.get("stop_reason").and_then(|v| v.as_str()).unwrap_or("end_turn").to_string()
+                            evt.get("stop_reason")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("end_turn")
+                                .to_string(),
                         );
                     }
                 }
@@ -816,17 +870,26 @@ pub async fn run_via_brain(
                         let provider_key = provider.split('/').next().unwrap_or(&provider);
                         match kind {
                             CooldownKind::Long => {
-                                crate::provider_cooldown::put_provider_in_long_cooldown(provider_key, human_reason);
+                                crate::provider_cooldown::put_provider_in_long_cooldown(
+                                    provider_key,
+                                    human_reason,
+                                );
                                 tracing::warn!(
                                     "Provider '{}' COOLDOWN LUNGO 6h ({}): {}. Routing successivo selezionera' un altro provider.",
                                     provider, err_class, human_reason
                                 );
                             }
                             CooldownKind::Short => {
-                                crate::provider_cooldown::put_provider_in_short_cooldown(provider_key, human_reason, 60);
+                                crate::provider_cooldown::put_provider_in_short_cooldown(
+                                    provider_key,
+                                    human_reason,
+                                    60,
+                                );
                                 tracing::warn!(
                                     "Provider '{}' COOLDOWN BREVE 60s ({}): {}",
-                                    provider, err_class, human_reason
+                                    provider,
+                                    err_class,
+                                    human_reason
                                 );
                             }
                         }
@@ -943,10 +1006,8 @@ pub async fn run_via_brain(
         .map(|a| !a.is_empty())
         .unwrap_or(false);
     let final_answer_empty = final_answer.trim().is_empty();
-    let hollow_no_tools = status == AgentRunStatus::Completed
-        && had_tools
-        && steps.is_empty()
-        && iteration <= 1;
+    let hollow_no_tools =
+        status == AgentRunStatus::Completed && had_tools && steps.is_empty() && iteration <= 1;
     let hollow_empty_answer = status == AgentRunStatus::Completed && final_answer_empty;
 
     // ── Detection "RESIGNED" ─────────────────────────────────────────────
@@ -1119,8 +1180,12 @@ fn sanitize_error_for_user(raw: &str) -> String {
         return "conversazione interrotta per un problema di sincronizzazione tra i passaggi interni dell'agente".to_string();
     }
     // Errore di contesto troppo lungo
-    if raw.contains("context length") || raw.contains("too many tokens") || raw.contains("maximum context") {
-        return "la conversazione ha superato la lunghezza massima consentita dal modello".to_string();
+    if raw.contains("context length")
+        || raw.contains("too many tokens")
+        || raw.contains("maximum context")
+    {
+        return "la conversazione ha superato la lunghezza massima consentita dal modello"
+            .to_string();
     }
     // Errore di rate limit
     if raw.contains("rate_limit") || raw.contains("429") || raw.contains("Too Many Requests") {
@@ -1131,11 +1196,17 @@ fn sanitize_error_for_user(raw: &str) -> String {
         return "errore di autenticazione con il provider AI".to_string();
     }
     // Errore 5xx del provider (503, 502, 500, 504, ecc.)
-    if raw.contains("Internal server error") || raw.contains("internal server error")
-        || raw.contains("service unavailable") || raw.contains("Service Unavailable")
-        || raw.contains("bad gateway") || raw.contains("Bad Gateway")
-        || raw.contains("Gateway Timeout") || raw.contains("gateway timeout")
-        || raw.contains("503") || raw.contains("502") || raw.contains("504")
+    if raw.contains("Internal server error")
+        || raw.contains("internal server error")
+        || raw.contains("service unavailable")
+        || raw.contains("Service Unavailable")
+        || raw.contains("bad gateway")
+        || raw.contains("Bad Gateway")
+        || raw.contains("Gateway Timeout")
+        || raw.contains("gateway timeout")
+        || raw.contains("503")
+        || raw.contains("502")
+        || raw.contains("504")
     {
         return "il provider AI e' temporaneamente non disponibile (errore server). Il sistema sta provando con un altro provider.".to_string();
     }
@@ -1205,12 +1276,7 @@ pub async fn resume_run(
     Ok(())
 }
 
-fn fail_result(
-    run_id: &str,
-    provider: &str,
-    model: &str,
-    msg: String,
-) -> AgentRunResult {
+fn fail_result(run_id: &str, provider: &str, model: &str, msg: String) -> AgentRunResult {
     AgentRunResult {
         run_id: run_id.to_string(),
         status: AgentRunStatus::Failed,
@@ -1251,11 +1317,21 @@ mod tests {
     /// `settings.automation.study_mode_readonly_tools`.
     fn test_whitelist() -> Vec<String> {
         vec![
-            "read_file", "read_file_lines", "list_files", "search_in_files",
-            "search_codebase_semantic", "get_project_structure", "get_file_diff",
-            "git_status", "git_log", "git_diff",
-            "list_services", "read_service_output",
-            "nexus_mcp_tool_search", "list_profiles", "get_profile",
+            "read_file",
+            "read_file_lines",
+            "list_files",
+            "search_in_files",
+            "search_codebase_semantic",
+            "get_project_structure",
+            "get_file_diff",
+            "git_status",
+            "git_log",
+            "git_diff",
+            "list_services",
+            "read_service_output",
+            "nexus_mcp_tool_search",
+            "list_profiles",
+            "get_profile",
         ]
         .into_iter()
         .map(String::from)
@@ -1320,11 +1396,23 @@ mod tests {
         assert!(names.contains(&"git_status"));
         assert!(names.contains(&"nexus_mcp_tool_search"));
         // NON devono esserci tool che scrivono / eseguono / eliminano
-        assert!(!names.contains(&"write_file"), "write_file vietato in study");
+        assert!(
+            !names.contains(&"write_file"),
+            "write_file vietato in study"
+        );
         assert!(!names.contains(&"edit_file"), "edit_file vietato in study");
-        assert!(!names.contains(&"run_command"), "run_command vietato in study");
-        assert!(!names.contains(&"git_commit"), "git_commit vietato in study");
-        assert!(!names.contains(&"delete_file"), "delete_file vietato in study");
+        assert!(
+            !names.contains(&"run_command"),
+            "run_command vietato in study"
+        );
+        assert!(
+            !names.contains(&"git_commit"),
+            "git_commit vietato in study"
+        );
+        assert!(
+            !names.contains(&"delete_file"),
+            "delete_file vietato in study"
+        );
     }
 
     #[test]
@@ -1352,11 +1440,8 @@ mod tests {
         // whitelist piu' ristretta.
         let tools = make_test_tools();
         let restricted_wl = vec!["read_file".to_string()];
-        let filtered = filter_tools_by_automation_mode(
-            tools,
-            &AutomationMode::Study,
-            &restricted_wl,
-        );
+        let filtered =
+            filter_tools_by_automation_mode(tools, &AutomationMode::Study, &restricted_wl);
         let names: Vec<&str> = filtered
             .as_array()
             .unwrap()
@@ -1373,11 +1458,7 @@ mod tests {
         // study mode non puo' chiamare nessun tool (massima sicurezza).
         let tools = make_test_tools();
         let empty_wl: Vec<String> = Vec::new();
-        let filtered = filter_tools_by_automation_mode(
-            tools,
-            &AutomationMode::Study,
-            &empty_wl,
-        );
+        let filtered = filter_tools_by_automation_mode(tools, &AutomationMode::Study, &empty_wl);
         assert!(filtered.as_array().unwrap().is_empty());
     }
 
@@ -1447,9 +1528,13 @@ mod tests {
         // scrittura (per operare) sia tool di discovery (per scoprire
         // tool aggiuntivi a runtime).
         let must_have = [
-            "write_file", "edit_file", "run_command",     // scrittura
-            "nexus_mcp_tool_search", "nexus_mcp_tool_call", // discovery
-            "read_file", "list_files",                     // lettura
+            "write_file",
+            "edit_file",
+            "run_command", // scrittura
+            "nexus_mcp_tool_search",
+            "nexus_mcp_tool_call", // discovery
+            "read_file",
+            "list_files", // lettura
         ];
         for tool in &must_have {
             assert!(
@@ -1492,8 +1577,8 @@ mod tests {
         // E' quota/credito esaurito, NON un rate-limit transitorio: deve dare
         // cooldown lungo come credit_balance_too_low.
         let msg = "Error code: 429 - {'error': {'message': 'You exceeded your current quota, please check your plan and billing details.', 'type': 'insufficient_quota'}}";
-        let (class, kind, _) = classify_provider_error(None, msg)
-            .expect("429 quota deve essere classificato");
+        let (class, kind, _) =
+            classify_provider_error(None, msg).expect("429 quota deve essere classificato");
         assert_eq!(class, "billing_error");
         assert_eq!(kind, CooldownKind::Long);
     }
@@ -1503,8 +1588,8 @@ mod tests {
         // 429 generico (finestra di richieste) senza marker di quota/credito:
         // rate-limit transitorio, cooldown breve.
         let msg = "Error code: 429 - Rate limit reached for requests. Please try again later.";
-        let (class, kind, _) = classify_provider_error(None, msg)
-            .expect("429 rate limit deve essere classificato");
+        let (class, kind, _) =
+            classify_provider_error(None, msg).expect("429 rate limit deve essere classificato");
         assert_eq!(class, "rate_limit");
         assert_eq!(kind, CooldownKind::Short);
     }
@@ -1517,8 +1602,8 @@ mod tests {
         // l'error_class esplicito short-circuitava il pattern matching e il
         // provider con quota esaurita restava nel cascade (bug live).
         let msg = "You exceeded your current quota, please check your plan and billing details.";
-        let (class, kind, _) = classify_provider_error(Some("rate_limit"), msg)
-            .expect("deve essere classificato");
+        let (class, kind, _) =
+            classify_provider_error(Some("rate_limit"), msg).expect("deve essere classificato");
         assert_eq!(class, "billing_error");
         assert_eq!(kind, CooldownKind::Long);
     }
@@ -1527,9 +1612,8 @@ mod tests {
     fn error_class_rate_limit_senza_marker_resta_rate_limit() {
         // error_class=rate_limit + messaggio senza marker quota: resta
         // rate-limit transitorio (cooldown breve).
-        let (class, kind, _) =
-            classify_provider_error(Some("rate_limit"), "Too Many Requests")
-                .expect("deve essere classificato");
+        let (class, kind, _) = classify_provider_error(Some("rate_limit"), "Too Many Requests")
+            .expect("deve essere classificato");
         assert_eq!(class, "rate_limit");
         assert_eq!(kind, CooldownKind::Short);
     }
@@ -1537,9 +1621,8 @@ mod tests {
     #[test]
     fn insufficient_quota_error_class_e_billing() {
         // error_class esplicito insufficient_quota -> billing/cooldown-lungo.
-        let (class, kind, _) =
-            classify_provider_error(Some("insufficient_quota"), "")
-                .expect("deve essere classificato");
+        let (class, kind, _) = classify_provider_error(Some("insufficient_quota"), "")
+            .expect("deve essere classificato");
         assert_eq!(class, "billing_error");
         assert_eq!(kind, CooldownKind::Long);
     }
@@ -1548,8 +1631,8 @@ mod tests {
     fn billing_hard_limit_reached_e_billing() {
         // Marker OpenAI billing_hard_limit_reached -> cooldown lungo.
         let msg = "Error code: 429 - billing_hard_limit_reached";
-        let (class, kind, _) = classify_provider_error(None, msg)
-            .expect("deve essere classificato");
+        let (class, kind, _) =
+            classify_provider_error(None, msg).expect("deve essere classificato");
         assert_eq!(class, "billing_error");
         assert_eq!(kind, CooldownKind::Long);
     }

@@ -8,7 +8,11 @@ pub struct CargoCheckReleaseTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoCheckReleaseTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let out = run_cmd(
             "cargo",
             &["check", "--release", "--message-format=short"],
@@ -27,5 +31,7 @@ impl NexusToolHandler for CargoCheckReleaseTool {
             "duration_ms": out.duration_ms,
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::write_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::write_subproc()
+    }
 }

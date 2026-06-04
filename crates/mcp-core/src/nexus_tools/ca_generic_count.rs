@@ -8,8 +8,15 @@ pub struct CaGenericCountTool;
 
 #[async_trait]
 impl NexusToolHandler for CaGenericCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let (counts, files) = scan_substrings(&ctx.project_root, &["<T>", "<T,", "<T:", "where ", "PhantomData"]);
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let (counts, files) = scan_substrings(
+            &ctx.project_root,
+            &["<T>", "<T,", "<T:", "where ", "PhantomData"],
+        );
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -20,5 +27,7 @@ impl NexusToolHandler for CaGenericCountTool {
             "phantom_data": counts[4],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

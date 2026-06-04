@@ -8,7 +8,11 @@ pub struct SecAuditSummaryTool;
 
 #[async_trait]
 impl NexusToolHandler for SecAuditSummaryTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(
             &ctx.project_root,
             &[
@@ -24,14 +28,37 @@ impl NexusToolHandler for SecAuditSummaryTool {
         );
         let mut score = 100i32;
         let mut findings: Vec<&str> = vec![];
-        if counts[0] > 50 { score -= 5; findings.push("many_unwrap"); }
-        if counts[1] > 5 { score -= 5; findings.push("explicit_panics"); }
-        if counts[2] + counts[3] > 0 { score -= 10; findings.push("unsafe_code"); }
-        if counts[4] > 0 { score -= 20; findings.push("sql_format_interp"); }
-        if counts[5] > 0 { score -= 25; findings.push("tls_disabled"); }
-        if counts[6] > 0 { score -= 25; findings.push("jwt_alg_none"); }
-        if counts[7] > 5 { score -= 5; findings.push("plaintext_http"); }
-        if score < 0 { score = 0; }
+        if counts[0] > 50 {
+            score -= 5;
+            findings.push("many_unwrap");
+        }
+        if counts[1] > 5 {
+            score -= 5;
+            findings.push("explicit_panics");
+        }
+        if counts[2] + counts[3] > 0 {
+            score -= 10;
+            findings.push("unsafe_code");
+        }
+        if counts[4] > 0 {
+            score -= 20;
+            findings.push("sql_format_interp");
+        }
+        if counts[5] > 0 {
+            score -= 25;
+            findings.push("tls_disabled");
+        }
+        if counts[6] > 0 {
+            score -= 25;
+            findings.push("jwt_alg_none");
+        }
+        if counts[7] > 5 {
+            score -= 5;
+            findings.push("plaintext_http");
+        }
+        if score < 0 {
+            score = 0;
+        }
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -49,5 +76,7 @@ impl NexusToolHandler for SecAuditSummaryTool {
             }
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

@@ -84,12 +84,11 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
     }
 
     // Filtra quelli gia' processati
-    let rows = sqlx::query(
-        "SELECT commit_sha FROM nexus_meta_doc_changes WHERE commit_sha = ANY($1)",
-    )
-    .bind(&recent_shas)
-    .fetch_all(&state.db)
-    .await?;
+    let rows =
+        sqlx::query("SELECT commit_sha FROM nexus_meta_doc_changes WHERE commit_sha = ANY($1)")
+            .bind(&recent_shas)
+            .fetch_all(&state.db)
+            .await?;
     let processed: std::collections::HashSet<String> = rows
         .into_iter()
         .filter_map(|r| r.try_get::<String, _>("commit_sha").ok())

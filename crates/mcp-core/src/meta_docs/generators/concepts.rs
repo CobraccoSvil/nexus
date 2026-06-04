@@ -39,7 +39,9 @@ impl MetaDocGenerator for ConceptsGenerator {
                 slug: c.slug.to_string(),
                 body_md: c.body.to_string(),
                 tags: c.tags.iter().map(|s| s.to_string()).collect(),
-                source_files: vec!["crates/mcp-core/src/meta_docs/generators/concepts.rs".to_string()],
+                source_files: vec![
+                    "crates/mcp-core/src/meta_docs/generators/concepts.rs".to_string()
+                ],
                 source_commit: None,
                 vault_file_path: format!("{}/{}.md", c.folder, c.slug),
                 now,

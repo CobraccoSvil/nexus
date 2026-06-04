@@ -13,8 +13,8 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{
-    agent_types::{AgentRunStatus, AgentStep, AgentStepEvent, AgentStepStatus, SupervisorMode},
     agent_tools::AgentToolContext,
+    agent_types::{AgentRunStatus, AgentStep, AgentStepEvent, AgentStepStatus, SupervisorMode},
     auth::Claims,
     chat_learning::{
         api_error, apply_project_learning, dedup_on_write, ensure_project_access, hash_hint,
@@ -425,8 +425,10 @@ async fn build_knowledge_context(
     }
 
     // 5. Format markdown (ordinato per score)
-    let mut by_id: std::collections::HashMap<Uuid, (String, String, Vec<String>, Option<String>, String)> =
-        std::collections::HashMap::new();
+    let mut by_id: std::collections::HashMap<
+        Uuid,
+        (String, String, Vec<String>, Option<String>, String),
+    > = std::collections::HashMap::new();
     for r in &rows {
         let id: Uuid = r.try_get("id").ok()?;
         let title: String = r.try_get("title").unwrap_or_default();
@@ -478,67 +480,65 @@ async fn build_knowledge_context(
 
 #[allow(dead_code)]
 async fn load_project_analysis_summary(db: &PgPool, project_id: Uuid) -> Option<String> {
-    sqlx::query_scalar::<_, serde_json::Value>(
-        "SELECT analysis_json FROM projects WHERE id = $1",
-    )
-    .bind(project_id)
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten()
-    .and_then(|analysis: serde_json::Value| {
-        let langs = analysis
-            .get("languages")
-            .and_then(|l: &serde_json::Value| l.as_array())
-            .map(|arr: &Vec<serde_json::Value>| {
-                arr.iter()
-                    .take(5)
-                    .filter_map(|e: &serde_json::Value| {
-                        e.get("language")
-                            .and_then(|v: &serde_json::Value| v.as_str())
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
-        let frameworks = analysis
-            .get("frameworks")
-            .and_then(|f: &serde_json::Value| f.as_array())
-            .map(|arr: &Vec<serde_json::Value>| {
-                arr.iter()
-                    .take(6)
-                    .filter_map(|v: &serde_json::Value| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
-        let scripts = analysis
-            .get("dependencies")
-            .and_then(|d: &serde_json::Value| d.get("node"))
-            .and_then(|n: &serde_json::Value| n.get("scripts"))
-            .and_then(|s: &serde_json::Value| s.as_object())
-            .map(|scripts_map: &serde_json::Map<String, serde_json::Value>| {
-                scripts_map
-                    .iter()
-                    .take(8)
-                    .map(|(k, v): (&String, &serde_json::Value)| {
-                        format!("  {} -> {}", k, v.as_str().unwrap_or(""))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
+    sqlx::query_scalar::<_, serde_json::Value>("SELECT analysis_json FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|analysis: serde_json::Value| {
+            let langs = analysis
+                .get("languages")
+                .and_then(|l: &serde_json::Value| l.as_array())
+                .map(|arr: &Vec<serde_json::Value>| {
+                    arr.iter()
+                        .take(5)
+                        .filter_map(|e: &serde_json::Value| {
+                            e.get("language")
+                                .and_then(|v: &serde_json::Value| v.as_str())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let frameworks = analysis
+                .get("frameworks")
+                .and_then(|f: &serde_json::Value| f.as_array())
+                .map(|arr: &Vec<serde_json::Value>| {
+                    arr.iter()
+                        .take(6)
+                        .filter_map(|v: &serde_json::Value| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let scripts = analysis
+                .get("dependencies")
+                .and_then(|d: &serde_json::Value| d.get("node"))
+                .and_then(|n: &serde_json::Value| n.get("scripts"))
+                .and_then(|s: &serde_json::Value| s.as_object())
+                .map(|scripts_map: &serde_json::Map<String, serde_json::Value>| {
+                    scripts_map
+                        .iter()
+                        .take(8)
+                        .map(|(k, v): (&String, &serde_json::Value)| {
+                            format!("  {} -> {}", k, v.as_str().unwrap_or(""))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
 
-        if langs.is_empty() && frameworks.is_empty() {
-            None
-        } else {
-            let mut summary = format!("Linguaggi: {}\nFramework/stack: {}", langs, frameworks);
-            if !scripts.is_empty() {
-                summary.push_str(&format!("\nScript disponibili:\n{}", scripts));
+            if langs.is_empty() && frameworks.is_empty() {
+                None
+            } else {
+                let mut summary = format!("Linguaggi: {}\nFramework/stack: {}", langs, frameworks);
+                if !scripts.is_empty() {
+                    summary.push_str(&format!("\nScript disponibili:\n{}", scripts));
+                }
+                Some(summary)
             }
-            Some(summary)
-        }
-    })
+        })
 }
 
 #[allow(dead_code)]
@@ -625,7 +625,10 @@ async fn build_composed_system_context(
         ),
     };
 
-    format!("{}{}{}{}", services_block, project_header, profile_prompt_block, base)
+    format!(
+        "{}{}{}{}",
+        services_block, project_header, profile_prompt_block, base
+    )
 }
 
 #[allow(dead_code)]
@@ -667,8 +670,7 @@ fn model_belongs_to_provider(provider: &str, model: &str) -> bool {
                 || m.starts_with("o1")
                 || m.starts_with("o3")
                 || m.starts_with("o4")
-                || m
-                    .strip_prefix('o')
+                || m.strip_prefix('o')
                     .and_then(|rest| rest.chars().next())
                     .map(|c| c.is_ascii_digit())
                     .unwrap_or(false)
@@ -762,10 +764,7 @@ fn detect_model_reset(content: &str) -> bool {
 /// stabili Nexus, quindi keyword-based. I MODELLI invece sono letti dal DB
 /// (`ai_price_catalog`) — cosi' aggiungere claude-opus-5 al DB lo rende
 /// automaticamente riconoscibile in chat senza modifiche al codice.
-async fn detect_model_switch(
-    db: &sqlx::PgPool,
-    content: &str,
-) -> Option<(String, Option<String>)> {
+async fn detect_model_switch(db: &sqlx::PgPool, content: &str) -> Option<(String, Option<String>)> {
     let lower = content.trim().to_lowercase();
     // Ignora messaggi lunghi: quasi certamente non è un puro comando di switch
     if lower.chars().count() > 100 {
@@ -774,32 +773,30 @@ async fn detect_model_switch(
 
     // Identifica il provider richiesto in base a keyword nel messaggio.
     // I 5 provider id sono identificatori stabili (slug Nexus) — non cambiano.
-    let provider: &'static str = if lower.contains("mistral")
-        || lower.contains("codestral")
-        || lower.contains("mixtral")
-    {
-        "mistral"
-    } else if lower.contains("claude")
-        || lower.contains("anthropic")
-        || lower.contains("sonnet")
-        || lower.contains("opus")
-        || lower.contains("haiku")
-    {
-        "anthropic"
-    } else if lower.contains("openai")
-        || lower.contains("gpt")
-        || lower.contains("chatgpt")
-        || lower.contains("o1")
-        || lower.contains("o3")
-    {
-        "openai"
-    } else if lower.contains("gemini") || lower.contains("google") || lower.contains("bard") {
-        "google"
-    } else if lower.contains("deepseek") {
-        "deepseek"
-    } else {
-        return None;
-    };
+    let provider: &'static str =
+        if lower.contains("mistral") || lower.contains("codestral") || lower.contains("mixtral") {
+            "mistral"
+        } else if lower.contains("claude")
+            || lower.contains("anthropic")
+            || lower.contains("sonnet")
+            || lower.contains("opus")
+            || lower.contains("haiku")
+        {
+            "anthropic"
+        } else if lower.contains("openai")
+            || lower.contains("gpt")
+            || lower.contains("chatgpt")
+            || lower.contains("o1")
+            || lower.contains("o3")
+        {
+            "openai"
+        } else if lower.contains("gemini") || lower.contains("google") || lower.contains("bard") {
+            "google"
+        } else if lower.contains("deepseek") {
+            "deepseek"
+        } else {
+            return None;
+        };
 
     // Verifica che sia presente un verbo d'azione (switch, usa, cambia, ecc.)
     let has_action = lower.starts_with("usa ")
@@ -835,7 +832,7 @@ async fn detect_model_switch(
     let candidates: Vec<String> = sqlx::query_scalar(
         "SELECT model FROM ai_price_catalog \
          WHERE provider = $1 AND is_enabled = TRUE \
-         ORDER BY is_featured DESC, input_cost_per_million_tokens ASC"
+         ORDER BY is_featured DESC, input_cost_per_million_tokens ASC",
     )
     .bind(provider)
     .fetch_all(db)
@@ -852,9 +849,9 @@ async fn detect_model_switch(
         // (es. "claude-opus-4-6" -> ["claude", "opus", "4", "6"]) — se nel
         // messaggio c'e' una componente "opus" (>=4 char per evitare match
         // di numeri o suffissi tipo "4"), considera match.
-        m_lower.split('-').any(|part| {
-            part.len() >= 4 && lower.contains(part)
-        })
+        m_lower
+            .split('-')
+            .any(|part| part.len() >= 4 && lower.contains(part))
     });
 
     Some((provider.to_string(), specific_model))
@@ -884,7 +881,11 @@ fn normalize_attachments(input: &[ChatAttachmentRequest]) -> Vec<ChatAttachment>
             let sanitized = strip_null_bytes(&attachment.text_content);
             let text_content = sanitized.trim();
             let has_text = !name.is_empty() && !text_content.is_empty();
-            let has_image = !name.is_empty() && attachment.base64_content.as_ref().map_or(false, |b| !b.is_empty());
+            let has_image = !name.is_empty()
+                && attachment
+                    .base64_content
+                    .as_ref()
+                    .map_or(false, |b| !b.is_empty());
             if !has_text && !has_image {
                 return None;
             }
@@ -958,8 +959,7 @@ async fn enrich_attachments_with_ids_from_db(
             return atts;
         }
     };
-    let mut by_name: std::collections::HashMap<String, Uuid> =
-        std::collections::HashMap::new();
+    let mut by_name: std::collections::HashMap<String, Uuid> = std::collections::HashMap::new();
     for row in rows.iter() {
         let id: Uuid = match row.try_get("id") {
             Ok(v) => v,
@@ -1010,39 +1010,53 @@ async fn build_recent_conversation_history(
     }
 
     // Le righe sono DESC → le rovesciamo per avere ordine cronologico
-    rows.into_iter().rev().filter_map(|row| {
-        let role = row.try_get::<String, _>("role").ok()?;
-        let content = row.try_get::<String, _>("content").ok()?;
-        if content.trim().is_empty() { return None; }
-        // Normalizza il ruolo per compatibilità con il formato messages LLM.
-        // 'summary' (iniettato dal compact) viene inviato come messaggio user
-        // — il content e' gia' prefissato con "[Riassunto ...]".
-        let llm_role = match role.as_str() {
-            "assistant" => "assistant",
-            _ => "user",
-        };
-        Some(serde_json::json!({ "role": llm_role, "content": content }))
-    }).collect()
+    rows.into_iter()
+        .rev()
+        .filter_map(|row| {
+            let role = row.try_get::<String, _>("role").ok()?;
+            let content = row.try_get::<String, _>("content").ok()?;
+            if content.trim().is_empty() {
+                return None;
+            }
+            // Normalizza il ruolo per compatibilità con il formato messages LLM.
+            // 'summary' (iniettato dal compact) viene inviato come messaggio user
+            // — il content e' gia' prefissato con "[Riassunto ...]".
+            let llm_role = match role.as_str() {
+                "assistant" => "assistant",
+                _ => "user",
+            };
+            Some(serde_json::json!({ "role": llm_role, "content": content }))
+        })
+        .collect()
 }
 
 /// Versione testuale compatta (usata solo per logging)
-async fn build_recent_conversation_context(
-    db: &PgPool,
-    session_id: Uuid,
-    limit: i64,
-) -> String {
+async fn build_recent_conversation_context(db: &PgPool, session_id: Uuid, limit: i64) -> String {
     let msgs = build_recent_conversation_history(db, session_id, limit).await;
-    if msgs.is_empty() { return String::new(); }
-    let entries: Vec<String> = msgs.iter().filter_map(|m| {
-        let role = m.get("role")?.as_str()?;
-        let content = m.get("content")?.as_str()?;
-        let compact = content.replace('\n', " ").split_whitespace().collect::<Vec<_>>().join(" ");
-        let clipped = if compact.chars().count() > 120 {
-            format!("{}...", compact.chars().take(120).collect::<String>())
-        } else { compact };
-        Some(format!("- {}: {}", role, clipped))
-    }).collect();
-    if entries.is_empty() { String::new() } else {
+    if msgs.is_empty() {
+        return String::new();
+    }
+    let entries: Vec<String> = msgs
+        .iter()
+        .filter_map(|m| {
+            let role = m.get("role")?.as_str()?;
+            let content = m.get("content")?.as_str()?;
+            let compact = content
+                .replace('\n', " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let clipped = if compact.chars().count() > 120 {
+                format!("{}...", compact.chars().take(120).collect::<String>())
+            } else {
+                compact
+            };
+            Some(format!("- {}: {}", role, clipped))
+        })
+        .collect();
+    if entries.is_empty() {
+        String::new()
+    } else {
         format!("Contesto conversazione recente:\n{}", entries.join("\n"))
     }
 }
@@ -1259,7 +1273,10 @@ async fn find_target_user_message(
             .collect::<Vec<_>>()
             .join(" ");
         if compact.chars().count() > 120 {
-            return Some(format!("{}...", compact.chars().take(120).collect::<String>()));
+            return Some(format!(
+                "{}...",
+                compact.chars().take(120).collect::<String>()
+            ));
         }
         return Some(compact);
     }
@@ -1330,12 +1347,20 @@ fn spawn_embed_conversation_turn(
             Ok(v) => {
                 tracing::info!(
                     "conversation_embed: OK dim={} session={} role={} msg_id={}",
-                    v.len(), session_id, role, message_id
+                    v.len(),
+                    session_id,
+                    role,
+                    message_id
                 );
                 v
             }
             Err(e) => {
-                tracing::warn!("conversation_embed: FALLITO session={} role={} msg_id={}: {e}", session_id, role, message_id);
+                tracing::warn!(
+                    "conversation_embed: FALLITO session={} role={} msg_id={}: {e}",
+                    session_id,
+                    role,
+                    message_id
+                );
                 return;
             }
         };
@@ -1343,10 +1368,20 @@ fn spawn_embed_conversation_turn(
         let now = chrono::Utc::now().to_rfc3339();
         if let Err(e) = vector_memory::upsert_conversation_turn(
             &db, &point_id, &vector, session_id, &role, &content, &now,
-        ).await {
-            tracing::warn!("conversation_upsert: FALLITO point={} session={}: {e}", point_id, session_id);
+        )
+        .await
+        {
+            tracing::warn!(
+                "conversation_upsert: FALLITO point={} session={}: {e}",
+                point_id,
+                session_id
+            );
         } else {
-            tracing::info!("conversation_upsert: OK point={} session={}", point_id, session_id);
+            tracing::info!(
+                "conversation_upsert: OK point={} session={}",
+                point_id,
+                session_id
+            );
         }
     });
 }
@@ -1393,19 +1428,26 @@ async fn build_vectorized_conversation_history(
     // X" passato; con il turno precedente ("quanti utenti / 4 utenti") il
     // vettore si concentra sul tema utenti.
     let mut embed_input = String::new();
-    if let Some(last_turn) = recent.iter().rev().take(2).collect::<Vec<_>>().iter().rev().fold(
-        Some(String::new()),
-        |acc, msg| {
+    if let Some(last_turn) = recent
+        .iter()
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>()
+        .iter()
+        .rev()
+        .fold(Some(String::new()), |acc, msg| {
             let mut s = acc?;
             let role = msg.get("role")?.as_str()?;
             let content = msg.get("content")?.as_str()?;
-            if !s.is_empty() { s.push('\n'); }
+            if !s.is_empty() {
+                s.push('\n');
+            }
             s.push_str(role);
             s.push_str(": ");
             s.push_str(content);
             Some(s)
-        },
-    ) {
+        })
+    {
         if !last_turn.is_empty() {
             embed_input.push_str(&last_turn);
             embed_input.push('\n');
@@ -1423,72 +1465,102 @@ async fn build_vectorized_conversation_history(
         }
         embed_input.truncate(cut);
     }
-    let vector = match neural.embed_text("", &embed_input).await {
-        Ok(v) => {
-            tracing::warn!(
+    let vector =
+        match neural.embed_text("", &embed_input).await {
+            Ok(v) => {
+                tracing::warn!(
                 "vectorized history: embed OK (con ultimo turno), dim={}, session={}, input_len={}",
                 v.len(), session_id, embed_input.len()
             );
-            v
-        }
-        Err(e) => {
-            tracing::warn!("vectorized history: embedding fallito, fallback a {RAW_FALLBACK} raw: {e}");
-            return build_recent_conversation_history(db, session_id, RAW_FALLBACK).await;
-        }
-    };
+                v
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "vectorized history: embedding fallito, fallback a {RAW_FALLBACK} raw: {e}"
+                );
+                return build_recent_conversation_history(db, session_id, RAW_FALLBACK).await;
+            }
+        };
 
     let semantic_hits = match vector_memory::search_conversation_context(
-        db, &vector, session_id, semantic_top_k, 0.40,
-    ).await {
+        db,
+        &vector,
+        session_id,
+        semantic_top_k,
+        0.40,
+    )
+    .await
+    {
         Ok(hits) => {
             let scores: Vec<f64> = hits.iter().map(|h| h.score).collect();
             tracing::warn!(
                 "vectorized history: ricerca Qdrant OK, {} hit(s) per session={}, scores={:?}",
-                hits.len(), session_id, scores
+                hits.len(),
+                session_id,
+                scores
             );
             hits
         }
         Err(e) => {
-            tracing::warn!("vectorized history: ricerca Qdrant fallita, fallback a {RAW_FALLBACK} raw: {e}");
+            tracing::warn!(
+                "vectorized history: ricerca Qdrant fallita, fallback a {RAW_FALLBACK} raw: {e}"
+            );
             return build_recent_conversation_history(db, session_id, RAW_FALLBACK).await;
         }
     };
 
     if semantic_hits.is_empty() {
-        tracing::warn!("vectorized history: 0 hit semantici per session={}, fallback a {RAW_FALLBACK} raw", session_id);
+        tracing::warn!(
+            "vectorized history: 0 hit semantici per session={}, fallback a {RAW_FALLBACK} raw",
+            session_id
+        );
         return build_recent_conversation_history(db, session_id, RAW_FALLBACK).await;
     }
 
     // Raccogli i contenuti recenti per deduplicazione
-    let recent_contents: std::collections::HashSet<String> = recent.iter()
+    let recent_contents: std::collections::HashSet<String> = recent
+        .iter()
         .filter_map(|m| m.get("content").and_then(|v| v.as_str()).map(String::from))
         .collect();
 
     // Il timestamp del piu' vecchio dei recenti: tutto cio' che e' >= a questo
     // e' gia' coperto dai raw, quindi va escluso dai semantici per evitare
     // doppioni e per preservare l'ordine cronologico finale.
-    let oldest_recent_ts: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
-        r#"
+    let oldest_recent_ts: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+            r#"
         SELECT created_at FROM chat_messages
         WHERE session_id = $1 AND deleted_at IS NULL AND role IN ('user','assistant')
         ORDER BY created_at DESC
         OFFSET $2 LIMIT 1
         "#,
-    )
-    .bind(session_id)
-    .bind((recent_count - 1).max(0))
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten();
+        )
+        .bind(session_id)
+        .bind((recent_count - 1).max(0))
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
 
     // Converti hit semantici in messaggi, escludendo duplicati e quelli che
     // cadono nella finestra "recente" (gia' coperti dai raw).
     let mut semantic_msgs: Vec<(String, f64, serde_json::Value)> = Vec::new();
     for hit in &semantic_hits {
-        let role = hit.payload.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-        let content = hit.payload.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let created_at = hit.payload.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let role = hit
+            .payload
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("user");
+        let content = hit
+            .payload
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let created_at = hit
+            .payload
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if content.is_empty() || recent_contents.contains(content) {
             continue;
         }
@@ -1500,7 +1572,11 @@ async fn build_vectorized_conversation_history(
                 }
             }
         }
-        let llm_role = if role == "assistant" { "assistant" } else { "user" };
+        let llm_role = if role == "assistant" {
+            "assistant"
+        } else {
+            "user"
+        };
         semantic_msgs.push((
             created_at.to_string(),
             hit.score,
@@ -1528,7 +1604,8 @@ async fn build_vectorized_conversation_history(
     // turno, posizionato direttamente prima del messaggio user corrente
     // gestito dal caller: questo garantisce che il LLM "veda" il contesto
     // immediato come elemento dominante per la risposta.
-    let mut combined: Vec<serde_json::Value> = semantic_msgs.into_iter().map(|(_, _, m)| m).collect();
+    let mut combined: Vec<serde_json::Value> =
+        semantic_msgs.into_iter().map(|(_, _, m)| m).collect();
     combined.extend(recent);
     combined
 }
@@ -1569,7 +1646,7 @@ fn intent_human_description(intent: &str) -> Option<&'static str> {
 fn build_disambiguation_message(c: &crate::orchestrator::ClassifiedIntent) -> String {
     let mut s = String::from(
         "Per dare la risposta giusta ho bisogno di un chiarimento — la tua richiesta puo' \
-         essere interpretata in piu' modi. Quale di queste opzioni descrive meglio cosa vuoi?\n\n"
+         essere interpretata in piu' modi. Quale di queste opzioni descrive meglio cosa vuoi?\n\n",
     );
     let labels = ["A", "B", "C"];
     for (idx, cand) in c.candidates.iter().take(3).enumerate() {
@@ -1585,7 +1662,7 @@ fn build_disambiguation_message(c: &crate::orchestrator::ClassifiedIntent) -> St
     s.push_str(
         "\nRispondi indicando la lettera (es. \"A\") oppure descrivi piu' precisamente \
          cosa vuoi che faccia. Se preferisci che proceda senza chiedere, imposta la \
-         modalita' di automazione su \"Automatico\"."
+         modalita' di automazione su \"Automatico\".",
     );
     s
 }
@@ -1697,8 +1774,12 @@ async fn run_turn(
     // Se il gateway ha re-instradato la richiesta su provider locale per privacy:
     // 1. Azzerare la preferenza di sessione → al prossimo msg si torna al routing automatico
     // 2. Anteporre una nota informativa alla risposta
-    let assistant_content = if let Some(pr) = payload["completion"]["privacy_rerouted"].as_object() {
-        let provider = pr.get("provider").and_then(|v| v.as_str()).unwrap_or("locale");
+    let assistant_content = if let Some(pr) = payload["completion"]["privacy_rerouted"].as_object()
+    {
+        let provider = pr
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("locale");
         let tier = pr.get("blocked_tier").and_then(|v| v.as_u64()).unwrap_or(0);
         // Azzera la preferenza di sessione
         clear_session_preferred_provider_after_privacy(&state.db, session_id).await;
@@ -1856,9 +1937,7 @@ pub async fn list_chat_messages(
 
     for msg in messages.iter_mut() {
         let msg_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-        let attachments = attachments_by_msg
-            .remove(msg_id)
-            .unwrap_or_default();
+        let attachments = attachments_by_msg.remove(msg_id).unwrap_or_default();
         if let Value::Object(map) = msg {
             map.insert("attachments".to_string(), Value::Array(attachments));
         }
@@ -2297,10 +2376,7 @@ async fn build_initial_msg_with_attachments(
 
 /// Logica condivisa: carica progetto, costruisce contesto, avvia AgentLoop in background.
 /// Ritorna `None` se il progetto non è caricabile (fallback al singolo turn).
-async fn spawn_agent_run(
-    state: &AppState,
-    params: SpawnAgentParams,
-) -> Option<SpawnAgentResult> {
+async fn spawn_agent_run(state: &AppState, params: SpawnAgentParams) -> Option<SpawnAgentResult> {
     let project_ctx = load_project_context(&state.db, params.project_id, params.user_id).await;
     let proj = match project_ctx {
         Ok(p) => p,
@@ -2331,17 +2407,17 @@ async fn spawn_agent_run(
         &state.db,
         params.session_id,
         &params.content,
-    ).await;
+    )
+    .await;
     let classified = state
         .orchestrator
         .classify_intent_full(&classifier_input)
         .await;
-    if classified.is_ambiguous
-        && !matches!(params.automation_mode, AutomationMode::Automatic)
-    {
+    if classified.is_ambiguous && !matches!(params.automation_mode, AutomationMode::Automatic) {
         tracing::info!(
             "spawn_agent_run: intent ambiguo (conf={:.2}, candidati={}), chiedo disambiguazione",
-            classified.confidence, classified.candidates.len(),
+            classified.confidence,
+            classified.candidates.len(),
         );
         let disambig_msg = build_disambiguation_message(&classified);
         let meta = json!({
@@ -2383,10 +2459,12 @@ async fn spawn_agent_run(
     } else {
         crate::routing_slots::infer_slots_heuristic(&params.content)
     };
-    let slot_routing_hit = if params.provider_override.is_none()
-        && params.model_override.is_none()
+    let slot_routing_hit = if params.provider_override.is_none() && params.model_override.is_none()
     {
-        state.orchestrator.route_by_slots(&effective_slots, 0.60).await
+        state
+            .orchestrator
+            .route_by_slots(&effective_slots, 0.60)
+            .await
     } else {
         None
     };
@@ -2404,31 +2482,28 @@ async fn spawn_agent_run(
             .filter(|v| !v.trim().is_empty())
             .or_else(|| params.profile_provider.filter(|v| !v.trim().is_empty()))
     };
-    let effective_model_override = if let Some((_slot_provider, slot_model, _src)) = &slot_routing_hit {
-        Some(slot_model.clone())
-    } else {
-        params
-            .model_override
-            .filter(|v| !v.trim().is_empty())
-            .or_else(|| params.profile_model.filter(|v| !v.trim().is_empty()))
-    };
+    let effective_model_override =
+        if let Some((_slot_provider, slot_model, _src)) = &slot_routing_hit {
+            Some(slot_model.clone())
+        } else {
+            params
+                .model_override
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| params.profile_model.filter(|v| !v.trim().is_empty()))
+        };
     if let Some((p, m, src)) = &slot_routing_hit {
-        tracing::info!(
-            "spawn_agent_run: routing slot-based {} → {}/{}",
-            src, p, m
-        );
+        tracing::info!("spawn_agent_run: routing slot-based {} → {}/{}", src, p, m);
     }
 
     // Conta i messaggi esistenti nella sessione per calibrare il routing:
     // sessioni con molti messaggi indicano task lunghi (es. "continua") che
     // richiedono modelli più capaci anche se il messaggio è breve.
-    let context_message_count = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM chat_messages WHERE session_id = $1",
-    )
-    .bind(params.session_id)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0) as usize;
+    let context_message_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chat_messages WHERE session_id = $1")
+            .bind(params.session_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(0) as usize;
 
     // Versione "detailed": ritorna anche `no_capable_provider` e
     // `providers_in_cooldown`. Se nessun provider e' utilizzabile fermiamo
@@ -2465,7 +2540,8 @@ async fn spawn_agent_run(
         };
         tracing::warn!(
             "spawn_agent_run: no_capable_provider per session={} → STOP + alert. {}",
-            params.session_id, alert_msg,
+            params.session_id,
+            alert_msg,
         );
         // Persist run come "failed" con errore strutturato.
         let _ = sqlx::query(
@@ -2523,7 +2599,14 @@ async fn spawn_agent_run(
     // configurabile (DB-driven, regola G), compatta automaticamente la sessione
     // riusando la stessa logica del compact manuale (compact_session_core).
     // Best-effort: ogni fallimento e' loggato WARN e il turno prosegue.
-    maybe_auto_compact(state, params.session_id, params.project_id, &provider, &model_str).await;
+    maybe_auto_compact(
+        state,
+        params.session_id,
+        params.project_id,
+        &provider,
+        &model_str,
+    )
+    .await;
 
     // Persist initial run in DB
     let _ = sqlx::query(
@@ -2557,24 +2640,30 @@ async fn spawn_agent_run(
     // letterale del turno corrente. I semantici che ricadono nella finestra
     // recente vengono filtrati per evitare duplicazione.
     // Se Qdrant/embedding non disponibile, fallback a ultimi 8 raw.
-    let vec_deps_ok = state.dependency_status.qdrant.load(std::sync::atomic::Ordering::Relaxed)
-        && state.dependency_status.embedder.load(std::sync::atomic::Ordering::Relaxed);
+    let vec_deps_ok = state
+        .dependency_status
+        .qdrant
+        .load(std::sync::atomic::Ordering::Relaxed)
+        && state
+            .dependency_status
+            .embedder
+            .load(std::sync::atomic::Ordering::Relaxed);
     let recent_history = if vec_deps_ok {
         build_vectorized_conversation_history(
             &state.db,
             &state.orchestrator.neural,
             params.session_id,
             &params.content,
-            4,  // ultimi 4 messaggi raw = 2 turni completi user+assistant
-            6,  // top-6 semantici dalla storia piu' vecchia (soglia 0.40)
-        ).await
+            4, // ultimi 4 messaggi raw = 2 turni completi user+assistant
+            6, // top-6 semantici dalla storia piu' vecchia (soglia 0.40)
+        )
+        .await
     } else {
         // Dipendenze vettoriali down: usa solo gli ultimi messaggi raw
         build_recent_conversation_history(&state.db, params.session_id, 8).await
     };
     // Versione testuale compatta solo per logging
-    let recent_context =
-        build_recent_conversation_context(&state.db, params.session_id, 4).await;
+    let recent_context = build_recent_conversation_context(&state.db, params.session_id, 4).await;
     // Legge analysis_json + custom_instructions in un'unica query
     let (analysis_json_opt, custom_instructions_opt): (Option<serde_json::Value>, Option<String>) =
         sqlx::query_as::<_, (Option<serde_json::Value>, Option<String>)>(
@@ -2587,53 +2676,54 @@ async fn spawn_agent_run(
         .flatten()
         .unwrap_or((None, None));
 
-    let analysis_summary: Option<String> = analysis_json_opt.and_then(|analysis: serde_json::Value| {
-        let langs = analysis
-            .get("languages")
-            .and_then(|l| l.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .take(5)
-                    .filter_map(|e| e.get("language").and_then(|v| v.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
-        let frameworks = analysis
-            .get("frameworks")
-            .and_then(|f| f.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .take(6)
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
-        let scripts = analysis
-            .get("dependencies")
-            .and_then(|d| d.get("node"))
-            .and_then(|n| n.get("scripts"))
-            .and_then(|s| s.as_object())
-            .map(|scripts_map| {
-                scripts_map
-                    .iter()
-                    .take(8)
-                    .map(|(k, v)| format!("  {} → {}", k, v.as_str().unwrap_or("")))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        if langs.is_empty() && frameworks.is_empty() {
-            None
-        } else {
-            let mut summary = format!("Linguaggi: {}\nFramework/stack: {}", langs, frameworks);
-            if !scripts.is_empty() {
-                summary.push_str(&format!("\nScript disponibili:\n{}", scripts));
+    let analysis_summary: Option<String> =
+        analysis_json_opt.and_then(|analysis: serde_json::Value| {
+            let langs = analysis
+                .get("languages")
+                .and_then(|l| l.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .take(5)
+                        .filter_map(|e| e.get("language").and_then(|v| v.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let frameworks = analysis
+                .get("frameworks")
+                .and_then(|f| f.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .take(6)
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let scripts = analysis
+                .get("dependencies")
+                .and_then(|d| d.get("node"))
+                .and_then(|n| n.get("scripts"))
+                .and_then(|s| s.as_object())
+                .map(|scripts_map| {
+                    scripts_map
+                        .iter()
+                        .take(8)
+                        .map(|(k, v)| format!("  {} → {}", k, v.as_str().unwrap_or("")))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            if langs.is_empty() && frameworks.is_empty() {
+                None
+            } else {
+                let mut summary = format!("Linguaggi: {}\nFramework/stack: {}", langs, frameworks);
+                if !scripts.is_empty() {
+                    summary.push_str(&format!("\nScript disponibili:\n{}", scripts));
+                }
+                Some(summary)
             }
-            Some(summary)
-        }
-    });
+        });
 
     let db_connections_block = {
         let rows = sqlx::query(
@@ -2659,14 +2749,16 @@ async fn spawn_agent_run(
                 if let Some(ref dsn_val) = dsn {
                     block.push_str(&format!(
                         "  - {}{}: engine={} connection_string=\"{}\"\n",
-                        name, label,
+                        name,
+                        label,
                         engine.as_deref().unwrap_or("unknown"),
                         dsn_val
                     ));
                 } else {
                     block.push_str(&format!(
                         "  - {}{}: engine={} (nessuna connection string configurata)\n",
-                        name, label,
+                        name,
+                        label,
                         engine.as_deref().unwrap_or("unknown")
                     ));
                 }
@@ -2726,8 +2818,10 @@ async fn spawn_agent_run(
     // Istruzioni TDD per cicli test-fix-test iterativi
     let test_instructions = {
         let l = params.content.to_lowercase();
-        let is_test_intent = l.contains("test") || l.contains("testa")
-            || l.contains("verifica che funzion") || l.contains("tdd")
+        let is_test_intent = l.contains("test")
+            || l.contains("testa")
+            || l.contains("verifica che funzion")
+            || l.contains("tdd")
             || l.contains("fai passare");
         if is_test_intent {
             "\n=== MODALITA TEST-FIX-TEST ===\n\
@@ -2759,11 +2853,9 @@ async fn spawn_agent_run(
     // l'ultimo messaggio (la domanda stessa) invece di scalare al precedente
     // messaggio utente significativo. L'hint e' auto-aggiornato: include un
     // few-shot example tratto dalla cronologia reale di questa sessione.
-    let self_ref_hint = build_self_referential_hint(
-        &state.db,
-        params.session_id,
-        &params.content,
-    ).await.unwrap_or_default();
+    let self_ref_hint = build_self_referential_hint(&state.db, params.session_id, &params.content)
+        .await
+        .unwrap_or_default();
 
     // Istruzioni specifiche per modelli o-series (o1/o3/o4-mini): forzano
     // l'uso esplicito dei tool instead of narrare le azioni come testo.
@@ -2784,9 +2876,15 @@ async fn spawn_agent_run(
     };
 
     let system_text = format!(
-        "{}{}{}{}{}{}{}{}", project_header, project_custom_instructions,
-        automation_instructions, o_series_instructions, test_instructions,
-        params.profile_prompt_block, params.system_context, self_ref_hint
+        "{}{}{}{}{}{}{}{}",
+        project_header,
+        project_custom_instructions,
+        automation_instructions,
+        o_series_instructions,
+        test_instructions,
+        params.profile_prompt_block,
+        params.system_context,
+        self_ref_hint
     );
     // Costruzione del messaggio iniziale arricchito con il contenuto reale
     // degli allegati (ADR 0010/0011/0012 — pre-extraction nel prompt).
@@ -2868,10 +2966,11 @@ async fn spawn_agent_run(
     // Lettura della soglia SSE silence da settings (mig 0132). Cache 60s
     // tramite RoutingThresholdsCache: la doppia chiamata e' gratis.
     // Fallback al default tecnico (120s) se DB non disponibile.
-    let sse_max_silence_secs: u64 = match state.orchestrator.routing_thresholds.current_async().await {
-        Ok(t) => t.sse_heartbeat_max_silence_secs,
-        Err(_) => 120,
-    };
+    let sse_max_silence_secs: u64 =
+        match state.orchestrator.routing_thresholds.current_async().await {
+            Ok(t) => t.sse_heartbeat_max_silence_secs,
+            Err(_) => 120,
+        };
 
     // Cloni dedicati al panic-handler: se il corpo principale del tokio::spawn
     // panica, dobbiamo comunque emettere is_final e marcare il run come failed
@@ -2894,71 +2993,90 @@ async fn spawn_agent_run(
         );
 
         let agent_body = std::panic::AssertUnwindSafe(async move {
-        // ── Loop di retry con fallback automatico tra provider ───────────────
-        // Se il run fallisce per "credit too low" / "quota exceeded", il provider
-        // viene messo in cooldown lungo (in brain_agent_client). Qui rileviamo
-        // il fallimento e ritentiamo con il prossimo provider della gerarchia
-        // ammin (escludendo quelli in cooldown).
-        //
-        // Limite dinamico: tante iterazioni quanti sono i provider con almeno
-        // un modello idoneo nel catalog (is_enabled + supports_tool_use +
-        // consecutive_failures=0). Il +1 copre il tentativo iniziale. Floor=2
-        // per garantire almeno un fallback se il catalog e' parziale.
-        let max_provider_fallbacks: usize = {
-            let n: i64 = sqlx::query_scalar(
-                "SELECT COUNT(DISTINCT provider)
+            // ── Loop di retry con fallback automatico tra provider ───────────────
+            // Se il run fallisce per "credit too low" / "quota exceeded", il provider
+            // viene messo in cooldown lungo (in brain_agent_client). Qui rileviamo
+            // il fallimento e ritentiamo con il prossimo provider della gerarchia
+            // ammin (escludendo quelli in cooldown).
+            //
+            // Limite dinamico: tante iterazioni quanti sono i provider con almeno
+            // un modello idoneo nel catalog (is_enabled + supports_tool_use +
+            // consecutive_failures=0). Il +1 copre il tentativo iniziale. Floor=2
+            // per garantire almeno un fallback se il catalog e' parziale.
+            let max_provider_fallbacks: usize = {
+                let n: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(DISTINCT provider)
                    FROM ai_price_catalog
                   WHERE is_enabled = true
                     AND supports_tool_use = true
-                    AND consecutive_failures = 0"
-            )
-            .fetch_one(&db_clone)
-            .await
-            .unwrap_or(4);
-            std::cmp::max(2, (n as usize).saturating_add(1))
-        };
-        let provider_hierarchy: Vec<String> = {
-            let row: Option<String> = sqlx::query_scalar(
-                "SELECT value FROM settings WHERE key = 'provider_hierarchy' LIMIT 1"
-            )
-            .fetch_optional(&db_clone)
-            .await
-            .ok()
-            .flatten();
-            row.map(|s| s.split(',').map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).collect())
-                .unwrap_or_else(|| vec![
-                    "anthropic".into(), "openai".into(), "google".into(),
-                    "deepseek".into(), "mistral".into(),
-                ])
-        };
+                    AND consecutive_failures = 0",
+                )
+                .fetch_one(&db_clone)
+                .await
+                .unwrap_or(4);
+                std::cmp::max(2, (n as usize).saturating_add(1))
+            };
+            let provider_hierarchy: Vec<String> = {
+                let row: Option<String> = sqlx::query_scalar(
+                    "SELECT value FROM settings WHERE key = 'provider_hierarchy' LIMIT 1",
+                )
+                .fetch_optional(&db_clone)
+                .await
+                .ok()
+                .flatten();
+                row.map(|s| {
+                    s.split(',')
+                        .map(|t| t.trim().to_lowercase())
+                        .filter(|t| !t.is_empty())
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    vec![
+                        "anthropic".into(),
+                        "openai".into(),
+                        "google".into(),
+                        "deepseek".into(),
+                        "mistral".into(),
+                    ]
+                })
+            };
 
-        let mut current_provider = provider_clone.clone();
-        let mut current_model    = model_clone.clone();
-        let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut result;
-        let mut fallback_attempt: usize = 0;
+            let mut current_provider = provider_clone.clone();
+            let mut current_model = model_clone.clone();
+            let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut result;
+            let mut fallback_attempt: usize = 0;
 
-        // ── Fix B+C: stima tokens richiesti e scelta context-aware ──────────
-        // Approssimazione (1 token = ~4 caratteri): system prompt + msg utente
-        // + storia conversazione + descrizioni tool. Usata per:
-        //   B) troncare history se eccede 70% ctx del modello selezionato
-        //   C) pre-filtrare il routing escludendo modelli con ctx insufficiente
-        let estimated_input_chars: usize = {
-            let history_chars: usize = recent_history_for_brain.iter()
-                .map(|m| m.get("content").and_then(|c| c.as_str()).map(|s| s.len()).unwrap_or(0))
-                .sum();
-            let tools_chars: usize = serde_json::to_string(&tools_json_for_brain)
-                .map(|s| s.len()).unwrap_or(0);
-            system_text_clone.len() + initial_msg_clone.len() + history_chars + tools_chars
-        };
-        let estimated_input_tokens: i64 = (estimated_input_chars / 4) as i64;
-        tracing::info!(
-            "agent_run {}: input stimato {} tokens (~{} chars)",
-            run_id, estimated_input_tokens, estimated_input_chars
-        );
-        // Se il modello primario non ha context_window sufficiente (con margine
-        // 30% per output), cerca subito un modello idoneo per ctx.
-        let primary_ctx: i64 = sqlx::query_scalar(
+            // ── Fix B+C: stima tokens richiesti e scelta context-aware ──────────
+            // Approssimazione (1 token = ~4 caratteri): system prompt + msg utente
+            // + storia conversazione + descrizioni tool. Usata per:
+            //   B) troncare history se eccede 70% ctx del modello selezionato
+            //   C) pre-filtrare il routing escludendo modelli con ctx insufficiente
+            let estimated_input_chars: usize = {
+                let history_chars: usize = recent_history_for_brain
+                    .iter()
+                    .map(|m| {
+                        m.get("content")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.len())
+                            .unwrap_or(0)
+                    })
+                    .sum();
+                let tools_chars: usize = serde_json::to_string(&tools_json_for_brain)
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                system_text_clone.len() + initial_msg_clone.len() + history_chars + tools_chars
+            };
+            let estimated_input_tokens: i64 = (estimated_input_chars / 4) as i64;
+            tracing::info!(
+                "agent_run {}: input stimato {} tokens (~{} chars)",
+                run_id,
+                estimated_input_tokens,
+                estimated_input_chars
+            );
+            // Se il modello primario non ha context_window sufficiente (con margine
+            // 30% per output), cerca subito un modello idoneo per ctx.
+            let primary_ctx: i64 = sqlx::query_scalar(
             "SELECT context_window FROM ai_price_catalog WHERE provider=$1 AND model=$2 LIMIT 1"
         )
         .bind(&current_provider)
@@ -2966,214 +3084,244 @@ async fn spawn_agent_run(
         .fetch_optional(&db_clone)
         .await
         .ok().flatten().unwrap_or(8192);
-        let ctx_needed: i64 = (estimated_input_tokens as f64 * 1.3) as i64;
-        if primary_ctx < ctx_needed {
-            tracing::warn!(
+            let ctx_needed: i64 = (estimated_input_tokens as f64 * 1.3) as i64;
+            if primary_ctx < ctx_needed {
+                tracing::warn!(
                 "agent_run {}: ctx insufficiente per primario {}/{} ({} < {}), cerco modello con ctx >= {}",
                 run_id, current_provider, current_model, primary_ctx, ctx_needed, ctx_needed
             );
-            let alt: Option<(String, String)> = sqlx::query_as::<_, (String, String)>(
-                "SELECT provider, model FROM ai_price_catalog
+                let alt: Option<(String, String)> = sqlx::query_as::<_, (String, String)>(
+                    "SELECT provider, model FROM ai_price_catalog
                   WHERE is_enabled=true AND supports_tool_use=true
                     AND consecutive_failures=0
                     AND context_window >= $1
                   ORDER BY input_cost_per_million_tokens ASC NULLS LAST
-                  LIMIT 1"
-            )
-            .bind(ctx_needed)
-            .fetch_optional(&db_clone)
-            .await
-            .ok().flatten();
-            if let Some((p, m)) = alt {
-                tracing::info!(
-                    "agent_run {}: routing context-aware: {} -> {}/{}",
-                    run_id, current_model, p, m
-                );
-                current_provider = p;
-                current_model = m;
+                  LIMIT 1",
+                )
+                .bind(ctx_needed)
+                .fetch_optional(&db_clone)
+                .await
+                .ok()
+                .flatten();
+                if let Some((p, m)) = alt {
+                    tracing::info!(
+                        "agent_run {}: routing context-aware: {} -> {}/{}",
+                        run_id,
+                        current_model,
+                        p,
+                        m
+                    );
+                    current_provider = p;
+                    current_model = m;
+                }
             }
-        }
 
-        loop {
-            tried.insert(current_provider.to_lowercase());
-            tracing::info!(
-                "agent_run {}: tentativo {}/{} con provider={} model={} (ctx_needed={})",
-                run_id, fallback_attempt + 1, max_provider_fallbacks, current_provider, current_model, ctx_needed
-            );
-            result = crate::brain_agent_client::run_via_brain(
-                run_id,
-                session_id_cp,
-                current_provider.clone(),
-                current_model.clone(),
-                system_text_clone.clone(),
-                initial_msg_clone.clone(),
-                tx_for_brain.clone(),
-                recent_history_for_brain.clone(),
-                tools_json_for_brain.clone(),
-                sse_max_silence_secs,
-                false, // emit_final_event: emesso manualmente dopo il break del retry loop
-                automation_mode_for_brain.clone(),
-            )
-            .await;
+            loop {
+                tried.insert(current_provider.to_lowercase());
+                tracing::info!(
+                    "agent_run {}: tentativo {}/{} con provider={} model={} (ctx_needed={})",
+                    run_id,
+                    fallback_attempt + 1,
+                    max_provider_fallbacks,
+                    current_provider,
+                    current_model,
+                    ctx_needed
+                );
+                result = crate::brain_agent_client::run_via_brain(
+                    run_id,
+                    session_id_cp,
+                    current_provider.clone(),
+                    current_model.clone(),
+                    system_text_clone.clone(),
+                    initial_msg_clone.clone(),
+                    tx_for_brain.clone(),
+                    recent_history_for_brain.clone(),
+                    tools_json_for_brain.clone(),
+                    sse_max_silence_secs,
+                    false, // emit_final_event: emesso manualmente dopo il break del retry loop
+                    automation_mode_for_brain.clone(),
+                )
+                .await;
 
-            // ── Fix D: detection errore infrastrutturale ────────────────────
-            // Se la risposta menziona ToolRunner/sandbox down, NON e' colpa del
-            // modello — non incrementare consecutive_failures (evita di
-            // auto-disabilitare modelli sani per problemi infra) e termina
-            // subito senza scalare (gli altri provider avrebbero lo stesso esito).
-            let is_infrastructure_error = result.final_answer.as_ref()
-                .map(|s| {
-                    let lower = s.to_lowercase();
-                    lower.contains("sandbox") && (lower.contains("gr pc") || lower.contains("grpc")
-                        || lower.contains("connession") || lower.contains("non e' raggiungibile")
-                        || lower.contains("non raggiungibile"))
-                    || lower.contains("50500")
-                    || lower.contains("tool_runner") || lower.contains("toolrunner")
-                    || lower.contains("tcp handshaker")
-                })
-                .unwrap_or(false);
-            if is_infrastructure_error {
-                tracing::warn!(
+                // ── Fix D: detection errore infrastrutturale ────────────────────
+                // Se la risposta menziona ToolRunner/sandbox down, NON e' colpa del
+                // modello — non incrementare consecutive_failures (evita di
+                // auto-disabilitare modelli sani per problemi infra) e termina
+                // subito senza scalare (gli altri provider avrebbero lo stesso esito).
+                let is_infrastructure_error = result
+                    .final_answer
+                    .as_ref()
+                    .map(|s| {
+                        let lower = s.to_lowercase();
+                        lower.contains("sandbox")
+                            && (lower.contains("gr pc")
+                                || lower.contains("grpc")
+                                || lower.contains("connession")
+                                || lower.contains("non e' raggiungibile")
+                                || lower.contains("non raggiungibile"))
+                            || lower.contains("50500")
+                            || lower.contains("tool_runner")
+                            || lower.contains("toolrunner")
+                            || lower.contains("tcp handshaker")
+                    })
+                    .unwrap_or(false);
+                if is_infrastructure_error {
+                    tracing::warn!(
                     "agent_run {}: errore INFRASTRUTTURALE rilevato (ToolRunner/sandbox down) — \
                      non incremento consecutive_failures per {}/{}, termino senza fallback (altri \
                      provider hanno lo stesso ToolRunner)",
                     run_id, result.provider, result.model
                 );
-                break;
-            }
+                    break;
+                }
 
-            // ── Counter hollow per modello (auto-disable) ────────────────────
-            // Se il run e' hollow_completion REALE in produzione, incrementa
-            // il counter consecutive_failures su ai_price_catalog. Questo e'
-            // piu' affidabile del model_health_probe perche' rileva il problema
-            // su workload reali (prompt lunghi, max_tokens reali) — non con
-            // "ping" che a volte passa anche su modelli broken (es. gemini-3.5-flash
-            // risponde a "ping" in 5s ma da hollow su prompt agente).
-            //
-            // Soglia 3 fallimenti consecutivi → is_enabled=false. Reset a 0 al
-            // primo successo (status=Completed e final_answer NON vuoto).
-            let intent_uses_tools = classified_intent_for_loop != "chat";
-            if matches!(result.status, AgentRunStatus::Completed) && intent_uses_tools {
-                let success_now = !result.hollow_completion
-                    && result.final_answer.as_ref()
-                        .map(|s| !s.trim().is_empty())
-                        .unwrap_or(false);
+                // ── Counter hollow per modello (auto-disable) ────────────────────
+                // Se il run e' hollow_completion REALE in produzione, incrementa
+                // il counter consecutive_failures su ai_price_catalog. Questo e'
+                // piu' affidabile del model_health_probe perche' rileva il problema
+                // su workload reali (prompt lunghi, max_tokens reali) — non con
+                // "ping" che a volte passa anche su modelli broken (es. gemini-3.5-flash
+                // risponde a "ping" in 5s ma da hollow su prompt agente).
+                //
+                // Soglia 3 fallimenti consecutivi → is_enabled=false. Reset a 0 al
+                // primo successo (status=Completed e final_answer NON vuoto).
+                let intent_uses_tools = classified_intent_for_loop != "chat";
+                if matches!(result.status, AgentRunStatus::Completed) && intent_uses_tools {
+                    let success_now = !result.hollow_completion
+                        && result
+                            .final_answer
+                            .as_ref()
+                            .map(|s| !s.trim().is_empty())
+                            .unwrap_or(false);
 
-                // ── B: tool-failure model-specific (MALFORMED / output-vuoto su tool) ──
-                // `hollow_no_tools` = il modello aveva tool esposti ma non ne ha
-                // invocato nessuno al primo turno: e' il segnale runtime di
-                // finish_reason=MALFORMED_FUNCTION_CALL / output vuoto sul
-                // tool-forcing (es. gemini-2.5-pro sui task agentici). Questo NON
-                // significa che il modello sia rotto in assoluto: funziona per i
-                // task chat. Quindi NON tocchiamo is_enabled (che lo escluderebbe
-                // ANCHE dai task chat) ma incrementiamo un contatore DEDICATO
-                // (consecutive_tool_failures) e a soglia marchiamo
-                // supports_tool_use=false. L'auto-promoter, che per gli intent con
-                // requires_tool_use filtra su supports_tool_use, lo escludera' dai
-                // soli intent agentici lasciandolo per chat; il cleanup pass (A)
-                // disattivera' poi la riga matrix agentica gia' presente.
-                if result.hollow_no_tools {
-                    let tool_threshold: i32 = crate::settings::get_setting(
-                        &db_clone,
-                        "agent.model_tool_failure_threshold",
-                    )
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|v| v.trim().parse::<i32>().ok())
-                    .filter(|n| *n > 0)
-                    .unwrap_or(3);
+                    // ── B: tool-failure model-specific (MALFORMED / output-vuoto su tool) ──
+                    // `hollow_no_tools` = il modello aveva tool esposti ma non ne ha
+                    // invocato nessuno al primo turno: e' il segnale runtime di
+                    // finish_reason=MALFORMED_FUNCTION_CALL / output vuoto sul
+                    // tool-forcing (es. gemini-2.5-pro sui task agentici). Questo NON
+                    // significa che il modello sia rotto in assoluto: funziona per i
+                    // task chat. Quindi NON tocchiamo is_enabled (che lo escluderebbe
+                    // ANCHE dai task chat) ma incrementiamo un contatore DEDICATO
+                    // (consecutive_tool_failures) e a soglia marchiamo
+                    // supports_tool_use=false. L'auto-promoter, che per gli intent con
+                    // requires_tool_use filtra su supports_tool_use, lo escludera' dai
+                    // soli intent agentici lasciandolo per chat; il cleanup pass (A)
+                    // disattivera' poi la riga matrix agentica gia' presente.
+                    if result.hollow_no_tools {
+                        let tool_threshold: i32 = crate::settings::get_setting(
+                            &db_clone,
+                            "agent.model_tool_failure_threshold",
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.trim().parse::<i32>().ok())
+                        .filter(|n| *n > 0)
+                        .unwrap_or(3);
 
-                    // Incrementa il contatore DEDICATO e decide l'azione con la
-                    // funzione pura testata (agent_types::tool_failure_action).
-                    let new_count: Option<i32> = sqlx::query_scalar(
-                        "UPDATE ai_price_catalog
+                        // Incrementa il contatore DEDICATO e decide l'azione con la
+                        // funzione pura testata (agent_types::tool_failure_action).
+                        let new_count: Option<i32> = sqlx::query_scalar(
+                            "UPDATE ai_price_catalog
                             SET consecutive_tool_failures = consecutive_tool_failures + 1,
                                 updated_at = NOW()
                           WHERE provider = $1 AND model = $2
                         RETURNING consecutive_tool_failures",
-                    )
-                    .bind(&result.provider)
-                    .bind(&result.model)
-                    .fetch_optional(&db_clone)
-                    .await
-                    .ok()
-                    .flatten();
-                    if let Some(n) = new_count {
-                        let action = crate::agent_types::tool_failure_action(
-                            true, true, true, false, n - 1, tool_threshold,
-                        );
-                        tracing::warn!(
+                        )
+                        .bind(&result.provider)
+                        .bind(&result.model)
+                        .fetch_optional(&db_clone)
+                        .await
+                        .ok()
+                        .flatten();
+                        if let Some(n) = new_count {
+                            let action = crate::agent_types::tool_failure_action(
+                                true,
+                                true,
+                                true,
+                                false,
+                                n - 1,
+                                tool_threshold,
+                            );
+                            tracing::warn!(
                             "agent_run {}: tool-failure (MALFORMED/empty su tool) su {}/{} — tool_counter={}/{}",
                             run_id, result.provider, result.model, n, tool_threshold
                         );
-                        if matches!(action, crate::agent_types::ToolCapabilityAction::MarkNonToolCapable) {
-                            let _ = sqlx::query(
-                                "UPDATE ai_price_catalog
+                            if matches!(
+                                action,
+                                crate::agent_types::ToolCapabilityAction::MarkNonToolCapable
+                            ) {
+                                let _ = sqlx::query(
+                                    "UPDATE ai_price_catalog
                                     SET supports_tool_use = false,
                                         auto_disabled_reason = 'malformed_tool_calls',
                                         updated_at = NOW()
                                   WHERE provider = $1 AND model = $2
                                     AND supports_tool_use = true",
-                            )
-                            .bind(&result.provider)
-                            .bind(&result.model)
-                            .execute(&db_clone)
-                            .await;
-                            tracing::warn!(
+                                )
+                                .bind(&result.provider)
+                                .bind(&result.model)
+                                .execute(&db_clone)
+                                .await;
+                                tracing::warn!(
                                 "MARK NON-TOOL-CAPABLE {}/{} dopo {} tool-failure consecutivi (supports_tool_use=false). Resta disponibile per i task chat.",
                                 result.provider, result.model, n
                             );
+                            }
                         }
-                    }
-                } else if result.hollow_completion {
-                    // Hollow generico NON dovuto al tool-forcing (empty answer /
-                    // resigned con content): mantiene la semantica storica sul
-                    // contatore consecutive_failures -> is_enabled=false a soglia 3.
-                    let new_count: Option<i32> = sqlx::query_scalar(
-                        "UPDATE ai_price_catalog
+                    } else if result.hollow_completion {
+                        // Hollow generico NON dovuto al tool-forcing (empty answer /
+                        // resigned con content): mantiene la semantica storica sul
+                        // contatore consecutive_failures -> is_enabled=false a soglia 3.
+                        let new_count: Option<i32> = sqlx::query_scalar(
+                            "UPDATE ai_price_catalog
                             SET consecutive_failures = consecutive_failures + 1,
                                 updated_at = NOW()
                           WHERE provider = $1 AND model = $2
                         RETURNING consecutive_failures",
-                    )
-                    .bind(&result.provider)
-                    .bind(&result.model)
-                    .fetch_optional(&db_clone)
-                    .await
-                    .ok()
-                    .flatten();
-                    if let Some(n) = new_count {
-                        tracing::warn!(
-                            "agent_run {}: hollow run reale su {}/{} — counter={}/3",
-                            run_id, result.provider, result.model, n
-                        );
-                        if n >= 3 {
-                            let _ = sqlx::query(
-                                "UPDATE ai_price_catalog
+                        )
+                        .bind(&result.provider)
+                        .bind(&result.model)
+                        .fetch_optional(&db_clone)
+                        .await
+                        .ok()
+                        .flatten();
+                        if let Some(n) = new_count {
+                            tracing::warn!(
+                                "agent_run {}: hollow run reale su {}/{} — counter={}/3",
+                                run_id,
+                                result.provider,
+                                result.model,
+                                n
+                            );
+                            if n >= 3 {
+                                let _ = sqlx::query(
+                                    "UPDATE ai_price_catalog
                                     SET is_enabled = false,
                                         auto_disabled_at = NOW(),
                                         auto_disabled_reason = 'hollow_completion_runtime',
                                         updated_at = NOW()
                                   WHERE provider = $1 AND model = $2
                                     AND is_enabled = true",
-                            )
-                            .bind(&result.provider)
-                            .bind(&result.model)
-                            .execute(&db_clone)
-                            .await;
-                            tracing::warn!(
-                                "AUTO-DISABLE runtime {}/{} dopo {} hollow consecutivi",
-                                result.provider, result.model, n
-                            );
+                                )
+                                .bind(&result.provider)
+                                .bind(&result.model)
+                                .execute(&db_clone)
+                                .await;
+                                tracing::warn!(
+                                    "AUTO-DISABLE runtime {}/{} dopo {} hollow consecutivi",
+                                    result.provider,
+                                    result.model,
+                                    n
+                                );
+                            }
                         }
-                    }
-                } else if success_now {
-                    // Turno-con-tool andato a buon fine: reset di ENTRAMBI i
-                    // contatori (generico e tool-specific) e riabilita la
-                    // tool-capability se era stata revocata per malformed.
-                    let _ = sqlx::query(
-                        "UPDATE ai_price_catalog
+                    } else if success_now {
+                        // Turno-con-tool andato a buon fine: reset di ENTRAMBI i
+                        // contatori (generico e tool-specific) e riabilita la
+                        // tool-capability se era stata revocata per malformed.
+                        let _ = sqlx::query(
+                            "UPDATE ai_price_catalog
                             SET consecutive_failures = 0,
                                 consecutive_tool_failures = 0,
                                 supports_tool_use = CASE
@@ -3188,86 +3336,91 @@ async fn spawn_agent_run(
                             AND (consecutive_failures > 0
                                  OR consecutive_tool_failures > 0
                                  OR auto_disabled_reason = 'malformed_tool_calls')",
-                    )
-                    .bind(&result.provider)
-                    .bind(&result.model)
-                    .execute(&db_clone)
-                    .await;
+                        )
+                        .bind(&result.provider)
+                        .bind(&result.model)
+                        .execute(&db_clone)
+                        .await;
+                    }
                 }
-            }
 
-            // Decide se ritentare: nuova logica basata su error_class strutturato
-            // propagato dal brain via SSE, oltre allo stato cooldown del provider.
-            // Casi che giustificano un retry su altro provider:
-            //   - provider in cooldown (lungo o breve, gia' marcato dal brain_agent_client)
-            //   - error_class in {billing_error, rate_limit, provider_error}
-            //   - il run e' fallito con stop_reason=error (anche senza classify, ritenta una volta)
-            //   - hollow_completion: il modello ha risposto senza usare tool (0 step)
-            let failed_retry = matches!(result.status, AgentRunStatus::Failed) && {
-                let in_cooldown = crate::provider_cooldown::is_provider_in_cooldown(&current_provider);
-                let retriable_class = matches!(
-                    result.error_class.as_deref(),
-                    Some("billing_error") | Some("rate_limit") | Some("provider_error")
-                );
-                in_cooldown || retriable_class
-            };
-            // Hollow completion: il modello ha risposto senza usare tool.
-            // Per intent `chat` (chiacchierata, domande conversazionali,
-            // meta-domande) la risposta senza tool e' attesa e corretta —
-            // disabilitiamo il retry. Per altri intent (anche `docs` quando
-            // l'utente chiede di scrivere/leggere documentazione) il retry
-            // serve perche' il modello dovrebbe usare tool.
-            //
-            // G1 override: se il messaggio utente e' una richiesta d'azione
-            // (avvia/installa/configura/docker/...) forziamo il retry ANCHE se
-            // l'intent classifier ha classificato come "chat" — in questo caso
-            // la classificazione e' probabile mente errata e la risposta senza
-            // tool e' sempre un fallimento.
-            let is_action_request = crate::agent_types::detect_action_request(&initial_msg_clone);
-            let hollow_retry = result.hollow_completion
-                && (classified_intent_for_loop != "chat" || is_action_request);
-            let should_retry = failed_retry || hollow_retry;
+                // Decide se ritentare: nuova logica basata su error_class strutturato
+                // propagato dal brain via SSE, oltre allo stato cooldown del provider.
+                // Casi che giustificano un retry su altro provider:
+                //   - provider in cooldown (lungo o breve, gia' marcato dal brain_agent_client)
+                //   - error_class in {billing_error, rate_limit, provider_error}
+                //   - il run e' fallito con stop_reason=error (anche senza classify, ritenta una volta)
+                //   - hollow_completion: il modello ha risposto senza usare tool (0 step)
+                let failed_retry = matches!(result.status, AgentRunStatus::Failed) && {
+                    let in_cooldown =
+                        crate::provider_cooldown::is_provider_in_cooldown(&current_provider);
+                    let retriable_class = matches!(
+                        result.error_class.as_deref(),
+                        Some("billing_error") | Some("rate_limit") | Some("provider_error")
+                    );
+                    in_cooldown || retriable_class
+                };
+                // Hollow completion: il modello ha risposto senza usare tool.
+                // Per intent `chat` (chiacchierata, domande conversazionali,
+                // meta-domande) la risposta senza tool e' attesa e corretta —
+                // disabilitiamo il retry. Per altri intent (anche `docs` quando
+                // l'utente chiede di scrivere/leggere documentazione) il retry
+                // serve perche' il modello dovrebbe usare tool.
+                //
+                // G1 override: se il messaggio utente e' una richiesta d'azione
+                // (avvia/installa/configura/docker/...) forziamo il retry ANCHE se
+                // l'intent classifier ha classificato come "chat" — in questo caso
+                // la classificazione e' probabile mente errata e la risposta senza
+                // tool e' sempre un fallimento.
+                let is_action_request =
+                    crate::agent_types::detect_action_request(&initial_msg_clone);
+                let hollow_retry = result.hollow_completion
+                    && (classified_intent_for_loop != "chat" || is_action_request);
+                let should_retry = failed_retry || hollow_retry;
 
-            if !should_retry || fallback_attempt + 1 >= max_provider_fallbacks {
-                break;
-            }
+                if !should_retry || fallback_attempt + 1 >= max_provider_fallbacks {
+                    break;
+                }
 
-            if hollow_retry {
-                tracing::warn!(
-                    "agent_run {}: hollow completion da {}/{} — il modello ha risposto \
+                if hollow_retry {
+                    tracing::warn!(
+                        "agent_run {}: hollow completion da {}/{} — il modello ha risposto \
                      senza usare tool, ritento con un modello piu capace",
-                    run_id, current_provider, current_model
-                );
-            }
+                        run_id,
+                        current_provider,
+                        current_model
+                    );
+                }
 
-            // ── ESCALATION su hollow ricorrente ─────────────────────────────
-            // Se gia' 1 hollow nel run (questo e' il 2o tentativo dopo hollow),
-            // smetti di girare in tondo sui modelli small e scala al primo
-            // modello "di ordine superiore" disponibile nel catalog:
-            // performance_tier='heavy' AND is_enabled, ordinato per qualita'
-            // (costo input desc = proxy di capacita'). Provider-agnostic:
-            // sceglie qualunque heavy disponibile non gia' tried/in-cooldown.
-            //
-            // Esempi attesi (sort cost desc):
-            //   anthropic/claude-opus-4-7 > openai/gpt-5 > anthropic/claude-sonnet-4-6
-            //   > mistral/mistral-large-latest > google/gemini-2.5-pro > deepseek/deepseek-reasoner
-            //
-            // Conta come "hollow precedente" se hollow_retry == true ora E
-            // questo e' fallback_attempt >= 1 (cioe' siamo gia' al 2o turno).
-            let escalate_on_hollow = hollow_retry && fallback_attempt >= 1;
-            let next_pair: Option<(String, String)> = if escalate_on_hollow {
-                let tried_models: Vec<String> = tried.iter().cloned().collect();
-                // Ordina i candidati in base alla "potenza" desumibile dal catalog:
-                //   1. tier_rank: heavy(2) > medium(1) > light(0)
-                //   2. input_cost_per_million_tokens desc (proxy di capacita')
-                // Filtri:
-                //   - is_enabled
-                //   - supports_tool_use (l'intent richiede tool)
-                //   - consecutive_failures = 0 (non ha gia' dato hollow di recente)
-                //   - provider non gia' tried in questo run
-                //   - provider non in cooldown billing/quota
-                let candidates: Vec<(String, String, String)> = sqlx::query_as::<_, (String, String, String)>(
-                    "SELECT provider, model, performance_tier
+                // ── ESCALATION su hollow ricorrente ─────────────────────────────
+                // Se gia' 1 hollow nel run (questo e' il 2o tentativo dopo hollow),
+                // smetti di girare in tondo sui modelli small e scala al primo
+                // modello "di ordine superiore" disponibile nel catalog:
+                // performance_tier='heavy' AND is_enabled, ordinato per qualita'
+                // (costo input desc = proxy di capacita'). Provider-agnostic:
+                // sceglie qualunque heavy disponibile non gia' tried/in-cooldown.
+                //
+                // Esempi attesi (sort cost desc):
+                //   anthropic/claude-opus-4-7 > openai/gpt-5 > anthropic/claude-sonnet-4-6
+                //   > mistral/mistral-large-latest > google/gemini-2.5-pro > deepseek/deepseek-reasoner
+                //
+                // Conta come "hollow precedente" se hollow_retry == true ora E
+                // questo e' fallback_attempt >= 1 (cioe' siamo gia' al 2o turno).
+                let escalate_on_hollow = hollow_retry && fallback_attempt >= 1;
+                let next_pair: Option<(String, String)> = if escalate_on_hollow {
+                    let tried_models: Vec<String> = tried.iter().cloned().collect();
+                    // Ordina i candidati in base alla "potenza" desumibile dal catalog:
+                    //   1. tier_rank: heavy(2) > medium(1) > light(0)
+                    //   2. input_cost_per_million_tokens desc (proxy di capacita')
+                    // Filtri:
+                    //   - is_enabled
+                    //   - supports_tool_use (l'intent richiede tool)
+                    //   - consecutive_failures = 0 (non ha gia' dato hollow di recente)
+                    //   - provider non gia' tried in questo run
+                    //   - provider non in cooldown billing/quota
+                    let candidates: Vec<(String, String, String)> =
+                        sqlx::query_as::<_, (String, String, String)>(
+                            "SELECT provider, model, performance_tier
                        FROM ai_price_catalog
                       WHERE is_enabled = true
                         AND supports_tool_use = true
@@ -3281,14 +3434,14 @@ async fn spawn_agent_run(
                                END DESC,
                                input_cost_per_million_tokens DESC NULLS LAST,
                                output_cost_per_million_tokens DESC NULLS LAST",
-                )
-                .bind(&tried_models)
-                .bind(ctx_needed)
-                .fetch_all(&db_clone)
-                .await
-                .unwrap_or_default();
-                // Primo candidato il cui provider non e' in cooldown
-                candidates.into_iter().find(|(p, _, _)| {
+                        )
+                        .bind(&tried_models)
+                        .bind(ctx_needed)
+                        .fetch_all(&db_clone)
+                        .await
+                        .unwrap_or_default();
+                    // Primo candidato il cui provider non e' in cooldown
+                    candidates.into_iter().find(|(p, _, _)| {
                     !crate::provider_cooldown::is_provider_in_cooldown(p)
                 }).map(|(p, m, tier)| {
                     tracing::warn!(
@@ -3297,209 +3450,225 @@ async fn spawn_agent_run(
                     );
                     (p, m)
                 })
-            } else { None };
+                } else {
+                    None
+                };
 
-            let (chosen_provider, chosen_model) = if let Some(pair) = next_pair {
-                pair
-            } else {
-                // Cerca il prossimo provider nella gerarchia che sia:
-                //   - non gia' provato in questo run
-                //   - non in cooldown billing/quota
-                //   - dotato di un default model in nexus_provider_default_model
-                //   - con coppia (provider, model) coerente (guard-rail anti-mismatch)
-                //
-                // INVARIANTE: provider e model devono SEMPRE appartenere allo
-                // stesso provider. Un provider senza default model viene SKIPPATO
-                // nel fallback, mai accoppiato al model del provider precedente.
-                // Fonte di verita: nexus_provider_default_model (regola G); i
-                // prefix in model_belongs_to_provider sono detection. Vedi ADR 0016.
-                //
-                // Se la routing_matrix non e disponibile non si puo decidere un
-                // model coerente -> break (manteniamo il result corrente).
-                let matrix_arc = match routing_matrix_for_loop.current_async().await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::error!(
+                let (chosen_provider, chosen_model) = if let Some(pair) = next_pair {
+                    pair
+                } else {
+                    // Cerca il prossimo provider nella gerarchia che sia:
+                    //   - non gia' provato in questo run
+                    //   - non in cooldown billing/quota
+                    //   - dotato di un default model in nexus_provider_default_model
+                    //   - con coppia (provider, model) coerente (guard-rail anti-mismatch)
+                    //
+                    // INVARIANTE: provider e model devono SEMPRE appartenere allo
+                    // stesso provider. Un provider senza default model viene SKIPPATO
+                    // nel fallback, mai accoppiato al model del provider precedente.
+                    // Fonte di verita: nexus_provider_default_model (regola G); i
+                    // prefix in model_belongs_to_provider sono detection. Vedi ADR 0016.
+                    //
+                    // Se la routing_matrix non e disponibile non si puo decidere un
+                    // model coerente -> break (manteniamo il result corrente).
+                    let matrix_arc = match routing_matrix_for_loop.current_async().await {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!(
                             "agent_run {}: routing_matrix non disponibile ({}), interrompo fallback e mantengo risultato",
                             run_id, e
                         );
-                        break;
-                    }
-                };
-                let mut chosen: Option<(String, String)> = None;
-                for candidate in provider_hierarchy.iter() {
-                    if tried.contains(candidate)
-                        || crate::provider_cooldown::is_provider_in_cooldown(candidate)
-                    {
-                        continue;
-                    }
-                    let Some(candidate_model) = matrix_arc.default_model(candidate) else {
-                        tracing::warn!(
+                            break;
+                        }
+                    };
+                    let mut chosen: Option<(String, String)> = None;
+                    for candidate in provider_hierarchy.iter() {
+                        if tried.contains(candidate)
+                            || crate::provider_cooldown::is_provider_in_cooldown(candidate)
+                        {
+                            continue;
+                        }
+                        let Some(candidate_model) = matrix_arc.default_model(candidate) else {
+                            tracing::warn!(
                             "agent_run {}: provider '{}' senza default model in nexus_provider_default_model, skip nel fallback",
                             run_id, candidate
                         );
-                        continue;
-                    };
-                    // Guard-rail: la coppia (provider, model) deve essere coerente.
-                    // Previene QUALSIASI mismatch: se il default model non
-                    // appartiene al provider, NON tentiamo la chiamata (404).
-                    if !model_belongs_to_provider(candidate, &candidate_model) {
-                        tracing::error!(
+                            continue;
+                        };
+                        // Guard-rail: la coppia (provider, model) deve essere coerente.
+                        // Previene QUALSIASI mismatch: se il default model non
+                        // appartiene al provider, NON tentiamo la chiamata (404).
+                        if !model_belongs_to_provider(candidate, &candidate_model) {
+                            tracing::error!(
                             "agent_run {}: coppia incoerente provider='{}' model='{}' in nexus_provider_default_model, skip nel fallback",
                             run_id, candidate, candidate_model
                         );
-                        continue;
+                            continue;
+                        }
+                        chosen = Some((candidate.clone(), candidate_model));
+                        break;
                     }
-                    chosen = Some((candidate.clone(), candidate_model));
-                    break;
-                }
-                let Some(pair) = chosen else {
-                    tracing::warn!(
+                    let Some(pair) = chosen else {
+                        tracing::warn!(
                         "agent_run {}: nessun provider alternativo con default model coerente disponibile, mantengo risultato",
                         run_id
                     );
-                    break;
+                        break;
+                    };
+                    pair
                 };
-                pair
-            };
-            // Invariante difensiva finale: anche i candidati da escalation
-            // hollow (next_pair) passano per il guard-rail. Una coppia
-            // incoerente non deve mai diventare current_provider/model.
-            if !model_belongs_to_provider(&chosen_provider, &chosen_model) {
-                tracing::error!(
+                // Invariante difensiva finale: anche i candidati da escalation
+                // hollow (next_pair) passano per il guard-rail. Una coppia
+                // incoerente non deve mai diventare current_provider/model.
+                if !model_belongs_to_provider(&chosen_provider, &chosen_model) {
+                    tracing::error!(
                     "agent_run {}: coppia incoerente scelta provider='{}' model='{}', interrompo fallback (guard-rail)",
                     run_id, chosen_provider, chosen_model
                 );
-                break;
+                    break;
+                }
+                current_provider = chosen_provider;
+                current_model = chosen_model;
+                fallback_attempt += 1;
+                tracing::warn!(
+                    "agent_run {}: fallback automatico a {}/{} (motivo: {})",
+                    run_id,
+                    current_provider,
+                    current_model,
+                    if hollow_retry {
+                        "hollow completion"
+                    } else {
+                        "provider error/cooldown"
+                    }
+                );
+                // Meta-step `fallback` pubblicato in chat per trasparenza:
+                // utente vede in tempo reale che il sistema ha cambiato
+                // provider/modello (es. anthropic -> openai per quota_exceeded).
+                let reason = if hollow_retry {
+                    "hollow_completion"
+                } else {
+                    "provider_error_or_cooldown"
+                };
+                let _ = tx_for_brain.send(AgentStepEvent {
+                    run_id: run_id.to_string(),
+                    step: None,
+                    trace: None,
+                    is_final: false,
+                    token_delta: None,
+                    thinking_delta: None,
+                    meta_step: Some(crate::agent_types::AgentMetaStep {
+                        kind: "fallback".to_string(),
+                        title: format!("Fallback su {}/{}", current_provider, current_model),
+                        payload: serde_json::json!({
+                            "to_provider": current_provider,
+                            "to_model": current_model,
+                            "reason": reason,
+                            "attempt": fallback_attempt,
+                        }),
+                        correlation_id: None,
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    }),
+                });
             }
-            current_provider = chosen_provider;
-            current_model = chosen_model;
-            fallback_attempt += 1;
-            tracing::warn!(
-                "agent_run {}: fallback automatico a {}/{} (motivo: {})",
-                run_id, current_provider, current_model,
-                if hollow_retry { "hollow completion" } else { "provider error/cooldown" }
-            );
-            // Meta-step `fallback` pubblicato in chat per trasparenza:
-            // utente vede in tempo reale che il sistema ha cambiato
-            // provider/modello (es. anthropic -> openai per quota_exceeded).
-            let reason = if hollow_retry { "hollow_completion" } else { "provider_error_or_cooldown" };
+            // Emetti is_final solo DOPO la fine del retry loop, cosi' il
+            // frontend non chiude lo stream SSE dopo il primo tentativo fallito
+            // perdendo i successivi tentativi di fallback.
             let _ = tx_for_brain.send(AgentStepEvent {
                 run_id: run_id.to_string(),
                 step: None,
                 trace: None,
-                is_final: false,
+                is_final: true,
                 token_delta: None,
                 thinking_delta: None,
-                meta_step: Some(crate::agent_types::AgentMetaStep {
-                    kind: "fallback".to_string(),
-                    title: format!("Fallback su {}/{}", current_provider, current_model),
-                    payload: serde_json::json!({
-                        "to_provider": current_provider,
-                        "to_model": current_model,
-                        "reason": reason,
-                        "attempt": fallback_attempt,
-                    }),
-                    correlation_id: None,
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                }),
+                meta_step: None,
             });
-        }
-        // Emetti is_final solo DOPO la fine del retry loop, cosi' il
-        // frontend non chiude lo stream SSE dopo il primo tentativo fallito
-        // perdendo i successivi tentativi di fallback.
-        let _ = tx_for_brain.send(AgentStepEvent {
-            run_id: run_id.to_string(),
-            step: None,
-            trace: None,
-            is_final: true,
-            token_delta: None,
-            thinking_delta: None,
-            meta_step: None,
-        });
-        channels_clone.remove(&run_id);
+            channels_clone.remove(&run_id);
 
-        // Se il gateway ha re-instradato su provider locale per privacy
-        // (il provider finale differ da quello richiesto ed è "vllm" o altro locale),
-        // azzeriamo la preferenza di sessione → al prossimo messaggio torna il routing automatico.
-        let privacy_rerouted = had_session_override
-            && result.provider != requested_provider_clone
-            && matches!(result.provider.as_str(), "vllm" | "local" | "ollama");
-        if privacy_rerouted {
-            clear_session_preferred_provider_after_privacy(&db_clone, session_id_cp).await;
-        }
+            // Se il gateway ha re-instradato su provider locale per privacy
+            // (il provider finale differ da quello richiesto ed è "vllm" o altro locale),
+            // azzeriamo la preferenza di sessione → al prossimo messaggio torna il routing automatico.
+            let privacy_rerouted = had_session_override
+                && result.provider != requested_provider_clone
+                && matches!(result.provider.as_str(), "vllm" | "local" | "ollama");
+            if privacy_rerouted {
+                clear_session_preferred_provider_after_privacy(&db_clone, session_id_cp).await;
+            }
 
-        // ── Hollow completion: il modello ha dichiarato di aver completato
-        // senza invocare alcun tool. Per intent `chat` questo e' atteso —
-        // non aggiungiamo avvisi spuri.
-        let conversational_intent = classified_intent_for_loop == "chat";
-        let report_hollow = result.hollow_completion && !conversational_intent;
-        if report_hollow {
-            tracing::warn!(
-                "agent_run {}: hollow completion rilevato — il modello {}/{} \
+            // ── Hollow completion: il modello ha dichiarato di aver completato
+            // senza invocare alcun tool. Per intent `chat` questo e' atteso —
+            // non aggiungiamo avvisi spuri.
+            let conversational_intent = classified_intent_for_loop == "chat";
+            let report_hollow = result.hollow_completion && !conversational_intent;
+            if report_hollow {
+                tracing::warn!(
+                    "agent_run {}: hollow completion rilevato — il modello {}/{} \
                  non ha eseguito alcun tool. La risposta potrebbe essere incompleta.",
-                run_id, result.provider, result.model
-            );
-        }
+                    run_id,
+                    result.provider,
+                    result.model
+                );
+            }
 
-        // Save final answer as assistant message.
-        // Se l'agente ha completato ma final_answer e' None o whitespace-only
-        // (caso hollow EMPTY_ANSWER, es. deepseek-coder che chiude il turno
-        // senza emettere body), generiamo comunque un messaggio chiaro per
-        // l'utente — altrimenti la UI mostra solo lo status "completed"
-        // senza alcun contenuto, lasciando l'utente con l'impressione che il
-        // sistema abbia "fatto qualcosa" che in realta' non e' avvenuto.
-        let answer_owned: Option<String> = match result.final_answer.as_ref() {
-            Some(s) if !s.trim().is_empty() => Some(s.clone()),
-            // Final answer mancante o vuoto: fabrichiamo un placeholder solo
-            // se siamo arrivati qui DOPO il retry loop (hollow_completion
-            // confermato e tentativi esauriti). Altrimenti il body fantasma
-            // confonderebbe la storia turni.
-            _ if report_hollow => Some(format!(
-                "_(Nessuna risposta utile prodotta dall'agente — {} / {} ha chiuso \
+            // Save final answer as assistant message.
+            // Se l'agente ha completato ma final_answer e' None o whitespace-only
+            // (caso hollow EMPTY_ANSWER, es. deepseek-coder che chiude il turno
+            // senza emettere body), generiamo comunque un messaggio chiaro per
+            // l'utente — altrimenti la UI mostra solo lo status "completed"
+            // senza alcun contenuto, lasciando l'utente con l'impressione che il
+            // sistema abbia "fatto qualcosa" che in realta' non e' avvenuto.
+            let answer_owned: Option<String> = match result.final_answer.as_ref() {
+                Some(s) if !s.trim().is_empty() => Some(s.clone()),
+                // Final answer mancante o vuoto: fabrichiamo un placeholder solo
+                // se siamo arrivati qui DOPO il retry loop (hollow_completion
+                // confermato e tentativi esauriti). Altrimenti il body fantasma
+                // confonderebbe la storia turni.
+                _ if report_hollow => Some(format!(
+                    "_(Nessuna risposta utile prodotta dall'agente — {} / {} ha chiuso \
                  il turno con un completamento vuoto dopo aver esaurito i tentativi \
                  di fallback. Riformula la richiesta o cambia provider/modello manualmente.)_",
-                result.provider, result.model
-            )),
-            _ => None,
-        };
+                    result.provider, result.model
+                )),
+                _ => None,
+            };
 
-        if let Some(ref answer) = answer_owned {
-            // Annota la risposta solo se l'intent richiedeva tool e l'agente
-            // ha prodotto un body (per evitare doppia annotazione sul placeholder).
-            let had_real_body = result.final_answer.as_ref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false);
-            let effective_answer = if report_hollow && had_real_body {
-                format!(
-                    "{answer}\n\n---\n*Avviso: l'agente ({}/{}) ha risposto senza \
+            if let Some(ref answer) = answer_owned {
+                // Annota la risposta solo se l'intent richiedeva tool e l'agente
+                // ha prodotto un body (per evitare doppia annotazione sul placeholder).
+                let had_real_body = result
+                    .final_answer
+                    .as_ref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                let effective_answer = if report_hollow && had_real_body {
+                    format!(
+                        "{answer}\n\n---\n*Avviso: l'agente ({}/{}) ha risposto senza \
                      eseguire alcun tool (0 step). La risposta potrebbe essere \
                      incompleta o generica. Riprova con un modello piu' capace \
                      o riformula la richiesta.*",
-                    result.provider, result.model
-                )
-            } else {
-                answer.clone()
-            };
-            let meta = json!({
-                "provider": &result.provider,
-                "model": &result.model,
-                "agentRunId": run_id.to_string(),
-                "iterationCount": result.iteration_count,
-                "automationMode": "agent",
-                "privacyRerouted": privacy_rerouted,
-                "hollowCompletion": result.hollow_completion,
-                // Usage tracking: senza questi campi il TokenUsageBar resta
-                // invisibile (la query in billing::get_session_usage somma
-                // metadata->>'totalTokens'). I valori sono gia' calcolati e
-                // scritti su agent_runs subito sotto.
-                "promptTokens": result.prompt_tokens,
-                "completionTokens": result.completion_tokens,
-                "totalTokens": result.total_tokens,
-                "totalCost": result.total_cost,
-                "currency": "USD",
-            });
-            let _ = sqlx::query(
+                        result.provider, result.model
+                    )
+                } else {
+                    answer.clone()
+                };
+                let meta = json!({
+                    "provider": &result.provider,
+                    "model": &result.model,
+                    "agentRunId": run_id.to_string(),
+                    "iterationCount": result.iteration_count,
+                    "automationMode": "agent",
+                    "privacyRerouted": privacy_rerouted,
+                    "hollowCompletion": result.hollow_completion,
+                    // Usage tracking: senza questi campi il TokenUsageBar resta
+                    // invisibile (la query in billing::get_session_usage somma
+                    // metadata->>'totalTokens'). I valori sono gia' calcolati e
+                    // scritti su agent_runs subito sotto.
+                    "promptTokens": result.prompt_tokens,
+                    "completionTokens": result.completion_tokens,
+                    "totalTokens": result.total_tokens,
+                    "totalCost": result.total_cost,
+                    "currency": "USD",
+                });
+                let _ = sqlx::query(
                 r#"INSERT INTO chat_messages
                    (id, session_id, project_id, role, content, metadata, request_message_id, created_at)
                    VALUES (gen_random_uuid(),$1,$2,'assistant',$3,$4,$5,NOW())"#,
@@ -3512,120 +3681,123 @@ async fn spawn_agent_run(
             .execute(&db_clone)
             .await;
 
-            spawn_embed_conversation_turn(
-                neural_for_embed.clone(),
-                db_clone.clone(),
-                session_id_cp,
-                Uuid::new_v4(),
-                "assistant".to_string(),
-                effective_answer.clone(),
-            );
-        }
+                spawn_embed_conversation_turn(
+                    neural_for_embed.clone(),
+                    db_clone.clone(),
+                    session_id_cp,
+                    Uuid::new_v4(),
+                    "assistant".to_string(),
+                    effective_answer.clone(),
+                );
+            }
 
-        // Update run status in DB
-        let status_str = match result.status {
-            AgentRunStatus::Completed => "completed",
-            AgentRunStatus::AwaitingConfirmation => "awaiting_confirmation",
-            AgentRunStatus::Failed => "failed",
-            AgentRunStatus::TimedOut => "timed_out",
-            AgentRunStatus::Cancelled => "cancelled",
-            AgentRunStatus::Running => "running",
-            AgentRunStatus::LoopAborted => "loop_aborted",
-            AgentRunStatus::ProviderUnavailable => "provider_unavailable",
-        };
-        let _ = sqlx::query(
-            "UPDATE agent_runs SET status=$2, final_answer=$3, iteration_count=$4, \
+            // Update run status in DB
+            let status_str = match result.status {
+                AgentRunStatus::Completed => "completed",
+                AgentRunStatus::AwaitingConfirmation => "awaiting_confirmation",
+                AgentRunStatus::Failed => "failed",
+                AgentRunStatus::TimedOut => "timed_out",
+                AgentRunStatus::Cancelled => "cancelled",
+                AgentRunStatus::Running => "running",
+                AgentRunStatus::LoopAborted => "loop_aborted",
+                AgentRunStatus::ProviderUnavailable => "provider_unavailable",
+            };
+            let _ = sqlx::query(
+                "UPDATE agent_runs SET status=$2, final_answer=$3, iteration_count=$4, \
              prompt_tokens=$5, completion_tokens=$6, total_tokens=$7, total_cost=$8, \
              nexus_override_applied=$9, nexus_agent_type=$10, nexus_task_type=$11, \
              completed_at=NOW() WHERE id=$1",
-        )
-        .bind(run_id)
-        .bind(status_str)
-        .bind(result.final_answer.as_deref())
-        .bind(result.iteration_count as i32)
-        .bind(result.prompt_tokens as i32)
-        .bind(result.completion_tokens as i32)
-        .bind(result.total_tokens as i32)
-        .bind(result.total_cost)
-        .bind(result.nexus_override_applied)
-        .bind(result.nexus_agent_type.as_deref())
-        .bind(result.nexus_task_type.as_deref())
-        .execute(&db_clone)
-        .await;
+            )
+            .bind(run_id)
+            .bind(status_str)
+            .bind(result.final_answer.as_deref())
+            .bind(result.iteration_count as i32)
+            .bind(result.prompt_tokens as i32)
+            .bind(result.completion_tokens as i32)
+            .bind(result.total_tokens as i32)
+            .bind(result.total_cost)
+            .bind(result.nexus_override_applied)
+            .bind(result.nexus_agent_type.as_deref())
+            .bind(result.nexus_task_type.as_deref())
+            .execute(&db_clone)
+            .await;
 
-        // ── G4: memorizza startup_command dopo avvio servizio riuscito ─────
-        // Se il run è completato con successo e ha eseguito un `docker compose up`,
-        // salva il comando in memory_entries → al turno successivo l'agente lo
-        // trova in "Memoria di progetto" e sa già cosa eseguire.
-        if matches!(result.status, AgentRunStatus::Completed) {
-            crate::agent_types::save_startup_command_if_needed(
-                &db_clone,
-                project_id_cp,
-                &result.steps,
-            ).await;
-        }
-
-        // ── Budget tracking ──────────────────────────────────────────────
-        // Incrementa il `spent_current_period_usd` per il provider del run.
-        // Strategia comune a tutti i 5 provider visto che la maggior parte
-        // (anthropic/openai/google/mistral) non espone balance via API: il
-        // budget va stimato sommando il cost dei run reali.
-        //
-        // Calcolo del cost:
-        //   - Se brain ha propagato result.total_cost > 0 -> usalo.
-        //   - Altrimenti: calcolo da prompt_tokens/completion_tokens × prezzi
-        //     dal catalog (caso comune: brain non emette total_cost nelle
-        //     SSE events, ma propaga i token usage che sono affidabili).
-        let cost_to_charge: f64 = if result.total_cost > 0.0 {
-            result.total_cost
-        } else if result.prompt_tokens > 0 || result.completion_tokens > 0 {
-            // Look up prezzi dal catalog. Costo per milione di token.
-            #[derive(sqlx::FromRow)]
-            struct PriceRow {
-                input_cost: f64,
-                output_cost: f64,
+            // ── G4: memorizza startup_command dopo avvio servizio riuscito ─────
+            // Se il run è completato con successo e ha eseguito un `docker compose up`,
+            // salva il comando in memory_entries → al turno successivo l'agente lo
+            // trova in "Memoria di progetto" e sa già cosa eseguire.
+            if matches!(result.status, AgentRunStatus::Completed) {
+                crate::agent_types::save_startup_command_if_needed(
+                    &db_clone,
+                    project_id_cp,
+                    &result.steps,
+                )
+                .await;
             }
-            let prices: Option<PriceRow> = sqlx::query_as::<_, PriceRow>(
-                "SELECT input_cost_per_million_tokens::float8 AS input_cost,
+
+            // ── Budget tracking ──────────────────────────────────────────────
+            // Incrementa il `spent_current_period_usd` per il provider del run.
+            // Strategia comune a tutti i 5 provider visto che la maggior parte
+            // (anthropic/openai/google/mistral) non espone balance via API: il
+            // budget va stimato sommando il cost dei run reali.
+            //
+            // Calcolo del cost:
+            //   - Se brain ha propagato result.total_cost > 0 -> usalo.
+            //   - Altrimenti: calcolo da prompt_tokens/completion_tokens × prezzi
+            //     dal catalog (caso comune: brain non emette total_cost nelle
+            //     SSE events, ma propaga i token usage che sono affidabili).
+            let cost_to_charge: f64 =
+                if result.total_cost > 0.0 {
+                    result.total_cost
+                } else if result.prompt_tokens > 0 || result.completion_tokens > 0 {
+                    // Look up prezzi dal catalog. Costo per milione di token.
+                    #[derive(sqlx::FromRow)]
+                    struct PriceRow {
+                        input_cost: f64,
+                        output_cost: f64,
+                    }
+                    let prices: Option<PriceRow> = sqlx::query_as::<_, PriceRow>(
+                        "SELECT input_cost_per_million_tokens::float8 AS input_cost,
                         output_cost_per_million_tokens::float8 AS output_cost
                    FROM ai_price_catalog
                   WHERE provider = $1 AND model = $2 AND is_enabled = true
                   ORDER BY effective_from DESC LIMIT 1",
-            )
-            .bind(&result.provider)
-            .bind(&result.model)
-            .fetch_optional(&db_clone)
-            .await
-            .ok()
-            .flatten();
-            if let Some(p) = prices {
-                let input_cost = (result.prompt_tokens as f64) * p.input_cost / 1_000_000.0;
-                let output_cost = (result.completion_tokens as f64) * p.output_cost / 1_000_000.0;
-                let total = input_cost + output_cost;
-                if total > 0.0 {
-                    // Aggiorna anche agent_runs.total_cost per coerenza UI.
-                    let _ = sqlx::query(
+                    )
+                    .bind(&result.provider)
+                    .bind(&result.model)
+                    .fetch_optional(&db_clone)
+                    .await
+                    .ok()
+                    .flatten();
+                    if let Some(p) = prices {
+                        let input_cost = (result.prompt_tokens as f64) * p.input_cost / 1_000_000.0;
+                        let output_cost =
+                            (result.completion_tokens as f64) * p.output_cost / 1_000_000.0;
+                        let total = input_cost + output_cost;
+                        if total > 0.0 {
+                            // Aggiorna anche agent_runs.total_cost per coerenza UI.
+                            let _ = sqlx::query(
                         "UPDATE agent_runs SET total_cost = $2 WHERE id = $1 AND total_cost = 0",
                     )
                     .bind(run_id)
                     .bind(total)
                     .execute(&db_clone)
                     .await;
-                    tracing::debug!(
+                            tracing::debug!(
                         "budget: cost calcolato da Rust per {}/{} = ${:.6} (prompt={} comp={})",
                         result.provider, result.model, total,
                         result.prompt_tokens, result.completion_tokens
                     );
-                }
-                total
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-        if cost_to_charge > 0.0 {
-            let _ = sqlx::query(
+                        }
+                        total
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+            if cost_to_charge > 0.0 {
+                let _ = sqlx::query(
                 "INSERT INTO provider_budget_status (provider, spent_current_period_usd)
                    VALUES ($1, $2)
                  ON CONFLICT (provider) DO UPDATE
@@ -3636,15 +3808,15 @@ async fn spawn_agent_run(
             .bind(cost_to_charge)
             .execute(&db_clone)
             .await;
-        }
+            }
 
-        // Persisti gli step del run su agent_steps (fix bug: la tabella veniva letta
-        // da chat_agent.rs:121,195 ma non scritta — dashboard "AI Workspace" mostrava
-        // sempre storia vuota, reflection non poteva correlare step con outcome).
-        // Gli step sono gia' raccolti in-memory dal brain_agent_client durante il loop SSE.
-        if !result.steps.is_empty() {
-            for step in &result.steps {
-                let _ = sqlx::query(
+            // Persisti gli step del run su agent_steps (fix bug: la tabella veniva letta
+            // da chat_agent.rs:121,195 ma non scritta — dashboard "AI Workspace" mostrava
+            // sempre storia vuota, reflection non poteva correlare step con outcome).
+            // Gli step sono gia' raccolti in-memory dal brain_agent_client durante il loop SSE.
+            if !result.steps.is_empty() {
+                for step in &result.steps {
+                    let _ = sqlx::query(
                     "INSERT INTO agent_steps \
                      (id, run_id, step_index, tool_name, tool_input, tool_result, status, created_at) \
                      VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW())",
@@ -3657,13 +3829,13 @@ async fn spawn_agent_run(
                 .bind(step.status.as_str())
                 .execute(&db_clone)
                 .await;
+                }
+                tracing::debug!(
+                    "agent_run {}: {} step persistiti in agent_steps",
+                    run_id,
+                    result.steps.len()
+                );
             }
-            tracing::debug!(
-                "agent_run {}: {} step persistiti in agent_steps",
-                run_id,
-                result.steps.len()
-            );
-        }
         }); // chiude AssertUnwindSafe(async move { ... })
 
         // Cattura panic dell'intero body: senza questo, un panic dentro lo
@@ -3832,18 +4004,24 @@ pub async fn send_chat_message(
         let mid = user_message_id;
         let cnt = content.to_string();
         let intent_val: Option<String> = None; // l'intent verra' aggiornato dal classifier
-        // Recupera repo root per vault PUSH
-        let repo_root: Option<String> = sqlx::query_scalar(
-            "SELECT repository_root_path FROM projects WHERE id = "
-        )
-        .bind(pid)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten();
+                                               // Recupera repo root per vault PUSH
+        let repo_root: Option<String> =
+            sqlx::query_scalar("SELECT repository_root_path FROM projects WHERE id = ")
+                .bind(pid)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
         tokio::spawn(async move {
             crate::knowledge::create_note_from_user_message(
-                db_clone, neural_clone, pid, mid, cnt, intent_val, repo_root, channels_clone,
+                db_clone,
+                neural_clone,
+                pid,
+                mid,
+                cnt,
+                intent_val,
+                repo_root,
+                channels_clone,
             )
             .await;
         });
@@ -3884,7 +4062,9 @@ pub async fn send_chat_message(
             })));
         }
 
-        if let Some((switched_provider, switched_model)) = detect_model_switch(&state.db, content).await {
+        if let Some((switched_provider, switched_model)) =
+            detect_model_switch(&state.db, content).await
+        {
             // Persiste la preferenza nella sessione per i messaggi futuri
             let _ = sqlx::query(
                 "UPDATE chat_sessions SET preferred_provider = $1, preferred_model = $2 WHERE id = $3",
@@ -3896,7 +4076,9 @@ pub async fn send_chat_message(
             .await;
 
             // Genera un messaggio assistant di conferma e salvalo nel DB
-            let model_label = switched_model.clone().unwrap_or_else(|| switched_provider.clone());
+            let model_label = switched_model
+                .clone()
+                .unwrap_or_else(|| switched_provider.clone());
             let ack_content = format!(
                 "Modello impostato su **{}**{}. I prossimi messaggi in questa sessione useranno questo provider.",
                 switched_provider,
@@ -3962,10 +4144,7 @@ pub async fn send_chat_message(
         .provider_override
         .clone()
         .or(session_preferred_provider);
-    let effective_model_override = body
-        .model_override
-        .clone()
-        .or(session_preferred_model);
+    let effective_model_override = body.model_override.clone().or(session_preferred_model);
 
     let profile_id = body
         .profile_id
@@ -3979,28 +4158,28 @@ pub async fn send_chat_message(
         fetch_profile_context(&state.db, user_id, &profile_id, &body.content).await;
 
     let automation_mode = parse_automation_mode(
-        body.automation_mode.as_deref()
-            .or(profile_automation.as_deref())
+        body.automation_mode
+            .as_deref()
+            .or(profile_automation.as_deref()),
     );
-    let supervisor_mode = SupervisorMode::from_str(
-        body.supervisor_mode.as_deref().unwrap_or("none")
-    );
+    let supervisor_mode =
+        SupervisorMode::from_str(body.supervisor_mode.as_deref().unwrap_or("none"));
 
     // Fetch user info to build system context
-    let github_username: Option<String> = sqlx::query_scalar(
-        "SELECT github_username FROM users WHERE id = $1",
-    )
-    .bind(user_id)
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None)
-    .flatten();
+    let github_username: Option<String> =
+        sqlx::query_scalar("SELECT github_username FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or(None)
+            .flatten();
 
     let system_prompt = crate::prompt_templates::get_template_or_default(
         &state.db,
         &state.template_cache,
         "system.nexus_base",
-    ).await;
+    )
+    .await;
 
     let system_context = {
         let mut ctx = system_prompt;
@@ -4060,8 +4239,11 @@ pub async fn send_chat_message(
 
                 tracing::info!(
                     "Resuming interrupted run {} (iter={}, supervisor={}) for session {}",
-                    prev_run_id, prev_iterations,
-                    prev_run.try_get::<String, _>("supervisor_mode").unwrap_or_else(|_| "none".into()),
+                    prev_run_id,
+                    prev_iterations,
+                    prev_run
+                        .try_get::<String, _>("supervisor_mode")
+                        .unwrap_or_else(|_| "none".into()),
                     context.session_id
                 );
 
@@ -4070,7 +4252,8 @@ pub async fn send_chat_message(
                 let (tx, _rx) = broadcast::channel::<AgentStepEvent>(256);
                 state.agent_channels.insert(new_run_id, tx.clone());
 
-                let prev_supervisor_str: String = prev_run.try_get("supervisor_mode")
+                let prev_supervisor_str: String = prev_run
+                    .try_get("supervisor_mode")
                     .unwrap_or_else(|_| "none".to_string());
                 let prev_supervisor = SupervisorMode::from_str(&prev_supervisor_str);
 
@@ -4102,7 +4285,8 @@ pub async fn send_chat_message(
                 .await;
 
                 // Carica contesto progetto per il nuovo run
-                if let Ok(proj) = load_project_context(&state.db, context.project_id, user_id).await {
+                if let Ok(proj) = load_project_context(&state.db, context.project_id, user_id).await
+                {
                     let db_clone2 = state.db.clone();
                     let channels2 = state.agent_channels.clone();
                     let proj_channels2 = state.project_channels.clone();
@@ -4116,10 +4300,19 @@ pub async fn send_chat_message(
                     let automation_r = automation_mode.clone();
                     let supervisor_r = prev_supervisor;
                     let template_cache_r = state.template_cache.clone();
-                    let routing_thresholds_for_resume = state.orchestrator.routing_thresholds.clone();
+                    let routing_thresholds_for_resume =
+                        state.orchestrator.routing_thresholds.clone();
                     let user_role_r = claims.role.clone();
 
-                    let _ = (&neural2, &term2, &automation_r, &supervisor_r, &user_role_r, &proj, &prev_messages_json);
+                    let _ = (
+                        &neural2,
+                        &term2,
+                        &automation_r,
+                        &supervisor_r,
+                        &user_role_r,
+                        &proj,
+                        &prev_messages_json,
+                    );
                     tokio::spawn(async move {
                         let resume_tpl = crate::prompt_templates::get_template_or_default(
                             &db_clone2,
@@ -4127,29 +4320,29 @@ pub async fn send_chat_message(
                             "automation.run_resume_instruction",
                         )
                         .await;
-                        let resume_prompt = resume_tpl.replace("{{prev_iterations}}", &prev_iterations.to_string());
+                        let resume_prompt =
+                            resume_tpl.replace("{{prev_iterations}}", &prev_iterations.to_string());
 
                         let resume_history =
                             build_recent_conversation_history(&db_clone2, session_id_r, 8).await;
 
-                        let tools_for_resume = crate::brain_agent_client::build_tools_json_for_agent(
-                            &db_clone2,
-                            user_id,
-                            project_id_r,
-                            &automation_r,
-                            &provider_r,
-                            &model_r,
-                        )
-                        .await;
+                        let tools_for_resume =
+                            crate::brain_agent_client::build_tools_json_for_agent(
+                                &db_clone2,
+                                user_id,
+                                project_id_r,
+                                &automation_r,
+                                &provider_r,
+                                &model_r,
+                            )
+                            .await;
 
                         // Re-leggo soglia SSE silence (mig 0132) — cache 60s.
-                        let sse_silence_resume: u64 = match routing_thresholds_for_resume
-                            .current_async()
-                            .await
-                        {
-                            Ok(t) => t.sse_heartbeat_max_silence_secs,
-                            Err(_) => 120,
-                        };
+                        let sse_silence_resume: u64 =
+                            match routing_thresholds_for_resume.current_async().await {
+                                Ok(t) => t.sse_heartbeat_max_silence_secs,
+                                Err(_) => 120,
+                            };
 
                         let result = crate::brain_agent_client::run_via_brain(
                             new_run_id,
@@ -4196,19 +4389,27 @@ pub async fn send_chat_message(
                             .await;
                         }
 
-                        let _run_completed = matches!(result.status, crate::agent_types::AgentRunStatus::Completed);
+                        let _run_completed =
+                            matches!(result.status, crate::agent_types::AgentRunStatus::Completed);
                         crate::agent_types::finalize_agent_run(
-                            &db_clone2, new_run_id,
-                            result.status, result.final_answer.as_deref(),
+                            &db_clone2,
+                            new_run_id,
+                            result.status,
+                            result.final_answer.as_deref(),
                             result.iteration_count,
-                        ).await;
+                        )
+                        .await;
 
                         // M12.1: ingestione automatica del resoconto nella KB
                         // (nota agent_summary + embedding + auto-link). Best-effort.
                         if _run_completed {
                             crate::knowledge::ingest_run::ingest_run_summary_to_kb(
-                                &db_clone2, &neural2, &proj_channels2, new_run_id,
-                            ).await;
+                                &db_clone2,
+                                &neural2,
+                                &proj_channels2,
+                                new_run_id,
+                            )
+                            .await;
                         }
                     });
 
@@ -4238,13 +4439,19 @@ pub async fn send_chat_message(
         if tier >= crate::dlp::SensitivityTier::Sensitive {
             // Provider per il check DLP: usa l'override se presente, altrimenti
             // il primo default dalla routing matrix (DB-driven, niente hardcoded).
-            let matrix_provider: Option<String> = state.orchestrator.routing_matrix.current()
+            let matrix_provider: Option<String> = state
+                .orchestrator
+                .routing_matrix
+                .current()
                 .ok()
                 .and_then(|m| m.default_models.keys().next().cloned());
-            let check_provider = effective_provider_override.as_deref()
+            let check_provider = effective_provider_override
+                .as_deref()
                 .or(matrix_provider.as_deref())
                 .unwrap_or("system");
-            if let Some(dlp_msg) = crate::dlp::check_dlp_policy_db(check_provider, tier, &state.db).await {
+            if let Some(dlp_msg) =
+                crate::dlp::check_dlp_policy_db(check_provider, tier, &state.db).await
+            {
                 if dlp_msg.contains("DLP Block") {
                     // Salva il messaggio di errore come risposta assistant in DB
                     // così l'utente vede il motivo del blocco nell'interfaccia.
@@ -4286,27 +4493,32 @@ pub async fn send_chat_message(
 
     // ── Modalita' agente: dispatcha al loop agente invece del singolo turn ──
     if automation_mode != AutomationMode::Study {
-        if let Some(result) = spawn_agent_run(&state, SpawnAgentParams {
-            user_id,
-            session_id: context.session_id,
-            project_id: context.project_id,
-            user_message_id,
-            content: content.to_string(),
-            automation_mode: automation_mode.clone(),
-            supervisor_mode,
-            profile_prompt_block,
-            system_context: system_context.clone(),
-            provider_override: effective_provider_override.clone(),
-            model_override: effective_model_override.clone(),
-            profile_provider: profile_provider.clone(),
-            profile_model: profile_model.clone(),
-            attachments: enrich_attachments_with_ids(
-                normalize_attachments(&body.attachments),
-                &saved_attachments_list,
-            ),
-            user_role: claims.role.clone(),
-            nexus_agent_type_hint: body.agent_type_hint.clone(),
-        }).await {
+        if let Some(result) = spawn_agent_run(
+            &state,
+            SpawnAgentParams {
+                user_id,
+                session_id: context.session_id,
+                project_id: context.project_id,
+                user_message_id,
+                content: content.to_string(),
+                automation_mode: automation_mode.clone(),
+                supervisor_mode,
+                profile_prompt_block,
+                system_context: system_context.clone(),
+                provider_override: effective_provider_override.clone(),
+                model_override: effective_model_override.clone(),
+                profile_provider: profile_provider.clone(),
+                profile_model: profile_model.clone(),
+                attachments: enrich_attachments_with_ids(
+                    normalize_attachments(&body.attachments),
+                    &saved_attachments_list,
+                ),
+                user_role: claims.role.clone(),
+                nexus_agent_type_hint: body.agent_type_hint.clone(),
+            },
+        )
+        .await
+        {
             // Avvia il file watcher anche in modalita' agente asincrona.
             update_user_active_project(&state, user_id, context.project_id).await;
             return Ok(Json(json!({
@@ -4584,12 +4796,9 @@ pub async fn resend_chat_message(
     // <allegati> nel prompt iniziale del retry non avrebbe gli ID e il modello
     // re-incappa nel bug del fallback al filename (vedi
     // enrich_attachments_with_ids_from_db).
-    let attachments = enrich_attachments_with_ids_from_db(
-        &state.db,
-        attachments_raw,
-        source_user_message_id,
-    )
-    .await;
+    let attachments =
+        enrich_attachments_with_ids_from_db(&state.db, attachments_raw, source_user_message_id)
+            .await;
     let attachments_metadata = if body.attachments.is_empty() {
         source_metadata
             .get("attachments")
@@ -4622,14 +4831,13 @@ pub async fn resend_chat_message(
     if automation_mode != AutomationMode::Study {
         let (profile_prompt_block, _, _, _) =
             fetch_profile_context(&state.db, user_id, &profile_id, &source_prompt).await;
-        let github_username: Option<String> = sqlx::query_scalar(
-            "SELECT github_username FROM users WHERE id = $1",
-        )
-        .bind(user_id)
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None)
-        .flatten();
+        let github_username: Option<String> =
+            sqlx::query_scalar("SELECT github_username FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_optional(&state.db)
+                .await
+                .unwrap_or(None)
+                .flatten();
         let system_context_str = {
             let mut ctx = String::from(
                 "Sei Nexus, agente operativo di sviluppo. Regole:\n\
@@ -4678,24 +4886,29 @@ pub async fn resend_chat_message(
             ctx
         };
 
-        if let Some(result) = spawn_agent_run(&state, SpawnAgentParams {
-            user_id,
-            session_id,
-            project_id,
-            user_message_id: resent_user_message_id,
-            content: source_prompt.clone(),
-            automation_mode: automation_mode.clone(),
-            supervisor_mode: SupervisorMode::default(),
-            profile_prompt_block,
-            system_context: system_context_str,
-            provider_override: provider_override.clone(),
-            model_override: model_override.clone(),
-            profile_provider: None,
-            profile_model: None,
-            attachments: attachments.clone(),
-            user_role: claims.role.clone(),
-            nexus_agent_type_hint: None, // resend non usa hint
-        }).await {
+        if let Some(result) = spawn_agent_run(
+            &state,
+            SpawnAgentParams {
+                user_id,
+                session_id,
+                project_id,
+                user_message_id: resent_user_message_id,
+                content: source_prompt.clone(),
+                automation_mode: automation_mode.clone(),
+                supervisor_mode: SupervisorMode::default(),
+                profile_prompt_block,
+                system_context: system_context_str,
+                provider_override: provider_override.clone(),
+                model_override: model_override.clone(),
+                profile_provider: None,
+                profile_model: None,
+                attachments: attachments.clone(),
+                user_role: claims.role.clone(),
+                nexus_agent_type_hint: None, // resend non usa hint
+            },
+        )
+        .await
+        {
             update_user_active_project(&state, user_id, project_id).await;
             return Ok(Json(json!({
                 "sessionId": session_id.to_string(),
@@ -4879,14 +5092,17 @@ pub async fn feedback_error(
     // far fallire l'insert (la colonna ammette NULL).
     let run_id: Option<Uuid> = match raw_run_id {
         Some(id) => {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE id = $1)",
-            )
-            .bind(id)
-            .fetch_one(&state.db)
-            .await
-            .unwrap_or(false);
-            if exists { Some(id) } else { None }
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE id = $1)")
+                    .bind(id)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap_or(false);
+            if exists {
+                Some(id)
+            } else {
+                None
+            }
         }
         None => None,
     };
@@ -5004,12 +5220,19 @@ pub async fn feedback_error(
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Guard: se embedder/qdrant sono down, skip vettorializzazione (la correzione e' gia' in DB)
-    let qdrant_ok = state.dependency_status.qdrant.load(std::sync::atomic::Ordering::Relaxed);
-    let embedder_ok = state.dependency_status.embedder.load(std::sync::atomic::Ordering::Relaxed);
+    let qdrant_ok = state
+        .dependency_status
+        .qdrant
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let embedder_ok = state
+        .dependency_status
+        .embedder
+        .load(std::sync::atomic::Ordering::Relaxed);
     if !qdrant_ok || !embedder_ok {
         tracing::info!(
             "corrections: skip vettorializzazione (qdrant={}, embedder={})",
-            qdrant_ok, embedder_ok
+            qdrant_ok,
+            embedder_ok
         );
     } else {
         let vector = state
@@ -5153,14 +5376,17 @@ pub async fn feedback_positive(
     // far fallire l'insert (la colonna ammette NULL).
     let run_id: Option<Uuid> = match raw_run_id {
         Some(id) => {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE id = $1)",
-            )
-            .bind(id)
-            .fetch_one(&state.db)
-            .await
-            .unwrap_or(false);
-            if exists { Some(id) } else { None }
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM orchestrator_runs WHERE id = $1)")
+                    .bind(id)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap_or(false);
+            if exists {
+                Some(id)
+            } else {
+                None
+            }
         }
         None => None,
     };
@@ -5233,18 +5459,18 @@ pub async fn feedback_positive(
         let pascal = crate::internal_learning::snake_to_pascal(&agent_type_hint);
         let agent_type = nexus_orchestrator::AgentType::from_name(&pascal);
         let q = bridge.record_outcome(
-            &task_id,
-            &intent,
-            agent_type,
-            true,   // success
-            1.0,    // reward massimo
-            0,      // duration_ms non disponibile qui
+            &task_id, &intent, agent_type, true, // success
+            1.0,  // reward massimo
+            0,    // duration_ms non disponibile qui
             None,
         );
         new_q_value = Some(q);
         tracing::info!(
             "feedback_positive: Q-update task={} intent={} agent={} new_q={}",
-            task_id, intent, pascal, q,
+            task_id,
+            intent,
+            pascal,
+            q,
         );
     }
 
@@ -5363,7 +5589,6 @@ pub struct PrecheckRequest {
     pub session_id: Option<Uuid>,
 }
 
-
 pub async fn precheck_chat_message(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -5397,7 +5622,8 @@ pub async fn precheck_chat_message(
         &state.db,
         &state.template_cache,
         "chat.precheck_message",
-    ).await;
+    )
+    .await;
 
     // Arricchimento contestuale: se il client passa session_id, il precheck
     // riceve gli ultimi turni della conversazione. Risolve i falsi-positivi
@@ -5412,25 +5638,50 @@ pub async fn precheck_chat_message(
 
     let messages_json = serde_json::to_string(&json!([
         { "role": "user", "content": effective_message }
-    ])).unwrap_or_default();
+    ]))
+    .unwrap_or_default();
 
     // Modello purpose-specific letto da DB (purpose: chat_feedback_generator).
     // Errore esplicito 503 se la matrice non e' caricata o il purpose non e' configurato.
-    let matrix_arc = state.orchestrator.routing_matrix.current_async().await
-        .map_err(|e| api_error(StatusCode::SERVICE_UNAVAILABLE,
-            format!("routing_matrix non disponibile: {e}. Verifica DB e migrazioni 0101/0102.")))?;
+    let matrix_arc = state
+        .orchestrator
+        .routing_matrix
+        .current_async()
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("routing_matrix non disponibile: {e}. Verifica DB e migrazioni 0101/0102."),
+            )
+        })?;
     let (provider_pf, model_pf) = matrix_arc
         .purpose_model("chat_feedback_generator")
-        .ok_or_else(|| api_error(StatusCode::SERVICE_UNAVAILABLE,
-            "purpose 'chat_feedback_generator' non configurato in nexus_purpose_model. \
-             Esegui INSERT su nexus_purpose_model con il modello desiderato.".to_string()))?;
-    let raw = match state.orchestrator.neural
-        .generate_agent_turn(&provider_pf, &model_pf, &messages_json, "[]", 300, &system_prompt)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "purpose 'chat_feedback_generator' non configurato in nexus_purpose_model. \
+             Esegui INSERT su nexus_purpose_model con il modello desiderato."
+                    .to_string(),
+            )
+        })?;
+    let raw = match state
+        .orchestrator
+        .neural
+        .generate_agent_turn(
+            &provider_pf,
+            &model_pf,
+            &messages_json,
+            "[]",
+            300,
+            &system_prompt,
+        )
         .await
     {
         Ok(val) => val
-            .get("content").and_then(Value::as_str)
-            .unwrap_or("").to_string(),
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         Err(_) => {
             // Se il modello non risponde non bloccare l'utente
             return Ok(Json(json!({
@@ -5443,29 +5694,47 @@ pub async fn precheck_chat_message(
     // Estrae il JSON anche se il modello ha aggiunto testo prima/dopo
     let json_start = raw.find('{').unwrap_or(0);
     let json_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
-    let parsed: Value = serde_json::from_str(&raw[json_start..json_end]).unwrap_or_else(|_| json!({
-        "ok": true, "correctedText": null,
-        "contextSuggestion": null, "issues": [], "reason": null
-    }));
+    let parsed: Value = serde_json::from_str(&raw[json_start..json_end]).unwrap_or_else(|_| {
+        json!({
+            "ok": true, "correctedText": null,
+            "contextSuggestion": null, "issues": [], "reason": null
+        })
+    });
 
     let ok = parsed.get("ok").and_then(Value::as_bool).unwrap_or(true);
-    let corrected_text = parsed.get("correctedText").and_then(Value::as_str).map(ToOwned::to_owned)
+    let corrected_text = parsed
+        .get("correctedText")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
         // Scarta solo se esattamente identico (byte-by-byte) o vuoto — non usare to_lowercase()
         // perché perderebbe correzioni su accenti o caratteri speciali
         .filter(|c| !c.trim().is_empty() && c.trim() != message.trim());
-    let context_suggestion = parsed.get("contextSuggestion").and_then(Value::as_str).map(ToOwned::to_owned)
+    let context_suggestion = parsed
+        .get("contextSuggestion")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
         .filter(|s| !s.trim().is_empty());
-    let issues: Vec<String> = parsed.get("issues").and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(ToOwned::to_owned)).collect())
+    let issues: Vec<String> = parsed
+        .get("issues")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                .collect()
+        })
         .unwrap_or_default();
-    let reason = parsed.get("reason").and_then(Value::as_str).map(ToOwned::to_owned);
+    let reason = parsed
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
 
     // ok=false solo se c'è davvero qualcosa di utile da mostrare
-    let effective_ok = if corrected_text.is_none() && context_suggestion.is_none() && issues.is_empty() {
-        true
-    } else {
-        ok
-    };
+    let effective_ok =
+        if corrected_text.is_none() && context_suggestion.is_none() && issues.is_empty() {
+            true
+        } else {
+            ok
+        };
 
     Ok(Json(json!({
         "ok": effective_ok,
@@ -5503,10 +5772,14 @@ pub async fn feedback_assist_handler(
         &state.db,
         &state.template_cache,
         "chat.feedback_assist",
-    ).await;
+    )
+    .await;
 
     if system_prompt.is_empty() {
-        return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, "Template non disponibile".to_string()));
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Template non disponibile".to_string(),
+        ));
     }
 
     // Tronca il contenuto del messaggio per non eccedere il contesto
@@ -5516,27 +5789,58 @@ pub async fn feedback_assist_handler(
     let user_content = if partial.is_empty() {
         format!("RISPOSTA AI:\n{}", msg_preview)
     } else {
-        format!("RISPOSTA AI:\n{}\n\nDESCRIZIONE PARZIALE DELL'UTENTE:\n{}", msg_preview, partial)
+        format!(
+            "RISPOSTA AI:\n{}\n\nDESCRIZIONE PARZIALE DELL'UTENTE:\n{}",
+            msg_preview, partial
+        )
     };
 
     let messages_json = serde_json::to_string(&json!([
         { "role": "user", "content": user_content }
-    ])).unwrap_or_default();
+    ]))
+    .unwrap_or_default();
 
     // Modello purpose-specific letto da DB (purpose: chat_title_generator).
     // Errore esplicito 503 se la matrice non e' caricata o il purpose non e' configurato.
-    let matrix_arc = state.orchestrator.routing_matrix.current_async().await
-        .map_err(|e| api_error(StatusCode::SERVICE_UNAVAILABLE,
-            format!("routing_matrix non disponibile: {e}. Verifica DB e migrazioni 0101/0102.")))?;
+    let matrix_arc = state
+        .orchestrator
+        .routing_matrix
+        .current_async()
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("routing_matrix non disponibile: {e}. Verifica DB e migrazioni 0101/0102."),
+            )
+        })?;
     let (provider_pt, model_pt) = matrix_arc
         .purpose_model("chat_title_generator")
-        .ok_or_else(|| api_error(StatusCode::SERVICE_UNAVAILABLE,
-            "purpose 'chat_title_generator' non configurato in nexus_purpose_model.".to_string()))?;
-    let raw = match state.orchestrator.neural
-        .generate_agent_turn(&provider_pt, &model_pt, &messages_json, "[]", 400, &system_prompt)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "purpose 'chat_title_generator' non configurato in nexus_purpose_model."
+                    .to_string(),
+            )
+        })?;
+    let raw = match state
+        .orchestrator
+        .neural
+        .generate_agent_turn(
+            &provider_pt,
+            &model_pt,
+            &messages_json,
+            "[]",
+            400,
+            &system_prompt,
+        )
         .await
     {
-        Ok(val) => val.get("content").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+        Ok(val) => val
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string(),
         Err(e) => {
             tracing::warn!("feedback_assist LLM error: {}", e);
             return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));

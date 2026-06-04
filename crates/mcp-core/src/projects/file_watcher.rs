@@ -8,7 +8,6 @@
 ///
 /// Il watcher gira in background per tutta la durata del processo. Un `DashSet`
 /// in `AppState` impedisce di avviare watcher duplicati sullo stesso progetto.
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,17 +30,49 @@ const CODE_EXTENSIONS: &[&str] = &["tsx", "jsx", "ts", "js", "rs", "py", "cs", "
 /// package.json, Cargo.toml creati da un sub-agent implementer).
 const NOTIFY_EXTENSIONS: &[&str] = &[
     // codice (gia' in CODE_EXTENSIONS, ripetuto per chiarezza)
-    "tsx", "jsx", "ts", "js", "rs", "py", "cs", "go", "vue",
+    "tsx",
+    "jsx",
+    "ts",
+    "js",
+    "rs",
+    "py",
+    "cs",
+    "go",
+    "vue",
     // markup / styling
-    "html", "htm", "css", "scss", "sass", "less", "svg",
+    "html",
+    "htm",
+    "css",
+    "scss",
+    "sass",
+    "less",
+    "svg",
     // dati / config
-    "json", "yaml", "yml", "toml", "xml", "ini", "env",
+    "json",
+    "yaml",
+    "yml",
+    "toml",
+    "xml",
+    "ini",
+    "env",
     // documentazione / testo
-    "md", "mdx", "txt", "rst", "adoc",
+    "md",
+    "mdx",
+    "txt",
+    "rst",
+    "adoc",
     // shell / db / docker
-    "sh", "bash", "zsh", "ps1", "sql", "dockerfile", "lock",
+    "sh",
+    "bash",
+    "zsh",
+    "ps1",
+    "sql",
+    "dockerfile",
+    "lock",
     // build / package manager
-    "cjs", "mjs", "d.ts",
+    "cjs",
+    "mjs",
+    "d.ts",
 ];
 
 /// Directory da ignorare.
@@ -132,7 +163,11 @@ async fn run_watcher(
         // fino alla scadenza del debounce, altrimenti aspettiamo a lungo.
         let timeout = deadline.map(|d| {
             let now = tokio::time::Instant::now();
-            if d > now { d - now } else { Duration::ZERO }
+            if d > now {
+                d - now
+            } else {
+                Duration::ZERO
+            }
         });
 
         let recv_fut = rx.recv();

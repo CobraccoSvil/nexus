@@ -136,7 +136,9 @@ async fn generate_migrations_log(ctx: &MetaDocContext<'_>) -> Result<String> {
         while let Ok(Some(ent)) = rd.next_entry().await {
             let name = ent.file_name().to_string_lossy().to_string();
             if name.ends_with(".sql") {
-                let content = tokio::fs::read_to_string(ent.path()).await.unwrap_or_default();
+                let content = tokio::fs::read_to_string(ent.path())
+                    .await
+                    .unwrap_or_default();
                 // Estrae il primo commento `-- ...` come descrizione
                 let first_comment = content
                     .lines()
@@ -173,22 +175,19 @@ async fn generate_migrations_log(ctx: &MetaDocContext<'_>) -> Result<String> {
 
 async fn generate_qdrant_collections(ctx: &MetaDocContext<'_>) -> Result<String> {
     // Legge URL Qdrant dalle settings; default localhost:6333
-    let qdrant_url: String = sqlx::query_scalar(
-        "SELECT value FROM settings WHERE key = 'qdrant_url'"
-    )
-    .fetch_optional(ctx.db)
-    .await?
-    .unwrap_or_else(|| "http://localhost:6333".to_string());
+    let qdrant_url: String =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'qdrant_url'")
+            .fetch_optional(ctx.db)
+            .await?
+            .unwrap_or_else(|| "http://localhost:6333".to_string());
 
     let client = reqwest::Client::new();
     let mut out = String::with_capacity(2048);
-    out.push_str("Collection Qdrant attualmente create. Generato chiamando `GET /collections`.\n\n");
+    out.push_str(
+        "Collection Qdrant attualmente create. Generato chiamando `GET /collections`.\n\n",
+    );
 
-    match client
-        .get(format!("{qdrant_url}/collections"))
-        .send()
-        .await
-    {
+    match client.get(format!("{qdrant_url}/collections")).send().await {
         Ok(resp) if resp.status().is_success() => {
             let payload: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
             let collections = payload
@@ -203,7 +202,10 @@ async fn generate_qdrant_collections(ctx: &MetaDocContext<'_>) -> Result<String>
             }
         }
         Ok(resp) => {
-            out.push_str(&format!("\n_Qdrant ha risposto {}: collection non disponibili._\n", resp.status()));
+            out.push_str(&format!(
+                "\n_Qdrant ha risposto {}: collection non disponibili._\n",
+                resp.status()
+            ));
         }
         Err(e) => {
             out.push_str(&format!("\n_Errore di connessione a Qdrant: {e}._\n"));

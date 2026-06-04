@@ -35,7 +35,11 @@ pub async fn tool_knowledge_search(ctx: &AgentToolContext, input: &Value) -> Str
         .and_then(|v| v.as_f64())
         .unwrap_or(0.4) as f32;
 
-    let embed_text = if query.len() > 2000 { &query[..2000] } else { query };
+    let embed_text = if query.len() > 2000 {
+        &query[..2000]
+    } else {
+        query
+    };
     let vector = match ctx.neural.embed_text("", embed_text).await {
         Ok(v) => v,
         Err(e) => return json!({"error": format!("embed fallito: {e}")}).to_string(),
@@ -66,7 +70,8 @@ pub async fn tool_knowledge_search(ctx: &AgentToolContext, input: &Value) -> Str
         .take(top_k)
         .collect();
     if note_hits.is_empty() {
-        return json!({"results": [], "message": "nessuna nota trovata sopra la soglia"}).to_string();
+        return json!({"results": [], "message": "nessuna nota trovata sopra la soglia"})
+            .to_string();
     }
 
     let ids: Vec<Uuid> = note_hits.iter().map(|(id, _)| *id).collect();
@@ -279,7 +284,11 @@ pub async fn tool_knowledge_create_note(ctx: &AgentToolContext, input: &Value) -
     let note_id = Uuid::new_v4();
 
     // Embedding + Qdrant upsert
-    let embed_text = if body_md.len() > 2000 { &body_md[..2000] } else { &body_md };
+    let embed_text = if body_md.len() > 2000 {
+        &body_md[..2000]
+    } else {
+        &body_md
+    };
     let qdrant_point_id = match ctx.neural.embed_text("", embed_text).await {
         Ok(vector) => {
             let point_id = Uuid::new_v4().to_string();
@@ -289,7 +298,9 @@ pub async fn tool_knowledge_create_note(ctx: &AgentToolContext, input: &Value) -
                 "intent": intent,
                 "status": "active",
             });
-            match crate::vector_memory::upsert_knowledge_point(&ctx.db, &point_id, vector, payload).await {
+            match crate::vector_memory::upsert_knowledge_point(&ctx.db, &point_id, vector, payload)
+                .await
+            {
                 Ok(_) => Some(point_id),
                 Err(e) => {
                     tracing::warn!(error = %e, "knowledge_create_note: Qdrant upsert fallito");
@@ -364,9 +375,11 @@ pub async fn tool_knowledge_create_note(ctx: &AgentToolContext, input: &Value) -
                 "title": title_clone,
                 "intent": intent_clone,
             });
-            let combined = format!("{title_clone}
+            let combined = format!(
+                "{title_clone}
 
-{body_clone}");
+{body_clone}"
+            );
             if let Err(e) = crate::rag::index_text(
                 &db_clone,
                 crate::rag::SourceKind::Kb,
@@ -398,7 +411,13 @@ pub async fn tool_knowledge_create_note(ctx: &AgentToolContext, input: &Value) -
 /// dipendenza); `duplicate`/`correction`/`refinement`/`followup` = relazioni
 /// di intake (vedi Componente 1).
 pub(crate) const KNOWLEDGE_REL_TYPES: [&str; 7] = [
-    "followup", "correction", "refinement", "duplicate", "blocks", "blocked_by", "relates",
+    "followup",
+    "correction",
+    "refinement",
+    "duplicate",
+    "blocks",
+    "blocked_by",
+    "relates",
 ];
 
 /// `knowledge_get_links` — link entranti e uscenti di una nota.
@@ -540,10 +559,14 @@ pub async fn tool_knowledge_get_subgraph(ctx: &AgentToolContext, input: &Value) 
             Ok(v) => v,
             Err(e) => return json!({"error": format!("embed fallito: {e}")}).to_string(),
         };
-        let hits =
-            crate::vector_memory::search_knowledge_points(&ctx.db, vector, ctx.project_id, max_nodes)
-                .await
-                .unwrap_or_default();
+        let hits = crate::vector_memory::search_knowledge_points(
+            &ctx.db,
+            vector,
+            ctx.project_id,
+            max_nodes,
+        )
+        .await
+        .unwrap_or_default();
         for h in hits.iter() {
             if let Some(id) = h
                 .payload
@@ -567,7 +590,8 @@ pub async fn tool_knowledge_get_subgraph(ctx: &AgentToolContext, input: &Value) 
             .to_string();
     }
     if nodes.is_empty() {
-        return json!({"nodes": [], "edges": [], "message": "nessun nodo seed trovato"}).to_string();
+        return json!({"nodes": [], "edges": [], "message": "nessun nodo seed trovato"})
+            .to_string();
     }
 
     // 2. Espansione BFS via link (project_knowledge_links non ha project_id;
@@ -831,7 +855,10 @@ async fn read_graph_import_settings(db: &sqlx::PgPool) -> (bool, usize) {
 pub async fn tool_knowledge_import_graph(ctx: &AgentToolContext, input: &Value) -> String {
     let format = match input.get("format").and_then(|v| v.as_str()) {
         Some(f) if !f.trim().is_empty() => f.trim().to_string(),
-        _ => return json!({"error": "parametro 'format' obbligatorio (json|mermaid|dot)"}).to_string(),
+        _ => {
+            return json!({"error": "parametro 'format' obbligatorio (json|mermaid|dot)"})
+                .to_string()
+        }
     };
     let content = match input.get("content").and_then(|v| v.as_str()) {
         Some(c) if !c.trim().is_empty() => c.to_string(),
@@ -880,7 +907,11 @@ pub async fn tool_knowledge_import_graph(ctx: &AgentToolContext, input: &Value) 
         let tags: Vec<String> = node.node_type.clone().into_iter().collect();
 
         let embed_src = format!("{title}\n{body_md}");
-        let embed_text = if embed_src.len() > 2000 { &embed_src[..2000] } else { &embed_src };
+        let embed_text = if embed_src.len() > 2000 {
+            &embed_src[..2000]
+        } else {
+            &embed_src
+        };
         let qdrant_point_id = match ctx.neural.embed_text("", embed_text).await {
             Ok(vector) => {
                 let point_id = Uuid::new_v4().to_string();
@@ -890,7 +921,11 @@ pub async fn tool_knowledge_import_graph(ctx: &AgentToolContext, input: &Value) 
                     "intent": "domain",
                     "status": "active",
                 });
-                match crate::vector_memory::upsert_knowledge_point(&ctx.db, &point_id, vector, payload).await {
+                match crate::vector_memory::upsert_knowledge_point(
+                    &ctx.db, &point_id, vector, payload,
+                )
+                .await
+                {
                     Ok(_) => Some(point_id),
                     Err(_) => None,
                 }

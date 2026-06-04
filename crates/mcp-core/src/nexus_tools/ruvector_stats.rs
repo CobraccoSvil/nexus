@@ -53,15 +53,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_call() {
-        let ctx = NexusToolContext::new(
-            std::env::temp_dir(),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-        );
-        let out = RuVectorStatsTool
-            .execute(&ctx, &json!({}))
-            .await
-            .unwrap();
+        let ctx = NexusToolContext::new(std::env::temp_dir(), uuid::Uuid::nil(), uuid::Uuid::nil());
+        let out = RuVectorStatsTool.execute(&ctx, &json!({})).await.unwrap();
         // Deve sempre tornare un Value, con ok true o false
         assert!(out["ok"] == true || out["ok"] == false);
     }

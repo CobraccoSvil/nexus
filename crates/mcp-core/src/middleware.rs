@@ -26,16 +26,28 @@ pub async fn require_admin(
     tracing::warn!("require_admin: CHECKING path={}", req.uri());
     match auth::validate_token(&state.db, req.headers()).await {
         Ok(claims) => {
-            tracing::warn!("require_admin: user={}, role={}, path={}", claims.sub, claims.role, req.uri());
+            tracing::warn!(
+                "require_admin: user={}, role={}, path={}",
+                claims.sub,
+                claims.role,
+                req.uri()
+            );
             if claims.role != "admin" {
-                tracing::warn!("require_admin: access denied - role={} is not admin", claims.role);
+                tracing::warn!(
+                    "require_admin: access denied - role={} is not admin",
+                    claims.role
+                );
                 return Err(StatusCode::FORBIDDEN);
             }
             req.extensions_mut().insert(claims);
             Ok(next.run(req).await)
         }
         Err(e) => {
-            tracing::warn!("require_admin: token validation failed: {:?}, path={}", e, req.uri());
+            tracing::warn!(
+                "require_admin: token validation failed: {:?}, path={}",
+                e,
+                req.uri()
+            );
             Err(e)
         }
     }
@@ -53,7 +65,10 @@ pub async fn event_capture_middleware(
 
     let resp = next.run(req).await;
 
-    let is_mutation = matches!(method, Method::POST | Method::PUT | Method::DELETE | Method::PATCH);
+    let is_mutation = matches!(
+        method,
+        Method::POST | Method::PUT | Method::DELETE | Method::PATCH
+    );
     if is_mutation && resp.status().is_success() {
         if let Some(pid) = extract_project_id(&path) {
             let session_id = extract_session_id(&path);

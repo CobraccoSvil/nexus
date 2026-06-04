@@ -77,11 +77,7 @@ async fn cache_ttl(db: &PgPool) -> Duration {
 /// ritorna il payload arricchito con `from_cache`/`served_count`/`hint`.
 /// Altrimenti chiama `compute` (lettura raw), memorizza il risultato e ritorna
 /// il payload originale.
-pub async fn get_or_compute<F, Fut>(
-    db: &PgPool,
-    key: ReadCacheKey,
-    compute: F,
-) -> String
+pub async fn get_or_compute<F, Fut>(db: &PgPool, key: ReadCacheKey, compute: F) -> String
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = String>,

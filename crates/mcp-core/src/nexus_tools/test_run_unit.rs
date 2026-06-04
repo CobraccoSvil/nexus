@@ -8,8 +8,18 @@ pub struct TestRunUnitTool;
 
 #[async_trait]
 impl NexusToolHandler for TestRunUnitTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let out = run_cmd("cargo", &["test", "--lib", "--quiet"], &ctx.project_root, ctx.timeout_secs).await?;
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let out = run_cmd(
+            "cargo",
+            &["test", "--lib", "--quiet"],
+            &ctx.project_root,
+            ctx.timeout_secs,
+        )
+        .await?;
         Ok(json!({
             "ok": out.success(),
             "exit_code": out.exit_code,
@@ -18,5 +28,7 @@ impl NexusToolHandler for TestRunUnitTool {
             "stderr_tail": out.stderr.lines().rev().take(10).collect::<Vec<_>>(),
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::write_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::write_subproc()
+    }
 }

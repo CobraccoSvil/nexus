@@ -47,8 +47,19 @@ pub(super) async fn collect_config_files(root: &Path) -> Vec<serde_json::Value> 
     let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
 
     let skip_dirs: &[&str] = &[
-        ".git", "node_modules", "target", "dist", "build", ".next",
-        "bin", "obj", ".venv", "__pycache__", ".turbo", ".cache", "vendor",
+        ".git",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        ".next",
+        "bin",
+        "obj",
+        ".venv",
+        "__pycache__",
+        ".turbo",
+        ".cache",
+        "vendor",
     ];
 
     while let Some((dir, depth)) = stack.pop() {
@@ -67,19 +78,31 @@ pub(super) async fn collect_config_files(root: &Path) -> Vec<serde_json::Value> 
             };
             if let Ok(ft) = entry.file_type().await {
                 if ft.is_dir() {
-                    if depth + 1 > DEEP_ANALYZER_MAX_DEPTH { continue; }
-                    if name.starts_with('.') && name != "." && name != ".github" { continue; }
-                    if skip_dirs.contains(&name.as_str()) { continue; }
+                    if depth + 1 > DEEP_ANALYZER_MAX_DEPTH {
+                        continue;
+                    }
+                    if name.starts_with('.') && name != "." && name != ".github" {
+                        continue;
+                    }
+                    if skip_dirs.contains(&name.as_str()) {
+                        continue;
+                    }
                     stack.push((path, depth + 1));
                 } else if ft.is_file() && patterns.contains(name.as_str()) {
-                    if found.len() >= DEEP_ANALYZER_MAX_FILES { break; }
+                    if found.len() >= DEEP_ANALYZER_MAX_FILES {
+                        break;
+                    }
                     let rel_path = path
                         .strip_prefix(root)
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_else(|_| name.clone());
                     let raw = tokio::fs::read(&path).await.unwrap_or_default();
                     let truncated = raw.len() > DEEP_ANALYZER_MAX_FILE_BYTES;
-                    let bytes_slice = if truncated { &raw[..DEEP_ANALYZER_MAX_FILE_BYTES] } else { &raw[..] };
+                    let bytes_slice = if truncated {
+                        &raw[..DEEP_ANALYZER_MAX_FILE_BYTES]
+                    } else {
+                        &raw[..]
+                    };
                     let content = String::from_utf8_lossy(bytes_slice).to_string();
                     found.push(json!({
                         "path": rel_path,
@@ -109,7 +132,9 @@ pub(super) async fn collect_registered_services(slug: &str) -> Vec<serde_json::V
         let txt = String::from_utf8_lossy(&o.stdout);
         for line in txt.lines() {
             let unit = line.trim();
-            if unit.is_empty() { continue; }
+            if unit.is_empty() {
+                continue;
+            }
             let info = Command::new("bash")
                 .arg("-lc")
                 .arg(format!(
@@ -122,9 +147,13 @@ pub(super) async fn collect_registered_services(slug: &str) -> Vec<serde_json::V
             if let Ok(i) = info {
                 let body = String::from_utf8_lossy(&i.stdout);
                 for ln in body.lines() {
-                    if let Some(v) = ln.strip_prefix("ActiveState=") { active_state = v.to_string(); }
-                    else if let Some(v) = ln.strip_prefix("ExecStart=") { exec_start = v.to_string(); }
-                    else if let Some(v) = ln.strip_prefix("WorkingDirectory=") { workdir = v.to_string(); }
+                    if let Some(v) = ln.strip_prefix("ActiveState=") {
+                        active_state = v.to_string();
+                    } else if let Some(v) = ln.strip_prefix("ExecStart=") {
+                        exec_start = v.to_string();
+                    } else if let Some(v) = ln.strip_prefix("WorkingDirectory=") {
+                        workdir = v.to_string();
+                    }
                 }
             }
             services.push(json!({
@@ -176,12 +205,17 @@ pub async fn deep_analyze_project(
             (project_id, insight_version, insights, prompt_key, prompt_version,
              status, config_files_count)
          VALUES ($1, 1, '{}'::jsonb, 'agent.project.analyzer', 1, 'running', 0)
-         RETURNING id"
+         RETURNING id",
     )
     .bind(project_id)
     .fetch_one(&state.db)
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("insert running: {e}")))?;
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("insert running: {e}"),
+        )
+    })?;
 
     // Snapshot dei dati per la fase async (la closure vive con 'static).
     let db = state.db.clone();
@@ -195,16 +229,17 @@ pub async fn deep_analyze_project(
         let started = std::time::Instant::now();
 
         // 1. Recupera l'ultima analisi statica
-        let static_analysis: serde_json::Value = sqlx::query_scalar::<_, Option<serde_json::Value>>(
-            "SELECT analysis_json FROM projects WHERE id = $1",
-        )
-        .bind(project_id)
-        .fetch_optional(&db)
-        .await
-        .ok()
-        .flatten()
-        .flatten()
-        .unwrap_or(json!({}));
+        let static_analysis: serde_json::Value =
+            sqlx::query_scalar::<_, Option<serde_json::Value>>(
+                "SELECT analysis_json FROM projects WHERE id = $1",
+            )
+            .bind(project_id)
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten()
+            .flatten()
+            .unwrap_or(json!({}));
 
         let lang_hint = static_analysis
             .get("languages")
@@ -217,14 +252,29 @@ pub async fn deep_analyze_project(
         let frameworks_list: Vec<String> = static_analysis
             .get("frameworks")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let repo_summary = format!(
             "{} file totali in {} (linguaggio dominante: {}). Framework: {}.",
-            static_analysis.get("totalFiles").and_then(|v| v.as_u64()).unwrap_or(0),
+            static_analysis
+                .get("totalFiles")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
             project_name,
-            if lang_hint.is_empty() { "non determinato" } else { lang_hint.as_str() },
-            if frameworks_list.is_empty() { "nessuno".to_string() } else { frameworks_list.join(", ") },
+            if lang_hint.is_empty() {
+                "non determinato"
+            } else {
+                lang_hint.as_str()
+            },
+            if frameworks_list.is_empty() {
+                "nessuno".to_string()
+            } else {
+                frameworks_list.join(", ")
+            },
         );
 
         // 2. Raccoglie config files dal filesystem
@@ -236,8 +286,8 @@ pub async fn deep_analyze_project(
 
         // 4. Chiama il brain (timeout 5 minuti — dato che siamo in background, non
         //    proxy timeout, possiamo essere generosi)
-        let brain_url = std::env::var("BRAIN_REST_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+        let brain_url =
+            std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
         let body = json!({
             "project_id": project_id.to_string(),
             "project_name": project_name,
@@ -260,14 +310,23 @@ pub async fn deep_analyze_project(
             }
         };
         let response = match client
-            .post(format!("{}/agent/project-analyze", brain_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/agent/project-analyze",
+                brain_url.trim_end_matches('/')
+            ))
             .json(&body)
             .send()
             .await
         {
             Ok(r) => r,
             Err(e) => {
-                let _ = mark_failed(&db, run_id, &format!("brain unreachable: {e}"), started.elapsed().as_millis() as i32).await;
+                let _ = mark_failed(
+                    &db,
+                    run_id,
+                    &format!("brain unreachable: {e}"),
+                    started.elapsed().as_millis() as i32,
+                )
+                .await;
                 return;
             }
         };
@@ -275,31 +334,55 @@ pub async fn deep_analyze_project(
         if !response.status().is_success() {
             let st = response.status();
             let txt = response.text().await.unwrap_or_default();
-            let _ = mark_failed(&db, run_id, &format!("brain error {st}: {}", &txt[..txt.len().min(300)]), started.elapsed().as_millis() as i32).await;
+            let _ = mark_failed(
+                &db,
+                run_id,
+                &format!("brain error {st}: {}", &txt[..txt.len().min(300)]),
+                started.elapsed().as_millis() as i32,
+            )
+            .await;
             return;
         }
 
         let brain_resp: serde_json::Value = match response.json().await {
             Ok(v) => v,
             Err(e) => {
-                let _ = mark_failed(&db, run_id, &format!("brain json: {e}"), started.elapsed().as_millis() as i32).await;
+                let _ = mark_failed(
+                    &db,
+                    run_id,
+                    &format!("brain json: {e}"),
+                    started.elapsed().as_millis() as i32,
+                )
+                .await;
                 return;
             }
         };
 
         // 5. UPDATE finale della riga 'running'
-        let status_str = brain_resp.get("status").and_then(|v| v.as_str()).unwrap_or("failed");
-        let model_used = brain_resp.get("model_used").and_then(|v| v.as_str()).map(String::from);
-        let duration_ms = brain_resp.get("duration_ms").and_then(|v| v.as_i64())
-            .unwrap_or_else(|| started.elapsed().as_millis() as i64) as i32;
+        let status_str = brain_resp
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("failed");
+        let model_used = brain_resp
+            .get("model_used")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let duration_ms = brain_resp
+            .get("duration_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_else(|| started.elapsed().as_millis() as i64)
+            as i32;
         let insights_payload = brain_resp.get("insights").cloned().unwrap_or(json!({}));
-        let error_msg = brain_resp.get("error").and_then(|v| v.as_str()).map(String::from);
+        let error_msg = brain_resp
+            .get("error")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         let _ = sqlx::query(
             "UPDATE nexus_project_insights
                 SET insights = $1, model_used = $2, duration_ms = $3,
                     config_files_count = $4, status = $5, error_message = $6
-                WHERE id = $7"
+                WHERE id = $7",
         )
         .bind(&insights_payload)
         .bind(&model_used)
@@ -313,11 +396,18 @@ pub async fn deep_analyze_project(
 
         tracing::info!(
             "deep_analyze background: run_id={} status={} duration_ms={}",
-            run_id, status_str, duration_ms
+            run_id,
+            status_str,
+            duration_ms
         );
 
         // Se l'analisi e' completata con successo, popola la Knowledge Base
-        if status_str == "completed" && !insights_payload.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        if status_str == "completed"
+            && !insights_payload
+                .as_object()
+                .map(|o| o.is_empty())
+                .unwrap_or(true)
+        {
             crate::knowledge::seed_knowledge_from_insights(
                 db,
                 neural,
@@ -325,7 +415,8 @@ pub async fn deep_analyze_project(
                 insights_payload,
                 Some(repo_root_str),
                 project_channels,
-            ).await;
+            )
+            .await;
         }
     });
 
@@ -338,11 +429,16 @@ pub async fn deep_analyze_project(
 }
 
 /// Helper: marca una riga insights come 'failed' con error_message.
-async fn mark_failed(db: &sqlx::PgPool, run_id: i64, msg: &str, duration_ms: i32) -> Result<(), sqlx::Error> {
+async fn mark_failed(
+    db: &sqlx::PgPool,
+    run_id: i64,
+    msg: &str,
+    duration_ms: i32,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE nexus_project_insights
             SET status = 'failed', error_message = $1, duration_ms = $2
-            WHERE id = $3"
+            WHERE id = $3",
     )
     .bind(msg)
     .bind(duration_ms)
@@ -370,7 +466,7 @@ pub async fn get_project_insights(
                 error_message, created_at
          FROM nexus_project_insights
          WHERE project_id = $1
-         ORDER BY created_at DESC LIMIT 1"
+         ORDER BY created_at DESC LIMIT 1",
     )
     .bind(project_id)
     .fetch_optional(&state.db)

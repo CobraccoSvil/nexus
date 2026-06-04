@@ -7,7 +7,11 @@ pub struct CargoFeaturesListTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoFeaturesListTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let manifest = ctx.project_root.join("Cargo.toml");
         let content = std::fs::read_to_string(&manifest).map_err(NexusToolError::Io)?;
         let mut features: Vec<(String, Vec<String>)> = Vec::new();
@@ -49,5 +53,7 @@ impl NexusToolHandler for CargoFeaturesListTool {
             .collect();
         Ok(json!({"ok": true, "count": items.len(), "features": items}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

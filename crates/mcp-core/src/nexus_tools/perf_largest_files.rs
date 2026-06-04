@@ -7,12 +7,16 @@ use std::path::{Path, PathBuf};
 pub struct PerfLargestFilesTool;
 
 fn collect(dir: &Path, root: &Path, depth: usize, out: &mut Vec<(String, u64)>) {
-    if depth > 8 { return; }
+    if depth > 8 {
+        return;
+    }
     if let Ok(rd) = std::fs::read_dir(dir) {
         for entry in rd.flatten() {
             let p = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == "target" || name == "node_modules" || name.starts_with('.') { continue; }
+            if name == "target" || name == "node_modules" || name.starts_with('.') {
+                continue;
+            }
             if p.is_dir() {
                 collect(&p, root, depth + 1, out);
             } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
@@ -28,16 +32,25 @@ fn collect(dir: &Path, root: &Path, depth: usize, out: &mut Vec<(String, u64)>) 
 #[async_trait]
 impl NexusToolHandler for PerfLargestFilesTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20).clamp(1, 200) as usize;
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 200) as usize;
         let mut all: Vec<(String, u64)> = vec![];
-        let roots: [PathBuf; 2] = [ctx.project_root.join("src"), ctx.project_root.join("crates")];
+        let roots: [PathBuf; 2] = [
+            ctx.project_root.join("src"),
+            ctx.project_root.join("crates"),
+        ];
         for r in &roots {
             if r.is_dir() {
                 collect(r, &ctx.project_root, 0, &mut all);
             }
         }
         all.sort_by(|a, b| b.1.cmp(&a.1));
-        let top: Vec<Value> = all.into_iter().take(limit)
+        let top: Vec<Value> = all
+            .into_iter()
+            .take(limit)
             .map(|(p, s)| json!({"path": p, "bytes": s}))
             .collect();
         Ok(json!({"ok": true, "count": top.len(), "files": top}))
@@ -45,5 +58,7 @@ impl NexusToolHandler for PerfLargestFilesTool {
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"limit":{"type":"integer"}}})
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

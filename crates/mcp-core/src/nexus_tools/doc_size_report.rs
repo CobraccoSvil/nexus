@@ -7,7 +7,9 @@ use std::path::Path;
 pub struct DocSizeReportTool;
 
 fn walk(dir: &Path, depth: usize, count: &mut usize, bytes: &mut u64) {
-    if depth > 6 { return; }
+    if depth > 6 {
+        return;
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -15,7 +17,9 @@ fn walk(dir: &Path, depth: usize, count: &mut usize, bytes: &mut u64) {
     for entry in entries.flatten() {
         let p = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || name == "target" || name == "node_modules" { continue; }
+        if name.starts_with('.') || name == "target" || name == "node_modules" {
+            continue;
+        }
         if p.is_dir() {
             walk(&p, depth + 1, count, bytes);
         } else if p.extension().and_then(|e| e.to_str()) == Some("md") {
@@ -29,11 +33,17 @@ fn walk(dir: &Path, depth: usize, count: &mut usize, bytes: &mut u64) {
 
 #[async_trait]
 impl NexusToolHandler for DocSizeReportTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let mut count = 0usize;
         let mut bytes = 0u64;
         walk(&ctx.project_root, 0, &mut count, &mut bytes);
         Ok(json!({"ok": true, "files": count, "total_bytes": bytes}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

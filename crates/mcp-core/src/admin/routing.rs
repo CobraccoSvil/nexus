@@ -35,13 +35,15 @@ pub async fn list_purpose_models(
 
     let items = rows
         .into_iter()
-        .map(|(purpose, provider, model_id, notes, updated_at)| PurposeModelEntry {
-            purpose,
-            provider,
-            model_id,
-            notes,
-            updated_at,
-        })
+        .map(
+            |(purpose, provider, model_id, notes, updated_at)| PurposeModelEntry {
+                purpose,
+                provider,
+                model_id,
+                notes,
+                updated_at,
+            },
+        )
         .collect();
 
     Ok(Json(ListPurposeModelsResponse { items }))
@@ -99,4 +101,3 @@ pub async fn update_purpose_model(
         purpose: purpose.to_string(),
     }))
 }
-

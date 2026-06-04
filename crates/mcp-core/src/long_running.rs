@@ -1,3 +1,4 @@
+use crate::AppState;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -6,7 +7,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use crate::AppState;
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]

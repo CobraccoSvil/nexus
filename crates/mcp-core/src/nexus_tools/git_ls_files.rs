@@ -12,7 +12,10 @@ impl NexusToolHandler for GitLsFilesTool {
         let max = args.get("max").and_then(Value::as_u64).unwrap_or(2000) as usize;
         let out = run_cmd("git", &["ls-files"], &ctx.project_root, ctx.timeout_secs).await?;
         if !out.success() {
-            return Err(NexusToolError::Exec { exit_code: out.exit_code, stderr: out.stderr });
+            return Err(NexusToolError::Exec {
+                exit_code: out.exit_code,
+                stderr: out.stderr,
+            });
         }
         let files: Vec<&str> = out.stdout.lines().take(max).collect();
         let total = out.stdout.lines().count();
@@ -21,5 +24,7 @@ impl NexusToolHandler for GitLsFilesTool {
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"max":{"type":"integer"}}})
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only_subproc()
+    }
 }

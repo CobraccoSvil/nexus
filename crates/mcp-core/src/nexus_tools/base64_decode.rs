@@ -18,7 +18,10 @@ impl NexusToolHandler for Base64DecodeTool {
             .get("input")
             .and_then(Value::as_str)
             .ok_or_else(|| NexusToolError::BadInput("input required".into()))?;
-        let url_safe = args.get("url_safe").and_then(Value::as_bool).unwrap_or(false);
+        let url_safe = args
+            .get("url_safe")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let bytes = if url_safe {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(input.as_bytes())
         } else {
@@ -26,9 +29,8 @@ impl NexusToolHandler for Base64DecodeTool {
         }
         .map_err(|e| NexusToolError::BadInput(format!("base64 decode failed: {}", e)))?;
 
-        let output = String::from_utf8(bytes.clone()).unwrap_or_else(|_| {
-            format!("<binary {}B, not utf-8>", bytes.len())
-        });
+        let output = String::from_utf8(bytes.clone())
+            .unwrap_or_else(|_| format!("<binary {}B, not utf-8>", bytes.len()));
         Ok(json!({
             "ok": true,
             "bytes": bytes.len(),
@@ -59,11 +61,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_b64_decode() {
-        let ctx = NexusToolContext::new(
-            std::env::temp_dir(),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-        );
+        let ctx = NexusToolContext::new(std::env::temp_dir(), uuid::Uuid::nil(), uuid::Uuid::nil());
         let out = Base64DecodeTool
             .execute(&ctx, &json!({"input": "aGVsbG8="}))
             .await
@@ -73,11 +71,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_b64_decode_bad() {
-        let ctx = NexusToolContext::new(
-            std::env::temp_dir(),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-        );
+        let ctx = NexusToolContext::new(std::env::temp_dir(), uuid::Uuid::nil(), uuid::Uuid::nil());
         let res = Base64DecodeTool
             .execute(&ctx, &json!({"input": "!!!not-b64!!!"}))
             .await;

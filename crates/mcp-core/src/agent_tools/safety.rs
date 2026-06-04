@@ -239,7 +239,11 @@ pub fn format_blocked_result(cmd: &str, reason: &BlockReason) -> String {
 }
 
 fn truncate_for_log(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() } else { format!("{}...[truncated]", &s[..max]) }
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...[truncated]", &s[..max])
+    }
 }
 
 #[cfg(test)]
@@ -433,7 +437,10 @@ mod tests {
     #[test]
     fn blocca_curl_a_mcp_core() {
         let r = check_command("curl http://127.0.0.1:4000/api/health");
-        assert!(r.is_some(), "curl verso mcp-core :4000 deve essere bloccato");
+        assert!(
+            r.is_some(),
+            "curl verso mcp-core :4000 deve essere bloccato"
+        );
         assert_eq!(r.unwrap().category, "curl_to_internal");
     }
 

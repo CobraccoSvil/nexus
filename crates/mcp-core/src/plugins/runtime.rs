@@ -19,13 +19,15 @@ pub async fn test_plugin(
 
     let resolution = build_plugin_resolution(&state.db, plugin_instance_id, user_id).await?;
 
-    let (success, tool_count, error_message, tools_payload) =
-        match mcp_client::list_tools(&resolution.config).await {
-            Ok(tools) => {
-                for tool in &tools {
-                    let schema =
-                        serde_json::to_value(&tool.input_schema).unwrap_or_else(|_| json!({}));
-                    let _ = sqlx::query(
+    let (success, tool_count, error_message, tools_payload) = match mcp_client::list_tools(
+        &resolution.config,
+    )
+    .await
+    {
+        Ok(tools) => {
+            for tool in &tools {
+                let schema = serde_json::to_value(&tool.input_schema).unwrap_or_else(|_| json!({}));
+                let _ = sqlx::query(
                         r#"
                     INSERT INTO mcp_server_tools (server_id, tool_name, description, input_schema, discovered_at)
                     VALUES ($1, $2, $3, $4, NOW())
@@ -39,43 +41,46 @@ pub async fn test_plugin(
                     .bind(schema)
                     .execute(&state.db)
                     .await;
-                }
+            }
 
-                // Indicizzazione semantica Qdrant (fire-and-forget)
-                {
-                    let db_idx = state.db.clone();
-                    let neural_idx = state.orchestrator.neural.clone();
-                    let server_id = resolution.mcp_server_id;
-                    let server_name = resolution.mcp_server_name.clone();
-                    let tools_meta: Vec<(String, String)> = tools
-                        .iter()
-                        .map(|t| (t.name.clone(), t.description.clone().unwrap_or_default()))
-                        .collect();
-                    tokio::spawn(async move {
-                        let scope: String = sqlx::query_scalar(
-                            "SELECT COALESCE(scope, 'user') FROM mcp_servers WHERE id=$1",
+            // Indicizzazione semantica Qdrant (fire-and-forget)
+            {
+                let db_idx = state.db.clone();
+                let neural_idx = state.orchestrator.neural.clone();
+                let server_id = resolution.mcp_server_id;
+                let server_name = resolution.mcp_server_name.clone();
+                let tools_meta: Vec<(String, String)> = tools
+                    .iter()
+                    .map(|t| (t.name.clone(), t.description.clone().unwrap_or_default()))
+                    .collect();
+                tokio::spawn(async move {
+                    let scope: String = sqlx::query_scalar(
+                        "SELECT COALESCE(scope, 'user') FROM mcp_servers WHERE id=$1",
+                    )
+                    .bind(server_id)
+                    .fetch_optional(&db_idx)
+                    .await
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| "user".to_string());
+                    for (tname, tdesc) in &tools_meta {
+                        if let Err(e) = crate::nexus_builtin::index_tool(
+                            &db_idx,
+                            &neural_idx,
+                            server_id,
+                            &server_name,
+                            tname,
+                            tdesc,
+                            &scope,
                         )
-                        .bind(server_id)
-                        .fetch_optional(&db_idx)
                         .await
-                        .unwrap_or(None)
-                        .unwrap_or_else(|| "user".to_string());
-                        for (tname, tdesc) in &tools_meta {
-                            if let Err(e) = crate::nexus_builtin::index_tool(
-                                &db_idx, &neural_idx, server_id, &server_name, tname, tdesc, &scope,
-                            )
-                            .await
-                            {
-                                tracing::debug!(
-                                    "plugin index_tool {}/{}: {}",
-                                    server_name, tname, e
-                                );
-                            }
+                        {
+                            tracing::debug!("plugin index_tool {}/{}: {}", server_name, tname, e);
                         }
-                    });
-                }
+                    }
+                });
+            }
 
-                let policy_row = sqlx::query(
+            let policy_row = sqlx::query(
                     "SELECT mode, tools FROM plugin_instance_tool_policies WHERE plugin_instance_id = $1",
                 )
                 .bind(plugin_instance_id)
@@ -83,54 +88,54 @@ pub async fn test_plugin(
                 .await
                 .ok()
                 .flatten();
-                if let Some(policy_row) = policy_row {
-                    let mode: String = policy_row
-                        .try_get("mode")
-                        .unwrap_or_else(|_| "all".to_string());
-                    let current_tools: Value = policy_row.try_get("tools").unwrap_or(json!([]));
-                    let current_count = current_tools.as_array().map(|a| a.len()).unwrap_or(0);
-                    if mode == "allowlist" && current_count == 0 {
-                        let discovered = tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
-                        let _ = sqlx::query(
+            if let Some(policy_row) = policy_row {
+                let mode: String = policy_row
+                    .try_get("mode")
+                    .unwrap_or_else(|_| "all".to_string());
+                let current_tools: Value = policy_row.try_get("tools").unwrap_or(json!([]));
+                let current_count = current_tools.as_array().map(|a| a.len()).unwrap_or(0);
+                if mode == "allowlist" && current_count == 0 {
+                    let discovered = tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+                    let _ = sqlx::query(
                             "UPDATE plugin_instance_tool_policies SET tools = $2, updated_at = NOW() WHERE plugin_instance_id = $1",
                         )
                         .bind(plugin_instance_id)
                         .bind(json!(discovered))
                         .execute(&state.db)
                         .await;
-                    }
                 }
+            }
 
-                let payload = tools
-                    .iter()
-                    .map(|t| {
-                        json!({
-                            "name": t.name,
-                            "description": t.description,
-                            "inputSchema": t.input_schema,
-                        })
+            let payload = tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.input_schema,
                     })
-                    .collect::<Vec<_>>();
-                (true, payload.len() as i32, None, payload)
-            }
-            Err(error) => {
-                let raw_error = error.to_string();
-                let mut msg = format_compact_error(&raw_error);
-                if resolution.plugin_slug.eq_ignore_ascii_case("figma-http")
-                    && raw_error.contains("HTTP 401")
-                {
-                    let token_hint = resolve_secret_value(&state.db, "figma_oauth_token").await;
-                    msg = if token_hint.as_deref().map(is_figma_pat).unwrap_or(false) {
-                        "MCP Figma ha rifiutato la connessione remota (401). Il token PAT figd_ funziona con REST API ma può non essere valido sul remote MCP: in Nexus è attivo fallback stdio `figma-developer-mcp`. Verifica token e riesegui il test."
+                })
+                .collect::<Vec<_>>();
+            (true, payload.len() as i32, None, payload)
+        }
+        Err(error) => {
+            let raw_error = error.to_string();
+            let mut msg = format_compact_error(&raw_error);
+            if resolution.plugin_slug.eq_ignore_ascii_case("figma-http")
+                && raw_error.contains("HTTP 401")
+            {
+                let token_hint = resolve_secret_value(&state.db, "figma_oauth_token").await;
+                msg = if token_hint.as_deref().map(is_figma_pat).unwrap_or(false) {
+                    "MCP Figma ha rifiutato la connessione remota (401). Il token PAT figd_ funziona con REST API ma può non essere valido sul remote MCP: in Nexus è attivo fallback stdio `figma-developer-mcp`. Verifica token e riesegui il test."
                             .to_string()
-                    } else {
-                        "MCP Figma ha rifiutato la connessione remota (401). Verifica OAuth app Figma (client_id/client_secret), scope `mcp:connect` e callback."
+                } else {
+                    "MCP Figma ha rifiutato la connessione remota (401). Verifica OAuth app Figma (client_id/client_secret), scope `mcp:connect` e callback."
                             .to_string()
-                    };
-                }
-                (false, 0, Some(msg.clone()), Vec::new())
+                };
             }
-        };
+            (false, 0, Some(msg.clone()), Vec::new())
+        }
+    };
 
     let _ = sqlx::query(
         r#"

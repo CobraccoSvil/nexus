@@ -10,10 +10,23 @@ const SENSITIVE_PREFIXES: &[&str] = &["url.", "credential.", "remote."];
 
 #[async_trait]
 impl NexusToolHandler for GitConfigListTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let out = run_cmd("git", &["config", "--list", "--local"], &ctx.project_root, ctx.timeout_secs).await?;
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let out = run_cmd(
+            "git",
+            &["config", "--list", "--local"],
+            &ctx.project_root,
+            ctx.timeout_secs,
+        )
+        .await?;
         if !out.success() {
-            return Err(NexusToolError::Exec { exit_code: out.exit_code, stderr: out.stderr });
+            return Err(NexusToolError::Exec {
+                exit_code: out.exit_code,
+                stderr: out.stderr,
+            });
         }
         let mut map = Map::new();
         for line in out.stdout.lines() {
@@ -29,5 +42,7 @@ impl NexusToolHandler for GitConfigListTool {
         }
         Ok(json!({"ok": true, "count": map.len(), "config": Value::Object(map)}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only_subproc()
+    }
 }

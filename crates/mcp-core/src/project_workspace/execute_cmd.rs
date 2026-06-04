@@ -86,12 +86,20 @@ pub async fn execute_command(
             let exit_code = output.status.code().unwrap_or(-1);
 
             let stdout_out = if stdout.len() > max_output {
-                format!("{}...\n[troncato a {} byte]", &stdout[..max_output], max_output)
+                format!(
+                    "{}...\n[troncato a {} byte]",
+                    &stdout[..max_output],
+                    max_output
+                )
             } else {
                 stdout.to_string()
             };
             let stderr_out = if stderr.len() > max_output {
-                format!("{}...\n[troncato a {} byte]", &stderr[..max_output], max_output)
+                format!(
+                    "{}...\n[troncato a {} byte]",
+                    &stderr[..max_output],
+                    max_output
+                )
             } else {
                 stderr.to_string()
             };

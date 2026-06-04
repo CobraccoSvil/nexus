@@ -3,11 +3,11 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use sqlx::PgPool;
-use tokio;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::PgPool;
 use std::path::PathBuf;
+use tokio;
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Setting {
@@ -149,8 +149,10 @@ async fn ensure_required_settings(state: &super::AppState) {
     // I valori di default vengono presi da env (NEXUS_DLP_*). Se l'utente ha già impostato qualcosa
     // nel DB (valore non vuoto), non lo sovrascriviamo.
     let dlp_enabled = std::env::var("NEXUS_DLP_ENABLED").unwrap_or_else(|_| "true".to_string());
-    let allow_tier2 = std::env::var("NEXUS_ALLOW_CLOUD_TIER2").unwrap_or_else(|_| "true".to_string());
-    let allow_tier3 = std::env::var("NEXUS_ALLOW_CLOUD_TIER3").unwrap_or_else(|_| "false".to_string());
+    let allow_tier2 =
+        std::env::var("NEXUS_ALLOW_CLOUD_TIER2").unwrap_or_else(|_| "true".to_string());
+    let allow_tier3 =
+        std::env::var("NEXUS_ALLOW_CLOUD_TIER3").unwrap_or_else(|_| "false".to_string());
 
     let _ = sqlx::query(
         r#"
@@ -467,15 +469,16 @@ pub async fn update_setting(
 
     // Notifica tutti i client connessi (evento system-wide)
     let ns = key.split('_').next().unwrap_or("admin").to_string();
-    nexus_events::dispatcher::broadcast_all_global(
-        nexus_events::ProjectEvent::SettingChanged {
-            namespace: ns,
-            key: key.clone(),
-        },
-    );
+    nexus_events::dispatcher::broadcast_all_global(nexus_events::ProjectEvent::SettingChanged {
+        namespace: ns,
+        key: key.clone(),
+    });
 
     // Invalida cache DLP se è cambiata una chiave di configurazione DLP
-    if matches!(key.as_str(), "dlp_enabled" | "dlp_allow_cloud_tier2" | "dlp_allow_cloud_tier3") {
+    if matches!(
+        key.as_str(),
+        "dlp_enabled" | "dlp_allow_cloud_tier2" | "dlp_allow_cloud_tier3"
+    ) {
         crate::dlp::invalidate_dlp_cache();
     }
 
@@ -492,7 +495,8 @@ pub async fn update_setting(
             let neural_url = std::env::var("NEURAL_CORE_REST_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
             let client = nexus_http::build_client();
-            let _ = client.post(&format!("{}/reload-settings", neural_url))
+            let _ = client
+                .post(&format!("{}/reload-settings", neural_url))
                 .json(&serde_json::json!({}))
                 .send()
                 .await;
@@ -502,7 +506,8 @@ pub async fn update_setting(
             let neural_url = std::env::var("NEURAL_CORE_REST_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
             let client = nexus_http::build_client();
-            let _ = client.post(&format!("{}/reload-settings", neural_url))
+            let _ = client
+                .post(&format!("{}/reload-settings", neural_url))
                 .json(&serde_json::json!({}))
                 .send()
                 .await;
@@ -548,10 +553,12 @@ pub async fn bulk_update(
     }
 
     // Se sono state cambiate chiavi DLP, invalida la cache in-process
-    let has_dlp_key = body
-        .settings
-        .iter()
-        .any(|e| matches!(e.key.as_str(), "dlp_enabled" | "dlp_allow_cloud_tier2" | "dlp_allow_cloud_tier3"));
+    let has_dlp_key = body.settings.iter().any(|e| {
+        matches!(
+            e.key.as_str(),
+            "dlp_enabled" | "dlp_allow_cloud_tier2" | "dlp_allow_cloud_tier3"
+        )
+    });
     if has_dlp_key {
         crate::dlp::invalidate_dlp_cache();
     }

@@ -2,16 +2,16 @@
 // knowledge/mod.rs — Knowledge Base per-progetto (Obsidian-compatible)
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub mod vault;
-pub mod routes;
-pub mod generators;
-pub mod functional_spec_agent;
-pub mod graph_import;
-pub mod code_graph;
-pub mod code_doc;
 pub mod auto_link;
-pub mod ingest_run;
+pub mod code_doc;
+pub mod code_graph;
+pub mod functional_spec_agent;
+pub mod generators;
+pub mod graph_import;
 pub mod impact;
+pub mod ingest_run;
+pub mod routes;
+pub mod vault;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -40,13 +40,7 @@ pub fn slug_from_title(title: &str, max_len: usize) -> String {
     let slug: String = title
         .to_lowercase()
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c
-            } else {
-                '-'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     // Rimuovi trattini consecutivi e trim
     let mut result = String::with_capacity(slug.len());
@@ -203,14 +197,15 @@ pub async fn create_note_inner(
             vault_file_path = Some(rel_path.clone());
 
             // Assicura .gitignore contenga .nexus/ (se commit_vault_to_git = false)
-            let commit_to_git = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ")
-                .bind("knowledge.commit_vault_to_git")
-                .fetch_optional(db)
-                .await
-                .ok()
-                .flatten()
-                .map(|v| v.trim() == "true")
-                .unwrap_or(false);
+            let commit_to_git =
+                sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ")
+                    .bind("knowledge.commit_vault_to_git")
+                    .fetch_optional(db)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|v| v.trim() == "true")
+                    .unwrap_or(false);
             if !commit_to_git {
                 vault::ensure_gitignore_entry(root).await;
             }
@@ -304,8 +299,15 @@ pub async fn seed_knowledge_from_insights(
     project_channels: nexus_events::ProjectChannels,
 ) {
     if let Err(e) = seed_knowledge_inner(
-        &db, &neural, project_id, &insights, repo_root.as_deref(), &project_channels,
-    ).await {
+        &db,
+        &neural,
+        project_id,
+        &insights,
+        repo_root.as_deref(),
+        &project_channels,
+    )
+    .await
+    {
         tracing::warn!(
             project_id = %project_id,
             "seed knowledge da analisi fallito: {e}"
@@ -324,16 +326,27 @@ async fn seed_knowledge_inner(
     use anyhow::Context;
 
     // --- 1. Nota panoramica progetto ---
-    let summary = insights.get("project_summary").and_then(|v| v.as_str()).unwrap_or("");
-    let domain = insights.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+    let summary = insights
+        .get("project_summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let domain = insights
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let arch = insights.get("architecture").cloned().unwrap_or(json!({}));
     let arch_pattern = arch.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-    let arch_desc = arch.get("description").and_then(|v| v.as_str()).unwrap_or("");
-    let primary_langs: Vec<&str> = arch.get("primary_languages")
+    let arch_desc = arch
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let primary_langs: Vec<&str> = arch
+        .get("primary_languages")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
-    let primary_fw: Vec<&str> = arch.get("primary_frameworks")
+    let primary_fw: Vec<&str> = arch
+        .get("primary_frameworks")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
@@ -350,25 +363,56 @@ async fn seed_knowledge_inner(
         );
         let overview_title = format!("Panoramica progetto: {}", &summary[..summary.len().min(50)]);
         let mut tags = vec!["analisi-progetto".to_string(), "panoramica".to_string()];
-        if !domain.is_empty() { tags.push(domain.to_lowercase()); }
-        for lang in &primary_langs { tags.push(lang.to_lowercase()); }
+        if !domain.is_empty() {
+            tags.push(domain.to_lowercase());
+        }
+        for lang in &primary_langs {
+            tags.push(lang.to_lowercase());
+        }
 
         insert_seed_note(
-            db, neural, project_id, &overview_title, &overview_body,
-            "analysis", &tags, &[], repo_root, project_channels,
-        ).await.ok();
+            db,
+            neural,
+            project_id,
+            &overview_title,
+            &overview_body,
+            "analysis",
+            &tags,
+            &[],
+            repo_root,
+            project_channels,
+        )
+        .await
+        .ok();
     }
 
     // --- 2. Note per config_issues ---
     if let Some(issues) = insights.get("config_issues").and_then(|v| v.as_array()) {
         for issue in issues {
-            let severity = issue.get("severity").and_then(|v| v.as_str()).unwrap_or("medium");
-            let title_raw = issue.get("title").and_then(|v| v.as_str()).unwrap_or("Problema di configurazione");
-            let description = issue.get("description").and_then(|v| v.as_str()).unwrap_or("");
-            let suggested_fix = issue.get("suggested_fix").and_then(|v| v.as_str()).unwrap_or("");
-            let files: Vec<String> = issue.get("files")
+            let severity = issue
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("medium");
+            let title_raw = issue
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Problema di configurazione");
+            let description = issue
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let suggested_fix = issue
+                .get("suggested_fix")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let files: Vec<String> = issue
+                .get("files")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
 
             let body = format!(
@@ -386,18 +430,37 @@ async fn seed_knowledge_inner(
             ];
 
             insert_seed_note(
-                db, neural, project_id, &title, &body,
-                "fix", &tags, &files, repo_root, project_channels,
-            ).await.ok();
+                db,
+                neural,
+                project_id,
+                &title,
+                &body,
+                "fix",
+                &tags,
+                &files,
+                repo_root,
+                project_channels,
+            )
+            .await
+            .ok();
         }
     }
 
     // --- 3. Note per suggested_actions ---
     if let Some(actions) = insights.get("suggested_actions").and_then(|v| v.as_array()) {
         for action in actions {
-            let priority = action.get("priority").and_then(|v| v.as_str()).unwrap_or("medium");
-            let title_raw = action.get("title").and_then(|v| v.as_str()).unwrap_or("Azione suggerita");
-            let rationale = action.get("rationale").and_then(|v| v.as_str()).unwrap_or("");
+            let priority = action
+                .get("priority")
+                .and_then(|v| v.as_str())
+                .unwrap_or("medium");
+            let title_raw = action
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Azione suggerita");
+            let rationale = action
+                .get("rationale")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let command = action.get("command").and_then(|v| v.as_str()).unwrap_or("");
 
             let body = format!(
@@ -415,9 +478,19 @@ async fn seed_knowledge_inner(
             ];
 
             insert_seed_note(
-                db, neural, project_id, &title, &body,
-                "improvement", &tags, &[], repo_root, project_channels,
-            ).await.ok();
+                db,
+                neural,
+                project_id,
+                &title,
+                &body,
+                "improvement",
+                &tags,
+                &[],
+                repo_root,
+                project_channels,
+            )
+            .await
+            .ok();
         }
     }
 
@@ -451,7 +524,11 @@ async fn insert_seed_note(
     let note_id = Uuid::new_v4();
 
     // Embedding
-    let embed_text = if body_md.len() > 2000 { &body_md[..2000] } else { body_md };
+    let embed_text = if body_md.len() > 2000 {
+        &body_md[..2000]
+    } else {
+        body_md
+    };
     let embed = neural.embed_text("", embed_text).await?;
     let point_id = Uuid::new_v4().to_string();
 
@@ -479,8 +556,8 @@ async fn insert_seed_note(
     let vault_content = vault::serialize_note(
         note_id,
         project_id,
-        None,  // nessun source_message_id
-        None,  // nessun source_run_id
+        None, // nessun source_message_id
+        None, // nessun source_run_id
         Some(intent),
         "active",
         tags,

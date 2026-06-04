@@ -81,7 +81,10 @@ impl NexusToolHandler for RuVectorInsertTool {
             .map(|v| v.clamp(0.0, 1.0) as f32)
             .unwrap_or(1.0);
 
-        match bridge.ruvector().insert_with_persist(id.clone(), vector, Some(metadata), confidence) {
+        match bridge
+            .ruvector()
+            .insert_with_persist(id.clone(), vector, Some(metadata), confidence)
+        {
             Ok(node_id) => {
                 let stats = bridge.ruvector().stats();
                 nexus_events::dispatcher::emit_global(
@@ -140,11 +143,7 @@ mod tests {
     #[tokio::test]
     async fn test_insert_without_bridge() {
         // Senza bridge globale init, l'handler ritorna ok=false con reason
-        let ctx = NexusToolContext::new(
-            std::env::temp_dir(),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-        );
+        let ctx = NexusToolContext::new(std::env::temp_dir(), uuid::Uuid::nil(), uuid::Uuid::nil());
         let out = RuVectorInsertTool
             .execute(&ctx, &json!({"text": "hello world"}))
             .await

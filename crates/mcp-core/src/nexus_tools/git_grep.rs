@@ -12,11 +12,7 @@ pub struct GitGrepTool;
 
 #[async_trait]
 impl NexusToolHandler for GitGrepTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let pattern = args
             .get("pattern")
             .and_then(Value::as_str)
@@ -57,7 +53,10 @@ impl NexusToolHandler for GitGrepTool {
             // format: path:line:text
             let mut parts = line.splitn(3, ':');
             let path = parts.next().unwrap_or("");
-            let line_no = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+            let line_no = parts
+                .next()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
             let text = parts.next().unwrap_or("");
             if !path.is_empty() {
                 items.push(json!({

@@ -44,9 +44,21 @@ fn stub_content(name: &str) -> Option<&'static str> {
 }
 
 const SUPPORTED_LIST: &[&str] = &[
-    "button", "input", "label", "card", "alert", "tabs", "table",
-    "badge", "separator", "sonner", "dialog", "dropdown-menu",
-    "select", "popover", "textarea",
+    "button",
+    "input",
+    "label",
+    "card",
+    "alert",
+    "tabs",
+    "table",
+    "badge",
+    "separator",
+    "sonner",
+    "dialog",
+    "dropdown-menu",
+    "select",
+    "popover",
+    "textarea",
 ];
 
 pub(super) async fn tool_nexus_install_shadcn_components(
@@ -61,8 +73,12 @@ pub(super) async fn tool_nexus_install_shadcn_components(
             .filter(|s| !s.is_empty())
             .collect(),
         _ => vec![
-            "button".into(), "input".into(), "label".into(),
-            "card".into(), "alert".into(), "tabs".into(),
+            "button".into(),
+            "input".into(),
+            "label".into(),
+            "card".into(),
+            "alert".into(),
+            "tabs".into(),
             "sonner".into(),
         ],
     };

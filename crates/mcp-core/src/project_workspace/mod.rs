@@ -3,6 +3,7 @@ pub mod allocate_port;
 pub mod auto_bootstrap;
 pub mod browser_check;
 pub mod changes;
+pub mod execute_cmd;
 pub mod fs_events;
 pub mod logs;
 pub mod playwright_install;
@@ -11,11 +12,10 @@ pub mod processes;
 pub mod run_configs;
 pub mod runtime_issues;
 pub mod scan_ports;
-pub mod sync_ports;
 pub mod services;
+pub mod sync_ports;
 pub mod wizard;
 pub mod workbench;
-pub mod execute_cmd;
 
 // Import condivisi usati da tutti i sotto-moduli tramite `use super::*`
 use std::collections::BTreeMap;
@@ -31,25 +31,22 @@ use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::{auth::Claims, AppState};
 use crate::nexus_gateway::{GwMessage, GwMetadata, GwRequest};
 use crate::projects::{
     api_error, list_directory_nodes, load_project_context, load_projects_base_root,
     load_user_project_preferences, parse_user_id, refresh_git_snapshot,
-    save_user_project_preferences, sign_terminal_token, terminal_session_secret,
-    terminal_shell, upsert_open_session, WorkbenchStateUpdateRequest,
-    TerminalSessionClaims, TerminalSessionResponse,
+    save_user_project_preferences, sign_terminal_token, terminal_session_secret, terminal_shell,
+    upsert_open_session, TerminalSessionClaims, TerminalSessionResponse,
+    WorkbenchStateUpdateRequest,
 };
+use crate::{auth::Claims, AppState};
 
 type ApiError = (StatusCode, Json<Value>);
 type ApiResult = Result<Json<Value>, ApiError>;
 
 // Re-esportazioni pubbliche: mantengono la stessa interfaccia del file monolitico originale
 pub use workbench::{
-    open_project,
-    get_workbench_state,
-    update_workbench_state,
-    create_terminal_session,
+    create_terminal_session, get_workbench_state, open_project, update_workbench_state,
 };
 
 pub use changes::get_project_changes;
@@ -62,50 +59,26 @@ pub use allocate_port::kill_port_process as kill_project_port_process;
 pub use execute_cmd::execute_command;
 
 pub use services::{
-    get_project_services_status,
-    control_project_service,
+    cleanup_project_ports, control_project_service, create_port_allocation, delete_port_allocation,
+    get_port_allocations, get_project_ports, get_project_services_status,
     restart_all_project_services,
-    cleanup_project_ports,
-    get_project_ports,
-    get_port_allocations,
-    create_port_allocation,
-    delete_port_allocation,
 };
 
 pub use logs::{
-    get_project_problems,
-    get_output_channels,
-    get_output_events,
-    get_playwright_runs,
-    get_playwright_run_detail,
-    stream_playwright_run,
-    clear_playwright_runs,
-    serve_playwright_artifact,
+    clear_playwright_runs, get_output_channels, get_output_events, get_playwright_run_detail,
+    get_playwright_runs, get_project_problems, serve_playwright_artifact, stream_playwright_run,
 };
 
-pub use wizard::{
-    wizard_detect_services,
-    wizard_install_service,
-    uninstall_project_service,
-};
+pub use wizard::{uninstall_project_service, wizard_detect_services, wizard_install_service};
 
 pub use run_configs::{
-    compute_run_config_suggestions,
-    save_suggestions_cache,
-    detect_run_configs,
-    get_run_configs,
-    create_run_config,
-    update_run_config,
-    delete_run_config,
-    launch_run_config,
+    compute_run_config_suggestions, create_run_config, delete_run_config, detect_run_configs,
+    get_run_configs, launch_run_config, save_suggestions_cache, update_run_config,
     CreateRunConfigBody,
 };
 
 pub use processes::{
-    get_sandbox_config_api,
-    set_sandbox_config_api,
-    stop_agent_process,
-    clear_finished_processes,
+    clear_finished_processes, get_sandbox_config_api, set_sandbox_config_api, stop_agent_process,
     stream_agent_process_logs,
 };
 
@@ -123,7 +96,10 @@ pub(super) fn walkdir_specs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
             if p.is_dir() {
                 out.extend(walkdir_specs(&p));
             } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".spec.ts") || name.ends_with(".spec.js") || name.ends_with(".spec.mts") {
+                if name.ends_with(".spec.ts")
+                    || name.ends_with(".spec.js")
+                    || name.ends_with(".spec.mts")
+                {
                     out.push(p);
                 }
             }
@@ -140,25 +116,32 @@ mod tests {
     use tempfile::tempdir;
 
     fn has_label_containing(suggestions: &[Value], fragment: &str) -> bool {
-        suggestions.iter().any(|s| s.get("label")
-            .and_then(|l| l.as_str())
-            .map(|l| l.contains(fragment))
-            .unwrap_or(false))
+        suggestions.iter().any(|s| {
+            s.get("label")
+                .and_then(|l| l.as_str())
+                .map(|l| l.contains(fragment))
+                .unwrap_or(false)
+        })
     }
 
     fn find_label_containing<'a>(suggestions: &'a [Value], fragment: &str) -> Option<&'a Value> {
-        suggestions.iter().find(|s| s.get("label")
-            .and_then(|l| l.as_str())
-            .map(|l| l.contains(fragment))
-            .unwrap_or(false))
+        suggestions.iter().find(|s| {
+            s.get("label")
+                .and_then(|l| l.as_str())
+                .map(|l| l.contains(fragment))
+                .unwrap_or(false)
+        })
     }
 
     #[test]
     fn detects_dev_compose_variant() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        fs::write(root.join("docker-compose.dev.yml"),
-            "services:\n  backend:\n    image: foo\n").unwrap();
+        fs::write(
+            root.join("docker-compose.dev.yml"),
+            "services:\n  backend:\n    image: foo\n",
+        )
+        .unwrap();
 
         let suggestions = compute_run_config_suggestions(root);
 
@@ -177,19 +160,28 @@ mod tests {
         fs::write(root.join("App.sln"), "").unwrap();
         let proj = root.join("Api");
         fs::create_dir_all(&proj).unwrap();
-        fs::write(proj.join("Api.csproj"),
-            "<Project Sdk=\"Microsoft.NET.Sdk.Web\"></Project>").unwrap();
+        fs::write(
+            proj.join("Api.csproj"),
+            "<Project Sdk=\"Microsoft.NET.Sdk.Web\"></Project>",
+        )
+        .unwrap();
         fs::write(root.join("Dockerfile.dev"), "FROM scratch\n").unwrap();
 
         let suggestions = compute_run_config_suggestions(root);
 
         let dotnet = find_label_containing(&suggestions, "dotnet run")
             .expect("la voce dotnet run deve comunque esistere");
-        assert_eq!(dotnet.get("essential").and_then(|v| v.as_bool()), Some(false),
-            "dotnet run deve essere demosso in progetti containerizzati");
+        assert_eq!(
+            dotnet.get("essential").and_then(|v| v.as_bool()),
+            Some(false),
+            "dotnet run deve essere demosso in progetti containerizzati"
+        );
         let group = dotnet.get("group").and_then(|v| v.as_str()).unwrap_or("");
-        assert!(group.contains("richiede SDK locale"),
-            "il group deve segnalare il prerequisito, era: {}", group);
+        assert!(
+            group.contains("richiede SDK locale"),
+            "il group deve segnalare il prerequisito, era: {}",
+            group
+        );
     }
 
     #[test]
@@ -224,36 +216,69 @@ lint:\n\
     #[test]
     fn compose_file_rank_ordering() {
         use std::path::PathBuf;
-        assert_eq!(wizard::compose_file_rank(&PathBuf::from("docker-compose.dev.yml")), 0);
-        assert_eq!(wizard::compose_file_rank(&PathBuf::from("compose.dev.yaml")), 0);
-        assert_eq!(wizard::compose_file_rank(&PathBuf::from("docker-compose.local.yml")), 1);
-        assert_eq!(wizard::compose_file_rank(&PathBuf::from("docker-compose.yml")), 2);
+        assert_eq!(
+            wizard::compose_file_rank(&PathBuf::from("docker-compose.dev.yml")),
+            0
+        );
+        assert_eq!(
+            wizard::compose_file_rank(&PathBuf::from("compose.dev.yaml")),
+            0
+        );
+        assert_eq!(
+            wizard::compose_file_rank(&PathBuf::from("docker-compose.local.yml")),
+            1
+        );
+        assert_eq!(
+            wizard::compose_file_rank(&PathBuf::from("docker-compose.yml")),
+            2
+        );
         assert_eq!(wizard::compose_file_rank(&PathBuf::from("compose.yaml")), 2);
-        assert_eq!(wizard::compose_file_rank(&PathBuf::from("docker-compose.prod.yml")), 3);
+        assert_eq!(
+            wizard::compose_file_rank(&PathBuf::from("docker-compose.prod.yml")),
+            3
+        );
     }
 
     #[test]
     fn base_compose_demoted_when_dev_variant_exists() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        fs::write(root.join("docker-compose.yml"),
-            "services:\n  backend:\n    image: foo\n").unwrap();
-        fs::write(root.join("docker-compose.dev.yml"),
-            "services:\n  backend:\n    image: foo\n").unwrap();
+        fs::write(
+            root.join("docker-compose.yml"),
+            "services:\n  backend:\n    image: foo\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docker-compose.dev.yml"),
+            "services:\n  backend:\n    image: foo\n",
+        )
+        .unwrap();
 
         let suggestions = compute_run_config_suggestions(root);
 
         let dev_up = find_label_containing(&suggestions, "docker-compose.dev.yml up backend")
             .expect("atteso up backend dal compose dev");
-        assert_eq!(dev_up.get("essential").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            dev_up.get("essential").and_then(|v| v.as_bool()),
+            Some(true)
+        );
 
         // Il bundle `up` del file base non deve essere essential quando c'è un dev.
-        let base_up_bundle = suggestions.iter().find(|s| {
-            let label = s.get("label").and_then(|l| l.as_str()).unwrap_or("");
-            label == "docker compose -f docker-compose.yml up"
-        }).expect("atteso bundle up dal compose base");
-        assert_eq!(base_up_bundle.get("essential").and_then(|v| v.as_bool()), Some(false));
+        let base_up_bundle = suggestions
+            .iter()
+            .find(|s| {
+                let label = s.get("label").and_then(|l| l.as_str()).unwrap_or("");
+                label == "docker compose -f docker-compose.yml up"
+            })
+            .expect("atteso bundle up dal compose base");
+        assert_eq!(
+            base_up_bundle.get("essential").and_then(|v| v.as_bool()),
+            Some(false)
+        );
 
-        assert!(has_label_containing(&suggestions, "docker-compose.yml up backend"));
+        assert!(has_label_containing(
+            &suggestions,
+            "docker-compose.yml up backend"
+        ));
     }
 }

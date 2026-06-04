@@ -47,7 +47,9 @@ pub struct LearningFeedbackRequest {
     pub is_terminal: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 /// Risposta: nuovo Q-value calcolato per (task_type, agent_type).
 #[derive(Debug, Serialize)]
@@ -66,7 +68,10 @@ pub async fn submit_feedback(
         return Err((StatusCode::BAD_REQUEST, "campo `task_id` vuoto".to_string()));
     }
     if body.agent_type.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "campo `agent_type` vuoto".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "campo `agent_type` vuoto".to_string(),
+        ));
     }
 
     let bridge = match crate::nexus_bridge::NexusBridge::global() {
@@ -98,11 +103,19 @@ pub async fn submit_feedback(
         success,
         reward,
         body.duration_ms,
-        if success { None } else { Some("reward<0.5".to_string()) },
+        if success {
+            None
+        } else {
+            Some("reward<0.5".to_string())
+        },
     );
     tracing::info!(
         "internal_learning: feedback task_id={} task_type={} agent={} reward={:.2} -> Q={:.3}",
-        body.task_id, body.task_type, body.agent_type, reward, new_q,
+        body.task_id,
+        body.task_type,
+        body.agent_type,
+        reward,
+        new_q,
     );
 
     Ok(Json(LearningFeedbackResponse {

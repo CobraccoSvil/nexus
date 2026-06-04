@@ -18,7 +18,10 @@ impl NexusToolHandler for UuidGenerateTool {
             .and_then(Value::as_u64)
             .unwrap_or(1)
             .min(100) as usize;
-        let hyphenated = args.get("hyphenated").and_then(Value::as_bool).unwrap_or(true);
+        let hyphenated = args
+            .get("hyphenated")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
             let u = uuid::Uuid::new_v4();
@@ -56,11 +59,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_uuid_gen() {
-        let ctx = NexusToolContext::new(
-            std::env::temp_dir(),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-        );
+        let ctx = NexusToolContext::new(std::env::temp_dir(), uuid::Uuid::nil(), uuid::Uuid::nil());
         let out = UuidGenerateTool
             .execute(&ctx, &json!({"count": 3}))
             .await

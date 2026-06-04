@@ -8,7 +8,11 @@ pub struct GitFsckTool;
 
 #[async_trait]
 impl NexusToolHandler for GitFsckTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let out = run_cmd(
             "git",
             &["fsck", "--no-progress", "--no-dangling"],
@@ -25,5 +29,7 @@ impl NexusToolHandler for GitFsckTool {
             "duration_ms": out.duration_ms,
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only_subproc()
+    }
 }

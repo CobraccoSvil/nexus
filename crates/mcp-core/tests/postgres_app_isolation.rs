@@ -21,8 +21,9 @@ async fn nexus_pool() -> Option<PgPool> {
 
 async fn app_pool() -> Option<PgPool> {
     // Admin del cluster postgres-app (porta 5434) per ispezione roles.
-    let url = env::var("NEXUS_APP_ADMIN_URL")
-        .unwrap_or_else(|_| "postgres://nexus_admin:nexus_admin_secret@localhost:5434/postgres".into());
+    let url = env::var("NEXUS_APP_ADMIN_URL").unwrap_or_else(|_| {
+        "postgres://nexus_admin:nexus_admin_secret@localhost:5434/postgres".into()
+    });
     PgPool::connect(&url).await.ok()
 }
 
@@ -37,10 +38,16 @@ async fn cluster_app_e_separato_dal_cluster_nexus() {
         return;
     };
     // Identifico i cluster via system_identifier (univoco per data directory).
-    let nexus_id: i64 = sqlx::query_scalar("SELECT system_identifier::bigint FROM pg_control_system()")
-        .fetch_one(&nexus).await.unwrap_or(0);
-    let app_id: i64 = sqlx::query_scalar("SELECT system_identifier::bigint FROM pg_control_system()")
-        .fetch_one(&app).await.unwrap_or(0);
+    let nexus_id: i64 =
+        sqlx::query_scalar("SELECT system_identifier::bigint FROM pg_control_system()")
+            .fetch_one(&nexus)
+            .await
+            .unwrap_or(0);
+    let app_id: i64 =
+        sqlx::query_scalar("SELECT system_identifier::bigint FROM pg_control_system()")
+            .fetch_one(&app)
+            .await
+            .unwrap_or(0);
     assert!(
         nexus_id != 0 && app_id != 0 && nexus_id != app_id,
         "i due cluster condividono il system_identifier {nexus_id} → NON sono fisicamente separati"
@@ -49,26 +56,42 @@ async fn cluster_app_e_separato_dal_cluster_nexus() {
 
 #[tokio::test]
 async fn role_nexus_app_esiste_solo_nel_cluster_app() {
-    let Some(nexus) = nexus_pool().await else { eprintln!("skip"); return; };
-    let Some(app) = app_pool().await else { eprintln!("skip"); return; };
+    let Some(nexus) = nexus_pool().await else {
+        eprintln!("skip");
+        return;
+    };
+    let Some(app) = app_pool().await else {
+        eprintln!("skip");
+        return;
+    };
     // Nel cluster app: deve esistere
-    let in_app: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM pg_roles WHERE rolname = 'nexus_app'",
-    )
-    .fetch_one(&app).await.unwrap_or(0);
-    assert_eq!(in_app, 1, "role nexus_app DEVE esistere nel cluster postgres-app");
+    let in_app: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM pg_roles WHERE rolname = 'nexus_app'")
+            .fetch_one(&app)
+            .await
+            .unwrap_or(0);
+    assert_eq!(
+        in_app, 1,
+        "role nexus_app DEVE esistere nel cluster postgres-app"
+    );
     // Nel cluster nexus: NON deve esistere (isolation fisica)
-    let in_nexus: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM pg_roles WHERE rolname = 'nexus_app'",
-    )
-    .fetch_one(&nexus).await.unwrap_or(0);
-    assert_eq!(in_nexus, 0,
-        "role nexus_app NON deve esistere nel cluster postgres-nexus (rottura isolation L2+L6)");
+    let in_nexus: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM pg_roles WHERE rolname = 'nexus_app'")
+            .fetch_one(&nexus)
+            .await
+            .unwrap_or(0);
+    assert_eq!(
+        in_nexus, 0,
+        "role nexus_app NON deve esistere nel cluster postgres-nexus (rottura isolation L2+L6)"
+    );
 }
 
 #[tokio::test]
 async fn nexus_app_ha_privilegi_minimali() {
-    let Some(app) = app_pool().await else { eprintln!("skip"); return; };
+    let Some(app) = app_pool().await else {
+        eprintln!("skip");
+        return;
+    };
     let row = sqlx::query(
         "SELECT rolsuper, rolcreaterole, rolreplication, rolbypassrls, rolcreatedb
          FROM pg_roles WHERE rolname = 'nexus_app'",
@@ -86,13 +109,25 @@ async fn nexus_app_ha_privilegi_minimali() {
     assert!(!createrole, "nexus_app NON deve poter creare role");
     assert!(!replication, "nexus_app NON deve poter fare replication");
     assert!(!bypassrls, "nexus_app NON deve bypassare RLS");
-    assert!(createdb, "nexus_app DEVE poter CREATE DATABASE (provisioning app DBs)");
+    assert!(
+        createdb,
+        "nexus_app DEVE poter CREATE DATABASE (provisioning app DBs)"
+    );
 }
 
 #[tokio::test]
 async fn cluster_app_non_ha_tabelle_infrastruttura_nexus() {
-    let Some(app) = app_pool().await else { eprintln!("skip"); return; };
-    let proibite = ["agent_runs", "nexus_agent_plans", "chat_sessions", "settings", "projects"];
+    let Some(app) = app_pool().await else {
+        eprintln!("skip");
+        return;
+    };
+    let proibite = [
+        "agent_runs",
+        "nexus_agent_plans",
+        "chat_sessions",
+        "settings",
+        "projects",
+    ];
     for t in proibite {
         let exists: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM information_schema.tables WHERE table_name = $1",

@@ -140,40 +140,66 @@ async fn run_cycle(
     let gateway_result = probe_gateway().await;
 
     // Aggiorna stato atomico
-    status.qdrant.store(qdrant_result.healthy, Ordering::Relaxed);
-    status.embedder.store(embedder_result.healthy, Ordering::Relaxed);
-    status.gateway.store(gateway_result.healthy, Ordering::Relaxed);
-    status.last_check.store(Utc::now().timestamp(), Ordering::Relaxed);
+    status
+        .qdrant
+        .store(qdrant_result.healthy, Ordering::Relaxed);
+    status
+        .embedder
+        .store(embedder_result.healthy, Ordering::Relaxed);
+    status
+        .gateway
+        .store(gateway_result.healthy, Ordering::Relaxed);
+    status
+        .last_check
+        .store(Utc::now().timestamp(), Ordering::Relaxed);
 
     // Log su cambio stato (evita spam nei log)
     if !qdrant_result.healthy && was_qdrant_ok {
         tracing::warn!(
             "task_watchdog: qdrant DOWN — {} ({}ms)",
-            qdrant_result.error_message.as_deref().unwrap_or("sconosciuto"),
+            qdrant_result
+                .error_message
+                .as_deref()
+                .unwrap_or("sconosciuto"),
             qdrant_result.latency_ms.unwrap_or(0),
         );
     } else if qdrant_result.healthy && !was_qdrant_ok {
-        tracing::info!("task_watchdog: qdrant RIPRISTINATO ({}ms)", qdrant_result.latency_ms.unwrap_or(0));
+        tracing::info!(
+            "task_watchdog: qdrant RIPRISTINATO ({}ms)",
+            qdrant_result.latency_ms.unwrap_or(0)
+        );
     }
 
     if !embedder_result.healthy && was_embedder_ok {
         tracing::warn!(
             "task_watchdog: embedder DOWN — {} ({}ms)",
-            embedder_result.error_message.as_deref().unwrap_or("sconosciuto"),
+            embedder_result
+                .error_message
+                .as_deref()
+                .unwrap_or("sconosciuto"),
             embedder_result.latency_ms.unwrap_or(0),
         );
     } else if embedder_result.healthy && !was_embedder_ok {
-        tracing::info!("task_watchdog: embedder RIPRISTINATO ({}ms)", embedder_result.latency_ms.unwrap_or(0));
+        tracing::info!(
+            "task_watchdog: embedder RIPRISTINATO ({}ms)",
+            embedder_result.latency_ms.unwrap_or(0)
+        );
     }
 
     if !gateway_result.healthy && was_gateway_ok {
         tracing::warn!(
             "task_watchdog: nexus-gateway DOWN — {} ({}ms)",
-            gateway_result.error_message.as_deref().unwrap_or("sconosciuto"),
+            gateway_result
+                .error_message
+                .as_deref()
+                .unwrap_or("sconosciuto"),
             gateway_result.latency_ms.unwrap_or(0),
         );
     } else if gateway_result.healthy && !was_gateway_ok {
-        tracing::info!("task_watchdog: nexus-gateway RIPRISTINATO ({}ms)", gateway_result.latency_ms.unwrap_or(0));
+        tracing::info!(
+            "task_watchdog: nexus-gateway RIPRISTINATO ({}ms)",
+            gateway_result.latency_ms.unwrap_or(0)
+        );
     }
 
     // Persisti in DB (fire-and-forget)
@@ -186,8 +212,12 @@ async fn run_cycle(
     let last_recovery = status.last_recovery_attempt.load(Ordering::Relaxed);
     let recovery_cooldown_expired = (now_ts - last_recovery) > 300;
 
-    if recovery_cooldown_expired && (!qdrant_result.healthy || !embedder_result.healthy || !gateway_result.healthy) {
-        status.last_recovery_attempt.store(now_ts, Ordering::Relaxed);
+    if recovery_cooldown_expired
+        && (!qdrant_result.healthy || !embedder_result.healthy || !gateway_result.healthy)
+    {
+        status
+            .last_recovery_attempt
+            .store(now_ts, Ordering::Relaxed);
         if !qdrant_result.healthy {
             attempt_recovery("qdrant", &qdrant_result).await;
         }
@@ -204,7 +234,7 @@ async fn run_cycle(
 
     // 3. Pulizia storico >24h (una query leggera, eseguita ogni ciclo)
     let _ = sqlx::query(
-        "DELETE FROM nexus_dependency_health WHERE checked_at < NOW() - INTERVAL '24 hours'"
+        "DELETE FROM nexus_dependency_health WHERE checked_at < NOW() - INTERVAL '24 hours'",
     )
     .execute(db)
     .await;
@@ -341,7 +371,14 @@ async fn try_restart_gateway() {
 
 async fn try_restart_container(name_hint: &str) {
     let output = tokio::process::Command::new("docker")
-        .args(["ps", "-a", "--filter", &format!("name={name_hint}"), "--format", "{{.Names}} {{.Status}}"])
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("name={name_hint}"),
+            "--format",
+            "{{.Names}} {{.Status}}",
+        ])
         .output()
         .await;
 
@@ -350,7 +387,9 @@ async fn try_restart_container(name_hint: &str) {
             let stdout = String::from_utf8_lossy(&o.stdout);
             for line in stdout.lines() {
                 let container_name = line.split_whitespace().next().unwrap_or("");
-                if container_name.is_empty() { continue; }
+                if container_name.is_empty() {
+                    continue;
+                }
                 // Non toccare container ideai-* (infrastruttura protetta)
                 if container_name.starts_with("ideai-") {
                     tracing::info!(
@@ -359,7 +398,9 @@ async fn try_restart_container(name_hint: &str) {
                     continue;
                 }
                 if line.contains("Exited") || line.contains("exited") {
-                    tracing::info!("task_watchdog: recovery {name_hint}: riavvio container {container_name}");
+                    tracing::info!(
+                        "task_watchdog: recovery {name_hint}: riavvio container {container_name}"
+                    );
                     let _ = tokio::process::Command::new("docker")
                         .args(["start", container_name])
                         .output()
@@ -424,8 +465,8 @@ struct ProbeResult {
 
 /// Probe Qdrant via HTTP GET /healthz (pattern da environment.rs:394).
 async fn probe_qdrant() -> ProbeResult {
-    let qdrant_url = std::env::var("QDRANT_URL")
-        .unwrap_or_else(|_| "http://localhost:6333".to_string());
+    let qdrant_url =
+        std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string());
     let health_url = format!("{}/healthz", qdrant_url.trim_end_matches('/'));
 
     let client = match reqwest::Client::builder()
@@ -463,7 +504,11 @@ async fn probe_qdrant() -> ProbeResult {
                 healthy: false,
                 latency_ms: Some(started.elapsed().as_millis() as i32),
                 error_kind: Some(kind.into()),
-                error_message: Some(format!("HTTP {} — {}", status, &body[..body.len().min(200)])),
+                error_message: Some(format!(
+                    "HTTP {} — {}",
+                    status,
+                    &body[..body.len().min(200)]
+                )),
             }
         }
         Err(e) => {
@@ -555,7 +600,10 @@ async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
     .unwrap_or_default();
 
     for scan_id in &stale_scans {
-        tracing::warn!("task_watchdog: terminata quality scan bloccata id={}", scan_id);
+        tracing::warn!(
+            "task_watchdog: terminata quality scan bloccata id={}",
+            scan_id
+        );
     }
 
     // Vector compaction bloccate (>10 minuti)
@@ -573,7 +621,10 @@ async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
     .unwrap_or_default();
 
     for id in &stale_compactions {
-        tracing::warn!("task_watchdog: terminata vector compaction bloccata id={}", id);
+        tracing::warn!(
+            "task_watchdog: terminata vector compaction bloccata id={}",
+            id
+        );
     }
 
     // Agent processes bloccati (>10 minuti senza heartbeat)
@@ -600,7 +651,15 @@ async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
     // prima del UPDATE finale, oppure DB tx fallita post-emit. La query
     // ritorna anche session_id per emettere un messaggio assistant di errore
     // in chat (cosi' l'utente vede il fallimento e puo' riprovare).
-    let stale_runs = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, Option<uuid::Uuid>, Option<uuid::Uuid>)>(
+    let stale_runs = sqlx::query_as::<
+        _,
+        (
+            uuid::Uuid,
+            uuid::Uuid,
+            Option<uuid::Uuid>,
+            Option<uuid::Uuid>,
+        ),
+    >(
         "UPDATE agent_runs SET \
              status = 'timed_out', \
              completed_at = NOW(), \
@@ -618,7 +677,8 @@ async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
     for (run_id, session_id, project_id_opt, request_msg_id) in &stale_runs {
         tracing::warn!(
             "task_watchdog: terminato agent_run orfano id={} session={}",
-            run_id, session_id
+            run_id,
+            session_id
         );
 
         // 1. Emetti is_final sul broadcast (se canale ancora attivo) per
@@ -726,8 +786,9 @@ pub async fn watchdog_status_handler(
     .await
     .unwrap_or(0);
 
-    let mk_dep_json = |ok: bool, detail: Option<(bool, Option<i32>, Option<String>, Option<String>)>| {
-        match detail {
+    let mk_dep_json =
+        |ok: bool, detail: Option<(bool, Option<i32>, Option<String>, Option<String>)>| match detail
+        {
             Some((_, latency, error_kind, error_msg)) => json!({
                 "healthy": ok,
                 "latency_ms": latency,
@@ -739,8 +800,7 @@ pub async fn watchdog_status_handler(
                 "healthy": ok,
                 "last_check": &last_check_str,
             }),
-        }
-    };
+        };
 
     Json(json!({
         "dependencies": {

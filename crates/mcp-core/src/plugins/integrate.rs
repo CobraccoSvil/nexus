@@ -56,7 +56,13 @@ fn normalize_slug(raw: &str) -> String {
     raw.trim()
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .to_string()
@@ -73,13 +79,18 @@ fn normalize_scope(raw: Option<&str>) -> Result<String, (StatusCode, Json<Value>
     }
 }
 
-fn build_mcp_config(req: &IntegrateDraftRequest) -> Result<McpServerConfig, (StatusCode, Json<Value>)> {
+fn build_mcp_config(
+    req: &IntegrateDraftRequest,
+) -> Result<McpServerConfig, (StatusCode, Json<Value>)> {
     let transport = req.transport.trim().to_lowercase();
     let transport = match transport.as_str() {
         "http" => {
             let url = req.http_url.as_deref().unwrap_or("").trim();
             if url.is_empty() {
-                return Err(api_error(StatusCode::BAD_REQUEST, "httpUrl richiesto per transport http"));
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "httpUrl richiesto per transport http",
+                ));
             }
             McpTransport::Http {
                 url: url.to_string(),
@@ -109,9 +120,7 @@ fn build_mcp_config(req: &IntegrateDraftRequest) -> Result<McpServerConfig, (Sta
     };
 
     Ok(McpServerConfig {
-        id: format!("integrate:{}",
-            normalize_slug(&req.slug)
-        ),
+        id: format!("integrate:{}", normalize_slug(&req.slug)),
         name: req.name.clone(),
         transport,
         enabled: true,
@@ -135,9 +144,12 @@ pub async fn draft_plugin_integration(
     let scope = normalize_scope(body.default_scope.as_deref())?;
     let cfg = build_mcp_config(&body)?;
 
-    let tools = mcp_client::list_tools(&cfg)
-        .await
-        .map_err(|e| api_error(StatusCode::BAD_GATEWAY, format!("Tool discovery fallito: {e}")))?;
+    let tools = mcp_client::list_tools(&cfg).await.map_err(|e| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("Tool discovery fallito: {e}"),
+        )
+    })?;
 
     let discovered_tools = tools
         .iter()
@@ -201,7 +213,12 @@ pub async fn publish_plugin_integration(
     if slug.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "item.slug richiesto"));
     }
-    let name = item.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if name.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "item.name richiesto"));
     }
@@ -224,7 +241,10 @@ pub async fn publish_plugin_integration(
         ));
     }
 
-    let http_url = item.get("httpUrl").and_then(Value::as_str).map(str::to_string);
+    let http_url = item
+        .get("httpUrl")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let stdio_command = item
         .get("stdioCommand")
         .and_then(Value::as_str)
@@ -295,7 +315,9 @@ pub async fn publish_plugin_integration(
     let catalog_item_id: Uuid = row.try_get("id").unwrap_or(Uuid::nil());
 
     let version = body.version.unwrap_or_else(|| "1.0.0".to_string());
-    let changelog = body.changelog.unwrap_or_else(|| "Integrated via admin wizard".to_string());
+    let changelog = body
+        .changelog
+        .unwrap_or_else(|| "Integrated via admin wizard".to_string());
     let _ = sqlx::query(
         r#"
         INSERT INTO plugin_releases (catalog_item_id, version, changelog, config_patch, is_stable)
@@ -335,4 +357,3 @@ pub async fn publish_plugin_integration(
         "version": version,
     })))
 }
-

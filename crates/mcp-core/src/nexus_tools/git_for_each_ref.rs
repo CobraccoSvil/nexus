@@ -8,26 +8,42 @@ pub struct GitForEachRefTool;
 
 #[async_trait]
 impl NexusToolHandler for GitForEachRefTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let out = run_cmd(
             "git",
-            &["for-each-ref", "--format=%(refname)|%(objecttype)|%(objectname)"],
+            &[
+                "for-each-ref",
+                "--format=%(refname)|%(objecttype)|%(objectname)",
+            ],
             &ctx.project_root,
             ctx.timeout_secs,
         )
         .await?;
         if !out.success() {
-            return Err(NexusToolError::Exec { exit_code: out.exit_code, stderr: out.stderr });
+            return Err(NexusToolError::Exec {
+                exit_code: out.exit_code,
+                stderr: out.stderr,
+            });
         }
-        let refs: Vec<Value> = out.stdout.lines().map(|l| {
-            let parts: Vec<&str> = l.split('|').collect();
-            json!({
-                "ref": parts.first().copied().unwrap_or(""),
-                "type": parts.get(1).copied().unwrap_or(""),
-                "sha": parts.get(2).copied().unwrap_or(""),
+        let refs: Vec<Value> = out
+            .stdout
+            .lines()
+            .map(|l| {
+                let parts: Vec<&str> = l.split('|').collect();
+                json!({
+                    "ref": parts.first().copied().unwrap_or(""),
+                    "type": parts.get(1).copied().unwrap_or(""),
+                    "sha": parts.get(2).copied().unwrap_or(""),
+                })
             })
-        }).collect();
+            .collect();
         Ok(json!({"ok": true, "count": refs.len(), "refs": refs}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only_subproc()
+    }
 }

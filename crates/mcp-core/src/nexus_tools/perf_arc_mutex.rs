@@ -8,8 +8,21 @@ pub struct PerfArcMutexTool;
 
 #[async_trait]
 impl NexusToolHandler for PerfArcMutexTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let (counts, files) = scan_substrings(&ctx.project_root, &["Arc<Mutex<", "Arc<RwLock<", "Arc::new(", "Mutex::new(", "RwLock::new("]);
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let (counts, files) = scan_substrings(
+            &ctx.project_root,
+            &[
+                "Arc<Mutex<",
+                "Arc<RwLock<",
+                "Arc::new(",
+                "Mutex::new(",
+                "RwLock::new(",
+            ],
+        );
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -20,5 +33,7 @@ impl NexusToolHandler for PerfArcMutexTool {
             "rwlock_new": counts[4],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

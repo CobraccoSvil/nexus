@@ -34,19 +34,14 @@ pub struct MemoryNsReadTool;
 
 #[async_trait]
 impl NexusToolHandler for MemoryNsReadTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let key = args
             .get("key")
             .and_then(Value::as_str)
             .ok_or_else(|| NexusToolError::BadInput("parametro 'key' obbligatorio".into()))?;
 
-        let bridge = crate::nexus_bridge::NexusBridge::global().ok_or_else(|| {
-            NexusToolError::BadInput("NexusBridge non inizializzato".into())
-        })?;
+        let bridge = crate::nexus_bridge::NexusBridge::global()
+            .ok_or_else(|| NexusToolError::BadInput("NexusBridge non inizializzato".into()))?;
 
         let scoped = scoped_key(ctx, key);
         match bridge.observability_ns().get(&scoped) {
@@ -89,11 +84,7 @@ pub struct MemoryNsWriteTool;
 
 #[async_trait]
 impl NexusToolHandler for MemoryNsWriteTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let key = args
             .get("key")
             .and_then(Value::as_str)
@@ -112,9 +103,8 @@ impl NexusToolHandler for MemoryNsWriteTool {
 
         let ttl_secs = args.get("ttl_seconds").and_then(Value::as_u64);
 
-        let bridge = crate::nexus_bridge::NexusBridge::global().ok_or_else(|| {
-            NexusToolError::BadInput("NexusBridge non inizializzato".into())
-        })?;
+        let bridge = crate::nexus_bridge::NexusBridge::global()
+            .ok_or_else(|| NexusToolError::BadInput("NexusBridge non inizializzato".into()))?;
 
         let scoped = scoped_key(ctx, key);
         let ns = bridge.observability_ns();
@@ -213,10 +203,7 @@ mod tests {
         let shared_key = format!("scopecheck-{}", Uuid::new_v4());
 
         let _ = MemoryNsWriteTool
-            .execute(
-                &p1,
-                &json!({"key": shared_key, "value": "from-p1"}),
-            )
+            .execute(&p1, &json!({"key": shared_key, "value": "from-p1"}))
             .await
             .unwrap();
 

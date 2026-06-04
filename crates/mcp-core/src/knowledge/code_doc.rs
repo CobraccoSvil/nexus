@@ -39,7 +39,12 @@ async fn setting_bool(state: &AppState, key: &str, default: bool) -> bool {
         .await
         .ok()
         .flatten()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }
 
@@ -77,7 +82,12 @@ pub async fn generate_code_doc_for_file(
         .symbols
         .iter()
         .take(80)
-        .map(|s| format!("- {:?} `{}` (riga {}, {:?})", s.kind, s.name, s.line, s.visibility))
+        .map(|s| {
+            format!(
+                "- {:?} `{}` (riga {}, {:?})",
+                s.kind, s.name, s.line, s.visibility
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let imports_list = ast
@@ -136,7 +146,10 @@ pub async fn generate_code_doc_for_file(
         .unwrap_or("")
         .trim()
         .to_string();
-    if doc.is_empty() || doc.to_lowercase().starts_with("[error") || doc.starts_with("Errore del provider") {
+    if doc.is_empty()
+        || doc.to_lowercase().starts_with("[error")
+        || doc.starts_with("Errore del provider")
+    {
         anyhow::bail!("documentazione vuota o errore provider per {rel_path}");
     }
 
@@ -179,7 +192,10 @@ pub async fn generate_code_doc_for_file(
         title: rel_path.to_string(),
         body_md: body,
         intent: Some("code_doc".to_string()),
-        tags: vec!["kind:code_doc".to_string(), format!("lang:{}", ast.language)],
+        tags: vec![
+            "kind:code_doc".to_string(),
+            format!("lang:{}", ast.language),
+        ],
         file_paths: vec![rel_path.to_string()],
     };
     let note_id = apply_project_note(state, project_id, &note).await?;
@@ -255,7 +271,8 @@ pub async fn generate_code_wiki_for_project(
                 continue;
             }
         };
-        match generate_code_doc_for_file(state, project_id, &rel, &content, &provider, &model).await {
+        match generate_code_doc_for_file(state, project_id, &rel, &content, &provider, &model).await
+        {
             Ok(_) => ok += 1,
             Err(e) => {
                 tracing::warn!(file = %rel, error = %e, "code_doc: generazione fallita");
@@ -286,7 +303,11 @@ pub async fn generate_code_wiki_handler(
     tokio::spawn(async move {
         match generate_code_wiki_for_project(&st, project_id).await {
             Ok((ok, skip)) => {
-                tracing::info!(generati = ok, saltati = skip, "code_doc: wiki on-demand completata")
+                tracing::info!(
+                    generati = ok,
+                    saltati = skip,
+                    "code_doc: wiki on-demand completata"
+                )
             }
             Err(e) => tracing::warn!(error = %e, "code_doc: wiki on-demand fallita"),
         }

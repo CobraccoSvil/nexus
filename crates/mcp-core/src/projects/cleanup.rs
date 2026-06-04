@@ -85,11 +85,7 @@ fn validate_slug(slug: &str) -> Result<(), String> {
         return Err(format!("slug '{}' deve iniziare con alfanumerico", slug));
     }
     for c in slug.chars() {
-        let ok = c.is_ascii_lowercase()
-            || c.is_ascii_digit()
-            || c == '-'
-            || c == '_'
-            || c == '.';
+        let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '.';
         if !ok {
             return Err(format!(
                 "slug '{}' contiene caratteri non permessi (atteso [a-z0-9._-])",
@@ -245,7 +241,10 @@ async fn run_docker_ps(args: &[&str]) -> Result<Vec<String>, String> {
     for a in args {
         cmd.arg(a);
     }
-    if !args.iter().any(|a| *a == "--format" || a.starts_with("--format")) {
+    if !args
+        .iter()
+        .any(|a| *a == "--format" || a.starts_with("--format"))
+    {
         cmd.arg("-q");
     }
     let output = cmd
@@ -330,7 +329,8 @@ async fn cleanup_systemd_units(slug: &str) -> SystemdResult {
     let mut entries = match tokio::fs::read_dir(&dir).await {
         Ok(e) => e,
         Err(e) => {
-            out.errors.push(format!("read_dir {}: {}", dir.display(), e));
+            out.errors
+                .push(format!("read_dir {}: {}", dir.display(), e));
             return out;
         }
     };
@@ -377,9 +377,7 @@ async fn cleanup_systemd_units(slug: &str) -> SystemdResult {
         }
         match tokio::fs::remove_file(path).await {
             Ok(_) => out.removed.push(unit.clone()),
-            Err(e) => out
-                .errors
-                .push(format!("rm {}: {}", path.display(), e)),
+            Err(e) => out.errors.push(format!("rm {}: {}", path.display(), e)),
         }
     }
 
@@ -419,13 +417,10 @@ async fn cleanup_qdrant_points(db: &PgPool, project_id: Uuid) -> QdrantResult {
             _ => default_name.to_string(),
         };
         match qdrant_delete_by_project(&base_url, &collection, project_id).await {
-            Ok(status) => out.results.push(QdrantCollectionResult {
-                collection,
-                status,
-            }),
-            Err(e) => out
-                .errors
-                .push(format!("collection {}: {}", collection, e)),
+            Ok(status) => out
+                .results
+                .push(QdrantCollectionResult { collection, status }),
+            Err(e) => out.errors.push(format!("collection {}: {}", collection, e)),
         }
     }
 
@@ -466,7 +461,11 @@ async fn qdrant_delete_by_project(
             .text()
             .await
             .unwrap_or_else(|_| "<no body>".to_string());
-        return Err(format!("http {}: {}", status, body.chars().take(160).collect::<String>()));
+        return Err(format!(
+            "http {}: {}",
+            status,
+            body.chars().take(160).collect::<String>()
+        ));
     }
     let result_body = response
         .text()

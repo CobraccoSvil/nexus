@@ -1,17 +1,22 @@
 //! `project_info` — informazioni generali del progetto: nome, root, git, stack, istruzioni custom, sandbox.
 
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
+use crate::nexus_tools::db_helper::get_pool;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::Row;
-use crate::nexus_tools::db_helper::get_pool;
 
 pub struct ProjectInfoTool;
 
 #[async_trait]
 impl NexusToolHandler for ProjectInfoTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let pool = get_pool().await
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let pool = get_pool()
+            .await
             .map_err(|e| NexusToolError::BadInput(format!("db connect: {}", e)))?;
 
         let row = sqlx::query(
@@ -23,7 +28,7 @@ impl NexusToolHandler for ProjectInfoTool {
                       r.is_git_repo, r.current_branch, r.remote_url
                FROM projects p
                LEFT JOIN repositories r ON r.project_id = p.id
-               WHERE p.id = $1"#
+               WHERE p.id = $1"#,
         )
         .bind(ctx.project_id)
         .fetch_optional(&pool)
@@ -42,7 +47,8 @@ impl NexusToolHandler for ProjectInfoTool {
         let name: String = row.try_get("name").unwrap_or_default();
         let slug: String = row.try_get("slug").unwrap_or_default();
         let default_branch: Option<String> = row.try_get("default_branch").unwrap_or(None);
-        let custom_instructions: Option<String> = row.try_get("custom_instructions").unwrap_or(None);
+        let custom_instructions: Option<String> =
+            row.try_get("custom_instructions").unwrap_or(None);
         let sandbox_config: Option<Value> = row.try_get("sandbox_config").unwrap_or(None);
         let analysis_json: Option<Value> = row.try_get("analysis_json").unwrap_or(None);
         let is_git_repo: Option<bool> = row.try_get("is_git_repo").unwrap_or(None);
@@ -50,9 +56,9 @@ impl NexusToolHandler for ProjectInfoTool {
         let remote_url: Option<String> = row.try_get("remote_url").unwrap_or(None);
 
         // Estrai summary dallo analysis_json se presente
-        let stack_summary = analysis_json.as_ref().and_then(|a| {
-            a.get("summary").and_then(|s| s.as_str()).map(String::from)
-        });
+        let stack_summary = analysis_json
+            .as_ref()
+            .and_then(|a| a.get("summary").and_then(|s| s.as_str()).map(String::from));
 
         Ok(json!({
             "ok": true,
@@ -76,6 +82,11 @@ impl NexusToolHandler for ProjectInfoTool {
     }
 
     fn safety(&self) -> NexusToolSafety {
-        NexusToolSafety { read_only: true, can_write_filesystem: false, can_execute_subproc: false, network_egress: true }
+        NexusToolSafety {
+            read_only: true,
+            can_write_filesystem: false,
+            can_execute_subproc: false,
+            network_egress: true,
+        }
     }
 }

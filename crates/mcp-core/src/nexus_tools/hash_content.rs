@@ -11,11 +11,7 @@ pub struct HashContentTool;
 
 #[async_trait]
 impl NexusToolHandler for HashContentTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let algo = args.get("algo").and_then(Value::as_str).unwrap_or("sha256");
         let bytes: Vec<u8> = if let Some(c) = args.get("content").and_then(Value::as_str) {
             c.as_bytes().to_vec()
@@ -78,15 +74,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_sha256_known() {
-        let ctx = NexusToolContext::new(
-            std::env::temp_dir(),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-        );
+        let ctx = NexusToolContext::new(std::env::temp_dir(), uuid::Uuid::nil(), uuid::Uuid::nil());
         let out = HashContentTool
             .execute(&ctx, &json!({"content": "hello"}))
             .await
             .unwrap();
-        assert_eq!(out["hex"], "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        assert_eq!(
+            out["hex"],
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
     }
 }

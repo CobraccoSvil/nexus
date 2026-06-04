@@ -8,7 +8,11 @@ pub struct BuildLockfileAgeTool;
 
 #[async_trait]
 impl NexusToolHandler for BuildLockfileAgeTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let p = ctx.project_root.join("Cargo.lock");
         if !p.is_file() {
             return Ok(json!({"ok": true, "exists": false}));
@@ -22,5 +26,7 @@ impl NexusToolHandler for BuildLockfileAgeTool {
             .map(|d| d.as_secs());
         Ok(json!({"ok": true, "exists": true, "size": size, "age_secs": age_secs}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

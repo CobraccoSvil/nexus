@@ -97,11 +97,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_no_bridge() {
-        let ctx = NexusToolContext::new(
-            std::env::temp_dir(),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-        );
+        let ctx = NexusToolContext::new(std::env::temp_dir(), uuid::Uuid::nil(), uuid::Uuid::nil());
         let out = RuVectorSearchTool
             .execute(&ctx, &json!({"query": "hello"}))
             .await

@@ -6,16 +6,13 @@ use axum::{
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::{auth::Claims, AppState};
 use crate::projects::{
-    api_error, execute_git_paths_operation, execute_git_remote_operation,
-    load_project_context, parse_user_id,
-    parse_branch_line, record_git_operation,
-    refresh_git_snapshot, run_git_command,
-    GitCommitRequest, GitCheckoutRequest, GitCreateBranchRequest,
-    GitDiffQuery, GitLogEntry, GitPathsRequest, GitRemoteRequest,
-    GitUiPreferencesUpdateRequest,
+    api_error, execute_git_paths_operation, execute_git_remote_operation, load_project_context,
+    parse_branch_line, parse_user_id, record_git_operation, refresh_git_snapshot, run_git_command,
+    GitCheckoutRequest, GitCommitRequest, GitCreateBranchRequest, GitDiffQuery, GitLogEntry,
+    GitPathsRequest, GitRemoteRequest, GitUiPreferencesUpdateRequest,
 };
+use crate::{auth::Claims, AppState};
 
 type ApiError = (StatusCode, Json<Value>);
 type ApiResult = Result<Json<Value>, ApiError>;
@@ -113,7 +110,10 @@ pub async fn git_log(
                 author: parts[2].to_string(),
                 date: parts[3].to_string(),
                 subject: parts[4].to_string(),
-                body: parts.get(5).map(|b| b.trim().to_string()).unwrap_or_default(),
+                body: parts
+                    .get(5)
+                    .map(|b| b.trim().to_string())
+                    .unwrap_or_default(),
             })
         })
         .collect::<Vec<_>>();

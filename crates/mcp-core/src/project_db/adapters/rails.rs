@@ -1,9 +1,11 @@
 //! Adapter Rails ActiveRecord — crea migration tramite `bin/rails generate migration`.
 
+use super::{sha256_hex, MigrationAdapter};
+use crate::project_db::{
+    AppliedMigration, Migration, ProjectDbContext, ProjectDbError, RolledBackMigration,
+};
 use async_trait::async_trait;
 use std::path::PathBuf;
-use crate::project_db::{Migration, AppliedMigration, RolledBackMigration, ProjectDbError, ProjectDbContext};
-use super::{MigrationAdapter, sha256_hex};
 
 pub struct RailsAdapter;
 
@@ -11,7 +13,9 @@ pub struct RailsAdapter;
 impl MigrationAdapter for RailsAdapter {
     async fn list_pending(&self, ctx: &ProjectDbContext) -> Result<Vec<Migration>, ProjectDbError> {
         let dir = ctx.project_root.join(&ctx.migration_path);
-        if !dir.exists() { return Ok(vec![]); }
+        if !dir.exists() {
+            return Ok(vec![]);
+        }
         let mut files: Vec<_> = std::fs::read_dir(&dir)?
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().ends_with(".rb"))
@@ -21,7 +25,11 @@ impl MigrationAdapter for RailsAdapter {
         for entry in files {
             let path = entry.path();
             let content = std::fs::read_to_string(&path).unwrap_or_default();
-            let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let filename = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             result.push(Migration {
                 filename: filename.clone(),
                 checksum: sha256_hex(&content),
@@ -38,10 +46,20 @@ impl MigrationAdapter for RailsAdapter {
         name: &str,
         _sql: &str,
     ) -> Result<PathBuf, ProjectDbError> {
-        let camel_name: String = name.split_whitespace()
-            .map(|w| { let mut c = w.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() })
+        let camel_name: String = name
+            .split_whitespace()
+            .map(|w| {
+                let mut c = w.chars();
+                c.next()
+                    .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                    .unwrap_or_default()
+            })
             .collect();
-        let rails_bin = if ctx.project_root.join("bin/rails").exists() { "bin/rails" } else { "rails" };
+        let rails_bin = if ctx.project_root.join("bin/rails").exists() {
+            "bin/rails"
+        } else {
+            "rails"
+        };
         let output = std::process::Command::new(rails_bin)
             .args(["generate", "migration", &camel_name])
             .current_dir(&ctx.project_root)
@@ -49,7 +67,10 @@ impl MigrationAdapter for RailsAdapter {
             .map_err(|e| ProjectDbError::Adapter(format!("rails generate migration: {}", e)))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ProjectDbError::Adapter(format!("rails generate migration fallita: {}", stderr)));
+            return Err(ProjectDbError::Adapter(format!(
+                "rails generate migration fallita: {}",
+                stderr
+            )));
         }
         Ok(ctx.project_root.join(&ctx.migration_path))
     }
@@ -59,7 +80,11 @@ impl MigrationAdapter for RailsAdapter {
         ctx: &ProjectDbContext,
         _connection_url: &str,
     ) -> Result<Vec<AppliedMigration>, ProjectDbError> {
-        let rails_bin = if ctx.project_root.join("bin/rails").exists() { "bin/rails" } else { "rails" };
+        let rails_bin = if ctx.project_root.join("bin/rails").exists() {
+            "bin/rails"
+        } else {
+            "rails"
+        };
         let output = std::process::Command::new(rails_bin)
             .args(["db:migrate"])
             .current_dir(&ctx.project_root)
@@ -67,7 +92,10 @@ impl MigrationAdapter for RailsAdapter {
             .map_err(|e| ProjectDbError::Adapter(format!("rails db:migrate: {}", e)))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ProjectDbError::Adapter(format!("rails db:migrate fallita: {}", stderr)));
+            return Err(ProjectDbError::Adapter(format!(
+                "rails db:migrate fallita: {}",
+                stderr
+            )));
         }
         Ok(vec![])
     }
@@ -77,7 +105,11 @@ impl MigrationAdapter for RailsAdapter {
         ctx: &ProjectDbContext,
         _connection_url: &str,
     ) -> Result<Option<RolledBackMigration>, ProjectDbError> {
-        let rails_bin = if ctx.project_root.join("bin/rails").exists() { "bin/rails" } else { "rails" };
+        let rails_bin = if ctx.project_root.join("bin/rails").exists() {
+            "bin/rails"
+        } else {
+            "rails"
+        };
         let output = std::process::Command::new(rails_bin)
             .args(["db:rollback"])
             .current_dir(&ctx.project_root)
@@ -85,8 +117,13 @@ impl MigrationAdapter for RailsAdapter {
             .map_err(|e| ProjectDbError::Adapter(format!("rails db:rollback: {}", e)))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ProjectDbError::Adapter(format!("rails db:rollback fallita: {}", stderr)));
+            return Err(ProjectDbError::Adapter(format!(
+                "rails db:rollback fallita: {}",
+                stderr
+            )));
         }
-        Ok(Some(RolledBackMigration { filename: "rails:last".into() }))
+        Ok(Some(RolledBackMigration {
+            filename: "rails:last".into(),
+        }))
     }
 }

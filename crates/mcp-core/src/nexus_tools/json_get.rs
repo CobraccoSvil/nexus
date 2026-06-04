@@ -71,11 +71,7 @@ fn resolve<'a>(root: &'a Value, segs: &[Segment]) -> Option<&'a Value> {
 
 #[async_trait]
 impl NexusToolHandler for JsonGetTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let query = args
             .get("query")
             .and_then(Value::as_str)
@@ -138,11 +134,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_json_get_nested() {
-        let ctx = NexusToolContext::new(
-            std::env::temp_dir(),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-        );
+        let ctx = NexusToolContext::new(std::env::temp_dir(), uuid::Uuid::nil(), uuid::Uuid::nil());
         let out = JsonGetTool
             .execute(
                 &ctx,
@@ -159,16 +151,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_json_get_missing() {
-        let ctx = NexusToolContext::new(
-            std::env::temp_dir(),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-        );
+        let ctx = NexusToolContext::new(std::env::temp_dir(), uuid::Uuid::nil(), uuid::Uuid::nil());
         let out = JsonGetTool
-            .execute(
-                &ctx,
-                &json!({"json_content": "{\"a\":1}", "query": "b.c"}),
-            )
+            .execute(&ctx, &json!({"json_content": "{\"a\":1}", "query": "b.c"}))
             .await
             .unwrap();
         assert_eq!(out["found"], false);

@@ -30,18 +30,22 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct AuditEntry {
     pub project_id: Uuid,
-    pub actor: &'static str,           // "agent" | "user" | "system"
+    pub actor: &'static str, // "agent" | "user" | "system"
     pub actor_user_id: Option<Uuid>,
     pub actor_session_id: Option<Uuid>,
-    pub action: String,                // es. "port_allocate", "command_blocked"
-    pub resource_kind: &'static str,   // "port" | "db" | "container" | "file" | "env" | "command" | "service"
+    pub action: String,              // es. "port_allocate", "command_blocked"
+    pub resource_kind: &'static str, // "port" | "db" | "container" | "file" | "env" | "command" | "service"
     pub resource_id: Option<String>,
-    pub outcome: &'static str,         // "allowed" | "blocked" | "killed"
+    pub outcome: &'static str, // "allowed" | "blocked" | "killed"
     pub details: Value,
 }
 
 impl AuditEntry {
-    pub fn allowed(project_id: Uuid, action: impl Into<String>, resource_kind: &'static str) -> Self {
+    pub fn allowed(
+        project_id: Uuid,
+        action: impl Into<String>,
+        resource_kind: &'static str,
+    ) -> Self {
         Self {
             project_id,
             actor: "agent",
@@ -54,7 +58,11 @@ impl AuditEntry {
             details: Value::Object(Default::default()),
         }
     }
-    pub fn blocked(project_id: Uuid, action: impl Into<String>, resource_kind: &'static str) -> Self {
+    pub fn blocked(
+        project_id: Uuid,
+        action: impl Into<String>,
+        resource_kind: &'static str,
+    ) -> Self {
         Self {
             project_id,
             actor: "agent",
@@ -67,7 +75,11 @@ impl AuditEntry {
             details: Value::Object(Default::default()),
         }
     }
-    pub fn killed(project_id: Uuid, action: impl Into<String>, resource_kind: &'static str) -> Self {
+    pub fn killed(
+        project_id: Uuid,
+        action: impl Into<String>,
+        resource_kind: &'static str,
+    ) -> Self {
         Self {
             project_id,
             actor: "system",
@@ -156,17 +168,19 @@ async fn writer_loop(db: PgPool, mut rx: mpsc::UnboundedReceiver<AuditEntry>) {
 }
 
 async fn flush(db: &PgPool, buf: &mut Vec<AuditEntry>) {
-    if buf.is_empty() { return; }
+    if buf.is_empty() {
+        return;
+    }
     // INSERT batch tramite UNNEST: piu' efficiente di N singole INSERT.
-    let projects:    Vec<Uuid> = buf.iter().map(|e| e.project_id).collect();
-    let actors:      Vec<&str> = buf.iter().map(|e| e.actor).collect();
-    let user_ids:    Vec<Option<Uuid>> = buf.iter().map(|e| e.actor_user_id).collect();
+    let projects: Vec<Uuid> = buf.iter().map(|e| e.project_id).collect();
+    let actors: Vec<&str> = buf.iter().map(|e| e.actor).collect();
+    let user_ids: Vec<Option<Uuid>> = buf.iter().map(|e| e.actor_user_id).collect();
     let session_ids: Vec<Option<Uuid>> = buf.iter().map(|e| e.actor_session_id).collect();
-    let actions:     Vec<&str> = buf.iter().map(|e| e.action.as_str()).collect();
-    let kinds:       Vec<&str> = buf.iter().map(|e| e.resource_kind).collect();
-    let res_ids:     Vec<Option<&str>> = buf.iter().map(|e| e.resource_id.as_deref()).collect();
-    let outcomes:    Vec<&str> = buf.iter().map(|e| e.outcome).collect();
-    let details:     Vec<Value> = buf.iter().map(|e| e.details.clone()).collect();
+    let actions: Vec<&str> = buf.iter().map(|e| e.action.as_str()).collect();
+    let kinds: Vec<&str> = buf.iter().map(|e| e.resource_kind).collect();
+    let res_ids: Vec<Option<&str>> = buf.iter().map(|e| e.resource_id.as_deref()).collect();
+    let outcomes: Vec<&str> = buf.iter().map(|e| e.outcome).collect();
+    let details: Vec<Value> = buf.iter().map(|e| e.details.clone()).collect();
 
     let res = sqlx::query(
         "INSERT INTO nexus_resource_audit \

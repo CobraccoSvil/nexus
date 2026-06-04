@@ -7,13 +7,13 @@ use serde_json::{json, Value};
 use tokio::fs;
 use uuid::Uuid;
 
-use crate::{auth::Claims, AppState};
 use crate::projects::{
-    api_error, load_project_context, parse_user_id, resolve_relative_path,
-    resolve_workspace_target, to_relative, upsert_open_session, list_directory_nodes,
-    CreateEntryRequest, DeleteEntryRequest, FileQuery, RenameEntryRequest, SaveFileRequest,
-    SearchQuery, TreeQuery, EXCLUDED_NAMES,
+    api_error, list_directory_nodes, load_project_context, parse_user_id, resolve_relative_path,
+    resolve_workspace_target, to_relative, upsert_open_session, CreateEntryRequest,
+    DeleteEntryRequest, FileQuery, RenameEntryRequest, SaveFileRequest, SearchQuery, TreeQuery,
+    EXCLUDED_NAMES,
 };
+use crate::{auth::Claims, AppState};
 
 type ApiError = (StatusCode, Json<Value>);
 type ApiResult = Result<Json<Value>, ApiError>;
@@ -35,12 +35,14 @@ pub async fn get_project_tree(
     // list_directory_nodes fa I/O sincrono intensivo: spawn_blocking
     // per non bloccare il runtime tokio.
     let root_for_tree = context.root_path.clone();
-    let nodes = tokio::task::spawn_blocking(move || {
-        list_directory_nodes(&root_for_tree, &target)
-    })
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("spawn_blocking tree: {e}")))?
-    ?;
+    let nodes = tokio::task::spawn_blocking(move || list_directory_nodes(&root_for_tree, &target))
+        .await
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("spawn_blocking tree: {e}"),
+            )
+        })??;
 
     Ok(Json(json!({
         "path": query.path.unwrap_or_default(),
@@ -217,9 +219,13 @@ pub async fn rename_project_entry(
 
     let (_, old_path) = resolve_workspace_target(&context.root_path, &body.old_path)?;
     if !old_path.exists() {
-        return Err(api_error(StatusCode::NOT_FOUND, "Il percorso da rinominare non esiste"));
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "Il percorso da rinominare non esiste",
+        ));
     }
-    let (new_relative_path, new_path) = resolve_workspace_target(&context.root_path, &body.new_path)?;
+    let (new_relative_path, new_path) =
+        resolve_workspace_target(&context.root_path, &body.new_path)?;
     if new_path.exists() {
         return Err(api_error(
             StatusCode::CONFLICT,
@@ -278,7 +284,10 @@ pub async fn delete_project_entry(
 
     let (relative_path, target_path) = resolve_workspace_target(&context.root_path, &body.path)?;
     if !target_path.exists() {
-        return Err(api_error(StatusCode::NOT_FOUND, "Il percorso da eliminare non esiste"));
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "Il percorso da eliminare non esiste",
+        ));
     }
 
     let metadata = fs::metadata(&target_path)
@@ -360,7 +369,8 @@ pub async fn search_project(
                 let rel_path = to_relative(&root_path, &child_path);
                 let name_lower = name.to_lowercase();
                 let rel_lower = rel_path.to_lowercase();
-                let name_match = name_lower.contains(&term_lower) || rel_lower.contains(&term_lower);
+                let name_match =
+                    name_lower.contains(&term_lower) || rel_lower.contains(&term_lower);
                 if name_match {
                     matches.push(json!({
                         "path": rel_path.clone(),
@@ -397,7 +407,12 @@ pub async fn search_project(
         matches
     })
     .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Ricerca fallita: {e}")))?;
+    .map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Ricerca fallita: {e}"),
+        )
+    })?;
 
     Ok(Json(json!({
         "query": term,

@@ -31,7 +31,9 @@ fn parse_frontmatter(content: &str) -> Option<(Map<String, Value>, usize)> {
 #[async_trait]
 impl NexusToolHandler for DocFrontmatterParseTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let path = args.get("path").and_then(Value::as_str)
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
             .ok_or_else(|| NexusToolError::BadInput("path required".into()))?;
         let pb = std::path::PathBuf::from(path);
         if pb.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -43,12 +45,16 @@ impl NexusToolHandler for DocFrontmatterParseTool {
         }
         let content = std::fs::read_to_string(&full).map_err(NexusToolError::Io)?;
         match parse_frontmatter(&content) {
-            Some((map, _)) => Ok(json!({"ok": true, "path": path, "has_frontmatter": true, "fields": Value::Object(map)})),
+            Some((map, _)) => Ok(
+                json!({"ok": true, "path": path, "has_frontmatter": true, "fields": Value::Object(map)}),
+            ),
             None => Ok(json!({"ok": true, "path": path, "has_frontmatter": false})),
         }
     }
     fn input_schema(&self) -> Value {
         json!({"type":"object","required":["path"],"properties":{"path":{"type":"string"}}})
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

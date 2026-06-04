@@ -116,7 +116,10 @@ pub async fn create_profile(
     let user_id = parse_user_id(&claims)?;
     let name = body.name.trim().to_string();
     if name.is_empty() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Il nome del profilo e' obbligatorio"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Il nome del profilo e' obbligatorio",
+        ));
     }
     let row = sqlx::query(
         r#"
@@ -132,14 +135,32 @@ pub async fn create_profile(
     .bind(body.description.as_deref().map(str::trim))
     .bind(body.avatar_emoji.as_deref().unwrap_or("\u{1F916}").trim())
     .bind(body.system_prompt.as_deref().unwrap_or("").trim())
-    .bind(body.default_provider.as_deref().filter(|s| !s.trim().is_empty()).map(str::trim))
-    .bind(body.default_model.as_deref().filter(|s| !s.trim().is_empty()).map(str::trim))
-    .bind(body.default_automation.as_deref().filter(|s| !s.trim().is_empty()).map(str::trim))
+    .bind(
+        body.default_provider
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::trim),
+    )
+    .bind(
+        body.default_model
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::trim),
+    )
+    .bind(
+        body.default_automation
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::trim),
+    )
     .fetch_one(&state.db)
     .await
     .map_err(|e| {
         if e.to_string().contains("unique") || e.to_string().contains("duplicate") {
-            api_error(StatusCode::CONFLICT, "Un profilo con questo nome esiste gia'")
+            api_error(
+                StatusCode::CONFLICT,
+                "Un profilo con questo nome esiste gia'",
+            )
         } else {
             api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
@@ -176,17 +197,47 @@ pub async fn update_profile(
     )
     .bind(profile_uuid)
     .bind(user_id)
-    .bind(body.name.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+    .bind(
+        body.name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    )
     .bind(body.description.as_deref().map(str::trim))
-    .bind(body.avatar_emoji.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+    .bind(
+        body.avatar_emoji
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    )
     .bind(body.system_prompt.as_deref().map(str::trim))
-    .bind(body.default_provider.as_deref().filter(|s| !s.trim().is_empty()).map(str::trim))
-    .bind(body.default_model.as_deref().filter(|s| !s.trim().is_empty()).map(str::trim))
-    .bind(body.default_automation.as_deref().filter(|s| !s.trim().is_empty()).map(str::trim))
+    .bind(
+        body.default_provider
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::trim),
+    )
+    .bind(
+        body.default_model
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::trim),
+    )
+    .bind(
+        body.default_automation
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::trim),
+    )
     .fetch_optional(&state.db)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Profilo non trovato o non modificabile"))?;
+    .ok_or_else(|| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            "Profilo non trovato o non modificabile",
+        )
+    })?;
 
     Ok(Json(row_to_json(&row)))
 }
@@ -211,7 +262,10 @@ pub async fn delete_profile(
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if deleted.is_none() {
-        return Err(api_error(StatusCode::NOT_FOUND, "Profilo non trovato o non eliminabile"));
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "Profilo non trovato o non eliminabile",
+        ));
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -240,15 +294,23 @@ pub async fn set_default_profile(
         return Err(api_error(StatusCode::NOT_FOUND, "Profilo non trovato"));
     }
 
-    let mut tx = state.db.begin().await
+    let mut tx = state
+        .db
+        .begin()
+        .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     sqlx::query("UPDATE user_profiles SET is_default = FALSE WHERE user_id = $1")
-        .bind(user_id).execute(&mut *tx).await
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     sqlx::query("UPDATE user_profiles SET is_default = TRUE, updated_at = NOW() WHERE id = $1")
-        .bind(profile_uuid).execute(&mut *tx).await
+        .bind(profile_uuid)
+        .execute(&mut *tx)
+        .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    tx.commit().await
+    tx.commit()
+        .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({ "ok": true })))
@@ -288,12 +350,36 @@ pub async fn fork_profile(
     )
     .bind(user_id)
     .bind(&fork_name)
-    .bind(source.try_get::<Option<String>, _>("description").unwrap_or(None))
-    .bind(source.try_get::<String, _>("avatar_emoji").unwrap_or_else(|_| "\u{1F916}".to_string()))
-    .bind(source.try_get::<String, _>("system_prompt").unwrap_or_default())
-    .bind(source.try_get::<Option<String>, _>("default_provider").unwrap_or(None))
-    .bind(source.try_get::<Option<String>, _>("default_model").unwrap_or(None))
-    .bind(source.try_get::<Option<String>, _>("default_automation").unwrap_or(None))
+    .bind(
+        source
+            .try_get::<Option<String>, _>("description")
+            .unwrap_or(None),
+    )
+    .bind(
+        source
+            .try_get::<String, _>("avatar_emoji")
+            .unwrap_or_else(|_| "\u{1F916}".to_string()),
+    )
+    .bind(
+        source
+            .try_get::<String, _>("system_prompt")
+            .unwrap_or_default(),
+    )
+    .bind(
+        source
+            .try_get::<Option<String>, _>("default_provider")
+            .unwrap_or(None),
+    )
+    .bind(
+        source
+            .try_get::<Option<String>, _>("default_model")
+            .unwrap_or(None),
+    )
+    .bind(
+        source
+            .try_get::<Option<String>, _>("default_automation")
+            .unwrap_or(None),
+    )
     .fetch_one(&state.db)
     .await
     .map_err(|e| {
@@ -379,18 +465,33 @@ async fn auto_select_profile(
     let mut best_idx: Option<usize> = None;
 
     for (idx, row) in rows.iter().enumerate() {
-        let name = row.try_get::<String, _>("name").unwrap_or_default().to_lowercase();
-        let description = row.try_get::<Option<String>, _>("description")
-            .unwrap_or(None).unwrap_or_default().to_lowercase();
-        let prompt = row.try_get::<String, _>("system_prompt").unwrap_or_default().to_lowercase();
+        let name = row
+            .try_get::<String, _>("name")
+            .unwrap_or_default()
+            .to_lowercase();
+        let description = row
+            .try_get::<Option<String>, _>("description")
+            .unwrap_or(None)
+            .unwrap_or_default()
+            .to_lowercase();
+        let prompt = row
+            .try_get::<String, _>("system_prompt")
+            .unwrap_or_default()
+            .to_lowercase();
 
-        let candidate_text = format!("{} {} {}", name, description, &prompt[..prompt.len().min(300)]);
+        let candidate_text = format!(
+            "{} {} {}",
+            name,
+            description,
+            &prompt[..prompt.len().min(300)]
+        );
         let keywords: Vec<&str> = candidate_text
             .split(|c: char| !c.is_alphanumeric())
             .filter(|w| w.len() > 3)
             .collect();
 
-        let score = keywords.iter()
+        let score = keywords
+            .iter()
             .filter(|&&kw| req_lower.contains(kw))
             .count();
 
@@ -412,17 +513,30 @@ async fn auto_select_profile(
     }
 }
 
-fn build_profile_result(r: sqlx::postgres::PgRow) -> (String, Option<String>, Option<String>, Option<String>) {
+fn build_profile_result(
+    r: sqlx::postgres::PgRow,
+) -> (String, Option<String>, Option<String>, Option<String>) {
     let prompt = r.try_get::<String, _>("system_prompt").unwrap_or_default();
-    let provider = r.try_get::<Option<String>, _>("default_provider").unwrap_or(None);
-    let model = r.try_get::<Option<String>, _>("default_model").unwrap_or(None);
-    let automation = r.try_get::<Option<String>, _>("default_automation").unwrap_or(None);
-    let emoji = r.try_get::<String, _>("avatar_emoji").unwrap_or_else(|_| "\u{1F916}".to_string());
+    let provider = r
+        .try_get::<Option<String>, _>("default_provider")
+        .unwrap_or(None);
+    let model = r
+        .try_get::<Option<String>, _>("default_model")
+        .unwrap_or(None);
+    let automation = r
+        .try_get::<Option<String>, _>("default_automation")
+        .unwrap_or(None);
+    let emoji = r
+        .try_get::<String, _>("avatar_emoji")
+        .unwrap_or_else(|_| "\u{1F916}".to_string());
     let name = r.try_get::<String, _>("name").unwrap_or_default();
     let header = if prompt.is_empty() {
         String::new()
     } else {
-        format!("=== PROFILO: {} {} ===\n{}\n=== FINE PROFILO ===\n\n", emoji, name, prompt)
+        format!(
+            "=== PROFILO: {} {} ===\n{}\n=== FINE PROFILO ===\n\n",
+            emoji, name, prompt
+        )
     };
     (header, provider, model, automation)
 }
@@ -434,12 +548,10 @@ pub async fn admin_list_profiles(
     State(state): State<AppState>,
     Extension(_claims): Extension<Claims>,
 ) -> ApiResult {
-    let rows = sqlx::query(
-        "SELECT * FROM user_profiles WHERE is_system = TRUE ORDER BY name ASC",
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rows = sqlx::query("SELECT * FROM user_profiles WHERE is_system = TRUE ORDER BY name ASC")
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let profiles: Vec<Value> = rows.iter().map(row_to_json).collect();
     Ok(Json(json!({ "profiles": profiles })))
@@ -453,7 +565,10 @@ pub async fn admin_create_profile(
 ) -> ApiResult {
     let name = body.name.trim().to_string();
     if name.is_empty() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Il nome del profilo e' obbligatorio"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Il nome del profilo e' obbligatorio",
+        ));
     }
     let row = sqlx::query(
         r#"
@@ -468,14 +583,32 @@ pub async fn admin_create_profile(
     .bind(body.description.as_deref().map(str::trim))
     .bind(body.avatar_emoji.as_deref().unwrap_or("\u{1F916}").trim())
     .bind(body.system_prompt.as_deref().unwrap_or("").trim())
-    .bind(body.default_provider.as_deref().filter(|s| !s.trim().is_empty()).map(str::trim))
-    .bind(body.default_model.as_deref().filter(|s| !s.trim().is_empty()).map(str::trim))
-    .bind(body.default_automation.as_deref().filter(|s| !s.trim().is_empty()).map(str::trim))
+    .bind(
+        body.default_provider
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::trim),
+    )
+    .bind(
+        body.default_model
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::trim),
+    )
+    .bind(
+        body.default_automation
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::trim),
+    )
     .fetch_one(&state.db)
     .await
     .map_err(|e| {
         if e.to_string().contains("unique") || e.to_string().contains("duplicate") {
-            api_error(StatusCode::CONFLICT, "Un profilo di sistema con questo nome esiste gia'")
+            api_error(
+                StatusCode::CONFLICT,
+                "Un profilo di sistema con questo nome esiste gia'",
+            )
         } else {
             api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
@@ -510,13 +643,38 @@ pub async fn admin_update_profile(
         "#,
     )
     .bind(profile_uuid)
-    .bind(body.name.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+    .bind(
+        body.name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    )
     .bind(body.description.as_deref().map(str::trim))
-    .bind(body.avatar_emoji.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+    .bind(
+        body.avatar_emoji
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    )
     .bind(body.system_prompt.as_deref().map(str::trim))
-    .bind(body.default_provider.as_deref().filter(|s| !s.trim().is_empty()).map(str::trim))
-    .bind(body.default_model.as_deref().filter(|s| !s.trim().is_empty()).map(str::trim))
-    .bind(body.default_automation.as_deref().filter(|s| !s.trim().is_empty()).map(str::trim))
+    .bind(
+        body.default_provider
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::trim),
+    )
+    .bind(
+        body.default_model
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::trim),
+    )
+    .bind(
+        body.default_automation
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::trim),
+    )
     .fetch_optional(&state.db)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -534,16 +692,18 @@ pub async fn admin_delete_profile(
     let profile_uuid = Uuid::parse_str(&profile_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Profile id non valido"))?;
 
-    let deleted = sqlx::query(
-        "DELETE FROM user_profiles WHERE id = $1 AND is_system = TRUE RETURNING id",
-    )
-    .bind(profile_uuid)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let deleted =
+        sqlx::query("DELETE FROM user_profiles WHERE id = $1 AND is_system = TRUE RETURNING id")
+            .bind(profile_uuid)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if deleted.is_none() {
-        return Err(api_error(StatusCode::NOT_FOUND, "Profilo di sistema non trovato"));
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "Profilo di sistema non trovato",
+        ));
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -566,16 +726,19 @@ pub async fn admin_list_user_profiles(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let profiles: Vec<Value> = rows.iter().map(|r| {
-        let mut v = row_to_json(r);
-        if let Some(obj) = v.as_object_mut() {
-            obj.insert(
-                "userEmail".to_string(),
-                json!(r.try_get::<Option<String>, _>("user_email").unwrap_or(None)),
-            );
-        }
-        v
-    }).collect();
+    let profiles: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let mut v = row_to_json(r);
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "userEmail".to_string(),
+                    json!(r.try_get::<Option<String>, _>("user_email").unwrap_or(None)),
+                );
+            }
+            v
+        })
+        .collect();
     Ok(Json(json!({ "profiles": profiles })))
 }
 
@@ -602,14 +765,19 @@ pub async fn admin_get_profile_mcp_servers(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let servers: Vec<Value> = rows.iter().map(|r| json!({
-        "id": r.try_get::<Uuid, _>("id").ok().map(|v| v.to_string()),
-        "name": r.try_get::<String, _>("name").unwrap_or_default(),
-        "description": r.try_get::<Option<String>, _>("description").unwrap_or(None),
-        "transport": r.try_get::<String, _>("transport").unwrap_or_default(),
-        "scope": r.try_get::<String, _>("scope").unwrap_or_default(),
-        "enabled": r.try_get::<bool, _>("enabled").unwrap_or(true),
-    })).collect();
+    let servers: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.try_get::<Uuid, _>("id").ok().map(|v| v.to_string()),
+                "name": r.try_get::<String, _>("name").unwrap_or_default(),
+                "description": r.try_get::<Option<String>, _>("description").unwrap_or(None),
+                "transport": r.try_get::<String, _>("transport").unwrap_or_default(),
+                "scope": r.try_get::<String, _>("scope").unwrap_or_default(),
+                "enabled": r.try_get::<bool, _>("enabled").unwrap_or(true),
+            })
+        })
+        .collect();
 
     Ok(Json(json!({ "servers": servers })))
 }
@@ -624,11 +792,16 @@ pub async fn admin_set_profile_mcp_servers(
     let profile_uuid = Uuid::parse_str(&profile_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Profile id non valido"))?;
 
-    let server_uuids: Vec<Uuid> = body.mcp_server_ids.iter()
+    let server_uuids: Vec<Uuid> = body
+        .mcp_server_ids
+        .iter()
         .filter_map(|s| Uuid::parse_str(s).ok())
         .collect();
 
-    let mut tx = state.db.begin().await
+    let mut tx = state
+        .db
+        .begin()
+        .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     sqlx::query("DELETE FROM profile_mcp_servers WHERE profile_id = $1")
@@ -648,7 +821,8 @@ pub async fn admin_set_profile_mcp_servers(
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
 
-    tx.commit().await
+    tx.commit()
+        .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({ "ok": true, "count": server_uuids.len() })))
@@ -671,14 +845,19 @@ pub async fn admin_list_global_mcp_servers(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let servers: Vec<Value> = rows.iter().map(|r| json!({
-        "id": r.try_get::<Uuid, _>("id").ok().map(|v| v.to_string()),
-        "name": r.try_get::<String, _>("name").unwrap_or_default(),
-        "description": r.try_get::<Option<String>, _>("description").unwrap_or(None),
-        "transport": r.try_get::<String, _>("transport").unwrap_or_default(),
-        "scope": r.try_get::<String, _>("scope").unwrap_or_default(),
-        "enabled": r.try_get::<bool, _>("enabled").unwrap_or(true),
-    })).collect();
+    let servers: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.try_get::<Uuid, _>("id").ok().map(|v| v.to_string()),
+                "name": r.try_get::<String, _>("name").unwrap_or_default(),
+                "description": r.try_get::<Option<String>, _>("description").unwrap_or(None),
+                "transport": r.try_get::<String, _>("transport").unwrap_or_default(),
+                "scope": r.try_get::<String, _>("scope").unwrap_or_default(),
+                "enabled": r.try_get::<bool, _>("enabled").unwrap_or(true),
+            })
+        })
+        .collect();
 
     Ok(Json(json!({ "servers": servers })))
 }

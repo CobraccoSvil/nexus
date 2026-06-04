@@ -39,16 +39,23 @@ pub(super) async fn get_project_slug(db: &PgPool, project_id: Uuid) -> Result<St
 // Handler: documents
 // ---------------------------------------------------------------------------
 
-pub(super) async fn handle_doc_generate(db: &PgPool, project_id: Uuid, user_id: Uuid, args: &Value) -> String {
+pub(super) async fn handle_doc_generate(
+    db: &PgPool,
+    project_id: Uuid,
+    user_id: Uuid,
+    args: &Value,
+) -> String {
     let pid = match args.get("project_id").and_then(Value::as_str) {
         Some(s) => match Uuid::parse_str(s) {
             Ok(u) => u,
             Err(_) => {
                 // Prova a cercare per nome progetto
-                match sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects WHERE name ILIKE $1 LIMIT 1")
-                    .bind(s)
-                    .fetch_optional(db)
-                    .await
+                match sqlx::query_scalar::<_, Uuid>(
+                    "SELECT id FROM projects WHERE name ILIKE $1 LIMIT 1",
+                )
+                .bind(s)
+                .fetch_optional(db)
+                .await
                 {
                     Ok(Some(found_id)) => found_id,
                     _ => project_id,
@@ -63,8 +70,16 @@ pub(super) async fn handle_doc_generate(db: &PgPool, project_id: Uuid, user_id: 
         None => return "[Errore] Parametro 'doc_type' obbligatorio".to_string(),
     };
 
-    let title = args.get("title").and_then(Value::as_str).unwrap_or("").to_string();
-    let standard = args.get("standard").and_then(Value::as_str).unwrap_or("ieee830").to_string();
+    let title = args
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let standard = args
+        .get("standard")
+        .and_then(Value::as_str)
+        .unwrap_or("ieee830")
+        .to_string();
 
     // Resolve project root path
     let root_row = sqlx::query("SELECT w.absolute_path, p.name FROM workspaces w JOIN projects p ON p.id = w.project_id WHERE w.project_id = $1 AND w.is_primary = TRUE")
@@ -85,10 +100,17 @@ pub(super) async fn handle_doc_generate(db: &PgPool, project_id: Uuid, user_id: 
         Some(v) if !v.is_null() && v.as_object().map_or(true, |o| !o.is_empty()) => v.clone(),
         _ => {
             // Raccogli informazioni sul progetto per generare il contenuto automaticamente
-            tracing::info!("nexus_doc_generate: content_json mancante, auto-generazione per {}", doc_type);
-            let brain_rest = std::env::var("NEURAL_CORE_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+            tracing::info!(
+                "nexus_doc_generate: content_json mancante, auto-generazione per {}",
+                doc_type
+            );
+            let brain_rest = std::env::var("NEURAL_CORE_REST_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
             // Leggi file chiave del progetto per il contesto
-            let mut project_context = format!("Progetto: {}\nRoot: {}\nTipo documento: {}\n\n", project_name, root_path, doc_type);
+            let mut project_context = format!(
+                "Progetto: {}\nRoot: {}\nTipo documento: {}\n\n",
+                project_name, root_path, doc_type
+            );
             // Cerca file importanti
             let key_files: &[&str] = &["README.md", "readme.md", "package.json", "Cargo.toml"];
             for filename in key_files {
@@ -103,11 +125,19 @@ pub(super) async fn handle_doc_generate(db: &PgPool, project_id: Uuid, user_id: 
                 project_context.push_str("--- Struttura directory ---\n");
                 let mut count = 0;
                 while let Ok(Some(entry)) = dir.next_entry().await {
-                    if count >= 40 { break; }
+                    if count >= 40 {
+                        break;
+                    }
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if name.starts_with('.') { continue; }
+                    if name.starts_with('.') {
+                        continue;
+                    }
                     let is_dir = entry.file_type().await.map_or(false, |t| t.is_dir());
-                    project_context.push_str(&format!("{}{}\n", name, if is_dir { "/" } else { "" }));
+                    project_context.push_str(&format!(
+                        "{}{}\n",
+                        name,
+                        if is_dir { "/" } else { "" }
+                    ));
                     count += 1;
                 }
             }
@@ -128,7 +158,10 @@ pub(super) async fn handle_doc_generate(db: &PgPool, project_id: Uuid, user_id: 
                  Genera almeno 5 sezioni principali con sottosezioni. Ogni content deve essere almeno 2-3 frasi.\n\n\
                  CONTESTO PROGETTO:\n{}", doc_type_label, project_context
             );
-            let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build().unwrap();
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap();
             // Modello purpose-specific letto da DB (purpose: docs_generator)
             // invece che hardcoded. Vedi migrazione 0102.
             // Nota: handle_doc_generate non ha accesso a Orchestrator/AppState,
@@ -157,7 +190,12 @@ pub(super) async fn handle_doc_generate(db: &PgPool, project_id: Uuid, user_id: 
                 "model": gen_model,
                 "prompt": gen_prompt
             });
-            let resp = match http.post(format!("{}/complete", brain_rest)).json(&body).send().await {
+            let resp = match http
+                .post(format!("{}/complete", brain_rest))
+                .json(&body)
+                .send()
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => return format!("[Errore] Generazione automatica contenuto fallita: {e}"),
             };
@@ -194,8 +232,14 @@ pub(super) async fn handle_doc_generate(db: &PgPool, project_id: Uuid, user_id: 
                     serde_json::json!({"sections": [{"number": "1", "title": doc_type_label, "content": raw, "subsections": []}]})
                 }
             };
-            let sec_count = content_val.get("sections").and_then(|s| s.as_array()).map_or(0, |a: &Vec<Value>| a.len());
-            tracing::info!("nexus_doc_generate: contenuto auto-generato con {} sezioni", sec_count);
+            let sec_count = content_val
+                .get("sections")
+                .and_then(|s| s.as_array())
+                .map_or(0, |a: &Vec<Value>| a.len());
+            tracing::info!(
+                "nexus_doc_generate: contenuto auto-generato con {} sezioni",
+                sec_count
+            );
             content_val
         }
     };
@@ -225,16 +269,33 @@ pub(super) async fn handle_doc_generate(db: &PgPool, project_id: Uuid, user_id: 
     // Usa NeuralCoreClient per la generazione del documento
     let neural_url = crate::auth::get_setting(db, "neural_core_url")
         .await
-        .unwrap_or_else(|| std::env::var("NEURAL_CORE_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string()));
+        .unwrap_or_else(|| {
+            std::env::var("NEURAL_CORE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string())
+        });
 
     let neural = match crate::orchestrator::NeuralCoreClient::connect(&neural_url).await {
         Ok(c) => c,
         Err(e) => return format!("[Errore] Connessione a Neural Core fallita: {e}"),
     };
 
-    let final_title = if title.is_empty() { slug.replace('-', " ") } else { title.clone() };
+    let final_title = if title.is_empty() {
+        slug.replace('-', " ")
+    } else {
+        title.clone()
+    };
 
-    match neural.generate_document(&doc_type, &content_str, &abs_output, &standard, &final_title, &project_name).await {
+    match neural
+        .generate_document(
+            &doc_type,
+            &content_str,
+            &abs_output,
+            &standard,
+            &final_title,
+            &project_name,
+        )
+        .await
+    {
         Ok((_file_path, page_count, section_count)) => {
             // Salva nel DB
             let doc_id = Uuid::new_v4();
@@ -261,7 +322,11 @@ pub(super) async fn handle_doc_generate(db: &PgPool, project_id: Uuid, user_id: 
             let doc_type2 = doc_type.clone();
             let version2 = version.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::vector_memory::vectorize_document(&db2, pid2, doc_id2, &doc_type2, &version2, &content2).await {
+                if let Err(e) = crate::vector_memory::vectorize_document(
+                    &db2, pid2, doc_id2, &doc_type2, &version2, &content2,
+                )
+                .await
+                {
                     tracing::warn!("Vettorializzazione documento fallita: {e}");
                 }
             });
@@ -296,7 +361,7 @@ pub(super) async fn handle_doc_update(db: &PgPool, _project_id: Uuid, args: &Val
 
     // Carica il documento esistente
     let row = sqlx::query(
-        "SELECT id, version, file_path, structure_json, title FROM project_documents WHERE id = $1"
+        "SELECT id, version, file_path, structure_json, title FROM project_documents WHERE id = $1",
     )
     .bind(doc_id)
     .fetch_optional(db)
@@ -307,7 +372,9 @@ pub(super) async fn handle_doc_update(db: &PgPool, _project_id: Uuid, args: &Val
         _ => return "[Errore] Documento non trovato".to_string(),
     };
 
-    let old_version: String = row.try_get("version").unwrap_or_else(|_| "1.0.0".to_string());
+    let old_version: String = row
+        .try_get("version")
+        .unwrap_or_else(|_| "1.0.0".to_string());
     let old_file_path: String = row.try_get("file_path").unwrap_or_default();
     let _title: String = row.try_get("title").unwrap_or_default();
     let mut structure: Value = row.try_get("structure_json").unwrap_or(json!({}));
@@ -331,7 +398,10 @@ pub(super) async fn handle_doc_update(db: &PgPool, _project_id: Uuid, args: &Val
     if let Some(existing_sections) = structure.get_mut("sections").and_then(Value::as_array_mut) {
         for update in &sections {
             let num = update.get("number").and_then(Value::as_str).unwrap_or("");
-            if let Some(existing) = existing_sections.iter_mut().find(|s| s.get("number").and_then(Value::as_str) == Some(num)) {
+            if let Some(existing) = existing_sections
+                .iter_mut()
+                .find(|s| s.get("number").and_then(Value::as_str) == Some(num))
+            {
                 if let Some(content) = update.get("content") {
                     existing["content"] = content.clone();
                 }
@@ -375,7 +445,7 @@ pub(super) async fn handle_doc_list(db: &PgPool, args: &Value) -> String {
          FROM project_documents WHERE project_id = $1
          AND ($2 = '' OR doc_type = $2)
          AND ($3 = '' OR status = $3)
-         ORDER BY doc_type, updated_at DESC"
+         ORDER BY doc_type, updated_at DESC",
     )
     .bind(pid)
     .bind(doc_type_filter)
@@ -385,14 +455,19 @@ pub(super) async fn handle_doc_list(db: &PgPool, args: &Value) -> String {
 
     match rows {
         Ok(rows) => {
-            let docs: Vec<Value> = rows.iter().map(|r| json!({
-                "id": r.try_get::<Uuid, _>("id").map(|u| u.to_string()).unwrap_or_default(),
-                "doc_type": r.try_get::<String, _>("doc_type").unwrap_or_default(),
-                "title": r.try_get::<String, _>("title").unwrap_or_default(),
-                "version": r.try_get::<String, _>("version").unwrap_or_default(),
-                "file_path": r.try_get::<String, _>("file_path").unwrap_or_default(),
-                "status": r.try_get::<String, _>("status").unwrap_or_default(),
-            })).collect();
+            let docs: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "id": r.try_get::<Uuid, _>("id").map(|u| u.to_string()).unwrap_or_default(),
+                        "doc_type": r.try_get::<String, _>("doc_type").unwrap_or_default(),
+                        "title": r.try_get::<String, _>("title").unwrap_or_default(),
+                        "version": r.try_get::<String, _>("version").unwrap_or_default(),
+                        "file_path": r.try_get::<String, _>("file_path").unwrap_or_default(),
+                        "status": r.try_get::<String, _>("status").unwrap_or_default(),
+                    })
+                })
+                .collect();
             format_json(&json!({ "documents": docs, "count": docs.len() }))
         }
         Err(e) => format!("[Errore DB] {e}"),
@@ -401,20 +476,29 @@ pub(super) async fn handle_doc_list(db: &PgPool, args: &Value) -> String {
 
 pub(super) async fn handle_doc_search(db: &PgPool, project_id: Uuid, args: &Value) -> String {
     let pid = match args.get("project_id").and_then(Value::as_str) {
-        Some(s) => match Uuid::parse_str(s) { Ok(u) => u, Err(_) => project_id },
+        Some(s) => match Uuid::parse_str(s) {
+            Ok(u) => u,
+            Err(_) => project_id,
+        },
         None => project_id,
     };
     let query = match args.get("query").and_then(Value::as_str) {
         Some(q) if !q.trim().is_empty() => q.trim().to_string(),
         _ => return "[Errore] Parametro 'query' obbligatorio".to_string(),
     };
-    let doc_type = args.get("doc_type").and_then(Value::as_str).map(String::from);
+    let doc_type = args
+        .get("doc_type")
+        .and_then(Value::as_str)
+        .map(String::from);
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(5) as usize;
 
     // Embed query
     let neural_url = crate::auth::get_setting(db, "neural_core_url")
         .await
-        .unwrap_or_else(|| std::env::var("NEURAL_CORE_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string()));
+        .unwrap_or_else(|| {
+            std::env::var("NEURAL_CORE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string())
+        });
 
     let neural = match crate::orchestrator::NeuralCoreClient::connect(&neural_url).await {
         Ok(c) => c,
@@ -426,7 +510,8 @@ pub(super) async fn handle_doc_search(db: &PgPool, project_id: Uuid, args: &Valu
         Err(e) => return format!("[Errore] Embedding: {e}"),
     };
 
-    let results = crate::vector_memory::search_doc_points(db, &vector, pid, doc_type.as_deref(), limit).await;
+    let results =
+        crate::vector_memory::search_doc_points(db, &vector, pid, doc_type.as_deref(), limit).await;
     match results {
         Ok(hits) => {
             let results: Vec<Value> = hits.iter().map(|h| {
@@ -453,7 +538,10 @@ pub(super) async fn handle_doc_status(db: &PgPool, args: &Value) -> String {
     };
     let status = match args.get("status").and_then(Value::as_str) {
         Some(s) if ["draft", "review", "approved", "outdated"].contains(&s) => s.to_string(),
-        _ => return "[Errore] Parametro 'status' obbligatorio (draft|review|approved|outdated)".to_string(),
+        _ => {
+            return "[Errore] Parametro 'status' obbligatorio (draft|review|approved|outdated)"
+                .to_string()
+        }
     };
 
     match sqlx::query("UPDATE project_documents SET status = $1, updated_at = NOW() WHERE id = $2")

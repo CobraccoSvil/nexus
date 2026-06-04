@@ -78,10 +78,7 @@ const DEFAULT_FIGMA_EXPORT_SUBDIR: &str = "figma_export";
 /// Estrae il code-snapshot finale dal .make e lo scrive su disco sotto la
 /// project_root (default `figma_export/`). Ritorna SOLO un manifest JSON con
 /// metadati: niente contenuto file, per non saturare il contesto del modello.
-pub(super) async fn tool_nexus_extract_figma_code(
-    ctx: &AgentToolContext,
-    input: &Value,
-) -> String {
+pub(super) async fn tool_nexus_extract_figma_code(ctx: &AgentToolContext, input: &Value) -> String {
     if !ctx.can_write {
         return json!({
             "error": "Permesso di scrittura non concesso su questo progetto: \
@@ -258,9 +255,7 @@ pub(super) async fn tool_nexus_extract_figma_code(
     if snapshot.unrecognized_total > 0 {
         let sample = snapshot.unrecognized.first();
         let tool_hint = sample.map(|u| u.tool_name.as_str()).unwrap_or("?");
-        let keys_hint = sample
-            .map(|u| u.outer_keys.join(","))
-            .unwrap_or_default();
+        let keys_hint = sample.map(|u| u.outer_keys.join(",")).unwrap_or_default();
         notes.push_str(&format!(
             " ATTENZIONE: {} scritture file non riconosciute (formato sconosciuto: \
              toolName={}, campi=[{}]). Il code-snapshot potrebbe essere INCOMPLETO: \
@@ -423,8 +418,8 @@ fn extract_figma(bytes: &[u8], limits: AttachmentLimits) -> Result<Value, String
 
     // Caso 2: ZIP. Apri e indicizza entry note.
     let reader = Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(reader)
-        .map_err(|e| format!("apertura ZIP fallita: {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("apertura ZIP fallita: {e}"))?;
     let index = scan_archive(&mut archive);
 
     // Caso 2a: presenza di ai_chat.json → Figma Make.
@@ -476,16 +471,22 @@ fn extract_figma(bytes: &[u8], limits: AttachmentLimits) -> Result<Value, String
         // Caso 2b: solo canvas.fig → legacy binary fallback.
         // Politica "mai troncare-e-buttare": leggiamo l'INTERA entry; il cap
         // passato e' solo la guardia anti-OOM estrema (non un cap di contenuto).
-        let payload =
-            read_entry_to_bytes(&mut archive, canvas_idx, limits.figma_make_ai_chat_max_load_bytes)?
-                .bytes;
+        let payload = read_entry_to_bytes(
+            &mut archive,
+            canvas_idx,
+            limits.figma_make_ai_chat_max_load_bytes,
+        )?
+        .bytes;
         let mut v = build_legacy_binary_result(&payload);
         if let Some(obj) = v.as_object_mut() {
             obj.insert("extracted_strings_fallback".into(), Value::Bool(true));
         }
         Ok(v)
     } else {
-        Err("Archivio Figma non riconosciuto: nessun ai_chat.json ne' canvas.fig al suo interno".into())
+        Err(
+            "Archivio Figma non riconosciuto: nessun ai_chat.json ne' canvas.fig al suo interno"
+                .into(),
+        )
     }
 }
 
@@ -507,9 +508,7 @@ fn scan_archive<R: std::io::Read + std::io::Seek>(
             idx.thumbnail_idx = Some(i);
         } else if name == "canvas.fig" || name.ends_with("/canvas.fig") {
             idx.canvas_idx = Some(i);
-        } else if name.starts_with("images/")
-            || name.contains("/images/")
-        {
+        } else if name.starts_with("images/") || name.contains("/images/") {
             // conta solo file, non directory
             if !name.ends_with('/') {
                 idx.images_count += 1;
@@ -539,7 +538,10 @@ fn read_entry_to_bytes<R: std::io::Read + std::io::Seek>(
     reader
         .read_to_end(&mut buf)
         .map_err(|e| format!("read entry {idx} fallita: {e}"))?;
-    Ok(LoadedBytes { bytes: buf, truncated })
+    Ok(LoadedBytes {
+        bytes: buf,
+        truncated,
+    })
 }
 
 fn read_entry_to_string<R: std::io::Read + std::io::Seek>(
@@ -586,8 +588,8 @@ struct ChatParseResult {
 ///    "parts": [ { "partType": "text", "contentJson": "{\"text\":\"...\"}" } ] } ] } ] }`.
 /// Tutti i livelli sono tollerati a mancare; un parse error top-level e' propagato.
 fn parse_ai_chat(bytes: &[u8]) -> Result<ChatParseResult, String> {
-    let root: Value = serde_json::from_slice(bytes)
-        .map_err(|e| format!("parse ai_chat.json fallito: {e}"))?;
+    let root: Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("parse ai_chat.json fallito: {e}"))?;
 
     // Politica "mai troncare-e-buttare": estraiamo TUTTI i messaggi (user +
     // assistant) per intero, nessun cap su numero/caratteri.
@@ -623,10 +625,7 @@ fn parse_ai_chat(bytes: &[u8]) -> Result<ChatParseResult, String> {
 
             let mut buf = String::new();
             for part in parts {
-                let part_type = part
-                    .get("partType")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let part_type = part.get("partType").and_then(Value::as_str).unwrap_or("");
                 if part_type != "text" {
                     continue;
                 }
@@ -1064,9 +1063,7 @@ fn build_legacy_binary_result(payload: &[u8]) -> Value {
 ///
 /// Politica "mai troncare-e-buttare": restituisce il render INTEGRALE; il
 /// chunking lato RAG indicizza tutto il contenuto.
-pub async fn extract_figma_strings_inline(
-    file_path: &std::path::Path,
-) -> Result<String, String> {
+pub async fn extract_figma_strings_inline(file_path: &std::path::Path) -> Result<String, String> {
     let bytes = tokio::fs::read(file_path)
         .await
         .map_err(|e| format!("read figma '{}' fallita: {e}", file_path.display()))?;
@@ -1209,8 +1206,8 @@ mod tests {
         {
             let cursor = Cursor::new(&mut buf);
             let mut zw = zip::ZipWriter::new(cursor);
-            let opts: SimpleFileOptions = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+            let opts: SimpleFileOptions =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             zw.start_file("ai_chat.json", opts).unwrap();
             zw.write_all(ai_chat_body.as_bytes()).unwrap();
             if include_meta {
@@ -1225,7 +1222,8 @@ mod tests {
                 zw.write_all(&[0x89, 0x50, 0x4E, 0x47]).unwrap();
             }
             zw.start_file("canvas.fig", opts).unwrap();
-            zw.write_all(b"fig-makej\x00binary opaque content here").unwrap();
+            zw.write_all(b"fig-makej\x00binary opaque content here")
+                .unwrap();
             zw.start_file("images/cover.png", opts).unwrap();
             zw.write_all(&[0xFF; 16]).unwrap();
             zw.finish().unwrap();
@@ -1293,7 +1291,11 @@ mod tests {
         let zip = make_ai_chat_zip(&body, false, false);
         let v = extract_figma(&zip, limits()).expect("extract");
         let text = v["chat_messages"][0]["text"].as_str().unwrap();
-        assert_eq!(text.chars().count(), 5000, "assistant integrale, niente cap");
+        assert_eq!(
+            text.chars().count(),
+            5000,
+            "assistant integrale, niente cap"
+        );
         assert!(!text.contains("troncato"));
     }
 
@@ -1306,7 +1308,8 @@ mod tests {
             let opts: SimpleFileOptions =
                 SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             zw.start_file("canvas.fig", opts).unwrap();
-            zw.write_all(b"PROPRIETARY_BINARY_HEADER_with_readable_text_here").unwrap();
+            zw.write_all(b"PROPRIETARY_BINARY_HEADER_with_readable_text_here")
+                .unwrap();
             zw.finish().unwrap();
         }
         let v = extract_figma(&buf, limits()).expect("extract");
@@ -1408,7 +1411,12 @@ mod tests {
 
         // App.tsx presente con la SECONDA versione (write_tool), BookingPage
         // presente, path sporco e content vuoto scartati.
-        assert_eq!(snap.files.len(), 2, "attesi 2 file, trovati {:?}", snap.files.keys().collect::<Vec<_>>());
+        assert_eq!(
+            snap.files.len(),
+            2,
+            "attesi 2 file, trovati {:?}",
+            snap.files.keys().collect::<Vec<_>>()
+        );
         let app = snap.files.get("src/app/App.tsx").expect("App.tsx presente");
         assert!(app.contains("Routes"), "deve vincere la v2 (write_tool)");
         assert!(snap.files.contains_key("src/app/pages/BookingPage.tsx"));
@@ -1483,7 +1491,10 @@ mod tests {
         let root: Value = serde_json::from_str(&body).expect("ai_chat valido");
         let snap = extract_make_code_snapshot(&root, false);
         let entry = detect_entrypoints(&snap.files);
-        assert!(entry.contains(&"src/app/App.tsx".to_string()), "entry={entry:?}");
+        assert!(
+            entry.contains(&"src/app/App.tsx".to_string()),
+            "entry={entry:?}"
+        );
     }
 
     #[test]
@@ -1498,8 +1509,14 @@ mod tests {
 
     #[test]
     fn package_root_name_handles_scoped() {
-        assert_eq!(package_root_name("lucide-react/icons").as_deref(), Some("lucide-react"));
-        assert_eq!(package_root_name("@radix-ui/react-dialog/sub").as_deref(), Some("@radix-ui/react-dialog"));
+        assert_eq!(
+            package_root_name("lucide-react/icons").as_deref(),
+            Some("lucide-react")
+        );
+        assert_eq!(
+            package_root_name("@radix-ui/react-dialog/sub").as_deref(),
+            Some("@radix-ui/react-dialog")
+        );
         assert_eq!(package_root_name("react").as_deref(), Some("react"));
     }
 
@@ -1509,7 +1526,10 @@ mod tests {
             parse_path_from_message("Successfully updated the file at /src/app/X.tsx.").as_deref(),
             Some("/src/app/X.tsx")
         );
-        assert!(parse_path_from_message("Successfully updated the file at /src/X.tsx Make sure to fall back").is_none());
+        assert!(parse_path_from_message(
+            "Successfully updated the file at /src/X.tsx Make sure to fall back"
+        )
+        .is_none());
         assert!(parse_path_from_message("nothing here").is_none());
     }
 

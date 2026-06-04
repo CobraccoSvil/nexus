@@ -7,7 +7,11 @@ pub struct BuildTargetListTool;
 
 #[async_trait]
 impl NexusToolHandler for BuildTargetListTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let dir = ctx.project_root.join("target");
         if !dir.is_dir() {
             return Ok(json!({"ok": true, "exists": false, "subdirs": []}));
@@ -22,5 +26,7 @@ impl NexusToolHandler for BuildTargetListTool {
         }
         Ok(json!({"ok": true, "exists": true, "count": subdirs.len(), "subdirs": subdirs}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

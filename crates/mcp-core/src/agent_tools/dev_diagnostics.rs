@@ -11,8 +11,8 @@
 //! Estensibile: nuovi pattern via INSERT in DB, niente deploy.
 
 use serde_json::{json, Value};
-use std::path::Path;
 use sqlx::{PgPool, Row};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -59,9 +59,7 @@ async fn load_diagnostics(db: &PgPool) -> Vec<Diagnostic> {
             let pattern = match regex::Regex::new(&pattern_str) {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::warn!(
-                        "dev_diagnostics: regex invalida '{pattern_str}': {e}"
-                    );
+                    tracing::warn!("dev_diagnostics: regex invalida '{pattern_str}': {e}");
                     return None;
                 }
             };
@@ -69,7 +67,9 @@ async fn load_diagnostics(db: &PgPool) -> Vec<Diagnostic> {
                 pattern,
                 category: r.try_get("category").ok()?,
                 fix_template: r.try_get("fix_template").ok()?,
-                severity: r.try_get::<String, _>("severity").unwrap_or_else(|_| "warning".into()),
+                severity: r
+                    .try_get::<String, _>("severity")
+                    .unwrap_or_else(|_| "warning".into()),
                 confidence: r.try_get::<i32, _>("confidence").unwrap_or(80),
                 description: r.try_get::<String, _>("description").unwrap_or_default(),
             })
@@ -94,16 +94,15 @@ async fn get_diagnostics(db: &PgPool) -> Vec<Diagnostic> {
         });
     }
     let guard = CACHE.lock().unwrap();
-    guard.as_ref().map(|c| c.entries.clone()).unwrap_or_default()
+    guard
+        .as_ref()
+        .map(|c| c.entries.clone())
+        .unwrap_or_default()
 }
 
 /// Sostituisce i placeholder {1},{2},... con i capture group della regex match.
 /// Riconosce anche placeholder testuali: {file}, {from}, {module}, {log_path}.
-fn render_fix_template(
-    template: &str,
-    caps: &regex::Captures,
-    log_path: Option<&str>,
-) -> String {
+fn render_fix_template(template: &str, caps: &regex::Captures, log_path: Option<&str>) -> String {
     let mut out = template.to_string();
     // Numerici {1},{2},...
     for i in 1..caps.len() {
@@ -138,7 +137,9 @@ async fn read_log_tail(path: &Path) -> Result<String, String> {
             .map_err(|e| format!("read fallita: {e}"))?
     } else {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let mut f = tokio::fs::File::open(path).await.map_err(|e| e.to_string())?;
+        let mut f = tokio::fs::File::open(path)
+            .await
+            .map_err(|e| e.to_string())?;
         f.seek(std::io::SeekFrom::Start(start as u64))
             .await
             .map_err(|e| e.to_string())?;
@@ -155,8 +156,14 @@ pub(super) async fn tool_nexus_dev_server_diagnose(
     input: &Value,
 ) -> String {
     // Input opzionali: log_path (file da scansionare), inline_log (stringa), port (per nota)
-    let log_path = input.get("log_path").and_then(Value::as_str).map(|s| s.trim().to_string());
-    let inline_log = input.get("log").and_then(Value::as_str).map(|s| s.to_string());
+    let log_path = input
+        .get("log_path")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string());
+    let inline_log = input
+        .get("log")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
     let port = input.get("port").and_then(Value::as_i64);
 
     let log_content = if let Some(s) = inline_log {
@@ -214,7 +221,10 @@ pub(super) async fn tool_nexus_dev_server_diagnose(
             }
             seen_categories.insert(dedup_key.clone(), prev_count + 1);
 
-            let matched_text = caps.get(0).map(|m| m.as_str().to_string()).unwrap_or_default();
+            let matched_text = caps
+                .get(0)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
             findings.push(json!({
                 "category": diag.category,
                 "severity": diag.severity,

@@ -8,10 +8,21 @@ pub struct CaDeriveCountTool;
 
 #[async_trait]
 impl NexusToolHandler for CaDeriveCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(
             &ctx.project_root,
-            &["#[derive(", "Debug", "Clone", "Serialize", "Deserialize", "Default"],
+            &[
+                "#[derive(",
+                "Debug",
+                "Clone",
+                "Serialize",
+                "Deserialize",
+                "Default",
+            ],
         );
         Ok(json!({
             "ok": true,
@@ -24,5 +35,7 @@ impl NexusToolHandler for CaDeriveCountTool {
             "default": counts[5],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

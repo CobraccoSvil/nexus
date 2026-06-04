@@ -7,7 +7,9 @@ use std::path::Path;
 pub struct PerfLocPerCrateTool;
 
 fn count_loc(dir: &Path, depth: usize) -> usize {
-    if depth > 6 { return 0; }
+    if depth > 6 {
+        return 0;
+    }
     let mut total = 0usize;
     if let Ok(rd) = std::fs::read_dir(dir) {
         for entry in rd.flatten() {
@@ -26,14 +28,20 @@ fn count_loc(dir: &Path, depth: usize) -> usize {
 
 #[async_trait]
 impl NexusToolHandler for PerfLocPerCrateTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let crates_dir = ctx.project_root.join("crates");
         let mut out: Vec<Value> = vec![];
         if crates_dir.is_dir() {
             if let Ok(rd) = std::fs::read_dir(&crates_dir) {
                 for entry in rd.flatten() {
                     let p = entry.path();
-                    if !p.is_dir() { continue; }
+                    if !p.is_dir() {
+                        continue;
+                    }
                     let src = p.join("src");
                     let loc = if src.is_dir() { count_loc(&src, 0) } else { 0 };
                     out.push(json!({"crate": entry.file_name().to_string_lossy(), "loc": loc}));
@@ -45,8 +53,15 @@ impl NexusToolHandler for PerfLocPerCrateTool {
                 out.push(json!({"crate": "(root)", "loc": count_loc(&src, 0)}));
             }
         }
-        out.sort_by(|a, b| b["loc"].as_u64().unwrap_or(0).cmp(&a["loc"].as_u64().unwrap_or(0)));
+        out.sort_by(|a, b| {
+            b["loc"]
+                .as_u64()
+                .unwrap_or(0)
+                .cmp(&a["loc"].as_u64().unwrap_or(0))
+        });
         Ok(json!({"ok": true, "count": out.len(), "crates": out}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

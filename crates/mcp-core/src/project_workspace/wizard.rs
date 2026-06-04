@@ -5,51 +5,106 @@ use super::*;
 /// Descrive un singolo step di setup dell'ambiente (es. `pnpm install`).
 struct SetupStep {
     /// Nome leggibile dello step (es. "pnpm install")
-    label:         &'static str,
+    label: &'static str,
     /// Eseguibile da lanciare
-    cmd:           &'static str,
+    cmd: &'static str,
     /// Argomenti da passare all'eseguibile
-    args:          &'static [&'static str],
+    args: &'static [&'static str],
     /// File/directory che indica la presenza del progetto (es. "package.json")
-    indicator:     &'static str,
+    indicator: &'static str,
     /// File/directory che indica che il setup è GIA' stato fatto (es. "node_modules").
     /// Se questo path NON esiste, lo step viene eseguito.
-    done_marker:   &'static str,
+    done_marker: &'static str,
 }
 
 /// Tabella di rilevamento framework → step di setup.
 /// Ordinata per priorità: lock file prima del file generico dello stesso ecosistema.
 static SETUP_STEPS: &[SetupStep] = &[
     // ── Node.js ──────────────────────────────────────────────────────────────
-    SetupStep { label: "pnpm install",  cmd: "pnpm", args: &["install", "--frozen-lockfile"],
-                indicator: "pnpm-lock.yaml",   done_marker: "node_modules" },
-    SetupStep { label: "yarn install",  cmd: "yarn", args: &["install", "--frozen-lockfile"],
-                indicator: "yarn.lock",         done_marker: "node_modules" },
-    SetupStep { label: "npm install",   cmd: "npm",  args: &["install"],
-                indicator: "package.json",      done_marker: "node_modules" },
+    SetupStep {
+        label: "pnpm install",
+        cmd: "pnpm",
+        args: &["install", "--frozen-lockfile"],
+        indicator: "pnpm-lock.yaml",
+        done_marker: "node_modules",
+    },
+    SetupStep {
+        label: "yarn install",
+        cmd: "yarn",
+        args: &["install", "--frozen-lockfile"],
+        indicator: "yarn.lock",
+        done_marker: "node_modules",
+    },
+    SetupStep {
+        label: "npm install",
+        cmd: "npm",
+        args: &["install"],
+        indicator: "package.json",
+        done_marker: "node_modules",
+    },
     // ── .NET ─────────────────────────────────────────────────────────────────
     // Nota: l'indicatore *.csproj viene gestito a parte (glob) perché ha
     // un'estensione variabile; qui usiamo il file di soluzione come proxy.
-    SetupStep { label: "dotnet restore", cmd: "dotnet", args: &["restore"],
-                indicator: "*.csproj",          done_marker: "bin" },
+    SetupStep {
+        label: "dotnet restore",
+        cmd: "dotnet",
+        args: &["restore"],
+        indicator: "*.csproj",
+        done_marker: "bin",
+    },
     // ── Python ───────────────────────────────────────────────────────────────
-    SetupStep { label: "uv sync",        cmd: "uv",     args: &["sync"],
-                indicator: "uv.lock",           done_marker: ".venv" },
-    SetupStep { label: "poetry install", cmd: "poetry", args: &["install", "--no-interaction"],
-                indicator: "poetry.lock",       done_marker: ".venv" },
-    SetupStep { label: "pip install",    cmd: "pip",    args: &["install", "-r", "requirements.txt"],
-                indicator: "requirements.txt",  done_marker: ".venv" },
-    SetupStep { label: "pipenv install", cmd: "pipenv", args: &["install"],
-                indicator: "Pipfile",           done_marker: ".venv" },
+    SetupStep {
+        label: "uv sync",
+        cmd: "uv",
+        args: &["sync"],
+        indicator: "uv.lock",
+        done_marker: ".venv",
+    },
+    SetupStep {
+        label: "poetry install",
+        cmd: "poetry",
+        args: &["install", "--no-interaction"],
+        indicator: "poetry.lock",
+        done_marker: ".venv",
+    },
+    SetupStep {
+        label: "pip install",
+        cmd: "pip",
+        args: &["install", "-r", "requirements.txt"],
+        indicator: "requirements.txt",
+        done_marker: ".venv",
+    },
+    SetupStep {
+        label: "pipenv install",
+        cmd: "pipenv",
+        args: &["install"],
+        indicator: "Pipfile",
+        done_marker: ".venv",
+    },
     // ── Go ───────────────────────────────────────────────────────────────────
-    SetupStep { label: "go mod download", cmd: "go", args: &["mod", "download"],
-                indicator: "go.mod",            done_marker: "vendor" },
+    SetupStep {
+        label: "go mod download",
+        cmd: "go",
+        args: &["mod", "download"],
+        indicator: "go.mod",
+        done_marker: "vendor",
+    },
     // ── Ruby ─────────────────────────────────────────────────────────────────
-    SetupStep { label: "bundle install", cmd: "bundle", args: &["install"],
-                indicator: "Gemfile",           done_marker: "vendor/bundle" },
+    SetupStep {
+        label: "bundle install",
+        cmd: "bundle",
+        args: &["install"],
+        indicator: "Gemfile",
+        done_marker: "vendor/bundle",
+    },
     // ── PHP ───────────────────────────────────────────────────────────────────
-    SetupStep { label: "composer install", cmd: "composer", args: &["install", "--no-interaction"],
-                indicator: "composer.json",     done_marker: "vendor" },
+    SetupStep {
+        label: "composer install",
+        cmd: "composer",
+        args: &["install", "--no-interaction"],
+        indicator: "composer.json",
+        done_marker: "vendor",
+    },
 ];
 
 /// Rileva quale step di setup è necessario per il `cwd` dato e lo esegue.
@@ -64,20 +119,26 @@ async fn run_env_setup(cwd: &str, unit_name: &str) -> Vec<serde_json::Value> {
         let indicator_exists = if step.indicator.contains('*') {
             // Glob semplice: cerca file con quell'estensione nella directory
             let ext = step.indicator.trim_start_matches('*');
-            tokio::fs::read_dir(cwd).await
+            tokio::fs::read_dir(cwd)
+                .await
                 .ok()
                 .map(|mut rd| {
                     // La lettura in async richiede un loop; usiamo std come fallback
                     // perché il read_dir async non ha un metodo .any() diretto.
                     drop(rd);
-                    std::fs::read_dir(cwd).ok()
-                        .map(|rd| rd.filter_map(|e| e.ok())
-                            .any(|e| e.file_name().to_string_lossy().ends_with(ext)))
+                    std::fs::read_dir(cwd)
+                        .ok()
+                        .map(|rd| {
+                            rd.filter_map(|e| e.ok())
+                                .any(|e| e.file_name().to_string_lossy().ends_with(ext))
+                        })
                         .unwrap_or(false)
                 })
                 .unwrap_or(false)
         } else {
-            tokio::fs::metadata(format!("{}/{}", cwd, step.indicator)).await.is_ok()
+            tokio::fs::metadata(format!("{}/{}", cwd, step.indicator))
+                .await
+                .is_ok()
         };
 
         if !indicator_exists {
@@ -85,7 +146,9 @@ async fn run_env_setup(cwd: &str, unit_name: &str) -> Vec<serde_json::Value> {
         }
 
         // Controlla se il done_marker è già presente (setup già fatto)
-        let done = tokio::fs::metadata(format!("{}/{}", cwd, step.done_marker)).await.is_ok();
+        let done = tokio::fs::metadata(format!("{}/{}", cwd, step.done_marker))
+            .await
+            .is_ok();
         if done {
             tracing::debug!(unit = %unit_name, cwd = %cwd, step = %step.label, "setup già presente, skip");
             continue;
@@ -105,9 +168,16 @@ async fn run_env_setup(cwd: &str, unit_name: &str) -> Vec<serde_json::Value> {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 // Ultime 15 righe per non saturare la risposta JSON
-                let tail = |s: &str| s.lines().rev().take(15)
-                    .collect::<Vec<_>>().into_iter().rev()
-                    .collect::<Vec<_>>().join("\n");
+                let tail = |s: &str| {
+                    s.lines()
+                        .rev()
+                        .take(15)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
                 if ok {
                     tracing::info!(unit = %unit_name, cwd = %cwd, step = %step.label, "setup completato");
                 } else {
@@ -293,7 +363,8 @@ pub async fn wizard_detect_services(
 
     // Porta deterministica per suggerimenti web: evita conflitti già in fase di analisi.
     async fn suggest_port(state: &AppState, project_id: &Uuid, key: &str) -> u16 {
-        super::services::deterministic_project_port_for_key(project_id, key, &state.port_registry).await
+        super::services::deterministic_project_port_for_key(project_id, key, &state.port_registry)
+            .await
     }
 
     // ── 1. package.json / pnpm ─────────────────────────────────────────────
@@ -302,11 +373,18 @@ pub async fn wizard_detect_services(
         if let Ok(content) = tokio::fs::read_to_string(pkg_path).await {
             if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) {
                 let scripts = pkg.get("scripts").and_then(|s| s.as_object());
-                let cwd = std::path::Path::new(pkg_path).parent()
+                let cwd = std::path::Path::new(pkg_path)
+                    .parent()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|| root.clone());
-                let rel = cwd.strip_prefix(&root).unwrap_or("").trim_start_matches('/');
-                let pkg_manager = if tokio::fs::metadata(format!("{}/pnpm-lock.yaml", cwd)).await.is_ok() {
+                let rel = cwd
+                    .strip_prefix(&root)
+                    .unwrap_or("")
+                    .trim_start_matches('/');
+                let pkg_manager = if tokio::fs::metadata(format!("{}/pnpm-lock.yaml", cwd))
+                    .await
+                    .is_ok()
+                {
                     "pnpm"
                 } else {
                     "npm"
@@ -314,9 +392,14 @@ pub async fn wizard_detect_services(
                 // Controlla se node_modules esiste. Il flag `needs_install`
                 // viene usato dalla UI per mostrare uno step "Setup ambiente";
                 // il wizard install eseguirà automaticamente il setup.
-                let needs_install = tokio::fs::metadata(format!("{}/node_modules", &cwd)).await.is_err();
+                let needs_install = tokio::fs::metadata(format!("{}/node_modules", &cwd))
+                    .await
+                    .is_err();
                 for script_name in ["dev", "start", "serve", "preview"] {
-                    if scripts.map(|s| s.contains_key(script_name)).unwrap_or(false) {
+                    if scripts
+                        .map(|s| s.contains_key(script_name))
+                        .unwrap_or(false)
+                    {
                         let svc_short = if rel.is_empty() {
                             script_name.to_string()
                         } else {
@@ -345,15 +428,22 @@ pub async fn wizard_detect_services(
     // ── 2. .NET / launchSettings.json ──────────────────────────────────────
     let launch_paths = find_files_named(&root, "launchSettings.json", 8).await;
     for lp in &launch_paths {
-        let cwd = std::path::Path::new(lp).parent()
+        let cwd = std::path::Path::new(lp)
+            .parent()
             .and_then(|p| p.parent()) // Properties/ → project dir
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| root.clone());
         let csproj = find_csproj_in(&cwd).await;
         let proj_arg = csproj.as_deref().unwrap_or(".");
-        let rel = cwd.strip_prefix(&root).unwrap_or("").trim_start_matches('/');
-        let svc_short = if rel.is_empty() { "dotnet".to_string() }
-                        else { rel.replace('/', "-") };
+        let rel = cwd
+            .strip_prefix(&root)
+            .unwrap_or("")
+            .trim_start_matches('/');
+        let svc_short = if rel.is_empty() {
+            "dotnet".to_string()
+        } else {
+            rel.replace('/', "-")
+        };
         // needs_install: manca la directory bin/ → dotnet restore necessario
         let needs_install = tokio::fs::metadata(format!("{}/bin", cwd)).await.is_err();
         suggestions.push(json!({
@@ -376,18 +466,27 @@ pub async fn wizard_detect_services(
     for cp in &cargo_paths {
         if let Ok(content) = tokio::fs::read_to_string(cp).await {
             // Cerca [[bin]] entries
-            let bin_names: Vec<String> = content.lines()
+            let bin_names: Vec<String> = content
+                .lines()
                 .filter_map(|l| {
                     let t = l.trim();
                     if t.starts_with("name") && content.contains("[[bin]]") {
-                        t.splitn(2, '=').nth(1)
+                        t.splitn(2, '=')
+                            .nth(1)
                             .map(|v| v.trim().trim_matches('"').to_string())
-                    } else { None }
-                }).collect();
-            let cwd = std::path::Path::new(cp).parent()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let cwd = std::path::Path::new(cp)
+                .parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| root.clone());
-            let rel = cwd.strip_prefix(&root).unwrap_or("").trim_start_matches('/');
+            let rel = cwd
+                .strip_prefix(&root)
+                .unwrap_or("")
+                .trim_start_matches('/');
             for bin in &bin_names {
                 let svc_short = format!("cargo-{}", bin);
                 suggestions.push(json!({
@@ -405,8 +504,12 @@ pub async fn wizard_detect_services(
     }
 
     // ── 4. docker-compose.yml ──────────────────────────────────────────────
-    for dc_name in &["docker-compose.yml", "docker-compose.yaml",
-                     "docker-compose.dev.yml", "docker-compose.dev.yaml"] {
+    for dc_name in &[
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "docker-compose.dev.yml",
+        "docker-compose.dev.yaml",
+    ] {
         let dc_path = format!("{}/{}", root, dc_name);
         if tokio::fs::metadata(&dc_path).await.is_ok() {
             suggestions.push(json!({
@@ -432,13 +535,25 @@ pub async fn wizard_detect_services(
             let (py_pkg_manager, needs_install) = {
                 let venv_ok = tokio::fs::metadata(format!("{}/.venv", root)).await.is_ok()
                     || tokio::fs::metadata(format!("{}/venv", root)).await.is_ok();
-                let pm = if tokio::fs::metadata(format!("{}/uv.lock", root)).await.is_ok() {
+                let pm = if tokio::fs::metadata(format!("{}/uv.lock", root))
+                    .await
+                    .is_ok()
+                {
                     "uv sync"
-                } else if tokio::fs::metadata(format!("{}/poetry.lock", root)).await.is_ok() {
+                } else if tokio::fs::metadata(format!("{}/poetry.lock", root))
+                    .await
+                    .is_ok()
+                {
                     "poetry install"
-                } else if tokio::fs::metadata(format!("{}/Pipfile", root)).await.is_ok() {
+                } else if tokio::fs::metadata(format!("{}/Pipfile", root))
+                    .await
+                    .is_ok()
+                {
                     "pipenv install"
-                } else if tokio::fs::metadata(format!("{}/requirements.txt", root)).await.is_ok() {
+                } else if tokio::fs::metadata(format!("{}/requirements.txt", root))
+                    .await
+                    .is_ok()
+                {
                     "pip install -r requirements.txt"
                 } else {
                     ""
@@ -462,8 +577,15 @@ pub async fn wizard_detect_services(
 
     // Marca quelli già installati come .service files
     if let Ok(svc_out) = systemctl_user()
-        .args(["--user", "list-unit-files", "--type=service", "--no-legend", "--no-pager"])
-        .output().await
+        .args([
+            "--user",
+            "list-unit-files",
+            "--type=service",
+            "--no-legend",
+            "--no-pager",
+        ])
+        .output()
+        .await
     {
         let installed: std::collections::HashSet<String> = String::from_utf8_lossy(&svc_out.stdout)
             .lines()
@@ -494,9 +616,11 @@ pub async fn wizard_install_service(
     let context = load_project_context(&state.db, project_id, user_id).await?;
     let slug = context.details.name.to_lowercase().replace([' ', '_'], "-");
 
-    let short = body["short"].as_str()
+    let short = body["short"]
+        .as_str()
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'short' obbligatorio"))?;
-    let command = body["command"].as_str()
+    let command = body["command"]
+        .as_str()
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'command' obbligatorio"))?;
     let root_str = context.root_path.to_string_lossy().to_string();
     let cwd = body["cwd"].as_str().unwrap_or(&root_str);
@@ -504,7 +628,10 @@ pub async fn wizard_install_service(
     let description = body["description"].as_str().unwrap_or(&desc_fallback);
 
     if short.contains('/') || short.contains("..") {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Nome servizio non valido"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Nome servizio non valido",
+        ));
     }
 
     // ── Validazione anti-placeholder ─────────────────────────────────────
@@ -513,7 +640,10 @@ pub async fn wizard_install_service(
     // sempre `active (exited)` ma non facevano nulla, confondendo l'utente.
     let cmd_trim = command.trim();
     if cmd_trim.is_empty() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Il comando del servizio non può essere vuoto"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Il comando del servizio non può essere vuoto",
+        ));
     }
     let cmd_basename = std::path::Path::new(cmd_trim)
         .file_name()
@@ -538,7 +668,10 @@ pub async fn wizard_install_service(
     if let Err(e) = tokio::fs::metadata(cwd).await {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
-            format!("La directory di lavoro '{}' non esiste o non è accessibile: {}", cwd, e),
+            format!(
+                "La directory di lavoro '{}' non esiste o non è accessibile: {}",
+                cwd, e
+            ),
         ));
     }
 
@@ -556,8 +689,13 @@ pub async fn wizard_install_service(
     // Soluzione: risolvi il path assoluto del binary via bash login shell
     // (`bash -lc 'command -v X'`) che eredita il PATH dell'utente, e usalo
     // in ExecStart. Se il binary inizia gia' con / o ./ lo lasciamo invariato.
-    let args: Vec<String> = body["args"].as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+    let args: Vec<String> = body["args"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let resolved_command: String = if command.starts_with('/') || command.starts_with("./") {
@@ -576,11 +714,16 @@ pub async fn wizard_install_service(
         let probed: Option<String> = {
             let r = tokio::process::Command::new("/bin/bash")
                 .args(["-lc", &format!("command -v {}", command)])
-                .output().await;
+                .output()
+                .await;
             match r {
                 Ok(out) if out.status.success() => {
                     let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if p.is_empty() { None } else { Some(p) }
+                    if p.is_empty() {
+                        None
+                    } else {
+                        Some(p)
+                    }
                 }
                 _ => None,
             }
@@ -633,7 +776,9 @@ pub async fn wizard_install_service(
 
     fn parse_port_token(s: &str) -> Option<u16> {
         let t = s.trim();
-        if t.is_empty() { return None; }
+        if t.is_empty() {
+            return None;
+        }
         let t = t.trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ';');
         t.parse::<u16>().ok()
     }
@@ -676,8 +821,16 @@ pub async fn wizard_install_service(
         let pkg = std::path::Path::new(cwd).join("package.json");
         let content = std::fs::read_to_string(&pkg).ok()?;
         let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
-        let cmd = parsed.get("scripts")?.get(script_name)?.as_str()?.to_string();
-        if cmd.trim().is_empty() { None } else { Some(cmd) }
+        let cmd = parsed
+            .get("scripts")?
+            .get(script_name)?
+            .as_str()?
+            .to_string();
+        if cmd.trim().is_empty() {
+            None
+        } else {
+            Some(cmd)
+        }
     }
 
     fn rewrite_port_flags(command: &str, target_port: u16) -> String {
@@ -686,8 +839,8 @@ pub async fn wizard_install_service(
         // Rimpiazza porte note (default tool framework) anche per Vite (5173), Svelte (5173),
         // Astro (4321), Nuxt (3000), CRA (3000), Angular (4200), Webpack (8080).
         for bad in [
-            "3000", "3001", "3002", "4000", "4010", "4020", "4030", "4040", "4050", "4060",
-            "4200", "4321", "5173", "5174", "5000", "5001", "8000", "8001", "8080", "9000",
+            "3000", "3001", "3002", "4000", "4010", "4020", "4030", "4040", "4050", "4060", "4200",
+            "4321", "5173", "5174", "5000", "5001", "8000", "8001", "8080", "9000",
         ] {
             out = out.replace(&format!("--port={}", bad), &format!("--port={}", p));
             out = out.replace(&format!("--port {}", bad), &format!("--port {}", p));
@@ -697,7 +850,10 @@ pub async fn wizard_install_service(
             out = out.replace(&format!("127.0.0.1:{}", bad), &format!("127.0.0.1:{}", p));
         }
         let lower = out.to_lowercase();
-        let has_flag = lower.contains("--port") || lower.split_whitespace().any(|t| t == "-p" || t.starts_with("-p"));
+        let has_flag = lower.contains("--port")
+            || lower
+                .split_whitespace()
+                .any(|t| t == "-p" || t.starts_with("-p"));
         // Forza --port per tool che ignorano $PORT env var:
         // - Vite (5173 default, ignora PORT senza --port o vite.config)
         // - Astro (4321 default, idem)
@@ -719,7 +875,8 @@ pub async fn wizard_install_service(
     }
 
     // Blocco Environment= per variabili d'ambiente (con policy porte: mai usare porte riservate Nexus, incl. 3000).
-    let reserved: std::collections::HashSet<u16> = services::NEXUS_RESERVED_PORTS.iter().copied().collect();
+    let reserved: std::collections::HashSet<u16> =
+        services::NEXUS_RESERVED_PORTS.iter().copied().collect();
     let mut env_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     if let Some(obj) = body["env"].as_object() {
         for (k, v) in obj {
@@ -728,28 +885,40 @@ pub async fn wizard_install_service(
     }
 
     let kind = body["kind"].as_str().unwrap_or("");
-    let wants_port = matches!(kind, "npm" | "pnpm" | "dotnet") || looks_like_web_server_command(&exec_start);
+    let wants_port =
+        matches!(kind, "npm" | "pnpm" | "dotnet") || looks_like_web_server_command(&exec_start);
     let existing_port = env_map.get("PORT").and_then(|v| parse_port_token(v));
     let final_port = if wants_port {
         // Se il client non passa PORT, assegnalo in modo deterministico nel bucket progetto.
         // Questo evita che servizi web finiscano su 3000/3002 per fallback e garantisce stabilità.
         let port = match existing_port {
             Some(p) => p,
-            None => super::services::deterministic_project_port_for_key(
-                &project_id,
-                short,
-                &state.port_registry,
-            )
-            .await,
+            None => {
+                super::services::deterministic_project_port_for_key(
+                    &project_id,
+                    short,
+                    &state.port_registry,
+                )
+                .await
+            }
         };
         let ok = !reserved.contains(&port)
             && state.port_registry.is_port_available(port).await
-            && tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await.is_ok();
-        let actual = if ok { port } else { services::find_free_project_port(&project_id, &state.port_registry).await };
+            && tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+                .await
+                .is_ok();
+        let actual = if ok {
+            port
+        } else {
+            services::find_free_project_port(&project_id, &state.port_registry).await
+        };
         env_map.insert("PORT".to_string(), actual.to_string());
         // .NET: usa ASPNETCORE_URLS per forzare la porta (PORT da solo non basta).
         if kind == "dotnet" && !env_map.contains_key("ASPNETCORE_URLS") {
-            env_map.insert("ASPNETCORE_URLS".to_string(), format!("http://0.0.0.0:{}", actual));
+            env_map.insert(
+                "ASPNETCORE_URLS".to_string(),
+                format!("http://0.0.0.0:{}", actual),
+            );
         }
         Some(actual)
     } else {
@@ -761,24 +930,41 @@ pub async fn wizard_install_service(
         // reale dal package.json. Necessario per Vite/Astro/Nuxt che ignorano
         // $PORT env e richiedono --port sulla CLI del tool, non del wrapper.
         let lower_exec = exec_start.to_lowercase();
-        let is_script_runner = (lower_exec.contains("npm") || lower_exec.contains("pnpm") || lower_exec.contains("yarn"))
-            && (lower_exec.contains(" run ") || lower_exec.ends_with(" dev") || lower_exec.ends_with(" start"));
+        let is_script_runner = (lower_exec.contains("npm")
+            || lower_exec.contains("pnpm")
+            || lower_exec.contains("yarn"))
+            && (lower_exec.contains(" run ")
+                || lower_exec.ends_with(" dev")
+                || lower_exec.ends_with(" start"));
         if is_script_runner {
             if let Some(resolved) = resolve_script_command(cwd, &exec_start) {
                 let resolved_lower = resolved.to_lowercase();
-                let uses_vite_like = resolved_lower.contains("vite") || resolved_lower.contains("astro") || resolved_lower.contains("nuxt") || resolved_lower.contains("svelte");
+                let uses_vite_like = resolved_lower.contains("vite")
+                    || resolved_lower.contains("astro")
+                    || resolved_lower.contains("nuxt")
+                    || resolved_lower.contains("svelte");
                 if uses_vite_like {
                     // Estrai il package manager (npm/pnpm/yarn) per usare `<pm> exec`.
-                    let pm = if lower_exec.contains("pnpm") { "pnpm exec" }
-                             else if lower_exec.contains("yarn") { "yarn" }
-                             else { "npx" };
-                    let needs_host = resolved_lower.contains("vite") || resolved_lower.contains("svelte");
+                    let pm = if lower_exec.contains("pnpm") {
+                        "pnpm exec"
+                    } else if lower_exec.contains("yarn") {
+                        "yarn"
+                    } else {
+                        "npx"
+                    };
+                    let needs_host =
+                        resolved_lower.contains("vite") || resolved_lower.contains("svelte");
                     let host_flag = if needs_host { " --host 0.0.0.0" } else { "" };
                     // resolved e' qualcosa come "vite" o "vite --some-flag" — manteniamo i suoi flag
                     // ma aggiungiamo --port se manca.
                     let resolved_rewritten = rewrite_port_flags(&resolved, p);
-                    let needs_port_append = !resolved_rewritten.to_lowercase().contains("--port") && !resolved_rewritten.to_lowercase().contains(" -p ");
-                    let port_flag = if needs_port_append { format!(" --port {}", p) } else { String::new() };
+                    let needs_port_append = !resolved_rewritten.to_lowercase().contains("--port")
+                        && !resolved_rewritten.to_lowercase().contains(" -p ");
+                    let port_flag = if needs_port_append {
+                        format!(" --port {}", p)
+                    } else {
+                        String::new()
+                    };
                     format!("{} {}{}{}", pm, resolved_rewritten, port_flag, host_flag)
                 } else {
                     rewrite_port_flags(&exec_start, p)
@@ -800,7 +986,10 @@ pub async fn wizard_install_service(
     // porta appena allocata nelle ricerche sibling.
     {
         #[derive(sqlx::FromRow)]
-        struct PortLabel { port: i32, label: String }
+        struct PortLabel {
+            port: i32,
+            label: String,
+        }
         let sibling_rows: Vec<PortLabel> = sqlx::query_as(
             "SELECT port, label FROM nexus_port_allocations \
              WHERE project_id = $1 AND label != $2 ORDER BY port ASC",
@@ -869,9 +1058,11 @@ pub async fn wizard_install_service(
     let svc_dir = format!("{}/.config/systemd/user", home);
     let svc_path = format!("{}/{}", svc_dir, unit_name);
 
-    tokio::fs::create_dir_all(&svc_dir).await
+    tokio::fs::create_dir_all(&svc_dir)
+        .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {}", e)))?;
-    tokio::fs::write(&svc_path, &unit_content).await
+    tokio::fs::write(&svc_path, &unit_content)
+        .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("write: {}", e)))?;
 
     // Cleanup: rimuove servizi disabled dello stesso progetto con ruolo sovrapponibile.
@@ -880,7 +1071,13 @@ pub async fn wizard_install_service(
     let mut cleaned: Vec<String> = Vec::new();
     let slug_prefix = format!("{}-", slug);
     if let Ok(list_out) = systemctl_user()
-        .args(["--user", "list-unit-files", "--type=service", "--no-legend", "--no-pager"])
+        .args([
+            "--user",
+            "list-unit-files",
+            "--type=service",
+            "--no-legend",
+            "--no-pager",
+        ])
         .output()
         .await
     {
@@ -888,21 +1085,37 @@ pub async fn wizard_install_service(
             let cols: Vec<&str> = line.split_whitespace().collect();
             let old_unit = cols.first().copied().unwrap_or("");
             let old_state = cols.get(1).copied().unwrap_or("");
-            if old_state != "disabled" { continue; }
-            if !old_unit.starts_with(&slug_prefix) || !old_unit.ends_with(".service") { continue; }
-            if old_unit == unit_name { continue; }
+            if old_state != "disabled" {
+                continue;
+            }
+            if !old_unit.starts_with(&slug_prefix) || !old_unit.ends_with(".service") {
+                continue;
+            }
+            if old_unit == unit_name {
+                continue;
+            }
             let old_short = old_unit
-                .strip_prefix(&slug_prefix).unwrap_or(old_unit)
-                .strip_suffix(".service").unwrap_or(old_unit);
+                .strip_prefix(&slug_prefix)
+                .unwrap_or(old_unit)
+                .strip_suffix(".service")
+                .unwrap_or(old_unit);
             if short.starts_with(old_short) || old_short.starts_with(short) {
                 let old_path = format!("{}/{}", svc_dir, old_unit);
                 let _ = systemctl_user()
-                    .args(["--user", "stop", old_unit]).output().await;
+                    .args(["--user", "stop", old_unit])
+                    .output()
+                    .await;
                 let _ = systemctl_user()
-                    .args(["--user", "disable", old_unit]).output().await;
+                    .args(["--user", "disable", old_unit])
+                    .output()
+                    .await;
                 let _ = tokio::fs::remove_file(&old_path).await;
                 cleaned.push(old_unit.to_string());
-                tracing::info!("Rimosso servizio orfano {} (sostituito da {})", old_unit, unit_name);
+                tracing::info!(
+                    "Rimosso servizio orfano {} (sostituito da {})",
+                    old_unit,
+                    unit_name
+                );
             }
         }
     }
@@ -913,10 +1126,17 @@ pub async fn wizard_install_service(
     let detected_ports = services::extract_ports_from_unit(&unit_content);
     for p in &detected_ports {
         // Ignora errori di registrazione (es. porta gia' allocata) — non blocca l'install
-        if let Err(e) = state.port_registry.allocate(
-            project_id, *p, short, "auto", None, Some(&unit_name),
-        ).await {
-            tracing::warn!("port_registry: registrazione porta {} per {} fallita: {}", p, unit_name, e);
+        if let Err(e) = state
+            .port_registry
+            .allocate(project_id, *p, short, "auto", None, Some(&unit_name))
+            .await
+        {
+            tracing::warn!(
+                "port_registry: registrazione porta {} per {} fallita: {}",
+                p,
+                unit_name,
+                e
+            );
         }
     }
 
@@ -932,11 +1152,15 @@ pub async fn wizard_install_service(
     if systemd_user_available().await {
         mode = "systemd";
         let _ = systemctl_user()
-            .args(["--user", "daemon-reload"]).output().await;
+            .args(["--user", "daemon-reload"])
+            .output()
+            .await;
         // enable --now: abilita all'avvio E avvia subito (prima si faceva solo
         // `enable`, quindi il servizio non partiva).
         let enable_out = systemctl_user()
-            .args(["--user", "enable", "--now", &unit_name]).output().await
+            .args(["--user", "enable", "--now", &unit_name])
+            .output()
+            .await
             .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         ok = enable_out.status.success();
         if !ok {
@@ -1008,24 +1232,38 @@ pub async fn uninstall_project_service(
     let slug = context.details.name.to_lowercase().replace([' ', '_'], "-");
 
     if service.contains('/') || service.contains("..") {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Nome servizio non valido"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Nome servizio non valido",
+        ));
     }
     let unit_name = if service.starts_with(&format!("{}-", slug)) {
-        if service.ends_with(".service") { service.clone() } else { format!("{}.service", service) }
+        if service.ends_with(".service") {
+            service.clone()
+        } else {
+            format!("{}.service", service)
+        }
     } else {
         format!("{}-{}.service", slug, service)
     };
     // Sicurezza ridondante
     if !unit_name.starts_with(&format!("{}-", slug)) {
-        return Err(api_error(StatusCode::FORBIDDEN, "L'unit non appartiene al progetto"));
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "L'unit non appartiene al progetto",
+        ));
     }
 
     // 1. stop (ignora errori: il servizio potrebbe già essere fermo)
     let _ = systemctl_user()
-        .args(["--user", "stop", &unit_name]).output().await;
+        .args(["--user", "stop", &unit_name])
+        .output()
+        .await;
     // 2. disable
     let _ = systemctl_user()
-        .args(["--user", "disable", &unit_name]).output().await;
+        .args(["--user", "disable", &unit_name])
+        .output()
+        .await;
 
     // 3. Prima di rimuovere il file, leggi il contenuto per estrarre le porte da rilasciare
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
@@ -1036,7 +1274,12 @@ pub async fn uninstall_project_service(
         let ports = services::extract_ports_from_unit(&content);
         for p in ports {
             if let Err(e) = state.port_registry.release(p).await {
-                tracing::debug!("port_registry: rilascio porta {} per {} ignorato: {}", p, unit_name, e);
+                tracing::debug!(
+                    "port_registry: rilascio porta {} per {} ignorato: {}",
+                    p,
+                    unit_name,
+                    e
+                );
             }
         }
     }
@@ -1045,15 +1288,19 @@ pub async fn uninstall_project_service(
     let removed = match tokio::fs::remove_file(&svc_path).await {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Impossibile rimuovere {}: {}", svc_path, e),
-        )),
+        Err(e) => {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Impossibile rimuovere {}: {}", svc_path, e),
+            ))
+        }
     };
 
     // 5. daemon-reload
     let _ = systemctl_user()
-        .args(["--user", "daemon-reload"]).output().await;
+        .args(["--user", "daemon-reload"])
+        .output()
+        .await;
 
     Ok(Json(json!({
         "ok":      true,
@@ -1070,11 +1317,20 @@ pub async fn uninstall_project_service(
 pub(super) async fn find_files_named(root: &str, filename: &str, max_depth: usize) -> Vec<String> {
     // Directory sempre da saltare: non contengono sorgenti propri del progetto
     const SKIP: &[&str] = &[
-        ".git", "node_modules", ".next", ".turbo", ".cache",
-        "__pycache__", ".venv", "venv", "env",
-        "obj", "bin",            // .NET build output
-        ".terraform", ".gradle", // build tools
-        "vendor",                // Go/PHP vendor
+        ".git",
+        "node_modules",
+        ".next",
+        ".turbo",
+        ".cache",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "env",
+        "obj",
+        "bin", // .NET build output
+        ".terraform",
+        ".gradle", // build tools
+        "vendor",  // Go/PHP vendor
     ];
     // Salta "target" solo se contiene a sua volta "debug" o "release" (indice di build Rust)
     let mut results = Vec::new();
@@ -1083,17 +1339,22 @@ pub(super) async fn find_files_named(root: &str, filename: &str, max_depth: usiz
     queue.push_back((std::path::PathBuf::from(root), 0));
 
     while let Some((dir, depth)) = queue.pop_front() {
-        let Ok(mut rd) = tokio::fs::read_dir(&dir).await else { continue };
+        let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
         while let Ok(Some(entry)) = rd.next_entry().await {
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if SKIP.contains(&name) { continue; }
+            if SKIP.contains(&name) {
+                continue;
+            }
             // Salta "target/" solo se sembra una build Rust (ha "debug" o "release" al suo interno)
             if name == "target" && path.is_dir() {
-                let is_rust_target =
-                    tokio::fs::metadata(path.join("debug")).await.is_ok() ||
-                    tokio::fs::metadata(path.join("release")).await.is_ok();
-                if is_rust_target { continue; }
+                let is_rust_target = tokio::fs::metadata(path.join("debug")).await.is_ok()
+                    || tokio::fs::metadata(path.join("release")).await.is_ok();
+                if is_rust_target {
+                    continue;
+                }
             }
             if name == filename {
                 results.push(path.to_string_lossy().to_string());
@@ -1134,9 +1395,11 @@ pub(super) async fn refine_with_nexus(
     };
 
     // Costruisce il contesto: prime directory di primo livello + lista comandi
-    let top_dirs: Vec<String> = std::fs::read_dir(root).ok()
+    let top_dirs: Vec<String> = std::fs::read_dir(root)
+        .ok()
         .map(|it| {
-            let mut v: Vec<String> = it.filter_map(|e| e.ok())
+            let mut v: Vec<String> = it
+                .filter_map(|e| e.ok())
                 .filter(|e| e.path().is_dir())
                 .map(|e| e.file_name().to_string_lossy().to_string())
                 .filter(|n| !n.starts_with('.') && n != "node_modules" && n != "target")
@@ -1147,16 +1410,27 @@ pub(super) async fn refine_with_nexus(
         })
         .unwrap_or_default();
 
-    let cmds: Vec<String> = suggestions.iter().enumerate().map(|(i, s)| {
-        let label = s.get("label").and_then(|v| v.as_str()).unwrap_or("");
-        let kind = s.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-        let cmd = s.get("command").and_then(|v| v.as_str()).unwrap_or("");
-        let args: String = s.get("args").and_then(|a| a.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" "))
-            .unwrap_or_default();
-        let group = s.get("group").and_then(|v| v.as_str()).unwrap_or("");
-        format!("{i}: [{kind}][{group}] {label}  →  {cmd} {args}")
-    }).collect();
+    let cmds: Vec<String> = suggestions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let label = s.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            let kind = s.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let cmd = s.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let args: String = s
+                .get("args")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            let group = s.get("group").and_then(|v| v.as_str()).unwrap_or("");
+            format!("{i}: [{kind}][{group}] {label}  →  {cmd} {args}")
+        })
+        .collect();
 
     let prompt = format!(
         "Sei un assistente per la classificazione di comandi di avvio applicazione.\n\
@@ -1178,7 +1452,10 @@ pub(super) async fn refine_with_nexus(
 
     let req = GwRequest {
         model: "coder-small".to_string(),
-        messages: vec![GwMessage { role: "user".to_string(), content: prompt }],
+        messages: vec![GwMessage {
+            role: "user".to_string(),
+            content: prompt,
+        }],
         max_tokens: Some(1024),
         temperature: Some(0.0),
         tools: None,
@@ -1191,14 +1468,18 @@ pub(super) async fn refine_with_nexus(
         },
     };
 
-    let resp = match tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        gw.complete(req),
-    ).await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => { tracing::warn!("refine_with_nexus: gateway error: {e}"); return; }
-        Err(_) => { tracing::warn!("refine_with_nexus: timeout"); return; }
-    };
+    let resp =
+        match tokio::time::timeout(std::time::Duration::from_secs(15), gw.complete(req)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::warn!("refine_with_nexus: gateway error: {e}");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!("refine_with_nexus: timeout");
+                return;
+            }
+        };
 
     // Tenta di estrarre il blocco JSON dall'eventuale testo libero
     let raw = resp.content.trim();
@@ -1213,11 +1494,16 @@ pub(super) async fn refine_with_nexus(
 
     let parsed: Vec<serde_json::Value> = match serde_json::from_str(&json_str) {
         Ok(v) => v,
-        Err(e) => { tracing::warn!("refine_with_nexus: JSON parse error: {e}"); return; }
+        Err(e) => {
+            tracing::warn!("refine_with_nexus: JSON parse error: {e}");
+            return;
+        }
     };
 
     for (i, item) in parsed.iter().enumerate() {
-        if i >= suggestions.len() { break; }
+        if i >= suggestions.len() {
+            break;
+        }
         if let Some(role) = item.get("role").and_then(|v| v.as_str()) {
             suggestions[i]["role"] = json!(role);
         }
@@ -1228,19 +1514,45 @@ pub(super) async fn refine_with_nexus(
 }
 
 /// Classifica il ruolo semantico di un comando di run.
-pub(super) fn classify_role(kind: &str, name: &str, pkg: Option<&serde_json::Value>) -> &'static str {
-    if kind == "playwright" { return "test"; }
-    let lname = name.to_lowercase();
-    if lname == "test" || lname.starts_with("test:") || lname == "cargo test"
-        || lname == "go test ./..." || lname == "dotnet test"
-    { return "test"; }
-
-    let tool_prefixes = ["lint", "format", "fmt", "check", "typecheck", "tsc",
-                         "build", "compile", "i18n", "ai:guard", "quality"];
-    for t in &tool_prefixes {
-        if lname == *t || lname.starts_with(&format!("{}:", t)) { return "tool"; }
+pub(super) fn classify_role(
+    kind: &str,
+    name: &str,
+    pkg: Option<&serde_json::Value>,
+) -> &'static str {
+    if kind == "playwright" {
+        return "test";
     }
-    if lname.starts_with("cargo build") { return "tool"; }
+    let lname = name.to_lowercase();
+    if lname == "test"
+        || lname.starts_with("test:")
+        || lname == "cargo test"
+        || lname == "go test ./..."
+        || lname == "dotnet test"
+    {
+        return "test";
+    }
+
+    let tool_prefixes = [
+        "lint",
+        "format",
+        "fmt",
+        "check",
+        "typecheck",
+        "tsc",
+        "build",
+        "compile",
+        "i18n",
+        "ai:guard",
+        "quality",
+    ];
+    for t in &tool_prefixes {
+        if lname == *t || lname.starts_with(&format!("{}:", t)) {
+            return "tool";
+        }
+    }
+    if lname.starts_with("cargo build") {
+        return "tool";
+    }
 
     if kind == "shell" && (lname.starts_with("docker") || lname == "docker-compose up") {
         return "service";
@@ -1254,23 +1566,43 @@ pub(super) fn classify_role(kind: &str, name: &str, pkg: Option<&serde_json::Val
                 deps.map_or(false, |d| d.contains_key(key))
                     || dev_deps.map_or(false, |d| d.contains_key(key))
             };
-            if has_dep("next") || has_dep("react") || has_dep("vite") || has_dep("vue")
-                || has_dep("svelte") || has_dep("astro") || has_dep("@angular/core")
-            { return "frontend"; }
+            if has_dep("next")
+                || has_dep("react")
+                || has_dep("vite")
+                || has_dep("vue")
+                || has_dep("svelte")
+                || has_dep("astro")
+                || has_dep("@angular/core")
+            {
+                return "frontend";
+            }
             if let Some(pkg_name) = pkg.get("name").and_then(|v| v.as_str()) {
                 let low = pkg_name.to_lowercase();
-                if low.contains("api") || low.contains("server") || low.contains("backend")
-                    || low.contains("gateway") || low.contains("service") || low.contains("worker")
-                    || low.contains("brain") || low.contains("mcp")
-                { return "backend"; }
+                if low.contains("api")
+                    || low.contains("server")
+                    || low.contains("backend")
+                    || low.contains("gateway")
+                    || low.contains("service")
+                    || low.contains("worker")
+                    || low.contains("brain")
+                    || low.contains("mcp")
+                {
+                    return "backend";
+                }
             }
         }
-        if matches!(lname.as_str(), "dev" | "start" | "serve" | "preview") { return "frontend"; }
+        if matches!(lname.as_str(), "dev" | "start" | "serve" | "preview") {
+            return "frontend";
+        }
         return "tool";
     }
 
-    if kind == "cargo" || kind == "python" { return "backend"; }
-    if kind == "shell" && (lname == "go run ." || lname == "dotnet run") { return "backend"; }
+    if kind == "cargo" || kind == "python" {
+        return "backend";
+    }
+    if kind == "shell" && (lname == "go run ." || lname == "dotnet run") {
+        return "backend";
+    }
 
     "tool"
 }
@@ -1278,11 +1610,13 @@ pub(super) fn classify_role(kind: &str, name: &str, pkg: Option<&serde_json::Val
 /// True se la configurazione è essenziale per avviare l'app end-to-end.
 pub(super) fn is_essential(role: &str, name: &str, kind: &str) -> bool {
     match role {
-        "frontend" | "backend" => matches!(name, "dev" | "start" | "serve")
-            || kind == "cargo"
-            || kind == "python"
-            || name == "go run ."
-            || name == "dotnet run",
+        "frontend" | "backend" => {
+            matches!(name, "dev" | "start" | "serve")
+                || kind == "cargo"
+                || kind == "python"
+                || name == "go run ."
+                || name == "dotnet run"
+        }
         "service" => name == "docker-compose up" || name.starts_with("docker-compose up "),
         _ => false,
     }
@@ -1297,11 +1631,16 @@ pub(super) fn collect_workspace_dirs(root: &std::path::Path) -> Vec<std::path::P
     if let Ok(content) = std::fs::read_to_string(root.join("package.json")) {
         if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) {
             if let Some(ws) = pkg.get("workspaces") {
-                let arr = if ws.is_array() { ws.as_array() }
-                          else { ws.get("packages").and_then(|p| p.as_array()) };
+                let arr = if ws.is_array() {
+                    ws.as_array()
+                } else {
+                    ws.get("packages").and_then(|p| p.as_array())
+                };
                 if let Some(arr) = arr {
                     for v in arr {
-                        if let Some(s) = v.as_str() { patterns.push(s.to_string()); }
+                        if let Some(s) = v.as_str() {
+                            patterns.push(s.to_string());
+                        }
                     }
                 }
             }
@@ -1312,12 +1651,16 @@ pub(super) fn collect_workspace_dirs(root: &std::path::Path) -> Vec<std::path::P
         let mut in_packages = false;
         for line in content.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("packages:") { in_packages = true; continue; }
+            if trimmed.starts_with("packages:") {
+                in_packages = true;
+                continue;
+            }
             if in_packages {
                 if let Some(rest) = trimmed.strip_prefix("- ") {
                     let pat = rest.trim().trim_matches(|c| c == '"' || c == '\'');
                     patterns.push(pat.to_string());
-                } else if !trimmed.is_empty() && !trimmed.starts_with('#')
+                } else if !trimmed.is_empty()
+                    && !trimmed.starts_with('#')
                     && !trimmed.starts_with('-')
                 {
                     in_packages = false;
@@ -1346,9 +1689,17 @@ pub(super) fn collect_workspace_dirs(root: &std::path::Path) -> Vec<std::path::P
             if let Ok(entries) = std::fs::read_dir(&parent) {
                 for entry in entries.filter_map(|e| e.ok()) {
                     let p = entry.path();
-                    if !p.is_dir() { continue; }
-                    let n = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-                    if n.starts_with('.') || skip.contains(&n.as_str()) { continue; }
+                    if !p.is_dir() {
+                        continue;
+                    }
+                    let n = p
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    if n.starts_with('.') || skip.contains(&n.as_str()) {
+                        continue;
+                    }
                     if p.join("package.json").exists() && !dirs.contains(&p) {
                         dirs.push(p);
                     }
@@ -1365,7 +1716,8 @@ pub(super) fn collect_workspace_dirs(root: &std::path::Path) -> Vec<std::path::P
 pub(super) fn collect_cargo_workspace_members(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut raw: Vec<String> = Vec::new();
     let content = match std::fs::read_to_string(root.join("Cargo.toml")) {
-        Ok(c) => c, Err(_) => return Vec::new(),
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
     };
     let mut in_workspace = false;
     let mut in_members = false;
@@ -1376,23 +1728,36 @@ pub(super) fn collect_cargo_workspace_members(root: &std::path::Path) -> Vec<std
             in_members = false;
             continue;
         }
-        if !in_workspace { continue; }
+        if !in_workspace {
+            continue;
+        }
         if trimmed.starts_with("members") {
             in_members = true;
             if let Some(start) = trimmed.find('[') {
-                let rest = &trimmed[start+1..];
+                let rest = &trimmed[start + 1..];
                 for tok in rest.split(',') {
-                    let t = tok.trim().trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
-                    if !t.is_empty() { raw.push(t.to_string()); }
+                    let t = tok
+                        .trim()
+                        .trim_matches(|c: char| c == '[' || c == ']' || c == '"' || c == '\'');
+                    if !t.is_empty() {
+                        raw.push(t.to_string());
+                    }
                 }
-                if trimmed.contains(']') { in_members = false; }
+                if trimmed.contains(']') {
+                    in_members = false;
+                }
             }
             continue;
         }
         if in_members {
-            if trimmed.contains(']') { in_members = false; continue; }
+            if trimmed.contains(']') {
+                in_members = false;
+                continue;
+            }
             let t = trimmed.trim_matches(|c: char| c == ',' || c == '"' || c == '\'');
-            if !t.is_empty() { raw.push(t.to_string()); }
+            if !t.is_empty() {
+                raw.push(t.to_string());
+            }
         }
     }
 
@@ -1403,12 +1768,16 @@ pub(super) fn collect_cargo_workspace_members(root: &std::path::Path) -> Vec<std
             if let Ok(entries) = std::fs::read_dir(&parent) {
                 for e in entries.filter_map(|e| e.ok()) {
                     let p = e.path();
-                    if p.is_dir() && p.join("Cargo.toml").exists() { out.push(p); }
+                    if p.is_dir() && p.join("Cargo.toml").exists() {
+                        out.push(p);
+                    }
                 }
             }
         } else {
             let p = root.join(&m);
-            if p.join("Cargo.toml").exists() { out.push(p); }
+            if p.join("Cargo.toml").exists() {
+                out.push(p);
+            }
         }
     }
     out
@@ -1417,23 +1786,37 @@ pub(super) fn collect_cargo_workspace_members(root: &std::path::Path) -> Vec<std
 /// Parser minimale di docker-compose: estrae i nomi dei service al primo livello di indentazione.
 pub(crate) fn parse_compose_services(path: &std::path::Path) -> Vec<String> {
     let mut services = Vec::new();
-    let content = match std::fs::read_to_string(path) { Ok(c) => c, Err(_) => return services };
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return services,
+    };
     let mut in_services = false;
     let mut svc_indent: Option<usize> = None;
     for line in content.lines() {
-        if line.trim().is_empty() || line.trim_start().starts_with('#') { continue; }
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
         let indent = line.len() - line.trim_start().len();
         let trimmed = line.trim_end();
         let key = trimmed.trim_start();
         if !in_services {
-            if key == "services:" { in_services = true; svc_indent = None; }
+            if key == "services:" {
+                in_services = true;
+                svc_indent = None;
+            }
             continue;
         }
-        if indent == 0 && key.ends_with(':') && key != "services:" { break; }
-        if svc_indent.is_none() && indent > 0 { svc_indent = Some(indent); }
+        if indent == 0 && key.ends_with(':') && key != "services:" {
+            break;
+        }
+        if svc_indent.is_none() && indent > 0 {
+            svc_indent = Some(indent);
+        }
         if Some(indent) == svc_indent {
             if let Some(name) = key.strip_suffix(':') {
-                if !name.is_empty() && !name.contains(' ') { services.push(name.to_string()); }
+                if !name.is_empty() && !name.contains(' ') {
+                    services.push(name.to_string());
+                }
             }
         }
     }
@@ -1444,10 +1827,14 @@ pub(crate) fn parse_compose_services(path: &std::path::Path) -> Vec<String> {
 /// Matcha `docker-compose*.y(a)ml` e `compose*.y(a)ml`.
 pub(crate) fn collect_compose_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out: Vec<std::path::PathBuf> = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root) else { return out; };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
     for e in entries.flatten() {
         let p = e.path();
-        if !p.is_file() { continue; }
+        if !p.is_file() {
+            continue;
+        }
         let name = match p.file_name().map(|n| n.to_string_lossy().to_lowercase()) {
             Some(n) => n,
             None => continue,
@@ -1458,16 +1845,29 @@ pub(crate) fn collect_compose_files(root: &std::path::Path) -> Vec<std::path::Pa
             out.push(p);
         }
     }
-    out.sort_by_key(|p| (compose_file_rank(p),
-        p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+    out.sort_by_key(|p| {
+        (
+            compose_file_rank(p),
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        )
+    });
     out
 }
 
 pub(super) fn detect_playwright_suggestions(root: &std::path::Path) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     let mut pw_dirs: Vec<std::path::PathBuf> = Vec::new();
-    for c in &["playwright.config.ts", "playwright.config.js", "playwright.config.mjs"] {
-        if root.join(c).exists() { pw_dirs.push(root.to_path_buf()); break; }
+    for c in &[
+        "playwright.config.ts",
+        "playwright.config.js",
+        "playwright.config.mjs",
+    ] {
+        if root.join(c).exists() {
+            pw_dirs.push(root.to_path_buf());
+            break;
+        }
     }
     if pw_dirs.is_empty() {
         if let Ok(entries) = std::fs::read_dir(root) {
@@ -1475,7 +1875,10 @@ pub(super) fn detect_playwright_suggestions(root: &std::path::Path) -> Vec<Value
                 let p = e.path();
                 if p.is_dir() {
                     for c in &["playwright.config.ts", "playwright.config.js"] {
-                        if p.join(c).exists() { pw_dirs.push(p.clone()); break; }
+                        if p.join(c).exists() {
+                            pw_dirs.push(p.clone());
+                            break;
+                        }
                     }
                 }
             }
@@ -1483,36 +1886,103 @@ pub(super) fn detect_playwright_suggestions(root: &std::path::Path) -> Vec<Value
     }
     for pw_dir in &pw_dirs {
         let is_root = pw_dir == root;
-        let cwd_val: Value = if is_root { Value::Null } else { json!(pw_dir.to_string_lossy()) };
-        let pkg_manager = if pw_dir.join("pnpm-lock.yaml").exists() || root.join("pnpm-lock.yaml").exists() { "pnpm" }
-            else if pw_dir.join("yarn.lock").exists() || root.join("yarn.lock").exists() { "yarn" }
-            else { "npm" };
-        let dir_label = if is_root { "root".to_string() }
-            else { pw_dir.strip_prefix(root).ok()
+        let cwd_val: Value = if is_root {
+            Value::Null
+        } else {
+            json!(pw_dir.to_string_lossy())
+        };
+        let pkg_manager =
+            if pw_dir.join("pnpm-lock.yaml").exists() || root.join("pnpm-lock.yaml").exists() {
+                "pnpm"
+            } else if pw_dir.join("yarn.lock").exists() || root.join("yarn.lock").exists() {
+                "yarn"
+            } else {
+                "npm"
+            };
+        let dir_label = if is_root {
+            "root".to_string()
+        } else {
+            pw_dir
+                .strip_prefix(root)
+                .ok()
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|| pw_dir.file_name().unwrap_or_default().to_string_lossy().to_string()) };
-        let prefix = if is_root { String::new() } else { format!("[{}] ", dir_label) };
+                .unwrap_or_else(|| {
+                    pw_dir
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                })
+        };
+        let prefix = if is_root {
+            String::new()
+        } else {
+            format!("[{}] ", dir_label)
+        };
         let group = format!("playwright/{}", dir_label);
-        push_sugg(&mut out,
-            format!("{}playwright test", prefix), "playwright", pkg_manager,
+        push_sugg(
+            &mut out,
+            format!("{}playwright test", prefix),
+            "playwright",
+            pkg_manager,
             vec![json!("exec"), json!("playwright"), json!("test")],
-            cwd_val.clone(), json!({}), "test", false, group.clone());
-        push_sugg(&mut out,
-            format!("{}playwright test --update-snapshots", prefix), "playwright", pkg_manager,
-            vec![json!("exec"), json!("playwright"), json!("test"), json!("--update-snapshots")],
-            cwd_val.clone(), json!({}), "test", false, group.clone());
+            cwd_val.clone(),
+            json!({}),
+            "test",
+            false,
+            group.clone(),
+        );
+        push_sugg(
+            &mut out,
+            format!("{}playwright test --update-snapshots", prefix),
+            "playwright",
+            pkg_manager,
+            vec![
+                json!("exec"),
+                json!("playwright"),
+                json!("test"),
+                json!("--update-snapshots"),
+            ],
+            cwd_val.clone(),
+            json!({}),
+            "test",
+            false,
+            group.clone(),
+        );
         for sub in &["tests", "e2e", "test"] {
             let tests_root = pw_dir.join(sub);
-            if !tests_root.exists() { continue; }
+            if !tests_root.exists() {
+                continue;
+            }
             for spec in walkdir_specs(&tests_root).iter().take(10) {
-                let rel = spec.strip_prefix(if is_root { root } else { pw_dir })
-                    .unwrap_or(spec).to_string_lossy().replace('\\', "/");
-                let name = spec.file_stem().unwrap_or_default().to_string_lossy()
-                    .trim_end_matches(".spec").to_string();
-                push_sugg(&mut out,
-                    format!("{}playwright · {}", prefix, name), "playwright", pkg_manager,
-                    vec![json!("exec"), json!("playwright"), json!("test"), json!(rel)],
-                    cwd_val.clone(), json!({}), "test", false, group.clone());
+                let rel = spec
+                    .strip_prefix(if is_root { root } else { pw_dir })
+                    .unwrap_or(spec)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let name = spec
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .trim_end_matches(".spec")
+                    .to_string();
+                push_sugg(
+                    &mut out,
+                    format!("{}playwright · {}", prefix, name),
+                    "playwright",
+                    pkg_manager,
+                    vec![
+                        json!("exec"),
+                        json!("playwright"),
+                        json!("test"),
+                        json!(rel),
+                    ],
+                    cwd_val.clone(),
+                    json!({}),
+                    "test",
+                    false,
+                    group.clone(),
+                );
             }
         }
     }
@@ -1521,8 +1991,14 @@ pub(super) fn detect_playwright_suggestions(root: &std::path::Path) -> Vec<Value
 
 /// 0 = dev, 1 = local, 2 = base (nessun suffisso), 3 = prod/altro.
 pub(super) fn compose_file_rank(p: &std::path::Path) -> u8 {
-    let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-    let stem = name.trim_end_matches(".yml").trim_end_matches(".yaml").to_string();
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let stem = name
+        .trim_end_matches(".yml")
+        .trim_end_matches(".yaml")
+        .to_string();
     // stem tipo: docker-compose, docker-compose.dev, compose.prod, ecc.
     let suffix = stem.rsplit('.').next().unwrap_or("");
     match suffix {
@@ -1532,7 +2008,11 @@ pub(super) fn compose_file_rank(p: &std::path::Path) -> u8 {
         "" => 2,
         _ => {
             // Se il suffisso è l'intero stem → è il file base (es. "compose", "docker-compose").
-            if suffix == stem { 2 } else { 3 }
+            if suffix == stem {
+                2
+            } else {
+                3
+            }
         }
     }
 }
@@ -1566,9 +2046,16 @@ pub(super) fn extract_make_target_body(content: &str, target: &str) -> String {
 /// Helper condiviso da tutte le funzioni di detection run-config.
 #[inline]
 pub(super) fn push_sugg(
-    out: &mut Vec<Value>, label: String, kind: &str, command: &str,
-    args: Vec<Value>, cwd: Value, env: Value,
-    role: &str, essential: bool, group: String,
+    out: &mut Vec<Value>,
+    label: String,
+    kind: &str,
+    command: &str,
+    args: Vec<Value>,
+    cwd: Value,
+    env: Value,
+    role: &str,
+    essential: bool,
+    group: String,
 ) {
     out.push(json!({
         "label": label, "kind": kind, "command": command,
@@ -1581,16 +2068,28 @@ pub(super) fn push_sugg(
 /// Per ogni .sln emette `dotnet run --project <dir>` per i csproj Web/Exe e `dotnet test` per i test.
 pub(super) fn detect_dotnet_suggestions(root: &std::path::Path) -> Vec<Value> {
     fn dir_has_sln(dir: &std::path::Path) -> bool {
-        std::fs::read_dir(dir).ok()
-            .map(|d| d.flatten().any(|e| e.path().extension().map(|x| x == "sln").unwrap_or(false)))
+        std::fs::read_dir(dir)
+            .ok()
+            .map(|d| {
+                d.flatten()
+                    .any(|e| e.path().extension().map(|x| x == "sln").unwrap_or(false))
+            })
             .unwrap_or(false)
     }
 
     fn classify_csproj(path: &std::path::Path) -> Option<&'static str> {
         let content = std::fs::read_to_string(path).unwrap_or_default();
-        let name_lc = path.file_stem().unwrap_or_default().to_string_lossy().to_lowercase();
-        if name_lc.contains("test") || name_lc.contains("spec")
-            || content.contains("xunit") || content.contains("nunit") || content.contains("MSTest") {
+        let name_lc = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        if name_lc.contains("test")
+            || name_lc.contains("spec")
+            || content.contains("xunit")
+            || content.contains("nunit")
+            || content.contains("MSTest")
+        {
             return Some("test");
         }
         if content.contains("Sdk.Web") || content.contains("OutputType>Exe") {
@@ -1607,7 +2106,11 @@ pub(super) fn detect_dotnet_suggestions(root: &std::path::Path) -> Vec<Value> {
         for e in entries.flatten() {
             let p = e.path();
             if p.is_dir() && dir_has_sln(&p) {
-                let label = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                let label = p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
                 sln_dirs.push((p, label));
             }
         }
@@ -1622,11 +2125,19 @@ pub(super) fn detect_dotnet_suggestions(root: &std::path::Path) -> Vec<Value> {
         || root.join("Dockerfile.dev").exists()
         || !collect_compose_files(root).is_empty();
     let run_essential = false;
-    let group_suffix = if containerized { " (host — richiede SDK locale)" } else { " (richiede .NET SDK)" };
+    let group_suffix = if containerized {
+        " (host — richiede SDK locale)"
+    } else {
+        " (richiede .NET SDK)"
+    };
 
     let mut out: Vec<Value> = Vec::new();
     for (sln_dir, dir_label) in &sln_dirs {
-        let base_group = if dir_label.is_empty() { "dotnet".to_string() } else { dir_label.clone() };
+        let base_group = if dir_label.is_empty() {
+            "dotnet".to_string()
+        } else {
+            dir_label.clone()
+        };
         let group = format!("{}{}", base_group, group_suffix);
         let mut runnable: Vec<std::path::PathBuf> = Vec::new();
         let mut has_tests = false;
@@ -1634,7 +2145,8 @@ pub(super) fn detect_dotnet_suggestions(root: &std::path::Path) -> Vec<Value> {
         if let Ok(entries) = std::fs::read_dir(sln_dir) {
             for e in entries.flatten() {
                 let p = e.path();
-                let search_dirs: Vec<std::path::PathBuf> = if p.is_dir() { vec![p] } else { vec![] };
+                let search_dirs: Vec<std::path::PathBuf> =
+                    if p.is_dir() { vec![p] } else { vec![] };
                 for dir in search_dirs {
                     if let Ok(inner) = std::fs::read_dir(&dir) {
                         for ie in inner.flatten() {
@@ -1678,7 +2190,10 @@ pub(super) fn detect_dotnet_suggestions(root: &std::path::Path) -> Vec<Value> {
         } else {
             for csproj in &runnable {
                 let rel = csproj.strip_prefix(root).unwrap_or(csproj);
-                let proj_dir = rel.parent().map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+                let proj_dir = rel
+                    .parent()
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_default();
                 let cmd = if proj_dir.is_empty() {
                     format!("dotnet run{}", sdk_notice)
                 } else {
@@ -1695,16 +2210,21 @@ pub(super) fn detect_dotnet_suggestions(root: &std::path::Path) -> Vec<Value> {
             }
         }
         if has_tests {
-            let test_cmd = if dir_label.is_empty() { "dotnet test".to_string() }
-                           else { format!("dotnet test {}", dir_label) };
+            let test_cmd = if dir_label.is_empty() {
+                "dotnet test".to_string()
+            } else {
+                format!("dotnet test {}", dir_label)
+            };
             let test_args: Vec<serde_json::Value> = if dir_label.is_empty() {
                 vec![json!("test")]
             } else {
                 vec![json!("test"), json!(dir_label.clone())]
             };
-            out.push(json!({ "label": test_cmd, "kind": "shell", "command": "dotnet",
+            out.push(
+                json!({ "label": test_cmd, "kind": "shell", "command": "dotnet",
                 "args": test_args, "cwd": null, "env": {},
-                "role": "test", "essential": false, "group": group.clone() }));
+                "role": "test", "essential": false, "group": group.clone() }),
+            );
         }
     }
     out

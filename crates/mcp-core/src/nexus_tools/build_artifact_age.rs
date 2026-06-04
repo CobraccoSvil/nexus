@@ -8,7 +8,11 @@ pub struct BuildArtifactAgeTool;
 
 #[async_trait]
 impl NexusToolHandler for BuildArtifactAgeTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let dir = ctx.project_root.join("target").join("release");
         if !dir.is_dir() {
             return Ok(json!({"ok": true, "exists": false}));
@@ -21,7 +25,9 @@ impl NexusToolHandler for BuildArtifactAgeTool {
                     if meta.is_file() {
                         count += 1;
                         if let Ok(m) = meta.modified() {
-                            if newest.map(|n| m > n).unwrap_or(true) { newest = Some(m); }
+                            if newest.map(|n| m > n).unwrap_or(true) {
+                                newest = Some(m);
+                            }
                         }
                     }
                 }
@@ -32,5 +38,7 @@ impl NexusToolHandler for BuildArtifactAgeTool {
             .map(|d| d.as_secs());
         Ok(json!({"ok": true, "exists": true, "files": count, "newest_age_secs": age_secs}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

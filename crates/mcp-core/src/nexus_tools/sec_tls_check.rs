@@ -8,7 +8,11 @@ pub struct SecTlsCheckTool;
 
 #[async_trait]
 impl NexusToolHandler for SecTlsCheckTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(
             &ctx.project_root,
             &[
@@ -34,5 +38,7 @@ impl NexusToolHandler for SecTlsCheckTool {
             "warning": danger > 0,
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

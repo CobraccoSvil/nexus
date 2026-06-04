@@ -47,9 +47,7 @@ impl ActionSlots {
     /// True se action_verb, target_type, scope sono tutti popolati con
     /// valori canonici. `framework` e' opzionale.
     pub fn is_complete(&self) -> bool {
-        !self.action_verb.is_empty()
-            && !self.target_type.is_empty()
-            && !self.scope.is_empty()
+        !self.action_verb.is_empty() && !self.target_type.is_empty() && !self.scope.is_empty()
     }
 
     /// Soglia minima sopra la quale fidarsi dello slot filling.
@@ -115,11 +113,23 @@ impl SlotsRoutingMatrix {
         // per priority.
         let probes: [(Option<&str>, Option<&str>, Option<&str>); 5] = [
             // (framework, scope, target) — Some(x) = match esatto, None = wildcard
-            (Some(slots.framework.as_str()), Some(slots.scope.as_str()), Some(slots.target_type.as_str())),
-            (None,                            Some(slots.scope.as_str()), Some(slots.target_type.as_str())),
-            (None,                            None,                       Some(slots.target_type.as_str())),
-            (Some(slots.framework.as_str()), None,                       Some(slots.target_type.as_str())),
-            (None,                            None,                       None),
+            (
+                Some(slots.framework.as_str()),
+                Some(slots.scope.as_str()),
+                Some(slots.target_type.as_str()),
+            ),
+            (
+                None,
+                Some(slots.scope.as_str()),
+                Some(slots.target_type.as_str()),
+            ),
+            (None, None, Some(slots.target_type.as_str())),
+            (
+                Some(slots.framework.as_str()),
+                None,
+                Some(slots.target_type.as_str()),
+            ),
+            (None, None, None),
         ];
 
         for (fw_probe, scope_probe, target_probe) in probes {
@@ -188,25 +198,65 @@ pub fn infer_slots_heuristic(message: &str) -> ActionSlots {
 
     // === action_verb ===
     let resolve_kw = [
-        "risolv", "correggi", "ripara", "fix the", " fix ", "make work", "make pass",
-        "fai funzionare", "fai passare", "non passano", "stanno fallendo", "are failing",
-        "is failing", "non funziona", "make them pass", "esegui i test e",
+        "risolv",
+        "correggi",
+        "ripara",
+        "fix the",
+        " fix ",
+        "make work",
+        "make pass",
+        "fai funzionare",
+        "fai passare",
+        "non passano",
+        "stanno fallendo",
+        "are failing",
+        "is failing",
+        "non funziona",
+        "make them pass",
+        "esegui i test e",
     ];
     let write_kw = [
-        "scrivi", "aggiung", "crea ", "create ", "aggiungi", "implementa", "implement",
-        "add ", "write new", "write a", "scrivere",
+        "scrivi",
+        "aggiung",
+        "crea ",
+        "create ",
+        "aggiungi",
+        "implementa",
+        "implement",
+        "add ",
+        "write new",
+        "write a",
+        "scrivere",
     ];
     let read_kw = [
-        "leggi", "leggere", "elenca", "mostra", "ispez", "controlla lo stato",
-        "list files", "list ", "guarda",
+        "leggi",
+        "leggere",
+        "elenca",
+        "mostra",
+        "ispez",
+        "controlla lo stato",
+        "list files",
+        "list ",
+        "guarda",
     ];
     let analyze_kw = [
-        "perche'", "perché", "perche ", "why does", "investiga", "analizza", "indaga",
+        "perche'",
+        "perché",
+        "perche ",
+        "why does",
+        "investiga",
+        "analizza",
+        "indaga",
         "root cause",
     ];
     let refactor_kw = ["refactor", "rinomina", "ristruttur", "estrai funzione"];
     let configure_kw = [
-        "configur", "imposta", "setup", "set up", "abilit", "disabilit",
+        "configur",
+        "imposta",
+        "setup",
+        "set up",
+        "abilit",
+        "disabilit",
     ];
     let deploy_kw = ["deploy", "deploya", "rilascia", "rilancia"];
     let delete_kw = ["elimin", "rimuov", "cancell", "delete", "remove"];
@@ -235,15 +285,21 @@ pub fn infer_slots_heuristic(message: &str) -> ActionSlots {
     }
 
     // === target_type ===
-    let target_type = if lc.contains("test") || lc.contains("playwright")
-        || lc.contains("pytest") || lc.contains("jest") || lc.contains("vitest")
+    let target_type = if lc.contains("test")
+        || lc.contains("playwright")
+        || lc.contains("pytest")
+        || lc.contains("jest")
+        || lc.contains("vitest")
         || lc.contains("cargo test")
     {
         "tests"
     } else if lc.contains("docker") || lc.contains("k8s") || lc.contains("dockerfile") {
         "infrastructure"
-    } else if lc.contains("config") || lc.contains(".yml") || lc.contains(".yaml")
-        || lc.contains(".toml") || lc.contains(".env")
+    } else if lc.contains("config")
+        || lc.contains(".yml")
+        || lc.contains(".yaml")
+        || lc.contains(".toml")
+        || lc.contains(".env")
     {
         "config"
     } else if lc.contains("servizi") || lc.contains("service") || lc.contains("microservizio") {
@@ -257,19 +313,31 @@ pub fn infer_slots_heuristic(message: &str) -> ActionSlots {
     };
 
     // === framework ===
-    let framework = if lc.contains("playwright") { "playwright" }
-        else if lc.contains("pytest") { "pytest" }
-        else if lc.contains("cargo") { "cargo" }
-        else if lc.contains("jest") { "jest" }
-        else if lc.contains("vitest") { "vitest" }
-        else if lc.contains("docker") { "docker" }
-        else if lc.contains("nextjs") || lc.contains("next.js") { "nextjs" }
-        else { "" };
+    let framework = if lc.contains("playwright") {
+        "playwright"
+    } else if lc.contains("pytest") {
+        "pytest"
+    } else if lc.contains("cargo") {
+        "cargo"
+    } else if lc.contains("jest") {
+        "jest"
+    } else if lc.contains("vitest") {
+        "vitest"
+    } else if lc.contains("docker") {
+        "docker"
+    } else if lc.contains("nextjs") || lc.contains("next.js") {
+        "nextjs"
+    } else {
+        ""
+    };
 
     // === scope ===
-    let scope = if lc.contains("cross-service") || lc.contains("cross service")
-        || lc.contains("microservi") || lc.contains("frontend e backend")
-        || lc.contains("backend e frontend") || lc.contains("piu' servizi")
+    let scope = if lc.contains("cross-service")
+        || lc.contains("cross service")
+        || lc.contains("microservi")
+        || lc.contains("frontend e backend")
+        || lc.contains("backend e frontend")
+        || lc.contains("piu' servizi")
         || lc.contains("piu servizi")
     {
         "cross_service"
@@ -280,7 +348,8 @@ pub fn infer_slots_heuristic(message: &str) -> ActionSlots {
         || (action_verb == "resolve" && target_type == "tests")
     {
         "multi_file"
-    } else if lc.contains("tutto il sistema") || lc.contains("system-wide")
+    } else if lc.contains("tutto il sistema")
+        || lc.contains("system-wide")
         || lc.contains("intera piattaforma")
     {
         "system_wide"
@@ -300,29 +369,30 @@ pub fn infer_slots_heuristic(message: &str) -> ActionSlots {
 }
 
 async fn fetch_slots_from_db(db: &PgPool) -> Result<SlotsRoutingMatrix, String> {
-    let rows: Vec<(String, String, String, String, String, String, i32, String)> =
-        sqlx::query_as(
-            r#"SELECT action_verb, target_type, framework, scope,
+    let rows: Vec<(String, String, String, String, String, String, i32, String)> = sqlx::query_as(
+        r#"SELECT action_verb, target_type, framework, scope,
                       provider, model_id, priority, rationale
                FROM nexus_routing_slots_matrix
                WHERE is_active = TRUE
                ORDER BY priority DESC"#,
-        )
-        .fetch_all(db)
-        .await
-        .map_err(|e| format!("query nexus_routing_slots_matrix fallita: {e}"))?;
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("query nexus_routing_slots_matrix fallita: {e}"))?;
     let entries: Vec<SlotsRoutingEntry> = rows
         .into_iter()
-        .map(|(av, tt, fw, sc, prov, model, prio, rat)| SlotsRoutingEntry {
-            action_verb: av,
-            target_type: tt,
-            framework: fw,
-            scope: sc,
-            provider: prov,
-            model_id: model,
-            priority: prio,
-            rationale: rat,
-        })
+        .map(
+            |(av, tt, fw, sc, prov, model, prio, rat)| SlotsRoutingEntry {
+                action_verb: av,
+                target_type: tt,
+                framework: fw,
+                scope: sc,
+                provider: prov,
+                model_id: model,
+                priority: prio,
+                rationale: rat,
+            },
+        )
         .collect();
     Ok(SlotsRoutingMatrix {
         entries,
@@ -355,10 +425,7 @@ impl SlotsRoutingMatrixCache {
             Ok(m) => {
                 let n = m.len();
                 *cache.inner.write().await = Some(Arc::new(m));
-                tracing::info!(
-                    "SlotsRoutingMatrix caricata: {} entry attive (mig 0133)",
-                    n
-                );
+                tracing::info!("SlotsRoutingMatrix caricata: {} entry attive (mig 0133)", n);
             }
             Err(e) => {
                 tracing::warn!(
@@ -508,8 +575,11 @@ mod tests {
             confidence: 0.92,
         };
         let result = m.lookup(&slots).unwrap();
-        assert!(result.1.contains("sonnet"),
-            "atteso modello capable (sonnet), got {}", result.1);
+        assert!(
+            result.1.contains("sonnet"),
+            "atteso modello capable (sonnet), got {}",
+            result.1
+        );
     }
 
     #[test]
@@ -518,15 +588,15 @@ mod tests {
         let slots = ActionSlots {
             action_verb: "resolve".into(),
             target_type: "tests".into(),
-            framework: "".into(),  // no framework → matcha wildcard
+            framework: "".into(), // no framework → matcha wildcard
             scope: "multi_file".into(),
             confidence: 0.9,
         };
         let chain = m.lookup_chain(&slots);
         // Atteso: 2 entry (anthropic priority 100, mistral priority 90)
         assert_eq!(chain.len(), 2);
-        assert_eq!(chain[0].0, "anthropic");  // priority 100
-        assert_eq!(chain[1].0, "mistral");    // priority 90
+        assert_eq!(chain[0].0, "anthropic"); // priority 100
+        assert_eq!(chain[1].0, "mistral"); // priority 90
     }
 
     #[test]
@@ -535,7 +605,7 @@ mod tests {
         let slots = ActionSlots {
             action_verb: "resolve".into(),
             target_type: "tests".into(),
-            framework: "vitest".into(),  // non in DB → wildcard fallback
+            framework: "vitest".into(), // non in DB → wildcard fallback
             scope: "multi_file".into(),
             confidence: 0.85,
         };
@@ -576,7 +646,7 @@ mod tests {
     fn lookup_ritorna_none_per_slots_incompleti() {
         let m = make_test_matrix();
         let bad = ActionSlots {
-            action_verb: "".into(),  // mancante
+            action_verb: "".into(), // mancante
             target_type: "tests".into(),
             framework: "".into(),
             scope: "single".into(),
@@ -605,7 +675,7 @@ mod tests {
         let m = make_test_matrix();
         let slots = ActionSlots {
             action_verb: "delete".into(),
-            target_type: "infrastructure".into(),  // target qualunque
+            target_type: "infrastructure".into(), // target qualunque
             framework: "docker".into(),
             scope: "multi_file".into(),
             confidence: 0.85,
@@ -619,10 +689,11 @@ mod tests {
         assert!(ActionSlots {
             action_verb: "read".into(),
             target_type: "code".into(),
-            framework: "".into(),  // OK vuoto
+            framework: "".into(), // OK vuoto
             scope: "single".into(),
             confidence: 0.9,
-        }.is_complete());
+        }
+        .is_complete());
         // action_verb mancante
         assert!(!ActionSlots {
             action_verb: "".into(),
@@ -630,7 +701,8 @@ mod tests {
             framework: "".into(),
             scope: "single".into(),
             confidence: 0.9,
-        }.is_complete());
+        }
+        .is_complete());
         // scope mancante
         assert!(!ActionSlots {
             action_verb: "read".into(),
@@ -638,7 +710,8 @@ mod tests {
             framework: "".into(),
             scope: "".into(),
             confidence: 0.9,
-        }.is_complete());
+        }
+        .is_complete());
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -648,7 +721,7 @@ mod tests {
     #[test]
     fn heuristic_caso_redemptor_resolve_playwright_multi_file() {
         let slots = infer_slots_heuristic(
-            "Esegui i test Playwright di Redemptor e correggi i test che falliscono"
+            "Esegui i test Playwright di Redemptor e correggi i test che falliscono",
         );
         assert_eq!(slots.action_verb, "resolve");
         assert_eq!(slots.target_type, "tests");
@@ -712,7 +785,7 @@ mod tests {
     fn heuristic_caso_analyze_root_cause() {
         // Caso con keyword esplicita cross-service
         let slots = infer_slots_heuristic(
-            "indaga perché il backend non risponde al frontend in cross-service"
+            "indaga perché il backend non risponde al frontend in cross-service",
         );
         assert_eq!(slots.action_verb, "analyze");
         assert_eq!(slots.scope, "cross_service");
@@ -740,7 +813,10 @@ mod tests {
         };
         let chain = m.lookup_chain(&slots);
         // Chain non vuota e ordinata DESC
-        assert!(chain.len() >= 2, "chain deve avere >=2 candidati per cooldown fallback");
+        assert!(
+            chain.len() >= 2,
+            "chain deve avere >=2 candidati per cooldown fallback"
+        );
         // Anthropic priority 100, Mistral priority 90 → anthropic primo
         assert_eq!(chain[0].0, "anthropic");
         assert_eq!(chain[1].0, "mistral");
@@ -773,49 +849,313 @@ mod tests {
     fn golden_production_matrix() -> SlotsRoutingMatrix {
         let entries = vec![
             // resolve tests playwright multi_file (caso Redemptor)
-            ("resolve", "tests", "playwright", "multi_file", "anthropic", "claude-sonnet-4-6", 110),
-            ("resolve", "tests", "*", "multi_file", "anthropic", "claude-sonnet-4-6", 100),
-            ("resolve", "tests", "*", "multi_file", "mistral", "mistral-large-2411", 90),
-            ("resolve", "tests", "*", "single", "anthropic", "claude-haiku-4-5-20251001", 100),
-            ("resolve", "tests", "*", "cross_service", "anthropic", "claude-opus-4-6", 100),
+            (
+                "resolve",
+                "tests",
+                "playwright",
+                "multi_file",
+                "anthropic",
+                "claude-sonnet-4-6",
+                110,
+            ),
+            (
+                "resolve",
+                "tests",
+                "*",
+                "multi_file",
+                "anthropic",
+                "claude-sonnet-4-6",
+                100,
+            ),
+            (
+                "resolve",
+                "tests",
+                "*",
+                "multi_file",
+                "mistral",
+                "mistral-large-2411",
+                90,
+            ),
+            (
+                "resolve",
+                "tests",
+                "*",
+                "single",
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+                100,
+            ),
+            (
+                "resolve",
+                "tests",
+                "*",
+                "cross_service",
+                "anthropic",
+                "claude-opus-4-6",
+                100,
+            ),
             // resolve code
-            ("resolve", "code", "*", "single", "anthropic", "claude-haiku-4-5-20251001", 100),
-            ("resolve", "code", "*", "single", "deepseek", "deepseek-chat", 80),
-            ("resolve", "code", "*", "multi_file", "anthropic", "claude-sonnet-4-6", 100),
-            ("resolve", "code", "*", "cross_service", "anthropic", "claude-opus-4-6", 100),
+            (
+                "resolve",
+                "code",
+                "*",
+                "single",
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+                100,
+            ),
+            (
+                "resolve",
+                "code",
+                "*",
+                "single",
+                "deepseek",
+                "deepseek-chat",
+                80,
+            ),
+            (
+                "resolve",
+                "code",
+                "*",
+                "multi_file",
+                "anthropic",
+                "claude-sonnet-4-6",
+                100,
+            ),
+            (
+                "resolve",
+                "code",
+                "*",
+                "cross_service",
+                "anthropic",
+                "claude-opus-4-6",
+                100,
+            ),
             // resolve config/service
-            ("resolve", "service", "*", "cross_service", "anthropic", "claude-sonnet-4-6", 100),
+            (
+                "resolve",
+                "service",
+                "*",
+                "cross_service",
+                "anthropic",
+                "claude-sonnet-4-6",
+                100,
+            ),
             // write tests
-            ("write", "tests", "*", "single", "openai", "gpt-4.1-mini", 100),
-            ("write", "tests", "*", "multi_file", "anthropic", "claude-haiku-4-5-20251001", 100),
-            ("write", "tests", "cargo", "*", "anthropic", "claude-sonnet-4-6", 110),
+            (
+                "write",
+                "tests",
+                "*",
+                "single",
+                "openai",
+                "gpt-4.1-mini",
+                100,
+            ),
+            (
+                "write",
+                "tests",
+                "*",
+                "multi_file",
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+                100,
+            ),
+            (
+                "write",
+                "tests",
+                "cargo",
+                "*",
+                "anthropic",
+                "claude-sonnet-4-6",
+                110,
+            ),
             // write code
-            ("write", "code", "*", "single", "openai", "gpt-4.1-mini", 100),
-            ("write", "code", "*", "multi_file", "anthropic", "claude-haiku-4-5-20251001", 100),
-            ("write", "code", "*", "cross_service", "anthropic", "claude-sonnet-4-6", 100),
+            (
+                "write",
+                "code",
+                "*",
+                "single",
+                "openai",
+                "gpt-4.1-mini",
+                100,
+            ),
+            (
+                "write",
+                "code",
+                "*",
+                "multi_file",
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+                100,
+            ),
+            (
+                "write",
+                "code",
+                "*",
+                "cross_service",
+                "anthropic",
+                "claude-sonnet-4-6",
+                100,
+            ),
             ("write", "docs", "*", "*", "openai", "gpt-4.1", 100),
             // read
-            ("read", "code", "*", "single", "google", "gemini-2.5-flash", 100),
-            ("read", "code", "*", "multi_file", "mistral", "mistral-small-latest", 100),
-            ("read", "code", "*", "cross_service", "anthropic", "claude-haiku-4-5-20251001", 100),
-            ("read", "config", "*", "*", "google", "gemini-2.5-flash", 100),
+            (
+                "read",
+                "code",
+                "*",
+                "single",
+                "google",
+                "gemini-2.5-flash",
+                100,
+            ),
+            (
+                "read",
+                "code",
+                "*",
+                "multi_file",
+                "mistral",
+                "mistral-small-latest",
+                100,
+            ),
+            (
+                "read",
+                "code",
+                "*",
+                "cross_service",
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+                100,
+            ),
+            (
+                "read",
+                "config",
+                "*",
+                "*",
+                "google",
+                "gemini-2.5-flash",
+                100,
+            ),
             // analyze
-            ("analyze", "code", "*", "single", "anthropic", "claude-haiku-4-5-20251001", 100),
-            ("analyze", "code", "*", "multi_file", "anthropic", "claude-sonnet-4-6", 100),
-            ("analyze", "code", "*", "cross_service", "anthropic", "claude-opus-4-6", 100),
-            ("analyze", "tests", "*", "*", "anthropic", "claude-sonnet-4-6", 100),
-            ("analyze", "service", "*", "cross_service", "anthropic", "claude-sonnet-4-6", 100),
+            (
+                "analyze",
+                "code",
+                "*",
+                "single",
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+                100,
+            ),
+            (
+                "analyze",
+                "code",
+                "*",
+                "multi_file",
+                "anthropic",
+                "claude-sonnet-4-6",
+                100,
+            ),
+            (
+                "analyze",
+                "code",
+                "*",
+                "cross_service",
+                "anthropic",
+                "claude-opus-4-6",
+                100,
+            ),
+            (
+                "analyze",
+                "tests",
+                "*",
+                "*",
+                "anthropic",
+                "claude-sonnet-4-6",
+                100,
+            ),
+            (
+                "analyze",
+                "service",
+                "*",
+                "cross_service",
+                "anthropic",
+                "claude-sonnet-4-6",
+                100,
+            ),
             // refactor
-            ("refactor", "code", "*", "single", "anthropic", "claude-haiku-4-5-20251001", 100),
-            ("refactor", "code", "*", "multi_file", "anthropic", "claude-sonnet-4-6", 100),
-            ("refactor", "code", "*", "cross_service", "anthropic", "claude-opus-4-6", 100),
+            (
+                "refactor",
+                "code",
+                "*",
+                "single",
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+                100,
+            ),
+            (
+                "refactor",
+                "code",
+                "*",
+                "multi_file",
+                "anthropic",
+                "claude-sonnet-4-6",
+                100,
+            ),
+            (
+                "refactor",
+                "code",
+                "*",
+                "cross_service",
+                "anthropic",
+                "claude-opus-4-6",
+                100,
+            ),
             // configure / deploy
-            ("configure", "service", "*", "*", "anthropic", "claude-sonnet-4-6", 100),
-            ("configure", "infrastructure", "*", "*", "anthropic", "claude-sonnet-4-6", 100),
-            ("deploy", "service", "*", "*", "anthropic", "claude-sonnet-4-6", 100),
-            ("deploy", "infrastructure", "*", "system_wide", "anthropic", "claude-opus-4-6", 100),
+            (
+                "configure",
+                "service",
+                "*",
+                "*",
+                "anthropic",
+                "claude-sonnet-4-6",
+                100,
+            ),
+            (
+                "configure",
+                "infrastructure",
+                "*",
+                "*",
+                "anthropic",
+                "claude-sonnet-4-6",
+                100,
+            ),
+            (
+                "deploy",
+                "service",
+                "*",
+                "*",
+                "anthropic",
+                "claude-sonnet-4-6",
+                100,
+            ),
+            (
+                "deploy",
+                "infrastructure",
+                "*",
+                "system_wide",
+                "anthropic",
+                "claude-opus-4-6",
+                100,
+            ),
             // delete (sempre capable)
-            ("delete", "*", "*", "*", "anthropic", "claude-sonnet-4-6", 100),
+            (
+                "delete",
+                "*",
+                "*",
+                "*",
+                "anthropic",
+                "claude-sonnet-4-6",
+                100,
+            ),
         ];
         SlotsRoutingMatrix {
             entries: entries
@@ -888,7 +1228,6 @@ mod tests {
                 pre_was: "test|veloce → gpt-4.1-mini",
                 post_effect: "cargo+resolve → Sonnet (capable per Rust)",
             },
-
             // ─── CONTRO-CASI: scrittura NUOVI test ───
             GoldenCase {
                 input: "scrivi un test pytest per la funzione foo",
@@ -906,7 +1245,6 @@ mod tests {
                 pre_was: "test|bilanciata → light model (problema: Rust serve expertise)",
                 post_effect: "cargo override priority 110 → Sonnet per Rust",
             },
-
             // ─── LETTURA file ───
             GoldenCase {
                 input: "leggi il file src/main.py e dimmi quante righe ha",
@@ -932,7 +1270,6 @@ mod tests {
                 pre_was: "code_read|bilanciata → flash",
                 post_effect: "read+config → flash anche cross_service",
             },
-
             // ─── ANALYZE (root cause cross-service) ───
             GoldenCase {
                 input: "perche' il frontend non riceve risposta dal backend?",
@@ -950,7 +1287,6 @@ mod tests {
                 pre_was: "debug|bilanciata → Sonnet (corretto)",
                 post_effect: "analyze+code+multi_file → Sonnet (stesso target)",
             },
-
             // ─── REFACTOR ───
             GoldenCase {
                 input: "refactor del modulo auth in piu' file",
@@ -968,7 +1304,6 @@ mod tests {
                 pre_was: "refactor|bilanciata → claude-haiku (corretto)",
                 post_effect: "refactor+code+single → haiku (basta)",
             },
-
             // ─── FIX semplice vs complesso ───
             GoldenCase {
                 input: "fix this NullPointerException at handlers.py:42",
@@ -994,7 +1329,6 @@ mod tests {
                 pre_was: "fix_complesso|approfondita → Sonnet",
                 post_effect: "resolve+code+cross_service → Opus per ragionamento esteso",
             },
-
             // ─── DEPLOY / CONFIGURE ───
             GoldenCase {
                 input: "deploya il microservizio doc-service in produzione",
@@ -1020,7 +1354,6 @@ mod tests {
                 pre_was: "system_admin|bilanciata → Sonnet (corretto)",
                 post_effect: "configure+service → Sonnet via wildcard scope",
             },
-
             // ─── SCRITTURA DOCS / CODE ───
             GoldenCase {
                 input: "scrivi la documentazione per la classe AuthManager",
@@ -1046,7 +1379,6 @@ mod tests {
                 pre_was: "file_ops|approfondita → claude-sonnet",
                 post_effect: "write+code+cross_service → Sonnet (cross-service ok)",
             },
-
             // ─── DELETE (sicurezza: sempre capable) ───
             GoldenCase {
                 input: "elimina i file dockerfile rimasti nel progetto",
@@ -1064,7 +1396,6 @@ mod tests {
                 pre_was: "file_ops|bilanciata → haiku (rischioso)",
                 post_effect: "delete+data → Sonnet (capable per DDL)",
             },
-
             // ─── CASI EDGE/AMBIGUI ───
             GoldenCase {
                 input: "fix tutti i test che falliscono nel CI",
@@ -1076,8 +1407,8 @@ mod tests {
             },
             GoldenCase {
                 input: "esegui playwright",
-                slots: s("read", "tests", "playwright", "single", 0.55),  // confidence bassa
-                expected_provider: "",  // non testabile direttamente: confidence bassa → fallback intent
+                slots: s("read", "tests", "playwright", "single", 0.55), // confidence bassa
+                expected_provider: "", // non testabile direttamente: confidence bassa → fallback intent
                 expected_model_contains: "",
                 pre_was: "test|veloce → gpt-4.1-mini",
                 post_effect: "confidence 0.55 < soglia 0.60 → fallback intent classico",
@@ -1111,7 +1442,8 @@ mod tests {
                 assert!(
                     case.expected_provider.is_empty(),
                     "caso '{}' confidence {:.2} sotto soglia ma expected provider non vuoto",
-                    case.input, case.slots.confidence
+                    case.input,
+                    case.slots.confidence
                 );
                 continue;
             }
@@ -1130,7 +1462,11 @@ mod tests {
             assert!(
                 model.contains(case.expected_model_contains),
                 "caso '{}': model '{}' non contiene '{}'. Pre era: '{}'. Post: '{}'",
-                case.input, model, case.expected_model_contains, case.pre_was, case.post_effect,
+                case.input,
+                model,
+                case.expected_model_contains,
+                case.pre_was,
+                case.post_effect,
             );
             covered_by_slots += 1;
         }
@@ -1141,12 +1477,17 @@ mod tests {
         assert!(
             coverage >= 0.90,
             "coverage matrice slots troppo bassa: {:.1}% ({}/{})",
-            coverage * 100.0, covered_by_slots, total
+            coverage * 100.0,
+            covered_by_slots,
+            total
         );
 
         eprintln!(
             "GOLDEN: {} casi totali, {} risolti via slots ({:.0}%), {} fallback intent",
-            total, covered_by_slots, coverage * 100.0, fallback_to_intent
+            total,
+            covered_by_slots,
+            coverage * 100.0,
+            fallback_to_intent
         );
     }
 
@@ -1176,15 +1517,19 @@ mod tests {
         // write → light
         assert!(
             m_write.contains("mini") || m_write.contains("4.1") || m_write.contains("haiku"),
-            "write tests dovrebbe usare modello light, got {}", m_write
+            "write tests dovrebbe usare modello light, got {}",
+            m_write
         );
         // resolve → capable
         assert!(
             m_resolve.contains("sonnet") || m_resolve.contains("haiku"),
-            "resolve tests deve usare modello capable, got {}", m_resolve
+            "resolve tests deve usare modello capable, got {}",
+            m_resolve
         );
         // E NON devono coincidere (sennò il routing non distingue)
-        assert_ne!(m_write, m_resolve,
-            "write e resolve sullo stesso target devono dare modelli DIVERSI");
+        assert_ne!(
+            m_write, m_resolve,
+            "write e resolve sullo stesso target devono dare modelli DIVERSI"
+        );
     }
 }

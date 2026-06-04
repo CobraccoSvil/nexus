@@ -8,10 +8,24 @@ pub struct CargoTestDocTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoTestDocTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let out = run_cmd("cargo", &["test", "--doc"], &ctx.project_root, ctx.timeout_secs.max(300)).await?;
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let out = run_cmd(
+            "cargo",
+            &["test", "--doc"],
+            &ctx.project_root,
+            ctx.timeout_secs.max(300),
+        )
+        .await?;
         let passed = out.stdout.lines().filter(|l| l.contains(" ... ok")).count();
-        let failed = out.stdout.lines().filter(|l| l.contains(" ... FAILED")).count();
+        let failed = out
+            .stdout
+            .lines()
+            .filter(|l| l.contains(" ... FAILED"))
+            .count();
         Ok(json!({
             "ok": out.success(),
             "exit_code": out.exit_code,
@@ -21,5 +35,7 @@ impl NexusToolHandler for CargoTestDocTool {
             "duration_ms": out.duration_ms,
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::write_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::write_subproc()
+    }
 }

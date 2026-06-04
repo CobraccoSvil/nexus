@@ -12,18 +12,20 @@ pub struct ProjectDbVacuumTool;
 
 #[async_trait]
 impl NexusToolHandler for ProjectDbVacuumTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
-        let table = args.get("table").and_then(Value::as_str).map(|s| s.trim().to_string());
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
+        let table = args
+            .get("table")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string());
         let analyze = args.get("analyze").and_then(Value::as_bool).unwrap_or(true);
         let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
 
         // Validazione nome tabella (no SQL injection)
         if let Some(ref t) = table {
-            if !t.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+            if !t
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            {
                 return Err(NexusToolError::BadInput(
                     "Nome tabella contiene caratteri non validi".into(),
                 ));

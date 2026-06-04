@@ -7,13 +7,18 @@ pub struct CargoLockfileCheckTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoLockfileCheckTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let lock = ctx.project_root.join("Cargo.lock");
         if !lock.exists() {
             return Ok(json!({"ok": true, "exists": false}));
         }
         let content = std::fs::read_to_string(&lock).map_err(NexusToolError::Io)?;
-        let version = content.lines()
+        let version = content
+            .lines()
             .find(|l| l.starts_with("version = "))
             .and_then(|l| l.split('=').nth(1))
             .map(|s| s.trim().to_string());
@@ -26,5 +31,7 @@ impl NexusToolHandler for CargoLockfileCheckTool {
             "size_bytes": content.len(),
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

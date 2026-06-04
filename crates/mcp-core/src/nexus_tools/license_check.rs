@@ -133,10 +133,7 @@ fn analyze_licenses(metadata: &Value) -> LicenseReport {
             .to_string();
 
         let category = categorize(&license);
-        *report
-            .by_category
-            .entry(category.to_string())
-            .or_insert(0) += 1;
+        *report.by_category.entry(category.to_string()).or_insert(0) += 1;
 
         let entry = json!({
             "name": name,

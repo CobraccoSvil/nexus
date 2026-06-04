@@ -7,7 +7,11 @@ pub struct DocChangelogCheckTool;
 
 #[async_trait]
 impl NexusToolHandler for DocChangelogCheckTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let candidates = ["CHANGELOG.md", "CHANGELOG", "HISTORY.md"];
         let mut found: Option<String> = None;
         let mut releases: usize = 0;
@@ -23,5 +27,7 @@ impl NexusToolHandler for DocChangelogCheckTool {
         }
         Ok(json!({"ok": true, "exists": found.is_some(), "filename": found, "releases": releases}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

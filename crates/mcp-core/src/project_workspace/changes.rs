@@ -21,15 +21,36 @@ pub async fn get_project_changes(
 
     // BFS iterativa, salta dir di build/cache, limite hard di 200 file
     const SKIP_DIRS: &[&str] = &[
-        ".git", "node_modules", ".next", ".turbo", ".cache", "__pycache__",
-        ".venv", "venv", "obj", "bin", ".terraform", "vendor", ".dotnet",
-        "dist", "build", "out", "target", ".nuxt", ".svelte-kit", ".parcel-cache",
-        "playwright-report", "test-results", ".pytest_cache", ".mypy_cache",
+        ".git",
+        "node_modules",
+        ".next",
+        ".turbo",
+        ".cache",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "obj",
+        "bin",
+        ".terraform",
+        "vendor",
+        ".dotnet",
+        "dist",
+        "build",
+        "out",
+        "target",
+        ".nuxt",
+        ".svelte-kit",
+        ".parcel-cache",
+        "playwright-report",
+        "test-results",
+        ".pytest_cache",
+        ".mypy_cache",
         ".tsbuildinfo",
     ];
 
     let mut changed: Vec<serde_json::Value> = Vec::new();
-    let mut queue: std::collections::VecDeque<std::path::PathBuf> = std::collections::VecDeque::new();
+    let mut queue: std::collections::VecDeque<std::path::PathBuf> =
+        std::collections::VecDeque::new();
     queue.push_back(std::path::PathBuf::from(&root));
 
     'outer: while let Some(dir) = queue.pop_front() {
@@ -49,19 +70,26 @@ pub async fn get_project_changes(
             };
             let path = entry.path();
             if ftype.is_dir() {
-                if SKIP_DIRS.contains(&name_s.as_str()) { continue; }
+                if SKIP_DIRS.contains(&name_s.as_str()) {
+                    continue;
+                }
                 queue.push_back(path);
             } else if ftype.is_file() {
                 if let Ok(meta) = entry.metadata().await {
                     if let Ok(mtime) = meta.modified() {
                         if mtime > since {
-                            let mtime_ms = mtime.duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as u64).unwrap_or(0);
-                            let rel = path.strip_prefix(&root)
+                            let mtime_ms = mtime
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let rel = path
+                                .strip_prefix(&root)
                                 .map(|p| p.to_string_lossy().to_string())
                                 .unwrap_or_else(|_| path.to_string_lossy().to_string());
                             changed.push(json!({ "path": rel, "mtime": mtime_ms }));
-                            if changed.len() >= 200 { break 'outer; }
+                            if changed.len() >= 200 {
+                                break 'outer;
+                            }
                         }
                     }
                 }

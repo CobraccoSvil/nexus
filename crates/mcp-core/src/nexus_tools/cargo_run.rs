@@ -20,7 +20,13 @@ impl NexusToolHandler for CargoRunTool {
             cmd_args.push("--bin");
             cmd_args.push(&bin_arg);
         }
-        let out = run_cmd("cargo", &cmd_args, &ctx.project_root, ctx.timeout_secs.max(180)).await?;
+        let out = run_cmd(
+            "cargo",
+            &cmd_args,
+            &ctx.project_root,
+            ctx.timeout_secs.max(180),
+        )
+        .await?;
         Ok(json!({
             "ok": out.success(),
             "exit_code": out.exit_code,
@@ -32,5 +38,7 @@ impl NexusToolHandler for CargoRunTool {
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"release":{"type":"boolean"},"bin":{"type":"string"}}})
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::write_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::write_subproc()
+    }
 }

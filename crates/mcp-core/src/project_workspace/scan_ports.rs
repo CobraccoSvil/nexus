@@ -77,10 +77,8 @@ pub fn compute_detected_ports(root: &std::path::Path) -> Vec<(i32, String, Strin
         if !p.is_file() {
             continue;
         }
-        let patterns: Vec<(Regex, &str)> = vec![(
-            Regex::new(r"port\s*[:=]\s*(\d+)").unwrap(),
-            "frontend",
-        )];
+        let patterns: Vec<(Regex, &str)> =
+            vec![(Regex::new(r"port\s*[:=]\s*(\d+)").unwrap(), "frontend")];
         for (port, lbl) in scan_file(&p, &patterns) {
             detected.push((port, lbl, "vite.config".to_string()));
         }
@@ -99,7 +97,12 @@ pub fn compute_detected_ports(root: &std::path::Path) -> Vec<(i32, String, Strin
     }
 
     // 4) docker-compose.yml
-    for name in &["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"] {
+    for name in &[
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+    ] {
         let p = root.join(name);
         if !p.is_file() {
             continue;
@@ -230,12 +233,7 @@ pub async fn scan_ports(
         if !p.is_file() {
             continue;
         }
-        let patterns = vec![
-            (
-                Regex::new(r"port\s*[:=]\s*(\d+)").unwrap(),
-                "frontend",
-            ),
-        ];
+        let patterns = vec![(Regex::new(r"port\s*[:=]\s*(\d+)").unwrap(), "frontend")];
         let found = scan_file(&p, &patterns).await;
         for (port, lbl) in found {
             detected.push((port, lbl, "vite.config".to_string()));
@@ -256,14 +254,20 @@ pub async fn scan_ports(
     }
 
     // 4) docker-compose.yml
-    for name in &["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"] {
+    for name in &[
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+    ] {
         let p = root.join(name);
         if !p.is_file() {
             continue;
         }
-        let patterns = vec![
-            (Regex::new(r#"-\s+"?(\d{4,5}):\d{2,5}"?"#).unwrap(), "compose"),
-        ];
+        let patterns = vec![(
+            Regex::new(r#"-\s+"?(\d{4,5}):\d{2,5}"?"#).unwrap(),
+            "compose",
+        )];
         let found = scan_file(&p, &patterns).await;
         for (port, lbl) in found {
             detected.push((port, lbl, format!("compose:{}", name)));

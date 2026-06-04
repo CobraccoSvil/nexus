@@ -73,9 +73,7 @@ fn py_from_re() -> &'static Regex {
 fn ts_import_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     // `import ... from './x'` / `export ... from '../x'`, virgolette singole o doppie.
-    RE.get_or_init(|| {
-        Regex::new(r#"(?m)\bfrom\s+["'](\.[^"']+)["']"#).unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r#"(?m)\bfrom\s+["'](\.[^"']+)["']"#).unwrap())
 }
 
 fn ts_require_re() -> &'static Regex {
@@ -221,7 +219,7 @@ pub fn import_candidates(lang: CodeLang, from_rel: &str, spec: &str) -> Vec<Stri
             }
             let dots = spec.chars().take_while(|c| *c == '.').count();
             let rest = &spec[dots..]; // es. "providers.base" o ""
-            // dots=1 -> stessa dir; dots=N -> sali N-1 livelli
+                                      // dots=1 -> stessa dir; dots=N -> sali N-1 livelli
             let mut base = dir_of(from_rel);
             for _ in 0..dots.saturating_sub(1) {
                 base = dir_of(&base);
@@ -353,12 +351,24 @@ mod tests {
             fn f() { let _ = 1; }
         "#;
         let imps = extract_imports("src/knowledge/mod.rs", src);
-        assert!(imps.contains(&"crate::knowledge::code_graph".to_string()), "{imps:?}");
-        assert!(imps.contains(&"super::routes::handler".to_string()), "{imps:?}");
+        assert!(
+            imps.contains(&"crate::knowledge::code_graph".to_string()),
+            "{imps:?}"
+        );
+        assert!(
+            imps.contains(&"super::routes::handler".to_string()),
+            "{imps:?}"
+        );
         assert!(imps.contains(&"mod::impact".to_string()), "{imps:?}");
         assert!(imps.contains(&"mod::helpers".to_string()), "{imps:?}");
-        assert!(!imps.iter().any(|i| i.contains("std")), "stdlib non intra-progetto: {imps:?}");
-        assert!(!imps.iter().any(|i| i.contains("serde")), "crate esterno escluso: {imps:?}");
+        assert!(
+            !imps.iter().any(|i| i.contains("std")),
+            "stdlib non intra-progetto: {imps:?}"
+        );
+        assert!(
+            !imps.iter().any(|i| i.contains("serde")),
+            "crate esterno escluso: {imps:?}"
+        );
     }
 
     #[test]
@@ -397,7 +407,10 @@ import json                # assoluto: ignorato\n\
     fn dedup_preserves_order() {
         let src = "use crate::a::b;\nuse crate::a::b;\nuse crate::c::d;\n";
         let imps = extract_imports("x.rs", src);
-        assert_eq!(imps, vec!["crate::a::b".to_string(), "crate::c::d".to_string()]);
+        assert_eq!(
+            imps,
+            vec!["crate::a::b".to_string(), "crate::c::d".to_string()]
+        );
     }
 
     #[test]
@@ -421,9 +434,15 @@ import json                # assoluto: ignorato\n\
     fn naming_target_mapping() {
         assert_eq!(naming_target("a/b.test.ts").as_deref(), Some("a/b.ts"));
         assert_eq!(naming_target("comp.spec.tsx").as_deref(), Some("comp.tsx"));
-        assert_eq!(naming_target("pkg/test_utils.py").as_deref(), Some("pkg/utils.py"));
+        assert_eq!(
+            naming_target("pkg/test_utils.py").as_deref(),
+            Some("pkg/utils.py")
+        );
         assert_eq!(naming_target("m_test.go").as_deref(), Some("m.go"));
-        assert_eq!(naming_target("src/parser_test.rs").as_deref(), Some("src/parser.rs"));
+        assert_eq!(
+            naming_target("src/parser_test.rs").as_deref(),
+            Some("src/parser.rs")
+        );
         assert_eq!(naming_target("main.rs"), None);
     }
 
@@ -438,7 +457,10 @@ import json                # assoluto: ignorato\n\
     fn ts_import_candidates() {
         let c = import_candidates(CodeLang::TypeScript, "apps/web/src/a.tsx", "./utils");
         assert!(c.contains(&"apps/web/src/utils.ts".to_string()), "{c:?}");
-        assert!(c.contains(&"apps/web/src/utils/index.tsx".to_string()), "{c:?}");
+        assert!(
+            c.contains(&"apps/web/src/utils/index.tsx".to_string()),
+            "{c:?}"
+        );
         let up = import_candidates(CodeLang::TypeScript, "apps/web/src/comp/x.ts", "../lib/b");
         assert!(up.contains(&"apps/web/src/lib/b.ts".to_string()), "{up:?}");
         // import non relativo (pacchetto) -> nessun candidato
@@ -449,8 +471,14 @@ import json                # assoluto: ignorato\n\
     fn python_import_candidates() {
         let c = import_candidates(CodeLang::Python, "brain/agents/x.py", ".models");
         assert!(c.contains(&"brain/agents/models.py".to_string()), "{c:?}");
-        assert!(c.contains(&"brain/agents/models/__init__.py".to_string()), "{c:?}");
+        assert!(
+            c.contains(&"brain/agents/models/__init__.py".to_string()),
+            "{c:?}"
+        );
         let up = import_candidates(CodeLang::Python, "brain/agents/x.py", "..providers.base");
-        assert!(up.contains(&"brain/providers/base.py".to_string()), "{up:?}");
+        assert!(
+            up.contains(&"brain/providers/base.py".to_string()),
+            "{up:?}"
+        );
     }
 }

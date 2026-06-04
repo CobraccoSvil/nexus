@@ -11,15 +11,17 @@ pub struct ProjectDbAnalyzeTool;
 
 #[async_trait]
 impl NexusToolHandler for ProjectDbAnalyzeTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
-        let table = args.get("table").and_then(Value::as_str).map(|s| s.trim().to_string());
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
+        let table = args
+            .get("table")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string());
 
         if let Some(ref t) = table {
-            if !t.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+            if !t
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            {
                 return Err(NexusToolError::BadInput(
                     "Nome tabella contiene caratteri non validi".into(),
                 ));

@@ -188,13 +188,13 @@ pub mod cargo_lockfile_check;
 pub mod cargo_msrv_detect;
 pub mod cargo_publish_dry;
 pub mod cargo_run;
-pub mod shell_exec;
 pub mod cargo_search;
 pub mod cargo_size_estimate;
 pub mod cargo_targets_list;
 pub mod cargo_test_doc;
 pub mod cargo_test_lib;
 pub mod cargo_workspace_members;
+pub mod shell_exec;
 
 // ── Fase 9D: 18 stub handlers implementati ────────────────────────────────
 // Code analysis
@@ -229,9 +229,9 @@ pub mod test_fixtures_list;
 pub mod test_ignored_count;
 pub mod test_mock_count;
 pub mod test_module_count;
+pub mod test_playwright;
 pub mod test_proptest_count;
 pub mod test_quickcheck_count;
-pub mod test_playwright;
 pub mod test_run_integration;
 pub mod test_run_quiet;
 pub mod test_run_unit;
@@ -338,7 +338,6 @@ pub mod meta_self_test;
 pub mod meta_version_info;
 
 // ── Fase 9M: Performance extras (20) ──────────────────────────────────────
-pub mod perf_scan;
 pub mod perf_arc_mutex;
 pub mod perf_async_funcs;
 pub mod perf_binary_size;
@@ -354,6 +353,7 @@ pub mod perf_loc_per_crate;
 pub mod perf_lto_check;
 pub mod perf_optimization_check;
 pub mod perf_panic_count;
+pub mod perf_scan;
 pub mod perf_string_alloc;
 pub mod perf_target_dir_size;
 pub mod perf_test_count;
@@ -383,7 +383,6 @@ pub mod doc_toc_extract;
 pub mod doc_word_count;
 
 // ── Fase 9K: Database extras (20) ─────────────────────────────────────────
-pub mod db_helper;
 pub mod db_active_queries;
 pub mod db_bloat_check;
 pub mod db_connection_info;
@@ -391,6 +390,7 @@ pub mod db_constraint_list;
 pub mod db_dead_tuples;
 pub mod db_extension_list;
 pub mod db_foreign_keys;
+pub mod db_helper;
 pub mod db_index_list;
 pub mod db_lock_list;
 pub mod db_migration_list;
@@ -404,6 +404,7 @@ pub mod db_table_list;
 pub mod db_table_size;
 pub mod db_unused_indexes;
 pub mod db_view_list;
+pub mod http_request;
 pub mod project_db_apply_migration;
 pub mod project_db_connections;
 pub mod project_db_create_migration;
@@ -415,7 +416,6 @@ pub mod project_db_status;
 pub mod project_db_tables;
 pub mod project_info;
 pub mod project_run_configs;
-pub mod http_request;
 pub mod service_healthcheck;
 
 // ── Fase 4: Bootstrap progetto ────────────────────────────────────────────
@@ -572,11 +572,7 @@ pub trait NexusToolHandler: Send + Sync {
     /// quindi l'implementazione può assumere che l'enforcement sia già stato
     /// applicato. L'output deve essere JSON serializzabile; eventuali errori
     /// strutturati passano attraverso `NexusToolError`.
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError>;
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError>;
 
     /// Schema JSON dell'input atteso. Usato per discovery / documentazione.
     /// Default: oggetto vuoto (il tool non richiede argomenti).
@@ -616,11 +612,7 @@ mod tests {
     #[tokio::test]
     async fn test_handler_trait_object_works() {
         let h: SharedHandler = Arc::new(Noop);
-        let ctx = NexusToolContext::new(
-            PathBuf::from("/tmp"),
-            Uuid::nil(),
-            Uuid::nil(),
-        );
+        let ctx = NexusToolContext::new(PathBuf::from("/tmp"), Uuid::nil(), Uuid::nil());
         let out = h.execute(&ctx, &serde_json::json!({})).await.unwrap();
         assert_eq!(out["ok"], true);
     }
@@ -637,12 +629,8 @@ mod tests {
 
     #[test]
     fn test_context_with_timeout() {
-        let ctx = NexusToolContext::new(
-            PathBuf::from("/tmp"),
-            Uuid::nil(),
-            Uuid::nil(),
-        )
-        .with_timeout(300);
+        let ctx = NexusToolContext::new(PathBuf::from("/tmp"), Uuid::nil(), Uuid::nil())
+            .with_timeout(300);
         assert_eq!(ctx.timeout_secs, 300);
     }
 }

@@ -9,7 +9,11 @@ pub struct DbUnusedIndexesTool;
 
 #[async_trait]
 impl NexusToolHandler for DbUnusedIndexesTool {
-    async fn execute(&self, _ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        _ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let pool = match db_helper::get_pool().await {
             Ok(p) => p,
             Err(e) => return Ok(json!({"ok": false, "error": e})),
@@ -21,15 +25,25 @@ impl NexusToolHandler for DbUnusedIndexesTool {
             Ok(r) => r,
             Err(e) => return Ok(json!({"ok": false, "error": format!("query: {}", e)})),
         };
-        let items: Vec<Value> = rows.iter().map(|r| json!({
-            "schema": r.try_get::<String, _>("schemaname").unwrap_or_default(),
-            "table": r.try_get::<String, _>("table").unwrap_or_default(),
-            "index": r.try_get::<String, _>("index").unwrap_or_default(),
-            "scans": r.try_get::<i64, _>("idx_scan").unwrap_or(0),
-        })).collect();
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "schema": r.try_get::<String, _>("schemaname").unwrap_or_default(),
+                    "table": r.try_get::<String, _>("table").unwrap_or_default(),
+                    "index": r.try_get::<String, _>("index").unwrap_or_default(),
+                    "scans": r.try_get::<i64, _>("idx_scan").unwrap_or(0),
+                })
+            })
+            .collect();
         Ok(json!({"ok": true, "count": items.len(), "indexes": items}))
     }
     fn safety(&self) -> NexusToolSafety {
-        NexusToolSafety { read_only: true, can_write_filesystem: false, can_execute_subproc: false, network_egress: true }
+        NexusToolSafety {
+            read_only: true,
+            can_write_filesystem: false,
+            can_execute_subproc: false,
+            network_egress: true,
+        }
     }
 }

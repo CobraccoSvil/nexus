@@ -9,11 +9,22 @@ pub struct GitCatFileTool;
 #[async_trait]
 impl NexusToolHandler for GitCatFileTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let r = args.get("ref").and_then(Value::as_str)
+        let r = args
+            .get("ref")
+            .and_then(Value::as_str)
             .ok_or_else(|| NexusToolError::BadInput("ref required".into()))?;
-        let out = run_cmd("git", &["cat-file", "-p", r], &ctx.project_root, ctx.timeout_secs).await?;
+        let out = run_cmd(
+            "git",
+            &["cat-file", "-p", r],
+            &ctx.project_root,
+            ctx.timeout_secs,
+        )
+        .await?;
         if !out.success() {
-            return Err(NexusToolError::Exec { exit_code: out.exit_code, stderr: out.stderr });
+            return Err(NexusToolError::Exec {
+                exit_code: out.exit_code,
+                stderr: out.stderr,
+            });
         }
         let preview: String = out.stdout.chars().take(4000).collect();
         Ok(json!({"ok": true, "ref": r, "size": out.stdout.len(), "content_preview": preview}))
@@ -21,5 +32,7 @@ impl NexusToolHandler for GitCatFileTool {
     fn input_schema(&self) -> Value {
         json!({"type":"object","required":["ref"],"properties":{"ref":{"type":"string"}}})
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only_subproc()
+    }
 }

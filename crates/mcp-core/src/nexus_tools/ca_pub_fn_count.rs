@@ -8,10 +8,19 @@ pub struct CaPubFnCountTool;
 
 #[async_trait]
 impl NexusToolHandler for CaPubFnCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(
             &ctx.project_root,
-            &["pub fn ", "pub async fn ", "pub(crate) fn ", "pub(super) fn "],
+            &[
+                "pub fn ",
+                "pub async fn ",
+                "pub(crate) fn ",
+                "pub(super) fn ",
+            ],
         );
         Ok(json!({
             "ok": true,
@@ -22,5 +31,7 @@ impl NexusToolHandler for CaPubFnCountTool {
             "pub_super_fn": counts[3],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

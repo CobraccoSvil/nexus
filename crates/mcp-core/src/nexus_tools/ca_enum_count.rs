@@ -8,8 +8,15 @@ pub struct CaEnumCountTool;
 
 #[async_trait]
 impl NexusToolHandler for CaEnumCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let (counts, files) = scan_substrings(&ctx.project_root, &["enum ", "pub enum ", "pub(crate) enum "]);
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let (counts, files) = scan_substrings(
+            &ctx.project_root,
+            &["enum ", "pub enum ", "pub(crate) enum "],
+        );
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -18,5 +25,7 @@ impl NexusToolHandler for CaEnumCountTool {
             "pub_crate_enum": counts[2],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

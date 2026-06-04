@@ -8,9 +8,15 @@ pub struct PerfCloneCountTool;
 
 #[async_trait]
 impl NexusToolHandler for PerfCloneCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(&ctx.project_root, &[".clone()", ".to_owned()"]);
         Ok(json!({"ok": true, "files_scanned": files, "clone": counts[0], "to_owned": counts[1]}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

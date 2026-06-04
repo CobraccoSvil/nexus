@@ -119,11 +119,16 @@ pub async fn open_pool(conn: &str) -> Result<PgPool, String> {
 pub fn cell_to_json(row: &sqlx::postgres::PgRow, idx: usize, type_name: &str) -> Value {
     macro_rules! try_as {
         ($t:ty) => {
-            row.try_get::<Option<$t>, _>(idx).ok().map(|o| o.map(Value::from))
+            row.try_get::<Option<$t>, _>(idx)
+                .ok()
+                .map(|o| o.map(Value::from))
         };
     }
     let val: Option<Option<Value>> = match type_name {
-        "BOOL" => row.try_get::<Option<bool>, _>(idx).ok().map(|o| o.map(Value::from)),
+        "BOOL" => row
+            .try_get::<Option<bool>, _>(idx)
+            .ok()
+            .map(|o| o.map(Value::from)),
         "INT2" => row
             .try_get::<Option<i16>, _>(idx)
             .ok()
@@ -132,7 +137,10 @@ pub fn cell_to_json(row: &sqlx::postgres::PgRow, idx: usize, type_name: &str) ->
             .try_get::<Option<i32>, _>(idx)
             .ok()
             .map(|o| o.map(|v| Value::from(v as i64))),
-        "INT8" => row.try_get::<Option<i64>, _>(idx).ok().map(|o| o.map(Value::from)),
+        "INT8" => row
+            .try_get::<Option<i64>, _>(idx)
+            .ok()
+            .map(|o| o.map(Value::from)),
         "FLOAT4" => row
             .try_get::<Option<f32>, _>(idx)
             .ok()
@@ -254,7 +262,11 @@ pub fn is_read_only(sql: &str) -> bool {
 /// Valori: "select", "insert", "update", "delete", "ddl", "tx", "other".
 pub fn classify_statement(sql: &str) -> &'static str {
     let t = skip_leading_noise(sql).to_lowercase();
-    if t.starts_with("select") || t.starts_with("with") || t.starts_with("show") || t.starts_with("explain") {
+    if t.starts_with("select")
+        || t.starts_with("with")
+        || t.starts_with("show")
+        || t.starts_with("explain")
+    {
         "select"
     } else if t.starts_with("insert") {
         "insert"
@@ -437,13 +449,13 @@ pub fn split_statements(sql: &str) -> Vec<String> {
 /// Esito strutturato di un'esecuzione SQL.
 #[derive(Debug)]
 pub struct QueryExecOutcome {
-    pub mode: &'static str,            // "read" | "write"
-    pub statement_kind: String,        // kind del LAST statement (select|insert|update|delete|ddl|tx|other)
-    pub columns: Vec<Value>,           // [{name,type}, ...]
-    pub rows: Vec<Value>,              // [{col:val, ...}, ...]
-    pub row_count: usize,              // numero righe ritornate (read) o 0 (write)
-    pub rows_affected: Option<u64>,    // somma rows_affected delle statement write (None se l'ultima e' read)
-    pub truncated: bool,               // true se ho clippato per max_rows
+    pub mode: &'static str,         // "read" | "write"
+    pub statement_kind: String, // kind del LAST statement (select|insert|update|delete|ddl|tx|other)
+    pub columns: Vec<Value>,    // [{name,type}, ...]
+    pub rows: Vec<Value>,       // [{col:val, ...}, ...]
+    pub row_count: usize,       // numero righe ritornate (read) o 0 (write)
+    pub rows_affected: Option<u64>, // somma rows_affected delle statement write (None se l'ultima e' read)
+    pub truncated: bool,            // true se ho clippato per max_rows
     pub duration_ms: u64,
     /// Numero di statement eseguiti (>=1). Se >1 il batch e' stato eseguito in transazione.
     pub statements_executed: usize,
@@ -492,7 +504,9 @@ pub async fn execute_query(
     let conn = resolve_project_conn(db, project_id, connection_name)
         .await
         .map_err(QueryExecError::ConnectionError)?;
-    let pool = open_pool(&conn).await.map_err(QueryExecError::ConnectionError)?;
+    let pool = open_pool(&conn)
+        .await
+        .map_err(QueryExecError::ConnectionError)?;
 
     let statements = split_statements(sql);
     if statements.is_empty() {
@@ -530,11 +544,9 @@ pub async fn execute_query(
         }
 
         if read_only {
-            let fetch = tokio::time::timeout(
-                Duration::from_secs(QUERY_TIMEOUT_SECS),
-                q.fetch_all(&pool),
-            )
-            .await;
+            let fetch =
+                tokio::time::timeout(Duration::from_secs(QUERY_TIMEOUT_SECS), q.fetch_all(&pool))
+                    .await;
             let rows = match fetch {
                 Err(_) => {
                     pool.close().await;
@@ -564,11 +576,9 @@ pub async fn execute_query(
                 per_statement_summary: Vec::new(),
             }
         } else {
-            let exec = tokio::time::timeout(
-                Duration::from_secs(QUERY_TIMEOUT_SECS),
-                q.execute(&pool),
-            )
-            .await;
+            let exec =
+                tokio::time::timeout(Duration::from_secs(QUERY_TIMEOUT_SECS), q.execute(&pool))
+                    .await;
             let res = match exec {
                 Err(_) => {
                     pool.close().await;
@@ -634,7 +644,11 @@ pub async fn execute_query(
             row_count: batch.rows.len(),
             columns: batch.columns,
             rows: batch.rows,
-            rows_affected: if last_is_read { None } else { Some(total_write) },
+            rows_affected: if last_is_read {
+                None
+            } else {
+                Some(total_write)
+            },
             truncated: batch.truncated,
             duration_ms,
             statements_executed: statements.len(),
@@ -824,7 +838,12 @@ pub async fn archive_ddl(
         .unwrap_or_else(|| "primary".to_string());
 
     let title = match (action.as_str(), object.as_str(), target.as_deref()) {
-        (a, "", _) => format!("DDL {} on '{}' - {}", a, effective_conn, timestamp.format("%Y-%m-%d %H:%M")),
+        (a, "", _) => format!(
+            "DDL {} on '{}' - {}",
+            a,
+            effective_conn,
+            timestamp.format("%Y-%m-%d %H:%M")
+        ),
         (a, o, Some(t)) => format!("DDL {} {} {} on '{}'", a, o, t, effective_conn),
         (a, o, None) => format!("DDL {} {} on '{}'", a, o, effective_conn),
     };
@@ -892,26 +911,19 @@ pub async fn archive_ddl(
     // File migration (best effort - se lo scrivi senza root, salta).
     // Passa la connection effettiva cosi' multi-DB scrive in cartelle
     // separate (nexus_migrations/<conn_name>/).
-    let (mig_filename, mig_abs) = match write_migration_file(
-        db,
-        project_id,
-        trimmed,
-        &title,
-        &effective_conn,
-    )
-    .await
-    {
-        Ok((name, abs)) => (Some(name), Some(abs)),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                %project_id,
-                connection = %effective_conn,
-                "archive_ddl: scrittura file migration fallita"
-            );
-            (None, None)
-        }
-    };
+    let (mig_filename, mig_abs) =
+        match write_migration_file(db, project_id, trimmed, &title, &effective_conn).await {
+            Ok((name, abs)) => (Some(name), Some(abs)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    %project_id,
+                    connection = %effective_conn,
+                    "archive_ddl: scrittura file migration fallita"
+                );
+                (None, None)
+            }
+        };
 
     tracing::info!(
         %project_id,
@@ -978,7 +990,10 @@ async fn write_migration_file(
     .await
     .map_err(|e| format!("query project_database_config: {e}"))?;
     let explicit_path: Option<String> = cfg_row
-        .and_then(|r| r.try_get::<Option<String>, _>("migration_path").unwrap_or(None))
+        .and_then(|r| {
+            r.try_get::<Option<String>, _>("migration_path")
+                .unwrap_or(None)
+        })
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
@@ -1040,10 +1055,7 @@ async fn write_migration_file(
 }
 
 fn first_token_upper(sql: &str) -> String {
-    sql.split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_uppercase()
+    sql.split_whitespace().next().unwrap_or("").to_uppercase()
 }
 
 fn second_meaningful_token_upper(sql: &str) -> String {

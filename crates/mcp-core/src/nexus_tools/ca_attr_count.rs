@@ -8,10 +8,22 @@ pub struct CaAttrCountTool;
 
 #[async_trait]
 impl NexusToolHandler for CaAttrCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(
             &ctx.project_root,
-            &["#[", "#![", "#[allow(", "#[deny(", "#[warn(", "#[deprecated", "#[inline"],
+            &[
+                "#[",
+                "#![",
+                "#[allow(",
+                "#[deny(",
+                "#[warn(",
+                "#[deprecated",
+                "#[inline",
+            ],
         );
         Ok(json!({
             "ok": true,
@@ -25,5 +37,7 @@ impl NexusToolHandler for CaAttrCountTool {
             "inline": counts[6],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

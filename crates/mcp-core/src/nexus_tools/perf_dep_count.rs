@@ -7,7 +7,11 @@ pub struct PerfDepCountTool;
 
 #[async_trait]
 impl NexusToolHandler for PerfDepCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let cargo = ctx.project_root.join("Cargo.toml");
         if !cargo.is_file() {
             return Ok(json!({"ok": false, "error": "Cargo.toml not found"}));
@@ -24,7 +28,9 @@ impl NexusToolHandler for PerfDepCountTool {
                 current = trimmed;
                 continue;
             }
-            if trimmed.is_empty() || trimmed.starts_with('#') || !trimmed.contains('=') { continue; }
+            if trimmed.is_empty() || trimmed.starts_with('#') || !trimmed.contains('=') {
+                continue;
+            }
             match current {
                 "[dependencies]" => deps += 1,
                 "[dev-dependencies]" => dev += 1,
@@ -33,7 +39,11 @@ impl NexusToolHandler for PerfDepCountTool {
                 _ => {}
             }
         }
-        Ok(json!({"ok": true, "dependencies": deps, "dev_dependencies": dev, "build_dependencies": build, "workspace_dependencies": workspace_deps}))
+        Ok(
+            json!({"ok": true, "dependencies": deps, "dev_dependencies": dev, "build_dependencies": build, "workspace_dependencies": workspace_deps}),
+        )
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

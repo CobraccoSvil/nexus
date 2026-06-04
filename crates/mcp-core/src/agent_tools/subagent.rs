@@ -27,8 +27,16 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
         Some(t) if !t.trim().is_empty() => t.to_string(),
         _ => return err("parametro 'task' obbligatorio e non vuoto"),
     };
-    let context_blob = input.get("context").and_then(Value::as_str).unwrap_or("").to_string();
-    let expected_format = input.get("expected_output_format").and_then(Value::as_str).unwrap_or("").to_string();
+    let context_blob = input
+        .get("context")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let expected_format = input
+        .get("expected_output_format")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
 
     run_single_subagent(ctx, &kind, &task, &context_blob, &expected_format)
         .await
@@ -52,7 +60,13 @@ async fn run_single_subagent(
     let project_id = ctx.project_id;
 
     // 2. Setting guards (lettura diretta da DB via ctx.db)
-    let (enabled, whitelist_csv, max_depth, cost_cap_usd, default_timeout): (bool, String, i64, f64, i64) = match read_subagent_settings(ctx).await {
+    let (enabled, whitelist_csv, max_depth, cost_cap_usd, default_timeout): (
+        bool,
+        String,
+        i64,
+        f64,
+        i64,
+    ) = match read_subagent_settings(ctx).await {
         Ok(v) => v,
         Err(e) => return json!({"error": format!("lettura settings fallita: {e}")}),
     };
@@ -60,7 +74,11 @@ async fn run_single_subagent(
     if !enabled {
         return json!({"error": "sub-agents disabilitati (orchestrator.subagents_enabled=false)"});
     }
-    let whitelist: Vec<&str> = whitelist_csv.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let whitelist: Vec<&str> = whitelist_csv
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     if !whitelist.contains(&kind) {
         return json!({"error": format!("kind '{kind}' non in whitelist: {whitelist:?}")});
     }
@@ -76,7 +94,9 @@ async fn run_single_subagent(
     .map_err(|e| format!("query definition: {e}"));
     let row = match row {
         Ok(Some(r)) => r,
-        Ok(None) => return json!({"error": format!("kind '{kind}' non trovato in nexus_subagent_definitions")}),
+        Ok(None) => {
+            return json!({"error": format!("kind '{kind}' non trovato in nexus_subagent_definitions")})
+        }
         Err(e) => return json!({"error": e}),
     };
     let is_enabled: bool = row.get::<bool, _>("is_enabled");
@@ -84,13 +104,23 @@ async fn run_single_subagent(
         return json!({"error": format!("kind '{kind}' disabilitato")});
     }
     let timeout_s: i64 = row.get::<i32, _>("timeout_s") as i64;
-    let timeout_s = if timeout_s > 0 { timeout_s } else { default_timeout };
+    let timeout_s = if timeout_s > 0 {
+        timeout_s
+    } else {
+        default_timeout
+    };
     let is_background: bool = row.get::<bool, _>("is_background");
 
     // 4. Depth guard: leggi dal parent_run_id quanti sub-agent gia' sopra di noi.
     // Se ctx.parent_run_id is None siamo il main → depth=1 per il nuovo sub.
-    let parent_run_id = ctx.parent_run_id.unwrap_or_else(|| ctx.session_id.unwrap_or(Uuid::nil()));
-    let current_depth = if ctx.parent_run_id.is_some() { 2_i64 } else { 1_i64 };
+    let parent_run_id = ctx
+        .parent_run_id
+        .unwrap_or_else(|| ctx.session_id.unwrap_or(Uuid::nil()));
+    let current_depth = if ctx.parent_run_id.is_some() {
+        2_i64
+    } else {
+        1_i64
+    };
     if current_depth > max_depth {
         return json!({"error": format!("depth {current_depth} > max {max_depth}: sub-agent annidamento eccessivo")});
     }
@@ -132,7 +162,8 @@ async fn run_single_subagent(
 
     // 7. Chiama il brain endpoint /agent/subagent-run per attivare la sub-run.
     // L'endpoint e' bloccante per is_background=false, fire-and-forget per true.
-    let brain_url = std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://localhost:8001".to_string());
+    let brain_url =
+        std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://localhost:8001".to_string());
     let payload = json!({
         "subagent_run_id": subagent_run_id.to_string(),
         "parent_run_id":   parent_run_id.to_string(),
@@ -160,10 +191,19 @@ async fn run_single_subagent(
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            let body: serde_json::Value = r.json().await.unwrap_or_else(|_| json!({"summary": "(no body)"}));
+            let body: serde_json::Value = r
+                .json()
+                .await
+                .unwrap_or_else(|_| json!({"summary": "(no body)"}));
             // Ritorna compact summary al main
-            let summary = body.get("summary").and_then(Value::as_str).unwrap_or("(no summary)");
-            let status = body.get("status").and_then(Value::as_str).unwrap_or("completed");
+            let summary = body
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("(no summary)");
+            let status = body
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("completed");
             json!({
                 "subagent_run_id": subagent_run_id.to_string(),
                 "kind": body.get("kind").cloned().unwrap_or(json!(kind)),
@@ -223,12 +263,24 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
     // Valida e normalizza ogni task prima di eseguire.
     let mut parsed: Vec<(String, String, String, String)> = Vec::with_capacity(tasks.len());
     for (i, t) in tasks.iter().enumerate() {
-        let kind = t.get("kind").and_then(Value::as_str).unwrap_or("").to_string();
-        let task = t.get("task").and_then(Value::as_str).unwrap_or("").to_string();
+        let kind = t
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let task = t
+            .get("task")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         if kind.is_empty() || task.trim().is_empty() {
             return err(&format!("task[{i}]: 'kind' e 'task' sono obbligatori"));
         }
-        let context_blob = t.get("context").and_then(Value::as_str).unwrap_or("").to_string();
+        let context_blob = t
+            .get("context")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let expected = t
             .get("expected_output_format")
             .and_then(Value::as_str)
@@ -257,7 +309,9 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
     .to_string()
 }
 
-async fn read_subagent_settings(ctx: &AgentToolContext) -> Result<(bool, String, i64, f64, i64), String> {
+async fn read_subagent_settings(
+    ctx: &AgentToolContext,
+) -> Result<(bool, String, i64, f64, i64), String> {
     // Lettura blocco per minimizzare round-trip.
     let rows = sqlx::query(
         "SELECT key, value FROM settings WHERE key IN (
@@ -281,11 +335,20 @@ async fn read_subagent_settings(ctx: &AgentToolContext) -> Result<(bool, String,
         let k: String = row.get("key");
         let v: String = row.get("value");
         match k.as_str() {
-            "orchestrator.subagents_enabled" => enabled = matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes" | "on"),
+            "orchestrator.subagents_enabled" => {
+                enabled = matches!(
+                    v.trim().to_lowercase().as_str(),
+                    "true" | "1" | "yes" | "on"
+                )
+            }
             "orchestrator.subagent_kinds_whitelist" => whitelist = v,
             "orchestrator.subagent_max_depth" => max_depth = v.trim().parse().unwrap_or(2),
-            "orchestrator.subagent_cost_cap_per_run_usd" => cost_cap = v.trim().parse().unwrap_or(5.0),
-            "orchestrator.subagent_default_timeout_s" => default_timeout = v.trim().parse().unwrap_or(300),
+            "orchestrator.subagent_cost_cap_per_run_usd" => {
+                cost_cap = v.trim().parse().unwrap_or(5.0)
+            }
+            "orchestrator.subagent_default_timeout_s" => {
+                default_timeout = v.trim().parse().unwrap_or(300)
+            }
             _ => {}
         }
     }
@@ -301,7 +364,11 @@ fn err(msg: &str) -> String {
 pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> String {
     let run_id = match input.get("subagent_run_id").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
-        _ => return format!("\u{274C} [nexus_subagent_poll] parametro 'subagent_run_id' obbligatorio"),
+        _ => {
+            return format!(
+                "\u{274C} [nexus_subagent_poll] parametro 'subagent_run_id' obbligatorio"
+            )
+        }
     };
     let row = sqlx::query(
         "SELECT id::text, status, kind, final_summary, artifacts, iterations,
@@ -340,7 +407,11 @@ pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> 
 pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -> String {
     let run_id = match input.get("subagent_run_id").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
-        _ => return format!("\u{274C} [nexus_subagent_resume] parametro 'subagent_run_id' obbligatorio"),
+        _ => {
+            return format!(
+                "\u{274C} [nexus_subagent_resume] parametro 'subagent_run_id' obbligatorio"
+            )
+        }
     };
     // Best-effort: aggiorna lo stato a 'running' e chiama l'endpoint brain
     // /agent/subagent-resume per re-dispatcharne l'esecuzione.
@@ -354,7 +425,8 @@ pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -
         return format!("\u{274C} [nexus_subagent_resume] update fallito: {e}");
     }
     // Notifica al brain (best-effort).
-    let brain_url = std::env::var("NEURAL_REST_URL").unwrap_or_else(|_| "http://localhost:8001".into());
+    let brain_url =
+        std::env::var("NEURAL_REST_URL").unwrap_or_else(|_| "http://localhost:8001".into());
     let resp = reqwest::Client::new()
         .post(format!("{brain_url}/agent/subagent-resume"))
         .json(&json!({"run_id": run_id}))

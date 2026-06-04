@@ -3,13 +3,17 @@
 //! La `TemplateCache` mantiene prompt caricati dal DB con TTL configurabile.
 //! Cache miss e chiavi inesistenti restituiscono `None`.
 
-use axum::{extract::{Path, State}, Json, http::StatusCode, Extension};
 use axum::response::IntoResponse;
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    Extension, Json,
+};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -20,11 +24,18 @@ pub struct TemplateCache {
 
 impl TemplateCache {
     pub fn new() -> Self {
-        Self { inner: Arc::new(DashMap::new()), ttl: Duration::from_secs(60) }
+        Self {
+            inner: Arc::new(DashMap::new()),
+            ttl: Duration::from_secs(60),
+        }
     }
     pub fn get(&self, key: &str) -> Option<String> {
         self.inner.get(key).and_then(|e| {
-            if e.1.elapsed() < self.ttl { Some(e.0.clone()) } else { None }
+            if e.1.elapsed() < self.ttl {
+                Some(e.0.clone())
+            } else {
+                None
+            }
         })
     }
     pub fn set(&self, key: String, value: String) {
@@ -105,11 +116,7 @@ pub struct FalsePositiveStat {
 ///
 /// Tutti i template di sistema devono essere presenti nel DB via migration.
 /// Se manca un template, il log errore indica esattamente quale chiave aggiungere.
-pub async fn get_template_or_default(
-    db: &PgPool,
-    cache: &TemplateCache,
-    key: &str,
-) -> String {
+pub async fn get_template_or_default(db: &PgPool, cache: &TemplateCache, key: &str) -> String {
     if let Some(cached) = cache.get(key) {
         return cached;
     }
@@ -202,7 +209,9 @@ pub async fn get_template_handler(
     .await
     .unwrap_or_default();
 
-    Ok(Json(serde_json::json!({ "template": template, "history": history })))
+    Ok(Json(
+        serde_json::json!({ "template": template, "history": history }),
+    ))
 }
 
 /// PUT /api/prompt-templates/:key
@@ -338,10 +347,13 @@ pub async fn false_positive_stats_handler(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let stats: Vec<FalsePositiveStat> = rows.iter().map(|row| FalsePositiveStat {
-        rule_key: row.get("rule_key"),
-        count: row.get("count"),
-    }).collect();
+    let stats: Vec<FalsePositiveStat> = rows
+        .iter()
+        .map(|row| FalsePositiveStat {
+            rule_key: row.get("rule_key"),
+            count: row.get("count"),
+        })
+        .collect();
     Ok(Json(stats))
 }
 
@@ -353,7 +365,9 @@ async fn generate_nexus_suggestion(db: &PgPool, rule_key: &str) -> anyhow::Resul
         .await?
         .map(|row| (row.get::<i32, _>("id"), row.get::<String, _>("content")));
 
-    let Some((tmpl_id, tmpl_content)) = template else { return Ok(()); };
+    let Some((tmpl_id, tmpl_content)) = template else {
+        return Ok(());
+    };
 
     // Check if nexus suggestion already pending (version unchanged since last nexus suggestion)
     let has_pending = sqlx::query_scalar::<_, i64>(
@@ -363,7 +377,9 @@ async fn generate_nexus_suggestion(db: &PgPool, rule_key: &str) -> anyhow::Resul
     .fetch_one(db)
     .await?;
 
-    if has_pending > 0 { return Ok(()); }
+    if has_pending > 0 {
+        return Ok(());
+    }
 
     // Get recent FP examples
     let examples = sqlx::query(
@@ -373,7 +389,8 @@ async fn generate_nexus_suggestion(db: &PgPool, rule_key: &str) -> anyhow::Resul
     .fetch_all(db)
     .await?;
 
-    let examples_text: Vec<String> = examples.iter()
+    let examples_text: Vec<String> = examples
+        .iter()
         .filter_map(|row| row.get::<Option<String>, _>("false_positive_reason"))
         .collect();
 
@@ -397,7 +414,6 @@ async fn generate_nexus_suggestion(db: &PgPool, rule_key: &str) -> anyhow::Resul
     Ok(())
 }
 
-
 /// Genera testo rispettando l'ordine dei provider configurato in admin (settings.provider_hierarchy).
 /// Se un provider restituisce errore di quota/credito/rate, tenta il successivo nella lista admin.
 /// Non aggiunge provider extra: la configurazione admin è autoritativa.
@@ -410,19 +426,19 @@ async fn generate_with_admin_fallback(
     billing_user_id: uuid::Uuid,
     billing_project_id: uuid::Uuid,
 ) -> Result<serde_json::Value, String> {
-    use crate::orchestrator::default_model_for_provider;
     use crate::billing::{self, UsageNumbers};
+    use crate::orchestrator::default_model_for_provider;
 
     // Carica l'ordine provider dall'admin (stesso campo usato dall'agent loop)
-    let hierarchy_str: Option<String> = sqlx::query_scalar(
-        "SELECT value FROM settings WHERE key = 'provider_hierarchy' LIMIT 1"
-    )
-    .fetch_optional(db)
-    .await
-    .unwrap_or(None);
+    let hierarchy_str: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'provider_hierarchy' LIMIT 1")
+            .fetch_optional(db)
+            .await
+            .unwrap_or(None);
 
-    let providers_csv = hierarchy_str
-        .ok_or_else(|| "Impostazione 'provider_hierarchy' non configurata nella tabella settings".to_string())?;
+    let providers_csv = hierarchy_str.ok_or_else(|| {
+        "Impostazione 'provider_hierarchy' non configurata nella tabella settings".to_string()
+    })?;
     let providers: Vec<String> = providers_csv
         .split(',')
         .map(|s| s.trim().to_lowercase())
@@ -456,7 +472,9 @@ async fn generate_with_admin_fallback(
         {
             Ok(r) => Some(r),
             Err(e) => {
-                tracing::error!("batch: billing reserve FAILED (provider={provider} model={model}): {e}");
+                tracing::error!(
+                    "batch: billing reserve FAILED (provider={provider} model={model}): {e}"
+                );
                 None
             }
         };
@@ -464,13 +482,12 @@ async fn generate_with_admin_fallback(
         match neural.generate_completion(provider, &model, prompt).await {
             Ok(v) => {
                 // Finalizza il costo con i token reali (se presenti), altrimenti usa stima.
-                let usage_numbers: UsageNumbers = billing::extract_usage_numbers(
-                    &v,
-                    prompt_tokens,
-                    estimated_completion_tokens,
-                );
+                let usage_numbers: UsageNumbers =
+                    billing::extract_usage_numbers(&v, prompt_tokens, estimated_completion_tokens);
                 if let Some(res) = &reservation {
-                    if let Err(e) = billing::finalize_usage(db, res, uuid::Uuid::new_v4(), &usage_numbers).await {
+                    if let Err(e) =
+                        billing::finalize_usage(db, res, uuid::Uuid::new_v4(), &usage_numbers).await
+                    {
                         tracing::error!("batch: billing finalize FAILED: {e}");
                     }
                 }
@@ -503,7 +520,11 @@ async fn generate_with_admin_fallback(
                 if let Some(res) = &reservation {
                     billing::release_usage(db, res, "provider_error").await;
                 }
-                tracing::warn!("batch: provider {} errore gRPC: {}, marcato broken", provider, e);
+                tracing::warn!(
+                    "batch: provider {} errore gRPC: {}, marcato broken",
+                    provider,
+                    e
+                );
                 broken_providers.insert(provider.clone());
                 continue;
             }
@@ -515,7 +536,6 @@ async fn generate_with_admin_fallback(
         providers.join(", ")
     ))
 }
-
 
 /// POST /api/prompt-templates/:key/ai-suggest
 /// Genera un nuovo contenuto per il prompt usando un LLM, con contesto d'uso preinserito.
@@ -558,7 +578,10 @@ pub async fn ai_suggest_handler(
         .map(|s| s.to_string())
         .unwrap_or(purpose_model);
 
-    let usage_ctx = template.usage_context.as_deref().unwrap_or("(nessun contesto d'uso documentato per questo prompt)");
+    let usage_ctx = template
+        .usage_context
+        .as_deref()
+        .unwrap_or("(nessun contesto d'uso documentato per questo prompt)");
 
     let meta_prompt = format!(
         r#"Sei un esperto di prompt engineering. Stai aiutando a riscrivere un prompt che fa parte del sistema Nexus.
@@ -598,7 +621,12 @@ ISTRUZIONI PER LA TUA RISPOSTA:
         .neural
         .generate_completion(provider.as_str(), model.as_str(), &meta_prompt)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        })?;
 
     let suggestion = result["content"]
         .as_str()
@@ -643,7 +671,9 @@ ISTRUZIONI PER LA TUA RISPOSTA:
             );
 
             // Usa lo stesso provider/model della richiesta principale per la tool suggestion
-            let tool_result = state.orchestrator.neural
+            let tool_result = state
+                .orchestrator
+                .neural
                 .generate_completion(provider.as_str(), model.as_str(), &tool_prompt)
                 .await
                 .unwrap_or_default();
@@ -660,7 +690,12 @@ ISTRUZIONI PER LA TUA RISPOSTA:
 
             let tool_map: std::collections::HashMap<String, String> = rows
                 .iter()
-                .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("server_name")))
+                .map(|r| {
+                    (
+                        r.get::<String, _>("name"),
+                        r.get::<String, _>("server_name"),
+                    )
+                })
                 .collect();
 
             let prompt_tools: Vec<PromptMcpTool> = tool_names
@@ -776,9 +811,12 @@ async fn batch_assign_tools_impl(
     // Mappa per lookup:
     // - by_pair: (server, tool_name) -> true
     // - by_name: tool_name -> set(server) per gestire collisioni e richiedere disambiguazione quando serve.
-    let mut tool_by_pair: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    let mut tool_servers_by_name: std::collections::HashMap<String, std::collections::HashSet<String>> =
-        std::collections::HashMap::new();
+    let mut tool_by_pair: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    let mut tool_servers_by_name: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
     for r in &tool_rows {
         let name: String = r.get("name");
         let server: String = r.get("server_name");
@@ -843,7 +881,9 @@ oppure\n\
         let matrix_arc = match state.orchestrator.routing_matrix.current_async().await {
             Ok(m) => m,
             Err(e) => {
-                tracing::error!("regenerate_tool_suggestions: routing_matrix non disponibile ({e}), skip");
+                tracing::error!(
+                    "regenerate_tool_suggestions: routing_matrix non disponibile ({e}), skip"
+                );
                 continue;
             }
         };
@@ -855,7 +895,8 @@ oppure\n\
             &mut broken_providers,
             billing_user_id,
             billing_project_id,
-        ).await;
+        )
+        .await;
 
         match tool_result {
             Ok(v) => {
@@ -872,7 +913,8 @@ oppure\n\
                         // - accetta [{tool_name, usage_context?}, ...]
                         // - ignora tool non presenti in tool_map
                         // - de-duplica
-                        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        let mut seen: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
                         let mut prompt_tools: Vec<PromptMcpTool> = Vec::new();
 
                         for item in arr_ref {
@@ -913,7 +955,9 @@ oppure\n\
                                     .map(|s| s.to_string());
                             }
 
-                            let Some(tool_name) = name else { continue; };
+                            let Some(tool_name) = name else {
+                                continue;
+                            };
 
                             // Se server non specificato:
                             // - accetta solo se il tool_name è univoco tra i server
@@ -923,7 +967,9 @@ oppure\n\
                             } else {
                                 let servers = tool_servers_by_name.get(&tool_name);
                                 match servers {
-                                    Some(s) if s.len() == 1 => s.iter().next().cloned().unwrap_or_default(),
+                                    Some(s) if s.len() == 1 => {
+                                        s.iter().next().cloned().unwrap_or_default()
+                                    }
                                     _ => continue, // ambiguo o inesistente
                                 }
                             };
@@ -962,9 +1008,12 @@ oppure\n\
                                 tool_by_pair.iter().map(|(srv, _)| srv.clone()).collect();
                             let mut meta_server: Option<String> = None;
                             for srv in servers {
-                                let search_pair = (srv.clone(), "nexus_mcp_tool_search".to_string());
+                                let search_pair =
+                                    (srv.clone(), "nexus_mcp_tool_search".to_string());
                                 let call_pair = (srv.clone(), "nexus_mcp_tool_call".to_string());
-                                if tool_by_pair.contains(&search_pair) && tool_by_pair.contains(&call_pair) {
+                                if tool_by_pair.contains(&search_pair)
+                                    && tool_by_pair.contains(&call_pair)
+                                {
                                     meta_server = Some(srv);
                                     break;
                                 }
@@ -996,8 +1045,12 @@ oppure\n\
                         .execute(&state.db)
                         .await;
 
-                        if count > 0 { assigned += 1; }
-                        results.push(serde_json::json!({"key": &key, "tools_count": count, "status": "ok"}));
+                        if count > 0 {
+                            assigned += 1;
+                        }
+                        results.push(
+                            serde_json::json!({"key": &key, "tools_count": count, "status": "ok"}),
+                        );
                     }
                     _ => {
                         errors += 1;
@@ -1015,7 +1068,11 @@ oppure\n\
         }
     }
 
-    let avg_tools = if processed > 0 { (total_tools_selected as f64) / (processed as f64) } else { 0.0 };
+    let avg_tools = if processed > 0 {
+        (total_tools_selected as f64) / (processed as f64)
+    } else {
+        0.0
+    };
     Ok(Json(serde_json::json!({
         "status": "completed",
         "processed": processed,
@@ -1079,7 +1136,9 @@ pub async fn batch_assign_tools_handler(
         .fetch_one(&state_clone.db)
         .await
         .unwrap_or_else(|_| {
-            tracing::error!("batch: impossibile risolvere project_id per billing (nessun progetto?)");
+            tracing::error!(
+                "batch: impossibile risolvere project_id per billing (nessun progetto?)"
+            );
             uuid::Uuid::nil()
         });
 
@@ -1110,7 +1169,8 @@ pub async fn batch_assign_tools_handler(
                 .unwrap_or(uuid::Uuid::nil());
 
                 if !user_id2.is_nil() && !project_id2.is_nil() {
-                    let _ = batch_assign_tools_impl(State(state_clone2), user_id2, project_id2).await;
+                    let _ =
+                        batch_assign_tools_impl(State(state_clone2), user_id2, project_id2).await;
                 }
                 RUNNING.store(false, Ordering::SeqCst);
             });
@@ -1145,11 +1205,15 @@ pub async fn internal_batch_assign_tools_handler(
 
     if RUNNING.swap(true, Ordering::SeqCst) {
         PENDING.store(true, Ordering::SeqCst);
-        return (StatusCode::ACCEPTED, Json(serde_json::json!({
-            "queued": false,
-            "running": true,
-            "pending": true
-        }))).into_response();
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "queued": false,
+                "running": true,
+                "pending": true
+            })),
+        )
+            .into_response();
     }
 
     let state_clone = state.clone();
@@ -1204,24 +1268,31 @@ pub async fn internal_batch_assign_tools_handler(
         }
     });
 
-    (StatusCode::ACCEPTED, Json(serde_json::json!({
-        "queued": true,
-        "running": true,
-        "pending": false
-    }))).into_response()
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "queued": true,
+            "running": true,
+            "pending": false
+        })),
+    )
+        .into_response()
 }
 /// GET /api/admin/prompt-templates/:key/tools
 pub async fn get_prompt_tools_handler(
     State(state): State<crate::AppState>,
     axum::extract::Path(key): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let row = sqlx::query(
-        "SELECT mcp_tools_json FROM nexus_prompt_templates WHERE key = $1",
-    )
-    .bind(&key)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+    let row = sqlx::query("SELECT mcp_tools_json FROM nexus_prompt_templates WHERE key = $1")
+        .bind(&key)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        })?;
 
     let assigned_tools: Vec<PromptMcpTool> = row
         .and_then(|r| r.try_get::<serde_json::Value, _>("mcp_tools_json").ok())
@@ -1262,7 +1333,10 @@ pub async fn update_prompt_tools_handler(
     axum::extract::Path(key): axum::extract::Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let tools = body.get("assigned_tools").cloned().unwrap_or(serde_json::json!([]));
+    let tools = body
+        .get("assigned_tools")
+        .cloned()
+        .unwrap_or(serde_json::json!([]));
     sqlx::query(
         "UPDATE nexus_prompt_templates SET mcp_tools_json = $1, updated_at = NOW() WHERE key = $2",
     )
@@ -1270,7 +1344,12 @@ pub async fn update_prompt_tools_handler(
     .bind(&key)
     .execute(&state.db)
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+    })?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -1303,12 +1382,11 @@ pub async fn available_mcp_tools_handler(
     Ok(Json(serde_json::json!(tools)))
 }
 
-
 /// Get set of disabled quality rule keys from DB (for RuleOverrides)
 #[allow(dead_code)]
 pub async fn get_disabled_quality_rules(db: &PgPool) -> std::collections::HashSet<String> {
     sqlx::query_scalar::<_, String>(
-        "SELECT key FROM nexus_prompt_templates WHERE category='quality' AND is_active=FALSE"
+        "SELECT key FROM nexus_prompt_templates WHERE category='quality' AND is_active=FALSE",
     )
     .fetch_all(db)
     .await

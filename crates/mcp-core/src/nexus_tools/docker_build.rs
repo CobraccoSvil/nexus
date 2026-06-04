@@ -24,11 +24,7 @@ fn validate_path_in_root(root: &std::path::Path, candidate: &str) -> Result<(), 
 
 #[async_trait]
 impl NexusToolHandler for DockerBuildTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let tag = args
             .get("tag")
             .and_then(Value::as_str)

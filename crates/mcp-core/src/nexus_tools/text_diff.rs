@@ -55,11 +55,7 @@ fn lcs_diff(a: &[&str], b: &[&str]) -> Vec<(char, usize, String)> {
 
 #[async_trait]
 impl NexusToolHandler for TextDiffTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let a_text: String = if let Some(s) = args.get("a").and_then(Value::as_str) {
             s.to_string()
         } else if let Some(p) = args.get("path_a").and_then(Value::as_str) {

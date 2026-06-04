@@ -187,7 +187,9 @@ pub async fn list_revisions(
             author: r.try_get("author").ok(),
             edit_summary: r.try_get("edit_summary").ok(),
             body_bytes: r.try_get::<i32, _>("body_bytes").unwrap_or(0) as i64,
-            created_at: r.try_get("created_at").unwrap_or_else(|_| chrono::Utc::now()),
+            created_at: r
+                .try_get("created_at")
+                .unwrap_or_else(|_| chrono::Utc::now()),
         })
         .collect())
 }
@@ -221,7 +223,9 @@ pub async fn get_revision(
         source: r.try_get("source").unwrap_or_default(),
         author: r.try_get("author").ok(),
         edit_summary: r.try_get("edit_summary").ok(),
-        created_at: r.try_get("created_at").unwrap_or_else(|_| chrono::Utc::now()),
+        created_at: r
+            .try_get("created_at")
+            .unwrap_or_else(|_| chrono::Utc::now()),
     }))
 }
 
@@ -315,8 +319,9 @@ pub async fn meta_restore(
     let source_commit: Option<String> = row.try_get("source_commit").ok();
     let source_files: Vec<String> = row.try_get("source_files").unwrap_or_default();
     let vault_file_path: String = row.try_get("vault_file_path").unwrap_or_default();
-    let created_at: chrono::DateTime<chrono::Utc> =
-        row.try_get("created_at").unwrap_or_else(|_| chrono::Utc::now());
+    let created_at: chrono::DateTime<chrono::Utc> = row
+        .try_get("created_at")
+        .unwrap_or_else(|_| chrono::Utc::now());
     let now = chrono::Utc::now();
 
     let body_full = crate::meta_docs::vault::serialize_meta_doc(

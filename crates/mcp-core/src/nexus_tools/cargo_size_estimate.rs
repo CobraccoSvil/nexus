@@ -7,7 +7,11 @@ pub struct CargoSizeEstimateTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoSizeEstimateTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let release = ctx.project_root.join("target").join("release");
         if !release.exists() {
             return Ok(json!({"ok": true, "exists": false}));
@@ -28,7 +32,10 @@ impl NexusToolHandler for CargoSizeEstimateTool {
         }
         bins.sort_by(|a, b| b.1.cmp(&a.1));
         let total: u64 = bins.iter().map(|(_, s)| s).sum();
-        let items: Vec<Value> = bins.iter().map(|(n, s)| json!({"name": n, "bytes": s, "mb": s / (1024 * 1024)})).collect();
+        let items: Vec<Value> = bins
+            .iter()
+            .map(|(n, s)| json!({"name": n, "bytes": s, "mb": s / (1024 * 1024)}))
+            .collect();
         Ok(json!({
             "ok": true,
             "exists": true,
@@ -38,5 +45,7 @@ impl NexusToolHandler for CargoSizeEstimateTool {
             "binaries": items,
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

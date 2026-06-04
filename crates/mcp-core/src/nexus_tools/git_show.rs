@@ -18,11 +18,7 @@ fn is_valid_ref(s: &str) -> bool {
 
 #[async_trait]
 impl NexusToolHandler for GitShowTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let rev = args.get("ref").and_then(Value::as_str).unwrap_or("HEAD");
         if !is_valid_ref(rev) {
             return Err(NexusToolError::BadInput(format!(
@@ -30,7 +26,10 @@ impl NexusToolHandler for GitShowTool {
                 rev
             )));
         }
-        let stats_only = args.get("stats_only").and_then(Value::as_bool).unwrap_or(false);
+        let stats_only = args
+            .get("stats_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         let fmt = "--format=%H%n%an <%ae>%n%at%n%s%n%b%n---END---";
         let mut cmd_args: Vec<&str> = vec!["show", fmt];

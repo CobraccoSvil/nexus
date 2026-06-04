@@ -14,11 +14,7 @@ pub struct CargoMetadataTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoMetadataTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let no_deps = args
             .get("no_deps")
             .and_then(Value::as_bool)

@@ -10,46 +10,52 @@
 //! - `sandbox` — configurazione sandbox del progetto
 //! - `command` — esecuzione comandi shell e test runner
 
-use std::{path::{Path, PathBuf}, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use mcp_quality;
 use mcp_db;
+use mcp_quality;
 
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::{projects::{resolve_relative_path, run_git_command}, vector_memory};
+use crate::{
+    projects::{resolve_relative_path, run_git_command},
+    vector_memory,
+};
 
-pub(crate) mod files;
-pub(crate) mod git;
-pub(crate) mod service;
-pub(crate) mod sandbox;
+pub(crate) mod archive_tools;
+pub(crate) mod attachment_inspector;
+pub(crate) mod attachment_settings;
+pub(crate) mod attachments;
 pub(crate) mod command;
 pub(crate) mod command_hints;
-pub(crate) mod shadcn_setup;
 pub(crate) mod dev_diagnostics;
-pub(crate) mod scaffold_verifier;
-pub(crate) mod project_db_query;
-pub(crate) mod testing;
-pub(crate) mod ports;
-pub(crate) mod todos;
-pub(crate) mod subagent;
-pub(crate) mod safety;
 pub(crate) mod dispatcher;
-pub(crate) mod knowledge;
-pub(crate) mod port_scanner;
-pub(crate) mod attachments;
-pub(crate) mod attachment_inspector;
-pub(crate) mod archive_tools;
 pub(crate) mod document_tools;
 pub(crate) mod figma_tools;
+pub(crate) mod files;
+pub(crate) mod git;
+pub(crate) mod knowledge;
+pub(crate) mod port_scanner;
+pub(crate) mod ports;
+pub(crate) mod project_db_query;
+pub(crate) mod rag_search;
+pub(crate) mod read_cache;
+pub(crate) mod safety;
+pub(crate) mod sandbox;
+pub(crate) mod scaffold_verifier;
+pub(crate) mod service;
+pub(crate) mod shadcn_setup;
+pub(crate) mod subagent;
+pub(crate) mod testing;
+pub(crate) mod todos;
 pub(crate) mod vision_tools;
 pub(crate) mod visual_compare;
-pub(crate) mod attachment_settings;
-pub(crate) mod read_cache;
-pub(crate) mod rag_search;
 
 // Re-export per uso interno crate (tool_run_tests è chiamato da agent_loop, in teoria).
 pub(crate) use command::tool_run_tests;
@@ -72,14 +78,14 @@ pub(super) const PROTECTED_PATTERNS: &[&str] = &[
     ".env.production",
     ".env.staging",
     ".env.development",
-    "nexus.env",          // env specifico di Nexus
-    "secrets",            // qualsiasi file con "secrets" nel nome
+    "nexus.env", // env specifico di Nexus
+    "secrets",   // qualsiasi file con "secrets" nel nome
     "credentials",
     "id_rsa",
     "id_ed25519",
     ".pem",
     ".key",
-    "Cargo.lock",         // non modificare il lockfile manualmente
+    "Cargo.lock", // non modificare il lockfile manualmente
     "pnpm-lock.yaml",
 ];
 
@@ -1621,7 +1627,11 @@ pub struct AgentToolContext {
     /// notificare i pannelli frontend in tempo reale.
     pub project_channels: nexus_events::ProjectChannels,
     /// Registro monitor in-memory (per `dispatcher_update_monitor` tool).
-    pub monitor_registry: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, serde_json::Value>>>>,
+    pub monitor_registry: std::sync::Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<Uuid, std::collections::HashMap<String, serde_json::Value>>,
+        >,
+    >,
     /// Cache port_registry (PR hardening): usata da `tool_run_service` per
     /// auto-allocare PORT nel bucket del progetto via `find_or_allocate_port`.
     pub port_registry: crate::port_registry::PortRegistryCache,
@@ -1631,8 +1641,15 @@ pub struct AgentToolContext {
 pub fn is_mutating_tool(name: &str) -> bool {
     matches!(
         name,
-        "write_file" | "edit_file" | "delete_file" | "rename_file"
-            | "git_stage" | "git_commit" | "git_push" | "git_pull" | "git_remote_add"
+        "write_file"
+            | "edit_file"
+            | "delete_file"
+            | "rename_file"
+            | "git_stage"
+            | "git_commit"
+            | "git_push"
+            | "git_pull"
+            | "git_remote_add"
     )
     // run_in_terminal è intenzionalmente NON mutante: il comando appare nel terminale
     // ma l'agente non ha visibilità dell'output, quindi non blocca la conferma.
@@ -1674,7 +1691,9 @@ pub(super) fn looks_like_long_running_command(command: &str, patterns: &[String]
             let pat_lower: Vec<String> = pat_tokens.iter().map(|t| t.to_lowercase()).collect();
             let pat_refs: Vec<&str> = pat_lower.iter().map(|s| s.as_str()).collect();
             if tokens.len() >= pat_refs.len()
-                && tokens.windows(pat_refs.len()).any(|w| w == pat_refs.as_slice())
+                && tokens
+                    .windows(pat_refs.len())
+                    .any(|w| w == pat_refs.as_slice())
             {
                 return true;
             }
@@ -1694,23 +1713,40 @@ pub(super) fn extract_file_structure(content: &str) -> Vec<(usize, String)> {
         let line = raw_line.trim();
 
         // Salta righe vuote e commenti
-        if line.is_empty() || line.starts_with("//") || line.starts_with("/*") || line.starts_with('#') {
+        if line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with("/*")
+            || line.starts_with('#')
+        {
             continue;
         }
 
         // Helper: estrai nome identificatore dopo una keyword
         let ident_after = |s: &str, kw: &str| -> Option<String> {
             let rest = s.strip_prefix(kw)?.trim_start();
-            let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-            if name.is_empty() { None } else { Some(name) }
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                None
+            } else {
+                Some(name)
+            }
         };
 
         // Normalizza spazi multipli per matching keyword composte
         let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
 
         // TypeScript/JavaScript — export function, async function, function
-        if let Some(name) = ["export async function ", "export function ", "async function ", "function "]
-            .iter().find_map(|kw| ident_after(&normalized, kw))
+        if let Some(name) = [
+            "export async function ",
+            "export function ",
+            "async function ",
+            "function ",
+        ]
+        .iter()
+        .find_map(|kw| ident_after(&normalized, kw))
         {
             entries.push((line_num, format!("fn {name}")));
             continue;
@@ -1719,7 +1755,11 @@ pub(super) fn extract_file_structure(content: &str) -> Vec<(usize, String)> {
         // TypeScript/JavaScript — export const X = (...) => / = async (
         if normalized.starts_with("export const ") || normalized.starts_with("const ") {
             // Solo se è assegnazione a funzione/arrow
-            if normalized.contains("= (") || normalized.contains("= async (") || normalized.contains(": React.") || normalized.contains("FC =") {
+            if normalized.contains("= (")
+                || normalized.contains("= async (")
+                || normalized.contains(": React.")
+                || normalized.contains("FC =")
+            {
                 if let Some(name) = ident_after(&normalized, "export const ")
                     .or_else(|| ident_after(&normalized, "const "))
                 {
@@ -1731,7 +1771,8 @@ pub(super) fn extract_file_structure(content: &str) -> Vec<(usize, String)> {
 
         // class (TS/JS/Python/C#)
         if let Some(name) = ["export default class ", "export class ", "class "]
-            .iter().find_map(|kw| ident_after(&normalized, kw))
+            .iter()
+            .find_map(|kw| ident_after(&normalized, kw))
         {
             entries.push((line_num, format!("class {name}")));
             continue;
@@ -1739,7 +1780,8 @@ pub(super) fn extract_file_structure(content: &str) -> Vec<(usize, String)> {
 
         // Rust — pub async fn, pub fn, async fn, fn
         if let Some(name) = ["pub async fn ", "pub fn ", "async fn ", "fn "]
-            .iter().find_map(|kw| ident_after(&normalized, kw))
+            .iter()
+            .find_map(|kw| ident_after(&normalized, kw))
         {
             entries.push((line_num, format!("fn {name}")));
             continue;
@@ -1750,24 +1792,39 @@ pub(super) fn extract_file_structure(content: &str) -> Vec<(usize, String)> {
             entries.push((line_num, format!("impl {name}")));
             continue;
         }
-        if let Some(name) = ["pub struct ", "struct "].iter().find_map(|kw| ident_after(&normalized, kw)) {
+        if let Some(name) = ["pub struct ", "struct "]
+            .iter()
+            .find_map(|kw| ident_after(&normalized, kw))
+        {
             entries.push((line_num, format!("struct {name}")));
             continue;
         }
-        if let Some(name) = ["pub enum ", "enum "].iter().find_map(|kw| ident_after(&normalized, kw)) {
+        if let Some(name) = ["pub enum ", "enum "]
+            .iter()
+            .find_map(|kw| ident_after(&normalized, kw))
+        {
             entries.push((line_num, format!("enum {name}")));
             continue;
         }
 
         // Python — def, async def
-        if let Some(name) = ["async def ", "def "].iter().find_map(|kw| ident_after(&normalized, kw)) {
+        if let Some(name) = ["async def ", "def "]
+            .iter()
+            .find_map(|kw| ident_after(&normalized, kw))
+        {
             entries.push((line_num, format!("def {name}")));
             continue;
         }
 
         // C# — public/private/protected method or class
-        if normalized.starts_with("public ") || normalized.starts_with("private ") || normalized.starts_with("protected ") {
-            if normalized.contains(" class ") || normalized.contains(" interface ") || normalized.contains(" enum ") {
+        if normalized.starts_with("public ")
+            || normalized.starts_with("private ")
+            || normalized.starts_with("protected ")
+        {
+            if normalized.contains(" class ")
+                || normalized.contains(" interface ")
+                || normalized.contains(" enum ")
+            {
                 let short: String = normalized.chars().take(60).collect();
                 entries.push((line_num, format!("class {short}")));
                 continue;
@@ -1806,7 +1863,9 @@ pub(super) fn format_process_output(info: &crate::agent_processes::ProcessOutput
     let mut msg = format!(
         "Processo: {} (pid: {}, status: {}",
         info.command,
-        info.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+        info.pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "?".into()),
         info.status,
     );
     if let Some(code) = info.exit_code {
@@ -1830,13 +1889,17 @@ pub(super) fn classify_command_error(exit_code: i32, stderr: &str, stdout: &str)
     let err = stderr.to_lowercase();
     let out = stdout.to_lowercase();
     let combined = format!("{err} {out}");
-    if exit_code == 127 || combined.contains("command not found") || combined.contains("not found") {
+    if exit_code == 127 || combined.contains("command not found") || combined.contains("not found")
+    {
         return "comando non trovato — verifica il nome esatto o installa il pacchetto mancante con run_command(\"sudo apt-get install -y <pacchetto>\")";
     }
     if combined.contains("permission denied") || combined.contains("operation not permitted") {
         return "permesso negato — prova ad aggiungere `sudo` oppure verifica i permessi del file con run_command(\"ls -la <percorso>\")";
     }
-    if combined.contains("no such file") || combined.contains("cannot find") || combined.contains("no existe") {
+    if combined.contains("no such file")
+        || combined.contains("cannot find")
+        || combined.contains("no existe")
+    {
         return "file o directory non trovata — verifica il percorso con list_files o run_command(\"ls <directory>\")";
     }
     if combined.contains("already installed") || combined.contains("is already") {
@@ -1906,31 +1969,72 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "build_project_image" => service::tool_build_project_image(ctx).await,
         "scan_code_quality" => tool_scan_code_quality(ctx, input).await,
         "search_codebase_semantic" => {
-            let query = input.get("query").and_then(Value::as_str).unwrap_or("").to_string();
-            let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(8).min(20) as usize;
+            let query = input
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let limit = input
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(8)
+                .min(20) as usize;
             tool_search_codebase_semantic(ctx, &query, limit).await
         }
         "search_file_semantic" => {
-            let path = input.get("path").and_then(Value::as_str).unwrap_or("").to_string();
-            let query = input.get("query").and_then(Value::as_str).unwrap_or("").to_string();
-            let top_k = input.get("top_k").and_then(Value::as_u64).unwrap_or(5).min(10) as usize;
-            let chunk_lines = input.get("chunk_lines").and_then(Value::as_u64).unwrap_or(50).max(10).min(200) as usize;
+            let path = input
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let query = input
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let top_k = input
+                .get("top_k")
+                .and_then(Value::as_u64)
+                .unwrap_or(5)
+                .min(10) as usize;
+            let chunk_lines = input
+                .get("chunk_lines")
+                .and_then(Value::as_u64)
+                .unwrap_or(50)
+                .max(10)
+                .min(200) as usize;
             tool_search_file_semantic(ctx, &path, &query, top_k, chunk_lines).await
         }
         "recall_context" => {
-            let query = input.get("query").and_then(Value::as_str).unwrap_or("").to_string();
-            let source = input.get("source").and_then(Value::as_str).unwrap_or("all").to_string();
-            let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(5).min(10) as usize;
+            let query = input
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let source = input
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or("all")
+                .to_string();
+            let limit = input
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(5)
+                .min(10) as usize;
             tool_recall_context(ctx, &query, &source, limit).await
         }
         "run_playwright_tests" => testing::tool_run_playwright_tests(ctx, input).await,
         "batch_analyze_code" => tool_batch_analyze_code(ctx, input).await,
         // ── Dispatcher centrale (pilotaggio pannelli) ──────────────────────
         "dispatcher_emit_event" => dispatcher::tool_dispatcher_emit_event(ctx, input).await,
-        "dispatcher_post_notification" => dispatcher::tool_dispatcher_post_notification(ctx, input).await,
+        "dispatcher_post_notification" => {
+            dispatcher::tool_dispatcher_post_notification(ctx, input).await
+        }
         "dispatcher_set_flag" => dispatcher::tool_dispatcher_set_flag(ctx, input).await,
         "dispatcher_update_monitor" => dispatcher::tool_dispatcher_update_monitor(ctx, input).await,
-        "dispatcher_highlight_panel" => dispatcher::tool_dispatcher_highlight_panel(ctx, input).await,
+        "dispatcher_highlight_panel" => {
+            dispatcher::tool_dispatcher_highlight_panel(ctx, input).await
+        }
         // ── Knowledge Base per-progetto ────────────────────────────────────
         "knowledge_search" => knowledge::tool_knowledge_search(ctx, input).await,
         "code_doc" => knowledge::tool_code_doc(ctx, input).await,
@@ -1947,17 +2051,31 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "nexus_list_attachments" => attachments::tool_nexus_list_attachments(ctx, input).await,
         "nexus_read_attachment" => attachments::tool_nexus_read_attachment(ctx, input).await,
         // ── Ingestion intelligente allegati (ADR 0011) ─────────────────────
-        "nexus_inspect_attachment" => attachment_inspector::tool_nexus_inspect_attachment(ctx, input).await,
-        "nexus_list_archive_entries" => archive_tools::tool_nexus_list_archive_entries(ctx, input).await,
-        "nexus_read_archive_entry" => archive_tools::tool_nexus_read_archive_entry(ctx, input).await,
+        "nexus_inspect_attachment" => {
+            attachment_inspector::tool_nexus_inspect_attachment(ctx, input).await
+        }
+        "nexus_list_archive_entries" => {
+            archive_tools::tool_nexus_list_archive_entries(ctx, input).await
+        }
+        "nexus_read_archive_entry" => {
+            archive_tools::tool_nexus_read_archive_entry(ctx, input).await
+        }
         "nexus_extract_pdf_text" => document_tools::tool_nexus_extract_pdf_text(ctx, input).await,
         "nexus_extract_docx_text" => document_tools::tool_nexus_extract_docx_text(ctx, input).await,
         "nexus_extract_xlsx_data" => document_tools::tool_nexus_extract_xlsx_data(ctx, input).await,
-        "nexus_extract_figma_structure" => figma_tools::tool_nexus_extract_figma_structure(ctx, input).await,
+        "nexus_extract_figma_structure" => {
+            figma_tools::tool_nexus_extract_figma_structure(ctx, input).await
+        }
         "nexus_extract_figma_code" => figma_tools::tool_nexus_extract_figma_code(ctx, input).await,
-        "nexus_describe_image_attachment" => vision_tools::tool_nexus_describe_image_attachment(ctx, input).await,
-        "nexus_install_shadcn_components" => shadcn_setup::tool_nexus_install_shadcn_components(ctx, input).await,
-        "nexus_dev_server_diagnose" => dev_diagnostics::tool_nexus_dev_server_diagnose(ctx, input).await,
+        "nexus_describe_image_attachment" => {
+            vision_tools::tool_nexus_describe_image_attachment(ctx, input).await
+        }
+        "nexus_install_shadcn_components" => {
+            shadcn_setup::tool_nexus_install_shadcn_components(ctx, input).await
+        }
+        "nexus_dev_server_diagnose" => {
+            dev_diagnostics::tool_nexus_dev_server_diagnose(ctx, input).await
+        }
         "nexus_verify_scaffold" => scaffold_verifier::tool_nexus_verify_scaffold(ctx, input).await,
         "nexus_db_query" => project_db_query::tool_nexus_db_query(ctx, input).await,
         "nexus_db_tables" => project_db_query::tool_nexus_db_tables(ctx, input).await,
@@ -2076,47 +2194,67 @@ async fn tool_create_profile(ctx: &AgentToolContext, input: &Value) -> String {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => return "[Errore: parametro 'system_prompt' obbligatorio]".to_string(),
     };
-    let emoji = input.get("emoji").and_then(Value::as_str).unwrap_or("🤖").trim().to_string();
-    let description: Option<String> = input.get("description").and_then(Value::as_str)
-        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let default_provider: Option<String> = input.get("default_provider").and_then(Value::as_str)
-        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let default_model: Option<String> = input.get("default_model").and_then(Value::as_str)
-        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let default_automation: Option<String> = input.get("default_automation").and_then(Value::as_str)
-        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let set_as_default = input.get("set_as_default").and_then(Value::as_bool).unwrap_or(false);
+    let emoji = input
+        .get("emoji")
+        .and_then(Value::as_str)
+        .unwrap_or("🤖")
+        .trim()
+        .to_string();
+    let description: Option<String> = input
+        .get("description")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let default_provider: Option<String> = input
+        .get("default_provider")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let default_model: Option<String> = input
+        .get("default_model")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let default_automation: Option<String> = input
+        .get("default_automation")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let set_as_default = input
+        .get("set_as_default")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     // Controlla se esiste già un profilo con lo stesso nome per l'utente
-    let existing: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM user_profiles WHERE user_id = $1 AND name = $2"
-    )
-    .bind(ctx.user_id)
-    .bind(&name)
-    .fetch_optional(&*ctx.db)
-    .await
-    .unwrap_or(None);
+    let existing: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM user_profiles WHERE user_id = $1 AND name = $2")
+            .bind(ctx.user_id)
+            .bind(&name)
+            .fetch_optional(&*ctx.db)
+            .await
+            .unwrap_or(None);
 
     if existing.is_some() {
-        return format!("[Profilo '{}' già esistente. Usa update_profile per modificarlo.]", name);
+        return format!(
+            "[Profilo '{}' già esistente. Usa update_profile per modificarlo.]",
+            name
+        );
     }
 
     let profile_id = Uuid::new_v4();
 
     // Se set_as_default, azzera is_default sugli altri
     if set_as_default {
-        let _ = sqlx::query(
-            "UPDATE user_profiles SET is_default = FALSE WHERE user_id = $1"
-        )
-        .bind(ctx.user_id)
-        .execute(&*ctx.db)
-        .await;
+        let _ = sqlx::query("UPDATE user_profiles SET is_default = FALSE WHERE user_id = $1")
+            .bind(ctx.user_id)
+            .execute(&*ctx.db)
+            .await;
     }
 
     let res = sqlx::query(
         "INSERT INTO user_profiles (id, user_id, name, avatar_emoji, description, system_prompt, \
          default_provider, default_model, default_automation, is_default, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())"
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())",
     )
     .bind(profile_id)
     .bind(ctx.user_id)
@@ -2159,17 +2297,31 @@ async fn tool_update_profile(ctx: &AgentToolContext, input: &Value) -> String {
 
     let (profile_id, current_prompt, current_emoji) = match row {
         Some(r) => r,
-        None => return format!("[Profilo '{}' non trovato. Usa create_profile per crearlo.]", profile_name),
+        None => {
+            return format!(
+                "[Profilo '{}' non trovato. Usa create_profile per crearlo.]",
+                profile_name
+            )
+        }
     };
 
-    let system_prompt = input.get("system_prompt").and_then(Value::as_str)
-        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    let system_prompt = input
+        .get("system_prompt")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .unwrap_or(current_prompt);
-    let emoji = input.get("emoji").and_then(Value::as_str)
-        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    let emoji = input
+        .get("emoji")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .unwrap_or(current_emoji);
-    let description: Option<String> = input.get("description").and_then(Value::as_str)
-        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let description: Option<String> = input
+        .get("description")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     let res = sqlx::query(
         "UPDATE user_profiles SET system_prompt = $1, avatar_emoji = $2, description = COALESCE($3, description), updated_at = NOW() \
@@ -2190,7 +2342,10 @@ async fn tool_update_profile(ctx: &AgentToolContext, input: &Value) -> String {
 
 async fn tool_scan_code_quality(ctx: &AgentToolContext, input: &Value) -> String {
     let file_path = input.get("file_path").and_then(Value::as_str);
-    let severity_filter = input.get("severity_filter").and_then(Value::as_str).unwrap_or("all");
+    let severity_filter = input
+        .get("severity_filter")
+        .and_then(Value::as_str)
+        .unwrap_or("all");
 
     if let Some(rel_path) = file_path {
         // Single file analysis
@@ -2202,8 +2357,18 @@ async fn tool_scan_code_quality(ctx: &AgentToolContext, input: &Value) -> String
 
         if rel_path.ends_with(".sql") {
             let db_report = mcp_db::analyze_query(&content);
-            let findings: Vec<String> = db_report.findings.iter()
-                .map(|f| format!("[{}][{}] {} -- {}", f.severity.to_uppercase(), f.category, f.title, f.detail))
+            let findings: Vec<String> = db_report
+                .findings
+                .iter()
+                .map(|f| {
+                    format!(
+                        "[{}][{}] {} -- {}",
+                        f.severity.to_uppercase(),
+                        f.category,
+                        f.title,
+                        f.detail
+                    )
+                })
                 .collect();
             if findings.is_empty() {
                 return format!("Nessun problema trovato in `{}`", rel_path);
@@ -2213,7 +2378,9 @@ async fn tool_scan_code_quality(ctx: &AgentToolContext, input: &Value) -> String
 
         let report = mcp_quality::analyze_source(rel_path, &content);
 
-        let filtered: Vec<_> = report.findings.iter()
+        let filtered: Vec<_> = report
+            .findings
+            .iter()
             .filter(|f| match severity_filter {
                 "high" => f.severity == "high",
                 "medium" => f.severity == "high" || f.severity == "medium",
@@ -2222,13 +2389,26 @@ async fn tool_scan_code_quality(ctx: &AgentToolContext, input: &Value) -> String
             .collect();
 
         if filtered.is_empty() {
-            return format!("Nessun problema trovato in `{}` (filtro: {})", rel_path, severity_filter);
+            return format!(
+                "Nessun problema trovato in `{}` (filtro: {})",
+                rel_path, severity_filter
+            );
         }
 
-        let lines: Vec<String> = filtered.iter().map(|f| {
-            let loc = f.line.map(|l| format!(":{}", l)).unwrap_or_default();
-            format!("[{}][{}] {}{} -- {}", f.severity.to_uppercase(), f.category, rel_path, loc, f.title)
-        }).collect();
+        let lines: Vec<String> = filtered
+            .iter()
+            .map(|f| {
+                let loc = f.line.map(|l| format!(":{}", l)).unwrap_or_default();
+                format!(
+                    "[{}][{}] {}{} -- {}",
+                    f.severity.to_uppercase(),
+                    f.category,
+                    rel_path,
+                    loc,
+                    f.title
+                )
+            })
+            .collect();
 
         format!("Analisi `{}`:\n{}\n\nMetriche: {} righe totali, complessità max: {}, lunghezza media funzioni: {:.0}",
             rel_path, lines.join("\n"),
@@ -2239,7 +2419,7 @@ async fn tool_scan_code_quality(ctx: &AgentToolContext, input: &Value) -> String
             "SELECT file_path, category, severity, title, line_number \
              FROM project_quality_findings WHERE project_id = $1 AND fixed_at IS NULL \
              ORDER BY CASE severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END \
-             LIMIT 30"
+             LIMIT 30",
         )
         .bind(ctx.project_id)
         .fetch_all(&*ctx.db)
@@ -2293,31 +2473,51 @@ async fn tool_search_codebase_semantic(
         Err(e) => return format!("Errore embedding: {e}"),
     };
     // Cerca in Qdrant
-    let hits = match vector_memory::search_code_index(&ctx.db, &embedding, ctx.project_id, limit).await {
-        Ok(h) => h,
-        Err(e) => return format!("Errore ricerca: {e}"),
-    };
+    let hits =
+        match vector_memory::search_code_index(&ctx.db, &embedding, ctx.project_id, limit).await {
+            Ok(h) => h,
+            Err(e) => return format!("Errore ricerca: {e}"),
+        };
     if hits.is_empty() {
         return "Nessun risultato trovato. Il codebase potrebbe non essere ancora indicizzato — prova ad analizzare il progetto prima.".to_string();
     }
     // Formatta risultati
-    let results: Vec<String> = hits.iter().enumerate().map(|(i, hit)| {
-        let file = hit.payload.get("file_path").and_then(Value::as_str).unwrap_or("?");
-        let chunk = hit.payload.get("chunk_index").and_then(Value::as_u64).unwrap_or(0);
-        let labels = hit.payload.get("ui_labels")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
-            .unwrap_or_default();
-        let score = (hit.score * 100.0).round() as u64;
-        let mut parts = vec![format!("{}. {} (score: {}%)", i + 1, file, score)];
-        if !labels.is_empty() {
-            parts.push(format!("   Label UI: {labels}"));
-        }
-        if chunk > 0 {
-            parts.push(format!("   Chunk: {chunk}"));
-        }
-        parts.join("\n")
-    }).collect();
+    let results: Vec<String> = hits
+        .iter()
+        .enumerate()
+        .map(|(i, hit)| {
+            let file = hit
+                .payload
+                .get("file_path")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let chunk = hit
+                .payload
+                .get("chunk_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let labels = hit
+                .payload
+                .get("ui_labels")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let score = (hit.score * 100.0).round() as u64;
+            let mut parts = vec![format!("{}. {} (score: {}%)", i + 1, file, score)];
+            if !labels.is_empty() {
+                parts.push(format!("   Label UI: {labels}"));
+            }
+            if chunk > 0 {
+                parts.push(format!("   Chunk: {chunk}"));
+            }
+            parts.join("\n")
+        })
+        .collect();
     format!("Risultati per '{query}':\n\n{}", results.join("\n\n"))
 }
 
@@ -2351,21 +2551,39 @@ async fn tool_recall_context(
     if search_conversation {
         if let Some(sid) = ctx.session_id {
             match vector_memory::search_conversation_context(
-                &ctx.db, &embedding, sid, limit as u64, 0.55,
-            ).await {
+                &ctx.db,
+                &embedding,
+                sid,
+                limit as u64,
+                0.55,
+            )
+            .await
+            {
                 Ok(hits) if !hits.is_empty() => {
                     let mut conv_results: Vec<String> = Vec::new();
                     for (i, hit) in hits.iter().enumerate() {
-                        let role = hit.payload.get("role").and_then(Value::as_str).unwrap_or("?");
-                        let preview = hit.payload.get("text_preview")
+                        let role = hit
+                            .payload
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?");
+                        let preview = hit
+                            .payload
+                            .get("text_preview")
                             .and_then(Value::as_str)
                             .or_else(|| hit.payload.get("content").and_then(Value::as_str))
                             .unwrap_or("");
                         let score = (hit.score * 100.0).round() as u64;
                         conv_results.push(format!(
                             "{}. [{}] (pertinenza: {}%)\n{}",
-                            i + 1, role, score,
-                            if preview.len() > 1500 { &preview[..1500] } else { preview }
+                            i + 1,
+                            role,
+                            score,
+                            if preview.len() > 1500 {
+                                &preview[..1500]
+                            } else {
+                                preview
+                            }
                         ));
                     }
                     sections.push(format!(
@@ -2383,20 +2601,38 @@ async fn tool_recall_context(
 
     if search_project {
         match vector_memory::search_project_context_points(
-            &ctx.db, &embedding, ctx.project_id, limit as u64, 0.60,
-        ).await {
+            &ctx.db,
+            &embedding,
+            ctx.project_id,
+            limit as u64,
+            0.60,
+        )
+        .await
+        {
             Ok(hits) if !hits.is_empty() => {
                 let mut proj_results: Vec<String> = Vec::new();
                 for (i, hit) in hits.iter().enumerate() {
-                    let title = hit.payload.get("section_title")
-                        .and_then(Value::as_str).unwrap_or("Contesto progetto");
-                    let preview = hit.payload.get("text_preview")
-                        .and_then(Value::as_str).unwrap_or("");
+                    let title = hit
+                        .payload
+                        .get("section_title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Contesto progetto");
+                    let preview = hit
+                        .payload
+                        .get("text_preview")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     let score = (hit.score * 100.0).round() as u64;
                     proj_results.push(format!(
                         "{}. {} (pertinenza: {}%)\n{}",
-                        i + 1, title, score,
-                        if preview.len() > 1500 { &preview[..1500] } else { preview }
+                        i + 1,
+                        title,
+                        score,
+                        if preview.len() > 1500 {
+                            &preview[..1500]
+                        } else {
+                            preview
+                        }
                     ));
                 }
                 sections.push(format!(
@@ -2418,7 +2654,10 @@ async fn tool_recall_context(
         );
     }
 
-    format!("Contesto recuperato per '{query}':\n\n{}", sections.join("\n\n"))
+    format!(
+        "Contesto recuperato per '{query}':\n\n{}",
+        sections.join("\n\n")
+    )
 }
 
 /// Ricerca semantica TF-IDF in-process all'interno di un singolo file.
@@ -2444,7 +2683,12 @@ async fn tool_search_file_semantic(
     } else {
         match resolve_relative_path(&ctx.root_path, path_str) {
             Ok(p) => p,
-            Err(e) => return format!("[Errore percorso: {}]", e.1["error"].as_str().unwrap_or("path error")),
+            Err(e) => {
+                return format!(
+                    "[Errore percorso: {}]",
+                    e.1["error"].as_str().unwrap_or("path error")
+                )
+            }
         }
     };
 
@@ -2506,7 +2750,10 @@ async fn tool_search_file_semantic(
             let count = chunk_lower.matches(token.as_str()).count() as f32;
             if count > 0.0 {
                 // TF puro, log-normalizzato per ridurre l'influenza di token ripetuti
-                raw_score += (1.0 + count.ln()) * (total_lines as f32 / (chunks.len() + 1).max(1) as f32).ln().max(1.0);
+                raw_score += (1.0 + count.ln())
+                    * (total_lines as f32 / (chunks.len() + 1).max(1) as f32)
+                        .ln()
+                        .max(1.0);
             }
         }
 
@@ -2528,11 +2775,18 @@ async fn tool_search_file_semantic(
     }
 
     if chunks.is_empty() {
-        return format!("File '{}' ({} righe): nessun chunk prodotto.", path_str, total_lines);
+        return format!(
+            "File '{}' ({} righe): nessun chunk prodotto.",
+            path_str, total_lines
+        );
     }
 
     // Ordina per score decrescente
-    chunks.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    chunks.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Deduplica: salta chunk il cui range sovrappone un chunk già selezionato
     let mut selected: Vec<&ScoredChunk> = Vec::new();
@@ -2542,7 +2796,8 @@ async fn tool_search_file_semantic(
             let overlap_end = chunk.end_line.min(sel.end_line);
             if overlap_start <= overlap_end {
                 let overlap_len = overlap_end - overlap_start + 1;
-                let min_len = (chunk.end_line - chunk.start_line + 1).min(sel.end_line - sel.start_line + 1);
+                let min_len =
+                    (chunk.end_line - chunk.start_line + 1).min(sel.end_line - sel.start_line + 1);
                 if overlap_len * 2 > min_len {
                     continue 'outer; // sovrappone troppo: salta
                 }
@@ -2559,7 +2814,10 @@ async fn tool_search_file_semantic(
 
     let header = format!(
         "File: {} ({} righe totali) — {} sezioni rilevanti per '{}'\n",
-        path_str, total_lines, selected.len(), query
+        path_str,
+        total_lines,
+        selected.len(),
+        query
     );
 
     let sections: Vec<String> = selected
@@ -2576,7 +2834,10 @@ async fn tool_search_file_semantic(
 }
 
 async fn tool_batch_analyze_code(ctx: &AgentToolContext, input: &Value) -> String {
-    let task = input.get("task").and_then(Value::as_str).unwrap_or("analyze");
+    let task = input
+        .get("task")
+        .and_then(Value::as_str)
+        .unwrap_or("analyze");
     let files_arr = match input.get("files").and_then(Value::as_array) {
         Some(a) => a.clone(),
         None => return "[batch_analyze_code] Campo 'files' mancante o non è un array".to_string(),
@@ -2601,7 +2862,11 @@ async fn tool_batch_analyze_code(ctx: &AgentToolContext, input: &Value) -> Strin
             Some(p) => p.to_string(),
             None => continue,
         };
-        let content = if let Some(c) = file_obj.get("content").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        let content = if let Some(c) = file_obj
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
             c.to_string()
         } else {
             // Leggi il file dalla root del progetto
@@ -2609,7 +2874,11 @@ async fn tool_batch_analyze_code(ctx: &AgentToolContext, input: &Value) -> Strin
             match tokio::fs::read_to_string(&abs_path).await {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!("batch_analyze_code: impossibile leggere {}: {}", path_str, e);
+                    tracing::warn!(
+                        "batch_analyze_code: impossibile leggere {}: {}",
+                        path_str,
+                        e
+                    );
                     format!("[Errore lettura file: {e}]")
                 }
             }
@@ -2625,8 +2894,8 @@ async fn tool_batch_analyze_code(ctx: &AgentToolContext, input: &Value) -> Strin
         return "[batch_analyze_code] Nessun file valido trovato".to_string();
     }
 
-    let brain_http_url = std::env::var("BRAIN_HTTP_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+    let brain_http_url =
+        std::env::var("BRAIN_HTTP_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
     let client = reqwest::Client::new();
 
     // Sottomette il batch
@@ -2667,12 +2936,18 @@ async fn tool_batch_analyze_code(ctx: &AgentToolContext, input: &Value) -> Strin
             Ok(v) => v,
             Err(_) => continue,
         };
-        let processing_status = status_json.get("status").and_then(Value::as_str).unwrap_or("");
+        let processing_status = status_json
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if processing_status == "ended" {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
-            return format!("[batch_analyze_code] Timeout: il batch {} non ha terminato in 10 minuti", batch_id);
+            return format!(
+                "[batch_analyze_code] Timeout: il batch {} non ha terminato in 10 minuti",
+                batch_id
+            );
         }
     }
 
@@ -2695,7 +2970,10 @@ async fn tool_batch_analyze_code(ctx: &AgentToolContext, input: &Value) -> Strin
     for (i, file_obj) in files_arr.iter().enumerate() {
         let path_str = file_obj.get("path").and_then(Value::as_str).unwrap_or("?");
         let custom_id = format!("file-{i}");
-        if let Some(result) = results.iter().find(|r| r.get("custom_id").and_then(Value::as_str) == Some(&custom_id)) {
+        if let Some(result) = results
+            .iter()
+            .find(|r| r.get("custom_id").and_then(Value::as_str) == Some(&custom_id))
+        {
             if let Some(content) = result.get("content").and_then(Value::as_str) {
                 output_parts.push(format!("### {path_str}\n\n{content}"));
             } else if let Some(err) = result.get("error").and_then(Value::as_str) {
@@ -2707,6 +2985,10 @@ async fn tool_batch_analyze_code(ctx: &AgentToolContext, input: &Value) -> Strin
     if output_parts.is_empty() {
         format!("[batch_analyze_code] Nessun risultato per il batch {batch_id}")
     } else {
-        format!("## Analisi batch ({task}) — {} file\n\n{}", output_parts.len(), output_parts.join("\n\n---\n\n"))
+        format!(
+            "## Analisi batch ({task}) — {} file\n\n{}",
+            output_parts.len(),
+            output_parts.join("\n\n---\n\n")
+        )
     }
 }

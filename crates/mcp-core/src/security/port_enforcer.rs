@@ -38,19 +38,22 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// in /proc o query DB lente.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub async fn port_enforcer_loop(
-    db: PgPool,
-    project_channels: nexus_events::ProjectChannels,
-) {
+pub async fn port_enforcer_loop(db: PgPool, project_channels: nexus_events::ProjectChannels) {
     let mut ticker = tokio::time::interval(SCAN_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    tracing::info!("port_enforcer avviato (scan ogni {}s)", SCAN_INTERVAL.as_secs());
+    tracing::info!(
+        "port_enforcer avviato (scan ogni {}s)",
+        SCAN_INTERVAL.as_secs()
+    );
     loop {
         ticker.tick().await;
         match tokio::time::timeout(SCAN_TIMEOUT, scan_and_enforce(&db, &project_channels)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!("port_enforcer scan fallito: {e}"),
-            Err(_) => tracing::error!("port_enforcer scan timeout ({}s): iterazione abortita", SCAN_TIMEOUT.as_secs()),
+            Err(_) => tracing::error!(
+                "port_enforcer scan timeout ({}s): iterazione abortita",
+                SCAN_TIMEOUT.as_secs()
+            ),
         }
     }
 }

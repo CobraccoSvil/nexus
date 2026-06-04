@@ -344,9 +344,12 @@ pub async fn update_plugin(
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let mcp_server_id: Uuid = existing
-        .try_get("mcp_server_id")
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Plugin senza adapter MCP collegato"))?;
+    let mcp_server_id: Uuid = existing.try_get("mcp_server_id").map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "Plugin senza adapter MCP collegato",
+        )
+    })?;
     sqlx::query(
         r#"
         UPDATE mcp_servers
@@ -372,10 +375,7 @@ pub async fn update_plugin(
         existing.try_get("project_id").unwrap_or(None),
         "update",
         "ok",
-        Some(format!(
-            "Plugin aggiornato alla versione {}",
-            body.version
-        )),
+        Some(format!("Plugin aggiornato alla versione {}", body.version)),
         json!({ "version": body.version }),
     )
     .await;
@@ -522,14 +522,20 @@ pub async fn toggle_plugin(
     .await;
 
     let project_id: Option<Uuid> = existing.try_get("project_id").unwrap_or(None);
-    let slug: String = existing.try_get("slug").unwrap_or_else(|_| "unknown".into());
+    let slug: String = existing
+        .try_get("slug")
+        .unwrap_or_else(|_| "unknown".into());
     if let Some(pid) = project_id {
         nexus_events::dispatcher::emit_global(
             pid,
             nexus_events::ProjectEvent::PluginChanged {
                 plugin_id: plugin_instance_id.to_string(),
                 slug,
-                action: if body.enabled { "enabled".to_string() } else { "disabled".to_string() },
+                action: if body.enabled {
+                    "enabled".to_string()
+                } else {
+                    "disabled".to_string()
+                },
             },
         );
     }
@@ -609,14 +615,18 @@ pub async fn migrate_legacy_mcp_server(
     let url: Option<String> = row.try_get("url").unwrap_or(None);
     let command: Option<String> = row.try_get("command").unwrap_or(None);
     let args: Value = row.try_get("args").unwrap_or(json!([]));
-    let catalog_slug =
-        detect_legacy_catalog_slug(&transport, url.as_deref(), command.as_deref(), &args)
-            .ok_or_else(|| {
-                api_error(
-                    StatusCode::BAD_REQUEST,
-                    "Questo MCP legacy non e' mappabile automaticamente a un plugin del catalogo curato",
-                )
-            })?;
+    let catalog_slug = detect_legacy_catalog_slug(
+        &transport,
+        url.as_deref(),
+        command.as_deref(),
+        &args,
+    )
+    .ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "Questo MCP legacy non e' mappabile automaticamente a un plugin del catalogo curato",
+        )
+    })?;
 
     let catalog = get_catalog_by_install_request(
         &state.db,
@@ -644,14 +654,13 @@ pub async fn migrate_legacy_mcp_server(
         // Se quell'istanza ha già un adapter mcp_servers collegato, NON possiamo collegarne un secondo
         // (vincolo UNIQUE su mcp_servers.plugin_instance_id). In quel caso, rendiamo la migrazione idempotente:
         // ritorniamo l'istanza esistente e puliamo il legacy server duplicato.
-        let existing_adapter = sqlx::query(
-            "SELECT id FROM mcp_servers WHERE plugin_instance_id = $1 LIMIT 1",
-        )
-        .bind(existing_id)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten();
+        let existing_adapter =
+            sqlx::query("SELECT id FROM mcp_servers WHERE plugin_instance_id = $1 LIMIT 1")
+                .bind(existing_id)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
 
         if existing_adapter.is_some() {
             // Il plugin è già operativo con un adapter: rimuovi il duplicato legacy per evitare confusione in UI.
@@ -713,9 +722,7 @@ pub async fn migrate_legacy_mcp_server(
         "envVars": env_vars,
         "headers": headers,
     });
-    let name: String = row
-        .try_get("name")
-        .unwrap_or_else(|_| catalog.name.clone());
+    let name: String = row.try_get("name").unwrap_or_else(|_| catalog.name.clone());
 
     let plugin_row = sqlx::query(
         r#"

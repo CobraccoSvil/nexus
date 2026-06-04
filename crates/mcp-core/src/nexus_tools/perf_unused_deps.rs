@@ -26,12 +26,16 @@ fn extract_deps(toml: &str) -> Vec<String> {
 }
 
 fn slurp(dir: &Path, depth: usize, into: &mut String) {
-    if depth > 8 { return; }
+    if depth > 8 {
+        return;
+    }
     if let Ok(rd) = std::fs::read_dir(dir) {
         for entry in rd.flatten() {
             let p = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == "target" || name.starts_with('.') { continue; }
+            if name == "target" || name.starts_with('.') {
+                continue;
+            }
             if p.is_dir() {
                 slurp(&p, depth + 1, into);
             } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
@@ -46,7 +50,11 @@ fn slurp(dir: &Path, depth: usize, into: &mut String) {
 
 #[async_trait]
 impl NexusToolHandler for PerfUnusedDepsTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let cargo = ctx.project_root.join("Cargo.toml");
         if !cargo.is_file() {
             return Ok(json!({"ok": false, "error": "Cargo.toml not found"}));
@@ -55,16 +63,25 @@ impl NexusToolHandler for PerfUnusedDepsTool {
         let deps = extract_deps(&toml);
         let mut buf = String::with_capacity(64 * 1024);
         let src = ctx.project_root.join("src");
-        if src.is_dir() { slurp(&src, 0, &mut buf); }
+        if src.is_dir() {
+            slurp(&src, 0, &mut buf);
+        }
         let crates = ctx.project_root.join("crates");
-        if crates.is_dir() { slurp(&crates, 0, &mut buf); }
-        let unused: Vec<String> = deps.into_iter()
+        if crates.is_dir() {
+            slurp(&crates, 0, &mut buf);
+        }
+        let unused: Vec<String> = deps
+            .into_iter()
             .filter(|d| {
                 let token = d.replace('-', "_");
                 !buf.contains(&token)
             })
             .collect();
-        Ok(json!({"ok": true, "candidate_unused": unused, "count": unused.len(), "note": "heuristic only"}))
+        Ok(
+            json!({"ok": true, "candidate_unused": unused, "count": unused.len(), "note": "heuristic only"}),
+        )
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

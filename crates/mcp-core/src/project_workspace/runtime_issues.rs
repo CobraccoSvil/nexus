@@ -95,11 +95,17 @@ pub async fn create_runtime_issue(
         .get("message")
         .and_then(Value::as_str)
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'message' obbligatorio"))?;
-    let severity = body.get("severity").and_then(Value::as_str).unwrap_or("error");
+    let severity = body
+        .get("severity")
+        .and_then(Value::as_str)
+        .unwrap_or("error");
     let details = body.get("details").and_then(Value::as_str);
     let tool_name = body.get("tool_name").and_then(Value::as_str);
     let command = body.get("command").and_then(Value::as_str);
-    let exit_code = body.get("exit_code").and_then(Value::as_i64).map(|i| i as i32);
+    let exit_code = body
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .map(|i| i as i32);
 
     // Fingerprint per dedup: sha1(message + command)
     let fingerprint = {

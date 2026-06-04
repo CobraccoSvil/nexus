@@ -9,7 +9,8 @@ use super::*;
 
 pub(super) fn parse_uuid(args: &Value, field: &str) -> Result<Uuid, String> {
     let s = args.get(field).and_then(Value::as_str).unwrap_or("");
-    Uuid::parse_str(s).map_err(|_| format!("[Errore] Parametro '{}' deve essere un UUID valido", field))
+    Uuid::parse_str(s)
+        .map_err(|_| format!("[Errore] Parametro '{}' deve essere un UUID valido", field))
 }
 
 pub(super) fn format_json(v: &Value) -> String {
@@ -42,14 +43,19 @@ pub(super) async fn handle_prompt_template_list(db: &PgPool, args: &Value) -> St
 
     match result {
         Ok(rows) => {
-            let templates: Vec<Value> = rows.iter().map(|r| json!({
-                "key": r.try_get::<String, _>("key").unwrap_or_default(),
-                "category": r.try_get::<String, _>("category").unwrap_or_default(),
-                "title": r.try_get::<String, _>("title").unwrap_or_default(),
-                "isActive": r.try_get::<bool, _>("is_active").unwrap_or(true),
-                "version": r.try_get::<i32, _>("version").unwrap_or(1),
-                "updatedBy": r.try_get::<String, _>("updated_by").unwrap_or_default(),
-            })).collect();
+            let templates: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "key": r.try_get::<String, _>("key").unwrap_or_default(),
+                        "category": r.try_get::<String, _>("category").unwrap_or_default(),
+                        "title": r.try_get::<String, _>("title").unwrap_or_default(),
+                        "isActive": r.try_get::<bool, _>("is_active").unwrap_or(true),
+                        "version": r.try_get::<i32, _>("version").unwrap_or(1),
+                        "updatedBy": r.try_get::<String, _>("updated_by").unwrap_or_default(),
+                    })
+                })
+                .collect();
             format_json(&json!({ "templates": templates, "count": templates.len() }))
         }
         Err(e) => format!("[Errore DB] {e}"),
@@ -65,7 +71,10 @@ pub(super) async fn handle_prompt_template_update(db: &PgPool, args: &Value) -> 
         Some(c) if !c.trim().is_empty() => c.to_string(),
         _ => return "[Errore] Parametro 'content' obbligatorio".to_string(),
     };
-    let change_note: Option<String> = args.get("change_note").and_then(Value::as_str).map(str::to_string);
+    let change_note: Option<String> = args
+        .get("change_note")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     // Salva history e aggiorna
     let current = sqlx::query("SELECT id, version FROM nexus_prompt_templates WHERE key=$1")
@@ -100,7 +109,7 @@ pub(super) async fn handle_prompt_template_update(db: &PgPool, args: &Value) -> 
         sqlx::query(
             "INSERT INTO nexus_prompt_templates (key, category, title, content, updated_by)
              VALUES ($1, 'system', $1, $2, 'nexus_agent')
-             RETURNING key, version"
+             RETURNING key, version",
         )
         .bind(&key)
         .bind(&content)
@@ -153,7 +162,7 @@ pub(super) async fn handle_admin_setting_update(db: &PgPool, args: &Value) -> St
     };
     match sqlx::query(
         "INSERT INTO settings (key, value) VALUES ($1,$2)
-         ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()"
+         ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()",
     )
     .bind(&key)
     .bind(&value)

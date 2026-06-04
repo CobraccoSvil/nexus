@@ -75,9 +75,7 @@ pub fn spawn_routing_matrix_auto_promoter(db: PgPool, enabled: bool, interval_s:
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(interval_s)
         .max(MIN_INTERVAL_S);
-    tracing::info!(
-        "routing_matrix_auto_promoter: avvio worker (interval={interval_s}s)"
-    );
+    tracing::info!("routing_matrix_auto_promoter: avvio worker (interval={interval_s}s)");
     tokio::spawn(async move {
         // Aspetta 120s al primo avvio (dopo che gli altri worker hanno
         // popolato consecutive_failures e gli altri dati).
@@ -236,7 +234,12 @@ pub async fn cleanup_stale_rows(db: &PgPool) -> sqlx::Result<u64> {
     )
     .fetch_optional(db)
     .await?
-    .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+    .map(|v| {
+        !matches!(
+            v.trim().to_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
     .unwrap_or(true);
     if !enabled {
         tracing::info!("routing_matrix_auto_promoter: cleanup_stale_rows DISABILITATO (flag)");
@@ -330,7 +333,9 @@ async fn load_requirements(db: &PgPool) -> sqlx::Result<Vec<IntentRequirement>> 
                 .try_get::<Vec<String>, _>("required_capabilities")
                 .unwrap_or_default(),
             requires_tool_use: r.try_get("requires_tool_use").unwrap_or(false),
-            preferred_tier: r.try_get("preferred_tier").unwrap_or_else(|_| "medium".into()),
+            preferred_tier: r
+                .try_get("preferred_tier")
+                .unwrap_or_else(|_| "medium".into()),
             weight_tier: r.try_get("weight_tier").unwrap_or(0.35),
             weight_cost: r.try_get("weight_cost").unwrap_or(0.25),
             weight_context: r.try_get("weight_context").unwrap_or(0.20),
@@ -391,10 +396,12 @@ fn select_top_candidates(req: &IntentRequirement, catalog: &[CatalogModel]) -> V
                 return false;
             }
             if !req.required_capabilities.is_empty() && !m.capabilities.is_empty() {
-                let required_lc: Vec<String> =
-                    req.required_capabilities.iter().map(|s| s.to_lowercase()).collect();
-                let cap_lc: Vec<String> =
-                    m.capabilities.iter().map(|s| s.to_lowercase()).collect();
+                let required_lc: Vec<String> = req
+                    .required_capabilities
+                    .iter()
+                    .map(|s| s.to_lowercase())
+                    .collect();
+                let cap_lc: Vec<String> = m.capabilities.iter().map(|s| s.to_lowercase()).collect();
                 let pct = capability_match_pct(&required_lc, &cap_lc);
                 // Almeno 50% delle capability richieste devono essere presenti.
                 if pct < 0.5 {
@@ -409,7 +416,11 @@ fn select_top_candidates(req: &IntentRequirement, catalog: &[CatalogModel]) -> V
         })
         .collect();
 
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Top-1 per provider, max 3 provider distinti.
     let mut seen_providers = std::collections::HashSet::new();
@@ -436,8 +447,11 @@ fn score_model(req: &IntentRequirement, m: &CatalogModel, full_catalog: &[Catalo
     let cap_score = if req.required_capabilities.is_empty() {
         1.0
     } else {
-        let required_lc: Vec<String> =
-            req.required_capabilities.iter().map(|s| s.to_lowercase()).collect();
+        let required_lc: Vec<String> = req
+            .required_capabilities
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
         let cap_lc: Vec<String> = m.capabilities.iter().map(|s| s.to_lowercase()).collect();
         capability_match_pct(&required_lc, &cap_lc)
     };
@@ -519,7 +533,15 @@ fn capability_match_pct(required: &[String], available: &[String]) -> f32 {
 mod tests {
     use super::*;
 
-    fn model(p: &str, name: &str, tier: &str, cost: f64, ctx: i32, tools: bool, caps: Vec<&str>) -> CatalogModel {
+    fn model(
+        p: &str,
+        name: &str,
+        tier: &str,
+        cost: f64,
+        ctx: i32,
+        tools: bool,
+        caps: Vec<&str>,
+    ) -> CatalogModel {
         CatalogModel {
             provider: p.into(),
             model: name.into(),
@@ -531,7 +553,14 @@ mod tests {
         }
     }
 
-    fn req(intent: &str, behavior: &str, caps: Vec<&str>, tools: bool, tier: &str, cost_dir: &str) -> IntentRequirement {
+    fn req(
+        intent: &str,
+        behavior: &str,
+        caps: Vec<&str>,
+        tools: bool,
+        tier: &str,
+        cost_dir: &str,
+    ) -> IntentRequirement {
         IntentRequirement {
             intent: intent.into(),
             behavior_mode: behavior.into(),
@@ -600,7 +629,10 @@ mod tests {
     #[test]
     fn capability_match_full_partial_none() {
         let req_caps = vec!["code".to_string(), "fix".to_string()];
-        assert_eq!(capability_match_pct(&req_caps, &["code".into(), "fix".into()]), 1.0);
+        assert_eq!(
+            capability_match_pct(&req_caps, &["code".into(), "fix".into()]),
+            1.0
+        );
         assert_eq!(capability_match_pct(&req_caps, &["code".into()]), 0.5);
         assert_eq!(capability_match_pct(&req_caps, &[]), 0.0);
     }
@@ -611,7 +643,14 @@ mod tests {
             model("a", "no-tools", "heavy", 1.0, 200000, false, vec!["code"]),
             model("b", "with-tools", "heavy", 1.0, 200000, true, vec!["code"]),
         ];
-        let r = req("fix_complesso", "approfondita", vec!["code"], true, "heavy", "desc");
+        let r = req(
+            "fix_complesso",
+            "approfondita",
+            vec!["code"],
+            true,
+            "heavy",
+            "desc",
+        );
         let top = select_top_candidates(&r, &catalog);
         assert_eq!(top.len(), 1);
         assert_eq!(top[0].catalog.model, "with-tools");
@@ -620,29 +659,79 @@ mod tests {
     #[test]
     fn select_top_one_per_provider() {
         let catalog = vec![
-            model("anthropic", "claude-opus", "heavy", 5.0, 200000, true, vec!["code", "reasoning"]),
-            model("anthropic", "claude-sonnet", "medium", 3.0, 200000, true, vec!["code"]),
-            model("openai", "gpt-5", "heavy", 4.0, 128000, true, vec!["code", "reasoning"]),
-            model("google", "gemini-pro", "heavy", 1.25, 1_000_000, true, vec!["code", "reasoning", "long-context"]),
+            model(
+                "anthropic",
+                "claude-opus",
+                "heavy",
+                5.0,
+                200000,
+                true,
+                vec!["code", "reasoning"],
+            ),
+            model(
+                "anthropic",
+                "claude-sonnet",
+                "medium",
+                3.0,
+                200000,
+                true,
+                vec!["code"],
+            ),
+            model(
+                "openai",
+                "gpt-5",
+                "heavy",
+                4.0,
+                128000,
+                true,
+                vec!["code", "reasoning"],
+            ),
+            model(
+                "google",
+                "gemini-pro",
+                "heavy",
+                1.25,
+                1_000_000,
+                true,
+                vec!["code", "reasoning", "long-context"],
+            ),
         ];
-        let r = req("fix_complesso", "approfondita", vec!["code", "reasoning"], true, "heavy", "desc");
+        let r = req(
+            "fix_complesso",
+            "approfondita",
+            vec!["code", "reasoning"],
+            true,
+            "heavy",
+            "desc",
+        );
         let top = select_top_candidates(&r, &catalog);
         // Max 3 provider, top-1 per provider
         assert_eq!(top.len(), 3);
-        let providers: std::collections::HashSet<_> = top.iter().map(|s| s.catalog.provider.clone()).collect();
+        let providers: std::collections::HashSet<_> =
+            top.iter().map(|s| s.catalog.provider.clone()).collect();
         assert_eq!(providers.len(), 3);
         // Solo "claude-opus" tra anthropic (top-1)
-        let anthropic_pick = top.iter().find(|s| s.catalog.provider == "anthropic").unwrap();
+        let anthropic_pick = top
+            .iter()
+            .find(|s| s.catalog.provider == "anthropic")
+            .unwrap();
         assert_eq!(anthropic_pick.catalog.model, "claude-opus");
     }
 
     #[test]
     fn select_top_excludes_low_capability_match() {
         let catalog = vec![
-            model("a", "weak", "medium", 1.0, 100000, true, vec!["chat"]),  // 0 di 2 capability
-            model("b", "ok",   "medium", 1.0, 100000, true, vec!["code", "fix"]), // 2 di 2
+            model("a", "weak", "medium", 1.0, 100000, true, vec!["chat"]), // 0 di 2 capability
+            model("b", "ok", "medium", 1.0, 100000, true, vec!["code", "fix"]), // 2 di 2
         ];
-        let r = req("fix_complesso", "bilanciata", vec!["code", "fix"], true, "medium", "asc");
+        let r = req(
+            "fix_complesso",
+            "bilanciata",
+            vec!["code", "fix"],
+            true,
+            "medium",
+            "asc",
+        );
         let top = select_top_candidates(&r, &catalog);
         assert_eq!(top.len(), 1);
         assert_eq!(top[0].catalog.model, "ok");
@@ -717,12 +806,30 @@ mod tests {
     fn score_model_economica_prefers_light_cheap() {
         let catalog = vec![
             model("a", "light-cheap", "light", 0.1, 100000, true, vec!["code"]),
-            model("b", "heavy-expensive", "heavy", 5.0, 200000, true, vec!["code"]),
+            model(
+                "b",
+                "heavy-expensive",
+                "heavy",
+                5.0,
+                200000,
+                true,
+                vec!["code"],
+            ),
         ];
-        let r = req("fix_semplice", "economica", vec!["code"], true, "light", "asc");
+        let r = req(
+            "fix_semplice",
+            "economica",
+            vec!["code"],
+            true,
+            "light",
+            "asc",
+        );
         let s_light = score_model(&r, &catalog[0], &catalog);
         let s_heavy = score_model(&r, &catalog[1], &catalog);
         // "economica" + tier=light + cost_dir=asc → light-cheap deve vincere
-        assert!(s_light > s_heavy, "economica deve preferire light-cheap ({s_light}) > heavy-expensive ({s_heavy})");
+        assert!(
+            s_light > s_heavy,
+            "economica deve preferire light-cheap ({s_light}) > heavy-expensive ({s_heavy})"
+        );
     }
 }

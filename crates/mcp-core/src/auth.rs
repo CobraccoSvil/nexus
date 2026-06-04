@@ -14,7 +14,7 @@ use crate::{github, AppState};
 
 // Re-export shared auth types from nexus-auth crate
 pub use nexus_auth::{
-    Claims, backend_url, frontend_url, get_or_create_jwt_secret, get_setting, validate_token,
+    backend_url, frontend_url, get_or_create_jwt_secret, get_setting, validate_token, Claims,
 };
 
 #[derive(Deserialize)]
@@ -46,7 +46,10 @@ fn set_cookie_header(token: &str) -> String {
 
 fn clear_cookie_header() -> String {
     let secure = if is_secure_context() { " Secure;" } else { "" };
-    format!("token=; HttpOnly;{} Path=/; Max-Age=0; SameSite=Lax", secure)
+    format!(
+        "token=; HttpOnly;{} Path=/; Max-Age=0; SameSite=Lax",
+        secure
+    )
 }
 
 fn extract_token_from_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -91,7 +94,11 @@ pub async fn github_callback(
     }
 }
 
-async fn handle_callback(state: &AppState, code: &str, raw_state: Option<&str>) -> anyhow::Result<Response> {
+async fn handle_callback(
+    state: &AppState,
+    code: &str,
+    raw_state: Option<&str>,
+) -> anyhow::Result<Response> {
     let callback_state = github::decode_github_oauth_state(&state.db, raw_state).await?;
     let identity = github::exchange_code_for_identity(&state.db, code).await?;
 
@@ -100,12 +107,11 @@ async fn handle_callback(state: &AppState, code: &str, raw_state: Option<&str>) 
             .user_id
             .ok_or_else(|| anyhow::anyhow!("GitHub OAuth state mismatch"))?;
 
-        let linked_user_id = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM users WHERE github_id = $1 LIMIT 1",
-        )
-        .bind(identity.github_user_id)
-        .fetch_optional(&state.db)
-        .await?;
+        let linked_user_id =
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE github_id = $1 LIMIT 1")
+                .bind(identity.github_user_id)
+                .fetch_optional(&state.db)
+                .await?;
 
         if let Some(existing_user_id) = linked_user_id {
             if existing_user_id != target_user_id {
@@ -131,12 +137,11 @@ async fn handle_callback(state: &AppState, code: &str, raw_state: Option<&str>) 
         .bind(target_user_id)
         .fetch_one(&state.db)
         .await?
-    } else if let Some(existing_user_id) = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM users WHERE github_id = $1 LIMIT 1",
-    )
-    .bind(identity.github_user_id)
-    .fetch_optional(&state.db)
-    .await?
+    } else if let Some(existing_user_id) =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE github_id = $1 LIMIT 1")
+            .bind(identity.github_user_id)
+            .fetch_optional(&state.db)
+            .await?
     {
         sqlx::query_as(
             r#"
@@ -154,12 +159,11 @@ async fn handle_callback(state: &AppState, code: &str, raw_state: Option<&str>) 
         .bind(existing_user_id)
         .fetch_one(&state.db)
         .await?
-    } else if let Some(existing_user_id) = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM users WHERE lower(email) = lower($1) LIMIT 1",
-    )
-    .bind(&identity.email)
-    .fetch_optional(&state.db)
-    .await?
+    } else if let Some(existing_user_id) =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE lower(email) = lower($1) LIMIT 1")
+            .bind(&identity.email)
+            .fetch_optional(&state.db)
+            .await?
     {
         sqlx::query_as(
             r#"

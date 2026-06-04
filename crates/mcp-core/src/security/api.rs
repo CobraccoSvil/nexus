@@ -74,10 +74,7 @@ pub async fn get_project_audit(
         query = query.bind(action);
     }
 
-    let rows = query
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    let rows = query.fetch_all(&state.db).await.unwrap_or_default();
 
     let items: Vec<Value> = rows
         .iter()
@@ -98,13 +95,12 @@ pub async fn get_project_audit(
         .collect();
 
     // Conta totale per paginazione
-    let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM nexus_resource_audit WHERE project_id = $1",
-    )
-    .bind(project_id)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM nexus_resource_audit WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(0);
 
     Ok(Json(json!({
         "items": items,
@@ -128,13 +124,12 @@ pub async fn get_project_quota(
     let quota = super::quotas::load_quota(&state.db, project_id).await;
 
     // Conteggi attuali
-    let ports_used: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM nexus_port_allocations WHERE project_id = $1",
-    )
-    .bind(project_id)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
+    let ports_used: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM nexus_port_allocations WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(0);
 
     let containers_used: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_processes \

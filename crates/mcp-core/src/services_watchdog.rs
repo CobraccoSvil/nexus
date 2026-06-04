@@ -137,7 +137,12 @@ async fn load_config(db: &PgPool) -> WatchdogConfig {
         .await
         .ok()
         .flatten()
-        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .map(|v| {
+            !matches!(
+                v.trim().to_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(true);
 
     let interval_s = get("agent.watchdog.interval_seconds")
@@ -271,7 +276,8 @@ async fn run_cycle(db: &PgPool, cfg: &WatchdogConfig, states: &mut HashMap<Strin
             None => {
                 tracing::warn!(
                     "services_watchdog: porta non risolvibile per {} (setting {}), skip",
-                    svc.name, svc.port_setting_key
+                    svc.name,
+                    svc.port_setting_key
                 );
                 continue;
             }
@@ -285,7 +291,8 @@ async fn run_cycle(db: &PgPool, cfg: &WatchdogConfig, states: &mut HashMap<Strin
             if st.consecutive_down > 0 || st.failed_restarts > 0 || st.given_up {
                 tracing::info!(
                     "services_watchdog: {} (porta {}) RIPRISTINATO",
-                    svc.name, port
+                    svc.name,
+                    port
                 );
             }
             st.consecutive_down = 0;
@@ -300,7 +307,9 @@ async fn run_cycle(db: &PgPool, cfg: &WatchdogConfig, states: &mut HashMap<Strin
             // Logga il DOWN una sola volta al raggiungimento soglia.
             tracing::info!(
                 "services_watchdog: {} (porta {}) DOWN da {} cicli",
-                svc.name, port, st.consecutive_down
+                svc.name,
+                port,
+                st.consecutive_down
             );
         }
 
@@ -330,7 +339,9 @@ async fn run_cycle(db: &PgPool, cfg: &WatchdogConfig, states: &mut HashMap<Strin
             Decision::Restart => {
                 tracing::info!(
                     "services_watchdog: riavvio {} (porta {}) — tentativo #{}",
-                    svc.name, port, st.failed_restarts + 1
+                    svc.name,
+                    port,
+                    st.failed_restarts + 1
                 );
                 let spawned = restart_service(&svc.name).await;
                 st.last_restart_ts = now_ts;
@@ -338,10 +349,7 @@ async fn run_cycle(db: &PgPool, cfg: &WatchdogConfig, states: &mut HashMap<Strin
                 // (dopo cooldown) non conferma up; verra' azzerato al recupero.
                 st.failed_restarts = st.failed_restarts.saturating_add(1);
                 if !spawned {
-                    tracing::warn!(
-                        "services_watchdog: spawn riavvio {} non partito",
-                        svc.name
-                    );
+                    tracing::warn!("services_watchdog: spawn riavvio {} non partito", svc.name);
                 }
             }
         }
@@ -354,7 +362,12 @@ async fn run_cycle(db: &PgPool, cfg: &WatchdogConfig, states: &mut HashMap<Strin
 mod tests {
     use super::*;
 
-    fn st(consecutive_down: u32, failed_restarts: u32, last_restart_ts: i64, given_up: bool) -> ServiceState {
+    fn st(
+        consecutive_down: u32,
+        failed_restarts: u32,
+        last_restart_ts: i64,
+        given_up: bool,
+    ) -> ServiceState {
         ServiceState {
             consecutive_down,
             failed_restarts,

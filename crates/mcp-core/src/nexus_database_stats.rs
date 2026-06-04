@@ -1,5 +1,4 @@
 /// Endpoint per statistiche del database Nexus interno.
-
 use axum::{extract::State, Json};
 use serde_json::json;
 
@@ -109,12 +108,13 @@ pub async fn nexus_database_stats(
             .flatten();
     let db_size_mb = db_size.map(|(s,)| s as f64 / 1_048_576.0).unwrap_or(0.0);
 
-    let active_conn: Option<(i64,)> =
-        sqlx::query_as("SELECT count(*)::bigint FROM pg_stat_activity WHERE datname = current_database()")
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
+    let active_conn: Option<(i64,)> = sqlx::query_as(
+        "SELECT count(*)::bigint FROM pg_stat_activity WHERE datname = current_database()",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
     let active_connections = active_conn.map(|(n,)| n).unwrap_or(0);
 
     let stats = json!({

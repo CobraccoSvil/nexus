@@ -9,7 +9,12 @@ pub(super) async fn tool_read_file(ctx: &AgentToolContext, input: &Value) -> Str
     };
     let target = match resolve_relative_path(&ctx.root_path, path_str) {
         Ok(p) => p,
-        Err(e) => return format!("[Errore percorso: {}]", e.1["error"].as_str().unwrap_or("path error")),
+        Err(e) => {
+            return format!(
+                "[Errore percorso: {}]",
+                e.1["error"].as_str().unwrap_or("path error")
+            )
+        }
     };
     let content = match tokio::fs::read_to_string(&target).await {
         Ok(c) => c,
@@ -65,17 +70,24 @@ pub(super) async fn tool_read_file_lines(ctx: &AgentToolContext, input: &Value) 
     // usati erroneamente da alcune istruzioni del supervisor — mappati automaticamente
     // per evitare che errori nei prompt causino loop di re-lettura).
     let start_line: usize = if let Some(n) = input.get("start_line").and_then(Value::as_u64) {
-        if n < 1 { return "[Errore: 'start_line' deve essere un intero >= 1]".to_string(); }
+        if n < 1 {
+            return "[Errore: 'start_line' deve essere un intero >= 1]".to_string();
+        }
         n as usize
     } else if let Some(n) = input.get("offset").and_then(Value::as_u64) {
-        if n < 1 { return "[Errore: 'offset' deve essere un intero >= 1]".to_string(); }
+        if n < 1 {
+            return "[Errore: 'offset' deve essere un intero >= 1]".to_string();
+        }
         n as usize
     } else {
-        return "[Errore: parametro 'start_line' mancante (oppure 'offset' come alias)]".to_string();
+        return "[Errore: parametro 'start_line' mancante (oppure 'offset' come alias)]"
+            .to_string();
     };
 
     let end_line: usize = if let Some(n) = input.get("end_line").and_then(Value::as_u64) {
-        if n < start_line as u64 { return "[Errore: 'end_line' deve essere >= start_line]".to_string(); }
+        if n < start_line as u64 {
+            return "[Errore: 'end_line' deve essere >= start_line]".to_string();
+        }
         n as usize
     } else if let Some(limit) = input.get("limit").and_then(Value::as_u64) {
         // offset + limit - 1 → end_line inclusa
@@ -89,7 +101,12 @@ pub(super) async fn tool_read_file_lines(ctx: &AgentToolContext, input: &Value) 
 
     let target = match resolve_relative_path(&ctx.root_path, path_str) {
         Ok(p) => p,
-        Err(e) => return format!("[Errore percorso: {}]", e.1["error"].as_str().unwrap_or("path error")),
+        Err(e) => {
+            return format!(
+                "[Errore percorso: {}]",
+                e.1["error"].as_str().unwrap_or("path error")
+            )
+        }
     };
     let content = match tokio::fs::read_to_string(&target).await {
         Ok(c) => c,
@@ -166,14 +183,15 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
     let clean = path_str.trim().trim_start_matches(['\\', '/']);
     let target = ctx.root_path.join(clean);
     // Verifica che sia dentro la root (anche per path non esistenti)
-    let normalized = target
-        .components()
-        .collect::<Vec<_>>()
-        .iter()
-        .fold(PathBuf::new(), |mut acc, c| {
-            acc.push(c);
-            acc
-        });
+    let normalized =
+        target
+            .components()
+            .collect::<Vec<_>>()
+            .iter()
+            .fold(PathBuf::new(), |mut acc, c| {
+                acc.push(c);
+                acc
+            });
     if !normalized.starts_with(&ctx.root_path) {
         return "[Errore: percorso non autorizzato (fuori dalla root del progetto)]".to_string();
     }
@@ -193,7 +211,11 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
                 ctx.project_id,
                 nexus_events::event::ProjectEvent::FileChanged {
                     path: path_str.to_string(),
-                    op: if existed_before { "modified".to_string() } else { "created".to_string() },
+                    op: if existed_before {
+                        "modified".to_string()
+                    } else {
+                        "created".to_string()
+                    },
                 },
             );
 
@@ -206,12 +228,29 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
             let path_str_bg = path_str.to_string();
             let content_bg = content.to_string();
             tokio::spawn(async move {
-                let _ = crate::projects::reindex_single_file(&db_bg, &neural_bg, project_id_bg, &root_bg, &target_bg).await;
+                let _ = crate::projects::reindex_single_file(
+                    &db_bg,
+                    &neural_bg,
+                    project_id_bg,
+                    &root_bg,
+                    &target_bg,
+                )
+                .await;
                 crate::projects::maybe_auto_scan_file(&db_bg, project_id_bg, &target_bg).await;
                 // Hook M2: se il file e' un .md di documentazione, registra in project_documents
-                let _ = upsert_project_document_if_doc(&db_bg, project_id_bg, &path_str_bg, &content_bg).await;
+                let _ = upsert_project_document_if_doc(
+                    &db_bg,
+                    project_id_bg,
+                    &path_str_bg,
+                    &content_bg,
+                )
+                .await;
             });
-            format!("File '{}' scritto con successo ({} byte)", path_str, content.len())
+            format!(
+                "File '{}' scritto con successo ({} byte)",
+                path_str,
+                content.len()
+            )
         }
         Err(e) => format!("[Errore scrittura '{}': {}]", path_str, e),
     }
@@ -245,11 +284,17 @@ async fn upsert_project_document_if_doc(
         || lower.contains("technical")
     {
         "technical_analysis"
-    } else if lower.contains("erd") || lower.contains("schema_diagram") || lower.contains("er_diagram") {
+    } else if lower.contains("erd")
+        || lower.contains("schema_diagram")
+        || lower.contains("er_diagram")
+    {
         "er_diagram"
     } else if lower.contains("changelog") || lower.contains("release_notes") {
         "release_notes"
-    } else if lower.contains("contributing") || lower.contains("project_management") || lower.contains("roadmap") {
+    } else if lower.contains("contributing")
+        || lower.contains("project_management")
+        || lower.contains("roadmap")
+    {
         "project_management"
     } else {
         return Ok(());
@@ -290,16 +335,18 @@ async fn upsert_project_document_if_doc(
 }
 
 pub(super) async fn tool_list_files(ctx: &AgentToolContext, input: &Value) -> String {
-    let dir_str = input
-        .get("directory")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let dir_str = input.get("directory").and_then(Value::as_str).unwrap_or("");
     let target = if dir_str.is_empty() {
         ctx.root_path.clone()
     } else {
         match resolve_relative_path(&ctx.root_path, dir_str) {
             Ok(p) => p,
-            Err(e) => return format!("[Errore percorso: {}]", e.1["error"].as_str().unwrap_or("path error")),
+            Err(e) => {
+                return format!(
+                    "[Errore percorso: {}]",
+                    e.1["error"].as_str().unwrap_or("path error")
+                )
+            }
         }
     };
 
@@ -371,13 +418,9 @@ pub(super) async fn tool_search_in_files(ctx: &AgentToolContext, input: &Value) 
                 let lines: Vec<String> = stdout
                     .lines()
                     .map(|line| {
-                        line.replacen(
-                            &ctx.root_path.to_string_lossy().as_ref(),
-                            "",
-                            1,
-                        )
-                        .trim_start_matches(['/', '\\'])
-                        .to_string()
+                        line.replacen(&ctx.root_path.to_string_lossy().as_ref(), "", 1)
+                            .trim_start_matches(['/', '\\'])
+                            .to_string()
                     })
                     .collect();
                 let total_lines = lines.len();
@@ -414,23 +457,37 @@ pub(super) async fn tool_delete_file(ctx: &AgentToolContext, input: &Value) -> S
         Some(s) => s,
         None => return "[Errore: parametro 'path' mancante]".to_string(),
     };
-    let recursive = input.get("recursive").and_then(Value::as_bool).unwrap_or(false);
+    let recursive = input
+        .get("recursive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let target = match resolve_relative_path(&ctx.root_path, path_str) {
         Ok(p) => p,
-        Err(e) => return format!("[Errore percorso: {}]", e.1["error"].as_str().unwrap_or("path error")),
+        Err(e) => {
+            return format!(
+                "[Errore percorso: {}]",
+                e.1["error"].as_str().unwrap_or("path error")
+            )
+        }
     };
 
     if target.is_dir() {
         if recursive {
             match tokio::fs::remove_dir_all(&target).await {
-                Ok(()) => format!("Directory '{}' eliminata ricorsivamente con successo", path_str),
+                Ok(()) => format!(
+                    "Directory '{}' eliminata ricorsivamente con successo",
+                    path_str
+                ),
                 Err(e) => format!("[Errore eliminazione directory '{}': {}]", path_str, e),
             }
         } else {
             match tokio::fs::remove_dir(&target).await {
                 Ok(()) => format!("Directory '{}' eliminata con successo", path_str),
-                Err(e) => format!("[Errore eliminazione directory '{}': {} (se non e' vuota usa recursive:true)]", path_str, e),
+                Err(e) => format!(
+                    "[Errore eliminazione directory '{}': {} (se non e' vuota usa recursive:true)]",
+                    path_str, e
+                ),
             }
         }
     } else {
@@ -466,18 +523,27 @@ pub(super) async fn tool_rename_file(ctx: &AgentToolContext, input: &Value) -> S
 
     let from = match resolve_relative_path(&ctx.root_path, from_str) {
         Ok(p) => p,
-        Err(e) => return format!("[Errore percorso sorgente: {}]", e.1["error"].as_str().unwrap_or("path error")),
+        Err(e) => {
+            return format!(
+                "[Errore percorso sorgente: {}]",
+                e.1["error"].as_str().unwrap_or("path error")
+            )
+        }
     };
 
     let to_clean = to_str.trim().trim_start_matches(['\\', '/']);
     let to = ctx.root_path.join(to_clean);
-    let normalized_to = to
-        .components()
-        .collect::<Vec<_>>()
-        .iter()
-        .fold(PathBuf::new(), |mut acc, c| { acc.push(c); acc });
+    let normalized_to =
+        to.components()
+            .collect::<Vec<_>>()
+            .iter()
+            .fold(PathBuf::new(), |mut acc, c| {
+                acc.push(c);
+                acc
+            });
     if !normalized_to.starts_with(&ctx.root_path) {
-        return "[Errore: destinazione non autorizzata (fuori dalla root del progetto)]".to_string();
+        return "[Errore: destinazione non autorizzata (fuori dalla root del progetto)]"
+            .to_string();
     }
 
     if let Some(parent) = to.parent() {
@@ -525,7 +591,12 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
 
     let target = match resolve_relative_path(&ctx.root_path, path_str) {
         Ok(p) => p,
-        Err(e) => return format!("[Errore percorso: {}]", e.1["error"].as_str().unwrap_or("path error")),
+        Err(e) => {
+            return format!(
+                "[Errore percorso: {}]",
+                e.1["error"].as_str().unwrap_or("path error")
+            )
+        }
     };
 
     let raw_content = match tokio::fs::read_to_string(&target).await {
@@ -654,7 +725,12 @@ pub(super) async fn tool_fs_mkdir(ctx: &AgentToolContext, input: &Value) -> Stri
     };
     let target = match resolve_relative_path(&ctx.root_path, path_str) {
         Ok(p) => p,
-        Err(e) => return format!("[Errore percorso: {}]", e.1["error"].as_str().unwrap_or("path error")),
+        Err(e) => {
+            return format!(
+                "[Errore percorso: {}]",
+                e.1["error"].as_str().unwrap_or("path error")
+            )
+        }
     };
     if target.is_dir() {
         return format!("Directory '{}' esiste gia'", path_str);
@@ -678,15 +754,28 @@ pub(super) async fn tool_fs_copy(ctx: &AgentToolContext, input: &Value) -> Strin
         Some(s) => s,
         None => return "[Errore: parametro 'to' mancante]".to_string(),
     };
-    let overwrite = input.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
+    let overwrite = input
+        .get("overwrite")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let from = match resolve_relative_path(&ctx.root_path, from_str) {
         Ok(p) => p,
-        Err(e) => return format!("[Errore percorso sorgente: {}]", e.1["error"].as_str().unwrap_or("path error")),
+        Err(e) => {
+            return format!(
+                "[Errore percorso sorgente: {}]",
+                e.1["error"].as_str().unwrap_or("path error")
+            )
+        }
     };
     let to = match resolve_relative_path(&ctx.root_path, to_str) {
         Ok(p) => p,
-        Err(e) => return format!("[Errore percorso destinazione: {}]", e.1["error"].as_str().unwrap_or("path error")),
+        Err(e) => {
+            return format!(
+                "[Errore percorso destinazione: {}]",
+                e.1["error"].as_str().unwrap_or("path error")
+            )
+        }
     };
 
     if !from.exists() {
@@ -708,12 +797,18 @@ pub(super) async fn tool_fs_copy(ctx: &AgentToolContext, input: &Value) -> Strin
             }
         }
         match tokio::fs::copy(&from, &to).await {
-            Ok(bytes) => format!("File copiato '{}' -> '{}' ({} byte)", from_str, to_str, bytes),
+            Ok(bytes) => format!(
+                "File copiato '{}' -> '{}' ({} byte)",
+                from_str, to_str, bytes
+            ),
             Err(e) => format!("[Errore copia file: {}]", e),
         }
     } else if from.is_dir() {
         match copy_dir_recursive(&from, &to).await {
-            Ok(count) => format!("Directory copiata '{}' -> '{}' ({} file)", from_str, to_str, count),
+            Ok(count) => format!(
+                "Directory copiata '{}' -> '{}' ({} file)",
+                from_str, to_str, count
+            ),
             Err(e) => format!("[Errore copia directory: {}]", e),
         }
     } else {
@@ -763,11 +858,21 @@ pub(super) async fn tool_fs_move(ctx: &AgentToolContext, input: &Value) -> Strin
 
     let from = match resolve_relative_path(&ctx.root_path, from_str) {
         Ok(p) => p,
-        Err(e) => return format!("[Errore percorso sorgente: {}]", e.1["error"].as_str().unwrap_or("path error")),
+        Err(e) => {
+            return format!(
+                "[Errore percorso sorgente: {}]",
+                e.1["error"].as_str().unwrap_or("path error")
+            )
+        }
     };
     let to = match resolve_relative_path(&ctx.root_path, to_str) {
         Ok(p) => p,
-        Err(e) => return format!("[Errore percorso destinazione: {}]", e.1["error"].as_str().unwrap_or("path error")),
+        Err(e) => {
+            return format!(
+                "[Errore percorso destinazione: {}]",
+                e.1["error"].as_str().unwrap_or("path error")
+            )
+        }
     };
 
     if !from.exists() {

@@ -22,7 +22,13 @@ use nexus_types::{api_error, ensure_project_access, parse_user_id, ApiResult};
 use crate::{auth::Claims, AppState};
 
 // Stati todo ammessi per l'edit manuale.
-const VALID_TODO_STATUS: &[&str] = &["pending", "in_progress", "completed", "blocked", "cancelled"];
+const VALID_TODO_STATUS: &[&str] = &[
+    "pending",
+    "in_progress",
+    "completed",
+    "blocked",
+    "cancelled",
+];
 
 #[derive(Deserialize)]
 pub struct EditTodoBody {
@@ -57,7 +63,12 @@ pub async fn edit_todo(
     .await
     .ok()
     .flatten()
-    .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "false" | "0" | "off" | "no"))
+    .map(|s| {
+        !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "off" | "no"
+        )
+    })
     .unwrap_or(true);
     if !editable {
         return Err(api_error(
@@ -77,7 +88,10 @@ pub async fn edit_todo(
 
     // SET clause dinamica. edited_by tracciato sempre. $1=todo_id $2=run_id
     // $3=project_id $4=edited_by, i campi opzionali da $5.
-    let mut sets = vec!["updated_at = NOW()".to_string(), "edited_by = $4".to_string()];
+    let mut sets = vec![
+        "updated_at = NOW()".to_string(),
+        "edited_by = $4".to_string(),
+    ];
     let mut bind_idx = 5u32;
     if body.content.is_some() {
         sets.push(format!("content = ${bind_idx}"));
@@ -163,7 +177,9 @@ pub async fn edit_todo(
         );
     }
 
-    Ok(Json(json!({ "ok": true, "todo_id": todo_id, "status": new_status })))
+    Ok(Json(
+        json!({ "ok": true, "todo_id": todo_id, "status": new_status }),
+    ))
 }
 
 /// GET /api/internal/agent/backlog/:project_id  (no-auth, chiamato dal brain)

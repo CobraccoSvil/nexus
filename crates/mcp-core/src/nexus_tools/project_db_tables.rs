@@ -14,11 +14,7 @@ pub struct ProjectDbTablesTool;
 
 #[async_trait]
 impl NexusToolHandler for ProjectDbTablesTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let schema = args
             .get("schema")
             .and_then(Value::as_str)
@@ -67,9 +63,7 @@ impl NexusToolHandler for ProjectDbTablesTool {
             .bind(&schema)
             .fetch_all(&project_pool)
             .await
-            .map_err(|e| {
-                NexusToolError::BadInput(format!("query tables failed: {}", e))
-            })?;
+            .map_err(|e| NexusToolError::BadInput(format!("query tables failed: {}", e)))?;
 
         let tables: Vec<Value> = rows
             .iter()

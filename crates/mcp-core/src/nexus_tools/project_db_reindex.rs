@@ -11,11 +11,7 @@ pub struct ProjectDbReindexTool;
 
 #[async_trait]
 impl NexusToolHandler for ProjectDbReindexTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let target_type = args
             .get("target_type")
             .and_then(Value::as_str)
@@ -30,7 +26,10 @@ impl NexusToolHandler for ProjectDbReindexTool {
             .trim()
             .to_string();
 
-        if !target_name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+        if !target_name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        {
             return Err(NexusToolError::BadInput(
                 "Nome target contiene caratteri non validi".into(),
             ));

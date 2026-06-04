@@ -8,10 +8,23 @@ pub struct CargoInstallListTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoInstallListTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let out = run_cmd("cargo", &["install", "--list"], &ctx.project_root, ctx.timeout_secs).await?;
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let out = run_cmd(
+            "cargo",
+            &["install", "--list"],
+            &ctx.project_root,
+            ctx.timeout_secs,
+        )
+        .await?;
         if !out.success() {
-            return Err(NexusToolError::Exec { exit_code: out.exit_code, stderr: out.stderr });
+            return Err(NexusToolError::Exec {
+                exit_code: out.exit_code,
+                stderr: out.stderr,
+            });
         }
         let mut crates = Vec::new();
         let mut current: Option<(String, String)> = None;
@@ -24,7 +37,10 @@ impl NexusToolHandler for CargoInstallListTool {
                         if let Some((n, v)) = current.take() {
                             crates.push(json!({"name": n, "version": v}));
                         }
-                        current = Some((parts[0].to_string(), parts[1].trim_start_matches('v').to_string()));
+                        current = Some((
+                            parts[0].to_string(),
+                            parts[1].trim_start_matches('v').to_string(),
+                        ));
                     }
                 }
             }
@@ -32,7 +48,11 @@ impl NexusToolHandler for CargoInstallListTool {
         if let Some((n, v)) = current.take() {
             crates.push(json!({"name": n, "version": v}));
         }
-        Ok(json!({"ok": true, "count": crates.len(), "crates": crates, "duration_ms": out.duration_ms}))
+        Ok(
+            json!({"ok": true, "count": crates.len(), "crates": crates, "duration_ms": out.duration_ms}),
+        )
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only_subproc()
+    }
 }

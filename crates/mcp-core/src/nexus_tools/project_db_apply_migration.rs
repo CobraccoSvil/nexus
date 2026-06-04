@@ -1,26 +1,30 @@
 //! `project_db_apply_migration` — applica le migration pending al DB del progetto utente.
 
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
+use crate::nexus_tools::db_helper::get_pool;
+use crate::project_db::exec::{open_pool, resolve_project_conn};
+use crate::project_db::{runner::MigrationRunner, MigrationTool, ProjectDbContext};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::Row;
-use crate::nexus_tools::db_helper::get_pool;
-use crate::project_db::{MigrationTool, ProjectDbContext, runner::MigrationRunner};
-use crate::project_db::exec::{open_pool, resolve_project_conn};
 
 pub struct ProjectDbApplyMigrationTool;
 
 #[async_trait]
 impl NexusToolHandler for ProjectDbApplyMigrationTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let target_filename = args.get("filename").and_then(Value::as_str).map(String::from);
+        let target_filename = args
+            .get("filename")
+            .and_then(Value::as_str)
+            .map(String::from);
 
-        let nexus_pool = get_pool().await
+        let nexus_pool = get_pool()
+            .await
             .map_err(|e| NexusToolError::BadInput(format!("nexus db connect: {}", e)))?;
 
         let config_row: Option<sqlx::postgres::PgRow> = sqlx::query(
             r#"SELECT migration_tool, migration_path, hosting_mode
-               FROM project_database_config WHERE project_id = $1"#
+               FROM project_database_config WHERE project_id = $1"#,
         )
         .bind(ctx.project_id)
         .fetch_optional(&nexus_pool)
@@ -29,11 +33,14 @@ impl NexusToolHandler for ProjectDbApplyMigrationTool {
 
         let Some(config) = config_row else {
             nexus_pool.close().await;
-            return Ok(json!({"ok": false, "error": "Nessuna configurazione DB. Usa project_db_status."}));
+            return Ok(
+                json!({"ok": false, "error": "Nessuna configurazione DB. Usa project_db_status."}),
+            );
         };
 
         let tool_str: Option<String> = config.try_get("migration_tool").unwrap_or(None);
-        let migration_path: String = config.try_get::<Option<String>, _>("migration_path")
+        let migration_path: String = config
+            .try_get::<Option<String>, _>("migration_path")
             .unwrap_or_default()
             .unwrap_or_else(|| "migrations".into());
         let hosting_mode: String = config.try_get("hosting_mode").unwrap_or_default();
@@ -45,11 +52,14 @@ impl NexusToolHandler for ProjectDbApplyMigrationTool {
             Ok(u) => u,
             Err(e) => {
                 nexus_pool.close().await;
-                return Ok(json!({"ok": false, "error": format!("Connessione DB progetto non risolvibile: {}", e)}));
+                return Ok(
+                    json!({"ok": false, "error": format!("Connessione DB progetto non risolvibile: {}", e)}),
+                );
             }
         };
 
-        let migration_tool = tool_str.as_deref()
+        let migration_tool = tool_str
+            .as_deref()
             .and_then(MigrationTool::from_str)
             .unwrap_or(MigrationTool::GenericSql);
 
@@ -63,17 +73,20 @@ impl NexusToolHandler for ProjectDbApplyMigrationTool {
 
         let pending_rows: Vec<sqlx::postgres::PgRow> = sqlx::query(
             r#"SELECT id, filename, sql_diff FROM project_migration_history
-               WHERE project_id = $1 AND status = 'pending' ORDER BY created_at ASC"#
+               WHERE project_id = $1 AND status = 'pending' ORDER BY created_at ASC"#,
         )
         .bind(ctx.project_id)
         .fetch_all(&nexus_pool)
         .await
         .map_err(|e| NexusToolError::BadInput(format!("pending query: {}", e)))?;
 
-        let rows_to_apply: Vec<&sqlx::postgres::PgRow> = pending_rows.iter()
+        let rows_to_apply: Vec<&sqlx::postgres::PgRow> = pending_rows
+            .iter()
             .filter(|row| {
                 target_filename.as_deref().map_or(true, |fname| {
-                    row.try_get::<String, _>("filename").map(|f| f == fname).unwrap_or(false)
+                    row.try_get::<String, _>("filename")
+                        .map(|f| f == fname)
+                        .unwrap_or(false)
                 })
             })
             .collect();
@@ -92,7 +105,9 @@ impl NexusToolHandler for ProjectDbApplyMigrationTool {
             let apply_result = if let Some(sql) = &sql_diff {
                 apply_raw_sql(&project_conn_url, sql).await
             } else {
-                runner.apply_pending(&project_conn_url).await
+                runner
+                    .apply_pending(&project_conn_url)
+                    .await
                     .map(|_| ())
                     .map_err(|e| e.to_string())
             };
@@ -139,14 +154,23 @@ impl NexusToolHandler for ProjectDbApplyMigrationTool {
     }
 
     fn safety(&self) -> NexusToolSafety {
-        NexusToolSafety { read_only: false, can_write_filesystem: false, can_execute_subproc: true, network_egress: true }
+        NexusToolSafety {
+            read_only: false,
+            can_write_filesystem: false,
+            can_execute_subproc: true,
+            network_egress: true,
+        }
     }
 }
 
 async fn apply_raw_sql(connection_url: &str, sql: &str) -> Result<(), String> {
-    if connection_url.is_empty() { return Err("URL connessione progetto non configurata".into()); }
+    if connection_url.is_empty() {
+        return Err("URL connessione progetto non configurata".into());
+    }
     let pool = open_pool(connection_url).await?;
-    sqlx::raw_sql(sql).execute(&pool).await
+    sqlx::raw_sql(sql)
+        .execute(&pool)
+        .await
         .map_err(|e| format!("esecuzione SQL: {}", e))?;
     pool.close().await;
     Ok(())

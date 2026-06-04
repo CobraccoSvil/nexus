@@ -13,7 +13,10 @@ fn extract_md_links(text: &str) -> Vec<(String, String)> {
     while i < bytes.len() {
         if bytes[i] == b'[' {
             // skip image marker !
-            if i > 0 && bytes[i - 1] == b'!' { i += 1; continue; }
+            if i > 0 && bytes[i - 1] == b'!' {
+                i += 1;
+                continue;
+            }
             if let Some(end_text) = text[i + 1..].find(']') {
                 let text_end = i + 1 + end_text;
                 if text_end + 1 < bytes.len() && bytes[text_end + 1] == b'(' {
@@ -36,7 +39,10 @@ fn extract_md_links(text: &str) -> Vec<(String, String)> {
 #[async_trait]
 impl NexusToolHandler for DocLinksExtractTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let path = args.get("path").and_then(Value::as_str).unwrap_or("README.md");
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("README.md");
         let pb = std::path::PathBuf::from(path);
         if pb.components().any(|c| matches!(c, Component::ParentDir)) {
             return Err(NexusToolError::BadInput("path traversal denied".into()));
@@ -46,7 +52,8 @@ impl NexusToolHandler for DocLinksExtractTool {
             return Err(NexusToolError::BadInput("path traversal denied".into()));
         }
         let content = std::fs::read_to_string(&full).map_err(NexusToolError::Io)?;
-        let links: Vec<Value> = extract_md_links(&content).into_iter()
+        let links: Vec<Value> = extract_md_links(&content)
+            .into_iter()
             .map(|(t, u)| json!({"text": t, "url": u}))
             .collect();
         Ok(json!({"ok": true, "path": path, "count": links.len(), "links": links}))
@@ -54,5 +61,7 @@ impl NexusToolHandler for DocLinksExtractTool {
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"}}})
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

@@ -35,10 +35,7 @@ pub struct PlaywrightProgress {
 pub enum PlaywrightEvent {
     /// Una riga di output dal processo (gia' troncata a 2 KB).
     #[serde(rename = "line")]
-    Line {
-        job_id: Uuid,
-        line: String,
-    },
+    Line { job_id: Uuid, line: String },
     /// Progress incrementale (counter aggiornati).
     #[serde(rename = "progress")]
     Progress {
@@ -210,15 +207,28 @@ fn parse_summary_line(line: &str) -> Option<(u32, u32, u32)> {
         if tokens.len() >= 2 {
             if let Ok(n) = tokens[0].parse::<u32>() {
                 match tokens[1] {
-                    "passed" => { passed = n; found = true; }
-                    "failed" => { failed = n; found = true; }
-                    "flaky" => { flaky = n; found = true; }
+                    "passed" => {
+                        passed = n;
+                        found = true;
+                    }
+                    "failed" => {
+                        failed = n;
+                        found = true;
+                    }
+                    "flaky" => {
+                        flaky = n;
+                        found = true;
+                    }
                     _ => {}
                 }
             }
         }
     }
-    if found { Some((passed, failed, flaky)) } else { None }
+    if found {
+        Some((passed, failed, flaky))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -245,7 +255,10 @@ mod tests {
         let mut p = PlaywrightProgress::default();
         parse_line("  ✘  2 e2e/bar.spec.ts:10:3 › broken test (50ms)", &mut p);
         assert_eq!(p.failed, 1);
-        assert!(p.failed_specs.iter().any(|s| s.contains("bar.spec.ts:10:3")));
+        assert!(p
+            .failed_specs
+            .iter()
+            .any(|s| s.contains("bar.spec.ts:10:3")));
     }
 
     #[test]

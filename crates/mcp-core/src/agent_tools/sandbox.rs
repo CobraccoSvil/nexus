@@ -41,10 +41,23 @@ pub(super) async fn tool_get_sandbox_config(ctx: &AgentToolContext) -> String {
     use crate::sandbox::load_project_sandbox_config;
     let cfg = load_project_sandbox_config(&ctx.db, ctx.project_id).await;
     let nm = cfg.network_mode.as_deref().unwrap_or("none (default)");
-    let mem = cfg.memory_mb.map(|m| format!("{MB}", MB = m)).unwrap_or_else(|| "1024 (default)".to_string());
-    let cpus = cfg.cpus.map(|c| c.to_string()).unwrap_or_else(|| "2.0 (default)".to_string());
-    let env_str = cfg.extra_env.as_ref().map(|e| {
-        e.iter().map(|(k, v)| format!("  {k}={v}")).collect::<Vec<_>>().join("\n")
-    }).unwrap_or_else(|| "  (nessuna)".to_string());
+    let mem = cfg
+        .memory_mb
+        .map(|m| format!("{MB}", MB = m))
+        .unwrap_or_else(|| "1024 (default)".to_string());
+    let cpus = cfg
+        .cpus
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "2.0 (default)".to_string());
+    let env_str = cfg
+        .extra_env
+        .as_ref()
+        .map(|e| {
+            e.iter()
+                .map(|(k, v)| format!("  {k}={v}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|| "  (nessuna)".to_string());
     format!("Configurazione sandbox progetto:\n- memoria: {mem} MB\n- cpu: {cpus} core\n- rete: {nm}\n- variabili extra:\n{env_str}")
 }

@@ -27,5 +27,7 @@ impl NexusToolHandler for TestRunQuietTool {
     fn input_schema(&self) -> Value {
         json!({"type":"object","properties":{"filter":{"type":"string"}}})
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::write_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::write_subproc()
+    }
 }

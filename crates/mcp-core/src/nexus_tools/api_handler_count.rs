@@ -8,10 +8,16 @@ pub struct ApiHandlerCountTool;
 
 #[async_trait]
 impl NexusToolHandler for ApiHandlerCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(
             &ctx.project_root,
-            &["get(", "post(", "put(", "delete(", "patch(", "head(", "options("],
+            &[
+                "get(", "post(", "put(", "delete(", "patch(", "head(", "options(",
+            ],
         );
         let total = counts.iter().sum::<usize>();
         Ok(json!({
@@ -27,5 +33,7 @@ impl NexusToolHandler for ApiHandlerCountTool {
             "total_methods": total,
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

@@ -63,13 +63,7 @@ impl NexusToolHandler for DepsAuditTool {
     ) -> Result<Value, NexusToolError> {
         let root = &ctx.project_root;
         if root.join("Cargo.toml").is_file() {
-            let out = run_cmd(
-                "cargo",
-                &["audit", "--json"],
-                root,
-                ctx.timeout_secs,
-            )
-            .await?;
+            let out = run_cmd("cargo", &["audit", "--json"], root, ctx.timeout_secs).await?;
             let parsed: Value = serde_json::from_str(&out.stdout).unwrap_or(Value::Null);
             let count = count_cargo_audit(&parsed);
             return Ok(json!({
@@ -95,13 +89,7 @@ impl NexusToolHandler for DepsAuditTool {
             }));
         }
         if root.join("requirements.txt").is_file() || root.join("pyproject.toml").is_file() {
-            let out = run_cmd(
-                "pip-audit",
-                &["--format=json"],
-                root,
-                ctx.timeout_secs,
-            )
-            .await?;
+            let out = run_cmd("pip-audit", &["--format=json"], root, ctx.timeout_secs).await?;
             let parsed: Value = serde_json::from_str(&out.stdout).unwrap_or(Value::Null);
             let count = count_pip_audit(&parsed);
             return Ok(json!({

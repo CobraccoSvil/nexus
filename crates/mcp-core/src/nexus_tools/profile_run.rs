@@ -36,11 +36,7 @@ fn stats(samples: &[u64]) -> (f64, u64, u64, u64) {
 
 #[async_trait]
 impl NexusToolHandler for ProfileRunTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let command = args
             .get("command")
             .and_then(Value::as_str)

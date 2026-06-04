@@ -7,7 +7,11 @@ pub struct DeployReleaseArtifactsTool;
 
 #[async_trait]
 impl NexusToolHandler for DeployReleaseArtifactsTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let candidates = [
             "dist",
             "build",
@@ -38,5 +42,7 @@ impl NexusToolHandler for DeployReleaseArtifactsTool {
         }
         Ok(json!({"ok": true, "found": found.len(), "dirs": found}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

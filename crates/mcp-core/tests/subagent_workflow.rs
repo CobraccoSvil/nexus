@@ -15,12 +15,19 @@ fn brain_url() -> String {
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap()
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap()
 }
 
 async fn brain_alive() -> bool {
-    client().get(format!("{}/health", brain_url())).send().await
-        .map(|r| r.status().is_success()).unwrap_or(false)
+    client()
+        .get(format!("{}/health", brain_url()))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
 }
 
 #[tokio::test]
@@ -32,17 +39,29 @@ async fn subagent_poll_not_found_per_uuid_inesistente() {
     let fake = "00000000-0000-0000-0000-000000000000";
     let url = format!("{}/agent/subagent-run/{}", brain_url(), fake);
     let resp = client().get(&url).send().await.expect("request");
-    assert!(resp.status().is_success(), "endpoint deve rispondere 2xx anche per not_found");
+    assert!(
+        resp.status().is_success(),
+        "endpoint deve rispondere 2xx anche per not_found"
+    );
     let body: serde_json::Value = resp.json().await.expect("json");
-    assert_eq!(body.get("error").and_then(|v| v.as_str()), Some("not_found"));
+    assert_eq!(
+        body.get("error").and_then(|v| v.as_str()),
+        Some("not_found")
+    );
 }
 
 #[tokio::test]
 async fn subagent_resume_ritorna_errore_per_uuid_inesistente() {
-    if !brain_alive().await { eprintln!("skip"); return; }
-    let resp = client().post(format!("{}/agent/subagent-resume", brain_url()))
+    if !brain_alive().await {
+        eprintln!("skip");
+        return;
+    }
+    let resp = client()
+        .post(format!("{}/agent/subagent-resume", brain_url()))
         .json(&serde_json::json!({"run_id": "00000000-0000-0000-0000-000000000000"}))
-        .send().await.expect("request");
+        .send()
+        .await
+        .expect("request");
     assert!(resp.status().is_success());
     let body: serde_json::Value = resp.json().await.expect("json");
     let status = body.get("status").and_then(|v| v.as_str()).unwrap_or("");
@@ -55,7 +74,10 @@ async fn subagent_resume_ritorna_errore_per_uuid_inesistente() {
 
 #[tokio::test]
 async fn clarifications_get_ritorna_null_se_nessuna() {
-    if !brain_alive().await { eprintln!("skip"); return; }
+    if !brain_alive().await {
+        eprintln!("skip");
+        return;
+    }
     let fake = "00000000-0000-0000-0000-000000000000";
     let url = format!("{}/agent/clarifications/{}", brain_url(), fake);
     let resp = client().get(&url).send().await.expect("request");

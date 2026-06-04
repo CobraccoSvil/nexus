@@ -20,7 +20,11 @@ pub async fn ensure_collection(
     dim: usize,
 ) -> Result<(), RagError> {
     // Check esistenza
-    let check_url = format!("{}/collections/{}", base_url.trim_end_matches('/'), collection);
+    let check_url = format!(
+        "{}/collections/{}",
+        base_url.trim_end_matches('/'),
+        collection
+    );
     let resp = client
         .get(&check_url)
         .send()
@@ -92,9 +96,7 @@ pub async fn upsert_points(
     if !resp.status().is_success() {
         let st = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(RagError::Qdrant(format!(
-            "upsert fallito: {st} {text}"
-        )));
+        return Err(RagError::Qdrant(format!("upsert fallito: {st} {text}")));
     }
     Ok(())
 }

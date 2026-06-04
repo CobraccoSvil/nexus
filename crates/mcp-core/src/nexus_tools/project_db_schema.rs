@@ -15,20 +15,13 @@ pub struct ProjectDbSchemaTool;
 
 #[async_trait]
 impl NexusToolHandler for ProjectDbSchemaTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let schema = args
             .get("schema")
             .and_then(Value::as_str)
             .unwrap_or("public")
             .to_string();
-        let table_filter = args
-            .get("table")
-            .and_then(Value::as_str)
-            .map(String::from);
+        let table_filter = args.get("table").and_then(Value::as_str).map(String::from);
 
         let nexus_pool = db_helper::get_pool()
             .await
@@ -50,9 +43,7 @@ impl NexusToolHandler for ProjectDbSchemaTool {
         .bind(&schema)
         .fetch_all(&project_pool)
         .await
-        .map_err(|e| {
-            NexusToolError::BadInput(format!("query tables failed: {}", e))
-        })?;
+        .map_err(|e| NexusToolError::BadInput(format!("query tables failed: {}", e)))?;
 
         if let Some(f) = &table_filter {
             tables_q.retain(|r| {
@@ -78,9 +69,7 @@ impl NexusToolHandler for ProjectDbSchemaTool {
             .bind(&table_name)
             .fetch_all(&project_pool)
             .await
-            .map_err(|e| {
-                NexusToolError::BadInput(format!("query cols failed: {}", e))
-            })?;
+            .map_err(|e| NexusToolError::BadInput(format!("query cols failed: {}", e)))?;
 
             let cols_json: Vec<Value> = cols
                 .iter()

@@ -155,7 +155,10 @@ pub async fn event_stream(
         .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
         .into_response();
     let h = resp.headers_mut();
-    h.insert("Cache-Control", HeaderValue::from_static("no-store, no-transform"));
+    h.insert(
+        "Cache-Control",
+        HeaderValue::from_static("no-store, no-transform"),
+    );
     h.insert("X-Accel-Buffering", HeaderValue::from_static("no"));
     Ok(resp)
 }
@@ -229,13 +232,11 @@ pub async fn project_snapshot(
 
     // ── Flags ─────────────────────────────────────────────────────────
     if want(nexus_events::event::TOPIC_FLAGS) {
-        let rows = sqlx::query(
-            "SELECT key, value FROM nexus_project_flags WHERE project_id = $1",
-        )
-        .bind(project_id)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let rows = sqlx::query("SELECT key, value FROM nexus_project_flags WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let mut flags = serde_json::Map::new();
         for row in rows {
             let k: String = row.get("key");
@@ -299,22 +300,35 @@ pub async fn dispatcher_test(
 
     let env = match action {
         "notification" => {
-            let severity = body.get("severity").and_then(Value::as_str).unwrap_or("info").to_string();
-            let message = body.get("message").and_then(Value::as_str).unwrap_or("Test notification").to_string();
+            let severity = body
+                .get("severity")
+                .and_then(Value::as_str)
+                .unwrap_or("info")
+                .to_string();
+            let message = body
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Test notification")
+                .to_string();
             dispatcher::emit(
                 &state.project_channels,
                 project_id,
                 ProjectEvent::Notification {
                     severity,
                     message,
-                    panel: body.get("panel").and_then(Value::as_str).map(str::to_string),
+                    panel: body
+                        .get("panel")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     ttl_ms: body.get("ttl_ms").and_then(Value::as_u64),
                     run_id: None,
                 },
             )
         }
         "set_flag" => {
-            let key = body.get("key").and_then(Value::as_str)
+            let key = body
+                .get("key")
+                .and_then(Value::as_str)
                 .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'key' mancante"))?
                 .to_string();
             let value = body.get("value").cloned().unwrap_or(Value::Null);
@@ -336,29 +350,48 @@ pub async fn dispatcher_test(
             )
         }
         "update_monitor" => {
-            let monitor_id = body.get("monitor_id").and_then(Value::as_str)
+            let monitor_id = body
+                .get("monitor_id")
+                .and_then(Value::as_str)
                 .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'monitor_id' mancante"))?
                 .to_string();
             let value = body.get("value").cloned().unwrap_or(Value::Null);
-            let label = body.get("label").and_then(Value::as_str).map(str::to_string);
+            let label = body
+                .get("label")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             // Salva in registry in-memory (HashMap<Uuid, HashMap<String, Value>>)
             let mut reg = state.monitor_registry.write();
             let project_map = reg.entry(project_id).or_default();
-            project_map.insert(monitor_id.clone(), json!({
-                "value": value.clone(),
-                "label": label.clone(),
-                "updated_at": chrono::Utc::now().to_rfc3339(),
-            }));
+            project_map.insert(
+                monitor_id.clone(),
+                json!({
+                    "value": value.clone(),
+                    "label": label.clone(),
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                }),
+            );
             drop(reg);
             dispatcher::emit(
                 &state.project_channels,
                 project_id,
-                ProjectEvent::MonitorUpdated { monitor_id, value, label },
+                ProjectEvent::MonitorUpdated {
+                    monitor_id,
+                    value,
+                    label,
+                },
             )
         }
         "highlight" => {
-            let panel = body.get("panel").and_then(Value::as_str).unwrap_or("playwright").to_string();
-            let duration_ms = body.get("duration_ms").and_then(Value::as_u64).unwrap_or(2000);
+            let panel = body
+                .get("panel")
+                .and_then(Value::as_str)
+                .unwrap_or("playwright")
+                .to_string();
+            let duration_ms = body
+                .get("duration_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(2000);
             dispatcher::emit(
                 &state.project_channels,
                 project_id,
@@ -366,17 +399,28 @@ pub async fn dispatcher_test(
             )
         }
         "file_changed" => {
-            let path = body.get("path").and_then(Value::as_str)
+            let path = body
+                .get("path")
+                .and_then(Value::as_str)
                 .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'path' mancante"))?
                 .to_string();
-            let op = body.get("op").and_then(Value::as_str).unwrap_or("modified").to_string();
+            let op = body
+                .get("op")
+                .and_then(Value::as_str)
+                .unwrap_or("modified")
+                .to_string();
             dispatcher::emit(
                 &state.project_channels,
                 project_id,
                 ProjectEvent::FileChanged { path, op },
             )
         }
-        other => return Err(api_error(StatusCode::BAD_REQUEST, format!("action sconosciuta: {}", other))),
+        other => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!("action sconosciuta: {}", other),
+            ))
+        }
     };
 
     Ok(Json(json!({

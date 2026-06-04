@@ -24,8 +24,8 @@ use sqlx::PgPool;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::knowledge::{sha256_hex, extract_tags, title_from_content};
-use crate::knowledge::vault::{parse_frontmatter, extract_wikilinks};
+use crate::knowledge::vault::{extract_wikilinks, parse_frontmatter};
+use crate::knowledge::{extract_tags, sha256_hex, title_from_content};
 use crate::orchestrator::NeuralCoreClient;
 use crate::settings;
 
@@ -48,21 +48,12 @@ pub fn start_vault_watcher(
     let watch_path = PathBuf::from(&watch_dir);
 
     if !watch_path.exists() {
-        tracing::debug!(
-            "knowledge_watcher: directory non esiste ancora, skip: {watch_dir}"
-        );
+        tracing::debug!("knowledge_watcher: directory non esiste ancora, skip: {watch_dir}");
         return;
     }
 
     tokio::spawn(async move {
-        let result = run_vault_watcher(
-            db,
-            neural,
-            project_id,
-            watch_path,
-            project_channels,
-        )
-        .await;
+        let result = run_vault_watcher(db, neural, project_id, watch_path, project_channels).await;
 
         if let Err(e) = result {
             tracing::warn!(
@@ -72,9 +63,7 @@ pub fn start_vault_watcher(
         }
     });
 
-    tracing::info!(
-        "knowledge_watcher: avviato per project={project_id} dir={watch_dir}"
-    );
+    tracing::info!("knowledge_watcher: avviato per project={project_id} dir={watch_dir}");
 }
 
 /// Ciclo principale del watcher. Ritorna solo in caso di errore grave o shutdown.
@@ -109,7 +98,11 @@ async fn run_vault_watcher(
 
         let timeout = deadline.map(|d| {
             let now = tokio::time::Instant::now();
-            if d > now { d - now } else { Duration::ZERO }
+            if d > now {
+                d - now
+            } else {
+                Duration::ZERO
+            }
         });
 
         let recv_fut = rx.recv();
@@ -176,11 +169,7 @@ struct PendingEvent {
 // ======================================================================
 
 /// Filtra e accoda gli eventi notify rilevanti.
-fn enqueue_event(
-    pending: &mut HashMap<PathBuf, PendingEvent>,
-    event: &Event,
-    watch_dir: &Path,
-) {
+fn enqueue_event(pending: &mut HashMap<PathBuf, PendingEvent>, event: &Event, watch_dir: &Path) {
     let kind = match &event.kind {
         EventKind::Create(_) => VaultEventKind::CreateOrModify,
         EventKind::Modify(notify::event::ModifyKind::Data(_))
@@ -215,10 +204,8 @@ async fn flush_pending(
     for (path, evt) in events {
         match evt.kind {
             VaultEventKind::CreateOrModify => {
-                if let Err(e) = handle_create_or_modify(
-                    db, neural, project_id, &path, project_channels,
-                )
-                .await
+                if let Err(e) =
+                    handle_create_or_modify(db, neural, project_id, &path, project_channels).await
                 {
                     tracing::debug!(
                         path = %path.display(),
@@ -267,10 +254,7 @@ async fn handle_create_or_modify(
         }
     };
 
-    let note_id_str = frontmatter
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let note_id_str = frontmatter.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let note_id = match note_id_str.parse::<Uuid>() {
         Ok(id) => id,
         Err(_) => {
@@ -341,7 +325,11 @@ async fn handle_create_or_modify(
         .context("update nota da vault fallito")?;
 
         // Re-embedding se il body e' cambiato.
-        let embed_text = if body.len() > 2000 { &body[..2000] } else { &body };
+        let embed_text = if body.len() > 2000 {
+            &body[..2000]
+        } else {
+            &body
+        };
         if let Ok(vector) = neural.embed_text("", embed_text).await {
             // Recupera il point_id Qdrant per l'upsert.
             let point_id: Option<String> = sqlx::query_scalar(
@@ -359,10 +347,8 @@ async fn handle_create_or_modify(
                     "note_id": note_id.to_string(),
                     "status": "active",
                 });
-                let _ = crate::vector_memory::upsert_knowledge_point(
-                    db, &pid, vector, payload,
-                )
-                .await;
+                let _ =
+                    crate::vector_memory::upsert_knowledge_point(db, &pid, vector, payload).await;
             }
         }
 
@@ -376,10 +362,7 @@ async fn handle_create_or_modify(
         let _ = nexus_events::dispatcher::emit(
             project_channels,
             project_id,
-            nexus_events::ProjectEvent::KnowledgeNoteUpdated {
-                note_id,
-                status,
-            },
+            nexus_events::ProjectEvent::KnowledgeNoteUpdated { note_id, status },
         );
 
         tracing::debug!(
@@ -393,12 +376,14 @@ async fn handle_create_or_modify(
             .and_then(|v| v.as_str())
             .unwrap_or("draft");
 
-        let intent = frontmatter
-            .get("intent")
-            .and_then(|v| v.as_str());
+        let intent = frontmatter.get("intent").and_then(|v| v.as_str());
 
         // Genera embedding.
-        let embed_text = if body.len() > 2000 { &body[..2000] } else { &body };
+        let embed_text = if body.len() > 2000 {
+            &body[..2000]
+        } else {
+            &body
+        };
         let point_id = Uuid::new_v4().to_string();
         let mut qdrant_point: Option<String> = None;
 
@@ -408,23 +393,19 @@ async fn handle_create_or_modify(
                 "note_id": note_id.to_string(),
                 "status": status,
             });
-            if crate::vector_memory::upsert_knowledge_point(
-                db, &point_id, vector, payload,
-            )
-            .await
-            .is_ok()
+            if crate::vector_memory::upsert_knowledge_point(db, &point_id, vector, payload)
+                .await
+                .is_ok()
             {
                 qdrant_point = Some(point_id);
             }
         }
 
         // Costruisci vault_file_path relativo.
-        let vault_file_path = path
-            .to_str()
-            .and_then(|s| {
-                s.find(".nexus/knowledge/notes/")
-                    .map(|idx| s[idx..].to_string())
-            });
+        let vault_file_path = path.to_str().and_then(|s| {
+            s.find(".nexus/knowledge/notes/")
+                .map(|idx| s[idx..].to_string())
+        });
 
         sqlx::query(
             r#"
@@ -482,12 +463,10 @@ async fn handle_remove(
     project_channels: &nexus_events::ProjectChannels,
 ) -> anyhow::Result<()> {
     // Cerchiamo la nota dal vault_file_path (relativo).
-    let rel_path = path
-        .to_str()
-        .and_then(|s| {
-            s.find(".nexus/knowledge/notes/")
-                .map(|idx| s[idx..].to_string())
-        });
+    let rel_path = path.to_str().and_then(|s| {
+        s.find(".nexus/knowledge/notes/")
+            .map(|idx| s[idx..].to_string())
+    });
 
     let rel = match rel_path {
         Some(r) => r,

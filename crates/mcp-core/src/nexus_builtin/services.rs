@@ -11,7 +11,14 @@ pub(super) async fn handle_service_status(db: &PgPool, project_id: Uuid) -> Stri
     let prefix = format!("{}-", slug);
 
     let out = match tokio::process::Command::new("systemctl")
-        .args(["--user", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"])
+        .args([
+            "--user",
+            "list-units",
+            "--type=service",
+            "--all",
+            "--no-legend",
+            "--no-pager",
+        ])
         .output()
         .await
     {
@@ -22,12 +29,18 @@ pub(super) async fn handle_service_status(db: &PgPool, project_id: Uuid) -> Stri
     let mut services: Vec<serde_json::Value> = Vec::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 4 { continue; }
+        if cols.len() < 4 {
+            continue;
+        }
         let unit = cols[0].trim_start_matches('●').trim();
-        if !unit.starts_with(&prefix) || !unit.ends_with(".service") { continue; }
+        if !unit.starts_with(&prefix) || !unit.ends_with(".service") {
+            continue;
+        }
         let short = unit
-            .strip_prefix(&prefix).unwrap_or(unit)
-            .strip_suffix(".service").unwrap_or(unit);
+            .strip_prefix(&prefix)
+            .unwrap_or(unit)
+            .strip_suffix(".service")
+            .unwrap_or(unit);
         services.push(serde_json::json!({
             "unit":  unit,
             "short": short,

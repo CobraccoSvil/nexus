@@ -17,11 +17,7 @@ pub struct ClippyLintTool;
 
 #[async_trait]
 impl NexusToolHandler for ClippyLintTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let workspace_member = args
             .get("workspace_member")
             .and_then(Value::as_str)

@@ -49,17 +49,32 @@ pub fn edge_type_to_rel(edge_type: Option<&str>) -> &'static str {
     };
     if t.is_empty() {
         "relates"
-    } else if t.contains("depend") || t.contains("require") || t.contains("need") || t.contains("blocked") {
+    } else if t.contains("depend")
+        || t.contains("require")
+        || t.contains("need")
+        || t.contains("blocked")
+    {
         "blocked_by"
     } else if t == "blocks" || t.contains("block") {
         "blocks"
-    } else if t.contains("contain") || t.contains("parent") || t.contains("include") || t.contains("refine") || t.contains("part_of") || t.contains("subtask") {
+    } else if t.contains("contain")
+        || t.contains("parent")
+        || t.contains("include")
+        || t.contains("refine")
+        || t.contains("part_of")
+        || t.contains("subtask")
+    {
         "refinement"
     } else if t.contains("duplicate") || t.contains("same") || t.contains("alias") {
         "duplicate"
-    } else if t.contains("follow") || t.contains("then") || t.contains("next") || t.contains("seq") {
+    } else if t.contains("follow") || t.contains("then") || t.contains("next") || t.contains("seq")
+    {
         "followup"
-    } else if t.contains("correct") || t.contains("contradic") || t.contains("supersede") || t.contains("replace") {
+    } else if t.contains("correct")
+        || t.contains("contradic")
+        || t.contains("supersede")
+        || t.contains("replace")
+    {
         "correction"
     } else {
         "relates"
@@ -72,7 +87,9 @@ pub fn parse_graph(format: &str, content: &str) -> Result<ImportedGraph, String>
         "json" | "node-link" | "nodelink" | "node_link" => parse_json_node_link(content),
         "mermaid" | "mmd" => Ok(parse_mermaid(content)),
         "dot" | "graphviz" | "gv" => Ok(parse_dot(content)),
-        other => Err(format!("formato non supportato: '{other}' (usa json|mermaid|dot)")),
+        other => Err(format!(
+            "formato non supportato: '{other}' (usa json|mermaid|dot)"
+        )),
     }
 }
 
@@ -134,11 +151,19 @@ fn parse_json_node_link(content: &str) -> Result<ImportedGraph, String> {
         .and_then(|e| e.as_array());
     if let Some(edges) = edges {
         for e in edges {
-            let source = match e.get("source").or_else(|| e.get("from")).and_then(value_to_id) {
+            let source = match e
+                .get("source")
+                .or_else(|| e.get("from"))
+                .and_then(value_to_id)
+            {
                 Some(s) => s,
                 None => continue,
             };
-            let target = match e.get("target").or_else(|| e.get("to")).and_then(value_to_id) {
+            let target = match e
+                .get("target")
+                .or_else(|| e.get("to"))
+                .and_then(value_to_id)
+            {
                 Some(t) => t,
                 None => continue,
             };
@@ -277,9 +302,7 @@ fn extract_dot_label(attrs: &str) -> Option<String> {
         let end = stripped.find('"')?;
         Some(stripped[..end].to_string())
     } else {
-        let end = rest
-            .find([',', ']', ' '])
-            .unwrap_or(rest.len());
+        let end = rest.find([',', ']', ' ']).unwrap_or(rest.len());
         let v = rest[..end].trim();
         if v.is_empty() {
             None
@@ -361,7 +384,10 @@ mod tests {
         .unwrap();
         assert_eq!(g.nodes.len(), 2);
         assert_eq!(g.edges.len(), 1);
-        assert_eq!(edge_type_to_rel(g.edges[0].edge_type.as_deref()), "blocked_by");
+        assert_eq!(
+            edge_type_to_rel(g.edges[0].edge_type.as_deref()),
+            "blocked_by"
+        );
     }
 
     #[test]

@@ -39,10 +39,7 @@ fn err_json(msg: impl Into<String>) -> String {
 /// Lista gli allegati di una sessione chat.
 ///
 /// Input: { "session_id": <uuid?> } — opzionale, default = ctx.session_id.
-pub(super) async fn tool_nexus_list_attachments(
-    ctx: &AgentToolContext,
-    input: &Value,
-) -> String {
+pub(super) async fn tool_nexus_list_attachments(ctx: &AgentToolContext, input: &Value) -> String {
     let session_id: Uuid = match input.get("session_id").and_then(Value::as_str) {
         Some(s) => match Uuid::parse_str(s) {
             Ok(u) => u,
@@ -105,10 +102,7 @@ pub(super) async fn tool_nexus_list_attachments(
 ///
 /// Input: { "attachment_id": <uuid>, "encoding"?: "auto|text|base64",
 ///          "offset"?: u64, "length"?: usize }
-pub(super) async fn tool_nexus_read_attachment(
-    ctx: &AgentToolContext,
-    input: &Value,
-) -> String {
+pub(super) async fn tool_nexus_read_attachment(ctx: &AgentToolContext, input: &Value) -> String {
     let attachment_id: Uuid = match input.get("attachment_id").and_then(Value::as_str) {
         Some(s) => match Uuid::parse_str(s) {
             Ok(u) => u,
@@ -247,7 +241,9 @@ async fn read_attachment_raw(
 
     // Decisione encoding.
     let is_text_like = mime_type.starts_with("text/")
-        || TEXT_LIKE_MIMES.iter().any(|m| mime_type.eq_ignore_ascii_case(m));
+        || TEXT_LIKE_MIMES
+            .iter()
+            .any(|m| mime_type.eq_ignore_ascii_case(m));
     let encoding = match encoding_req.as_str() {
         "text" => "text",
         "base64" => "base64",

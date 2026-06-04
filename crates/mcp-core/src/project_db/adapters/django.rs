@@ -1,9 +1,11 @@
 //! Adapter Django — crea migration tramite `python manage.py makemigrations`.
 
+use super::{sha256_hex, MigrationAdapter};
+use crate::project_db::{
+    AppliedMigration, Migration, ProjectDbContext, ProjectDbError, RolledBackMigration,
+};
 use async_trait::async_trait;
 use std::path::PathBuf;
-use crate::project_db::{Migration, AppliedMigration, RolledBackMigration, ProjectDbError, ProjectDbContext};
-use super::{MigrationAdapter, sha256_hex};
 
 pub struct DjangoAdapter;
 
@@ -11,7 +13,9 @@ pub struct DjangoAdapter;
 impl MigrationAdapter for DjangoAdapter {
     async fn list_pending(&self, ctx: &ProjectDbContext) -> Result<Vec<Migration>, ProjectDbError> {
         let dir = ctx.project_root.join(&ctx.migration_path);
-        if !dir.exists() { return Ok(vec![]); }
+        if !dir.exists() {
+            return Ok(vec![]);
+        }
         let mut files: Vec<_> = std::fs::read_dir(&dir)?
             .flatten()
             .filter(|e| {
@@ -24,7 +28,11 @@ impl MigrationAdapter for DjangoAdapter {
         for entry in files {
             let path = entry.path();
             let content = std::fs::read_to_string(&path).unwrap_or_default();
-            let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let filename = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             result.push(Migration {
                 filename: filename.clone(),
                 checksum: sha256_hex(&content),
@@ -49,7 +57,10 @@ impl MigrationAdapter for DjangoAdapter {
             .map_err(|e| ProjectDbError::Adapter(format!("makemigrations: {}", e)))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ProjectDbError::Adapter(format!("makemigrations fallita: {}", stderr)));
+            return Err(ProjectDbError::Adapter(format!(
+                "makemigrations fallita: {}",
+                stderr
+            )));
         }
         Ok(ctx.project_root.join(&ctx.migration_path))
     }
@@ -67,7 +78,10 @@ impl MigrationAdapter for DjangoAdapter {
             .map_err(|e| ProjectDbError::Adapter(format!("migrate: {}", e)))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ProjectDbError::Adapter(format!("django migrate fallita: {}", stderr)));
+            return Err(ProjectDbError::Adapter(format!(
+                "django migrate fallita: {}",
+                stderr
+            )));
         }
         Ok(vec![])
     }

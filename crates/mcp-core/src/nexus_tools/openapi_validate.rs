@@ -71,7 +71,12 @@ fn validate_spec(spec: &Value) -> Report {
     match spec.get("info") {
         None => report.errors.push("missing 'info' object".into()),
         Some(info) => {
-            if info.get("title").and_then(Value::as_str).unwrap_or("").is_empty() {
+            if info
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty()
+            {
                 report.errors.push("missing 'info.title'".into());
             }
             if info
@@ -122,11 +127,7 @@ fn validate_spec(spec: &Value) -> Report {
 
 #[async_trait]
 impl NexusToolHandler for OpenApiValidateTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let content_inline = args.get("content").and_then(Value::as_str);
         let (content, path_hint): (String, String) = if let Some(c) = content_inline {
             (c.to_string(), "inline.json".to_string())

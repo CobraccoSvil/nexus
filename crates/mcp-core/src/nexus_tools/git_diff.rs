@@ -13,11 +13,7 @@ pub struct GitDiffTool;
 
 #[async_trait]
 impl NexusToolHandler for GitDiffTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let path = args.get("path").and_then(Value::as_str).map(String::from);
         let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
         let revision = args

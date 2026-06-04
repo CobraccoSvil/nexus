@@ -13,21 +13,14 @@ pub struct TestCoverageTool;
 
 #[async_trait]
 impl NexusToolHandler for TestCoverageTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let workspace_member = args
             .get("workspace_member")
             .and_then(Value::as_str)
             .map(String::from);
 
-        let mut cmd: Vec<String> = vec![
-            "llvm-cov".into(),
-            "--json".into(),
-            "--summary-only".into(),
-        ];
+        let mut cmd: Vec<String> =
+            vec!["llvm-cov".into(), "--json".into(), "--summary-only".into()];
         if let Some(m) = &workspace_member {
             cmd.push("-p".into());
             cmd.push(m.clone());

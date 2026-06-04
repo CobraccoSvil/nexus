@@ -7,7 +7,11 @@ pub struct BuildDebugSizeTool;
 
 #[async_trait]
 impl NexusToolHandler for BuildDebugSizeTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let dir = ctx.project_root.join("target").join("debug");
         if !dir.is_dir() {
             return Ok(json!({"ok": true, "exists": false, "total_bytes": 0}));
@@ -29,5 +33,7 @@ impl NexusToolHandler for BuildDebugSizeTool {
         }
         Ok(json!({"ok": true, "exists": true, "total_bytes": total, "binary_count": count}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

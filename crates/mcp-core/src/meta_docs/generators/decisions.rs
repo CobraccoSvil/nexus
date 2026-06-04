@@ -63,9 +63,7 @@ impl MetaDocGenerator for DecisionExtractor {
         let mut found: Vec<(String, DateTime<Utc>)> = Vec::new();
         for r in &rows {
             let content: String = r.try_get("content").unwrap_or_default();
-            let created_at: DateTime<Utc> = r
-                .try_get("created_at")
-                .unwrap_or_else(|_| Utc::now());
+            let created_at: DateTime<Utc> = r.try_get("created_at").unwrap_or_else(|_| Utc::now());
             for pat in &patterns {
                 for m in pat.find_iter(&content) {
                     let s = m.as_str().trim().to_string();

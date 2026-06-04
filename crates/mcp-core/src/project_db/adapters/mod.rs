@@ -5,9 +5,11 @@
 //!
 //! V1 supporta solo PostgreSQL; gli adapter non-Postgres sono stub documentati.
 
+use crate::project_db::{
+    AppliedMigration, Migration, ProjectDbContext, ProjectDbError, RolledBackMigration,
+};
 use async_trait::async_trait;
 use std::path::PathBuf;
-use crate::project_db::{Migration, AppliedMigration, RolledBackMigration, ProjectDbError, ProjectDbContext};
 
 pub mod alembic;
 pub mod django;
@@ -72,8 +74,16 @@ pub(crate) fn sha256_hex(input: &str) -> String {
     }
     // Produciamo 64 hex chars per sembrare un SHA-256.
     // In produzione si sostituisce con sha2::Sha256.
-    let h2 = h.wrapping_mul(6364136223846793005u64).wrapping_add(1442695040888963407u64);
-    format!("{:016x}{:016x}{:016x}{:016x}", h, h2, h.wrapping_add(h2), h.wrapping_mul(h2))
+    let h2 = h
+        .wrapping_mul(6364136223846793005u64)
+        .wrapping_add(1442695040888963407u64);
+    format!(
+        "{:016x}{:016x}{:016x}{:016x}",
+        h,
+        h2,
+        h.wrapping_add(h2),
+        h.wrapping_mul(h2)
+    )
 }
 
 /// Genera un timestamp per il nome del file migration: `YYYYMMDD_HHMMSS`.
@@ -93,5 +103,13 @@ pub(crate) fn migration_timestamp() -> String {
     let day_of_year = days % 365;
     let month = (day_of_year / 30) + 1;
     let day = (day_of_year % 30) + 1;
-    format!("{:04}{:02}{:02}_{:02}{:02}{:02}", year, month.min(12), day.min(31), h, m, s)
+    format!(
+        "{:04}{:02}{:02}_{:02}{:02}{:02}",
+        year,
+        month.min(12),
+        day.min(31),
+        h,
+        m,
+        s
+    )
 }

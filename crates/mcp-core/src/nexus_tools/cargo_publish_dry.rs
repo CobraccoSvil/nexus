@@ -8,7 +8,11 @@ pub struct CargoPublishDryTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoPublishDryTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let out = run_cmd(
             "cargo",
             &["publish", "--dry-run", "--allow-dirty"],
@@ -23,5 +27,7 @@ impl NexusToolHandler for CargoPublishDryTool {
             "duration_ms": out.duration_ms,
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::write_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::write_subproc()
+    }
 }

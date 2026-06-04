@@ -13,11 +13,7 @@ pub struct ProjectRegisterExistingDirTool;
 
 #[async_trait]
 impl NexusToolHandler for ProjectRegisterExistingDirTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let path_str = args
             .get("path")
             .and_then(Value::as_str)
@@ -78,7 +74,10 @@ impl NexusToolHandler for ProjectRegisterExistingDirTool {
             Ok(out) if out.status.success() => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let lines: Vec<&str> = stdout.trim().lines().collect();
-                let branch = lines.get(1).map(|s| s.to_string()).unwrap_or_else(|| "main".to_string());
+                let branch = lines
+                    .get(1)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "main".to_string());
                 (true, branch)
             }
             _ => (false, "main".to_string()),
@@ -95,14 +94,13 @@ impl NexusToolHandler for ProjectRegisterExistingDirTool {
         let workspace_id = Uuid::new_v4();
         let repository_id = Uuid::new_v4();
 
-        let team_id: Uuid = sqlx::query_scalar(
-            "SELECT id FROM teams WHERE owner_user_id = $1 LIMIT 1",
-        )
-        .bind(ctx.user_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| NexusToolError::BadInput(format!("lookup team: {}", e)))?
-        .unwrap_or_else(Uuid::new_v4);
+        let team_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM teams WHERE owner_user_id = $1 LIMIT 1")
+                .bind(ctx.user_id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| NexusToolError::BadInput(format!("lookup team: {}", e)))?
+                .unwrap_or_else(Uuid::new_v4);
 
         let slug = format!(
             "{}-{}",

@@ -8,9 +8,15 @@ pub struct PerfBoxCountTool;
 
 #[async_trait]
 impl NexusToolHandler for PerfBoxCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(&ctx.project_root, &["Box<dyn ", "Box::new("]);
         Ok(json!({"ok": true, "files_scanned": files, "box_dyn": counts[0], "box_new": counts[1]}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

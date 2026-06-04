@@ -7,7 +7,11 @@ pub struct PerfCodegenUnitsTool;
 
 #[async_trait]
 impl NexusToolHandler for PerfCodegenUnitsTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let cargo = ctx.project_root.join("Cargo.toml");
         if !cargo.is_file() {
             return Ok(json!({"ok": false, "error": "Cargo.toml not found"}));
@@ -30,5 +34,7 @@ impl NexusToolHandler for PerfCodegenUnitsTool {
         }
         Ok(json!({"ok": true, "codegen_units": value, "default": value.is_none()}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

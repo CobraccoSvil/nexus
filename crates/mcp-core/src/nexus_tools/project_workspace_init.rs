@@ -14,11 +14,7 @@ pub struct ProjectWorkspaceInitTool;
 
 #[async_trait]
 impl NexusToolHandler for ProjectWorkspaceInitTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let path_str = args
             .get("path")
             .and_then(Value::as_str)
@@ -52,13 +48,12 @@ impl NexusToolHandler for ProjectWorkspaceInitTool {
             .map_err(|e| NexusToolError::BadInput(format!("nexus db: {}", e)))?;
 
         // Verifica che il progetto esista
-        let project_exists: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM projects WHERE id = $1",
-        )
-        .bind(ctx.project_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| NexusToolError::BadInput(format!("lookup progetto: {}", e)))?;
+        let project_exists: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM projects WHERE id = $1")
+                .bind(ctx.project_id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| NexusToolError::BadInput(format!("lookup progetto: {}", e)))?;
 
         if project_exists.is_none() {
             pool.close().await;

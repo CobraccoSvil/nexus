@@ -9,8 +9,16 @@ pub struct DbDeadTuplesTool;
 
 #[async_trait]
 impl NexusToolHandler for DbDeadTuplesTool {
-    async fn execute(&self, _ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(20).clamp(1, 200);
+    async fn execute(
+        &self,
+        _ctx: &NexusToolContext,
+        args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_i64)
+            .unwrap_or(20)
+            .clamp(1, 200);
         let pool = match db_helper::get_pool().await {
             Ok(p) => p,
             Err(e) => return Ok(json!({"ok": false, "error": e})),
@@ -34,6 +42,11 @@ impl NexusToolHandler for DbDeadTuplesTool {
         json!({"type":"object","properties":{"limit":{"type":"integer"}}})
     }
     fn safety(&self) -> NexusToolSafety {
-        NexusToolSafety { read_only: true, can_write_filesystem: false, can_execute_subproc: false, network_egress: true }
+        NexusToolSafety {
+            read_only: true,
+            can_write_filesystem: false,
+            can_execute_subproc: false,
+            network_egress: true,
+        }
     }
 }

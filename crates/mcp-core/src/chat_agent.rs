@@ -34,14 +34,15 @@ pub async fn agent_stream(
     Extension(claims): Extension<Claims>,
     AxumPath(session_id): AxumPath<String>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Sse<futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>>>, ApiError> {
+) -> Result<
+    Sse<futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>>>,
+    ApiError,
+> {
     let _user_id = parse_user_id(&claims)?;
     let _session_id = Uuid::parse_str(&session_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Session id non valido"))?;
 
-    let run_id: Option<Uuid> = params
-        .get("run_id")
-        .and_then(|s| Uuid::parse_str(s).ok());
+    let run_id: Option<Uuid> = params.get("run_id").and_then(|s| Uuid::parse_str(s).ok());
 
     // ── REPLAY dal DB ─────────────────────────────────────────────────────
     // Race condition fix: il client riceve la response POST /messages e POI
@@ -84,18 +85,22 @@ pub async fn agent_stream(
             }
         }
         // Se il run e' gia' terminato, emette agent_final con final_answer
-        if let Ok(Some(run_row)) = sqlx::query(
-            "SELECT status, final_answer FROM agent_runs WHERE id = $1",
-        )
-        .bind(rid)
-        .fetch_optional(&state.db)
-        .await
+        if let Ok(Some(run_row)) =
+            sqlx::query("SELECT status, final_answer FROM agent_runs WHERE id = $1")
+                .bind(rid)
+                .fetch_optional(&state.db)
+                .await
         {
             let status: String = run_row.try_get("status").unwrap_or_default();
             let is_terminal = matches!(
                 status.as_str(),
-                "completed" | "failed" | "timed_out" | "cancelled" | "interrupted"
-                    | "loop_aborted" | "provider_unavailable"
+                "completed"
+                    | "failed"
+                    | "timed_out"
+                    | "cancelled"
+                    | "interrupted"
+                    | "loop_aborted"
+                    | "provider_unavailable"
             );
             if is_terminal {
                 let final_answer: Option<String> = run_row.try_get("final_answer").unwrap_or(None);
@@ -115,7 +120,11 @@ pub async fn agent_stream(
     let sender = if let Some(rid) = run_id {
         state.agent_channels.get(&rid).map(|e| e.value().clone())
     } else {
-        state.agent_channels.iter().next().map(|e| e.value().clone())
+        state
+            .agent_channels
+            .iter()
+            .next()
+            .map(|e| e.value().clone())
     };
 
     let live_stream: futures::stream::BoxStream<'static, Result<Event, std::convert::Infallible>> =
@@ -397,7 +406,10 @@ pub async fn confirm_agent_run(
 
     let status: String = run.try_get("status").unwrap_or_default();
     if status != "awaiting_confirmation" {
-        return Err(api_error(StatusCode::CONFLICT, "Il run non e' in attesa di conferma"));
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "Il run non e' in attesa di conferma",
+        ));
     }
 
     if !body.approved {
@@ -407,7 +419,9 @@ pub async fn confirm_agent_run(
             .execute(&state.db)
             .await
             .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        return Ok(Json(json!({ "runId": run_id.to_string(), "status": "cancelled" })));
+        return Ok(Json(
+            json!({ "runId": run_id.to_string(), "status": "cancelled" }),
+        ));
     }
 
     // Approvato: delega la ripresa del loop al brain LangGraph via
@@ -439,14 +453,16 @@ pub async fn confirm_agent_run(
             "status": "running",
         }))),
         Err(e) => {
-            tracing::error!("confirm_agent_run: brain resume_run fallito run_id={} err={}", run_id, e);
+            tracing::error!(
+                "confirm_agent_run: brain resume_run fallito run_id={} err={}",
+                run_id,
+                e
+            );
             // Riporta il run a awaiting_confirmation per non lasciarlo appeso.
-            let _ = sqlx::query(
-                "UPDATE agent_runs SET status='awaiting_confirmation' WHERE id=$1",
-            )
-            .bind(run_id)
-            .execute(&state.db)
-            .await;
+            let _ = sqlx::query("UPDATE agent_runs SET status='awaiting_confirmation' WHERE id=$1")
+                .bind(run_id)
+                .execute(&state.db)
+                .await;
             Err(api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Brain non raggiungibile per approve: {e}"),
@@ -482,7 +498,9 @@ pub async fn cancel_agent_run(
 
     let status: String = run.get::<String, _>("status");
     if status != "running" && status != "awaiting_confirmation" {
-        return Ok(Json(json!({ "runId": run_id.to_string(), "status": status, "message": "Run già terminato" })));
+        return Ok(Json(
+            json!({ "runId": run_id.to_string(), "status": status, "message": "Run già terminato" }),
+        ));
     }
 
     sqlx::query(
@@ -510,5 +528,7 @@ pub async fn cancel_agent_run(
         });
     }
 
-    Ok(Json(json!({ "runId": run_id.to_string(), "status": "cancelled" })))
+    Ok(Json(
+        json!({ "runId": run_id.to_string(), "status": "cancelled" }),
+    ))
 }

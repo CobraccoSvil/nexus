@@ -7,7 +7,11 @@ pub struct DocApiListTool;
 
 #[async_trait]
 impl NexusToolHandler for DocApiListTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let dir = ctx.project_root.join("docs").join("api");
         if !dir.is_dir() {
             return Ok(json!({"ok": true, "exists": false, "files": []}));
@@ -24,5 +28,7 @@ impl NexusToolHandler for DocApiListTool {
         files.sort();
         Ok(json!({"ok": true, "exists": true, "count": files.len(), "files": files}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

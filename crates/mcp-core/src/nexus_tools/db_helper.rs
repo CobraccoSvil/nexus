@@ -12,13 +12,29 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 
 /// Parole chiave DDL che richiedono il blocco quando il target è un progetto utente.
 const DDL_KEYWORDS: &[&str] = &[
-    "CREATE TABLE", "CREATE INDEX", "CREATE VIEW", "CREATE SEQUENCE",
-    "CREATE TYPE", "CREATE FUNCTION", "CREATE TRIGGER", "CREATE SCHEMA",
-    "ALTER TABLE", "ALTER COLUMN", "ALTER INDEX",
-    "DROP TABLE", "DROP INDEX", "DROP VIEW", "DROP COLUMN",
-    "DROP SCHEMA", "DROP SEQUENCE", "DROP TYPE", "DROP FUNCTION",
+    "CREATE TABLE",
+    "CREATE INDEX",
+    "CREATE VIEW",
+    "CREATE SEQUENCE",
+    "CREATE TYPE",
+    "CREATE FUNCTION",
+    "CREATE TRIGGER",
+    "CREATE SCHEMA",
+    "ALTER TABLE",
+    "ALTER COLUMN",
+    "ALTER INDEX",
+    "DROP TABLE",
+    "DROP INDEX",
+    "DROP VIEW",
+    "DROP COLUMN",
+    "DROP SCHEMA",
+    "DROP SEQUENCE",
+    "DROP TYPE",
+    "DROP FUNCTION",
     "DROP TRIGGER",
-    "TRUNCATE", "RENAME TABLE", "RENAME COLUMN",
+    "TRUNCATE",
+    "RENAME TABLE",
+    "RENAME COLUMN",
 ];
 
 /// Controlla se un testo SQL contiene istruzioni DDL che modificano lo schema.
@@ -40,8 +56,7 @@ pub fn ddl_blocked_response(project_id: uuid::Uuid) -> String {
 }
 
 pub async fn get_pool() -> Result<PgPool, String> {
-    let db_url = std::env::var("DATABASE_URL")
-        .map_err(|_| "DATABASE_URL not set".to_string())?;
+    let db_url = std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL not set".to_string())?;
     PgPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(std::time::Duration::from_secs(5))
@@ -221,13 +236,12 @@ pub async fn ensure_project_db_isolation(
     let password = generate_db_password();
 
     // Controlla se il ruolo esiste gia'
-    let role_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)",
-    )
-    .bind(&role_name)
-    .fetch_one(nexus_pool)
-    .await
-    .unwrap_or(false);
+    let role_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)")
+            .bind(&role_name)
+            .fetch_one(nexus_pool)
+            .await
+            .unwrap_or(false);
 
     if role_exists {
         // Ruolo gia' creato: aggiorna solo la password e ritorna il DSN
@@ -261,13 +275,12 @@ pub async fn ensure_project_db_isolation(
     }
 
     // Controlla se il database esiste
-    let db_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
-    )
-    .bind(&db_name)
-    .fetch_one(nexus_pool)
-    .await
-    .unwrap_or(false);
+    let db_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(&db_name)
+            .fetch_one(nexus_pool)
+            .await
+            .unwrap_or(false);
 
     if !db_exists {
         let create_db = format!(
@@ -439,7 +452,9 @@ mod tests {
     #[test]
     fn test_contains_ddl_allows_select() {
         assert!(!contains_ddl_statement("SELECT * FROM users"));
-        assert!(!contains_ddl_statement("WITH cte AS (SELECT 1) SELECT * FROM cte"));
+        assert!(!contains_ddl_statement(
+            "WITH cte AS (SELECT 1) SELECT * FROM cte"
+        ));
     }
 
     #[test]

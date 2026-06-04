@@ -136,15 +136,21 @@ pub(crate) async fn run_one_round(
         .await
         .ok()
         .flatten()
-        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .map(|v| {
+            !matches!(
+                v.trim().to_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(true);
-    let tool_failure_threshold = crate::settings::get_setting(db, "agent.model_tool_failure_threshold")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.trim().parse::<i32>().ok())
-        .filter(|t| *t > 0)
-        .unwrap_or(3);
+    let tool_failure_threshold =
+        crate::settings::get_setting(db, "agent.model_tool_failure_threshold")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .filter(|t| *t > 0)
+            .unwrap_or(3);
 
     for (provider, model, consecutive_failures, supports_tool_use, tool_failures) in models {
         // Salta se il provider e' in cooldown lungo: faremmo solo rumore
@@ -155,7 +161,16 @@ pub(crate) async fn run_one_round(
             continue;
         }
 
-        match probe_one_model(orchestrator, db, &provider, &model, consecutive_failures, failure_threshold).await {
+        match probe_one_model(
+            orchestrator,
+            db,
+            &provider,
+            &model,
+            consecutive_failures,
+            failure_threshold,
+        )
+        .await
+        {
             ProbeOutcome::Ok => stats.healthy += 1,
             ProbeOutcome::ProviderWide => stats.provider_wide_errors += 1,
             ProbeOutcome::ModelSpecificCounted => stats.model_errors += 1,
@@ -172,7 +187,12 @@ pub(crate) async fn run_one_round(
         // vengono toccati. Il provider in cooldown e' gia' stato saltato sopra.
         if tool_probe_enabled && supports_tool_use {
             match tool_probe_one_model(
-                orchestrator, db, &provider, &model, tool_failures, tool_failure_threshold,
+                orchestrator,
+                db,
+                &provider,
+                &model,
+                tool_failures,
+                tool_failure_threshold,
             )
             .await
             {
@@ -244,9 +264,7 @@ enum ToolProbeOutcome {
 
 /// Legge i modelli enabled dal catalog. Ritorna
 /// (provider, model, consecutive_failures, supports_tool_use, consecutive_tool_failures).
-async fn load_enabled_models(
-    db: &PgPool,
-) -> sqlx::Result<Vec<(String, String, i32, bool, i32)>> {
+async fn load_enabled_models(db: &PgPool) -> sqlx::Result<Vec<(String, String, i32, bool, i32)>> {
     let rows = sqlx::query(
         "SELECT provider, model, consecutive_failures, \
                 COALESCE(supports_tool_use, false) AS supports_tool_use, \
@@ -283,7 +301,9 @@ async fn probe_one_model(
     let started = Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(PROBE_TIMEOUT_S),
-        orchestrator.neural.generate_completion(provider, model, PROBE_PROMPT),
+        orchestrator
+            .neural
+            .generate_completion(provider, model, PROBE_PROMPT),
     )
     .await;
     let latency_ms = started.elapsed().as_millis() as i32;
@@ -338,7 +358,10 @@ async fn probe_one_model(
         }
         Ok(Err(e)) => {
             // Errore di trasporto/gRPC: classificazione via il punto UNICO.
-            let ec = orchestrator.neural.classify_error(&e.to_string(), provider).await;
+            let ec = orchestrator
+                .neural
+                .classify_error(&e.to_string(), provider)
+                .await;
             classification_from_error_class(&ec)
         }
         Err(_timeout_elapsed) => Classification::ModelSpecific(
@@ -479,7 +502,9 @@ pub(crate) fn evaluate_tool_probe(response: &serde_json::Value) -> ToolProbeVerd
         return match classification_from_error_class(ec) {
             Classification::ProviderWide(kind, _) => ToolProbeVerdict::ProviderWide(kind),
             Classification::ModelSpecific(kind, _) => ToolProbeVerdict::ToolFailed(kind),
-            Classification::Ok => ToolProbeVerdict::ToolFailed("unexpected_ok_with_error_class".into()),
+            Classification::Ok => {
+                ToolProbeVerdict::ToolFailed("unexpected_ok_with_error_class".into())
+            }
         };
     }
 
@@ -497,9 +522,9 @@ pub(crate) fn evaluate_tool_probe(response: &serde_json::Value) -> ToolProbeVerd
         .get("tool_use_blocks")
         .and_then(|v| v.as_array())
         .map(|blocks| {
-            blocks.iter().any(|b| {
-                b.get("name").and_then(|n| n.as_str()) == Some(TOOL_PROBE_TOOL_NAME)
-            })
+            blocks
+                .iter()
+                .any(|b| b.get("name").and_then(|n| n.as_str()) == Some(TOOL_PROBE_TOOL_NAME))
         })
         .unwrap_or(false);
     if has_valid_tool_call {
@@ -571,7 +596,10 @@ async fn tool_probe_one_model(
     let verdict = match result {
         Ok(Ok(response)) => evaluate_tool_probe(&response),
         Ok(Err(e)) => {
-            let ec = orchestrator.neural.classify_error(&e.to_string(), provider).await;
+            let ec = orchestrator
+                .neural
+                .classify_error(&e.to_string(), provider)
+                .await;
             match classification_from_error_class(&ec) {
                 Classification::ProviderWide(kind, _) => ToolProbeVerdict::ProviderWide(kind),
                 Classification::ModelSpecific(kind, _) => ToolProbeVerdict::ToolFailed(kind),
@@ -783,7 +811,9 @@ pub(crate) async fn probe_model_on_insert(
 ) -> ProbeOnInsertResult {
     let result = tokio::time::timeout(
         Duration::from_secs(PROBE_TIMEOUT_S),
-        orchestrator.neural.generate_completion(provider, model, PROBE_PROMPT),
+        orchestrator
+            .neural
+            .generate_completion(provider, model, PROBE_PROMPT),
     )
     .await;
     match result {
@@ -799,17 +829,26 @@ pub(crate) async fn probe_model_on_insert(
                     .trim_start_matches("Error:")
                     .trim_start_matches("error:")
                     .trim();
-                match classification_from_error_class(&orchestrator.neural.classify_error(inner, provider).await) {
+                match classification_from_error_class(
+                    &orchestrator.neural.classify_error(inner, provider).await,
+                ) {
                     Classification::Ok => ProbeOnInsertResult::Healthy,
-                    Classification::ProviderWide(kind, _) => ProbeOnInsertResult::ProviderDown(kind),
-                    Classification::ModelSpecific(kind, _) => ProbeOnInsertResult::ModelBroken(kind),
+                    Classification::ProviderWide(kind, _) => {
+                        ProbeOnInsertResult::ProviderDown(kind)
+                    }
+                    Classification::ModelSpecific(kind, _) => {
+                        ProbeOnInsertResult::ModelBroken(kind)
+                    }
                 }
             } else {
                 ProbeOnInsertResult::Healthy
             }
         }
         Ok(Err(e)) => {
-            let ec = orchestrator.neural.classify_error(&e.to_string(), provider).await;
+            let ec = orchestrator
+                .neural
+                .classify_error(&e.to_string(), provider)
+                .await;
             match classification_from_error_class(&ec) {
                 Classification::Ok => ProbeOnInsertResult::Healthy,
                 Classification::ProviderWide(kind, _) => ProbeOnInsertResult::ProviderDown(kind),
@@ -831,22 +870,21 @@ pub(crate) fn classification_from_error_class(ec: &str) -> Classification {
             Classification::ProviderWide("credit_balance_too_low".into(), Some(ec.into()))
         }
         // 401: credenziali invalide -> tutto il provider e' inutilizzabile.
-        "auth_error" => {
-            Classification::ProviderWide("auth_error".into(), Some(ec.into()))
-        }
+        "auth_error" => Classification::ProviderWide("auth_error".into(), Some(ec.into())),
         // 403 forbidden -> NON e' un problema di credenziali ma di accesso a
         // quel modello/risorsa (es. Mistral 403 labs_not_enabled: modello Labs
         // non abilitato nell'org). E' model-specific come not_found: si
         // disabilita/conteggia il singolo modello, non si spegne l'intero
         // provider con long cooldown 6h.
-        "forbidden" => {
-            Classification::ModelSpecific("model_forbidden".into(), Some(ec.into()))
-        }
+        "forbidden" => Classification::ModelSpecific("model_forbidden".into(), Some(ec.into())),
         // Transienti -> short cooldown
-        "rate_limit" | "overloaded" | "service_unavailable" | "bad_gateway" | "provider_error"
-        | "timeout" | "connection_error" => {
-            Classification::ProviderWide("rate_limit".into(), Some(ec.into()))
-        }
+        "rate_limit"
+        | "overloaded"
+        | "service_unavailable"
+        | "bad_gateway"
+        | "provider_error"
+        | "timeout"
+        | "connection_error" => Classification::ProviderWide("rate_limit".into(), Some(ec.into())),
         // Model-specific -> conteggio/auto-disable del modello
         "not_found" => Classification::ModelSpecific("model_not_found".into(), Some(ec.into())),
         "context_too_long" | "invalid_request" | "unprocessable" | "unsupported" => {
@@ -953,7 +991,9 @@ mod tests {
     #[test]
     fn classification_billing_da_error_class() {
         let c = classification_from_error_class("billing_error");
-        assert!(matches!(c, Classification::ProviderWide(ref k, _) if k == "credit_balance_too_low"));
+        assert!(
+            matches!(c, Classification::ProviderWide(ref k, _) if k == "credit_balance_too_low")
+        );
     }
 
     #[test]

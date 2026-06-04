@@ -15,9 +15,9 @@
 //! - La collection Qdrant usata è configurabile via setting `qdrant_mcp_tools_collection`
 //! - L'hash SHA-256 dei primi 256 char di (name+description) serve per skip idempotente
 
-use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
-use sqlx::{PgPool, QueryBuilder, Postgres, Row};
+use sha2::{Digest, Sha256};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use uuid::Uuid;
 
 use crate::mcp_connectors;
@@ -46,16 +46,14 @@ const MAX_SEARCH_TOKENS: usize = 12;
 /// query, migration, table...) che restano significativi per il ranking.
 const SEARCH_STOPWORDS: &[&str] = &[
     // italiano
-    "una", "uno", "del", "dei", "delle", "della", "dello", "sul", "sui",
-    "sulla", "con", "per", "che", "non", "come", "dove", "quando", "questo",
-    "questa", "quello", "quella", "nel", "nella", "negli", "alla", "allo",
-    "agli", "dal", "dalla", "tra", "fra", "gli", "lei", "lui", "noi", "voi",
-    "loro", "suo", "sua", "mio", "mia", "tuo", "tua", "fare", "essere",
-    "avere", "esegui", "eseguire", "crea", "creare", "vuoi", "puoi",
-    // inglese
-    "and", "the", "for", "with", "that", "this", "from", "into", "your",
-    "you", "can", "are", "was", "were", "has", "have", "his", "her", "its",
-    "our", "their", "want", "create", "make", "run", "exec", "execute",
+    "una", "uno", "del", "dei", "delle", "della", "dello", "sul", "sui", "sulla", "con", "per",
+    "che", "non", "come", "dove", "quando", "questo", "questa", "quello", "quella", "nel", "nella",
+    "negli", "alla", "allo", "agli", "dal", "dalla", "tra", "fra", "gli", "lei", "lui", "noi",
+    "voi", "loro", "suo", "sua", "mio", "mia", "tuo", "tua", "fare", "essere", "avere", "esegui",
+    "eseguire", "crea", "creare", "vuoi", "puoi", // inglese
+    "and", "the", "for", "with", "that", "this", "from", "into", "your", "you", "can", "are", "was",
+    "were", "has", "have", "his", "her", "its", "our", "their", "want", "create", "make", "run",
+    "exec", "execute",
 ];
 
 // ── Helpers DB settings ───────────────────────────────────────────────────────
@@ -72,18 +70,21 @@ async fn get_setting(db: &PgPool, key: &str) -> Option<String> {
 }
 
 async fn qdrant_url(db: &PgPool) -> String {
-    get_setting(db, "qdrant_url").await
+    get_setting(db, "qdrant_url")
+        .await
         .or_else(|| std::env::var("QDRANT_URL").ok())
         .unwrap_or_else(|| DEFAULT_QDRANT_URL.to_string())
 }
 
 async fn collection_name(db: &PgPool) -> String {
-    get_setting(db, "qdrant_mcp_tools_collection").await
+    get_setting(db, "qdrant_mcp_tools_collection")
+        .await
         .unwrap_or_else(|| DEFAULT_COLLECTION.to_string())
 }
 
 async fn min_score(db: &PgPool) -> f64 {
-    get_setting(db, "mcp_tool_search_min_score").await
+    get_setting(db, "mcp_tool_search_min_score")
+        .await
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(DEFAULT_MIN_SCORE)
         .clamp(0.0, 1.0)
@@ -94,29 +95,29 @@ fn parse_i64(v: Option<&Value>, default: i64) -> i64 {
 }
 
 fn parse_str(v: Option<&Value>) -> Option<String> {
-    v.and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    v.and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 // ── Sicurezza accesso server ──────────────────────────────────────────────────
 
-async fn can_access_server(
-    db: &PgPool,
-    server_id: Uuid,
-    user_id: Uuid,
-    project_id: Uuid,
-) -> bool {
-    let row = sqlx::query(
-        "SELECT scope, user_id, project_id, enabled FROM mcp_servers WHERE id=$1",
-    )
-    .bind(server_id)
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten();
+async fn can_access_server(db: &PgPool, server_id: Uuid, user_id: Uuid, project_id: Uuid) -> bool {
+    let row =
+        sqlx::query("SELECT scope, user_id, project_id, enabled FROM mcp_servers WHERE id=$1")
+            .bind(server_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
 
-    let Some(row) = row else { return false; };
+    let Some(row) = row else {
+        return false;
+    };
     let enabled: bool = row.try_get("enabled").unwrap_or(false);
-    if !enabled { return false; }
+    if !enabled {
+        return false;
+    }
 
     let scope: String = row.try_get("scope").unwrap_or_else(|_| "user".to_string());
     let owner: Option<Uuid> = row.try_get("user_id").unwrap_or(None);
@@ -181,7 +182,14 @@ fn tool_point_id(server_id: Uuid, tool_name: &str) -> String {
 fn embedding_hash(tool_name: &str, description: &str, embedder_signature: &str) -> String {
     let mut h = Sha256::new();
     let combined = format!("{tool_name}:{description}");
-    h.update(combined.as_bytes().iter().take(256).copied().collect::<Vec<_>>());
+    h.update(
+        combined
+            .as_bytes()
+            .iter()
+            .take(256)
+            .copied()
+            .collect::<Vec<_>>(),
+    );
     // La signature non e' troncata: e' corta e identifica lo spazio vettoriale.
     h.update(b"|emb:");
     h.update(embedder_signature.as_bytes());
@@ -223,7 +231,9 @@ pub async fn index_tool(
     // (modello + dimensione vettore) compongono la signature dell'embedder,
     // che entra nell'hash per invalidarlo automaticamente al cambio embedder.
     let text = embed_text_for_tool(tool_name, description);
-    let (used_model, vector) = neural.embed_text_with_model("", &text).await
+    let (used_model, vector) = neural
+        .embed_text_with_model("", &text)
+        .await
         .map_err(|e| anyhow::anyhow!("embed_text fallita: {e}"))?;
     let embedder_signature = format!("{}:{}", used_model, vector.len());
     let new_hash = embedding_hash(tool_name, description, &embedder_signature);
@@ -256,7 +266,11 @@ pub async fn index_tool(
         }]
     });
 
-    let r = nexus_http::build_client().put(&url).json(&body).send().await?;
+    let r = nexus_http::build_client()
+        .put(&url)
+        .json(&body)
+        .send()
+        .await?;
     if !r.status().is_success() {
         let msg = r.text().await.unwrap_or_else(|_| "?".into());
         anyhow::bail!("Qdrant upsert fallita: {msg}");
@@ -299,14 +313,22 @@ async fn semantic_search(
         "with_vector": false,
     });
 
-    let resp = nexus_http::build_client().post(&url).json(&body).send().await?;
+    let resp = nexus_http::build_client()
+        .post(&url)
+        .json(&body)
+        .send()
+        .await?;
     if !resp.status().is_success() {
         let msg = resp.text().await.unwrap_or_else(|_| "?".into());
         anyhow::bail!("Qdrant search fallita: {msg}");
     }
 
     let payload: Value = resp.json().await?;
-    let hits = payload.get("result").and_then(Value::as_array).cloned().unwrap_or_default();
+    let hits = payload
+        .get("result")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
     // Filtra per scope (sicurezza)
     let user_str = user_id.to_string();
@@ -345,9 +367,20 @@ async fn semantic_search(
 
         // Recupera input_schema dal DB (non memorizzato in Qdrant per risparmiare spazio)
         let sid: Option<Uuid> = sid_str.parse().ok();
-        let tool_name = p.get("tool_name").and_then(Value::as_str).unwrap_or("").to_string();
-        let server_name = p.get("server_name").and_then(Value::as_str).unwrap_or("").to_string();
-        let description: Option<String> = p.get("description").and_then(Value::as_str).map(|s| s.to_string());
+        let tool_name = p
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let server_name = p
+            .get("server_name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let description: Option<String> = p
+            .get("description")
+            .and_then(Value::as_str)
+            .map(|s| s.to_string());
         let score = hit.get("score").and_then(Value::as_f64).unwrap_or(0.0);
 
         let input_schema: Value = if let Some(sid) = sid {
@@ -414,10 +447,7 @@ pub async fn handle_mcp_tool_search_with_neural(
 fn tokenize_query(query: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for raw in query
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-    {
+    for raw in query.to_lowercase().split(|c: char| !c.is_alphanumeric()) {
         if raw.chars().count() < TOKEN_MIN_LEN {
             continue;
         }
@@ -468,10 +498,16 @@ async fn handle_mcp_tool_search_inner(
                 }));
             }
             Ok(_) => {
-                tracing::debug!("mcp_tool_search: ricerca semantica vuota per '{}', fallback ILIKE", query);
+                tracing::debug!(
+                    "mcp_tool_search: ricerca semantica vuota per '{}', fallback ILIKE",
+                    query
+                );
             }
             Err(e) => {
-                tracing::warn!("mcp_tool_search: ricerca semantica fallita ({}), fallback ILIKE", e);
+                tracing::warn!(
+                    "mcp_tool_search: ricerca semantica fallita ({}), fallback ILIKE",
+                    e
+                );
             }
         }
     }
@@ -634,14 +670,16 @@ fn search_builtin_tools(query: &str, limit: usize) -> Vec<Value> {
     if query.trim().is_empty() {
         return Vec::new();
     }
-    let tools_json: Value =
-        match serde_json::from_str(crate::agent_tools::AGENT_TOOLS_JSON) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("search_builtin_tools: AGENT_TOOLS_JSON parse fallito: {}", e);
-                return Vec::new();
-            }
-        };
+    let tools_json: Value = match serde_json::from_str(crate::agent_tools::AGENT_TOOLS_JSON) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "search_builtin_tools: AGENT_TOOLS_JSON parse fallito: {}",
+                e
+            );
+            return Vec::new();
+        }
+    };
     let arr = match tools_json.as_array() {
         Some(a) => a,
         None => return Vec::new(),
@@ -667,9 +705,16 @@ fn search_builtin_tools(query: &str, limit: usize) -> Vec<Value> {
         );
 
         let score = if tokens.is_empty() {
-            if haystack.contains(&whole) { 1 } else { 0 }
+            if haystack.contains(&whole) {
+                1
+            } else {
+                0
+            }
         } else {
-            tokens.iter().filter(|tok| haystack.contains(tok.as_str())).count()
+            tokens
+                .iter()
+                .filter(|tok| haystack.contains(tok.as_str()))
+                .count()
         };
         if score == 0 {
             continue;
@@ -692,11 +737,7 @@ fn search_builtin_tools(query: &str, limit: usize) -> Vec<Value> {
     // Ordina per score DESC, poi ordine di dichiarazione (i tool piu'
     // fondamentali sono dichiarati per primi in AGENT_TOOLS_JSON).
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored
-        .into_iter()
-        .take(limit)
-        .map(|(_, _, v)| v)
-        .collect()
+    scored.into_iter().take(limit).map(|(_, _, v)| v).collect()
 }
 
 // ── Handler: nexus_mcp_tool_call ─────────────────────────────────────────────
@@ -709,7 +750,10 @@ pub async fn handle_mcp_tool_call(
 ) -> String {
     let server_id_str = parse_str(arguments.get("server_id"));
     let tool_name = parse_str(arguments.get("tool_name")).unwrap_or_default();
-    let args = arguments.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args = arguments
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     let Some(server_id_str) = server_id_str else {
         return format_json(&json!({"error": "server_id richiesto"}));
@@ -737,7 +781,10 @@ pub async fn handle_mcp_tool_reindex(
     neural: Option<&NeuralCoreClient>,
     arguments: &Value,
 ) -> String {
-    let force = arguments.get("force").and_then(Value::as_bool).unwrap_or(false);
+    let force = arguments
+        .get("force")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let Some(neural) = neural else {
         return format_json(&json!({"error": "embedder non disponibile (neural=None)"}));
@@ -777,7 +824,17 @@ pub async fn handle_mcp_tool_reindex(
         let tool_name: String = row.try_get("tool_name").unwrap_or_default();
         let description: String = row.try_get("description").unwrap_or_default();
 
-        match index_tool(db, neural, server_id, &server_name, &tool_name, &description, &scope).await {
+        match index_tool(
+            db,
+            neural,
+            server_id,
+            &server_name,
+            &tool_name,
+            &description,
+            &scope,
+        )
+        .await
+        {
             Ok(()) => indexed += 1,
             Err(e) => {
                 tracing::warn!("reindex: errore su {}/{}: {}", server_name, tool_name, e);

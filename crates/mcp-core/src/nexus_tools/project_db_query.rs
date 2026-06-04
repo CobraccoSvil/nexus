@@ -24,10 +24,7 @@ fn first_keyword(sql: &str) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ");
 
-    cleaned
-        .split_whitespace()
-        .next()
-        .map(|s| s.to_uppercase())
+    cleaned.split_whitespace().next().map(|s| s.to_uppercase())
 }
 
 fn is_read_only_query(sql: &str) -> bool {
@@ -43,11 +40,7 @@ fn is_read_only_query(sql: &str) -> bool {
 
 #[async_trait]
 impl NexusToolHandler for ProjectDbQueryTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let sql = args
             .get("sql")
             .and_then(Value::as_str)
@@ -135,11 +128,12 @@ impl NexusToolHandler for ProjectDbQueryTool {
 
         // PR hardening: audit query autorizzata
         crate::security::record_audit(
-            crate::security::AuditEntry::allowed(ctx.project_id, "db_query", "db")
-                .with_details(json!({
+            crate::security::AuditEntry::allowed(ctx.project_id, "db_query", "db").with_details(
+                json!({
                     "rows_returned": out_rows.len(),
                     "truncated": truncated,
-                })),
+                }),
+            ),
         );
 
         Ok(json!({
@@ -269,7 +263,9 @@ mod tests {
     #[test]
     fn test_read_only_accepts() {
         assert!(is_read_only_query("SELECT 1"));
-        assert!(is_read_only_query("with cte as (select 1) select * from cte"));
+        assert!(is_read_only_query(
+            "with cte as (select 1) select * from cte"
+        ));
         assert!(is_read_only_query("EXPLAIN SELECT 1"));
         assert!(is_read_only_query("SHOW search_path"));
         assert!(is_read_only_query("VALUES (1)"));

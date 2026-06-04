@@ -114,9 +114,8 @@ async fn run_one_sync(db: &PgPool) {
         .get("balance_infos")
         .and_then(|v| v.as_array())
         .and_then(|arr| {
-            arr.iter().find(|info| {
-                info.get("currency").and_then(|c| c.as_str()) == Some("USD")
-            })
+            arr.iter()
+                .find(|info| info.get("currency").and_then(|c| c.as_str()) == Some("USD"))
         })
         .and_then(|info| info.get("total_balance"))
         .and_then(|v| v.as_str());
@@ -157,7 +156,9 @@ async fn run_one_sync(db: &PgPool) {
             );
         }
         Ok(_) => {
-            tracing::debug!("deepseek_balance_sync: nessuna riga deepseek in provider_budget_status");
+            tracing::debug!(
+                "deepseek_balance_sync: nessuna riga deepseek in provider_budget_status"
+            );
         }
         Err(e) => {
             tracing::warn!("deepseek_balance_sync: UPDATE fallito: {e}");

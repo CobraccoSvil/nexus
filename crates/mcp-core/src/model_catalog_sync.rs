@@ -48,29 +48,49 @@ const DEFAULT_INTERVAL_HOURS: u64 = 6;
 fn is_chat_compatible_model(model: &str) -> bool {
     let lower = model.to_lowercase();
     const SUBSTRING_BLACKLIST: &[&str] = &[
-        "voxtral", "whisper", "embedding", "moderation", "unknown-provider",
+        "voxtral",
+        "whisper",
+        "embedding",
+        "moderation",
+        "unknown-provider",
     ];
     for bad in SUBSTRING_BLACKLIST {
-        if lower.contains(bad) { return false; }
+        if lower.contains(bad) {
+            return false;
+        }
     }
     const INFIX_BLACKLIST: &[&str] = &[
-        "-tts-", "-transcribe-", "-realtime-", "-instruct-", "-unknown-",
+        "-tts-",
+        "-transcribe-",
+        "-realtime-",
+        "-instruct-",
+        "-unknown-",
     ];
     for bad in INFIX_BLACKLIST {
-        if lower.contains(bad) { return false; }
+        if lower.contains(bad) {
+            return false;
+        }
     }
     const PREFIX_BLACKLIST: &[&str] = &[
-        "tts-", "dall-e", "dalle-", "imagen", "instruct-",
-        "babbage", "davinci-00", "text-embedding",
+        "tts-",
+        "dall-e",
+        "dalle-",
+        "imagen",
+        "instruct-",
+        "babbage",
+        "davinci-00",
+        "text-embedding",
     ];
     for bad in PREFIX_BLACKLIST {
-        if lower.starts_with(bad) { return false; }
+        if lower.starts_with(bad) {
+            return false;
+        }
     }
-    const SUFFIX_BLACKLIST: &[&str] = &[
-        "-tts", "-transcribe", "-realtime", "-embed", "-instruct",
-    ];
+    const SUFFIX_BLACKLIST: &[&str] = &["-tts", "-transcribe", "-realtime", "-embed", "-instruct"];
     for bad in SUFFIX_BLACKLIST {
-        if lower.ends_with(bad) { return false; }
+        if lower.ends_with(bad) {
+            return false;
+        }
     }
     // Nota: NESSUNA blacklist per nome modello/famiglia (es. ex-blacklist
     // hardcoded di gemini-3.x). I modelli "fantasma" (esposti dall'API
@@ -241,7 +261,9 @@ pub async fn trigger_sync_now(
     db: &PgPool,
     orchestrator: Option<&Orchestrator>,
 ) -> Result<SyncSummary, String> {
-    let stats = sync_tick(db, orchestrator).await.map_err(|e| e.to_string())?;
+    let stats = sync_tick(db, orchestrator)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(SyncSummary {
         providers_ok: stats.providers_ok,
         providers_skipped: stats.providers_skipped,
@@ -289,7 +311,15 @@ async fn sync_tick(db: &PgPool, orchestrator: Option<&Orchestrator>) -> anyhow::
         if provider.is_empty() {
             continue;
         }
-        match sync_provider(db, provider, disable_missing, insert_new_disabled, orchestrator).await {
+        match sync_provider(
+            db,
+            provider,
+            disable_missing,
+            insert_new_disabled,
+            orchestrator,
+        )
+        .await
+        {
             Ok((ins, dis, re)) => {
                 stats.providers_ok += 1;
                 stats.inserted += ins;
@@ -344,8 +374,10 @@ async fn sync_provider(
     .await?;
 
     // (model_name -> (is_enabled, manual_locked))
-    let catalog_models: std::collections::HashMap<String, (bool, bool)> =
-        catalog_rows.into_iter().map(|(m, e, l)| (m, (e, l))).collect();
+    let catalog_models: std::collections::HashMap<String, (bool, bool)> = catalog_rows
+        .into_iter()
+        .map(|(m, e, l)| (m, (e, l)))
+        .collect();
     let api_set: std::collections::HashSet<&str> = api_models.iter().map(|s| s.as_str()).collect();
 
     let mut inserted = 0u32;
@@ -360,7 +392,8 @@ async fn sync_provider(
         if !is_chat_compatible_model(api_model) {
             tracing::debug!(
                 "catalog_sync[{}]: skip '{}' (non chat-compatible)",
-                provider, api_model
+                provider,
+                api_model
             );
             continue;
         }
@@ -382,8 +415,19 @@ async fn sync_provider(
                     if let Ok(r) = res {
                         if r.rows_affected() > 0 {
                             inserted += 1;
-                            audit_log(db, provider, api_model, "inserted", json!({"source":"api_discovery"})).await;
-                            tracing::info!("catalog_sync[{}]: + nuovo modello rilevato '{}'", provider, api_model);
+                            audit_log(
+                                db,
+                                provider,
+                                api_model,
+                                "inserted",
+                                json!({"source":"api_discovery"}),
+                            )
+                            .await;
+                            tracing::info!(
+                                "catalog_sync[{}]: + nuovo modello rilevato '{}'",
+                                provider,
+                                api_model
+                            );
 
                             // Probe-on-insert: subito dopo l'INSERT (modello e'
                             // is_enabled=false di default), prova una chiamata
@@ -401,7 +445,8 @@ async fn sync_provider(
                                         // capability matching e capabilities=[] lo
                                         // renderebbe invisibile. Popoliamo SOLO se
                                         // attualmente vuoto (rispetta override admin).
-                                        let inferred_caps = infer_capabilities_from_name(provider, api_model);
+                                        let inferred_caps =
+                                            infer_capabilities_from_name(provider, api_model);
                                         let caps_json = json!(inferred_caps);
                                         let _ = sqlx::query(
                                             "UPDATE ai_price_catalog \
@@ -443,7 +488,10 @@ async fn sync_provider(
                                         .execute(db)
                                         .await;
                                         audit_log(
-                                            db, provider, api_model, "probe_failed_on_insert",
+                                            db,
+                                            provider,
+                                            api_model,
+                                            "probe_failed_on_insert",
                                             json!({"reason": reason}),
                                         )
                                         .await;
@@ -501,14 +549,19 @@ async fn sync_provider(
                         if r.rows_affected() > 0 {
                             reenabled += 1;
                             audit_log(db, provider, api_model, "reenabled", json!({})).await;
-                            tracing::info!("catalog_sync[{}]: re-enabled '{}' (ricomparso API)", provider, api_model);
+                            tracing::info!(
+                                "catalog_sync[{}]: re-enabled '{}' (ricomparso API)",
+                                provider,
+                                api_model
+                            );
                         }
                     }
                 } else if !is_enabled && manual_locked {
                     // Skip: admin lo ha disabilitato manualmente, non riabilitare anche se ricompare.
                     tracing::debug!(
                         "catalog_sync[{}]: skip re-enable '{}' (manual_locked)",
-                        provider, api_model
+                        provider,
+                        api_model
                     );
                 }
             }
@@ -537,7 +590,10 @@ async fn sync_provider(
                 if r.rows_affected() > 0 {
                     disabled += 1;
                     audit_log(
-                        db, provider, catalog_model, "disabled",
+                        db,
+                        provider,
+                        catalog_model,
+                        "disabled",
                         json!({"reason":"not_chat_compatible"}),
                     )
                     .await;
@@ -559,11 +615,14 @@ async fn sync_provider(
                 // Anthropic ritorna solo dated, ma il catalog/routing usa l'alias
                 // perche' e' piu' stabile (l'alias punta sempre alla versione corrente).
                 let has_dated_in_api = api_models.iter().any(|api_m| {
-                    if !api_m.starts_with(catalog_model.as_str()) || api_m.len() <= catalog_model.len() {
+                    if !api_m.starts_with(catalog_model.as_str())
+                        || api_m.len() <= catalog_model.len()
+                    {
                         return false;
                     }
                     let suffix = &api_m[catalog_model.len()..];
-                    suffix.starts_with('-') && suffix.len() == 9
+                    suffix.starts_with('-')
+                        && suffix.len() == 9
                         && suffix[1..].chars().all(|c| c.is_ascii_digit())
                 });
                 if has_dated_in_api {
@@ -574,7 +633,9 @@ async fn sync_provider(
                 // Es: catalog "claude-sonnet-4-6-20251201" disabilitato solo se
                 // anche "claude-sonnet-4-6" non e' nell'API.
                 let base_name = strip_date_suffix(catalog_model);
-                if base_name.as_str() != catalog_model.as_str() && api_set.contains(base_name.as_str()) {
+                if base_name.as_str() != catalog_model.as_str()
+                    && api_set.contains(base_name.as_str())
+                {
                     continue;
                 }
 
@@ -595,7 +656,10 @@ async fn sync_provider(
                         provider, catalog_model,
                     );
                     audit_log(
-                        db, provider, catalog_model, "kept_enabled_legacy",
+                        db,
+                        provider,
+                        catalog_model,
+                        "kept_enabled_legacy",
                         json!({"reason":"missing_from_api_but_recently_healthy"}),
                     )
                     .await;
@@ -614,11 +678,18 @@ async fn sync_provider(
                 if let Ok(r) = res {
                     if r.rows_affected() > 0 {
                         disabled += 1;
-                        audit_log(db, provider, catalog_model, "disabled",
-                                  json!({"reason":"missing_from_api"})).await;
+                        audit_log(
+                            db,
+                            provider,
+                            catalog_model,
+                            "disabled",
+                            json!({"reason":"missing_from_api"}),
+                        )
+                        .await;
                         tracing::warn!(
                             "catalog_sync[{}]: - disabled '{}' (non piu nell API)",
-                            provider, catalog_model,
+                            provider,
+                            catalog_model,
                         );
                     }
                 }
@@ -724,15 +795,16 @@ async fn audit_log(db: &PgPool, provider: &str, model: &str, action: &str, detai
 /// key (Gemini direct). Per gli altri provider chiama direttamente l'endpoint
 /// OpenAI-compatible del provider con la api_key dal DB.
 async fn fetch_provider_models(provider: &str, api_key: &str) -> anyhow::Result<Vec<String>> {
-    let client = reqwest::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()?;
+    let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?;
 
     // Caso speciale: Google → bridge via brain REST (vedi google_provider.py).
     if provider == "google" {
-        let brain_url = std::env::var("BRAIN_REST_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-        let url = format!("{}/providers/google/models/live", brain_url.trim_end_matches('/'));
+        let brain_url =
+            std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+        let url = format!(
+            "{}/providers/google/models/live",
+            brain_url.trim_end_matches('/')
+        );
         let resp = client.get(&url).send().await?;
         if !resp.status().is_success() {
             let status = resp.status();
@@ -752,7 +824,13 @@ async fn fetch_provider_models(provider: &str, api_key: &str) -> anyhow::Result<
     let (url, builder) = match provider {
         "anthropic" => {
             let url = "https://api.anthropic.com/v1/models";
-            (url, client.get(url).header("x-api-key", api_key).header("anthropic-version", "2023-06-01"))
+            (
+                url,
+                client
+                    .get(url)
+                    .header("x-api-key", api_key)
+                    .header("anthropic-version", "2023-06-01"),
+            )
         }
         "openai" => {
             let url = "https://api.openai.com/v1/models";
@@ -824,9 +902,15 @@ mod tests {
     #[test]
     fn test_strip_date_suffix() {
         assert_eq!(strip_date_suffix("claude-sonnet-4-6"), "claude-sonnet-4-6");
-        assert_eq!(strip_date_suffix("claude-sonnet-4-6-20251201"), "claude-sonnet-4-6");
+        assert_eq!(
+            strip_date_suffix("claude-sonnet-4-6-20251201"),
+            "claude-sonnet-4-6"
+        );
         assert_eq!(strip_date_suffix("gpt-4o-mini"), "gpt-4o-mini");
-        assert_eq!(strip_date_suffix("gpt-4o-mini-2024-07-18"), "gpt-4o-mini-2024-07-18");
+        assert_eq!(
+            strip_date_suffix("gpt-4o-mini-2024-07-18"),
+            "gpt-4o-mini-2024-07-18"
+        );
         // (sopra ha 2 digits-2 digits-2 digits, non matcha 8 digits)
         assert_eq!(strip_date_suffix("ministral-8b-2512"), "ministral-8b-2512");
     }

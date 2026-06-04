@@ -45,7 +45,8 @@ impl AutoCompactSettings {
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
 
-static CACHE: Lazy<RwLock<Option<(AutoCompactSettings, Instant)>>> = Lazy::new(|| RwLock::new(None));
+static CACHE: Lazy<RwLock<Option<(AutoCompactSettings, Instant)>>> =
+    Lazy::new(|| RwLock::new(None));
 
 /// Carica i parametri auto-compact dalla tabella `settings`, con cache 60s.
 ///

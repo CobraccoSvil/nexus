@@ -8,10 +8,19 @@ pub struct BuildRerunChecksTool;
 
 #[async_trait]
 impl NexusToolHandler for BuildRerunChecksTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(
             &ctx.project_root,
-            &["cargo:rerun-if-changed", "cargo:rerun-if-env-changed", "cargo:rustc-link-", "cargo:warning="],
+            &[
+                "cargo:rerun-if-changed",
+                "cargo:rerun-if-env-changed",
+                "cargo:rustc-link-",
+                "cargo:warning=",
+            ],
         );
         Ok(json!({
             "ok": true,
@@ -22,5 +31,7 @@ impl NexusToolHandler for BuildRerunChecksTool {
             "warnings": counts[3],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

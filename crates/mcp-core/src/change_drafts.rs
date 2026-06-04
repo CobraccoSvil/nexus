@@ -32,9 +32,9 @@ use uuid::Uuid;
 #[derive(Debug, Deserialize)]
 pub struct CreateDraftBody {
     pub project_id: Option<Uuid>,
-    pub trigger_kind: String,    // 'user_chat'|'autofix'|'review'|'manual'|'sub_agent'
-    pub summary: String,         // 1-2 sentence summary
-    pub draft: Value,            // JSON: { razionale, impact_analysis, diff_proposto, ... }
+    pub trigger_kind: String, // 'user_chat'|'autofix'|'review'|'manual'|'sub_agent'
+    pub summary: String,      // 1-2 sentence summary
+    pub draft: Value,         // JSON: { razionale, impact_analysis, diff_proposto, ... }
 }
 
 #[derive(Debug, Serialize)]

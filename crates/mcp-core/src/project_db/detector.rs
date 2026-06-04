@@ -3,8 +3,8 @@
 //! Strategia: cerca marker file noti nella root del progetto (e in path standard).
 //! Produce un [`DbProfile`] con confidenza, marker trovati, engine e tool.
 
-use std::path::Path;
 use super::{DbEngine, DbProfile, MigrationTool};
+use std::path::Path;
 
 /// Entry point principale: riceve la root del progetto e restituisce un `DbProfile`.
 /// Non fallisce mai: se nulla viene rilevato restituisce un profilo con engine Unknown.
@@ -85,7 +85,11 @@ pub fn detect_db_profile(project_root: &Path) -> DbProfile {
 
     // ── 5. Flyway (JVM) ───────────────────────────────────────────────────
     if project_root.join("flyway.conf").exists() || project_root.join("flyway.toml").exists() {
-        let marker = if project_root.join("flyway.conf").exists() { "flyway.conf" } else { "flyway.toml" };
+        let marker = if project_root.join("flyway.conf").exists() {
+            "flyway.conf"
+        } else {
+            "flyway.toml"
+        };
         markers.push(marker.into());
         migration_tool = migration_tool.or(Some(MigrationTool::Flyway));
         migration_path = migration_path.or(Some("db/migration".into()));
@@ -123,7 +127,8 @@ pub fn detect_db_profile(project_root: &Path) -> DbProfile {
                             name.starts_with("000") && name.ends_with(".py")
                         });
                         if has_django {
-                            let rel = migrations_dir.strip_prefix(project_root)
+                            let rel = migrations_dir
+                                .strip_prefix(project_root)
                                 .unwrap_or(&migrations_dir)
                                 .to_string_lossy()
                                 .to_string();
@@ -151,7 +156,11 @@ pub fn detect_db_profile(project_root: &Path) -> DbProfile {
     }
 
     // ── 8. Liquibase ──────────────────────────────────────────────────────
-    for lb_file in &["liquibase.properties", "changelog.xml", "db/changelog/db.changelog-master.xml"] {
+    for lb_file in &[
+        "liquibase.properties",
+        "changelog.xml",
+        "db/changelog/db.changelog-master.xml",
+    ] {
         if project_root.join(lb_file).exists() {
             markers.push((*lb_file).into());
             migration_tool = migration_tool.or(Some(MigrationTool::Liquibase));
@@ -166,9 +175,9 @@ pub fn detect_db_profile(project_root: &Path) -> DbProfile {
         let generic_dir = project_root.join("migrations");
         if generic_dir.exists() {
             if let Ok(entries) = std::fs::read_dir(&generic_dir) {
-                let has_sql = entries.flatten().any(|e| {
-                    e.file_name().to_string_lossy().ends_with(".sql")
-                });
+                let has_sql = entries
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy().ends_with(".sql"));
                 if has_sql {
                     markers.push("migrations/*.sql".into());
                     migration_tool = Some(MigrationTool::GenericSql);
@@ -215,7 +224,13 @@ fn engine_from_prisma_schema(schema: &str) -> DbEngine {
     for line in schema.lines() {
         let line = line.trim();
         if line.starts_with("provider") && line.contains('=') {
-            let val = line.split('=').nth(1).unwrap_or("").trim().trim_matches('"').trim_matches('\'');
+            let val = line
+                .split('=')
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
             return match val {
                 "postgresql" | "postgres" => DbEngine::Postgres,
                 "mysql" => DbEngine::Mysql,
@@ -245,7 +260,10 @@ fn detect_dotnet(project_root: &Path) -> Option<(DbEngine, Option<MigrationTool>
         // Cerca anche nelle sottodirectory (es. backend/FreeLance.Api/)
         let candidates = [
             p.clone(),
-            project_root.join("backend").join("FreeLance.Api").join(settings_file),
+            project_root
+                .join("backend")
+                .join("FreeLance.Api")
+                .join(settings_file),
             project_root.join("src").join(settings_file),
             project_root.join("Api").join(settings_file),
         ];
@@ -257,7 +275,9 @@ fn detect_dotnet(project_root: &Path) -> Option<(DbEngine, Option<MigrationTool>
                 }
             }
         }
-        if engine.is_some() { break; }
+        if engine.is_some() {
+            break;
+        }
     }
 
     // Cerca *.csproj per rilevare il provider EF Core
@@ -268,12 +288,19 @@ fn detect_dotnet(project_root: &Path) -> Option<(DbEngine, Option<MigrationTool>
     }
 
     // Verifica presenza *.sln come conferma progetto .NET
-    let has_sln = project_root.join("backend").read_dir()
-        .into_iter().flatten()
-        .any(|e| e.map(|d| d.file_name().to_string_lossy().ends_with(".sln")).unwrap_or(false))
-        || project_root.read_dir()
-        .into_iter().flatten()
-        .any(|e| e.map(|d| d.file_name().to_string_lossy().ends_with(".sln")).unwrap_or(false));
+    let has_sln = project_root
+        .join("backend")
+        .read_dir()
+        .into_iter()
+        .flatten()
+        .any(|e| {
+            e.map(|d| d.file_name().to_string_lossy().ends_with(".sln"))
+                .unwrap_or(false)
+        })
+        || project_root.read_dir().into_iter().flatten().any(|e| {
+            e.map(|d| d.file_name().to_string_lossy().ends_with(".sln"))
+                .unwrap_or(false)
+        });
 
     // Cerca cartella sql/ come migration path (pattern .NET senza EF migrations)
     if project_root.join("backend").join("sql").is_dir() {
@@ -289,7 +316,11 @@ fn detect_dotnet(project_root: &Path) -> Option<(DbEngine, Option<MigrationTool>
         // Accettiamo se abbiamo trovato l'engine da appsettings
     }
 
-    Some((found_engine, Some(MigrationTool::GenericSql), migration_path))
+    Some((
+        found_engine,
+        Some(MigrationTool::GenericSql),
+        migration_path,
+    ))
 }
 
 /// Estrae l'engine DB dalla connection string in appsettings JSON.
@@ -306,7 +337,13 @@ fn engine_from_appsettings(content: &str) -> Option<DbEngine> {
         if !(line.contains("Connection") && line.contains(':')) {
             continue;
         }
-        let value = line.split(':').skip(1).collect::<Vec<_>>().join(":").trim().to_string();
+        let value = line
+            .split(':')
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join(":")
+            .trim()
+            .to_string();
         let value = value.trim_matches('"').trim_matches(',').trim_matches('"');
         let lc = value.to_ascii_lowercase();
 
@@ -376,16 +413,23 @@ fn detect_from_csproj(project_root: &Path) -> Option<DbEngine> {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if !name.ends_with(".csproj") { continue; }
+                if !name.ends_with(".csproj") {
+                    continue;
+                }
                 if let Ok(content) = std::fs::read_to_string(entry.path()) {
                     let lc = content.to_ascii_lowercase();
-                    if lc.contains("entityframeworkcore.sqlserver") || lc.contains("microsoft.data.sqlclient") {
+                    if lc.contains("entityframeworkcore.sqlserver")
+                        || lc.contains("microsoft.data.sqlclient")
+                    {
                         return Some(DbEngine::Sqlserver);
                     }
-                    if lc.contains("npgsql.entityframeworkcore.postgresql") || lc.contains("npgsql") {
+                    if lc.contains("npgsql.entityframeworkcore.postgresql") || lc.contains("npgsql")
+                    {
                         return Some(DbEngine::Postgres);
                     }
-                    if lc.contains("pomelo.entityframeworkcore.mysql") || lc.contains("mysqlconnector") {
+                    if lc.contains("pomelo.entityframeworkcore.mysql")
+                        || lc.contains("mysqlconnector")
+                    {
                         return Some(DbEngine::Mysql);
                     }
                     if lc.contains("microsoft.entityframeworkcore.sqlite") {
@@ -397,20 +441,30 @@ fn detect_from_csproj(project_root: &Path) -> Option<DbEngine> {
         // Cerca anche in sottodirectory del livello successivo
         if let Ok(subdirs) = std::fs::read_dir(dir) {
             for sub in subdirs.flatten() {
-                if !sub.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
+                if !sub.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
                 if let Ok(entries) = std::fs::read_dir(sub.path()) {
                     for entry in entries.flatten() {
                         let name = entry.file_name().to_string_lossy().to_string();
-                        if !name.ends_with(".csproj") { continue; }
+                        if !name.ends_with(".csproj") {
+                            continue;
+                        }
                         if let Ok(content) = std::fs::read_to_string(entry.path()) {
                             let lc = content.to_ascii_lowercase();
-                            if lc.contains("entityframeworkcore.sqlserver") || lc.contains("microsoft.data.sqlclient") {
+                            if lc.contains("entityframeworkcore.sqlserver")
+                                || lc.contains("microsoft.data.sqlclient")
+                            {
                                 return Some(DbEngine::Sqlserver);
                             }
-                            if lc.contains("npgsql.entityframeworkcore.postgresql") || lc.contains("npgsql") {
+                            if lc.contains("npgsql.entityframeworkcore.postgresql")
+                                || lc.contains("npgsql")
+                            {
                                 return Some(DbEngine::Postgres);
                             }
-                            if lc.contains("pomelo.entityframeworkcore.mysql") || lc.contains("mysqlconnector") {
+                            if lc.contains("pomelo.entityframeworkcore.mysql")
+                                || lc.contains("mysqlconnector")
+                            {
                                 return Some(DbEngine::Mysql);
                             }
                             if lc.contains("microsoft.entityframeworkcore.sqlite") {
@@ -433,11 +487,24 @@ fn detect_engine_from_config(project_root: &Path) -> DbEngine {
             for line in content.lines() {
                 let line = line.trim();
                 if line.starts_with("DATABASE_URL") {
-                    let url = line.split('=').skip(1).collect::<Vec<_>>().join("=").to_lowercase();
-                    if url.contains("postgres") { return DbEngine::Postgres; }
-                    if url.contains("mysql") { return DbEngine::Mysql; }
-                    if url.contains("sqlite") { return DbEngine::Sqlite; }
-                    if url.contains("mongodb") { return DbEngine::Mongodb; }
+                    let url = line
+                        .split('=')
+                        .skip(1)
+                        .collect::<Vec<_>>()
+                        .join("=")
+                        .to_lowercase();
+                    if url.contains("postgres") {
+                        return DbEngine::Postgres;
+                    }
+                    if url.contains("mysql") {
+                        return DbEngine::Mysql;
+                    }
+                    if url.contains("sqlite") {
+                        return DbEngine::Sqlite;
+                    }
+                    if url.contains("mongodb") {
+                        return DbEngine::Mongodb;
+                    }
                 }
             }
         }
@@ -447,7 +514,10 @@ fn detect_engine_from_config(project_root: &Path) -> DbEngine {
     let pkg = project_root.join("package.json");
     if let Ok(content) = std::fs::read_to_string(&pkg) {
         let lower = content.to_lowercase();
-        if lower.contains("\"pg\"") || lower.contains("\"postgres\"") || lower.contains("\"postgresql\"") {
+        if lower.contains("\"pg\"")
+            || lower.contains("\"postgres\"")
+            || lower.contains("\"postgresql\"")
+        {
             return DbEngine::Postgres;
         }
         if lower.contains("\"mysql\"") || lower.contains("\"mysql2\"") {
@@ -465,9 +535,15 @@ fn detect_engine_from_config(project_root: &Path) -> DbEngine {
     let req = project_root.join("requirements.txt");
     if let Ok(content) = std::fs::read_to_string(&req) {
         let lower = content.to_lowercase();
-        if lower.contains("psycopg") || lower.contains("asyncpg") { return DbEngine::Postgres; }
-        if lower.contains("pymysql") || lower.contains("mysqlclient") { return DbEngine::Mysql; }
-        if lower.contains("pymongo") { return DbEngine::Mongodb; }
+        if lower.contains("psycopg") || lower.contains("asyncpg") {
+            return DbEngine::Postgres;
+        }
+        if lower.contains("pymysql") || lower.contains("mysqlclient") {
+            return DbEngine::Mysql;
+        }
+        if lower.contains("pymongo") {
+            return DbEngine::Mongodb;
+        }
     }
 
     DbEngine::Unknown("unknown".into())
@@ -495,7 +571,8 @@ mod tests {
         fs::write(
             dir.path().join("prisma/schema.prisma"),
             "datasource db { provider = \"postgresql\" url = env(\"DATABASE_URL\") }",
-        ).unwrap();
+        )
+        .unwrap();
         let profile = detect_db_profile(dir.path());
         assert_eq!(profile.migration_tool, Some(MigrationTool::Prisma));
         assert_eq!(profile.engine, DbEngine::Postgres);
@@ -525,18 +602,22 @@ mod tests {
     #[test]
     #[ignore] // richiede il progetto Redemptor in projects/
     fn test_detect_real_redemptor_project() {
-        let project_root = std::path::PathBuf::from(
-            "/home/administrator/ideai/projects/redemptor"
-        );
+        let project_root = std::path::PathBuf::from("/home/administrator/ideai/projects/redemptor");
         if !project_root.exists() {
             eprintln!("test ignored: project root not present");
             return;
         }
         let profile = detect_db_profile(&project_root);
-        eprintln!("REAL profile: engine={:?} marker_files={:?} confidence={}",
-            profile.engine, profile.marker_files, profile.confidence);
-        assert_eq!(profile.engine, DbEngine::Postgres,
-            "expected Postgres but got {:?}", profile.engine);
+        eprintln!(
+            "REAL profile: engine={:?} marker_files={:?} confidence={}",
+            profile.engine, profile.marker_files, profile.confidence
+        );
+        assert_eq!(
+            profile.engine,
+            DbEngine::Postgres,
+            "expected Postgres but got {:?}",
+            profile.engine
+        );
     }
 
     #[test]
@@ -557,13 +638,18 @@ mod tests {
   "GITHUB_WEBHOOK_BASE_URL": "https://api.redemptor.it"
 }"#;
         let result = engine_from_appsettings(full);
-        assert_eq!(result, Some(DbEngine::Postgres),
-            "expected Postgres but got {:?} from full file", result);
+        assert_eq!(
+            result,
+            Some(DbEngine::Postgres),
+            "expected Postgres but got {:?} from full file",
+            result
+        );
     }
 
     #[test]
     fn test_engine_from_appsettings_sqlserver_initial_catalog() {
-        let conn = r#""DefaultConnection": "Server=tcp:srv;Initial Catalog=db;User Id=sa;Password=pwd;""#;
+        let conn =
+            r#""DefaultConnection": "Server=tcp:srv;Initial Catalog=db;User Id=sa;Password=pwd;""#;
         assert_eq!(engine_from_appsettings(conn), Some(DbEngine::Sqlserver));
     }
 

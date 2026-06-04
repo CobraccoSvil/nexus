@@ -109,9 +109,7 @@ pub(super) async fn load_attachment(
     .map_err(|e| format!("query allegato fallita: {e}"))?;
 
     let row = row.ok_or_else(|| {
-        format!(
-            "Allegato {attachment_id} non trovato nel progetto corrente o non accessibile"
-        )
+        format!("Allegato {attachment_id} non trovato nel progetto corrente o non accessibile")
     })?;
 
     let id: Uuid = row.try_get("id").map_err(|e| e.to_string())?;
@@ -150,7 +148,11 @@ pub(super) async fn read_header(path: &std::path::Path) -> Result<Vec<u8>, Strin
 /// Classifica un file dai magic bytes + estensione/MIME come fallback.
 ///
 /// Ritorna `(kind, mime_reale, ext_reale)`.
-pub fn detect_kind(header: &[u8], file_name: &str, declared_mime: &str) -> (String, String, String) {
+pub fn detect_kind(
+    header: &[u8],
+    file_name: &str,
+    declared_mime: &str,
+) -> (String, String, String) {
     // 0) Fast-path ZIP-based: se inizia con PK\x03\x04, il sub-type lo decide
     //    `detect_zip_subtype` via string-search nelle entries (es. word/document.xml
     //    -> docx, canvas.fig -> figma). Più affidabile di `infer`, che richiede
@@ -387,10 +389,7 @@ fn kind_is_text(kind: &str) -> bool {
 ///    pre-fix `enrich_attachments_with_ids` dove il blocco `<allegati>` non
 ///    esponeva l'UUID e il modello e' costretto a guessare (osservato 30/05/2026:
 ///    Vertex passava sia il filename "PL.make" sia un UUID allucinato).
-pub(super) async fn tool_nexus_inspect_attachment(
-    ctx: &AgentToolContext,
-    input: &Value,
-) -> String {
+pub(super) async fn tool_nexus_inspect_attachment(ctx: &AgentToolContext, input: &Value) -> String {
     let raw_id = match input.get("attachment_id").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.trim(),
         _ => {
@@ -428,8 +427,7 @@ pub(super) async fn tool_nexus_inspect_attachment(
         Err(e) => return json!({ "error": e }).to_string(),
     };
 
-    let (kind, mime_reale, ext_reale) =
-        detect_kind(&header, &record.file_name, &record.mime_type);
+    let (kind, mime_reale, ext_reale) = detect_kind(&header, &record.file_name, &record.mime_type);
 
     // FASE 1 resa Figma Make: se e' un Figma .make il cui ai_chat.json contiene
     // scritture file (fast_apply_tool), il code-snapshot React e' gia' dentro:
@@ -518,9 +516,7 @@ fn memchr_contains(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || haystack.len() < needle.len() {
         return false;
     }
-    haystack
-        .windows(needle.len())
-        .any(|w| w == needle)
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// FIX 1 (ADR 0012): decide il tool che il modello DEVE chiamare subito dopo
@@ -622,15 +618,16 @@ fn next_action_recommended(kind: &str, attachment_id: &Uuid, figma_has_code: boo
              e satura il context window.",
             1500,
         ),
-        "json" | "xml" | "markdown" | "html" | "css" | "javascript" | "typescript"
-        | "python" | "rust" | "go" | "java" | "c" | "cpp" | "sql" | "toml" | "yaml"
-        | "csv" | "text" => builtin(
-            "nexus_read_attachment",
-            json!({ "attachment_id": id_s, "encoding": "text" }),
-            "Contenuto testuale: leggi come testo (encoding=text). Se vuoi una porzione \
+        "json" | "xml" | "markdown" | "html" | "css" | "javascript" | "typescript" | "python"
+        | "rust" | "go" | "java" | "c" | "cpp" | "sql" | "toml" | "yaml" | "csv" | "text" => {
+            builtin(
+                "nexus_read_attachment",
+                json!({ "attachment_id": id_s, "encoding": "text" }),
+                "Contenuto testuale: leggi come testo (encoding=text). Se vuoi una porzione \
              specifica usa offset/length.",
-            15000,
-        ),
+                15000,
+            )
+        }
         // binary opaco: niente raccomandazione automatica.
         _ => Value::Null,
     }

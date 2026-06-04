@@ -25,7 +25,8 @@ async fn read_int_setting(db: &PgPool, key: &str, default: i64) -> i64 {
         .await
         .ok()
         .flatten();
-    v.and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(default)
+    v.and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(default)
 }
 
 async fn read_bool_setting(db: &PgPool, key: &str, default: bool) -> bool {
@@ -35,8 +36,13 @@ async fn read_bool_setting(db: &PgPool, key: &str, default: bool) -> bool {
         .await
         .ok()
         .flatten();
-    v.map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "false" | "0" | "off" | "no"))
-        .unwrap_or(default)
+    v.map(|s| {
+        !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "off" | "no"
+        )
+    })
+    .unwrap_or(default)
 }
 
 /// Forward closure: chi importa (direttamente o transitivamente) i file seed.
@@ -92,11 +98,7 @@ pub async fn compute_impact_set(
 }
 
 /// Test che coprono i file dell'impact set (+ i seed). Query project_code_tests.
-pub async fn select_tests_for_paths(
-    db: &PgPool,
-    project_id: Uuid,
-    paths: &[String],
-) -> Vec<Value> {
+pub async fn select_tests_for_paths(db: &PgPool, project_id: Uuid, paths: &[String]) -> Vec<Value> {
     if paths.is_empty() {
         return Vec::new();
     }

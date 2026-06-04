@@ -11,12 +11,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-pub mod schema;
-pub mod architecture;
 pub mod api;
+pub mod architecture;
 pub mod changelog;
-pub mod decisions;
 pub mod concepts;
+pub mod decisions;
+pub mod schema;
 
 /// Output di un generator: una nota da scrivere/aggiornare nel vault.
 pub struct GeneratedDoc {

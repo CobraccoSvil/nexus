@@ -13,16 +13,10 @@ pub struct ProjectDbKillQueryTool;
 
 #[async_trait]
 impl NexusToolHandler for ProjectDbKillQueryTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
-        let pid = args
-            .get("pid")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| NexusToolError::BadInput("Parametro 'pid' obbligatorio (intero)".into()))?
-            as i32;
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
+        let pid = args.get("pid").and_then(Value::as_i64).ok_or_else(|| {
+            NexusToolError::BadInput("Parametro 'pid' obbligatorio (intero)".into())
+        })? as i32;
 
         let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
 

@@ -32,11 +32,7 @@ pub struct CargoCheckTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoCheckTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         // Parse input
         let workspace_member = args
             .get("workspace_member")
@@ -48,10 +44,8 @@ impl NexusToolHandler for CargoCheckTool {
             .unwrap_or(false);
 
         // Costruisci args cargo
-        let mut cargo_args: Vec<String> = vec![
-            "check".to_string(),
-            "--message-format=json".to_string(),
-        ];
+        let mut cargo_args: Vec<String> =
+            vec!["check".to_string(), "--message-format=json".to_string()];
         if release {
             cargo_args.push("--release".to_string());
         }
@@ -92,10 +86,7 @@ impl NexusToolHandler for CargoCheckTool {
                 Some(m) => m,
                 None => continue,
             };
-            let level = message
-                .get("level")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let level = message.get("level").and_then(Value::as_str).unwrap_or("");
             let text = message
                 .get("message")
                 .and_then(Value::as_str)
@@ -105,10 +96,17 @@ impl NexusToolHandler for CargoCheckTool {
             let (file, line_no) = message
                 .get("spans")
                 .and_then(Value::as_array)
-                .and_then(|spans| spans.iter().find(|s| s.get("is_primary") == Some(&json!(true))))
+                .and_then(|spans| {
+                    spans
+                        .iter()
+                        .find(|s| s.get("is_primary") == Some(&json!(true)))
+                })
                 .map(|span| {
                     (
-                        span.get("file_name").and_then(Value::as_str).unwrap_or("").to_string(),
+                        span.get("file_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
                         span.get("line_start").and_then(Value::as_u64).unwrap_or(0),
                     )
                 })

@@ -13,15 +13,13 @@ pub struct ProjectDbDiffSchemaTool;
 
 #[async_trait]
 impl NexusToolHandler for ProjectDbDiffSchemaTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let reference_file = args
             .get("reference_file")
             .and_then(Value::as_str)
-            .ok_or_else(|| NexusToolError::BadInput("Parametro 'reference_file' obbligatorio".into()))?
+            .ok_or_else(|| {
+                NexusToolError::BadInput("Parametro 'reference_file' obbligatorio".into())
+            })?
             .trim()
             .to_string();
 
@@ -58,12 +56,17 @@ impl NexusToolHandler for ProjectDbDiffSchemaTool {
 
         let dump = tokio::process::Command::new("pg_dump")
             .args([
-                "-h", &host,
-                "-p", &port,
-                "-U", &user,
-                "-d", &dbname,
+                "-h",
+                &host,
+                "-p",
+                &port,
+                "-U",
+                &user,
+                "-d",
+                &dbname,
                 "--schema-only",
-                "-f", &tmp_str,
+                "-f",
+                &tmp_str,
             ])
             .env("PGPASSWORD", &password)
             .stdin(std::process::Stdio::null())

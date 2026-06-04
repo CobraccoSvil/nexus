@@ -8,7 +8,11 @@ pub struct SecHttpUrlCountTool;
 
 #[async_trait]
 impl NexusToolHandler for SecHttpUrlCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(&ctx.project_root, &["http://", "https://"]);
         Ok(json!({
             "ok": true,
@@ -18,5 +22,7 @@ impl NexusToolHandler for SecHttpUrlCountTool {
             "ratio_plaintext": if counts[0] + counts[1] == 0 { 0.0 } else { counts[0] as f64 / (counts[0] + counts[1]) as f64 },
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

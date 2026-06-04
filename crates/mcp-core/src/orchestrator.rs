@@ -23,10 +23,10 @@ use mcp_proto::neural::{
 };
 
 use crate::{
-    provider_cooldown::{is_provider_in_cooldown, put_provider_in_cooldown},
     billing::{self, UsageNumbers},
-    nexus_gateway::{NexusGatewayClient, GwMessage, GwMetadata, GwRequest, intent_to_alias},
     domain::OrchestratorAudit,
+    nexus_gateway::{intent_to_alias, GwMessage, GwMetadata, GwRequest, NexusGatewayClient},
+    provider_cooldown::{is_provider_in_cooldown, put_provider_in_cooldown},
     vector_memory,
 };
 
@@ -48,17 +48,37 @@ fn classify_intent_local(message: &str) -> (&'static str, f32) {
     // perché richiede sequence di tool call (read_file → str_replace → restart),
     // che modelli "code-light" come codestral non sanno orchestrare.
     let stack_trace_signals = [
-        "\n   at ", "\n    at ", "traceback (most recent call last)",
-        ".exception", ".error:", "stack trace", "stacktrace",
-        "panicked at", "fatal:", "rejectedexecutionexception",
+        "\n   at ",
+        "\n    at ",
+        "traceback (most recent call last)",
+        ".exception",
+        ".error:",
+        "stack trace",
+        "stacktrace",
+        "panicked at",
+        "fatal:",
+        "rejectedexecutionexception",
     ];
     let agentic_signals = [
-        "analizza la gerarchia", "causa radice", "root cause",
-        "stack trace", "tool call", "fixare", "esegui restart",
-        "leggi il file", "appsettings", "log degli ultimi",
+        "analizza la gerarchia",
+        "causa radice",
+        "root cause",
+        "stack trace",
+        "tool call",
+        "fixare",
+        "esegui restart",
+        "leggi il file",
+        "appsettings",
+        "log degli ultimi",
     ];
-    let stack_hits: usize = stack_trace_signals.iter().filter(|s| lower.contains(*s)).count();
-    let agent_hits: usize = agentic_signals.iter().filter(|s| lower.contains(*s)).count();
+    let stack_hits: usize = stack_trace_signals
+        .iter()
+        .filter(|s| lower.contains(*s))
+        .count();
+    let agent_hits: usize = agentic_signals
+        .iter()
+        .filter(|s| lower.contains(*s))
+        .count();
     // Se trovo sia un segno di stack trace sia un segno di richiesta agentica,
     // o se trovo molti segni di stack trace (≥2), instrado verso "debug".
     if stack_hits >= 2 || (stack_hits >= 1 && agent_hits >= 1) || agent_hits >= 2 {
@@ -72,50 +92,153 @@ fn classify_intent_local(message: &str) -> (&'static str, f32) {
     // non di bug fixing. Stesso ragionamento per system_admin (docker,
     // systemctl, container) che richiede modelli con tool use solido.
     let rules: &[(&str, &[&str])] = &[
-        ("file_ops", &[
-            "elimina file", "rimuovi file", "cancella file", "remove file",
-            "delete file", "elimina i file", "remove the file",
-            "elimina la cartella", "rimuovi la cartella", "delete folder",
-            "elimina dockerfile", "rimuovi dockerfile",
-            "elimina docker-compose", "rimuovi docker-compose",
-            "elimina configurazione docker", "remove docker configuration",
-            "elimina file di configurazione", "rimuovi file di configurazione",
-            "ripulisci la directory", "cleanup directory",
-        ]),
-        ("system_admin", &[
-            "docker stop", "docker rm", "docker prune", "system prune",
-            "ferma il container", "stop container", "kill container",
-            "elimina container", "remove container", "delete container",
-            "ferma il servizio", "stop service", "systemctl stop",
-            "systemctl restart", "restart service",
-            "compose down", "compose up", "docker compose",
-            "elimina docker", "rimuovi docker locale", "elimina docker locale",
-            // Anche i pattern dell'analyzer: "rimuovere il container",
-            // "container ridondante", ecc.
-            "rimuovere il container", "rimuovere container",
-            "container ridondante", "container superfluo",
-        ]),
-        ("fix",          &["/fix", "bug", "error", "crash", "broken", "debug", "issue", "patch", "errore", "correggi", "risolvi", "problema"]),
+        (
+            "file_ops",
+            &[
+                "elimina file",
+                "rimuovi file",
+                "cancella file",
+                "remove file",
+                "delete file",
+                "elimina i file",
+                "remove the file",
+                "elimina la cartella",
+                "rimuovi la cartella",
+                "delete folder",
+                "elimina dockerfile",
+                "rimuovi dockerfile",
+                "elimina docker-compose",
+                "rimuovi docker-compose",
+                "elimina configurazione docker",
+                "remove docker configuration",
+                "elimina file di configurazione",
+                "rimuovi file di configurazione",
+                "ripulisci la directory",
+                "cleanup directory",
+            ],
+        ),
+        (
+            "system_admin",
+            &[
+                "docker stop",
+                "docker rm",
+                "docker prune",
+                "system prune",
+                "ferma il container",
+                "stop container",
+                "kill container",
+                "elimina container",
+                "remove container",
+                "delete container",
+                "ferma il servizio",
+                "stop service",
+                "systemctl stop",
+                "systemctl restart",
+                "restart service",
+                "compose down",
+                "compose up",
+                "docker compose",
+                "elimina docker",
+                "rimuovi docker locale",
+                "elimina docker locale",
+                // Anche i pattern dell'analyzer: "rimuovere il container",
+                // "container ridondante", ecc.
+                "rimuovere il container",
+                "rimuovere container",
+                "container ridondante",
+                "container superfluo",
+            ],
+        ),
+        (
+            "fix",
+            &[
+                "/fix", "bug", "error", "crash", "broken", "debug", "issue", "patch", "errore",
+                "correggi", "risolvi", "problema",
+            ],
+        ),
         // Refactor include task di migrazione codice (es. "migra il backend da SQL Server a PostgreSQL",
         // "converti TypeScript a JavaScript", "sostituisci EFCore con Npgsql"). Senza questi prefissi
         // laschi, "migra .NET 9 ..." finiva nel default "chat" → mistral-small inadatto.
         // I prefissi (no parola intera) catturano forme verbali italiane multiple:
         // "migra/migrare/migrate", "porta/portare", "converti/convertire", "trasforma/trasformare",
         // "sposta/spostare", "sostituisci/sostituire", "rimpiazza/rimpiazzare".
-        ("refactor",     &["/refactor", "refactor", "clean", "simplify", "extract", "improve",
-                           "migliora", "pulisci", "semplifica", "ristruttura",
-                           "migra ", "migrare ", "porta da ", "porta a ", "portare da ",
-                           "converti ", "convertire ", "trasform", "sposta da ", "spostare da ",
-                           "sostituisci ", "sostituire ", "rimpiazza ", "rimpiazzare ",
-                           "migrate from", "migrate to", "convert to", "rename "]),
-        ("test",         &["/test", "test", "coverage", "assert", "spec", "unit test", "integration test"]),
-        ("docs",         &["/docs", "document", "readme", "jsdoc", "comment", "explain", "documenta", "commenta", "spiega"]),
+        (
+            "refactor",
+            &[
+                "/refactor",
+                "refactor",
+                "clean",
+                "simplify",
+                "extract",
+                "improve",
+                "migliora",
+                "pulisci",
+                "semplifica",
+                "ristruttura",
+                "migra ",
+                "migrare ",
+                "porta da ",
+                "porta a ",
+                "portare da ",
+                "converti ",
+                "convertire ",
+                "trasform",
+                "sposta da ",
+                "spostare da ",
+                "sostituisci ",
+                "sostituire ",
+                "rimpiazza ",
+                "rimpiazzare ",
+                "migrate from",
+                "migrate to",
+                "convert to",
+                "rename ",
+            ],
+        ),
+        (
+            "test",
+            &[
+                "/test",
+                "test",
+                "coverage",
+                "assert",
+                "spec",
+                "unit test",
+                "integration test",
+            ],
+        ),
+        (
+            "docs",
+            &[
+                "/docs",
+                "document",
+                "readme",
+                "jsdoc",
+                "comment",
+                "explain",
+                "documenta",
+                "commenta",
+                "spiega",
+            ],
+        ),
         // Architecture e' per task di PLANNING (piano di migrazione, design system) senza
         // toccare ancora codice. I verbi imperativi di migrazione codice vanno a "refactor".
-        ("architecture", &["/arch", "architecture", "design", "system", "plan",
-                           "architettura", "progetta",
-                           "piano di migrazione", "migration plan",
-                           "strategia di migrazione", "migration strategy"]),
+        (
+            "architecture",
+            &[
+                "/arch",
+                "architecture",
+                "design",
+                "system",
+                "plan",
+                "architettura",
+                "progetta",
+                "piano di migrazione",
+                "migration plan",
+                "strategia di migrazione",
+                "migration strategy",
+            ],
+        ),
     ];
 
     for (intent, keywords) in rules {
@@ -145,19 +268,41 @@ fn is_risky_task(message: &str) -> bool {
     let lc = message.to_lowercase();
     const RISKY: &[&str] = &[
         // Filesystem distruttive
-        "rm -rf", " rm ", "rmdir", "unlink",
+        "rm -rf",
+        " rm ",
+        "rmdir",
+        "unlink",
         // Verbi distruttivi (prefissi: matchano forme infinitive/imperative/coniugate)
-        "elimin", "rimuov", "cancell", "delete", "remove",
+        "elimin",
+        "rimuov",
+        "cancell",
+        "delete",
+        "remove",
         // Docker / container
-        "docker prune", "system prune", "docker rm ", "docker rmi",
-        "compose down", "ferma il container", "stop container",
+        "docker prune",
+        "system prune",
+        "docker rm ",
+        "docker rmi",
+        "compose down",
+        "ferma il container",
+        "stop container",
         // Database
-        "drop table", "drop database", "drop schema", "truncate",
+        "drop table",
+        "drop database",
+        "drop schema",
+        "truncate",
         // Git distruttive
-        "git reset --hard", "force push", "--force", "git clean",
+        "git reset --hard",
+        "force push",
+        "--force",
+        "git clean",
         // Sistema
-        "shutdown", "reboot", "systemctl stop", "systemctl disable",
-        "kill -9", "pkill",
+        "shutdown",
+        "reboot",
+        "systemctl stop",
+        "systemctl disable",
+        "kill -9",
+        "pkill",
     ];
     RISKY.iter().any(|kw| lc.contains(*kw))
 }
@@ -186,24 +331,57 @@ fn is_agentic_request(message: &str) -> bool {
     let lc = message.to_lowercase();
     const AGENTIC_VERBS: &[&str] = &[
         // Setup / configurazione
-        "imposta", "impost", "configur", "setup", "set up", "set-up",
-        "abilit", "disabilit", "enable", "disable",
+        "imposta",
+        "impost",
+        "configur",
+        "setup",
+        "set up",
+        "set-up",
+        "abilit",
+        "disabilit",
+        "enable",
+        "disable",
         // Creazione / modifica
-        "crea ", "create ", "creare ", "aggiung", "add ",
-        "cambi", "modific", "aggiorn", "update ", "modify ",
+        "crea ",
+        "create ",
+        "creare ",
+        "aggiung",
+        "add ",
+        "cambi",
+        "modific",
+        "aggiorn",
+        "update ",
+        "modify ",
         // Deploy / esecuzione
-        "deploy", "lancia ", "launch", "avvia", "start service",
-        "installa", "install ",
+        "deploy",
+        "lancia ",
+        "launch",
+        "avvia",
+        "start service",
+        "installa",
+        "install ",
         // Investigazione + azione
-        "trova ", "find ", "individua", "identifica",
-        "verifica ", "verify ", "controlla ",
+        "trova ",
+        "find ",
+        "individua",
+        "identifica",
+        "verifica ",
+        "verify ",
+        "controlla ",
         // Implementazione / integrazione
-        "implementa", "integra", "integrate ", "implement",
+        "implementa",
+        "integra",
+        "integrate ",
+        "implement",
         // Riparazione (oltre fix che è già intent dedicato)
-        "ripar", "ripara",
+        "ripar",
+        "ripara",
         // Domande "come/dove" + azione (heuristic for "how to do X")
-        "come faccio a", "come si imposta", "come configurare",
-        "how do i ", "how to set",
+        "come faccio a",
+        "come si imposta",
+        "come configurare",
+        "how do i ",
+        "how to set",
     ];
     // Matching: almeno una keyword + il messaggio non è puramente informativo.
     // Heuristic per escludere domande puramente "cos'e'": se inizia con
@@ -237,9 +415,16 @@ fn is_agentic_request(message: &str) -> bool {
 fn is_test_failure_resolution(message: &str) -> bool {
     let lc = message.to_lowercase();
     // Deve menzionare i test E richiedere un'azione correttiva
-    let mentions_tests = ["test", "playwright", "vitest", "jest", "pytest", "cargo test"]
-        .iter()
-        .any(|kw| lc.contains(*kw));
+    let mentions_tests = [
+        "test",
+        "playwright",
+        "vitest",
+        "jest",
+        "pytest",
+        "cargo test",
+    ]
+    .iter()
+    .any(|kw| lc.contains(*kw));
     if !mentions_tests {
         return false;
     }
@@ -248,21 +433,49 @@ fn is_test_failure_resolution(message: &str) -> bool {
     // (problemi di catch playwright_test): "falliti", "fallit*", "fix m"
     // ("fix M44" è un format ricorrente nei prompt di Nexus M-tickets).
     const CORRECTIVE_VERBS: &[&str] = &[
-        "risolv", "fix", "correg", "ripar", "ripara",
-        "fai funzionare", "fai passare", "make pass", "make work",
-        "fai partire e", "esegui e", "lancia e",
-        "applica fix", "applica patch", "applica corre",
-        "make them pass", "pass all tests", "tutti i test passino",
-        "fai in modo che", "fai sì che", "fa sì che",
-        "non funziona", "non funzionano", "non passano",
-        "stanno fallendo", "are failing", "is failing", "failing",
-        "failure", "failures", "failed",
+        "risolv",
+        "fix",
+        "correg",
+        "ripar",
+        "ripara",
+        "fai funzionare",
+        "fai passare",
+        "make pass",
+        "make work",
+        "fai partire e",
+        "esegui e",
+        "lancia e",
+        "applica fix",
+        "applica patch",
+        "applica corre",
+        "make them pass",
+        "pass all tests",
+        "tutti i test passino",
+        "fai in modo che",
+        "fai sì che",
+        "fa sì che",
+        "non funziona",
+        "non funzionano",
+        "non passano",
+        "stanno fallendo",
+        "are failing",
+        "is failing",
+        "failing",
+        "failure",
+        "failures",
+        "failed",
         // Italiano: fallit* matcha fallito/falliti/fallita/fallite
-        "fallit", "falliscono", "fallimento", "fallimenti",
+        "fallit",
+        "falliscono",
+        "fallimento",
+        "fallimenti",
         // Format M-ticket Nexus: "Fix M44: ..." viene generato per ogni problema
-        "fix m", "errore — problema",
+        "fix m",
+        "errore — problema",
         // Errori da error-fix workflow
-        "errore rilevato", "severita: error", "severità: error",
+        "errore rilevato",
+        "severita: error",
+        "severità: error",
     ];
     CORRECTIVE_VERBS.iter().any(|kw| lc.contains(*kw))
 }
@@ -339,10 +552,18 @@ fn deterministic_intent_fallback(message: &str) -> Option<(&'static str, f32)> {
     // "scrivi readme per il progetto" matcherebbe altrimenti il blocco
     // agentico (verbo "scrivi" + contesto "progetto"). DOCS e' piu' specifico.
     const DOCS_PATTERNS: &[&str] = &[
-        "documenta", "genera doc", "genera la doc", "genera documentazione",
-        "crea documentazione", "crea la documentazione",
-        "scrivi readme", "scrivi il readme", "genera readme",
-        "write docs", "generate docs", "write readme",
+        "documenta",
+        "genera doc",
+        "genera la doc",
+        "genera documentazione",
+        "crea documentazione",
+        "crea la documentazione",
+        "scrivi readme",
+        "scrivi il readme",
+        "genera readme",
+        "write docs",
+        "generate docs",
+        "write readme",
     ];
     if DOCS_PATTERNS.iter().any(|p| lc.contains(*p)) {
         return Some(("docs", 0.70));
@@ -355,32 +576,73 @@ fn deterministic_intent_fallback(message: &str) -> Option<(&'static str, f32)> {
     // tool use solido in `nexus_routing_matrix` (stesso target della
     // promozione agentic esistente).
     const AGENTIC_VERBS: &[&str] = &[
-        "crea ", "creare", "crei ",
-        "implementa", "implementare",
-        "sviluppa", "sviluppare",
-        "costruisci", "costruire",
-        "genera ", "generare",
-        "scrivi ", "scrivere",
-        "aggiung", "add ",
-        "modific", "modify ",
-        "corregg", "fixa", "fix ",
+        "crea ",
+        "creare",
+        "crei ",
+        "implementa",
+        "implementare",
+        "sviluppa",
+        "sviluppare",
+        "costruisci",
+        "costruire",
+        "genera ",
+        "generare",
+        "scrivi ",
+        "scrivere",
+        "aggiung",
+        "add ",
+        "modific",
+        "modify ",
+        "corregg",
+        "fixa",
+        "fix ",
         "refactor",
-        "installa", "install ",
+        "installa",
+        "install ",
         "configur",
-        "avvia", "esegui ", "lancia ",
-        "build", "deploy",
+        "avvia",
+        "esegui ",
+        "lancia ",
+        "build",
+        "deploy",
         "scaffold",
     ];
     // Contesto che qualifica il verbo come task software (evita falsi positivi
     // tipo "crea un account sul sito X" che non e' un task di codice).
     const SOFTWARE_CONTEXT: &[&str] = &[
-        "app", "applicazione", "progetto", "project",
-        "file", "funzione", "function", "componente", "component",
-        "servizio", "service", "endpoint", "server", "api",
-        "script", "test", "codice", "code", "feature",
-        "modulo", "module", "classe", "class", "container",
-        "docker", "database", "schema", "migrazione", "migration",
-        "pagina", "page", "form", "route",
+        "app",
+        "applicazione",
+        "progetto",
+        "project",
+        "file",
+        "funzione",
+        "function",
+        "componente",
+        "component",
+        "servizio",
+        "service",
+        "endpoint",
+        "server",
+        "api",
+        "script",
+        "test",
+        "codice",
+        "code",
+        "feature",
+        "modulo",
+        "module",
+        "classe",
+        "class",
+        "container",
+        "docker",
+        "database",
+        "schema",
+        "migrazione",
+        "migration",
+        "pagina",
+        "page",
+        "form",
+        "route",
     ];
     if !purely_informational {
         let has_verb = AGENTIC_VERBS.iter().any(|v| lc.contains(*v));
@@ -396,15 +658,41 @@ fn deterministic_intent_fallback(message: &str) -> Option<(&'static str, f32)> {
     // use) — non esiste `code_read`/`analyze` nella matrix: `debug` e'
     // l'intent piu' vicino che instrada a modelli capaci di leggere file.
     const READ_VERBS: &[&str] = &[
-        "leggi ", "mostra", "analizza", "analizzare",
-        "cosa fa", "che cosa fa", "quanti ", "quante ",
-        "elenca", "lista ", "trova ", "cerca ", "individua",
-        "ispeziona", "esamina",
+        "leggi ",
+        "mostra",
+        "analizza",
+        "analizzare",
+        "cosa fa",
+        "che cosa fa",
+        "quanti ",
+        "quante ",
+        "elenca",
+        "lista ",
+        "trova ",
+        "cerca ",
+        "individua",
+        "ispeziona",
+        "esamina",
     ];
     const READ_CONTEXT: &[&str] = &[
-        "file", "src/", "codice", "code", "funzione", "function",
-        "classe", "class", "modulo", "module", "errore", "error",
-        "log", "endpoint", "test", "progetto", "repository", "repo",
+        "file",
+        "src/",
+        "codice",
+        "code",
+        "funzione",
+        "function",
+        "classe",
+        "class",
+        "modulo",
+        "module",
+        "errore",
+        "error",
+        "log",
+        "endpoint",
+        "test",
+        "progetto",
+        "repository",
+        "repo",
     ];
     if !purely_informational {
         let has_read_verb = READ_VERBS.iter().any(|v| lc.contains(*v));
@@ -544,16 +832,20 @@ fn spawn_routing_decision_insert(
         .bind(&intent)
         // classifier_source: per ora derivato (LLM se confidence > soglia,
         // altrimenti keyword/promotion). Fase 4 separera' i flussi esplicitamente.
-        .bind(if classifier_confidence >= 0.85 { "llm" } else { "keyword_or_promotion" })
+        .bind(if classifier_confidence >= 0.85 {
+            "llm"
+        } else {
+            "keyword_or_promotion"
+        })
         .bind(classifier_confidence)
-        .bind::<Option<bool>>(None)  // classifier_cached: non noto a questo livello
+        .bind::<Option<bool>>(None) // classifier_cached: non noto a questo livello
         .bind(&selected_provider)
         .bind(&selected_model)
         .bind(&decision_source)
         .bind(&rationale)
         .bind(no_capable_provider)
         .bind(&cooldown)
-        .bind(no_capable_provider)  // fallback_triggered = no_capable_provider
+        .bind(no_capable_provider) // fallback_triggered = no_capable_provider
         .execute(&db)
         .await;
         if let Err(e) = res {
@@ -604,7 +896,10 @@ async fn classify_intent_async_with_threshold(
 ) -> (&'static str, f32) {
     // Priorita': env var override > AtomicBool inizializzato dal DB in main.rs.
     let llm_enabled = match std::env::var("NEXUS_LLM_CLASSIFIER_ENABLED").as_deref() {
-        Ok(v) => !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Ok(v) => !matches!(
+            v.trim().to_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
         Err(_) => LLM_CLASSIFIER_ENABLED.load(Ordering::Relaxed),
     };
 
@@ -612,9 +907,12 @@ async fn classify_intent_async_with_threshold(
         return classify_intent_with_agentic_promotion(message);
     }
 
-    let brain_url = std::env::var("BRAIN_REST_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-    let url = format!("{}/classify-intent-agentic", brain_url.trim_end_matches('/'));
+    let brain_url =
+        std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+    let url = format!(
+        "{}/classify-intent-agentic",
+        brain_url.trim_end_matches('/')
+    );
 
     // Timeout configurabile via routing.llm_classifier_timeout_seconds (mig 0111).
     // Il classifier Python ha cache TTL 24h, request ripetuta risponde in <50ms.
@@ -648,7 +946,9 @@ async fn classify_intent_async_with_threshold(
     if parsed.fallback_used || parsed.confidence < min_confidence {
         tracing::debug!(
             "classifier LLM: scarso (fallback={}, conf={}, threshold={}) — uso keyword",
-            parsed.fallback_used, parsed.confidence, min_confidence
+            parsed.fallback_used,
+            parsed.confidence,
+            min_confidence
         );
         return classify_intent_with_agentic_promotion(message);
     }
@@ -656,14 +956,20 @@ async fn classify_intent_async_with_threshold(
     let intent_static = match intent_str_to_static(&parsed.intent) {
         Some(s) => s,
         None => {
-            tracing::warn!("classifier LLM: intent sconosciuto '{}' — fallback", parsed.intent);
+            tracing::warn!(
+                "classifier LLM: intent sconosciuto '{}' — fallback",
+                parsed.intent
+            );
             return classify_intent_with_agentic_promotion(message);
         }
     };
 
     tracing::info!(
         "classifier LLM: intent={} agentic_score={:.2} confidence={:.2} cached={}",
-        intent_static, parsed.agentic_score, parsed.confidence, parsed.cached
+        intent_static,
+        parsed.agentic_score,
+        parsed.confidence,
+        parsed.cached
     );
 
     // Up-tier extra basato su agentic_score: se il messaggio e' classificato
@@ -677,9 +983,7 @@ async fn classify_intent_async_with_threshold(
     // (deepseek-chat, gpt-4.1-mini) inadeguati per orchestrare multi-file
     // edit + debug. `fix_complesso` mappa a modelli capable.
     // Sia `test` sia `fix` vengono promossi (entrambi sono target sub-tier).
-    if (intent_static == "test" || intent_static == "fix")
-        && is_test_failure_resolution(message)
-    {
+    if (intent_static == "test" || intent_static == "fix") && is_test_failure_resolution(message) {
         tracing::info!(
             "intent: promozione {} → fix_complesso (test failure resolution detected)",
             intent_static
@@ -704,7 +1008,10 @@ async fn classify_intent_async_full_with_threshold(
     timeout_seconds: f32,
 ) -> ClassifiedIntent {
     let llm_enabled = match std::env::var("NEXUS_LLM_CLASSIFIER_ENABLED").as_deref() {
-        Ok(v) => !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Ok(v) => !matches!(
+            v.trim().to_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
         Err(_) => LLM_CLASSIFIER_ENABLED.load(Ordering::Relaxed),
     };
 
@@ -732,9 +1039,12 @@ async fn classify_intent_async_full_with_threshold(
         return keyword_to_full(i, c);
     }
 
-    let brain_url = std::env::var("BRAIN_REST_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-    let url = format!("{}/classify-intent-agentic", brain_url.trim_end_matches('/'));
+    let brain_url =
+        std::env::var("BRAIN_REST_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+    let url = format!(
+        "{}/classify-intent-agentic",
+        brain_url.trim_end_matches('/')
+    );
 
     let timeout_dur = std::time::Duration::from_millis((timeout_seconds * 1000.0) as u64);
     let http = match reqwest::Client::builder().timeout(timeout_dur).build() {
@@ -767,7 +1077,10 @@ async fn classify_intent_async_full_with_threshold(
         // Conserviamo i candidati LLM se disponibili (utili per audit anche
         // quando il top intent non passa la soglia di confidence).
         let candidates = if parsed.candidates.is_empty() {
-            vec![IntentCandidate { intent: i.to_string(), confidence: c }]
+            vec![IntentCandidate {
+                intent: i.to_string(),
+                confidence: c,
+            }]
         } else {
             parsed.candidates
         };
@@ -818,11 +1131,7 @@ async fn classify_intent_async_full_with_threshold(
 /// Il path principale (resolve_agent_provider*, run) usa
 /// `Orchestrator::classify_intent_with_db_thresholds`.
 async fn classify_intent_async(message: &str) -> (&'static str, f32) {
-    classify_intent_async_with_threshold(
-        message,
-        LLM_CLASSIFIER_MIN_CONFIDENCE_DEFAULT,
-        5.0,
-    ).await
+    classify_intent_async_with_threshold(message, LLM_CLASSIFIER_MIN_CONFIDENCE_DEFAULT, 5.0).await
 }
 
 #[derive(Debug)]
@@ -943,13 +1252,13 @@ async fn route_model_from_catalog(
     // (mig 0110), che applica le soglie di token threshold per l'intent.
     let required_tier = match mode {
         "approfondita" => match base_tier {
-            "light"  => "medium",
+            "light" => "medium",
             "medium" => "heavy",
-            other    => other,
+            other => other,
         },
         "veloce" | "economica" => match base_tier {
-            "heavy"  => "medium",
-            other    => other,
+            "heavy" => "medium",
+            other => other,
         },
         _ => base_tier,
     };
@@ -1106,17 +1415,24 @@ fn route_model_with_mode(
         "architecture" => "architecture",
         "refactor" => "refactor",
         "fix" => {
-            if estimated_tokens > token_thresholds.complex_fix { "fix_complesso" }
-            else { "fix_semplice" }
+            if estimated_tokens > token_thresholds.complex_fix {
+                "fix_complesso"
+            } else {
+                "fix_semplice"
+            }
         }
         "test" => "test",
         "docs" => "docs",
         "file_ops" => "file_ops",
         "system_admin" => "system_admin",
         _ => {
-            if estimated_tokens <= token_thresholds.chat_breve { "chat_breve" }
-            else if estimated_tokens <= token_thresholds.chat_media { "chat_media" }
-            else { "chat_lunga" }
+            if estimated_tokens <= token_thresholds.chat_breve {
+                "chat_breve"
+            } else if estimated_tokens <= token_thresholds.chat_media {
+                "chat_media"
+            } else {
+                "chat_lunga"
+            }
         }
     };
 
@@ -1142,12 +1458,17 @@ fn route_model_with_mode(
                 rationale: "routing_matrix DB",
             };
         }
-        tracing::warn!("route_model_with_mode: skip provider {} (in cooldown)", provider);
+        tracing::warn!(
+            "route_model_with_mode: skip provider {} (in cooldown)",
+            provider
+        );
     }
 
     // 2. Fallback: prova lo stesso intent con mode 'bilanciata' (budget-aware)
     if mode != "bilanciata" {
-        if let Some((provider, model)) = matrix.lookup_with_budget(intent_key, "bilanciata", est_i32) {
+        if let Some((provider, model)) =
+            matrix.lookup_with_budget(intent_key, "bilanciata", est_i32)
+        {
             if !in_cooldown(&provider) {
                 return RoutingDecision {
                     provider,
@@ -1155,7 +1476,10 @@ fn route_model_with_mode(
                     rationale: "routing_matrix DB (mode fallback bilanciata)",
                 };
             }
-            tracing::warn!("route_model_with_mode: skip provider {} su fallback bilanciata (in cooldown)", provider);
+            tracing::warn!(
+                "route_model_with_mode: skip provider {} su fallback bilanciata (in cooldown)",
+                provider
+            );
         }
     }
 
@@ -1207,8 +1531,7 @@ struct SettingValueRow {
     value: String,
 }
 
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct RoutingConfig {
     provider_hierarchy: Vec<String>,
     default_provider: Option<String>,
@@ -1412,8 +1735,8 @@ impl AutomationMode {
     /// Restituisce la chiave DB del template per le istruzioni di modalità.
     fn prompt_instruction_template_key(self) -> &'static str {
         match self {
-            Self::Study    => "automation.mode_study_instruction",
-            Self::Confirm  => "automation.mode_confirm_instruction",
+            Self::Study => "automation.mode_study_instruction",
+            Self::Confirm => "automation.mode_confirm_instruction",
             Self::Automatic => "automation.mode_automatic_instruction",
         }
     }
@@ -1463,9 +1786,12 @@ impl NeuralCoreClient {
             .max_decoding_message_size(MAX_MSG)
             .max_encoding_message_size(MAX_MSG);
         tracing::info!("Connected to Neural Core at {} (max msg 128MB)", url);
-        let brain_http_url = std::env::var("BRAIN_HTTP_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-        Ok(Self { client, brain_http_url })
+        let brain_http_url =
+            std::env::var("BRAIN_HTTP_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+        Ok(Self {
+            client,
+            brain_http_url,
+        })
     }
 
     #[allow(dead_code)]
@@ -1616,11 +1942,7 @@ impl NeuralCoreClient {
             "max_tokens": max_tokens,
             "system_text": system_text,
         });
-        let http_result = reqwest::Client::new()
-            .post(&url)
-            .json(&body)
-            .send()
-            .await;
+        let http_result = reqwest::Client::new().post(&url).json(&body).send().await;
         let mut resp = match http_result {
             Ok(r) if r.status().is_success() => r,
             Ok(_) | Err(_) => {
@@ -1630,7 +1952,14 @@ impl NeuralCoreClient {
                     provider
                 );
                 return self
-                    .generate_agent_turn(provider, model, messages_json, tools_json, max_tokens, system_text)
+                    .generate_agent_turn(
+                        provider,
+                        model,
+                        messages_json,
+                        tools_json,
+                        max_tokens,
+                        system_text,
+                    )
                     .await;
             }
         };
@@ -1663,7 +1992,10 @@ impl NeuralCoreClient {
                                         .unwrap_or("errore sconosciuto");
                                     if msg.contains("non supporta lo streaming") {
                                         // Provider non supporta streaming — fallback a gRPC
-                                        tracing::debug!("provider {} non supporta streaming, fallback a gRPC", provider);
+                                        tracing::debug!(
+                                            "provider {} non supporta streaming, fallback a gRPC",
+                                            provider
+                                        );
                                         fallback_required = true;
                                         break;
                                     }
@@ -1689,7 +2021,9 @@ impl NeuralCoreClient {
                                     };
                                     anyhow::bail!(
                                         "brain stream error: {}{}{}",
-                                        msg, marker_retry, marker_class
+                                        msg,
+                                        marker_retry,
+                                        marker_class
                                     );
                                 }
                                 _ => {}
@@ -1704,7 +2038,14 @@ impl NeuralCoreClient {
 
         if fallback_required {
             return self
-                .generate_agent_turn(provider, model, messages_json, tools_json, max_tokens, system_text)
+                .generate_agent_turn(
+                    provider,
+                    model,
+                    messages_json,
+                    tools_json,
+                    max_tokens,
+                    system_text,
+                )
                 .await;
         }
 
@@ -1741,7 +2082,11 @@ impl NeuralCoreClient {
         match client.classify_error(req).await {
             Ok(resp) => serde_json::from_str::<Value>(&resp.into_inner().json)
                 .ok()
-                .and_then(|j| j.get("error_class").and_then(|v| v.as_str()).map(String::from))
+                .and_then(|j| {
+                    j.get("error_class")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
                 .unwrap_or_else(|| "error".to_string()),
             Err(e) => {
                 tracing::debug!("classify_error gRPC fallito: {e}");
@@ -1831,12 +2176,12 @@ impl Orchestrator {
     /// Classifier intent che usa le soglie da DB (mig 0111). Sostituisce le
     /// chiamate a `classify_intent_async(message)` nei call site di routing.
     /// Se la cache `routing_thresholds` non e' disponibile, fallback ai default.
-    async fn classify_intent_with_db_thresholds(
-        &self,
-        message: &str,
-    ) -> (&'static str, f32) {
+    async fn classify_intent_with_db_thresholds(&self, message: &str) -> (&'static str, f32) {
         let (min_conf, timeout_s) = match self.routing_thresholds.current_async().await {
-            Ok(t) => (t.llm_classifier_min_confidence, t.llm_classifier_timeout_seconds),
+            Ok(t) => (
+                t.llm_classifier_min_confidence,
+                t.llm_classifier_timeout_seconds,
+            ),
             Err(_) => (LLM_CLASSIFIER_MIN_CONFIDENCE_DEFAULT, 5.0),
         };
         classify_intent_async_with_threshold(message, min_conf, timeout_s).await
@@ -1946,7 +2291,8 @@ impl Orchestrator {
         if !slots.meets_confidence(min_slot_confidence) {
             tracing::debug!(
                 "route_by_slots: confidence {:.2} < soglia {:.2}, fallback intent classico",
-                slots.confidence, min_slot_confidence
+                slots.confidence,
+                min_slot_confidence
             );
             return None;
         }
@@ -1959,7 +2305,10 @@ impl Orchestrator {
         if chain.is_empty() {
             tracing::debug!(
                 "route_by_slots: nessun match per ({}, {}, {}, {}) in matrix",
-                slots.action_verb, slots.target_type, slots.framework, slots.scope,
+                slots.action_verb,
+                slots.target_type,
+                slots.framework,
+                slots.scope,
             );
             return None;
         }
@@ -1978,8 +2327,12 @@ impl Orchestrator {
             } else {
                 tracing::info!(
                     "route_by_slots: slots=({}, {}, {}, {}) → {}/{}",
-                    slots.action_verb, slots.target_type, slots.framework, slots.scope,
-                    provider, model,
+                    slots.action_verb,
+                    slots.target_type,
+                    slots.framework,
+                    slots.scope,
+                    provider,
+                    model,
                 );
             }
             return Some((provider.clone(), model.clone(), "slots_matrix"));
@@ -1996,10 +2349,7 @@ impl Orchestrator {
     /// mig 0110) + TokenThresholds (da settings.routing.*, mig 0111). Usato dai
     /// call site di `route_model_with_mode` per evitare di duplicare il pattern
     /// "leggi cache → estrai → passa".
-    async fn routing_helpers_for(
-        &self,
-        intent: &str,
-    ) -> (Option<String>, TokenThresholds) {
+    async fn routing_helpers_for(&self, intent: &str) -> (Option<String>, TokenThresholds) {
         let preferred = match self.intent_capability.current_async().await {
             Ok(map) => map.preferred_provider_for(intent).map(String::from),
             Err(_) => None,
@@ -2068,7 +2418,16 @@ impl Orchestrator {
             .unwrap_or_else(|| routing_for_mode.behavior_mode.clone());
 
         let (provider, model) = self
-            .resolve_agent_provider(db, _project_id, _profile_id, message, provider_override, model_override, context_message_count, Some(&configured_behavior_mode))
+            .resolve_agent_provider(
+                db,
+                _project_id,
+                _profile_id,
+                message,
+                provider_override,
+                model_override,
+                context_message_count,
+                Some(&configured_behavior_mode),
+            )
             .await;
         // Riclassifica via classifier LLM (gemini-flash, cache 24h) con fallback
         // keyword + promozione agentic. Vedi `classify_intent_async`.
@@ -2089,16 +2448,15 @@ impl Orchestrator {
         //   - se behavior_mode e' "dinamico" e il task NON e' rischioso e il
         //     model non corrisponde a quello della matrix statica, source = "catalog"
         //   - altrimenti source = "matrix"
-        let source: &'static str = if provider_override
-            .filter(|v| !v.trim().is_empty()).is_some()
-        {
+        let source: &'static str = if provider_override.filter(|v| !v.trim().is_empty()).is_some() {
             "override"
         } else if configured_behavior_mode == "dinamico" && !risky {
             // In modalita' dinamica non rischiosa il catalogo prezzi e' autoritativo.
             // Verifichiamo: se il modello scelto NON e' quello della matrix per
             // (intent, "bilanciata"), allora il catalogo lo ha sovrascritto.
             let (pref, thr) = self.routing_helpers_for(intent).await;
-            let matrix_default = route_model_with_mode(matrix, intent, 1500, "bilanciata", pref.as_deref(), &thr);
+            let matrix_default =
+                route_model_with_mode(matrix, intent, 1500, "bilanciata", pref.as_deref(), &thr);
             if matrix_default.model != model {
                 "catalog"
             } else {
@@ -2136,12 +2494,18 @@ impl Orchestrator {
 
         let rationale = format!(
             "intent={} confidence={:.2} mode={}{} source={} → {}/{}{}{}",
-            intent, confidence, effective_mode,
+            intent,
+            confidence,
+            effective_mode,
             if risky { " [risky→approfondita]" } else { "" },
-            source, provider, model,
+            source,
+            provider,
+            model,
             if !providers_in_cooldown.is_empty() {
                 format!(" [cooldown:{}]", providers_in_cooldown.join(","))
-            } else { String::new() },
+            } else {
+                String::new()
+            },
             cooldown_note,
         );
 
@@ -2168,7 +2532,8 @@ impl Orchestrator {
         );
 
         RoutingResolveResult {
-            provider, model,
+            provider,
+            model,
             intent: intent.to_string(),
             mode: effective_mode,
             risky,
@@ -2265,24 +2630,33 @@ impl Orchestrator {
                     None => ("light".to_string(), "chat".to_string()),
                 },
                 None => {
-                    tracing::warn!("intent_capability cache non disponibile, uso defaults light/chat");
+                    tracing::warn!(
+                        "intent_capability cache non disponibile, uso defaults light/chat"
+                    );
                     ("light".to_string(), "chat".to_string())
                 }
             };
-            if let Some(d) = route_model_from_catalog(db, &base_tier, &capability, "dinamico").await {
+            if let Some(d) = route_model_from_catalog(db, &base_tier, &capability, "dinamico").await
+            {
                 let provider = d.provider;
                 if !is_provider_in_cooldown(&provider) {
-                let model = model_override
-                    .filter(|v| !v.trim().is_empty())
-                    .map(str::to_string)
-                    .unwrap_or(d.model);
-                tracing::info!(
-                    "Agent routing (dinamico/catalog): intent={} tokens~{} → {}/{}",
-                    intent, estimated_tokens, provider, model
-                );
-                return (provider, model);
+                    let model = model_override
+                        .filter(|v| !v.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or(d.model);
+                    tracing::info!(
+                        "Agent routing (dinamico/catalog): intent={} tokens~{} → {}/{}",
+                        intent,
+                        estimated_tokens,
+                        provider,
+                        model
+                    );
+                    return (provider, model);
                 } else {
-                    tracing::warn!("Agent routing: '{}' in cooldown (catalog/dinamico), skip", provider);
+                    tracing::warn!(
+                        "Agent routing: '{}' in cooldown (catalog/dinamico), skip",
+                        provider
+                    );
                 }
             }
             // Catalogo vuoto → cade nel ramo statico bilanciata sotto
@@ -2294,7 +2668,8 @@ impl Orchestrator {
         // i modelli leggeri (mistral-small, gpt-4.1-nano) tendono a interpretare
         // liberamente le richieste distruttive (es. "elimina file Docker" ->
         // ricrea i file). Per task ad alto impatto serve un modello capable.
-        let effective_mode = if is_risky_task(message) && effective_behavior_mode != "approfondita" {
+        let effective_mode = if is_risky_task(message) && effective_behavior_mode != "approfondita"
+        {
             tracing::info!(
                 "Agent routing: task rischioso rilevato (mode {} -> approfondita)",
                 effective_behavior_mode
@@ -2308,8 +2683,12 @@ impl Orchestrator {
 
         let (pref_provider, thresholds) = self.routing_helpers_for(intent).await;
         let d = route_model_with_mode(
-            matrix, intent, estimated_tokens, effective_mode,
-            pref_provider.as_deref(), &thresholds,
+            matrix,
+            intent,
+            estimated_tokens,
+            effective_mode,
+            pref_provider.as_deref(),
+            &thresholds,
         );
         let decision_provider = d.provider.to_string();
         let decision_model = d.model.to_string();
@@ -2344,77 +2723,106 @@ impl Orchestrator {
         // Se il provider scelto e' in cooldown (rate-limit recente nel processo), trova alternativa.
         // Il fallback rispetta tier/capability: per task critici (heavy/medium) non degrada
         // silenziosamente a un default generico che potrebbe essere un modello inadeguato.
-        let (provider, model) = if is_provider_in_cooldown(&provider) {
-            tracing::warn!("Agent routing: '{}' scelto dal routing ma in cooldown, cerco alternativa", provider);
+        let (provider, model) =
+            if is_provider_in_cooldown(&provider) {
+                tracing::warn!(
+                    "Agent routing: '{}' scelto dal routing ma in cooldown, cerco alternativa",
+                    provider
+                );
 
-            // Risolvi tier/capability dalla cache (stessi valori usati sopra nel routing)
-            let icap_arc = self.intent_capability.current_async().await.ok();
-            let (tier, cap) = match icap_arc.as_deref() {
-                Some(map) => match map.get(intent) {
-                    Some(c) => (c.tier_for_tokens(estimated_tokens), c.base_capability.clone()),
+                // Risolvi tier/capability dalla cache (stessi valori usati sopra nel routing)
+                let icap_arc = self.intent_capability.current_async().await.ok();
+                let (tier, cap) = match icap_arc.as_deref() {
+                    Some(map) => match map.get(intent) {
+                        Some(c) => (
+                            c.tier_for_tokens(estimated_tokens),
+                            c.base_capability.clone(),
+                        ),
+                        None => ("light".to_string(), "chat".to_string()),
+                    },
                     None => ("light".to_string(), "chat".to_string()),
-                },
-                None => ("light".to_string(), "chat".to_string()),
-            };
+                };
 
-            // Strategia: cerca nel catalogo un modello dello stesso tier (o un
-            // livello sotto) da un provider NON in cooldown. Mantiene la qualita'
-            // richiesta per il task — non degrada a default generico.
-            let tiers_to_try: Vec<&str> = match tier.as_str() {
-                "heavy"  => vec!["heavy", "medium"],
-                "medium" => vec!["medium"],
-                _        => vec!["light"],
-            };
+                // Strategia: cerca nel catalogo un modello dello stesso tier (o un
+                // livello sotto) da un provider NON in cooldown. Mantiene la qualita'
+                // richiesta per il task — non degrada a default generico.
+                let tiers_to_try: Vec<&str> = match tier.as_str() {
+                    "heavy" => vec!["heavy", "medium"],
+                    "medium" => vec!["medium"],
+                    _ => vec!["light"],
+                };
 
-            let mut found = None;
-            for try_tier in &tiers_to_try {
-                let rows: Vec<(String, String)> = sqlx::query_as(
-                    r#"SELECT provider, model FROM ai_price_catalog
+                let mut found = None;
+                for try_tier in &tiers_to_try {
+                    let rows: Vec<(String, String)> = sqlx::query_as(
+                        r#"SELECT provider, model FROM ai_price_catalog
                        WHERE is_enabled = TRUE
                          AND performance_tier = $1
                          AND capabilities @> $2::jsonb
                          AND supports_tool_use = TRUE
                        ORDER BY input_cost_per_million_tokens ASC
-                       LIMIT 10"#
-                ).bind(try_tier).bind(format!("[\"{cap}\"]"))
-                .fetch_all(db).await.unwrap_or_default();
+                       LIMIT 10"#,
+                    )
+                    .bind(try_tier)
+                    .bind(format!("[\"{cap}\"]"))
+                    .fetch_all(db)
+                    .await
+                    .unwrap_or_default();
 
-                for (alt_provider, alt_model) in &rows {
-                    if !is_provider_in_cooldown(alt_provider) {
-                        tracing::info!(
+                    for (alt_provider, alt_model) in &rows {
+                        if !is_provider_in_cooldown(alt_provider) {
+                            tracing::info!(
                             "Agent routing (cooldown-fallback tier-aware): {} → {}/{} (tier={})",
                             provider, alt_provider, alt_model, try_tier
                         );
-                        found = Some((alt_provider.clone(), alt_model.clone()));
+                            found = Some((alt_provider.clone(), alt_model.clone()));
+                            break;
+                        }
+                    }
+                    if found.is_some() {
                         break;
                     }
                 }
-                if found.is_some() { break; }
-            }
 
-            // Ultimo resort: hierarchy classica (se il catalogo non ha nulla)
-            found.unwrap_or_else(|| {
-                let hierarchy_str: Option<String> = futures::executor::block_on(async {
-                    sqlx::query_scalar(
+                // Ultimo resort: hierarchy classica (se il catalogo non ha nulla)
+                found.unwrap_or_else(|| {
+                    let hierarchy_str: Option<String> =
+                        futures::executor::block_on(async {
+                            sqlx::query_scalar(
                         "SELECT value FROM settings WHERE key = 'provider_hierarchy' LIMIT 1"
                     ).fetch_optional(db).await.ok().flatten()
-                });
-                let hier: Vec<String> = hierarchy_str.as_deref().unwrap_or(&provider)
-                    .split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
-                let alt = hier.iter().find(|p| !is_provider_in_cooldown(p))
-                    .cloned()
-                    .unwrap_or_else(|| provider.clone());
-                let alt_model = default_model_for_provider(matrix, &alt).to_string();
-                tracing::warn!("Agent routing (cooldown-fallback legacy): {} → {}/{}", provider, alt, alt_model);
-                (alt, alt_model)
-            })
-        } else {
-            (provider, model)
-        };
+                        });
+                    let hier: Vec<String> = hierarchy_str
+                        .as_deref()
+                        .unwrap_or(&provider)
+                        .split(',')
+                        .map(|s| s.trim().to_lowercase())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let alt = hier
+                        .iter()
+                        .find(|p| !is_provider_in_cooldown(p))
+                        .cloned()
+                        .unwrap_or_else(|| provider.clone());
+                    let alt_model = default_model_for_provider(matrix, &alt).to_string();
+                    tracing::warn!(
+                        "Agent routing (cooldown-fallback legacy): {} → {}/{}",
+                        provider,
+                        alt,
+                        alt_model
+                    );
+                    (alt, alt_model)
+                })
+            } else {
+                (provider, model)
+            };
 
         tracing::info!(
             "Agent routing (local): intent={} tokens~{} → {}/{}",
-            intent, estimated_tokens, provider, model
+            intent,
+            estimated_tokens,
+            provider,
+            model
         );
 
         (provider, model)
@@ -2434,17 +2842,19 @@ impl Orchestrator {
         // Snapshot della routing matrix DB (cache 60s, await sul lock).
         // Se la matrice non e' caricata, ritorniamo errore esplicito invece
         // di un fallback nascosto.
-        let matrix_arc = self
-            .routing_matrix
-            .current_async()
-            .await
-            .map_err(|e| anyhow::anyhow!("routing_matrix non disponibile: {e}. Verifica DB e migrazioni 0101/0102."))?;
+        let matrix_arc = self.routing_matrix.current_async().await.map_err(|e| {
+            anyhow::anyhow!(
+                "routing_matrix non disponibile: {e}. Verifica DB e migrazioni 0101/0102."
+            )
+        })?;
         let matrix = &*matrix_arc;
 
         // Step 1 + 2: Routing locale — zero gRPC, zero latenza aggiuntiva
         // Usa estimate_complexity per non farsi ingannare da messaggi con liste dati lunghe
         let msg_tokens_estimate = estimate_complexity(&input.message);
-        let (intent_str, _confidence) = self.classify_intent_with_db_thresholds(&input.message).await;
+        let (intent_str, _confidence) = self
+            .classify_intent_with_db_thresholds(&input.message)
+            .await;
         let intent = intent_str.to_string();
         let mut routing = Self::load_routing_config(db).await?;
 
@@ -2461,14 +2871,23 @@ impl Orchestrator {
             },
             None => ("light".to_string(), "chat".to_string()),
         };
-        let (suggested_provider, suggested_model): (Option<String>, Option<String>) = if routing.behavior_mode == "dinamico" {
+        let (suggested_provider, suggested_model): (Option<String>, Option<String>) = if routing
+            .behavior_mode
+            == "dinamico"
+        {
             match route_model_from_catalog(db, &base_tier, &capability, "dinamico").await {
                 Some(dyn_decision) if !is_provider_in_cooldown(&dyn_decision.provider) => {
                     tracing::info!(
                         "Dynamic catalog routing: intent={} tokens~{} → {}/{}",
-                        intent, msg_tokens_estimate, dyn_decision.provider, dyn_decision.model
+                        intent,
+                        msg_tokens_estimate,
+                        dyn_decision.provider,
+                        dyn_decision.model
                     );
-                    (Some(dyn_decision.provider.to_string()), Some(dyn_decision.model.to_string()))
+                    (
+                        Some(dyn_decision.provider.to_string()),
+                        Some(dyn_decision.model.to_string()),
+                    )
                 }
                 other => {
                     if let Some(ref d) = other {
@@ -2480,9 +2899,9 @@ impl Orchestrator {
                     // Cerca nel catalogo un modello dello stesso tier (o inferiore)
                     // da un provider NON in cooldown
                     let tiers_to_try: Vec<&str> = match base_tier.as_str() {
-                        "heavy"  => vec!["heavy", "medium"],
+                        "heavy" => vec!["heavy", "medium"],
                         "medium" => vec!["medium", "light"],
-                        _        => vec!["light"],
+                        _ => vec!["light"],
                     };
                     let mut catalog_alt = None;
                     for try_tier in &tiers_to_try {
@@ -2493,9 +2912,13 @@ impl Orchestrator {
                                  AND capabilities @> $2::jsonb
                                  AND supports_tool_use = TRUE
                                ORDER BY input_cost_per_million_tokens ASC
-                               LIMIT 10"#
-                        ).bind(try_tier).bind(format!("[\"{capability}\"]"))
-                        .fetch_all(db).await.unwrap_or_default();
+                               LIMIT 10"#,
+                        )
+                        .bind(try_tier)
+                        .bind(format!("[\"{capability}\"]"))
+                        .fetch_all(db)
+                        .await
+                        .unwrap_or_default();
 
                         for (alt_p, alt_m) in &rows {
                             if !is_provider_in_cooldown(alt_p) {
@@ -2507,14 +2930,27 @@ impl Orchestrator {
                                 break;
                             }
                         }
-                        if catalog_alt.is_some() { break; }
+                        if catalog_alt.is_some() {
+                            break;
+                        }
                     }
 
                     catalog_alt.unwrap_or_else(|| {
-                        let (pref, thr) = futures::executor::block_on(self.routing_helpers_for(intent_str));
-                        let d = route_model_with_mode(matrix, intent_str, msg_tokens_estimate, "bilanciata",
-                                                       pref.as_deref(), &thr);
-                        tracing::info!("Dynamic routing fallback to bilanciata: {}/{}", d.provider, d.model);
+                        let (pref, thr) =
+                            futures::executor::block_on(self.routing_helpers_for(intent_str));
+                        let d = route_model_with_mode(
+                            matrix,
+                            intent_str,
+                            msg_tokens_estimate,
+                            "bilanciata",
+                            pref.as_deref(),
+                            &thr,
+                        );
+                        tracing::info!(
+                            "Dynamic routing fallback to bilanciata: {}/{}",
+                            d.provider,
+                            d.model
+                        );
                         (Some(d.provider.to_string()), Some(d.model.to_string()))
                     })
                 }
@@ -2522,20 +2958,39 @@ impl Orchestrator {
         } else if routing.behavior_mode == "manuale" {
             // Manuale: nessun routing automatico — usa provider/model da config admin
             let (pref, thr) = self.routing_helpers_for(intent_str).await;
-            let d = route_model_with_mode(matrix, intent_str, msg_tokens_estimate, "bilanciata",
-                                           pref.as_deref(), &thr);
+            let d = route_model_with_mode(
+                matrix,
+                intent_str,
+                msg_tokens_estimate,
+                "bilanciata",
+                pref.as_deref(),
+                &thr,
+            );
             tracing::info!(
                 "Manual routing config: intent={} tokens~{} → {}/{}",
-                intent, msg_tokens_estimate, d.provider, d.model
+                intent,
+                msg_tokens_estimate,
+                d.provider,
+                d.model
             );
             (Some(d.provider.to_string()), Some(d.model.to_string()))
         } else {
             let (pref, thr) = self.routing_helpers_for(intent_str).await;
-            let d = route_model_with_mode(matrix, intent_str, msg_tokens_estimate, &routing.behavior_mode,
-                                           pref.as_deref(), &thr);
+            let d = route_model_with_mode(
+                matrix,
+                intent_str,
+                msg_tokens_estimate,
+                &routing.behavior_mode,
+                pref.as_deref(),
+                &thr,
+            );
             tracing::info!(
                 "Local routing: intent={} tokens~{} mode={} → {}/{}",
-                intent, msg_tokens_estimate, routing.behavior_mode, d.provider, d.model
+                intent,
+                msg_tokens_estimate,
+                routing.behavior_mode,
+                d.provider,
+                d.model
             );
             (Some(d.provider.to_string()), Some(d.model.to_string()))
         };
@@ -2588,253 +3043,280 @@ impl Orchestrator {
         // ── Step 4: LLM Execution ─────────────────────────────────────────────────
         // PATH A: Nexus Gateway (routing, DLP, rate limiting, fallback automatico)
         // PATH B: Brain gRPC diretto (legacy, usato se il gateway non è disponibile)
-        let (provider, model, completion, usage, total_cost, currency) =
-            if let Some(gw) = &self.nexus_gateway {
-                let alias = intent_to_alias(
-                    &intent,
-                    &routing.behavior_mode,
-                    forced_model.as_deref(),
-                );
-                let gw_model = if let Some(fp) = &forced_provider {
-                    format!("{fp}/{}", forced_model.as_deref().unwrap_or(&alias))
-                } else {
-                    alias
-                };
-                let gw_req = GwRequest {
-                    model: gw_model,
-                    messages: vec![GwMessage {
-                        role: "user".to_string(),
-                        content: composed_prompt.clone(),
-                    }],
-                    max_tokens: Some(token_budget),
-                    temperature: None,
-                    tools: None,
-                    metadata: GwMetadata {
-                        tenant_id: input.project_id.clone(),
-                        user_id: input.user_id.clone(),
-                        request_id: run_id.to_string(),
-                        sensitivity_tier: 0,
-                        feature: intent.clone(),
-                    },
-                };
-                let prompt_tokens = mcp_token::count_tokens(&composed_prompt) as i32;
-                let estimated_completion = (token_budget as i32 - prompt_tokens).max(0);
-                // Fallback provider/model letti da DB (matrice routing) invece che hardcoded.
-                let fallback_provider: String = match matrix.lookup("chat", "bilanciata") {
-                    Some((p, _)) => p,
-                    None => "openai".to_string(),
-                };
-                let hint_provider_owned: String = forced_provider
-                    .as_deref()
-                    .or(suggested_provider.as_deref())
-                    .map(String::from)
-                    .unwrap_or(fallback_provider);
-                let fallback_model: String = default_model_for_provider(matrix, &hint_provider_owned);
-                let hint_model_owned: String = forced_model
-                    .as_deref()
-                    .or(suggested_model.as_deref())
-                    .map(String::from)
-                    .unwrap_or(fallback_model);
-                let hint_provider = hint_provider_owned.as_str();
-                let hint_model = hint_model_owned.as_str();
-                let reservation = billing::reserve_usage(
-                    db, user_id, project_uuid, hint_provider, hint_model,
-                    prompt_tokens, estimated_completion,
-                    json!({"intent": intent, "profile_id": input.profile_id,
-                           "via_nexus_gateway": true,
-                           "corrections_count": prompt_corrections.len()}),
-                )
-                .await.map_err(|e| anyhow::anyhow!("billing_rejected: {e}"))?;
-
-                let gw_resp = match gw.complete(gw_req).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        billing::release_usage(db, &reservation, "gateway_error").await;
-                        anyhow::bail!("Nexus Gateway failed for intent '{intent}': {e}");
-                    }
-                };
-                let actual_usage = UsageNumbers {
-                    prompt_tokens: gw_resp.usage.input_tokens as i32,
-                    completion_tokens: gw_resp.usage.output_tokens as i32,
-                    total_tokens: (gw_resp.usage.input_tokens + gw_resp.usage.output_tokens) as i32,
-                };
-                let (_, _, cost, cur) =
-                    billing::finalize_usage(db, &reservation, run_id, &actual_usage).await?;
-                let gw_completion = json!({"content": gw_resp.content, "metadata": {
-                    "provider": gw_resp.provider_used, "model": gw_resp.model_used,
-                    "latency_ms": gw_resp.latency_ms, "finish_reason": gw_resp.finish_reason},
-                    "privacy_rerouted": gw_resp.privacy_rerouted.as_ref().map(|pr| json!({
-                        "provider": pr.provider,
-                        "blocked_tier": pr.blocked_tier,
-                        "reason": pr.reason,
-                    }))
-                });
-                if let Some(ref pr) = gw_resp.privacy_rerouted {
-                    tracing::warn!(
-                        "Nexus Gateway: privacy re-route tier={} → local provider={} intent={} tokens={}",
-                        pr.blocked_tier, pr.provider, intent, actual_usage.total_tokens
-                    );
-                } else {
-                    tracing::info!(
-                        "Nexus Gateway: intent={} provider={} model={} tokens={}",
-                        intent, gw_resp.provider_used, gw_resp.model_used, actual_usage.total_tokens
-                    );
-                }
-                (gw_resp.provider_used, gw_resp.model_used, gw_completion, actual_usage, cost, cur)
+        let (provider, model, completion, usage, total_cost, currency) = if let Some(gw) =
+            &self.nexus_gateway
+        {
+            let alias = intent_to_alias(&intent, &routing.behavior_mode, forced_model.as_deref());
+            let gw_model = if let Some(fp) = &forced_provider {
+                format!("{fp}/{}", forced_model.as_deref().unwrap_or(&alias))
             } else {
-                // PATH B: Brain gRPC legacy
-                let mut selected_provider: Option<String> = None;
-                let mut selected_model: Option<String> = None;
-                let mut completion: Option<serde_json::Value> = None;
-                let mut usage: Option<UsageNumbers> = None;
-                let mut usage_cost: Option<(f64, f64, f64, String)> = None;
-                let mut skip_reasons = Vec::new();
-
-                // In modalità dinamico la scelta del catalogo è autoritativa
-                let provider_candidates = if let Some(provider) = forced_provider.as_ref() {
-                    vec![provider.clone()]
-                } else if routing.behavior_mode == "dinamico" {
-                    if let Some(p) = suggested_provider.as_ref() {
-                        vec![p.clone()]
-                    } else {
-                        routing.candidates(&intent, suggested_provider.as_deref())
-                    }
-                } else {
-                    routing.candidates(&intent, suggested_provider.as_deref())
-                };
-        for provider in provider_candidates {
-            let health = match self.neural.provider_health(&provider).await {
-                Ok(health) => health,
-                Err(error) => {
-                    skip_reasons.push(format!("{provider}:health_check_failed:{error}"));
-                    continue;
-                }
+                alias
             };
-
-            let status = health["status"].as_str().unwrap_or("unknown");
-            if !matches!(status, "ready" | "ok") {
-                let reason = health["reason"]
-                    .as_str()
-                    .or_else(|| health["skipReasons"].get(0).and_then(Value::as_str))
-                    .unwrap_or(status);
-                skip_reasons.push(format!("{provider}:skipped:{reason}"));
-                continue;
-            }
-
-            let model = if forced_provider.as_deref() == Some(provider.as_str()) {
-                forced_model.clone().unwrap_or_else(|| {
-                    routing.resolve_model(matrix, &provider, Some(provider.as_str()), None)
-                })
-            } else if routing.behavior_mode == "dinamico"
-                && suggested_provider.as_deref() == Some(provider.as_str())
-                && suggested_model.is_some()
-            {
-                // In dinamico fidiamoci del catalogo: niente override da provider_model_<x>.
-                // suggested_model.is_some() controllato sopra; clone+unwrap_or e' difensivo.
-                suggested_model.clone().unwrap_or_default()
-            } else {
-                routing.resolve_model(
-                    matrix,
-                    &provider,
-                    suggested_provider.as_deref(),
-                    suggested_model.as_deref(),
-                )
+            let gw_req = GwRequest {
+                model: gw_model,
+                messages: vec![GwMessage {
+                    role: "user".to_string(),
+                    content: composed_prompt.clone(),
+                }],
+                max_tokens: Some(token_budget),
+                temperature: None,
+                tools: None,
+                metadata: GwMetadata {
+                    tenant_id: input.project_id.clone(),
+                    user_id: input.user_id.clone(),
+                    request_id: run_id.to_string(),
+                    sensitivity_tier: 0,
+                    feature: intent.clone(),
+                },
             };
             let prompt_tokens = mcp_token::count_tokens(&composed_prompt) as i32;
-            let estimated_completion_tokens = token_budget as i32 - prompt_tokens;
-            let reservation = match billing::reserve_usage(
+            let estimated_completion = (token_budget as i32 - prompt_tokens).max(0);
+            // Fallback provider/model letti da DB (matrice routing) invece che hardcoded.
+            let fallback_provider: String = match matrix.lookup("chat", "bilanciata") {
+                Some((p, _)) => p,
+                None => "openai".to_string(),
+            };
+            let hint_provider_owned: String = forced_provider
+                .as_deref()
+                .or(suggested_provider.as_deref())
+                .map(String::from)
+                .unwrap_or(fallback_provider);
+            let fallback_model: String = default_model_for_provider(matrix, &hint_provider_owned);
+            let hint_model_owned: String = forced_model
+                .as_deref()
+                .or(suggested_model.as_deref())
+                .map(String::from)
+                .unwrap_or(fallback_model);
+            let hint_provider = hint_provider_owned.as_str();
+            let hint_model = hint_model_owned.as_str();
+            let reservation = billing::reserve_usage(
                 db,
                 user_id,
                 project_uuid,
-                &provider,
-                &model,
+                hint_provider,
+                hint_model,
                 prompt_tokens,
-                estimated_completion_tokens.max(0),
-                json!({
-                    "intent": intent,
-                    "profile_id": input.profile_id,
-                    "corrections_count": prompt_corrections.len(),
-                    "request_message_id": input.request_message_id,
-                    "automation_mode": input.automation_mode.as_str(),
-                    "provider_override": forced_provider,
-                    "model_override": forced_model,
-                    "attachments_count": input.attachments.len(),
-                }),
+                estimated_completion,
+                json!({"intent": intent, "profile_id": input.profile_id,
+                           "via_nexus_gateway": true,
+                           "corrections_count": prompt_corrections.len()}),
             )
             .await
-            {
-                Ok(reservation) => reservation,
-                Err(error) => {
-                    skip_reasons.push(format!("{provider}:billing_rejected:{error}"));
-                    continue;
+            .map_err(|e| anyhow::anyhow!("billing_rejected: {e}"))?;
+
+            let gw_resp = match gw.complete(gw_req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    billing::release_usage(db, &reservation, "gateway_error").await;
+                    anyhow::bail!("Nexus Gateway failed for intent '{intent}': {e}");
                 }
             };
+            let actual_usage = UsageNumbers {
+                prompt_tokens: gw_resp.usage.input_tokens as i32,
+                completion_tokens: gw_resp.usage.output_tokens as i32,
+                total_tokens: (gw_resp.usage.input_tokens + gw_resp.usage.output_tokens) as i32,
+            };
+            let (_, _, cost, cur) =
+                billing::finalize_usage(db, &reservation, run_id, &actual_usage).await?;
+            let gw_completion = json!({"content": gw_resp.content, "metadata": {
+                "provider": gw_resp.provider_used, "model": gw_resp.model_used,
+                "latency_ms": gw_resp.latency_ms, "finish_reason": gw_resp.finish_reason},
+                "privacy_rerouted": gw_resp.privacy_rerouted.as_ref().map(|pr| json!({
+                    "provider": pr.provider,
+                    "blocked_tier": pr.blocked_tier,
+                    "reason": pr.reason,
+                }))
+            });
+            if let Some(ref pr) = gw_resp.privacy_rerouted {
+                tracing::warn!(
+                        "Nexus Gateway: privacy re-route tier={} → local provider={} intent={} tokens={}",
+                        pr.blocked_tier, pr.provider, intent, actual_usage.total_tokens
+                    );
+            } else {
+                tracing::info!(
+                    "Nexus Gateway: intent={} provider={} model={} tokens={}",
+                    intent,
+                    gw_resp.provider_used,
+                    gw_resp.model_used,
+                    actual_usage.total_tokens
+                );
+            }
+            (
+                gw_resp.provider_used,
+                gw_resp.model_used,
+                gw_completion,
+                actual_usage,
+                cost,
+                cur,
+            )
+        } else {
+            // PATH B: Brain gRPC legacy
+            let mut selected_provider: Option<String> = None;
+            let mut selected_model: Option<String> = None;
+            let mut completion: Option<serde_json::Value> = None;
+            let mut usage: Option<UsageNumbers> = None;
+            let mut usage_cost: Option<(f64, f64, f64, String)> = None;
+            let mut skip_reasons = Vec::new();
 
-            let provider_completion = match self
-                .neural
-                .generate_completion(&provider, &model, &composed_prompt)
+            // In modalità dinamico la scelta del catalogo è autoritativa
+            let provider_candidates = if let Some(provider) = forced_provider.as_ref() {
+                vec![provider.clone()]
+            } else if routing.behavior_mode == "dinamico" {
+                if let Some(p) = suggested_provider.as_ref() {
+                    vec![p.clone()]
+                } else {
+                    routing.candidates(&intent, suggested_provider.as_deref())
+                }
+            } else {
+                routing.candidates(&intent, suggested_provider.as_deref())
+            };
+            for provider in provider_candidates {
+                let health = match self.neural.provider_health(&provider).await {
+                    Ok(health) => health,
+                    Err(error) => {
+                        skip_reasons.push(format!("{provider}:health_check_failed:{error}"));
+                        continue;
+                    }
+                };
+
+                let status = health["status"].as_str().unwrap_or("unknown");
+                if !matches!(status, "ready" | "ok") {
+                    let reason = health["reason"]
+                        .as_str()
+                        .or_else(|| health["skipReasons"].get(0).and_then(Value::as_str))
+                        .unwrap_or(status);
+                    skip_reasons.push(format!("{provider}:skipped:{reason}"));
+                    continue;
+                }
+
+                let model = if forced_provider.as_deref() == Some(provider.as_str()) {
+                    forced_model.clone().unwrap_or_else(|| {
+                        routing.resolve_model(matrix, &provider, Some(provider.as_str()), None)
+                    })
+                } else if routing.behavior_mode == "dinamico"
+                    && suggested_provider.as_deref() == Some(provider.as_str())
+                    && suggested_model.is_some()
+                {
+                    // In dinamico fidiamoci del catalogo: niente override da provider_model_<x>.
+                    // suggested_model.is_some() controllato sopra; clone+unwrap_or e' difensivo.
+                    suggested_model.clone().unwrap_or_default()
+                } else {
+                    routing.resolve_model(
+                        matrix,
+                        &provider,
+                        suggested_provider.as_deref(),
+                        suggested_model.as_deref(),
+                    )
+                };
+                let prompt_tokens = mcp_token::count_tokens(&composed_prompt) as i32;
+                let estimated_completion_tokens = token_budget as i32 - prompt_tokens;
+                let reservation = match billing::reserve_usage(
+                    db,
+                    user_id,
+                    project_uuid,
+                    &provider,
+                    &model,
+                    prompt_tokens,
+                    estimated_completion_tokens.max(0),
+                    json!({
+                        "intent": intent,
+                        "profile_id": input.profile_id,
+                        "corrections_count": prompt_corrections.len(),
+                        "request_message_id": input.request_message_id,
+                        "automation_mode": input.automation_mode.as_str(),
+                        "provider_override": forced_provider,
+                        "model_override": forced_model,
+                        "attachments_count": input.attachments.len(),
+                    }),
+                )
                 .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    billing::release_usage(db, &reservation, "provider_error").await;
-                    let error_msg = error.to_string();
-                    // Distingui rate limit da altri errori
-                    if error_msg.contains("429") || error_msg.to_lowercase().contains("rate_limit")
-                        || error_msg.to_lowercase().contains("quota")
-                        || error_msg.to_lowercase().contains("too_many_requests") {
-                        skip_reasons.push(format!("{provider}:rate_limited:{error_msg}"));
-                        tracing::warn!("Provider {provider} è rate-limited, provo il prossimo candidato");
+                {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        skip_reasons.push(format!("{provider}:billing_rejected:{error}"));
+                        continue;
+                    }
+                };
+
+                let provider_completion = match self
+                    .neural
+                    .generate_completion(&provider, &model, &composed_prompt)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        billing::release_usage(db, &reservation, "provider_error").await;
+                        let error_msg = error.to_string();
+                        // Distingui rate limit da altri errori
+                        if error_msg.contains("429")
+                            || error_msg.to_lowercase().contains("rate_limit")
+                            || error_msg.to_lowercase().contains("quota")
+                            || error_msg.to_lowercase().contains("too_many_requests")
+                        {
+                            skip_reasons.push(format!("{provider}:rate_limited:{error_msg}"));
+                            tracing::warn!(
+                                "Provider {provider} è rate-limited, provo il prossimo candidato"
+                            );
+                        } else {
+                            skip_reasons.push(format!("{provider}:execution_error:{error_msg}"));
+                        }
+                        continue;
+                    }
+                };
+
+                if completion_has_error(&provider_completion) {
+                    billing::release_usage(db, &reservation, "provider_failed").await;
+                    let error = provider_completion["metadata"]["error"]
+                        .as_str()
+                        .unwrap_or("generation_failed");
+                    // Distingui rate limit da altri errori anche nella risposta
+                    if error.contains("429")
+                        || error.to_lowercase().contains("rate_limit")
+                        || error.to_lowercase().contains("quota")
+                        || error.to_lowercase().contains("too_many_requests")
+                    {
+                        skip_reasons.push(format!("{provider}:rate_limited:{error}"));
+                        tracing::warn!("Provider {provider} segnala rate limit nella risposta, provo il prossimo");
                     } else {
-                        skip_reasons.push(format!("{provider}:execution_error:{error_msg}"));
+                        skip_reasons.push(format!("{provider}:failed:{error}"));
                     }
                     continue;
                 }
-            };
 
-            if completion_has_error(&provider_completion) {
-                billing::release_usage(db, &reservation, "provider_failed").await;
-                let error = provider_completion["metadata"]["error"]
-                    .as_str()
-                    .unwrap_or("generation_failed");
-                // Distingui rate limit da altri errori anche nella risposta
-                if error.contains("429") || error.to_lowercase().contains("rate_limit")
-                    || error.to_lowercase().contains("quota")
-                    || error.to_lowercase().contains("too_many_requests") {
-                    skip_reasons.push(format!("{provider}:rate_limited:{error}"));
-                    tracing::warn!("Provider {provider} segnala rate limit nella risposta, provo il prossimo");
-                } else {
-                    skip_reasons.push(format!("{provider}:failed:{error}"));
-                }
-                continue;
+                let usage_numbers = billing::extract_usage_numbers(
+                    &provider_completion,
+                    prompt_tokens,
+                    estimated_completion_tokens,
+                );
+                let finalized_cost =
+                    billing::finalize_usage(db, &reservation, run_id, &usage_numbers).await?;
+
+                selected_provider = Some(provider);
+                selected_model = Some(model);
+                completion = Some(provider_completion);
+                usage = Some(usage_numbers);
+                usage_cost = Some(finalized_cost);
+                break;
             }
 
-            let usage_numbers = billing::extract_usage_numbers(
-                &provider_completion,
-                prompt_tokens,
-                estimated_completion_tokens,
-            );
-            let finalized_cost =
-                billing::finalize_usage(db, &reservation, run_id, &usage_numbers).await?;
-
-            selected_provider = Some(provider);
-            selected_model = Some(model);
-            completion = Some(provider_completion);
-            usage = Some(usage_numbers);
-            usage_cost = Some(finalized_cost);
-            break;
-        }
-
-                let provider = selected_provider.ok_or_else(|| anyhow::anyhow!(
+            let provider = selected_provider.ok_or_else(|| {
+                anyhow::anyhow!(
                     "No AI provider available for intent '{intent}'. Skip reasons: {}",
                     skip_reasons.join(", ")
-                ))?;
-                let model = selected_model.unwrap_or_else(|| default_model_for_provider(matrix, &provider).to_string());
-                let completion = completion.ok_or_else(|| anyhow::anyhow!("No completion generated"))?;
-                let usage = usage.unwrap_or(UsageNumbers { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
-                let (_, _, cost, cur) = usage_cost.unwrap_or((0.0, 0.0, 0.0, "EUR".to_string()));
-                (provider, model, completion, usage, cost, cur)
-            };
+                )
+            })?;
+            let model = selected_model
+                .unwrap_or_else(|| default_model_for_provider(matrix, &provider).to_string());
+            let completion =
+                completion.ok_or_else(|| anyhow::anyhow!("No completion generated"))?;
+            let usage = usage.unwrap_or(UsageNumbers {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            });
+            let (_, _, cost, cur) = usage_cost.unwrap_or((0.0, 0.0, 0.0, "EUR".to_string()));
+            (provider, model, completion, usage, cost, cur)
+        };
 
         // Step 5: Build audit record
         let audit = OrchestratorAudit {
@@ -3007,10 +3489,8 @@ impl Orchestrator {
         attachments: &[ChatAttachment],
     ) -> String {
         let tpl_key = automation_mode.prompt_instruction_template_key();
-        let mode_instruction = crate::prompt_templates::get_template_or_default(
-            db, cache, tpl_key,
-        )
-        .await;
+        let mode_instruction =
+            crate::prompt_templates::get_template_or_default(db, cache, tpl_key).await;
         let mut sections = vec![mode_instruction];
 
         if !corrections.is_empty() {
@@ -3026,8 +3506,14 @@ impl Orchestrator {
         }
 
         if !attachments.is_empty() {
-            let text_attachments: Vec<_> = attachments.iter().filter(|a| !a.text_content.is_empty()).collect();
-            let image_attachments: Vec<_> = attachments.iter().filter(|a| a.base64_content.is_some()).collect();
+            let text_attachments: Vec<_> = attachments
+                .iter()
+                .filter(|a| !a.text_content.is_empty())
+                .collect();
+            let image_attachments: Vec<_> = attachments
+                .iter()
+                .filter(|a| a.base64_content.is_some())
+                .collect();
             if !text_attachments.is_empty() {
                 let mut block = String::from("Allegati utente per questo messaggio:\n");
                 for attachment in &text_attachments {
@@ -3215,20 +3701,28 @@ mod tests {
     #[test]
     fn test_is_agentic_request_positivi() {
         // Caso paradigmatico del bug originale
-        assert!(is_agentic_request("imposta un utente admin per l'applicazione e dammi user e password"));
+        assert!(is_agentic_request(
+            "imposta un utente admin per l'applicazione e dammi user e password"
+        ));
         // Setup / configurazione
-        assert!(is_agentic_request("Configura il backend per usare PostgreSQL"));
+        assert!(is_agentic_request(
+            "Configura il backend per usare PostgreSQL"
+        ));
         assert!(is_agentic_request("Setup HTTPS sul dev server"));
         assert!(is_agentic_request("Abilita CORS per /api/*"));
         // Creazione
         assert!(is_agentic_request("Crea un endpoint /healthz"));
-        assert!(is_agentic_request("Aggiungi una migrazione per la tabella users"));
+        assert!(is_agentic_request(
+            "Aggiungi una migrazione per la tabella users"
+        ));
         // Deploy / esecuzione
         assert!(is_agentic_request("Deploya il microservizio doc-service"));
         assert!(is_agentic_request("Lancia i test di integrazione"));
         assert!(is_agentic_request("Avvia il servizio backend"));
         // Domande "come fare X"
-        assert!(is_agentic_request("Come faccio a creare un nuovo utente admin?"));
+        assert!(is_agentic_request(
+            "Come faccio a creare un nuovo utente admin?"
+        ));
     }
 
     #[test]
@@ -3245,11 +3739,12 @@ mod tests {
     #[test]
     fn test_classify_intent_with_agentic_promotion() {
         // Caso paradigmatico: prompt agentic breve viene promosso da chat a system_admin
-        let (intent, _) = classify_intent_with_agentic_promotion(
-            "imposta un utente admin per l'applicazione"
+        let (intent, _) =
+            classify_intent_with_agentic_promotion("imposta un utente admin per l'applicazione");
+        assert_eq!(
+            intent, "system_admin",
+            "prompt agentic breve deve essere promosso a system_admin"
         );
-        assert_eq!(intent, "system_admin",
-            "prompt agentic breve deve essere promosso a system_admin");
 
         // Promozione anche per "configura"
         let (intent, _) = classify_intent_with_agentic_promotion("Configura il backend");
@@ -3271,26 +3766,46 @@ mod tests {
     #[test]
     fn test_is_test_failure_resolution_positivi() {
         // Casi paradigmatici osservati in produzione (Redemptor / Playwright)
-        assert!(is_test_failure_resolution("esegui i test playwright e risolvi i fail"));
-        assert!(is_test_failure_resolution("lancia i test e correggi gli errori"));
-        assert!(is_test_failure_resolution("fai funzionare i test Playwright"));
+        assert!(is_test_failure_resolution(
+            "esegui i test playwright e risolvi i fail"
+        ));
+        assert!(is_test_failure_resolution(
+            "lancia i test e correggi gli errori"
+        ));
+        assert!(is_test_failure_resolution(
+            "fai funzionare i test Playwright"
+        ));
         assert!(is_test_failure_resolution("fix i test che falliscono"));
-        assert!(is_test_failure_resolution("Run Playwright tests and make them pass"));
-        assert!(is_test_failure_resolution("i test playwright stanno fallendo, ripara"));
+        assert!(is_test_failure_resolution(
+            "Run Playwright tests and make them pass"
+        ));
+        assert!(is_test_failure_resolution(
+            "i test playwright stanno fallendo, ripara"
+        ));
         assert!(is_test_failure_resolution("applica fix ai test pytest"));
-        assert!(is_test_failure_resolution("i test cargo non passano, risolvi"));
-        assert!(is_test_failure_resolution("verifica perche' i test failure"));
-        assert!(is_test_failure_resolution("playwright test failure: indaga e correggi"));
+        assert!(is_test_failure_resolution(
+            "i test cargo non passano, risolvi"
+        ));
+        assert!(is_test_failure_resolution(
+            "verifica perche' i test failure"
+        ));
+        assert!(is_test_failure_resolution(
+            "playwright test failure: indaga e correggi"
+        ));
     }
 
     #[test]
     fn test_is_test_failure_resolution_negativi() {
         // "scrivi un test" non e' una risoluzione di fallimento
-        assert!(!is_test_failure_resolution("scrivi un test unitario per la funzione X"));
+        assert!(!is_test_failure_resolution(
+            "scrivi un test unitario per la funzione X"
+        ));
         // "esegui test" senza richiesta di fix non promuove
         assert!(!is_test_failure_resolution("esegui i test playwright"));
         // Senza menzione test
-        assert!(!is_test_failure_resolution("risolvi questo errore di compilazione"));
+        assert!(!is_test_failure_resolution(
+            "risolvi questo errore di compilazione"
+        ));
         // Chat informativa
         assert!(!is_test_failure_resolution("come si configura playwright?"));
         // Verb correttivo senza test
@@ -3302,36 +3817,40 @@ mod tests {
         // Caso paradigmatico Redemptor: gpt-4.1-mini diagnosticava invece di
         // applicare fix perche' intent=test mappava a modelli light.
         let (intent, _) = classify_intent_with_agentic_promotion(
-            "Esegui i test Playwright e risolvi i fallimenti rilevati"
+            "Esegui i test Playwright e risolvi i fallimenti rilevati",
         );
-        assert_eq!(intent, "fix_complesso",
-            "test + verbo correttivo deve essere promosso a fix_complesso");
+        assert_eq!(
+            intent, "fix_complesso",
+            "test + verbo correttivo deve essere promosso a fix_complesso"
+        );
 
-        let (intent, _) = classify_intent_with_agentic_promotion(
-            "fai funzionare i test Playwright"
-        );
+        let (intent, _) =
+            classify_intent_with_agentic_promotion("fai funzionare i test Playwright");
         assert_eq!(intent, "fix_complesso");
 
         // Negativo: solo "scrivi test" resta test (no failure resolution)
-        let (intent, _) = classify_intent_with_agentic_promotion(
-            "scrivi i test unitari per il modulo auth"
-        );
+        let (intent, _) =
+            classify_intent_with_agentic_promotion("scrivi i test unitari per il modulo auth");
         // Nota: classify_intent_local potrebbe ritornare un altro intent qui;
         // l'importante e' che NON sia fix_complesso senza failure resolution.
-        assert_ne!(intent, "fix_complesso",
-            "creazione test senza failure resolution non deve essere promossa");
+        assert_ne!(
+            intent, "fix_complesso",
+            "creazione test senza failure resolution non deve essere promossa"
+        );
     }
 
     #[test]
     fn test_classify_intent_local_file_ops() {
         // Verifiche dei nuovi intent introdotti
-        let (intent, _) = classify_intent_local("Per favore elimina i file Dockerfile rimasti nel progetto");
+        let (intent, _) =
+            classify_intent_local("Per favore elimina i file Dockerfile rimasti nel progetto");
         assert_eq!(intent, "file_ops");
     }
 
     #[test]
     fn test_classify_intent_local_system_admin() {
-        let (intent, _) = classify_intent_local("Esegui docker compose down per fermare i container");
+        let (intent, _) =
+            classify_intent_local("Esegui docker compose down per fermare i container");
         assert_eq!(intent, "system_admin");
     }
 
@@ -3347,9 +3866,8 @@ mod tests {
         // Bug residuo del refactor 0101: "migra il backend .NET 9 da SQL Server a PostgreSQL"
         // veniva classificato come "chat" e routato a mistral-small (inadatto per code migration).
         // Con i prefissi laschi "migra "/"migrare " in refactor, ora va correttamente in refactor.
-        let (intent, _) = classify_intent_local(
-            "Migra il backend .NET 9 da SQL Server a PostgreSQL"
-        );
+        let (intent, _) =
+            classify_intent_local("Migra il backend .NET 9 da SQL Server a PostgreSQL");
         assert_eq!(intent, "refactor");
     }
 
@@ -3362,7 +3880,7 @@ mod tests {
     #[test]
     fn test_classify_intent_local_sostituisci_libreria_va_a_refactor() {
         let (intent, _) = classify_intent_local(
-            "Sostituisci la libreria axios con fetch nativa in tutti i moduli"
+            "Sostituisci la libreria axios con fetch nativa in tutti i moduli",
         );
         assert_eq!(intent, "refactor");
     }
@@ -3371,7 +3889,7 @@ mod tests {
     fn test_classify_intent_local_piano_migrazione_va_a_architecture() {
         // Distinzione: PLANNING di migrazione (no codice) → architecture
         let (intent, _) = classify_intent_local(
-            "Definisci un piano di migrazione del database da MySQL a PostgreSQL"
+            "Definisci un piano di migrazione del database da MySQL a PostgreSQL",
         );
         assert_eq!(intent, "architecture");
     }
@@ -3381,7 +3899,14 @@ mod tests {
         // Test usa la fallback safe matrix (anthropic claude-sonnet per tutti gli intent rischiosi)
         let m = crate::routing_matrix::RoutingMatrix::fallback_safe();
         let thr = TokenThresholds::defaults();
-        let d = route_model_with_mode(&m, "file_ops", 1500, "approfondita", Some("anthropic"), &thr);
+        let d = route_model_with_mode(
+            &m,
+            "file_ops",
+            1500,
+            "approfondita",
+            Some("anthropic"),
+            &thr,
+        );
         assert_eq!(d.provider, "anthropic");
         assert_eq!(d.model, "claude-sonnet-4-6");
     }
@@ -3390,7 +3915,14 @@ mod tests {
     fn test_route_model_with_mode_system_admin_bilanciata() {
         let m = crate::routing_matrix::RoutingMatrix::fallback_safe();
         let thr = TokenThresholds::defaults();
-        let d = route_model_with_mode(&m, "system_admin", 1500, "bilanciata", Some("anthropic"), &thr);
+        let d = route_model_with_mode(
+            &m,
+            "system_admin",
+            1500,
+            "bilanciata",
+            Some("anthropic"),
+            &thr,
+        );
         assert_eq!(d.provider, "anthropic");
         // Almeno un modello "haiku" o "sonnet", mai "small" o "nano"
         assert!(!d.model.contains("nano"), "model={}", d.model);
@@ -3416,7 +3948,10 @@ mod tests {
         let thr = TokenThresholds::defaults();
         // No preferred_provider -> sentinella
         let d = route_model_with_mode(&empty, "system_admin", 1500, "bilanciata", None, &thr);
-        assert_eq!(d.provider, "__no_model__", "deve ritornare sentinella, non gpt-4o-mini hardcoded");
+        assert_eq!(
+            d.provider, "__no_model__",
+            "deve ritornare sentinella, non gpt-4o-mini hardcoded"
+        );
         assert_eq!(d.model, "__no_model__");
     }
 
@@ -3426,16 +3961,20 @@ mod tests {
         // invece dei valori hardcoded 400/1500/3000.
         let m = crate::routing_matrix::RoutingMatrix::fallback_safe();
         let custom_thr = TokenThresholds {
-            chat_breve: 100,   // soglia molto bassa: anche 200 token va a media
+            chat_breve: 100, // soglia molto bassa: anche 200 token va a media
             chat_media: 200,
-            complex_fix: 500,  // fix con 600 token va a fix_complesso
+            complex_fix: 500, // fix con 600 token va a fix_complesso
         };
         // Con questi thresholds, intent=fix tokens=600 -> fix_complesso
         // (la matrix fallback_safe ha fix_complesso × bilanciata mappato).
         let d = route_model_with_mode(&m, "fix", 600, "bilanciata", None, &custom_thr);
         // fix_complesso × bilanciata -> claude-haiku in fallback_safe matrix
         assert_eq!(d.provider, "anthropic");
-        assert!(d.model.contains("haiku"), "atteso haiku per fix_complesso bilanciata, got {}", d.model);
+        assert!(
+            d.model.contains("haiku"),
+            "atteso haiku per fix_complesso bilanciata, got {}",
+            d.model
+        );
     }
 
     #[test]
@@ -3459,7 +3998,12 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────
 
     /// Helper per creare un ClassifiedIntent di test.
-    fn classified(intent: &'static str, conf: f32, candidates: Vec<(&str, f32)>, ambig: bool) -> ClassifiedIntent {
+    fn classified(
+        intent: &'static str,
+        conf: f32,
+        candidates: Vec<(&str, f32)>,
+        ambig: bool,
+    ) -> ClassifiedIntent {
         ClassifiedIntent {
             intent,
             confidence: conf,
@@ -3484,9 +4028,10 @@ mod tests {
         // Caso reale dell'incidente: questo messaggio NON deve degradare a
         // chat. Deve ritornare un intent agentico ad alta confidenza cosi'
         // il pre-check salta l'LLM e il path agent parte anche se l'LLM e' down.
-        let (intent, conf) =
-            deterministic_intent_fallback("Crea l'applicazione completa descritta nel file allegato. Implementala e avviala.")
-                .expect("atteso match agentico");
+        let (intent, conf) = deterministic_intent_fallback(
+            "Crea l'applicazione completa descritta nel file allegato. Implementala e avviala.",
+        )
+        .expect("atteso match agentico");
         assert_ne!(intent, "chat");
         assert_eq!(intent, "system_admin");
         assert!(conf >= 0.85, "confidence attesa alta, got {conf}");
@@ -3506,7 +4051,10 @@ mod tests {
         let (intent, conf) = deterministic_intent_fallback("leggi src/app.js e dimmi cosa fa")
             .expect("atteso match lettura");
         assert_eq!(intent, "debug");
-        assert!(conf > 0.0 && conf < 0.85, "confidence media attesa, got {conf}");
+        assert!(
+            conf > 0.0 && conf < 0.85,
+            "confidence media attesa, got {conf}"
+        );
     }
 
     #[test]
@@ -3550,4 +4098,3 @@ mod tests {
         assert_eq!(parsed.intent, "fix");
     }
 }
-

@@ -27,13 +27,13 @@ use nexus_orchestrator::{
     LearningScheduler, MemoryConsolidationWorker, MemoryNamespace, MetricsAggregationWorker,
     OnnxMiniLmEmbedder, ProfilingWorker, QLearningConfig, QLearningReplayWorker, QLearningRouter,
     ReplicationBatch, ReplicationWorker, RoutingDecision, SelectionStrategy,
-    SessionPersistenceWorker, SwarmExecutionResult, SwarmTaskOutcome,
-    TaskBuilder, TaskResult, UltralearnWorker, VersioningWorker,
+    SessionPersistenceWorker, SwarmExecutionResult, SwarmTaskOutcome, TaskBuilder, TaskResult,
+    UltralearnWorker, VersioningWorker,
 };
-use std::time::Duration;
 use ruvector::{HnswConfig, RuVectorManager, RuVectorStore};
 use sqlx::PgPool;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// Metriche aggregate di un agent type per monitoring e dashboard
@@ -328,7 +328,9 @@ impl NexusBridge {
         };
 
         if auto_extract {
-            scheduler.register(Arc::new(UltralearnWorker::new().with_min_quality(min_confidence)));
+            scheduler.register(Arc::new(
+                UltralearnWorker::new().with_min_quality(min_confidence),
+            ));
             info!(
                 "UltralearnWorker registrato: auto_extract=true, min_confidence={:.2}",
                 min_confidence
@@ -353,15 +355,17 @@ impl NexusBridge {
         // ── RuVector stores ──────────────────────────────────────────────────
         // Crea il manager con le 4 collection solo se abbiamo il pool.
         // Il boot-loading avviene in background in `init_global_with_pool`.
-        let vector_stores = pool.as_ref().map(|p| Arc::new(RuVectorManager::new(p.clone())));
+        let vector_stores = pool
+            .as_ref()
+            .map(|p| Arc::new(RuVectorManager::new(p.clone())));
 
         // Lo store "memory" è quello esposto ai tool ruvector_*:
         //   - Se il manager esiste, usa la sua istanza (con persistenza).
         //   - Altrimenti crea un store in-memory puro (senza pool).
         let ruvector_store = match &vector_stores {
-            Some(m) => m
-                .get("memory")
-                .unwrap_or_else(|| Arc::new(RuVectorStore::with_config("memory", HnswConfig::default()))),
+            Some(m) => m.get("memory").unwrap_or_else(|| {
+                Arc::new(RuVectorStore::with_config("memory", HnswConfig::default()))
+            }),
             None => Arc::new(RuVectorStore::new("memory")),
         };
 
@@ -449,7 +453,7 @@ impl NexusBridge {
                 };
                 match sqlx::query(
                     "SELECT key, content FROM nexus_prompt_templates \
-                     WHERE key LIKE 'agent.%' AND is_active = TRUE"
+                     WHERE key LIKE 'agent.%' AND is_active = TRUE",
                 )
                 .fetch_all(pool.as_ref())
                 .await
@@ -466,7 +470,10 @@ impl NexusBridge {
                             })
                             .collect();
                         nexus_orchestrator::prompt_registry::initialize(prompts);
-                        info!("Agent prompt registry: {} template caricati da PostgreSQL", n);
+                        info!(
+                            "Agent prompt registry: {} template caricati da PostgreSQL",
+                            n
+                        );
                     }
                     Err(e) => {
                         warn!("Agent prompt registry: errore caricamento da DB: {e}");
@@ -488,8 +495,8 @@ impl NexusBridge {
         // abortito durante il graceful shutdown (evita worker orfani).
         {
             let scheduler = bridge.scheduler.clone();
-            let ns        = bridge.observability_ns.clone();
-            let router    = bridge.router.clone();
+            let ns = bridge.observability_ns.clone();
+            let router = bridge.router.clone();
             let handle = scheduler.start_periodic_loop(
                 Duration::from_secs(1800),
                 Arc::new(move || {
@@ -638,7 +645,15 @@ impl NexusBridge {
         let new_q = self.router.update_q_value(&outcome);
 
         // Attiva reactive workers in background (non blocca il critical path)
-        self.fire_reactive_workers(task_id, task_type, agent_type, success, quality_score, execution_time_ms, error);
+        self.fire_reactive_workers(
+            task_id,
+            task_type,
+            agent_type,
+            success,
+            quality_score,
+            execution_time_ms,
+            error,
+        );
 
         new_q
     }
@@ -656,36 +671,40 @@ impl NexusBridge {
         execution_time_ms: u64,
         error: Option<String>,
     ) {
-        let scheduler  = self.scheduler.clone();
-        let ns         = self.observability_ns.clone();
-        let router     = self.router.clone();
+        let scheduler = self.scheduler.clone();
+        let ns = self.observability_ns.clone();
+        let router = self.router.clone();
 
         // Costruisce un SwarmExecutionResult minimale per il singolo task
         let task_result = TaskResult {
-            task_id:           task_id.to_string(),
-            agent_type:        agent_type.clone(),
+            task_id: task_id.to_string(),
+            agent_type: agent_type.clone(),
             success,
-            output:            String::new(), // non disponibile qui
+            output: String::new(), // non disponibile qui
             error,
             execution_time_ms,
-            tokens_used:       0,
+            tokens_used: 0,
         };
         let routing = RoutingDecision {
-            agent_type:       agent_type,
-            q_value:          quality_score,
-            confidence:       quality_score,
-            candidates:       Vec::new(),
+            agent_type: agent_type,
+            q_value: quality_score,
+            confidence: quality_score,
+            candidates: Vec::new(),
             decision_time_us: 0,
-            strategy:         SelectionStrategy::Exploitation,
+            strategy: SelectionStrategy::Exploitation,
         };
         let task_outcome = SwarmTaskOutcome {
             task_id: task_id.to_string(),
             routing,
-            result: if success { Ok(task_result) } else { Err(format!("task {} failed", task_id)) },
+            result: if success {
+                Ok(task_result)
+            } else {
+                Err(format!("task {} failed", task_id))
+            },
         };
         let swarm = Arc::new(SwarmExecutionResult {
-            swarm_id:      format!("outcome-{}", task_id),
-            task_results:  vec![task_outcome],
+            swarm_id: format!("outcome-{}", task_id),
+            task_results: vec![task_outcome],
             success_count: if success { 1 } else { 0 },
             failure_count: if success { 0 } else { 1 },
             total_time_ms: execution_time_ms,
@@ -802,7 +821,10 @@ impl NexusBridge {
             if res.is_ok() {
                 ok += 1;
             } else if let Err(err) = res {
-                debug!("flush_replication_pending: entry '{}' fallita: {err}", e.key);
+                debug!(
+                    "flush_replication_pending: entry '{}' fallita: {err}",
+                    e.key
+                );
             }
         }
 
@@ -864,7 +886,8 @@ impl NexusBridge {
         let mut total_tokens_processed: i32 = 0;
 
         // Ricerca il Q-value per questo agent (best tra tutti i task type)
-        let q_value = self.router
+        let q_value = self
+            .router
             .get_best_q_value_for_agent(agent_type.name())
             .unwrap_or(0.0);
 
@@ -1036,10 +1059,7 @@ pub async fn nexus_tools() -> impl IntoResponse {
 
     let mut breakdown = serde_json::Map::new();
     for (category, count) in catalog.breakdown() {
-        breakdown.insert(
-            category.name().to_string(),
-            json!(count),
-        );
+        breakdown.insert(category.name().to_string(), json!(count));
     }
 
     (
@@ -1076,7 +1096,10 @@ pub async fn nexus_prometheus() -> impl IntoResponse {
     let mut out = String::with_capacity(2048);
     out.push_str("# HELP nexus_router_decisions_total Total routing decisions made\n");
     out.push_str("# TYPE nexus_router_decisions_total counter\n");
-    out.push_str(&format!("nexus_router_decisions_total {}\n", r.total_decisions));
+    out.push_str(&format!(
+        "nexus_router_decisions_total {}\n",
+        r.total_decisions
+    ));
 
     out.push_str("# HELP nexus_router_exploration_total Times exploration strategy was used\n");
     out.push_str("# TYPE nexus_router_exploration_total counter\n");
@@ -1162,7 +1185,9 @@ pub async fn nexus_prometheus() -> impl IntoResponse {
     out.push_str(&format!("nexus_ruvector_nodes_total {}\n", rv_nodes));
 
     let rv_persistent = bridge.ruvector().has_persistence() as u8;
-    out.push_str("# HELP nexus_ruvector_persistent 1 if RuVector has PostgreSQL persistence enabled\n");
+    out.push_str(
+        "# HELP nexus_ruvector_persistent 1 if RuVector has PostgreSQL persistence enabled\n",
+    );
     out.push_str("# TYPE nexus_ruvector_persistent gauge\n");
     out.push_str(&format!("nexus_ruvector_persistent {}\n", rv_persistent));
 
@@ -1246,9 +1271,18 @@ pub async fn nexus_test_routing(
         );
     };
 
-    let task_type   = body.get("task_type")   .and_then(|v| v.as_str()).unwrap_or("generic");
-    let instructions = body.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
-    let project_id  = body.get("project_id")  .and_then(|v| v.as_str()).unwrap_or("test");
+    let task_type = body
+        .get("task_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("generic");
+    let instructions = body
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let project_id = body
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("test");
 
     let Some(decision) = bridge.suggest_agent(task_type, instructions, project_id) else {
         return (
@@ -1262,12 +1296,15 @@ pub async fn nexus_test_routing(
     };
 
     let agent_type_str = format!("{:?}", decision.agent_type);
-    let strategy_str   = format!("{:?}", decision.strategy);
+    let strategy_str = format!("{:?}", decision.strategy);
 
     let (mapped_provider, mapped_model) = match state.routing_matrix.current_async().await {
         Ok(matrix) => crate::nexus_routing::agent_type_to_model(&decision.agent_type, &matrix)
             .unwrap_or_else(|| ("(unmapped)".to_string(), "(unmapped)".to_string())),
-        Err(_) => ("(matrix_unavailable)".to_string(), "(matrix_unavailable)".to_string()),
+        Err(_) => (
+            "(matrix_unavailable)".to_string(),
+            "(matrix_unavailable)".to_string(),
+        ),
     };
 
     let prompt_key = crate::nexus_routing::agent_type_to_prompt_key(&decision.agent_type);
@@ -1327,15 +1364,8 @@ mod tests {
     #[test]
     fn test_bridge_record_outcome() {
         let bridge = NexusBridge::new();
-        let new_q = bridge.record_outcome(
-            "task-1",
-            "coding",
-            AgentType::Coder,
-            true,
-            0.9,
-            100,
-            None,
-        );
+        let new_q =
+            bridge.record_outcome("task-1", "coding", AgentType::Coder, true, 0.9, 100, None);
         // Update Q-value dovrebbe produrre valore valido
         assert!(new_q.is_finite());
     }
@@ -1383,7 +1413,11 @@ mod tests {
             // per la steady state resta <5ms, ma qui vogliamo solo escludere
             // regressioni catastrofiche. In debug mode (non ottimizzato) il
             // threshold è più permissivo per evitare falsi positivi su CI.
-            let threshold_us: u64 = if cfg!(debug_assertions) { 1_000_000 } else { 100_000 };
+            let threshold_us: u64 = if cfg!(debug_assertions) {
+                1_000_000
+            } else {
+                100_000
+            };
             assert!(
                 d.decision_time_us < threshold_us,
                 "routing too slow: {}us (threshold={}us, debug={})",
@@ -1435,15 +1469,8 @@ mod tests {
         let mut q_success_final = 0.0;
         let mut q_failure_final = 0.0;
         for _ in 0..20 {
-            q_success_final = bridge_a.record_outcome(
-                "t-s",
-                "coding",
-                AgentType::Coder,
-                true,
-                1.0,
-                30,
-                None,
-            );
+            q_success_final =
+                bridge_a.record_outcome("t-s", "coding", AgentType::Coder, true, 1.0, 30, None);
             q_failure_final = bridge_b.record_outcome(
                 "t-f",
                 "coding",
@@ -1464,9 +1491,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_bridge_run_learning_loop_end_to_end() {
-        use nexus_orchestrator::{SwarmExecutionResult, SwarmTaskOutcome};
-        use nexus_orchestrator::{RoutingDecision, SelectionStrategy};
         use nexus_orchestrator::TaskResult as AgentTaskResult;
+        use nexus_orchestrator::{RoutingDecision, SelectionStrategy};
+        use nexus_orchestrator::{SwarmExecutionResult, SwarmTaskOutcome};
 
         let bridge = NexusBridge::new();
 
@@ -1513,7 +1540,9 @@ mod tests {
         let keys = ns.keys();
         // I worker reattivi devono aver lasciato delle tracce nel namespace
         assert!(
-            keys.iter().any(|k| k.starts_with("pattern:") || k == "metrics:latest" || k.starts_with("profile:")),
+            keys.iter().any(|k| k.starts_with("pattern:")
+                || k == "metrics:latest"
+                || k.starts_with("profile:")),
             "expected pattern:/metrics:/profile: keys in observability_ns, got {:?}",
             keys
         );
@@ -1604,7 +1633,8 @@ mod tests {
             let name = at.name();
             let roundtrip = AgentType::from_name(name);
             assert_eq!(
-                roundtrip.name(), name,
+                roundtrip.name(),
+                name,
                 "from_name roundtrip failed for {name}"
             );
         }
@@ -1717,6 +1747,9 @@ mod tests {
             .expect("Q-value deve esistere dopo 5 record_outcome");
 
         assert_eq!(q.visit_count, 5, "visit_count deve essere 5 dopo 5 run");
-        assert!(q.value > 0.0, "Q-value deve essere positivo dopo 5 successi");
+        assert!(
+            q.value > 0.0,
+            "Q-value deve essere positivo dopo 5 successi"
+        );
     }
 }

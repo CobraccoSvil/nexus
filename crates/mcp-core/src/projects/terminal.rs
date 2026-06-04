@@ -17,14 +17,12 @@ pub async fn terminal_commands_stream(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // Verifica accesso al progetto
-    let access = sqlx::query(
-        "SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2",
-    )
-    .bind(project_id)
-    .bind(user_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let access = sqlx::query("SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2")
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if access.is_none() {
         return Err(api_error(StatusCode::FORBIDDEN, "Accesso negato"));
@@ -37,56 +35,56 @@ pub async fn terminal_commands_stream(
     let stream = futures::stream::unfold(db, move |db| {
         let consumer_for_db = consumer_for_db.clone();
         async move {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        let _ = sqlx::query(
-            "UPDATE terminal_commands
+            let _ = sqlx::query(
+                "UPDATE terminal_commands
              SET status = 'pending', claimed_at = NULL, claimed_by = NULL
              WHERE project_id = $1
                AND status = 'in_flight'
                AND claimed_at < NOW() - INTERVAL '20 seconds'",
-        )
-        .bind(project_id)
-        .execute(&db)
-        .await;
+            )
+            .bind(project_id)
+            .execute(&db)
+            .await;
 
-        let rows = sqlx::query(
-            "UPDATE terminal_commands \
+            let rows = sqlx::query(
+                "UPDATE terminal_commands \
              SET status = 'in_flight', claimed_at = NOW(), claimed_by = $2 \
              WHERE id IN ( \
                  SELECT id FROM terminal_commands \
                  WHERE project_id = $1 AND status = 'pending' \
                  ORDER BY created_at ASC LIMIT 10 \
              ) RETURNING id, command, session_id, created_at",
-        )
-        .bind(project_id)
-        .bind(&consumer_for_db)
-        .fetch_all(&db)
-        .await
-        .unwrap_or_default();
+            )
+            .bind(project_id)
+            .bind(&consumer_for_db)
+            .fetch_all(&db)
+            .await
+            .unwrap_or_default();
 
-        let events: Vec<Result<Event, std::convert::Infallible>> = rows
-            .into_iter()
-            .filter_map(|row| {
-                let cmd_id: Uuid = row.try_get("id").ok()?;
-                let command: String = row.try_get("command").ok()?;
-                let session_id: Option<Uuid> = row.try_get("session_id").ok().flatten();
-                let created_at: Option<chrono::DateTime<chrono::Utc>> =
-                    row.try_get("created_at").ok();
-                let payload = serde_json::json!({
-                    "commandId": cmd_id.to_string(),
-                    "command": command,
-                    "sessionId": session_id.map(|s| s.to_string()),
-                    "createdAt": created_at.map(|value| value.to_rfc3339()),
-                });
-                serde_json::to_string(&payload).ok().map(|data| {
-                    Ok(Event::default().event("terminal_command").data(data))
+            let events: Vec<Result<Event, std::convert::Infallible>> = rows
+                .into_iter()
+                .filter_map(|row| {
+                    let cmd_id: Uuid = row.try_get("id").ok()?;
+                    let command: String = row.try_get("command").ok()?;
+                    let session_id: Option<Uuid> = row.try_get("session_id").ok().flatten();
+                    let created_at: Option<chrono::DateTime<chrono::Utc>> =
+                        row.try_get("created_at").ok();
+                    let payload = serde_json::json!({
+                        "commandId": cmd_id.to_string(),
+                        "command": command,
+                        "sessionId": session_id.map(|s| s.to_string()),
+                        "createdAt": created_at.map(|value| value.to_rfc3339()),
+                    });
+                    serde_json::to_string(&payload)
+                        .ok()
+                        .map(|data| Ok(Event::default().event("terminal_command").data(data)))
                 })
-            })
-            .collect();
+                .collect();
 
-        Some((futures::stream::iter(events), db))
-    }
+            Some((futures::stream::iter(events), db))
+        }
     })
     .flatten();
 
@@ -108,14 +106,12 @@ pub async fn terminal_presence(
         ));
     }
 
-    let access = sqlx::query(
-        "SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2",
-    )
-    .bind(project_id)
-    .bind(user_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let access = sqlx::query("SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2")
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if access.is_none() {
         return Err(api_error(StatusCode::FORBIDDEN, "Accesso negato"));
@@ -155,14 +151,12 @@ pub async fn terminal_command_ack(
         ));
     }
 
-    let access = sqlx::query(
-        "SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2",
-    )
-    .bind(project_id)
-    .bind(user_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let access = sqlx::query("SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2")
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if access.is_none() {
         return Err(api_error(StatusCode::FORBIDDEN, "Accesso negato"));
@@ -183,7 +177,11 @@ pub async fn terminal_command_ack(
         trimmed
     });
 
-    let status = if body.delivered { "delivered" } else { "failed" };
+    let status = if body.delivered {
+        "delivered"
+    } else {
+        "failed"
+    };
     let updated = sqlx::query(
         "UPDATE terminal_commands
          SET status = $4,
@@ -228,17 +226,18 @@ pub async fn terminal_command_finish(
     let user_id = parse_user_id(&claims)?;
     let consumer_id = body.consumer_id.trim();
     if consumer_id.is_empty() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "consumerId obbligatorio"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "consumerId obbligatorio",
+        ));
     }
 
-    let access = sqlx::query(
-        "SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2",
-    )
-    .bind(project_id)
-    .bind(user_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let access = sqlx::query("SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2")
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if access.is_none() {
         return Err(api_error(StatusCode::FORBIDDEN, "Accesso negato"));

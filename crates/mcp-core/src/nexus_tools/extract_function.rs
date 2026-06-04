@@ -22,7 +22,11 @@ pub struct ExtractFunctionTool;
 fn render_wrapper(lang: &str, name: &str, body: &str) -> (String, String) {
     match lang {
         "rust" => (
-            format!("fn {name}() {{\n{body}\n}}\n", name = name, body = indent(body, "    ")),
+            format!(
+                "fn {name}() {{\n{body}\n}}\n",
+                name = name,
+                body = indent(body, "    ")
+            ),
             format!("{name}();", name = name),
         ),
         "typescript" | "javascript" => (
@@ -58,11 +62,7 @@ fn indent(block: &str, prefix: &str) -> String {
 
 #[async_trait]
 impl NexusToolHandler for ExtractFunctionTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let path = args
             .get("path")
             .and_then(Value::as_str)

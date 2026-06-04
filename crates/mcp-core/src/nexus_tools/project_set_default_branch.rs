@@ -9,11 +9,7 @@ pub struct ProjectSetDefaultBranchTool;
 
 #[async_trait]
 impl NexusToolHandler for ProjectSetDefaultBranchTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let branch = args
             .get("branch")
             .and_then(Value::as_str)
@@ -29,21 +25,17 @@ impl NexusToolHandler for ProjectSetDefaultBranchTool {
             .await
             .map_err(|e| NexusToolError::BadInput(format!("nexus db: {}", e)))?;
 
-        let result = sqlx::query(
-            "UPDATE projects SET default_branch = $1 WHERE id = $2",
-        )
-        .bind(&branch)
-        .bind(ctx.project_id)
-        .execute(&pool)
-        .await
-        .map_err(|e| NexusToolError::BadInput(format!("update branch: {}", e)))?;
+        let result = sqlx::query("UPDATE projects SET default_branch = $1 WHERE id = $2")
+            .bind(&branch)
+            .bind(ctx.project_id)
+            .execute(&pool)
+            .await
+            .map_err(|e| NexusToolError::BadInput(format!("update branch: {}", e)))?;
 
         pool.close().await;
 
         if result.rows_affected() == 0 {
-            return Err(NexusToolError::BadInput(
-                "Progetto non trovato".into(),
-            ));
+            return Err(NexusToolError::BadInput("Progetto non trovato".into()));
         }
 
         Ok(json!({

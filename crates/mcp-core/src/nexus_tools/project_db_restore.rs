@@ -14,11 +14,7 @@ pub struct ProjectDbRestoreTool;
 
 #[async_trait]
 impl NexusToolHandler for ProjectDbRestoreTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let backup_path = args
             .get("backup_path")
             .and_then(Value::as_str)
@@ -56,7 +52,9 @@ impl NexusToolHandler for ProjectDbRestoreTool {
         }
 
         if !canonical.is_file() {
-            return Err(NexusToolError::BadInput("Il percorso non e' un file".into()));
+            return Err(NexusToolError::BadInput(
+                "Il percorso non e' un file".into(),
+            ));
         }
 
         // Ottieni DSN
@@ -78,10 +76,14 @@ impl NexusToolHandler for ProjectDbRestoreTool {
             // pg_restore per formato custom
             let clean = args.get("clean").and_then(Value::as_bool).unwrap_or(true);
             let mut cmd_args = vec![
-                "-h".to_string(), host,
-                "-p".to_string(), port,
-                "-U".to_string(), user,
-                "-d".to_string(), dbname.clone(),
+                "-h".to_string(),
+                host,
+                "-p".to_string(),
+                port,
+                "-U".to_string(),
+                user,
+                "-d".to_string(),
+                dbname.clone(),
             ];
             if clean {
                 cmd_args.push("--clean".to_string());
@@ -101,7 +103,18 @@ impl NexusToolHandler for ProjectDbRestoreTool {
         } else {
             // psql -f per formato plain SQL
             tokio::process::Command::new("psql")
-                .args(["-h", &host, "-p", &port, "-U", &user, "-d", &dbname, "-f", &canonical_str])
+                .args([
+                    "-h",
+                    &host,
+                    "-p",
+                    &port,
+                    "-U",
+                    &user,
+                    "-d",
+                    &dbname,
+                    "-f",
+                    &canonical_str,
+                ])
                 .env("PGPASSWORD", &password)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())

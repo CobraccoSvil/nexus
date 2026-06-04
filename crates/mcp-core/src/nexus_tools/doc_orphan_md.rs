@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 pub struct DocOrphanMdTool;
 
 fn collect_md(dir: &Path, root: &Path, out: &mut Vec<String>, depth: usize) {
-    if depth > 6 { return; }
+    if depth > 6 {
+        return;
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -33,16 +35,23 @@ fn collect_md(dir: &Path, root: &Path, out: &mut Vec<String>, depth: usize) {
 
 #[async_trait]
 impl NexusToolHandler for DocOrphanMdTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let readme_path = ctx.project_root.join("README.md");
         let readme = std::fs::read_to_string(&readme_path).unwrap_or_default();
         let mut all_md: Vec<String> = vec![];
         let root: PathBuf = ctx.project_root.clone();
         collect_md(&root, &root, &mut all_md, 0);
-        let orphans: Vec<String> = all_md.into_iter()
+        let orphans: Vec<String> = all_md
+            .into_iter()
             .filter(|md| !readme.contains(md))
             .collect();
         Ok(json!({"ok": true, "count": orphans.len(), "orphans": orphans}))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

@@ -1,9 +1,11 @@
 //! Adapter Prisma (Node.js/TypeScript) — crea migration tramite `prisma migrate dev --create-only`.
 
+use super::{sha256_hex, MigrationAdapter};
+use crate::project_db::{
+    AppliedMigration, Migration, ProjectDbContext, ProjectDbError, RolledBackMigration,
+};
 use async_trait::async_trait;
 use std::path::PathBuf;
-use crate::project_db::{Migration, AppliedMigration, RolledBackMigration, ProjectDbError, ProjectDbContext};
-use super::{MigrationAdapter, sha256_hex};
 
 pub struct PrismaAdapter;
 
@@ -12,12 +14,12 @@ impl MigrationAdapter for PrismaAdapter {
     async fn list_pending(&self, ctx: &ProjectDbContext) -> Result<Vec<Migration>, ProjectDbError> {
         // Prisma migrations: directory con migration.sql dentro
         let base = ctx.project_root.join(&ctx.migration_path);
-        if !base.exists() { return Ok(vec![]); }
+        if !base.exists() {
+            return Ok(vec![]);
+        }
         let mut result = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&base) {
-            let mut dirs: Vec<_> = entries.flatten()
-                .filter(|e| e.path().is_dir())
-                .collect();
+            let mut dirs: Vec<_> = entries.flatten().filter(|e| e.path().is_dir()).collect();
             dirs.sort_by_key(|e| e.file_name());
             for dir in dirs {
                 let sql_path = dir.path().join("migration.sql");
@@ -42,17 +44,34 @@ impl MigrationAdapter for PrismaAdapter {
         name: &str,
         _sql: &str,
     ) -> Result<PathBuf, ProjectDbError> {
-        let safe_name: String = name.chars()
-            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        let safe_name: String = name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let output = std::process::Command::new("npx")
-            .args(["prisma", "migrate", "dev", "--create-only", "--name", &safe_name])
+            .args([
+                "prisma",
+                "migrate",
+                "dev",
+                "--create-only",
+                "--name",
+                &safe_name,
+            ])
             .current_dir(&ctx.project_root)
             .output()
             .map_err(|e| ProjectDbError::Adapter(format!("prisma migrate dev: {}", e)))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ProjectDbError::Adapter(format!("prisma migrate dev fallita: {}", stderr)));
+            return Err(ProjectDbError::Adapter(format!(
+                "prisma migrate dev fallita: {}",
+                stderr
+            )));
         }
         // Trova la directory migration appena creata
         let base = ctx.project_root.join(&ctx.migration_path);
@@ -79,7 +98,10 @@ impl MigrationAdapter for PrismaAdapter {
             .map_err(|e| ProjectDbError::Adapter(format!("prisma migrate deploy: {}", e)))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ProjectDbError::Adapter(format!("prisma migrate deploy fallita: {}", stderr)));
+            return Err(ProjectDbError::Adapter(format!(
+                "prisma migrate deploy fallita: {}",
+                stderr
+            )));
         }
         Ok(vec![])
     }
@@ -90,7 +112,7 @@ impl MigrationAdapter for PrismaAdapter {
         _connection_url: &str,
     ) -> Result<Option<RolledBackMigration>, ProjectDbError> {
         Err(ProjectDbError::Adapter(
-            "Prisma non supporta rollback diretto. Usa reset o crea una migration inversa.".into()
+            "Prisma non supporta rollback diretto. Usa reset o crea una migration inversa.".into(),
         ))
     }
 }

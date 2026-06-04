@@ -8,7 +8,11 @@ pub struct CargoDocCheckTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoDocCheckTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         // RUSTDOCFLAGS=-D warnings deve essere settato dal chiamante; qui passiamo solo i flag.
         let out = run_cmd(
             "cargo",
@@ -28,5 +32,7 @@ impl NexusToolHandler for CargoDocCheckTool {
             "duration_ms": out.duration_ms,
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::write_subproc() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::write_subproc()
+    }
 }

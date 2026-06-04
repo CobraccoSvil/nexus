@@ -19,8 +19,7 @@ use tokio::sync::RwLock;
 
 const ENFORCEMENT_CACHE_TTL: Duration = Duration::from_secs(60);
 
-static ENFORCEMENT_CACHE: Lazy<RwLock<Option<(bool, Instant)>>> =
-    Lazy::new(|| RwLock::new(None));
+static ENFORCEMENT_CACHE: Lazy<RwLock<Option<(bool, Instant)>>> = Lazy::new(|| RwLock::new(None));
 
 const NEXUS_PORT_MIN: u32 = 20000;
 const NEXUS_PORT_MAX: u32 = 40000;
@@ -237,7 +236,10 @@ pub fn format_reject_message(path: &str, findings: &[PortFinding]) -> String {
         ));
     }
     if findings.len() > 10 {
-        msg.push_str(&format!("  ... e altri {} riscontri.\n", findings.len() - 10));
+        msg.push_str(&format!(
+            "  ... e altri {} riscontri.\n",
+            findings.len() - 10
+        ));
     }
     msg.push_str(
         "\nAzione richiesta:\n\
@@ -267,7 +269,10 @@ mod tests {
 
     #[test]
     fn docker_compose_no_longer_skipped() {
-        let res = scan_content("docker-compose.yml", "services:\n  web:\n    ports:\n      - 3000:3000\n");
+        let res = scan_content(
+            "docker-compose.yml",
+            "services:\n  web:\n    ports:\n      - 3000:3000\n",
+        );
         assert!(matches!(res, PortScanOutcome::Reject(_)));
     }
 
@@ -292,10 +297,7 @@ mod tests {
 
     #[test]
     fn allow_env_port_line() {
-        let res = scan_content(
-            "src/server.js",
-            "app.listen(process.env.PORT || 3000)\n",
-        );
+        let res = scan_content("src/server.js", "app.listen(process.env.PORT || 3000)\n");
         assert!(matches!(res, PortScanOutcome::Allowed));
     }
 

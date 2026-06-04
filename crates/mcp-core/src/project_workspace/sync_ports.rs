@@ -36,15 +36,14 @@ pub async fn sync_ports_to_files(
     let root = &context.root_path;
 
     // 1. Carica allocazioni in DB
-    let allocations: Vec<(i32, String)> =
-        sqlx::query_as::<_, (i32, String)>(
-            "SELECT port, COALESCE(label, '') FROM nexus_port_allocations \
+    let allocations: Vec<(i32, String)> = sqlx::query_as::<_, (i32, String)>(
+        "SELECT port, COALESCE(label, '') FROM nexus_port_allocations \
              WHERE project_id = $1",
-        )
-        .bind(project_id)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    )
+    .bind(project_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let mut backend_port: Option<i32> = None;
     let mut frontend_port: Option<i32> = None;
@@ -53,7 +52,10 @@ pub async fn sync_ports_to_files(
         if lbl.contains("backend") || lbl.contains("api") {
             backend_port.get_or_insert(*port);
         }
-        if lbl.contains("frontend") || lbl.contains("web") || lbl.contains("dev") && lbl != "backend-dev" {
+        if lbl.contains("frontend")
+            || lbl.contains("web")
+            || lbl.contains("dev") && lbl != "backend-dev"
+        {
             frontend_port.get_or_insert(*port);
         }
     }
@@ -76,23 +78,18 @@ pub async fn sync_ports_to_files(
             // server.port -> parseInt(process.env.PORT ?? '<fp>')
             let port_re = Regex::new(r"port\s*:\s*\d{2,5}").unwrap();
             new_content = port_re
-                .replace(&new_content, format!(
-                    "port: parseInt(process.env.PORT ?? '{}')",
-                    fp
-                ))
+                .replace(
+                    &new_content,
+                    format!("port: parseInt(process.env.PORT ?? '{}')", fp),
+                )
                 .to_string();
 
             // proxy target -> backend allocated
             if let Some(bp) = backend_port {
-                let proxy_re = Regex::new(
-                    r#"target\s*:\s*['"]http://localhost:\d{2,5}['"]"#,
-                )
-                .unwrap();
+                let proxy_re =
+                    Regex::new(r#"target\s*:\s*['"]http://localhost:\d{2,5}['"]"#).unwrap();
                 new_content = proxy_re
-                    .replace(
-                        &new_content,
-                        format!("target: 'http://localhost:{}'", bp),
-                    )
+                    .replace(&new_content, format!("target: 'http://localhost:{}'", bp))
                     .to_string();
             }
 
@@ -113,7 +110,9 @@ pub async fn sync_ports_to_files(
     // 3. Backend .env con PORT=backend_port
     if let Some(bp) = backend_port {
         let env_path = root.join("backend").join(".env");
-        let existing = tokio::fs::read_to_string(&env_path).await.unwrap_or_default();
+        let existing = tokio::fs::read_to_string(&env_path)
+            .await
+            .unwrap_or_default();
         let port_line = format!("PORT={}", bp);
         let new_env = if existing.contains("PORT=") {
             let re = Regex::new(r"(?m)^PORT=.*$").unwrap();
@@ -138,7 +137,11 @@ pub async fn sync_ports_to_files(
 
     // 4. playwright.config.ts baseURL
     if let Some(fp) = frontend_port {
-        for cfg in &["playwright.config.ts", "playwright.config.js", "frontend/playwright.config.ts"] {
+        for cfg in &[
+            "playwright.config.ts",
+            "playwright.config.js",
+            "frontend/playwright.config.ts",
+        ] {
             let path = root.join(cfg);
             if !path.is_file() {
                 continue;
@@ -147,15 +150,10 @@ pub async fn sync_ports_to_files(
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            let baseurl_re = Regex::new(
-                r#"baseURL\s*:\s*['"]http://localhost:\d{2,5}['"]"#,
-            )
-            .unwrap();
+            let baseurl_re =
+                Regex::new(r#"baseURL\s*:\s*['"]http://localhost:\d{2,5}['"]"#).unwrap();
             let new_content = baseurl_re
-                .replace(
-                    &content,
-                    format!("baseURL: 'http://localhost:{}'", fp),
-                )
+                .replace(&content, format!("baseURL: 'http://localhost:{}'", fp))
                 .to_string();
             if new_content != content {
                 if let Err(e) = tokio::fs::write(&path, &new_content).await {

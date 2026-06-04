@@ -20,7 +20,14 @@ pub async fn get_project_services_status(
     // `systemctl --user list-units --type=service --all --no-legend --no-pager`
     // restituisce righe: "  UNIT  LOAD  ACTIVE  SUB  DESCRIPTION"
     let out = tokio::process::Command::new("systemctl")
-        .args(["--user", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"])
+        .args([
+            "--user",
+            "list-units",
+            "--type=service",
+            "--all",
+            "--no-legend",
+            "--no-pager",
+        ])
         .output()
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -31,15 +38,21 @@ pub async fn get_project_services_status(
     let mut services: Vec<serde_json::Value> = Vec::new();
     for line in stdout.lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 4 { continue; }
+        if cols.len() < 4 {
+            continue;
+        }
         let unit = cols[0].trim_start_matches('●').trim();
-        if !unit.starts_with(&prefix) || !unit.ends_with(".service") { continue; }
+        if !unit.starts_with(&prefix) || !unit.ends_with(".service") {
+            continue;
+        }
         let active = cols[2]; // "active" | "inactive" | "failed" | ...
-        let sub    = cols[3]; // "running" | "exited" | "dead" | ...
-        // nome corto: rimuove il prefisso slug e il suffisso .service
+        let sub = cols[3]; // "running" | "exited" | "dead" | ...
+                           // nome corto: rimuove il prefisso slug e il suffisso .service
         let short = unit
-            .strip_prefix(&prefix).unwrap_or(unit)
-            .strip_suffix(".service").unwrap_or(unit);
+            .strip_prefix(&prefix)
+            .unwrap_or(unit)
+            .strip_suffix(".service")
+            .unwrap_or(unit);
 
         let mut entry = json!({
             "unit":   unit,
@@ -51,8 +64,7 @@ pub async fn get_project_services_status(
         // Se il servizio e' in crash-loop o failed, leggi il journal per diagnosticare.
         // Rileva anche servizi momentaneamente "active" ma con NRestarts elevato
         // (es. dotnet run che impiega 40s per la build prima di fallire).
-        let is_failing = (active == "activating" && sub == "auto-restart")
-            || active == "failed";
+        let is_failing = (active == "activating" && sub == "auto-restart") || active == "failed";
         let is_crash_looping = if !is_failing && active == "active" {
             // Controlla NRestarts: se > 2, il servizio sta ciclando
             tokio::process::Command::new("systemctl")
@@ -62,7 +74,8 @@ pub async fn get_project_services_status(
                 .ok()
                 .and_then(|o| {
                     let s = String::from_utf8_lossy(&o.stdout).to_string();
-                    s.trim().strip_prefix("NRestarts=")
+                    s.trim()
+                        .strip_prefix("NRestarts=")
                         .and_then(|v| v.parse::<u32>().ok())
                 })
                 .map_or(false, |n| n > 2)
@@ -111,7 +124,10 @@ pub async fn control_project_service(
 
     // Sicurezza: il service name non può contenere '/' o '..' e deve iniziare col prefisso slug
     if service.contains('/') || service.contains("..") {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Nome servizio non valido"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Nome servizio non valido",
+        ));
     }
 
     // Costruisce il nome unit: se il chiamante manda già il nome completo (slug-xxx) lo usa,
@@ -124,7 +140,12 @@ pub async fn control_project_service(
 
     let systemctl_action = match action.as_str() {
         "start" | "stop" | "restart" => action.as_str(),
-        other => return Err(api_error(StatusCode::BAD_REQUEST, format!("Azione non valida: {}", other))),
+        other => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!("Azione non valida: {}", other),
+            ))
+        }
     };
 
     // Pre-check: prima di start/restart, libera le porte occupate da processi estranei
@@ -132,7 +153,11 @@ pub async fn control_project_service(
     if systemctl_action == "start" || systemctl_action == "restart" {
         freed_ports = free_ports_for_unit(&svc_name).await;
         if !freed_ports.is_empty() {
-            tracing::info!("Pre-start {}: liberate {} porte occupate", svc_name, freed_ports.len());
+            tracing::info!(
+                "Pre-start {}: liberate {} porte occupate",
+                svc_name,
+                freed_ports.len()
+            );
         }
     }
 
@@ -153,8 +178,12 @@ pub async fn control_project_service(
                 port: None,
                 pid: None,
             },
-            "stop" => nexus_events::event::ProjectEvent::ServiceStopped { name: svc_name.clone() },
-            "restart" => nexus_events::event::ProjectEvent::ServiceRestarted { name: svc_name.clone() },
+            "stop" => nexus_events::event::ProjectEvent::ServiceStopped {
+                name: svc_name.clone(),
+            },
+            "restart" => nexus_events::event::ProjectEvent::ServiceRestarted {
+                name: svc_name.clone(),
+            },
             _ => unreachable!("validated above"),
         };
         nexus_events::dispatcher::emit(&state.project_channels, project_id, evt);
@@ -186,7 +215,14 @@ pub async fn restart_all_project_services(
     // Lista delle unit del progetto
     let prefix = format!("{}-", slug);
     let list = tokio::process::Command::new("systemctl")
-        .args(["--user", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"])
+        .args([
+            "--user",
+            "list-units",
+            "--type=service",
+            "--all",
+            "--no-legend",
+            "--no-pager",
+        ])
         .output()
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -195,7 +231,11 @@ pub async fn restart_all_project_services(
         .lines()
         .filter_map(|line| {
             let unit = line.split_whitespace().next()?;
-            if unit.starts_with(&prefix) { Some(unit.to_string()) } else { None }
+            if unit.starts_with(&prefix) {
+                Some(unit.to_string())
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -234,7 +274,14 @@ pub async fn stop_all_project_services(
 
     let prefix = format!("{}-", slug);
     let list = tokio::process::Command::new("systemctl")
-        .args(["--user", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"])
+        .args([
+            "--user",
+            "list-units",
+            "--type=service",
+            "--all",
+            "--no-legend",
+            "--no-pager",
+        ])
         .output()
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -243,7 +290,11 @@ pub async fn stop_all_project_services(
         .lines()
         .filter_map(|line| {
             let unit = line.split_whitespace().next()?;
-            if unit.starts_with(&prefix) { Some(unit.to_string()) } else { None }
+            if unit.starts_with(&prefix) {
+                Some(unit.to_string())
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -296,9 +347,15 @@ pub async fn cleanup_project_ports(
 
     // Porte target: dal body o, se assente, tutte quelle rilevate nel progetto
     let target_ports: std::collections::HashSet<u16> = match body {
-        Some(axum::Json(b)) => b.get("ports")
+        Some(axum::Json(b)) => b
+            .get("ports")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_u64()).map(|n| n as u16).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_u64())
+                    .map(|n| n as u16)
+                    .collect()
+            })
             .unwrap_or_default(),
         None => std::collections::HashSet::new(),
     };
@@ -306,7 +363,14 @@ pub async fn cleanup_project_ports(
     // Raccoglie i MainPID dei servizi systemd del progetto (PID protetti)
     let prefix = format!("{}-", slug);
     let list_out = tokio::process::Command::new("systemctl")
-        .args(["--user", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"])
+        .args([
+            "--user",
+            "list-units",
+            "--type=service",
+            "--all",
+            "--no-legend",
+            "--no-pager",
+        ])
         .output()
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -315,7 +379,11 @@ pub async fn cleanup_project_ports(
         .lines()
         .filter_map(|line| {
             let unit = line.split_whitespace().next()?;
-            if unit.starts_with(&prefix) { Some(unit.to_string()) } else { None }
+            if unit.starts_with(&prefix) {
+                Some(unit.to_string())
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -331,7 +399,9 @@ pub async fn cleanup_project_ports(
             for line in s.lines() {
                 if let Some(val) = line.strip_prefix("MainPID=") {
                     if let Ok(pid) = val.trim().parse::<u32>() {
-                        if pid > 0 { protected_pids.insert(pid); }
+                        if pid > 0 {
+                            protected_pids.insert(pid);
+                        }
                     }
                 }
             }
@@ -361,12 +431,16 @@ pub async fn cleanup_project_ports(
             }
         }
         map
-    }).await.unwrap_or_default();
+    })
+    .await
+    .unwrap_or_default();
     let mut queue: std::collections::VecDeque<u32> = protected_pids.iter().copied().collect();
     while let Some(pid) = queue.pop_front() {
         if let Some(kids) = children.get(&pid) {
             for &c in kids {
-                if protected_pids.insert(c) { queue.push_back(c); }
+                if protected_pids.insert(c) {
+                    queue.push_back(c);
+                }
             }
         }
     }
@@ -484,25 +558,32 @@ pub(super) async fn detect_project_ports(
 
     // 1. PID dai processi agent — include sia 'running' che altri status purché il processo sia ancora vivo.
     // Lo status nel DB può essere 'failed' dopo un riavvio di mcp-core anche se il processo gira ancora.
-    let agent_pids: Vec<i32> = sqlx::query(
-        "SELECT pid FROM agent_processes WHERE project_id = $1 AND pid IS NOT NULL"
-    )
-    .bind(project_id)
-    .fetch_all(db)
-    .await
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|row| row.try_get::<i32, _>("pid").ok())
-    // Verifica che il processo sia ancora vivo controllando /proc/{pid}
-    .filter(|pid| std::path::Path::new(&format!("/proc/{}", pid)).exists())
-    .collect();
+    let agent_pids: Vec<i32> =
+        sqlx::query("SELECT pid FROM agent_processes WHERE project_id = $1 AND pid IS NOT NULL")
+            .bind(project_id)
+            .fetch_all(db)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|row| row.try_get::<i32, _>("pid").ok())
+            // Verifica che il processo sia ancora vivo controllando /proc/{pid}
+            .filter(|pid| std::path::Path::new(&format!("/proc/{}", pid)).exists())
+            .collect();
 
     // 2a. MainPID dei servizi systemd --user `{slug}-*.service` + mappa pid→short_name
     let svc_prefix = format!("{}-", slug);
-    let mut pid_to_service: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    let mut pid_to_service: std::collections::HashMap<u32, String> =
+        std::collections::HashMap::new();
     let systemd_pids: Vec<u32> = {
         let list_out = tokio::process::Command::new("systemctl")
-            .args(["--user", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"])
+            .args([
+                "--user",
+                "list-units",
+                "--type=service",
+                "--all",
+                "--no-legend",
+                "--no-pager",
+            ])
             .output()
             .await
             .unwrap_or_else(|_| std::process::Output {
@@ -515,15 +596,21 @@ pub(super) async fn detect_project_ports(
             .lines()
             .filter_map(|line| {
                 let unit = line.split_whitespace().next()?;
-                if unit.starts_with(&svc_prefix) { Some(unit.to_string()) } else { None }
+                if unit.starts_with(&svc_prefix) {
+                    Some(unit.to_string())
+                } else {
+                    None
+                }
             })
             .collect();
 
         let mut pids = Vec::new();
         for unit in &units {
             let short = unit
-                .strip_prefix(&svc_prefix).unwrap_or(unit)
-                .strip_suffix(".service").unwrap_or(unit)
+                .strip_prefix(&svc_prefix)
+                .unwrap_or(unit)
+                .strip_suffix(".service")
+                .unwrap_or(unit)
                 .to_string();
             let show_out = tokio::process::Command::new("systemctl")
                 .args(["--user", "show", unit, "--property=MainPID"])
@@ -550,18 +637,19 @@ pub(super) async fn detect_project_ports(
     };
 
     // 2b. Raccogli tutti i PID rilevanti: agent + systemd + processi con cwd = project_root
-    let mut all_pids: std::collections::HashSet<u32> = agent_pids.iter().map(|p| *p as u32)
+    let mut all_pids: std::collections::HashSet<u32> = agent_pids
+        .iter()
+        .map(|p| *p as u32)
         .chain(systemd_pids.into_iter())
         .collect();
 
     // Scan /proc per costruire mappa figli e trovare processi con cwd nel project_root.
     // Tutto sincrono → spawn_blocking per non bloccare il runtime tokio.
     let project_root_owned = project_root.to_string();
-    let (children, cwd_pids) = tokio::task::spawn_blocking(move || {
-        scan_proc_children_and_cwd(&project_root_owned)
-    })
-    .await
-    .unwrap_or_default();
+    let (children, cwd_pids) =
+        tokio::task::spawn_blocking(move || scan_proc_children_and_cwd(&project_root_owned))
+            .await
+            .unwrap_or_default();
 
     all_pids.extend(cwd_pids);
 
@@ -591,7 +679,9 @@ pub(super) async fn detect_project_ports(
         if let Some(kids) = children.get(&pid) {
             for &child in kids {
                 let was_new = !pid_to_service.contains_key(&child);
-                pid_to_service.entry(child).or_insert_with(|| parent_svc.clone());
+                pid_to_service
+                    .entry(child)
+                    .or_insert_with(|| parent_svc.clone());
                 if was_new {
                     svc_queue.push_back(child);
                 }
@@ -642,7 +732,9 @@ pub(super) async fn detect_project_ports(
         let docker_prefix2 = format!("{}_", slug);
         for line in docker_str.lines() {
             let parts: Vec<&str> = line.splitn(2, '|').collect();
-            if parts.len() != 2 { continue; }
+            if parts.len() != 2 {
+                continue;
+            }
             let cname = parts[0].trim();
             // Filtra container appartenenti al progetto (per nome o per project label di docker-compose)
             if !cname.starts_with(&docker_prefix1)
@@ -657,14 +749,17 @@ pub(super) async fn detect_project_ports(
                 // Estrae la porta host: cerca pattern host_port->container_port
                 if let Some(arrow_pos) = entry.find("->") {
                     let host_part = &entry[..arrow_pos];
-                    let host_port: u16 = host_part.rsplit(':').next()
+                    let host_port: u16 = host_part
+                        .rsplit(':')
+                        .next()
                         .and_then(|p| p.parse().ok())
                         .unwrap_or(0);
                     if host_port > 0 {
                         // Tenta di derivare lo "short" del servizio dal nome container:
                         // redemptor-backend-dev → "backend"; redemptor-sqlserver-dev → "sqlserver"
                         let svc_guess = cname
-                            .strip_prefix(&docker_prefix1).or_else(|| cname.strip_prefix(&docker_prefix2))
+                            .strip_prefix(&docker_prefix1)
+                            .or_else(|| cname.strip_prefix(&docker_prefix2))
                             .map(|rest| {
                                 rest.trim_end_matches("-dev")
                                     .trim_end_matches("-prod")
@@ -703,23 +798,27 @@ pub async fn read_listening_ports_ss() -> anyhow::Result<Vec<(u16, u32, String)>
     for line in stdout.lines().skip(1) {
         // Esempio: LISTEN 0 128 0.0.0.0:3000 0.0.0.0:* users:(("node",pid=1234,fd=5))
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 5 { continue; }
+        if parts.len() < 5 {
+            continue;
+        }
         let local_addr = parts.get(3).unwrap_or(&"");
-        let port: u16 = local_addr.rsplit(':').next()
+        let port: u16 = local_addr
+            .rsplit(':')
+            .next()
             .and_then(|p| p.parse().ok())
             .unwrap_or(0);
-        if port == 0 { continue; }
+        if port == 0 {
+            continue;
+        }
         // Estrai pid e program da users:(("program",pid=NNN,fd=N))
         let users_str = parts[4..].join(" ");
-        let pid = users_str.split("pid=")
+        let pid = users_str
+            .split("pid=")
             .nth(1)
             .and_then(|s| s.split(',').next())
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(0);
-        let program = users_str.split('"')
-            .nth(1)
-            .unwrap_or("")
-            .to_string();
+        let program = users_str.split('"').nth(1).unwrap_or("").to_string();
         if pid > 0 {
             result.push((port, pid, program));
         }
@@ -735,13 +834,16 @@ pub fn read_listening_ports_proc() -> Vec<(u16, u32, String)> {
         if let Ok(content) = std::fs::read_to_string(path) {
             for line in content.lines().skip(1) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() < 10 { continue; }
+                if parts.len() < 10 {
+                    continue;
+                }
                 // stato 0A = LISTEN
-                if parts[3] != "0A" { continue; }
+                if parts[3] != "0A" {
+                    continue;
+                }
                 // local_address es. 00000000:0BB8
-                let port = u16::from_str_radix(
-                    parts[1].split(':').nth(1).unwrap_or("0"), 16
-                ).unwrap_or(0);
+                let port =
+                    u16::from_str_radix(parts[1].split(':').nth(1).unwrap_or("0"), 16).unwrap_or(0);
                 let inode: u64 = parts[9].parse().unwrap_or(0);
                 if port > 0 && inode > 0 {
                     inode_to_port.insert(inode, port);
@@ -756,14 +858,20 @@ pub fn read_listening_ports_proc() -> Vec<(u16, u32, String)> {
         for entry in proc_entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            let Ok(pid) = name_str.parse::<u32>() else { continue };
+            let Ok(pid) = name_str.parse::<u32>() else {
+                continue;
+            };
             let fd_dir = format!("/proc/{}/fd", pid);
-            let Ok(fds) = std::fs::read_dir(&fd_dir) else { continue };
+            let Ok(fds) = std::fs::read_dir(&fd_dir) else {
+                continue;
+            };
             for fd in fds.flatten() {
                 if let Ok(target) = std::fs::read_link(fd.path()) {
                     let t = target.to_string_lossy();
                     // "socket:[12345]"
-                    if let Some(inode_str) = t.strip_prefix("socket:[").and_then(|s| s.strip_suffix(']')) {
+                    if let Some(inode_str) =
+                        t.strip_prefix("socket:[").and_then(|s| s.strip_suffix(']'))
+                    {
                         if let Ok(inode) = inode_str.parse::<u64>() {
                             if let Some(&port) = inode_to_port.get(&inode) {
                                 result.push((port, pid, String::new()));
@@ -788,22 +896,22 @@ pub const NEXUS_RESERVED_PORTS: &[u16] = &[
     // Porte di sistema
     80, 443,
     // ── HTTP Nexus (4000-4079) ─────────────────────────────────────────────
-    4000,  // mcp-core HTTP
-    4001,  // web-ide (target migrazione da 3000)
-    4010,  // admin-service
-    4020,  // chat-service
-    4030,  // doc-service
-    4040,  // billing-service
-    4050,  // plugin-service
-    4060,  // nexus-gateway
-    4070,  // neural-core REST (target migrazione da 8001)
+    4000, // mcp-core HTTP
+    4001, // web-ide (target migrazione da 3000)
+    4010, // admin-service
+    4020, // chat-service
+    4030, // doc-service
+    4040, // billing-service
+    4050, // plugin-service
+    4060, // nexus-gateway
+    4070, // neural-core REST (target migrazione da 8001)
     // ── gRPC interno Nexus (4100-4139, target migrazione) ─────────────────
-    4100,  // neural-core gRPC (target da 50051)
-    4110,  // tool-runner gRPC (target da 50500)
-    4120,  // agent-router gRPC (target da 50501)
-    4130,  // presidio gRPC (target da 50052)
+    4100, // neural-core gRPC (target da 50051)
+    4110, // tool-runner gRPC (target da 50500)
+    4120, // agent-router gRPC (target da 50501)
+    4130, // presidio gRPC (target da 50052)
     // ── web-ide attuale ───────────────────────────────────────────────────
-    3000,  // Nexus web-ide (attuale)
+    3000, // Nexus web-ide (attuale)
     // ── Porte gRPC attuali (porte alte, in uso finché non migrati) ────────
     8001,  // neural-core REST (attuale)
     50051, // neural-core gRPC
@@ -811,10 +919,10 @@ pub const NEXUS_RESERVED_PORTS: &[u16] = &[
     50500, // tool-runner gRPC (reale, vedi mig 0239)
     50501, // agent-router gRPC (reale, vedi mig 0190/0239)
     // ── Database e infrastruttura ─────────────────────────────────────────
-    5432, 5433,   // PostgreSQL
-    6333, 6334,   // Qdrant REST + gRPC
-    6379,         // Redis
-    8080,         // nginx interno
+    5432, 5433, // PostgreSQL
+    6333, 6334, // Qdrant REST + gRPC
+    6379, // Redis
+    8080, // nginx interno
     // ── Monitoring e observability ────────────────────────────────────────
     3001,  // Grafana
     4055,  // browser-bridge-mcp
@@ -838,8 +946,8 @@ pub fn project_bucket_start(project_id: &Uuid) -> u16 {
     for i in 0..8 {
         v = (v << 8) | (b[i] as u64);
     }
-    let buckets: u64 =
-        ((PROJECT_PORT_RANGE_END - PROJECT_PORT_RANGE_START + 1) as u64) / (PROJECT_PORT_BUCKET_SIZE as u64);
+    let buckets: u64 = ((PROJECT_PORT_RANGE_END - PROJECT_PORT_RANGE_START + 1) as u64)
+        / (PROJECT_PORT_BUCKET_SIZE as u64);
     let idx = if buckets == 0 { 0 } else { v % buckets };
     PROJECT_PORT_RANGE_START + (idx as u16) * PROJECT_PORT_BUCKET_SIZE
 }
@@ -874,7 +982,10 @@ pub(super) async fn find_free_project_port(
     let mut port = start;
     while port <= end {
         if !reserved.contains(&port) && !allocated.contains(&port) {
-            if tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await.is_ok() {
+            if tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+                .await
+                .is_ok()
+            {
                 return port;
             }
         }
@@ -907,7 +1018,10 @@ pub(super) async fn deterministic_project_port_for_key(
     while tries < PROJECT_PORT_BUCKET_SIZE {
         let port = start.saturating_add(offset);
         if port >= start && port <= end && !reserved.contains(&port) && !allocated.contains(&port) {
-            if tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await.is_ok() {
+            if tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+                .await
+                .is_ok()
+            {
                 return port;
             }
         }
@@ -919,7 +1033,10 @@ pub(super) async fn deterministic_project_port_for_key(
 
 /// Trova la prima porta TCP libera a partire da `start`, escludendo le porte
 /// riservate da Nexus E quelle gia' allocate nel registro centralizzato.
-pub(super) async fn find_free_port(start: u16, registry: &crate::port_registry::PortRegistryCache) -> u16 {
+pub(super) async fn find_free_port(
+    start: u16,
+    registry: &crate::port_registry::PortRegistryCache,
+) -> u16 {
     let reserved: std::collections::HashSet<u16> = NEXUS_RESERVED_PORTS.iter().copied().collect();
     let allocated: std::collections::HashSet<u16> = registry
         .current()
@@ -929,8 +1046,13 @@ pub(super) async fn find_free_port(start: u16, registry: &crate::port_registry::
         .collect();
     let mut port = start;
     loop {
-        if port > 65000 { return start; } // fallback di sicurezza
-        if reserved.contains(&port) || allocated.contains(&port) { port += 1; continue; }
+        if port > 65000 {
+            return start;
+        } // fallback di sicurezza
+        if reserved.contains(&port) || allocated.contains(&port) {
+            port += 1;
+            continue;
+        }
         // Evita assegnazioni fuori dal range progetti quando start è nel range progetti.
         if start >= PROJECT_PORT_RANGE_START && start <= PROJECT_PORT_RANGE_END {
             if port < PROJECT_PORT_RANGE_START || port > PROJECT_PORT_RANGE_END {
@@ -938,7 +1060,10 @@ pub(super) async fn find_free_port(start: u16, registry: &crate::port_registry::
                 continue;
             }
         }
-        if tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await.is_ok() {
+        if tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+            .await
+            .is_ok()
+        {
             return port;
         }
         port += 1;
@@ -952,9 +1077,17 @@ pub(super) async fn find_free_port_no_registry(start: u16) -> u16 {
     let reserved: std::collections::HashSet<u16> = NEXUS_RESERVED_PORTS.iter().copied().collect();
     let mut port = start;
     loop {
-        if port > 65000 { return start; }
-        if reserved.contains(&port) { port += 1; continue; }
-        if tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await.is_ok() {
+        if port > 65000 {
+            return start;
+        }
+        if reserved.contains(&port) {
+            port += 1;
+            continue;
+        }
+        if tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
+            .await
+            .is_ok()
+        {
             return port;
         }
         port += 1;
@@ -995,9 +1128,15 @@ async fn free_ports_for_unit(unit_name: &str) -> Vec<serde_json::Value> {
     let mut freed = Vec::new();
     for target_port in &ports {
         for &(port, pid, ref program) in &listening {
-            if port != *target_port { continue; }
-            if pid == 0 { continue; }
-            if Some(pid) == own_pid { continue; }
+            if port != *target_port {
+                continue;
+            }
+            if pid == 0 {
+                continue;
+            }
+            if Some(pid) == own_pid {
+                continue;
+            }
             let _ = tokio::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .output()
@@ -1015,7 +1154,13 @@ async fn free_ports_for_unit(unit_name: &str) -> Vec<serde_json::Value> {
                 "program": program,
                 "method": "kill",
             }));
-            tracing::info!("Porta {} liberata: terminato PID {} ({}) per avvio {}", port, pid, program, unit_name);
+            tracing::info!(
+                "Porta {} liberata: terminato PID {} ({}) per avvio {}",
+                port,
+                pid,
+                program,
+                unit_name
+            );
         }
 
         // Container Docker che occupano questa porta
@@ -1027,13 +1172,17 @@ async fn free_ports_for_unit(unit_name: &str) -> Vec<serde_json::Value> {
             let docker_str = String::from_utf8_lossy(&docker_out.stdout);
             for line in docker_str.lines() {
                 let parts: Vec<&str> = line.splitn(2, '|').collect();
-                if parts.len() != 2 { continue; }
+                if parts.len() != 2 {
+                    continue;
+                }
                 let cname = parts[0].trim();
                 let port_section = parts[1];
                 let occupies_port = port_section.split(',').any(|entry| {
                     if let Some(arrow_pos) = entry.find("->") {
                         let host_part = &entry[..arrow_pos];
-                        host_part.rsplit(':').next()
+                        host_part
+                            .rsplit(':')
+                            .next()
                             .and_then(|p| p.trim().parse::<u16>().ok())
                             .map_or(false, |p| p == *target_port)
                     } else {
@@ -1050,7 +1199,12 @@ async fn free_ports_for_unit(unit_name: &str) -> Vec<serde_json::Value> {
                         "container": cname,
                         "method": "docker stop",
                     }));
-                    tracing::info!("Porta {} liberata: fermato container Docker '{}' per avvio {}", target_port, cname, unit_name);
+                    tracing::info!(
+                        "Porta {} liberata: fermato container Docker '{}' per avvio {}",
+                        target_port,
+                        cname,
+                        unit_name
+                    );
                 }
             }
         }
@@ -1068,15 +1222,21 @@ pub(super) fn extract_ports_from_unit(content: &str) -> Vec<u16> {
                 if let Some(val) = segment.split('=').nth(1) {
                     // Porta diretta (es. PORT=5215)
                     if let Ok(p) = val.parse::<u16>() {
-                        if p > 0 { ports.push(p); continue; }
+                        if p > 0 {
+                            ports.push(p);
+                            continue;
+                        }
                     }
                     // URL con porta (es. http://+:5215 o http://0.0.0.0:5215)
                     for part in val.split(';') {
                         if let Some(colon_pos) = part.rfind(':') {
                             let after = &part[colon_pos + 1..];
-                            let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                            let num_str: String =
+                                after.chars().take_while(|c| c.is_ascii_digit()).collect();
                             if let Ok(p) = num_str.parse::<u16>() {
-                                if p > 0 { ports.push(p); }
+                                if p > 0 {
+                                    ports.push(p);
+                                }
                             }
                         }
                     }
@@ -1091,15 +1251,20 @@ pub(super) fn extract_ports_from_unit(content: &str) -> Vec<u16> {
                     && i + 1 < tokens.len()
                 {
                     if let Ok(p) = tokens[i + 1].parse::<u16>() {
-                        if p > 0 { ports.push(p); }
+                        if p > 0 {
+                            ports.push(p);
+                        }
                     }
                 }
                 if *tok == "--urls" && i + 1 < tokens.len() {
                     if let Some(colon_pos) = tokens[i + 1].rfind(':') {
                         let after = &tokens[i + 1][colon_pos + 1..];
-                        let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                        let num_str: String =
+                            after.chars().take_while(|c| c.is_ascii_digit()).collect();
                         if let Ok(p) = num_str.parse::<u16>() {
-                            if p > 0 { ports.push(p); }
+                            if p > 0 {
+                                ports.push(p);
+                            }
                         }
                     }
                 }
@@ -1107,7 +1272,9 @@ pub(super) fn extract_ports_from_unit(content: &str) -> Vec<u16> {
                 if tok.starts_with("--port=") || tok.starts_with("-p=") {
                     if let Some(val) = tok.split('=').nth(1) {
                         if let Ok(p) = val.parse::<u16>() {
-                            if p > 0 { ports.push(p); }
+                            if p > 0 {
+                                ports.push(p);
+                            }
                         }
                     }
                 }
@@ -1132,7 +1299,8 @@ fn diagnose_service_failure(log: &str, _unit: &str, root: &std::path::Path) -> S
 
     // 1. Script npm mancante
     if log_lc.contains("missing script:") {
-        let script = log.lines()
+        let script = log
+            .lines()
             .find(|l| l.to_lowercase().contains("missing script:"))
             .and_then(|l| l.split('"').nth(1))
             .unwrap_or("sconosciuto");
@@ -1162,8 +1330,12 @@ fn diagnose_service_failure(log: &str, _unit: &str, root: &std::path::Path) -> S
     {
         // Verifica se node_modules esiste
         let has_node_modules = root.join("node_modules").exists()
-            || std::fs::read_dir(root).ok()
-                .map(|d| d.flatten().any(|e| e.path().is_dir() && e.path().join("node_modules").exists()))
+            || std::fs::read_dir(root)
+                .ok()
+                .map(|d| {
+                    d.flatten()
+                        .any(|e| e.path().is_dir() && e.path().join("node_modules").exists())
+                })
                 .unwrap_or(false);
         let suggestion = if has_node_modules {
             "Un modulo non e' installato. Esegui 'npm install' o 'pnpm install' nel terminale del progetto."
@@ -1178,7 +1350,9 @@ fn diagnose_service_failure(log: &str, _unit: &str, root: &std::path::Path) -> S
     }
 
     // 4. SDK .NET mancante
-    if log_lc.contains("dotnet") && (log_lc.contains("not found") || log_lc.contains("command not found")) {
+    if log_lc.contains("dotnet")
+        && (log_lc.contains("not found") || log_lc.contains("command not found"))
+    {
         return ServiceDiagnosis {
             error: "Il .NET SDK non e' installato o non e' nel PATH".into(),
             suggestion: "Installa il .NET SDK con 'sudo apt install dotnet-sdk-9.0' oppure usa la versione Docker del servizio.".into(),
@@ -1214,17 +1388,32 @@ fn diagnose_service_failure(log: &str, _unit: &str, root: &std::path::Path) -> S
     }
 
     // 8. Fallback: mostra le ultime righe del log
-    let last_lines: Vec<&str> = log.lines()
+    let last_lines: Vec<&str> = log
+        .lines()
         .filter(|l| {
             let ll = l.to_lowercase();
-            ll.contains("error") || ll.contains("fail") || ll.contains("exception")
-                || ll.contains("fatal") || ll.contains("panic")
+            ll.contains("error")
+                || ll.contains("fail")
+                || ll.contains("exception")
+                || ll.contains("fatal")
+                || ll.contains("panic")
         })
         .collect();
     let error_summary = if last_lines.is_empty() {
-        log.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ")
+        log.lines()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join(" | ")
     } else {
-        last_lines.into_iter().take(3).collect::<Vec<_>>().join(" | ")
+        last_lines
+            .into_iter()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" | ")
     };
 
     ServiceDiagnosis {
@@ -1248,7 +1437,9 @@ async fn get_service_main_pid(unit_name: &str) -> Option<u32> {
     for line in s.lines() {
         if let Some(val) = line.strip_prefix("MainPID=") {
             if let Ok(pid) = val.trim().parse::<u32>() {
-                if pid > 0 { return Some(pid); }
+                if pid > 0 {
+                    return Some(pid);
+                }
             }
         }
     }
@@ -1298,10 +1489,12 @@ pub async fn create_port_allocation(
     let project_id = Uuid::parse_str(&id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
 
-    let port = body["port"]
-        .as_u64()
-        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Campo 'port' obbligatorio (numero)"))?
-        as u16;
+    let port = body["port"].as_u64().ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "Campo 'port' obbligatorio (numero)",
+        )
+    })? as u16;
 
     // Validazione range
     if port < 1024 {
@@ -1475,11 +1668,9 @@ pub async fn detect_all_port_bindings(db: &sqlx::PgPool) -> Result<Vec<PortBindi
     //    `ss -tlnp` via tokio::process (async). Fallback: /proc/net/tcp via spawn_blocking.
     let listening = match read_listening_ports_ss().await {
         Ok(v) => v,
-        Err(_) => {
-            tokio::task::spawn_blocking(read_listening_ports_proc)
-                .await
-                .unwrap_or_default()
-        }
+        Err(_) => tokio::task::spawn_blocking(read_listening_ports_proc)
+            .await
+            .unwrap_or_default(),
     };
 
     if listening.is_empty() {
@@ -1508,11 +1699,9 @@ pub async fn detect_all_port_bindings(db: &sqlx::PgPool) -> Result<Vec<PortBindi
     // 3. Espandi con discendenti: scan /proc sincrono, spostato su spawn_blocking
     //    per non bloccare il runtime tokio (fix: freeze mcp-core su molti processi).
     let known_pids: Vec<u32> = pid_to_project.keys().copied().collect();
-    let children = tokio::task::spawn_blocking(move || {
-        build_children_map(&known_pids)
-    })
-    .await
-    .unwrap_or_default();
+    let children = tokio::task::spawn_blocking(move || build_children_map(&known_pids))
+        .await
+        .unwrap_or_default();
 
     // BFS: propaga project_id dai PID noti ai discendenti
     let root_pids: Vec<u32> = pid_to_project.keys().copied().collect();
@@ -1626,8 +1815,7 @@ fn scan_proc_children_and_cwd(
     std::collections::HashMap<u32, Vec<u32>>,
     std::collections::HashSet<u32>,
 ) {
-    let mut children: std::collections::HashMap<u32, Vec<u32>> =
-        std::collections::HashMap::new();
+    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
     let mut cwd_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let proc_dir = match std::fs::read_dir("/proc") {
         Ok(d) => d,
@@ -1666,11 +1854,8 @@ fn scan_proc_children_and_cwd(
 
 /// Filtra solo i PID che sono discendenti dei `known_pids` per ridurre
 /// le letture inutili.
-fn build_children_map(
-    _known_pids: &[u32],
-) -> std::collections::HashMap<u32, Vec<u32>> {
-    let mut children: std::collections::HashMap<u32, Vec<u32>> =
-        std::collections::HashMap::new();
+fn build_children_map(_known_pids: &[u32]) -> std::collections::HashMap<u32, Vec<u32>> {
+    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
     let proc_dir = match std::fs::read_dir("/proc") {
         Ok(d) => d,
         Err(_) => return children,

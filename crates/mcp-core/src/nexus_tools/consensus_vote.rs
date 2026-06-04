@@ -48,7 +48,9 @@ impl NexusToolHandler for ConsensusVoteTool {
             .ok_or_else(|| NexusToolError::BadInput("votes array required".into()))?;
 
         if votes_raw.is_empty() {
-            return Err(NexusToolError::BadInput("votes array must be non-empty".into()));
+            return Err(NexusToolError::BadInput(
+                "votes array must be non-empty".into(),
+            ));
         }
 
         let mut votes: Vec<Vote> = Vec::with_capacity(votes_raw.len());
@@ -61,11 +63,11 @@ impl NexusToolHandler for ConsensusVoteTool {
                 .get("approve")
                 .and_then(Value::as_bool)
                 .ok_or_else(|| NexusToolError::BadInput(format!("votes[{}].approve missing", i)))?;
-            let confidence = v
-                .get("confidence")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0) as f32;
-            let reason = v.get("reason").and_then(Value::as_str).map(|s| s.to_string());
+            let confidence = v.get("confidence").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+            let reason = v
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
 
             let mut vote = if approve {
                 Vote::approve(agent.to_string(), confidence)
@@ -151,11 +153,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_simple_majority_approved() {
-        let ctx = NexusToolContext::new(
-            std::env::temp_dir(),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-        );
+        let ctx = NexusToolContext::new(std::env::temp_dir(), uuid::Uuid::nil(), uuid::Uuid::nil());
         let out = ConsensusVoteTool
             .execute(
                 &ctx,
@@ -177,11 +175,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unanimous_rejected() {
-        let ctx = NexusToolContext::new(
-            std::env::temp_dir(),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-        );
+        let ctx = NexusToolContext::new(std::env::temp_dir(), uuid::Uuid::nil(), uuid::Uuid::nil());
         let out = ConsensusVoteTool
             .execute(
                 &ctx,
@@ -200,11 +194,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bad_strategy() {
-        let ctx = NexusToolContext::new(
-            std::env::temp_dir(),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-        );
+        let ctx = NexusToolContext::new(std::env::temp_dir(), uuid::Uuid::nil(), uuid::Uuid::nil());
         let res = ConsensusVoteTool
             .execute(
                 &ctx,

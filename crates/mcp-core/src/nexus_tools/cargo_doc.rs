@@ -12,11 +12,7 @@ pub struct CargoDocTool;
 
 #[async_trait]
 impl NexusToolHandler for CargoDocTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let private_items = args
             .get("private_items")
             .and_then(Value::as_bool)
@@ -31,7 +27,13 @@ impl NexusToolHandler for CargoDocTool {
             cmd_args.push("--document-private-items");
         }
 
-        let out = run_cmd("cargo", &cmd_args, &ctx.project_root, ctx.timeout_secs.max(300)).await?;
+        let out = run_cmd(
+            "cargo",
+            &cmd_args,
+            &ctx.project_root,
+            ctx.timeout_secs.max(300),
+        )
+        .await?;
 
         // Conta gli .html generati in target/doc se esiste
         let doc_dir = ctx.project_root.join("target").join("doc");

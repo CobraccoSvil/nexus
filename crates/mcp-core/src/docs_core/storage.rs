@@ -314,16 +314,14 @@ async fn rewrite_vault_file(
     // 2) Risolvi il root del vault (meta = fisso da settings; project = DB).
     let vault_root = match scope {
         DocScope::Meta => Some(crate::meta_docs::apply::resolve_vault_root(state).await),
-        DocScope::Project(pid) => {
-            sqlx::query_scalar::<_, String>(
-                "SELECT repository_root_path FROM projects WHERE id = $1",
-            )
-            .bind(pid)
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten()
-        }
+        DocScope::Project(pid) => sqlx::query_scalar::<_, String>(
+            "SELECT repository_root_path FROM projects WHERE id = $1",
+        )
+        .bind(pid)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten(),
     };
 
     // 3) Scrivi su disco (best-effort) e aggiorna vault_file_hash nel DB.

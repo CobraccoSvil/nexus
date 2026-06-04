@@ -23,11 +23,7 @@ fn count_bench_lines(stdout: &str) -> usize {
 
 #[async_trait]
 impl NexusToolHandler for BenchRunTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let filter = args.get("filter").and_then(Value::as_str).map(String::from);
 
         let cargo_toml = ctx.project_root.join("Cargo.toml");

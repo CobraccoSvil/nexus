@@ -8,8 +8,15 @@ pub struct CaStructCountTool;
 
 #[async_trait]
 impl NexusToolHandler for CaStructCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
-        let (counts, files) = scan_substrings(&ctx.project_root, &["struct ", "pub struct ", "pub(crate) struct "]);
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
+        let (counts, files) = scan_substrings(
+            &ctx.project_root,
+            &["struct ", "pub struct ", "pub(crate) struct "],
+        );
         Ok(json!({
             "ok": true,
             "files_scanned": files,
@@ -18,5 +25,7 @@ impl NexusToolHandler for CaStructCountTool {
             "pub_crate_struct": counts[2],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

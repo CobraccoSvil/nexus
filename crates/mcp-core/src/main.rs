@@ -1,82 +1,82 @@
-mod agent_processes;
-mod agent_types;
-mod claude_agents;
-mod brain_agent_client;
-mod dlp;
-mod provider_cooldown;
-mod models;
-mod sandbox;
-mod security;
-mod agent_tools;
 mod admin;
+mod agent_processes;
+mod agent_router_server;
+mod agent_todos_routes;
+mod agent_tools;
+mod agent_types;
 mod auth;
 mod billing;
+mod brain_agent_client;
 mod cache;
+mod catalog_sync_worker;
+mod change_drafts;
 mod chat_agent;
 mod chat_attachments;
 mod chat_learning;
 mod chat_messages;
 mod chat_sessions;
+mod claude_agents;
+mod context_settings;
 mod db;
+mod deepseek_balance_sync;
+mod dispatcher_routes;
+mod dlp;
+mod docs_core;
+mod documents;
 mod domain;
+mod environment;
 mod github;
+mod internal_learning;
+mod internal_routing;
+mod knowledge;
+mod knowledge_watcher;
+mod knowledge_workers;
+mod long_running;
 mod mcp_client;
 mod mcp_connectors;
-mod nexus_builtin;
+mod meta_docs;
+mod meta_docs_watcher;
+mod meta_docs_workers;
+mod middleware;
+mod model_catalog_sync;
+mod model_health_probe;
+mod models;
+mod nexus_autofix_worker;
 mod nexus_bridge;
+mod nexus_builtin;
+mod nexus_database_stats;
 mod nexus_gateway;
 mod nexus_routing;
 mod nexus_tool_catalog;
 mod nexus_tools;
-mod middleware;
 mod orchestrator;
 pub mod playwright_live;
-mod routing_config;
-mod routing_matrix;
-mod routing_slots;
+mod plugins;
+mod port_registry;
+mod profiles;
+mod project_context;
+mod project_db;
+mod project_db_routes;
 mod project_files;
 mod project_git;
 mod project_workspace;
 mod projects;
-mod plugins;
-mod profiles;
-mod long_running;
 mod prompt_templates;
-mod documents;
-mod environment;
-mod settings;
-mod context_settings;
-mod vector_memory;
-mod docs_core;
-mod knowledge;
-mod agent_todos_routes;
-mod project_context;
-mod quality_guard;
-mod project_db;
-mod project_db_routes;
-mod tool_runner_server;
-mod agent_router_server;
-mod nexus_database_stats;
-mod internal_routing;
-mod internal_learning;
-mod port_registry;
+mod provider_cooldown;
 mod provider_health_probe;
-mod model_health_probe;
-mod model_catalog_sync;
-mod catalog_sync_worker;
-mod deepseek_balance_sync;
-mod routing_matrix_auto_promoter;
-mod dispatcher_routes;
-mod services_watchdog;
-mod task_watchdog;
-mod knowledge_workers;
-mod knowledge_watcher;
-mod meta_docs;
-mod meta_docs_watcher;
-mod meta_docs_workers;
-mod change_drafts;
-mod nexus_autofix_worker;
+mod quality_guard;
 mod rag;
+mod routing_config;
+mod routing_matrix;
+mod routing_matrix_auto_promoter;
+mod routing_slots;
+mod sandbox;
+mod security;
+mod services_watchdog;
+mod settings;
+mod task_watchdog;
+mod tool_runner_server;
+mod vector_memory;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -155,7 +155,11 @@ struct AppState {
     /// Mappa monitor in-memory per project_id. Aggiornata dal tool agente
     /// `dispatcher_update_monitor` ed esposta nel snapshot bootstrap.
     /// `monitor_id -> { value, label }`.
-    pub(crate) monitor_registry: Arc<parking_lot::RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, serde_json::Value>>>>,
+    pub(crate) monitor_registry: Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<Uuid, std::collections::HashMap<String, serde_json::Value>>,
+        >,
+    >,
 }
 
 #[tokio::main(worker_threads = 32)]
@@ -206,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
     {
         use sqlx::Row;
         let stale = sqlx::query(
-            "SELECT id, pid FROM agent_processes WHERE status IN ('running', 'starting')"
+            "SELECT id, pid FROM agent_processes WHERE status IN ('running', 'starting')",
         )
         .fetch_all(&db)
         .await
@@ -227,14 +231,18 @@ async fn main() -> anyhow::Result<()> {
 
             if !still_alive {
                 let _ = sqlx::query(
-                    "UPDATE agent_processes SET status='failed', stopped_at=NOW() WHERE id=$1"
+                    "UPDATE agent_processes SET status='failed', stopped_at=NOW() WHERE id=$1",
                 )
                 .bind(id)
                 .execute(&db)
                 .await;
                 tracing::info!("Stale process {} (pid={:?}) marked failed", id, pid);
             } else {
-                tracing::info!("Process {} (pid={:?}) still running, re-attaching monitor", id, pid);
+                tracing::info!(
+                    "Process {} (pid={:?}) still running, re-attaching monitor",
+                    id,
+                    pid
+                );
                 // still_alive=true implica pid.is_some(); difensivamente saltiamo
                 // la re-attach se la condizione viene violata in futuro.
                 let Some(pid_val) = pid else {
@@ -247,7 +255,13 @@ async fn main() -> anyhow::Result<()> {
                     let stdout_path = format!("/proc/{}/fd/1", pid_val);
                     let stderr_path = format!("/proc/{}/fd/2", pid_val);
                     let mut child = match tokio::process::Command::new("tail")
-                        .args(["-f", "--pid", &pid_val.to_string(), &stdout_path, &stderr_path])
+                        .args([
+                            "-f",
+                            "--pid",
+                            &pid_val.to_string(),
+                            &stdout_path,
+                            &stderr_path,
+                        ])
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::null())
                         .spawn()
@@ -267,7 +281,13 @@ async fn main() -> anyhow::Result<()> {
                                     .unwrap_or(false);
                                 if !alive {
                                     let exit_code: Option<i32> = tokio::process::Command::new("sh")
-                                        .args(["-c", &format!("cat /proc/{}/status 2>/dev/null | grep -c VmPeak", pid_val)])
+                                        .args([
+                                            "-c",
+                                            &format!(
+                                                "cat /proc/{}/status 2>/dev/null | grep -c VmPeak",
+                                                pid_val
+                                            ),
+                                        ])
                                         .output()
                                         .await
                                         .ok()
@@ -293,7 +313,8 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(stdout) = stdout {
                         let mut lines = tokio::io::BufReader::new(stdout).lines();
                         let mut buf = String::new();
-                        let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                        let mut flush_tick =
+                            tokio::time::interval(std::time::Duration::from_secs(2));
                         loop {
                             tokio::select! {
                                 line = lines.next_line() => {
@@ -445,9 +466,11 @@ async fn main() -> anyhow::Result<()> {
                         if let Ok(until_ts) = ts_str.parse::<u64>() {
                             if until_ts > now_ts {
                                 let remaining = until_ts - now_ts;
-                                let provider = key.strip_prefix("nexus:billing_cooldown:")
-                                    .unwrap_or(&key);
-                                crate::provider_cooldown::restore_cooldown(provider, remaining, reason);
+                                let provider =
+                                    key.strip_prefix("nexus:billing_cooldown:").unwrap_or(&key);
+                                crate::provider_cooldown::restore_cooldown(
+                                    provider, remaining, reason,
+                                );
                             }
                         }
                     }
@@ -606,8 +629,16 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         sandbox = sandbox_available,
         "Sandbox Docker {}: ogni processo agente sarà {}",
-        if sandbox_available { "attiva" } else { "non disponibile" },
-        if sandbox_available { "isolato in container nexus-sandbox" } else { "eseguito con env filtrato (fallback)" }
+        if sandbox_available {
+            "attiva"
+        } else {
+            "non disponibile"
+        },
+        if sandbox_available {
+            "isolato in container nexus-sandbox"
+        } else {
+            "eseguito con env filtrato (fallback)"
+        }
     );
 
     let state = AppState {
@@ -699,24 +730,44 @@ async fn main() -> anyhow::Result<()> {
     // Indirizzo ToolRunner: env var (override emergenza) > DB > hardcoded.
     let tool_runner_addr_str = std::env::var("TOOL_RUNNER_ADDR")
         .ok()
-        .or_else(|| s_tool_runner_addr.ok().flatten().map(|v| v.trim().to_string()))
+        .or_else(|| {
+            s_tool_runner_addr
+                .ok()
+                .flatten()
+                .map(|v| v.trim().to_string())
+        })
         .unwrap_or_else(|| "127.0.0.1:50071".to_string());
 
     // Inizializza il flag AtomicBool per il classificatore LLM.
-    let llm_classifier_db = s_llm_classifier.ok().flatten()
-        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+    let llm_classifier_db = s_llm_classifier
+        .ok()
+        .flatten()
+        .map(|v| {
+            !matches!(
+                v.trim().to_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(true);
     crate::orchestrator::set_llm_classifier_enabled(llm_classifier_db);
     tracing::info!(
         "llm_classifier_enabled: {} (fonte: DB{})",
         llm_classifier_db,
-        if std::env::var("NEXUS_LLM_CLASSIFIER_ENABLED").is_ok() { " + env override attivo" } else { "" }
+        if std::env::var("NEXUS_LLM_CLASSIFIER_ENABLED").is_ok() {
+            " + env override attivo"
+        } else {
+            ""
+        }
     );
 
     // Inizializza la configurazione HTTP globale (timeout, pool) dal DB.
-    let http_timeout = s_http_timeout.ok().flatten()
+    let http_timeout = s_http_timeout
+        .ok()
+        .flatten()
         .and_then(|v| v.trim().parse::<u64>().ok());
-    let http_pool = s_http_pool.ok().flatten()
+    let http_pool = s_http_pool
+        .ok()
+        .flatten()
         .and_then(|v| v.trim().parse::<usize>().ok());
     nexus_http::init_global_config(http_timeout, http_pool);
 
@@ -731,12 +782,22 @@ async fn main() -> anyhow::Result<()> {
             opt.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(d)
         };
         let p_usize = |opt: Option<String>, d: usize| -> usize {
-            opt.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(d)
+            opt.and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(d)
         };
         let (
-            s_recov_interval, s_recov_probe_to, s_cd_default, s_cd_min, s_cd_max,
-            s_cd_long, s_cb_window, s_cb_threshold, s_cb_ext, s_probe_to,
-            s_slow_cd, s_outage,
+            s_recov_interval,
+            s_recov_probe_to,
+            s_cd_default,
+            s_cd_min,
+            s_cd_max,
+            s_cd_long,
+            s_cb_window,
+            s_cb_threshold,
+            s_cb_ext,
+            s_probe_to,
+            s_slow_cd,
+            s_outage,
         ) = tokio::join!(
             settings::get_setting(&state.db, "provider.billing_recovery_interval_s"),
             settings::get_setting(&state.db, "provider.recovery_probe_timeout_s"),
@@ -751,15 +812,26 @@ async fn main() -> anyhow::Result<()> {
             settings::get_setting(&state.db, "provider.slow_cooldown_s"),
             settings::get_setting(&state.db, "provider.outage_threshold"),
         );
-        pht.billing_recovery_interval_s = p_u64(s_recov_interval.ok().flatten(), pht.billing_recovery_interval_s);
-        pht.recovery_probe_timeout_s = p_u64(s_recov_probe_to.ok().flatten(), pht.recovery_probe_timeout_s);
+        pht.billing_recovery_interval_s = p_u64(
+            s_recov_interval.ok().flatten(),
+            pht.billing_recovery_interval_s,
+        );
+        pht.recovery_probe_timeout_s = p_u64(
+            s_recov_probe_to.ok().flatten(),
+            pht.recovery_probe_timeout_s,
+        );
         pht.cooldown_default_s = p_u64(s_cd_default.ok().flatten(), pht.cooldown_default_s);
         pht.cooldown_min_s = p_u64(s_cd_min.ok().flatten(), pht.cooldown_min_s);
         pht.cooldown_max_s = p_u64(s_cd_max.ok().flatten(), pht.cooldown_max_s);
         pht.cooldown_long_s = p_u64(s_cd_long.ok().flatten(), pht.cooldown_long_s);
-        pht.circuit_breaker_window_s = p_u64(s_cb_window.ok().flatten(), pht.circuit_breaker_window_s);
-        pht.circuit_breaker_threshold = p_usize(s_cb_threshold.ok().flatten(), pht.circuit_breaker_threshold);
-        pht.circuit_breaker_extended_cooldown_s = p_u64(s_cb_ext.ok().flatten(), pht.circuit_breaker_extended_cooldown_s);
+        pht.circuit_breaker_window_s =
+            p_u64(s_cb_window.ok().flatten(), pht.circuit_breaker_window_s);
+        pht.circuit_breaker_threshold =
+            p_usize(s_cb_threshold.ok().flatten(), pht.circuit_breaker_threshold);
+        pht.circuit_breaker_extended_cooldown_s = p_u64(
+            s_cb_ext.ok().flatten(),
+            pht.circuit_breaker_extended_cooldown_s,
+        );
         pht.health_probe_timeout_s = p_u64(s_probe_to.ok().flatten(), pht.health_probe_timeout_s);
         pht.slow_cooldown_s = p_u64(s_slow_cd.ok().flatten(), pht.slow_cooldown_s);
         pht.outage_threshold = p_usize(s_outage.ok().flatten(), pht.outage_threshold);
@@ -776,7 +848,12 @@ async fn main() -> anyhow::Result<()> {
         let orch_billing = std::sync::Arc::new(state.orchestrator.clone());
         let recov_interval = pht.billing_recovery_interval_s;
         tokio::spawn(async move {
-            provider_cooldown::billing_cooldown_recovery_loop(orch_billing, db_billing, recov_interval).await;
+            provider_cooldown::billing_cooldown_recovery_loop(
+                orch_billing,
+                db_billing,
+                recov_interval,
+            )
+            .await;
         });
     }
 
@@ -784,10 +861,19 @@ async fn main() -> anyhow::Result<()> {
     // per rilevare cooldown / quota esaurita PRIMA del primo errore utente.
     // Valore canonico: settings.provider_health_probe_enabled/interval_s nel DB.
     // Override emergenza: NEXUS_PROVIDER_HEALTH_PROBE_ENABLED, NEXUS_PROVIDER_HEALTH_PROBE_INTERVAL_S.
-    let probe_enabled = s_health_probe_enabled.ok().flatten()
-        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+    let probe_enabled = s_health_probe_enabled
+        .ok()
+        .flatten()
+        .map(|v| {
+            !matches!(
+                v.trim().to_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(true);
-    let probe_interval = s_health_probe_interval.ok().flatten()
+    let probe_interval = s_health_probe_interval
+        .ok()
+        .flatten()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(300);
     provider_health_probe::spawn_health_probe(
@@ -816,10 +902,19 @@ async fn main() -> anyhow::Result<()> {
     // Worker `catalog_sync`: aggiorna periodicamente ai_price_catalog dal
     // JSON LiteLLM. Cadenza configurabile via settings.model_catalog_sync_interval_s
     // (default 12h, minimo 1h). Disabilitabile via settings.model_catalog_sync_enabled.
-    let catalog_sync_enabled = s_catalog_sync_enabled.ok().flatten()
-        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+    let catalog_sync_enabled = s_catalog_sync_enabled
+        .ok()
+        .flatten()
+        .map(|v| {
+            !matches!(
+                v.trim().to_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(true);
-    let catalog_sync_interval = s_catalog_sync_interval.ok().flatten()
+    let catalog_sync_interval = s_catalog_sync_interval
+        .ok()
+        .flatten()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(43200);
     catalog_sync_worker::spawn_catalog_sync_worker(
@@ -832,13 +927,24 @@ async fn main() -> anyhow::Result<()> {
     // per rilevare modelli broken model-specific (model_not_found, hollow_completion,
     // unsupported, ecc.). Auto-disable dopo N fallimenti consecutivi
     // (settings.model_health_probe_failure_threshold, default 3).
-    let model_probe_enabled = s_model_health_enabled.ok().flatten()
-        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+    let model_probe_enabled = s_model_health_enabled
+        .ok()
+        .flatten()
+        .map(|v| {
+            !matches!(
+                v.trim().to_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(true);
-    let model_probe_interval = s_model_health_interval.ok().flatten()
+    let model_probe_interval = s_model_health_interval
+        .ok()
+        .flatten()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(1800);
-    let model_probe_threshold = s_model_health_threshold.ok().flatten()
+    let model_probe_threshold = s_model_health_threshold
+        .ok()
+        .flatten()
         .and_then(|v| v.trim().parse::<i32>().ok())
         .unwrap_or(3);
     model_health_probe::spawn_model_health_probe(
@@ -852,11 +958,7 @@ async fn main() -> anyhow::Result<()> {
     // Worker `deepseek_balance_sync`: DeepSeek e' l'unico provider con
     // endpoint pubblico /user/balance. Sincronizza provider_budget_status
     // con il dato reale ogni 15 min (default).
-    deepseek_balance_sync::spawn_deepseek_balance_sync(
-        state.db.clone(),
-        true,
-        900,
-    );
+    deepseek_balance_sync::spawn_deepseek_balance_sync(state.db.clone(), true, 900);
 
     // Worker `routing_matrix_auto_promoter`: ricostruisce le righe della
     // routing matrix dal catalog modelli ogni 6h (default), promuovendo i
@@ -874,7 +976,12 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .flatten();
     let ap_enabled = auto_promote_enabled
-        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .map(|v| {
+            !matches!(
+                v.trim().to_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(true);
     let ap_interval = auto_promote_interval
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -926,11 +1033,14 @@ async fn main() -> anyhow::Result<()> {
     // Override emergenza: ENABLE_TOOL_RUNNER=1 (priorita' piu' alta del DB).
     {
         let env_override = std::env::var("ENABLE_TOOL_RUNNER").ok().as_deref() == Some("1");
-        let db_enabled = s_tool_runner.ok().flatten()
+        let db_enabled = s_tool_runner
+            .ok()
+            .flatten()
             .map(|v| v.trim().eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         if env_override || db_enabled {
-            let addr: SocketAddr = tool_runner_addr_str.parse()
+            let addr: SocketAddr = tool_runner_addr_str
+                .parse()
                 .expect("tool_runner_addr (DB o env TOOL_RUNNER_ADDR) non valido");
             let deps = tool_runner_server::ToolRunnerDeps {
                 db: state.db.clone(),
@@ -967,12 +1077,16 @@ async fn main() -> anyhow::Result<()> {
         if env_override || db_enabled {
             // Indirizzo: env var (override emergenza) > DB (canonico) > hardcoded.
             let db_agent_addr = settings::get_setting(&state.db, "agent_router_addr")
-                .await.ok().flatten().map(|v| v.trim().to_string());
+                .await
+                .ok()
+                .flatten()
+                .map(|v| v.trim().to_string());
             let agent_router_addr_str = std::env::var("AGENT_ROUTER_ADDR")
                 .ok()
                 .or(db_agent_addr)
                 .unwrap_or_else(|| "127.0.0.1:50501".to_string());
-            let addr: SocketAddr = agent_router_addr_str.parse()
+            let addr: SocketAddr = agent_router_addr_str
+                .parse()
                 .expect("agent_router_addr (DB o env AGENT_ROUTER_ADDR) non valido");
             if let Err(e) = agent_router_server::spawn_agent_router_server(addr).await {
                 tracing::error!("AgentRouter server: avvio fallito: {e}");
@@ -987,7 +1101,13 @@ async fn main() -> anyhow::Result<()> {
 
     let cors = CorsLayer::new()
         .allow_origin(frontend_origin.parse::<HeaderValue>().unwrap())
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::PATCH])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::PATCH,
+        ])
         .allow_headers([
             http_header::CONTENT_TYPE,
             http_header::AUTHORIZATION,
@@ -1007,8 +1127,14 @@ async fn main() -> anyhow::Result<()> {
             .route("/nexus/stats", get(nexus_bridge::nexus_stats))
             .route("/nexus/tools", get(nexus_bridge::nexus_tools))
             .route("/nexus/metrics", get(nexus_bridge::nexus_prometheus))
-            .route("/nexus/test-routing", post(nexus_bridge::nexus_test_routing))
-            .route("/api/embedder-status", get(nexus_bridge::nexus_embedder_status))
+            .route(
+                "/nexus/test-routing",
+                post(nexus_bridge::nexus_test_routing),
+            )
+            .route(
+                "/api/embedder-status",
+                get(nexus_bridge::nexus_embedder_status),
+            )
             .route("/auth/github", get(auth::github_login))
             .route("/auth/github/callback", get(auth::github_callback))
             .route(
@@ -1348,11 +1474,10 @@ async fn main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/projects/:id/default-profile",
-                patch(projects::patch_project_default_profile)
-                    .layer(axum_mw::from_fn_with_state(
-                        state.clone(),
-                        middleware::require_auth,
-                    )),
+                patch(projects::patch_project_default_profile).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
             )
             .route(
                 "/api/projects/:id/quality-scan",
@@ -1468,17 +1593,15 @@ async fn main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/projects/:id/agent-processes/clear-finished",
-                post(project_workspace::clear_finished_processes).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                post(project_workspace::clear_finished_processes).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/agent-processes/:process_id/stream",
-                get(project_workspace::stream_agent_process_logs).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                get(project_workspace::stream_agent_process_logs).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/open",
@@ -1489,11 +1612,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/projects/:id/services/install-playwright",
-                post(project_workspace::playwright_install::install_playwright)
-                    .layer(axum_mw::from_fn_with_state(
-                        state.clone(),
-                        middleware::require_auth,
-                    )),
+                post(project_workspace::playwright_install::install_playwright).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/workbench-state",
@@ -1506,10 +1627,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/projects/:id/terminal/session",
-                post(project_workspace::create_terminal_session).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                post(project_workspace::create_terminal_session).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/preferences/git-ui",
@@ -1588,17 +1708,15 @@ async fn main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/projects/:id/db/migrations/apply",
-                post(project_db_routes::apply_project_migrations).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                post(project_db_routes::apply_project_migrations).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/db/migrations/rollback",
-                post(project_db_routes::rollback_project_migration).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                post(project_db_routes::rollback_project_migration).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/db/override-request",
@@ -1616,10 +1734,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/projects/:id/db/test-connection",
-                post(project_db_routes::test_project_db_connection).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                post(project_db_routes::test_project_db_connection).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/db/provision",
@@ -1630,10 +1747,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/projects/:id/db/connections",
-                get(project_db_routes::list_project_db_connections).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                get(project_db_routes::list_project_db_connections).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/db/connections/:conn_id/set-primary",
@@ -1778,17 +1894,15 @@ async fn main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/projects/:id/knowledge/extract-functional",
-                post(knowledge::routes::extract_functional_handler).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                post(knowledge::routes::extract_functional_handler).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/knowledge/init-or-refresh",
-                post(knowledge::routes::init_or_refresh_knowledge).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                post(knowledge::routes::init_or_refresh_knowledge).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/knowledge/notes/manual",
@@ -1902,7 +2016,10 @@ async fn main() -> anyhow::Result<()> {
                 "/api/change-drafts",
                 post(change_drafts::create_draft)
                     .get(change_drafts::list_drafts)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_auth)),
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_auth,
+                    )),
             )
             .route(
                 "/api/change-drafts/:id",
@@ -1989,17 +2106,15 @@ async fn main() -> anyhow::Result<()> {
             // matchit dà priorità al segmento statico "proxy" su "/:action" parametrico.
             .route(
                 "/api/projects/:id/services/:service/:action",
-                post(project_workspace::control_project_service).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                post(project_workspace::control_project_service).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/services",
-                get(project_workspace::get_project_services_status).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                get(project_workspace::get_project_services_status).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/services/wizard/detect",
@@ -2017,10 +2132,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/projects/:id/services/restart-all",
-                post(project_workspace::restart_all_project_services).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                post(project_workspace::restart_all_project_services).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/services/cleanup-ports",
@@ -2038,24 +2152,21 @@ async fn main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/projects/:id/services/kill-orphan-processes",
-                post(project_workspace::kill_project_orphan_processes).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                post(project_workspace::kill_project_orphan_processes).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/services/kill-port-process",
-                post(project_workspace::kill_project_port_process).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                post(project_workspace::kill_project_port_process).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/services/:service",
-                axum::routing::delete(project_workspace::uninstall_project_service).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                axum::routing::delete(project_workspace::uninstall_project_service).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/changes",
@@ -2082,10 +2193,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/projects/:id/port-allocations/:port",
-                axum::routing::delete(project_workspace::delete_port_allocation).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                axum::routing::delete(project_workspace::delete_port_allocation).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             // ── Esecuzione comandi dalla chat ─────────────────────────────────
             .route(
@@ -2127,10 +2237,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/projects/:id/playwright/runs/:run_id",
-                get(project_workspace::get_playwright_run_detail).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                get(project_workspace::get_playwright_run_detail).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/projects/:id/playwright/runs/:run_id/stream",
@@ -2357,23 +2466,33 @@ async fn main() -> anyhow::Result<()> {
                 "/api/profiles",
                 get(profiles::list_profiles)
                     .post(profiles::create_profile)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_auth)),
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_auth,
+                    )),
             )
             .route(
                 "/api/profiles/:id",
                 put(profiles::update_profile)
                     .delete(profiles::delete_profile)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_auth)),
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_auth,
+                    )),
             )
             .route(
                 "/api/profiles/:id/default",
-                post(profiles::set_default_profile)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_auth)),
+                post(profiles::set_default_profile).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
             )
             .route(
                 "/api/profiles/:id/fork",
-                post(profiles::fork_profile)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_auth)),
+                post(profiles::fork_profile).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
             )
             // Plugin Manager (MCP-first)
             .route(
@@ -2489,12 +2608,19 @@ async fn main() -> anyhow::Result<()> {
             // Utile per onboarding (popola subito catalog) e test E2E (no attesa interval).
             .route(
                 "/api/admin/catalog-sync",
-                axum::routing::post(|axum::extract::State(s): axum::extract::State<AppState>| async move {
-                    match model_catalog_sync::trigger_sync_now(&s.db, Some(&s.orchestrator)).await {
-                        Ok(summary) => axum::Json(serde_json::json!({"ok": true, "summary": summary})),
-                        Err(e) => axum::Json(serde_json::json!({"ok": false, "error": e})),
-                    }
-                }).layer(axum_mw::from_fn_with_state(
+                axum::routing::post(
+                    |axum::extract::State(s): axum::extract::State<AppState>| async move {
+                        match model_catalog_sync::trigger_sync_now(&s.db, Some(&s.orchestrator))
+                            .await
+                        {
+                            Ok(summary) => {
+                                axum::Json(serde_json::json!({"ok": true, "summary": summary}))
+                            }
+                            Err(e) => axum::Json(serde_json::json!({"ok": false, "error": e})),
+                        }
+                    },
+                )
+                .layer(axum_mw::from_fn_with_state(
                     state.clone(),
                     middleware::require_admin,
                 )),
@@ -2565,19 +2691,27 @@ async fn main() -> anyhow::Result<()> {
                 "/api/admin/profiles",
                 get(profiles::admin_list_profiles)
                     .post(profiles::admin_create_profile)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_admin,
+                    )),
             )
             .route(
                 "/api/admin/profiles/:id",
                 put(profiles::admin_update_profile)
                     .delete(profiles::admin_delete_profile)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_admin,
+                    )),
             )
             // Admin — profili custom degli utenti (read-only)
             .route(
                 "/api/admin/user-profiles",
-                get(profiles::admin_list_user_profiles)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                get(profiles::admin_list_user_profiles).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/feedback/errors",
@@ -2641,165 +2775,227 @@ async fn main() -> anyhow::Result<()> {
                 "/api/admin/long-running",
                 get(long_running::list_patterns)
                     .post(long_running::create_pattern)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_admin,
+                    )),
             )
             .route(
                 "/api/admin/long-running/:id",
                 put(long_running::update_pattern)
                     .delete(long_running::delete_pattern)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_admin,
+                    )),
             )
             .route(
                 "/api/admin/sync-model-catalog",
-                post(models::sync_model_catalog)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                post(models::sync_model_catalog).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/probe-models",
-                post(models::probe_models_now)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                post(models::probe_models_now).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             // Admin users management
             .route(
                 "/api/admin/users",
-                get(admin::users::list_users)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                get(admin::users::list_users).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/users/search",
-                get(admin::users::search_users)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                get(admin::users::search_users).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/users/:user_id",
                 get(admin::users::get_user)
                     .put(admin::users::update_user)
                     .delete(admin::users::delete_user)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_admin,
+                    )),
             )
             .route(
                 "/api/admin/users/:user_id/role",
-                put(admin::users::update_user_role)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                put(admin::users::update_user_role).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             // Admin projects management
             .route(
                 "/api/admin/projects",
-                get(admin::projects::list_all_projects)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                get(admin::projects::list_all_projects).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/projects/port",
-                post(admin::projects::port_projects)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                post(admin::projects::port_projects).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/projects/:project_id/members",
                 get(admin::projects::list_project_members)
                     .post(admin::projects::add_project_member)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_admin,
+                    )),
             )
             .route(
                 "/api/admin/projects/:project_id/members/:user_id",
                 put(admin::projects::update_project_member)
                     .delete(admin::projects::remove_project_member)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_admin,
+                    )),
             )
             // Environment status & fix
             .route(
                 "/api/admin/environment/status",
-                get(environment::get_environment_status)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                get(environment::get_environment_status).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/environment/fix",
-                post(environment::fix_environment)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                post(environment::fix_environment).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/qdrant-health",
-                get(environment::qdrant_health_handler)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                get(environment::qdrant_health_handler).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/watchdog-status",
-                get(task_watchdog::watchdog_status_handler)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                get(task_watchdog::watchdog_status_handler).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/embeddings/validate",
-                post(environment::embeddings_validate_handler)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                post(environment::embeddings_validate_handler).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/embeddings/apply",
-                post(environment::embeddings_apply_handler)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                post(environment::embeddings_apply_handler).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             // Admin — purpose models (nexus_purpose_model)
             .route(
                 "/api/admin/routing/purpose-models",
-                get(admin::routing::list_purpose_models)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                get(admin::routing::list_purpose_models).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/routing/purpose-model/:purpose",
-                put(admin::routing::update_purpose_model)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                put(admin::routing::update_purpose_model).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/gateway/providers",
-                get(environment::gateway_providers_handler)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                get(environment::gateway_providers_handler).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/gateway/reload",
-                post(environment::gateway_reload_handler)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                post(environment::gateway_reload_handler).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             // Retrocompatibilità: percorsi /api/admin/gateway/* per il frontend vecchio
             // (rimosso dopo che il frontend sarà stato ridistribuito con i nuovi percorsi)
             .route(
                 "/api/admin/gateway/providers",
-                get(environment::gateway_providers_handler)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                get(environment::gateway_providers_handler).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/gateway/reload",
-                post(environment::gateway_reload_handler)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                post(environment::gateway_reload_handler).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             // Admin — gestione cooldown provider (lista + reset manuale)
             // NOTA: la route senza path parameter deve precedere quella con :name
             .route(
                 "/api/admin/providers/cooldown",
-                get(environment::admin_cooldown_list)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                get(environment::admin_cooldown_list).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/providers/budget",
-                get(environment::admin_providers_budget_list)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                get(environment::admin_providers_budget_list).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/routing-matrix/auto-promote-now",
-                post(environment::admin_routing_matrix_auto_promote_now)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                post(environment::admin_routing_matrix_auto_promote_now).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_admin),
+                ),
             )
             .route(
                 "/api/admin/providers/:name/reset-cooldown",
-                post(environment::admin_reset_provider_cooldown)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                post(environment::admin_reset_provider_cooldown).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_admin),
+                ),
             )
             .route(
                 "/api/admin/providers/:name/set-budget",
-                post(environment::admin_set_provider_budget)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                post(environment::admin_set_provider_budget).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
             )
             .route(
                 "/api/admin/providers/:name/recharge-budget",
-                post(environment::admin_recharge_provider_budget)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_admin)),
+                post(environment::admin_recharge_provider_budget).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_admin),
+                ),
             )
             .route(
                 "/api/models",
@@ -2848,14 +3044,16 @@ async fn main() -> anyhow::Result<()> {
                 "/api/prompt-templates/:key",
                 get(prompt_templates::get_template_handler)
                     .put(prompt_templates::upsert_template_handler)
-                    .layer(axum_mw::from_fn_with_state(state.clone(), middleware::require_auth)),
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_auth,
+                    )),
             )
             .route(
                 "/api/prompt-templates/:key/disable",
-                post(prompt_templates::disable_template_handler).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                post(prompt_templates::disable_template_handler).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/prompt-templates/:key/enable",
@@ -2866,17 +3064,15 @@ async fn main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/admin/prompt-templates/batch-assign-tools",
-                post(prompt_templates::batch_assign_tools_handler).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_admin,
-                )),
+                post(prompt_templates::batch_assign_tools_handler).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_admin),
+                ),
             )
             .route(
                 "/api/admin/available-mcp-tools",
-                get(prompt_templates::available_mcp_tools_handler).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_admin,
-                )),
+                get(prompt_templates::available_mcp_tools_handler).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_admin),
+                ),
             )
             .route(
                 "/api/admin/prompt-templates/:key/tools",
@@ -2896,17 +3092,15 @@ async fn main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/quality/findings/:id/false-positive",
-                post(prompt_templates::mark_false_positive_handler).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                post(prompt_templates::mark_false_positive_handler).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .route(
                 "/api/quality/false-positive-stats",
-                get(prompt_templates::false_positive_stats_handler).layer(axum_mw::from_fn_with_state(
-                    state.clone(),
-                    middleware::require_auth,
-                )),
+                get(prompt_templates::false_positive_stats_handler).layer(
+                    axum_mw::from_fn_with_state(state.clone(), middleware::require_auth),
+                ),
             )
             .layer(axum_mw::from_fn_with_state(
                 state.clone(),
@@ -2933,8 +3127,8 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
-            let mut terminate = signal(SignalKind::terminate())
-                .expect("failed to register SIGTERM handler");
+            let mut terminate =
+                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("Ctrl-C ricevuto — avvio graceful shutdown");
@@ -3016,7 +3210,8 @@ async fn health(State(state): State<AppState>) -> Json<HealthSummary> {
             .flatten()
             .and_then(|v| {
                 // Estrae host:port da URL come "http://127.0.0.1:8001"
-                v.trim().trim_start_matches("http://")
+                v.trim()
+                    .trim_start_matches("http://")
                     .trim_start_matches("https://")
                     .split('/')
                     .next()
@@ -3035,7 +3230,11 @@ async fn health(State(state): State<AppState>) -> Json<HealthSummary> {
         .unwrap_or(false)
     };
 
-    let status = if db_ok && redis_ok && tools_grpc_ok && brain_rest_ok { "ok" } else { "degraded" };
+    let status = if db_ok && redis_ok && tools_grpc_ok && brain_rest_ok {
+        "ok"
+    } else {
+        "degraded"
+    };
 
     Json(HealthSummary {
         service: "mcp-core".to_string(),
@@ -3048,8 +3247,14 @@ async fn health(State(state): State<AppState>) -> Json<HealthSummary> {
             redis: redis_ok,
             neural_core: state.orchestrator.neural_healthy().await,
             tools_grpc: tools_grpc_ok,
-            qdrant: state.dependency_status.qdrant.load(std::sync::atomic::Ordering::Relaxed),
-            embedder: state.dependency_status.embedder.load(std::sync::atomic::Ordering::Relaxed),
+            qdrant: state
+                .dependency_status
+                .qdrant
+                .load(std::sync::atomic::Ordering::Relaxed),
+            embedder: state
+                .dependency_status
+                .embedder
+                .load(std::sync::atomic::Ordering::Relaxed),
             brain_rest: brain_rest_ok,
         },
     })

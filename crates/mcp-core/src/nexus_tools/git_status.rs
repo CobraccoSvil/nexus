@@ -218,7 +218,8 @@ mod tests {
 
     #[test]
     fn test_parse_rename() {
-        let input = "# branch.head main\n2 R. N... 100644 100644 100644 abc def R100 new.rs\told.rs\n";
+        let input =
+            "# branch.head main\n2 R. N... 100644 100644 100644 abc def R100 new.rs\told.rs\n";
         let s = parse_porcelain_v2(input);
         assert_eq!(s.renamed.len(), 1);
         assert_eq!(s.renamed[0]["from"], "old.rs");

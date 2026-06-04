@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct HealthSummary {
     pub service: String,
     pub version: String,
-    pub build_time: String,   // timestamp di compilazione — cambia ad ogni build
+    pub build_time: String, // timestamp di compilazione — cambia ad ogni build
     pub status: String,
     pub timestamp: DateTime<Utc>,
     pub components: ComponentHealth,

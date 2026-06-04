@@ -51,7 +51,11 @@ pub async fn provider_error_handler(
 ) -> impl IntoResponse {
     let provider = body.provider.trim().to_lowercase();
     if provider.is_empty() {
-        return (StatusCode::BAD_REQUEST, "campo `provider` vuoto".to_string()).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "campo `provider` vuoto".to_string(),
+        )
+            .into_response();
     }
     match body.error_class.as_str() {
         "billing_error" => {
@@ -70,20 +74,23 @@ pub async fn provider_error_handler(
             crate::provider_cooldown::put_provider_in_cooldown(&provider, Some(secs));
             tracing::warn!(
                 "provider-error bridge: '{}' → cooldown breve {}s (rate_limit)",
-                provider, secs
+                provider,
+                secs
             );
         }
         "overloaded" | "provider_error" => {
             crate::provider_cooldown::put_provider_in_cooldown(&provider, Some(60));
             tracing::warn!(
                 "provider-error bridge: '{}' → cooldown breve 60s ({})",
-                provider, body.error_class
+                provider,
+                body.error_class
             );
         }
         other => {
             tracing::debug!(
                 "provider-error bridge: '{}' classe non riconosciuta '{}', ignorata",
-                provider, other
+                provider,
+                other
             );
         }
     }
@@ -236,7 +243,9 @@ pub async fn decide_routing(
             body.provider_override.as_deref(),
             body.model_override.as_deref(),
             body.context_message_count,
-            body.behavior_mode.as_deref().filter(|v| !v.trim().is_empty()),
+            body.behavior_mode
+                .as_deref()
+                .filter(|v| !v.trim().is_empty()),
         )
         .await;
     // Se nessun provider e' utilizzabile, ritorna 503 ma comunque con il body
@@ -270,7 +279,13 @@ pub async fn decide_routing_get(
     let result = state
         .orchestrator
         .resolve_agent_provider_detailed(
-            &state.db, "", "", &q.message, None, None, 0,
+            &state.db,
+            "",
+            "",
+            &q.message,
+            None,
+            None,
+            0,
             q.mode.as_deref().filter(|v| !v.trim().is_empty()),
         )
         .await;
@@ -343,18 +358,25 @@ pub async fn list_catalog(
     }
     if let Some(cap) = q.requires_capability.as_deref().filter(|s| !s.is_empty()) {
         binds.push(cap.to_string());
-        sql.push_str(&format!(" AND capabilities @> jsonb_build_array(${}::text)", binds.len()));
+        sql.push_str(&format!(
+            " AND capabilities @> jsonb_build_array(${}::text)",
+            binds.len()
+        ));
     }
-    sql.push_str(" ORDER BY is_featured DESC, performance_tier, input_cost_per_million_tokens ASC LIMIT 100");
+    sql.push_str(
+        " ORDER BY is_featured DESC, performance_tier, input_cost_per_million_tokens ASC LIMIT 100",
+    );
 
     let mut q_builder = sqlx::query(&sql);
     for bind_val in &binds {
         q_builder = q_builder.bind(bind_val);
     }
-    let rows = q_builder
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("query catalog: {e}")))?;
+    let rows = q_builder.fetch_all(&state.db).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("query catalog: {e}"),
+        )
+    })?;
 
     let entries: Vec<CatalogEntry> = rows
         .into_iter()
@@ -368,8 +390,12 @@ pub async fn list_catalog(
             context_window: r.try_get("context_window").unwrap_or(0),
             supports_tool_use: r.try_get("supports_tool_use").unwrap_or(false),
             is_featured: r.try_get("is_featured").unwrap_or(false),
-            input_cost_per_million_tokens: r.try_get("input_cost_per_million_tokens").unwrap_or(0.0),
-            output_cost_per_million_tokens: r.try_get("output_cost_per_million_tokens").unwrap_or(0.0),
+            input_cost_per_million_tokens: r
+                .try_get("input_cost_per_million_tokens")
+                .unwrap_or(0.0),
+            output_cost_per_million_tokens: r
+                .try_get("output_cost_per_million_tokens")
+                .unwrap_or(0.0),
         })
         .collect();
     Ok(Json(entries))

@@ -8,14 +8,23 @@ pub struct SecSecretPatternsTool;
 
 #[async_trait]
 impl NexusToolHandler for SecSecretPatternsTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(
             &ctx.project_root,
             &[
-                "api_key", "apikey", "API_KEY",
-                "secret", "SECRET",
-                "password", "PASSWORD",
-                "token", "TOKEN",
+                "api_key",
+                "apikey",
+                "API_KEY",
+                "secret",
+                "SECRET",
+                "password",
+                "PASSWORD",
+                "token",
+                "TOKEN",
                 "AKIA", // AWS key prefix
                 "BEGIN PRIVATE KEY",
             ],
@@ -36,5 +45,7 @@ impl NexusToolHandler for SecSecretPatternsTool {
             "private_key_pem": counts[10],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

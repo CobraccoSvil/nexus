@@ -18,11 +18,7 @@ impl NexusToolHandler for GitStashListTool {
     ) -> Result<Value, NexusToolError> {
         let out = run_cmd(
             "git",
-            &[
-                "stash",
-                "list",
-                "--pretty=format:%gd%x09%gs",
-            ],
+            &["stash", "list", "--pretty=format:%gd%x09%gs"],
             &ctx.project_root,
             ctx.timeout_secs,
         )

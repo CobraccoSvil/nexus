@@ -17,8 +17,17 @@ use std::time::SystemTime;
 
 const SCAN_DEPTH: usize = 4;
 const EXCLUDE_DIRS: &[&str] = &[
-    "node_modules", ".git", "target", ".next", ".turbo", "dist", "build",
-    "__pycache__", ".venv", ".cache", ".pnpm-store",
+    "node_modules",
+    ".git",
+    "target",
+    ".next",
+    ".turbo",
+    "dist",
+    "build",
+    "__pycache__",
+    ".venv",
+    ".cache",
+    ".pnpm-store",
 ];
 
 #[derive(Default)]

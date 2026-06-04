@@ -59,7 +59,9 @@ struct CompareSettings {
 /// `nexus_visual_compare(url, reference?, viewport?, wait_ms?)`.
 pub(super) async fn tool_nexus_visual_compare(ctx: &AgentToolContext, input: &Value) -> String {
     if !ctx.can_write {
-        return err("Permesso di scrittura non concesso: impossibile salvare lo screenshot su disco.");
+        return err(
+            "Permesso di scrittura non concesso: impossibile salvare lo screenshot su disco.",
+        );
     }
 
     // 1) URL obbligatorio + validazione basilare (solo http/https locale).
@@ -90,7 +92,11 @@ pub(super) async fn tool_nexus_visual_compare(ctx: &AgentToolContext, input: &Va
     }
 
     // 3) Recupera l'immagine di riferimento (opzionale).
-    let reference = match input.get("reference").and_then(Value::as_str).map(str::trim) {
+    let reference = match input
+        .get("reference")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
         Some(r) if !r.is_empty() => match resolve_reference(ctx, r).await {
             Ok(Some(ref_img)) => Some(ref_img),
             Ok(None) => {
@@ -140,14 +146,8 @@ pub(super) async fn tool_nexus_visual_compare(ctx: &AgentToolContext, input: &Va
     // 7) Confronto vision via brain.
     let shot_b64 = B64.encode(&shot);
     let ref_b64 = B64.encode(&reference.bytes);
-    let compare = compare_via_brain(
-        &ctx.db,
-        &shot_b64,
-        "image/png",
-        &ref_b64,
-        &reference.mime,
-    )
-    .await;
+    let compare =
+        compare_via_brain(&ctx.db, &shot_b64, "image/png", &ref_b64, &reference.mime).await;
 
     match compare {
         Ok(v) => json!({
@@ -186,10 +186,18 @@ fn err(msg: &str) -> String {
 /// Carica i parametri dal DB con default safe documentati.
 async fn load_settings(db: &sqlx::PgPool) -> CompareSettings {
     CompareSettings {
-        viewport_width: setting_u64(db, "agent.visual_compare.viewport_width", DEFAULT_VIEWPORT_WIDTH as u64)
-            .await as u32,
-        viewport_height: setting_u64(db, "agent.visual_compare.viewport_height", DEFAULT_VIEWPORT_HEIGHT as u64)
-            .await as u32,
+        viewport_width: setting_u64(
+            db,
+            "agent.visual_compare.viewport_width",
+            DEFAULT_VIEWPORT_WIDTH as u64,
+        )
+        .await as u32,
+        viewport_height: setting_u64(
+            db,
+            "agent.visual_compare.viewport_height",
+            DEFAULT_VIEWPORT_HEIGHT as u64,
+        )
+        .await as u32,
         wait_ms: setting_u64(db, "agent.visual_compare.wait_ms", DEFAULT_WAIT_MS).await,
         screenshot_timeout_secs: setting_u64(
             db,
@@ -229,8 +237,8 @@ async fn resolve_reference(
     ctx: &AgentToolContext,
     reference: &str,
 ) -> Result<Option<ReferenceImage>, String> {
-    let attachment_id =
-        Uuid::parse_str(reference).map_err(|_| "'reference' non e' un attachment_id (UUID) valido".to_string())?;
+    let attachment_id = Uuid::parse_str(reference)
+        .map_err(|_| "'reference' non e' un attachment_id (UUID) valido".to_string())?;
 
     let record = load_attachment(&ctx.db, attachment_id, ctx.project_id).await?;
     let header = read_header(&record.file_path).await?;
@@ -257,7 +265,9 @@ async fn resolve_reference(
 }
 
 /// Estrae `thumbnail.png` da un archivio .make. Ritorna `Ok(None)` se assente.
-async fn extract_make_thumbnail(record: &AttachmentRecord) -> Result<Option<ReferenceImage>, String> {
+async fn extract_make_thumbnail(
+    record: &AttachmentRecord,
+) -> Result<Option<ReferenceImage>, String> {
     let bytes = tokio::fs::read(&record.file_path)
         .await
         .map_err(|e| format!("read .make fallita: {e}"))?;
@@ -280,7 +290,8 @@ fn extract_thumbnail_bytes(bytes: &[u8]) -> Result<Option<Vec<u8>>, String> {
         return Err("il .make non e' uno ZIP valido".into());
     }
     let reader = Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(reader).map_err(|e| format!("apertura ZIP fallita: {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(reader).map_err(|e| format!("apertura ZIP fallita: {e}"))?;
     let mut idx: Option<usize> = None;
     for i in 0..archive.len() {
         if let Ok(entry) = archive.by_index(i) {
@@ -314,7 +325,11 @@ fn is_image_kind(kind: &str) -> bool {
 ///
 /// Lo script stampa i byte PNG su stdout (in base64, per evitare problemi di
 /// encoding binario sui pipe) preceduti da un marcatore.
-async fn capture_screenshot(root: &Path, url: &str, cfg: &CompareSettings) -> Result<Vec<u8>, String> {
+async fn capture_screenshot(
+    root: &Path,
+    url: &str,
+    cfg: &CompareSettings,
+) -> Result<Vec<u8>, String> {
     const MARKER: &str = "NEXUS_SHOT_B64:";
     let script = format!(
         r#"
@@ -411,8 +426,8 @@ const {{ chromium }} = require('playwright');
 async fn save_screenshot(root: &Path, bytes: &[u8]) -> Result<String, String> {
     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
     let rel = format!("{SCREENSHOT_SUBDIR}/screenshot_{ts}.png");
-    let (clean_rel, abs_target) =
-        resolve_workspace_target(root, &rel).map_err(|_| "path screenshot non valido".to_string())?;
+    let (clean_rel, abs_target) = resolve_workspace_target(root, &rel)
+        .map_err(|_| "path screenshot non valido".to_string())?;
 
     if let Some(parent) = abs_target.parent() {
         tokio::fs::create_dir_all(parent)
@@ -462,7 +477,11 @@ async fn compare_via_brain(
     let status = response.status();
     let body_text = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("vision compare ha risposto HTTP {}: {}", status.as_u16(), body_text));
+        return Err(format!(
+            "vision compare ha risposto HTTP {}: {}",
+            status.as_u16(),
+            body_text
+        ));
     }
     serde_json::from_str::<Value>(&body_text)
         .map_err(|e| format!("risposta vision compare non e' JSON valido: {e}; body={body_text}"))
@@ -564,7 +583,10 @@ mod tests {
         assert_eq!(parsed["model_used"], "google/gemini-2.0-flash-exp");
         assert_eq!(parsed["differences"][0]["category"], "colore");
         assert_eq!(parsed["differences"][0]["severity"], "alta");
-        assert!(parsed["screenshot_path"].as_str().unwrap().ends_with(".png"));
+        assert!(parsed["screenshot_path"]
+            .as_str()
+            .unwrap()
+            .ends_with(".png"));
     }
 
     /// Il manifest di errore non deve contenere le immagini base64 e deve

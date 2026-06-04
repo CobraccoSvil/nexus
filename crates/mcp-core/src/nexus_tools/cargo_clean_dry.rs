@@ -26,7 +26,11 @@ fn dir_size(p: &Path, depth: usize) -> u64 {
 
 #[async_trait]
 impl NexusToolHandler for CargoCleanDryTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let target = ctx.project_root.join("target");
         if !target.exists() {
             return Ok(json!({"ok": true, "exists": false, "size_bytes": 0}));
@@ -40,5 +44,7 @@ impl NexusToolHandler for CargoCleanDryTool {
             "size_mb": size / (1024 * 1024),
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

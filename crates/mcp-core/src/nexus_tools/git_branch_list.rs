@@ -11,11 +11,7 @@ pub struct GitBranchListTool;
 
 #[async_trait]
 impl NexusToolHandler for GitBranchListTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let include_remote = args
             .get("include_remote")
             .and_then(Value::as_bool)

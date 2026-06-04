@@ -8,10 +8,19 @@ pub struct CaMacroCountTool;
 
 #[async_trait]
 impl NexusToolHandler for CaMacroCountTool {
-    async fn execute(&self, ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let (counts, files) = scan_substrings(
             &ctx.project_root,
-            &["macro_rules!", "#[proc_macro]", "#[proc_macro_derive", "#[proc_macro_attribute]"],
+            &[
+                "macro_rules!",
+                "#[proc_macro]",
+                "#[proc_macro_derive",
+                "#[proc_macro_attribute]",
+            ],
         );
         Ok(json!({
             "ok": true,
@@ -22,5 +31,7 @@ impl NexusToolHandler for CaMacroCountTool {
             "proc_macro_attribute": counts[3],
         }))
     }
-    fn safety(&self) -> NexusToolSafety { NexusToolSafety::read_only() }
+    fn safety(&self) -> NexusToolSafety {
+        NexusToolSafety::read_only()
+    }
 }

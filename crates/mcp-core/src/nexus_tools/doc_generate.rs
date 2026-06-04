@@ -15,11 +15,7 @@ pub struct DocGenerateTool;
 
 #[async_trait]
 impl NexusToolHandler for DocGenerateTool {
-    async fn execute(
-        &self,
-        ctx: &NexusToolContext,
-        args: &Value,
-    ) -> Result<Value, NexusToolError> {
+    async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
         let root = &ctx.project_root;
         let open = args.get("open").and_then(Value::as_bool).unwrap_or(false);
         let include_deps = args

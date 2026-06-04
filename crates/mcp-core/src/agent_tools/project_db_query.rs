@@ -33,7 +33,8 @@ pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -
     let sql = match input.get("sql").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => {
-            return json!({"error": "Parametro 'sql' obbligatorio (stringa non vuota)."}).to_string();
+            return json!({"error": "Parametro 'sql' obbligatorio (stringa non vuota)."})
+                .to_string();
         }
     };
 
@@ -79,8 +80,14 @@ pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -
             // dall'agente come nota KB + file migration, separate per
             // connessione in caso di multi-DB. Best effort: errori solo
             // loggati.
-            let archive =
-                archive_ddl(&ctx.db, ctx.project_id, &sql, &outcome, connection.as_deref()).await;
+            let archive = archive_ddl(
+                &ctx.db,
+                ctx.project_id,
+                &sql,
+                &outcome,
+                connection.as_deref(),
+            )
+            .await;
             let mut payload = outcome_to_json(&outcome);
             if let (Some(archived), Value::Object(ref mut map)) = (archive, &mut payload) {
                 map.insert(
@@ -96,9 +103,7 @@ pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -
         }
         Err(e) => match e {
             QueryExecError::ConnectionError(m) => json!({"error": m}).to_string(),
-            QueryExecError::Timeout => {
-                json!({"error": e.message()}).to_string()
-            }
+            QueryExecError::Timeout => json!({"error": e.message()}).to_string(),
             QueryExecError::Sql(_) => json!({
                 "error": e.message(),
                 "sql_excerpt": sql.chars().take(200).collect::<String>(),

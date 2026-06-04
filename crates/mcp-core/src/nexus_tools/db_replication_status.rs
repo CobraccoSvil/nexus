@@ -9,7 +9,11 @@ pub struct DbReplicationStatusTool;
 
 #[async_trait]
 impl NexusToolHandler for DbReplicationStatusTool {
-    async fn execute(&self, _ctx: &NexusToolContext, _args: &Value) -> Result<Value, NexusToolError> {
+    async fn execute(
+        &self,
+        _ctx: &NexusToolContext,
+        _args: &Value,
+    ) -> Result<Value, NexusToolError> {
         let pool = match db_helper::get_pool().await {
             Ok(p) => p,
             Err(e) => return Ok(json!({"ok": false, "error": e})),
@@ -20,17 +24,27 @@ impl NexusToolHandler for DbReplicationStatusTool {
             Ok(r) => r,
             Err(e) => return Ok(json!({"ok": false, "error": format!("query: {}", e)})),
         };
-        let items: Vec<Value> = rows.iter().map(|r| json!({
-            "pid": r.try_get::<i32, _>("pid").unwrap_or(0),
-            "user": r.try_get::<Option<String>, _>("usename").unwrap_or_default(),
-            "app": r.try_get::<Option<String>, _>("application_name").unwrap_or_default(),
-            "client": r.try_get::<Option<String>, _>("client").unwrap_or_default(),
-            "state": r.try_get::<Option<String>, _>("state").unwrap_or_default(),
-            "sync_state": r.try_get::<Option<String>, _>("sync_state").unwrap_or_default(),
-        })).collect();
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "pid": r.try_get::<i32, _>("pid").unwrap_or(0),
+                    "user": r.try_get::<Option<String>, _>("usename").unwrap_or_default(),
+                    "app": r.try_get::<Option<String>, _>("application_name").unwrap_or_default(),
+                    "client": r.try_get::<Option<String>, _>("client").unwrap_or_default(),
+                    "state": r.try_get::<Option<String>, _>("state").unwrap_or_default(),
+                    "sync_state": r.try_get::<Option<String>, _>("sync_state").unwrap_or_default(),
+                })
+            })
+            .collect();
         Ok(json!({"ok": true, "count": items.len(), "replicas": items}))
     }
     fn safety(&self) -> NexusToolSafety {
-        NexusToolSafety { read_only: true, can_write_filesystem: false, can_execute_subproc: false, network_egress: true }
+        NexusToolSafety {
+            read_only: true,
+            can_write_filesystem: false,
+            can_execute_subproc: false,
+            network_egress: true,
+        }
     }
 }

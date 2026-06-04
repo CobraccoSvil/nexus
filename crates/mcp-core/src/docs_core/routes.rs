@@ -76,12 +76,13 @@ async fn ensure_note_in_project(
     project_id: Uuid,
     note_id: Uuid,
 ) -> Result<(), nexus_types::ApiError> {
-    let row = sqlx::query("SELECT 1 FROM project_knowledge_notes WHERE id = $1 AND project_id = $2")
-        .bind(note_id)
-        .bind(project_id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let row =
+        sqlx::query("SELECT 1 FROM project_knowledge_notes WHERE id = $1 AND project_id = $2")
+            .bind(note_id)
+            .bind(project_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if row.is_none() {
         return Err(api_error(StatusCode::NOT_FOUND, "Nota non trovata"));
     }
@@ -129,7 +130,9 @@ pub async fn proj_get_revision(
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Revisione non trovata"))?;
-    Ok(Json(serde_json::to_value(rev).unwrap_or_else(|_| json!({}))))
+    Ok(Json(
+        serde_json::to_value(rev).unwrap_or_else(|_| json!({})),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,10 +174,15 @@ pub async fn proj_restore(
     Json(body): Json<ProjRestoreBody>,
 ) -> ApiResult {
     let (project_id, note_id) = parse_and_auth(&state, &claims, &pid, &nid).await?;
-    let target = get_revision(&state.db, DocScope::Project(project_id), note_id, body.version)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Revisione non trovata"))?;
+    let target = get_revision(
+        &state.db,
+        DocScope::Project(project_id),
+        note_id,
+        body.version,
+    )
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Revisione non trovata"))?;
 
     let patch = DocPatch {
         title: Some(target.title.clone()),
@@ -184,9 +192,15 @@ pub async fn proj_restore(
         revision_source: Some("revert"),
         edit_summary: Some(format!("restore della revisione v{}", body.version)),
     };
-    let out = update_doc(&state, DocScope::Project(project_id), note_id, &claims.sub, patch)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let out = update_doc(
+        &state,
+        DocScope::Project(project_id),
+        note_id,
+        &claims.sub,
+        patch,
+    )
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({
         "ok": true,
