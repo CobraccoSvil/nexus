@@ -526,34 +526,52 @@ impl Orchestrator {
 
                 // Fallback deterministico: miglior modello tool-capable del tier
                 // (degradazione di tier controllata in best_model_for_tier).
-                match best_model_for_tier(db, &tier, Some(&capability), true).await {
+                //
+                // RILASSO CAPABILITY (fix incidente UI 2026-06-04): prima prova
+                // con la capability dell'intent (es. "reasoning"); se nessun
+                // modello NON-thinking tool-capable la possiede — caso reale:
+                // tutti i modelli con capability "reasoning" sono is_thinking=true
+                // ed esclusi dal gate (mig 0317/0318) — rilassa la capability e
+                // prende il miglior non-thinking tool-capable del tier. Un modello
+                // non-thinking senza quel tag e' comunque MOLTO meglio di un
+                // thinking model che fallirebbe il loop agentico (deepseek-v4-pro
+                // -> reasoning_content 400). Senza questo rilassamento il gate
+                // teneva il modello thinking originale (override/slot), vanificando
+                // l'esclusione su tutti i path che forzano un modello.
+                let fallback = match best_model_for_tier(db, &tier, Some(&capability), true).await {
+                    Some(x) => Some(x),
+                    None => best_model_for_tier(db, &tier, None, true).await,
+                };
+                match fallback {
                     Some((alt_provider, alt_model)) => {
                         tracing::info!(
-                            "routing: {}/{} scartato per run agente (supports_tool_use=false) \
-                             -> fallback {}/{} (intent={}, tier={})",
+                            "routing: {}/{} scartato per run agente (non tool-capable o thinking) \
+                             -> fallback {}/{} (intent={}, tier={}, capability={})",
                             provider,
                             model,
                             alt_provider,
                             alt_model,
                             intent,
                             tier,
+                            capability,
                         );
                         *provider = alt_provider;
                         *model = alt_model;
                     }
                     None => {
-                        // Nessun modello tool-capable disponibile: fail visibile.
-                        // Non sostituiamo silenziosamente con qualcosa di sbagliato.
+                        // Nessun modello non-thinking tool-capable disponibile in
+                        // NESSUNA capability del tier: fail visibile. Non sostituiamo
+                        // silenziosamente con qualcosa di sbagliato.
                         tracing::warn!(
-                            "routing: {}/{} non tool-capable per run agente (intent={}) ma \
-                             nessun modello tool-capable disponibile nel catalog (tier={}, \
-                             capability={}). Run proseguira' col modello originale — verifica \
-                             ai_price_catalog (supports_tool_use) e i provider in cooldown.",
+                            "routing: {}/{} non utilizzabile per run agente (intent={}) ma \
+                             nessun modello non-thinking tool-capable disponibile nel catalog \
+                             (tier={}, neppure rilassando la capability). Run proseguira' col \
+                             modello originale — verifica ai_price_catalog (supports_tool_use, \
+                             is_thinking) e i provider in cooldown.",
                             provider,
                             model,
                             intent,
                             tier,
-                            capability,
                         );
                     }
                 }
