@@ -1106,16 +1106,19 @@ pub async fn run_via_brain(
         && iteration <= 2;
 
     let hollow_completion = hollow_no_tools || hollow_empty_answer || hollow_resigned;
+    let hollow_kind: &str = if !hollow_completion {
+        ""
+    } else if hollow_resigned {
+        "RESIGNED"
+    } else if hollow_empty_answer && !hollow_no_tools {
+        "EMPTY_ANSWER"
+    } else if hollow_empty_answer {
+        "EMPTY_ANSWER+NO_TOOLS"
+    } else {
+        "NO_TOOLS"
+    };
     if hollow_completion {
-        let kind = if hollow_resigned {
-            "RESIGNED"
-        } else if hollow_empty_answer && !hollow_no_tools {
-            "EMPTY_ANSWER"
-        } else if hollow_empty_answer {
-            "EMPTY_ANSWER+NO_TOOLS"
-        } else {
-            "NO_TOOLS"
-        };
+        let kind = hollow_kind;
         tracing::warn!(
             "agent_run {}: HOLLOW COMPLETION [{}] — modello {}/{} ha dichiarato \
              di aver completato (steps={}, iteration={}, final_answer_chars={}). \
@@ -1129,6 +1132,9 @@ pub async fn run_via_brain(
             final_answer.len(),
             final_answer.chars().take(180).collect::<String>(),
         );
+        // NB: la persistenza diagnostica in `nexus_provider_empty_responses`
+        // avviene in `chat_messages/agent_run.rs` (ha accesso allo `state.db`).
+        // Il kind e' propagato via `AgentRunResult.hollow_completion_kind`.
     }
 
     // Evento finale sul broadcast. Emesso solo se il caller lo richiede:
@@ -1216,6 +1222,7 @@ pub async fn run_via_brain(
         stop_reason: last_stop_reason,
         hollow_completion,
         hollow_no_tools,
+        hollow_completion_kind: hollow_kind.to_string(),
     }
 }
 
@@ -1348,6 +1355,7 @@ fn fail_result(run_id: &str, provider: &str, model: &str, msg: String) -> AgentR
         stop_reason: Some("error".to_string()),
         hollow_completion: false,
         hollow_no_tools: false,
+        hollow_completion_kind: String::new(),
     }
 }
 

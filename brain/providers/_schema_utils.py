@@ -142,27 +142,73 @@ def compress_tool_list(
 
 
 def is_first_agent_turn(messages: list[dict]) -> bool:
-    """Determina se siamo al primo turno agente (nessun tool_result nella history).
+    """Determina se siamo al primo turno agente.
 
-    La detection si basa sulla presenza di messaggi con role 'tool' (formato
-    OpenAI/Mistral/DeepSeek) o blocchi con type 'tool_result' nel content
-    (formato Anthropic).
+    Implementazione estesa rispetto alla definizione letterale "nessun tool_result
+    nella history". Restituisce True anche quando l'agente ha eseguito SOLO
+    tool di discovery (`nexus_mcp_tool_search`, `nexus_mcp_tool_call`) senza
+    aver mai invocato un tool "concreto" che agisce sul progetto. Motivazione:
+    se il modello ha CERCATO i tool ma poi vuole chiudere narrando ("Ora eseguo
+    i test...") senza chiamare il tool concreto, va riforzato `tool_choice` per
+    obbligare l'azione (incident chat 6 Beauty-Book run 2026-06-04 12:08).
 
-    Al primo turno il modello deve essere forzato a usare un tool per evitare
-    il pattern "narrate-without-act" (descrivere azioni senza eseguirle).
+    Detection:
+    - role='tool' o block type='tool_result' con tool_name in DISCOVERY_TOOLS
+      -> ancora "primo turno effettivo".
+    - role='tool' o block type='tool_result' con tool_name diverso da discovery
+      -> ESCE dal primo turno (l'agente ha agito).
+
+    NB: alcuni adapter non popolano tool_name nel tool_result. Per quei casi
+    correlo via tool_use_id col precedente tool_use (sempre presente nei
+    messaggi assistant). Fallback conservativo: se non riesco a mappare il
+    tool_name, considero come tool concreto (esce dal primo turno) per
+    evitare loop di forzatura.
     """
+    discovery = _DISCOVERY_TOOLS
+    # Indice tool_use_id -> tool_name dai messaggi assistant.
+    tool_use_names: dict[str, str] = {}
+    for m in messages:
+        if m.get("role") == "assistant":
+            content = m.get("content")
+            if isinstance(content, list):
+                for blk in content:
+                    if not isinstance(blk, dict):
+                        continue
+                    if blk.get("type") == "tool_use":
+                        tid = blk.get("id") or ""
+                        nm = blk.get("name") or ""
+                        if tid and nm:
+                            tool_use_names[tid] = nm
+
     for m in messages:
         role = m.get("role", "")
-        # Formato OpenAI-compat: role=tool
         if role == "tool":
-            return False
-        # Formato Anthropic: blocchi tool_result nel content
+            # Formato OpenAI-compat: name campo top-level
+            tname = (m.get("name") or "").strip()
+            if not tname:
+                tcid = m.get("tool_call_id") or ""
+                tname = tool_use_names.get(tcid, "")
+            # Se non risolto, conservativo: trattalo come tool concreto.
+            if not tname or tname not in discovery:
+                return False
         content = m.get("content")
         if isinstance(content, list):
             for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tuid = block.get("tool_use_id") or ""
+                tname = tool_use_names.get(tuid, "")
+                if not tname or tname not in discovery:
                     return False
     return True
+
+
+# Tool che NON contano come "azione concreta": l'agente li usa solo per
+# scoprire altri tool. `nexus_mcp_tool_call` invece ESEGUE il tool risolto
+# (azione vera), quindi NON e' discovery.
+_DISCOVERY_TOOLS = frozenset(
+    {"nexus_mcp_tool_search"}
+)
 
 
 def resolve_tool_choice_openai(

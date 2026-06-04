@@ -206,6 +206,13 @@ pub struct AgentRunResult {
     /// senza disabilitarlo globalmente, lasciandolo disponibile per i task chat.
     #[serde(default)]
     pub hollow_no_tools: bool,
+    /// Sottotipo specifico dell'hollow_completion per la diagnostica QW2:
+    /// "EMPTY_ANSWER" | "NO_TOOLS" | "EMPTY_ANSWER+NO_TOOLS" | "RESIGNED" | "".
+    /// Vuoto se hollow_completion=false. Propagato dal caller (brain_agent_client)
+    /// al persistente (chat_messages/agent_run) per il log in
+    /// `nexus_provider_empty_responses` (mig 0291).
+    #[serde(default)]
+    pub hollow_completion_kind: String,
 }
 
 /// Evento di trace LLM: mostra i messaggi inviati al provider e la risposta ricevuta.

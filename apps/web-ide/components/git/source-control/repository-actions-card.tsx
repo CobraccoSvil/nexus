@@ -1,0 +1,84 @@
+"use client";
+
+import type {
+  GitRepositoryState,
+  UserProjectDetails,
+} from "../../../lib/api-client";
+import {
+  commitGit,
+  stageGitPaths,
+  unstageGitPaths,
+} from "../../../lib/api-client";
+import { useThemeColors } from "../../../lib/theme";
+import { buttonStyle, cardStyle, inputStyle, sectionTitleStyle } from "./styles";
+
+interface RepositoryActionsCardProps {
+  project: UserProjectDetails;
+  git?: GitRepositoryState | null;
+  busy: boolean;
+  allChangedPaths: string[];
+  commitMessage: string;
+  setCommitMessage: (msg: string) => void;
+  runAction: (action: () => Promise<unknown>) => Promise<void>;
+}
+
+export function RepositoryActionsCard({
+  project,
+  git,
+  busy,
+  allChangedPaths,
+  commitMessage,
+  setCommitMessage,
+  runAction,
+}: RepositoryActionsCardProps) {
+  const tc = useThemeColors();
+
+  return (
+    <div style={cardStyle(tc)}>
+      <div style={sectionTitleStyle(tc)}>Gestione Repository</div>
+      <div style={{ color: tc.textMuted, fontSize: 12 }}>
+        Comandi rapidi per stage, commit e sincronizzazione del repository.
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <button
+          disabled={busy || !project.canManageGit || allChangedPaths.length === 0}
+          onClick={() => runAction(() => stageGitPaths(project.id, allChangedPaths))}
+          title="Stage all — aggiungi tutte le modifiche"
+          style={buttonStyle(tc, busy || !project.canManageGit || allChangedPaths.length === 0)}
+        >
+          Stage tutto
+        </button>
+        <button
+          disabled={busy || !project.canManageGit || (git?.staged.length ?? 0) === 0}
+          onClick={() => runAction(() => unstageGitPaths(project.id, git?.staged.map((item) => item.path) ?? []))}
+          title="Unstage all — rimuovi tutte le modifiche dallo stage"
+          style={buttonStyle(tc, busy || !project.canManageGit || (git?.staged.length ?? 0) === 0)}
+        >
+          Rimuovi stage
+        </button>
+      </div>
+
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <input
+          value={commitMessage}
+          onChange={(event) => setCommitMessage(event.target.value)}
+          placeholder="Messaggio commit"
+          style={inputStyle(tc)}
+        />
+        <button
+          disabled={busy || !project.canManageGit || !commitMessage.trim()}
+          onClick={() =>
+            runAction(async () => {
+              await commitGit(project.id, commitMessage.trim());
+              setCommitMessage("");
+            })
+          }
+          title="Commit — salva le modifiche staged"
+          style={buttonStyle(tc, busy || !project.canManageGit || !commitMessage.trim())}
+        >
+          Commit
+        </button>
+      </div>
+    </div>
+  );
+}
