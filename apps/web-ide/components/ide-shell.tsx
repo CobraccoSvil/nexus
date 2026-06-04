@@ -52,13 +52,9 @@ import { useThemeColors } from "../lib/theme";
 import { useGlobalDialog } from "./global-dialog-provider";
 import { useMultiChat } from "../lib/use-multi-chat";
 import { useProfiles, DEFAULT_PROFILE_ID } from "../lib/use-profiles";
-import { ProjectSwitcher } from "./project-switcher";
-import { UserSidebarMenu } from "./user-header";
-import { QuotaBadge } from "./panels/quota-badge";
 import { NoteDetail } from "./knowledge/note-detail";
 import type { SidebarView } from "./sidebar/sidebar-manager";
 import type { PanelTab } from "./panels/bottom-panel-manager";
-import { TruncatedText } from "./truncated-text";
 import {
   useProjectDispatcher,
   useProjectStore,
@@ -70,7 +66,25 @@ import {
   selectProblemsBadge,
   selectRunConfigsChangedAt,
 } from "../lib/project-dispatcher";
-import { ConnectionStatusBadge, ToastStack, usePanelHighlight } from "./dispatcher-status";
+import { ToastStack } from "./dispatcher-status";
+import {
+  EMPTY_GROUPS,
+  basename,
+  hydrateGroups,
+  iconButton,
+  makeTab,
+  normalizeWorkbenchState,
+  type ProviderHealthState,
+  type ProviderKey,
+  type SecondarySidebarView,
+} from "./shell/shell-helpers";
+import { TopBar } from "./shell/top-bar";
+import { ActivityBar } from "./shell/activity-bar";
+import { StatusBar } from "./shell/status-bar";
+import { FirstAnalysisOverlay } from "./shell/first-analysis-overlay";
+import { ShellOverlays } from "./shell/shell-overlays";
+import { BottomPanelHeader } from "./shell/bottom-panel-header";
+import { RightViewTabs } from "./shell/panel-tabs";
 
 // Dynamic imports per componenti pesanti IDE
 const ChatPanel = dynamic(() => import("./chat-panel.lazy"), {
@@ -115,283 +129,6 @@ const ProfileEditor = dynamic(() => import("./chat/profile-editor.lazy"), {
   ssr: false,
 });
 
-type SecondarySidebarView = "ai-tools";
-type ProviderKey = "openai" | "anthropic" | "google" | "deepseek" | "mistral";
-type ProviderHealthState = {
-  ok: boolean | null;
-  reason?: string;
-  status?: string;
-  billing?: boolean; // true = crediti/quota esauriti → pallino giallo
-};
-
-const sidebarItems: Array<{ key: SidebarView; label: string; icon: string }> = [
-  { key: "project-db", label: "Database", icon: "🗄" },
-  { key: "knowledge", label: "Knowledge", icon: "🧠" },
-  { key: "explorer", label: "Explorer", icon: "🗂" },
-  { key: "search", label: "Ricerca", icon: "🔍" },
-  { key: "source-control", label: "Git", icon: "⑂" },
-  { key: "run", label: "Run", icon: "▶" },
-  { key: "docs", label: "Documenti", icon: "📄" },
-  { key: "server-monitor", label: "Monitor", icon: "▣" },
-];
-
-const panelTabs: Array<{ key: PanelTab; label: string }> = [
-  { key: "problems", label: "Problemi" },
-  { key: "terminal", label: "Terminale" },
-  { key: "run", label: "Run & Debug" },
-  { key: "debug", label: "Console Debug" },
-  { key: "ports", label: "Porte" },
-  { key: "services", label: "Servizi" },
-  { key: "playwright", label: "Playwright" },
-  { key: "monitor", label: "Monitor" },
-  { key: "optimization", label: "Ottimizzazione" },
-  { key: "security", label: "Sicurezza" },
-];
-
-const EMPTY_GROUPS: EditorGroupState[] = [
-  { id: "primary", tabs: [], activePath: null },
-  { id: "secondary", tabs: [], activePath: null },
-];
-
-function basename(path: string) {
-  const parts = path.split(/[\\/]/);
-  return parts[parts.length - 1] || path;
-}
-
-function makeTab(path: string, content: string, dirty = false): EditorTabState {
-  return {
-    path,
-    title: basename(path),
-    dirty,
-    pinned: true,
-    content,
-  };
-}
-
-function defaultWorkbenchState(): WorkbenchState {
-  return {
-    layoutMode: "ai-center",
-    primarySidebarVisible: true,
-    secondarySidebarVisible: false,
-    secondarySidebarView: "ai-tools",
-    layoutControlStyle: "icon-menu",
-    iconButtonsOnly: true,
-    bottomPanelVisible: true,
-    activeSidebarView: "explorer",
-    activePanelTab: "terminal",
-    leftWidth: 300,
-    rightWidth: 430,
-    bottomHeight: 250,
-    editorGroups: EMPTY_GROUPS,
-    ai: {
-      activeContextPaths: [],
-    },
-    terminal: {
-      activeTabId: "shell-1",
-      tabs: [{ id: "shell-1", title: "shell 1" }],
-    },
-  };
-}
-
-function normalizeWorkbenchState(input?: Partial<WorkbenchState> | null): WorkbenchState {
-  const defaults = defaultWorkbenchState();
-  const groups = (input?.editorGroups ?? EMPTY_GROUPS)
-    .slice(0, 2)
-    .map((group, index) => ({
-      id: group.id || (index === 0 ? "primary" : "secondary"),
-      activePath: group.activePath ?? null,
-      tabs: (group.tabs ?? []).map((tab) => ({
-        path: tab.path,
-        title: tab.title || basename(tab.path),
-        dirty: Boolean(tab.dirty),
-        pinned: tab.pinned !== false,
-        content: tab.content ?? "",
-      })),
-    }));
-
-  while (groups.length < 2) {
-    groups.push({ id: groups.length === 0 ? "primary" : "secondary", tabs: [], activePath: null });
-  }
-
-  return {
-    ...defaults,
-    ...input,
-    layoutMode: (input?.layoutMode as WorkbenchLayoutMode | undefined) ?? defaults.layoutMode,
-    secondarySidebarVisible:
-      typeof input?.secondarySidebarVisible === "boolean"
-        ? input.secondarySidebarVisible
-        : defaults.secondarySidebarVisible,
-    secondarySidebarView:
-      (input?.secondarySidebarView as SecondarySidebarView | undefined) ??
-      defaults.secondarySidebarView,
-    layoutControlStyle:
-      input?.layoutControlStyle === "icon-menu" ? "icon-menu" : defaults.layoutControlStyle,
-    iconButtonsOnly:
-      typeof input?.iconButtonsOnly === "boolean"
-        ? input.iconButtonsOnly
-        : defaults.iconButtonsOnly,
-    activeSidebarView:
-      (input?.activeSidebarView as SidebarView | undefined) ?? defaults.activeSidebarView,
-    activePanelTab: (panelTabs.some((t) => t.key === input?.activePanelTab)
-      ? (input!.activePanelTab as PanelTab)
-      // "output" era un alias di "services" — reindirizza
-      : input?.activePanelTab === "output" ? "services"
-      : defaults.activePanelTab),
-    editorGroups: groups,
-    ai: {
-      ...defaults.ai,
-      ...(input?.ai ?? {}),
-    },
-    terminal: {
-      ...defaults.terminal,
-      ...(input?.terminal ?? {}),
-      tabs: input?.terminal?.tabs?.length ? input.terminal.tabs : defaults.terminal.tabs,
-    },
-  };
-}
-
-async function hydrateGroups(
-  projectId: string,
-  state: WorkbenchState,
-  fallbackPaths: string[],
-): Promise<EditorGroupState[]> {
-  const tabsByPath = new Map<string, EditorTabState>();
-
-  for (const group of state.editorGroups) {
-    for (const tab of group.tabs) {
-      tabsByPath.set(tab.path, {
-        ...tab,
-        title: tab.title || basename(tab.path),
-        content: tab.content ?? "",
-      });
-    }
-  }
-
-  for (const path of fallbackPaths) {
-    if (!tabsByPath.has(path)) {
-      tabsByPath.set(path, makeTab(path, ""));
-    }
-  }
-
-  await Promise.all(
-    [...tabsByPath.values()].map(async (tab) => {
-      if (typeof tab.content === "string" && tab.content.length > 0) {
-        return;
-      }
-      try {
-        const response = await getProjectFile(projectId, tab.path);
-        tab.content = response.content;
-        tab.title = basename(response.path);
-      } catch {
-        tab.content = "";
-      }
-    }),
-  );
-
-  const assigned = new Set<string>();
-  const groups = state.editorGroups.map((group) => {
-    const tabs = group.tabs
-      .map((tab) => tabsByPath.get(tab.path))
-      .filter((tab): tab is EditorTabState => Boolean(tab))
-      .map((tab) => {
-        assigned.add(tab.path);
-        return tab;
-      });
-    const activePath =
-      group.activePath && tabs.some((tab) => tab.path === group.activePath)
-        ? group.activePath
-        : tabs[0]?.path ?? null;
-    return {
-      id: group.id,
-      tabs,
-      activePath,
-    };
-  });
-
-  const leftovers = [...tabsByPath.values()].filter((tab) => !assigned.has(tab.path));
-  if (leftovers.length > 0) {
-    groups[0].tabs = [...groups[0].tabs, ...leftovers];
-    if (!groups[0].activePath) {
-      groups[0].activePath = leftovers[0].path;
-    }
-  }
-
-  return groups;
-}
-
-function StatusDot({ ok, billing }: { ok: boolean | null; billing?: boolean }) {
-  const color =
-    ok === null ? "#94a3b8"
-    : ok ? "#4ade80"
-    : billing ? "#facc15"   // giallo per crediti/quota esauriti
-    : "#f87171";             // rosso per errori reali
-  return (
-    <span
-      style={{
-        display: "inline-block",
-        width: 8,
-        height: 8,
-        borderRadius: "50%",
-        background: color,
-      }}
-    />
-  );
-}
-
-function summarizeProviderReason(reason?: string): string | undefined {
-  if (!reason) return undefined;
-  const normalized = reason.replace(/\r\n/g, "\n").trim();
-  if (!normalized) return undefined;
-  const cutTokens = [
-    "\n[",
-    "\nlinks",
-    "\nviolations",
-    "\n* ",
-    " To monitor your current usage",
-    " For more information on this error",
-    " Please retry in",
-  ];
-  let shortened = normalized;
-  for (const token of cutTokens) {
-    const idx = shortened.indexOf(token);
-    if (idx > 0) {
-      shortened = shortened.slice(0, idx).trim();
-    }
-  }
-  const firstLine = shortened.split("\n")[0]?.trim() ?? shortened;
-  return firstLine.length > 220 ? `${firstLine.slice(0, 217)}...` : firstLine;
-}
-
-function providerTitle(label: string, state: ProviderHealthState): string {
-  if (state.ok === null) {
-    return `${label} stato sconosciuto`;
-  }
-  if (state.ok) {
-    return state.status ? `${label} disponibile (${state.status})` : `${label} disponibile`;
-  }
-  const message = summarizeProviderReason(state.reason);
-  if (message) {
-    return `${label} errore: ${message}`;
-  }
-  return `${label} non disponibile`;
-}
-
-function iconButton(tc: ReturnType<typeof useThemeColors>, disabled = false, active = false) {
-  return {
-    width: 30,
-    height: 30,
-    border: `1px solid ${active ? tc.accent : tc.border}`,
-    background: disabled ? tc.bgInput : active ? tc.accentBg : tc.bgCard,
-    color: disabled ? tc.textMuted : active ? tc.accent : tc.textSecondary,
-    borderRadius: 7,
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    cursor: disabled ? "not-allowed" : "pointer",
-    fontSize: 13,
-    lineHeight: 1,
-  } as const;
-}
 
 export function IdeShell({ dashboard, initialProjectId }: { dashboard: DashboardSnapshot; initialProjectId?: string }) {
   const tc = useThemeColors();
@@ -913,7 +650,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
       sessionActivePaths: string[],
     ) => {
       const normalized = normalizeWorkbenchState(state);
-      const hydratedGroups = await hydrateGroups(project.id, normalized, sessionActivePaths);
+      const hydratedGroups = await hydrateGroups(project.id, normalized, sessionActivePaths, getProjectFile);
       setLayoutMode(normalized.layoutMode);
       setPrimarySidebarVisible(normalized.primarySidebarVisible);
       setSecondarySidebarVisible(Boolean(normalized.secondarySidebarVisible));
@@ -1967,302 +1704,63 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
       }}
     >
       {/* ── Top header ─────────────────────────────────────────────────────── */}
-      <header
-        style={{
-          gridColumn: "1 / 5",
-          display: "flex",
-          alignItems: "center",
-          columnGap: 10,
-          padding: "0 12px",
-          background: tc.bgHeader,
-          borderBottom: `1px solid ${tc.border}`,
-          flexWrap: isMobileViewport ? "wrap" : "nowrap",
-          rowGap: isMobileViewport ? 6 : 0,
+      <TopBar
+        tc={tc}
+        isMobileViewport={isMobileViewport}
+        isNarrowViewport={isNarrowViewport}
+        activeProject={activeProject}
+        projects={projects}
+        layoutMode={layoutMode}
+        primarySidebarVisible={primarySidebarVisible}
+        bottomPanelVisible={bottomPanelVisible}
+        isFullscreen={isFullscreen}
+        providerStatus={providerStatus}
+        onTogglePrimarySidebar={() => setPrimarySidebarVisible((current) => !current)}
+        onToggleBottomPanel={() => setBottomPanelVisible((current) => !current)}
+        onCycleLayoutMode={cycleLayoutMode}
+        onToggleFullscreen={() => { void toggleFullscreen(); }}
+        onSelectProject={async (projectId) => {
+          await handleOpenProject(projectId);
+          window.history.replaceState(null, "", "/?project=" + projectId);
         }}
-      >
-        <a
-          href="/?site"
-          title="Vedi sito"
-          style={{
-            fontSize: 13,
-            letterSpacing: "0.08em",
-            color: tc.text,
-            fontWeight: 700,
-            textDecoration: "none",
-            cursor: "pointer",
-          }}
-        >
-          NEXUS
-        </a>
-        <TruncatedText
-          text={activeProject?.name ?? "Nessun progetto"}
-          maxWidth={220}
-          tc={tc}
-          style={{ color: tc.textMuted, fontSize: 12 }}
-        />
-        <div style={{ width: 1, height: 20, background: tc.border }} />
-        <button
-          type="button"
-          onClick={() => setPrimarySidebarVisible((current) => !current)}
-          title={primarySidebarVisible ? "Nascondi primary sidebar" : "Mostra primary sidebar"}
-          aria-label={primarySidebarVisible ? "Nascondi primary sidebar" : "Mostra primary sidebar"}
-          style={iconButton(tc, false, primarySidebarVisible)}
-        >
-          ◧
-        </button>
-        <button
-          type="button"
-          onClick={() => setBottomPanelVisible((current) => !current)}
-          title={bottomPanelVisible ? "Nascondi panel" : "Mostra panel"}
-          aria-label={bottomPanelVisible ? "Nascondi panel" : "Mostra panel"}
-          style={iconButton(tc, false, bottomPanelVisible)}
-        >
-          <span style={{ display: "inline-block", transform: "rotate(90deg)" }}>◧</span>
-        </button>
-        <button
-          type="button"
-          onClick={cycleLayoutMode}
-          title={`Cambia layout (${layoutMode})`}
-          aria-label={`Cambia layout (${layoutMode})`}
-          style={iconButton(tc)}
-        >
-          ⧉
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            void toggleFullscreen();
-          }}
-          title={isFullscreen ? "Esci da pieno schermo" : "Vai a pieno schermo"}
-          aria-label={isFullscreen ? "Esci da pieno schermo" : "Vai a pieno schermo"}
-          style={iconButton(tc, false, isFullscreen)}
-        >
-          {isFullscreen ? "🗗" : "🗖"}
-        </button>
-        <div style={{ flex: 1, minWidth: 0, order: isMobileViewport ? 10 : 0 }}>
-          <ProjectSwitcher
-            projects={projects}
-            activeProjectId={activeProject?.id}
-            compact={isMobileViewport}
-            onSelect={async (projectId) => {
-              await handleOpenProject(projectId);
-              window.history.replaceState(null, "", "/?project=" + projectId);
-            }}
-            onRegister={handleRegisterProject}
-            onRefreshProjects={async () => {
-              try {
-                const response = await getMyProjects();
-                setProjects(response.projects);
-              } catch { /* ignore */ }
-            }}
-          />
-        </div>
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            columnGap: isNarrowViewport ? 8 : 10,
-            marginLeft: 8,
-            flexShrink: 0,
-            maxWidth: isNarrowViewport ? 320 : undefined,
-            overflowX: isNarrowViewport ? "auto" : "visible",
-            paddingBottom: isNarrowViewport ? 2 : 0,
-            order: isMobileViewport ? 11 : 0,
-            flexWrap: isMobileViewport ? "wrap" : "nowrap",
-            rowGap: isMobileViewport ? 6 : 0,
-            whiteSpace: "nowrap",
-          }}
-          aria-label="Stato provider AI"
-        >
-          <ConnectionStatusBadge />
-          <span
-            title={providerTitle("OpenAI", providerStatus.openai)}
-            style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
-          >
-            <StatusDot ok={providerStatus.openai.ok} billing={providerStatus.openai.billing} />
-            {!isNarrowViewport && "OpenAI"}
-          </span>
-          <span
-            title={providerTitle("Anthropic", providerStatus.anthropic)}
-            style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
-          >
-            <StatusDot ok={providerStatus.anthropic.ok} billing={providerStatus.anthropic.billing} />
-            {!isNarrowViewport && "Anthropic"}
-          </span>
-          <span
-            title={providerTitle("Google", providerStatus.google)}
-            style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
-          >
-            <StatusDot ok={providerStatus.google.ok} billing={providerStatus.google.billing} />
-            {!isNarrowViewport && "Google"}
-          </span>
-          <span
-            title={providerTitle("DeepSeek", providerStatus.deepseek)}
-            style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
-          >
-            <StatusDot ok={providerStatus.deepseek.ok} billing={providerStatus.deepseek.billing} />
-            {!isNarrowViewport && "DeepSeek"}
-          </span>
-          <span
-            title={providerTitle("Mistral", providerStatus.mistral)}
-            style={{ display: "inline-flex", alignItems: "center", gap: 4, color: tc.textMuted, fontSize: 11 }}
-          >
-            <StatusDot ok={providerStatus.mistral.ok} billing={providerStatus.mistral.billing} />
-            {!isNarrowViewport && "Mistral"}
-          </span>
-        </div>
-      </header>
+        onRegisterProject={handleRegisterProject}
+        onRefreshProjects={async () => {
+          try {
+            const response = await getMyProjects();
+            setProjects(response.projects);
+          } catch { /* ignore */ }
+        }}
+      />
 
       {/* ── Overlay prima analisi: copre il workbench finche' l'analisi non e' completata ── */}
       {activeProject && !activeProject.isAnalyzed && (
-        <div
-          style={{
-            gridRow: "2 / 5",
-            gridColumn: "1 / 5",
-            zIndex: 100,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            background: tc.bg,
+        <FirstAnalysisOverlay
+          tc={tc}
+          analysisInProgress={analysisInProgress}
+          analysisStep={analysisStep}
+          onAnalyze={() => { if (activeProject) void runFirstAnalysis(activeProject.id); }}
+          onSkip={() => {
+            // Permetti di entrare comunque senza analisi (power user)
+            setActiveProject(prev => prev ? { ...prev, isAnalyzed: true, nexusReady: true } : prev);
           }}
-        >
-          <div style={{
-            maxWidth: 520,
-            textAlign: "center",
-            padding: 40,
-            borderRadius: 12,
-            border: `1px solid ${tc.border}`,
-            background: tc.bgCard,
-            boxShadow: "0 8px 32px rgba(0,0,0,0.18)",
-          }}>
-            <div style={{ fontSize: 36, marginBottom: 16 }}>
-              {analysisInProgress ? "⚙️" : "📂"}
-            </div>
-            <div style={{ fontSize: 16, fontWeight: 700, color: tc.text, marginBottom: 8 }}>
-              {analysisInProgress ? "Analisi in corso..." : "Progetto non analizzato"}
-            </div>
-            <div style={{ fontSize: 13, color: tc.textSecondary, marginBottom: 20, lineHeight: "1.5" }}>
-              {analysisInProgress
-                ? analysisStep || "Nexus sta analizzando la struttura del progetto, i linguaggi, i framework e le configurazioni di esecuzione."
-                : "Nexus deve analizzare il progetto prima di poter offrire le funzionalita' complete (servizi, comandi, diagnostica, AI contestuale)."}
-            </div>
-            {analysisInProgress ? (
-              <div style={{
-                height: 4,
-                borderRadius: 2,
-                background: tc.border,
-                overflow: "hidden",
-                marginBottom: 12,
-              }}>
-                <div style={{
-                  height: "100%",
-                  background: tc.accent,
-                  borderRadius: 2,
-                  animation: "nexus-analysis-progress 2s ease-in-out infinite",
-                  width: "40%",
-                }} />
-                <style>{`
-                  @keyframes nexus-analysis-progress {
-                    0% { transform: translateX(-100%); }
-                    100% { transform: translateX(350%); }
-                  }
-                `}</style>
-              </div>
-            ) : (
-              <button
-                type="button"
-                onClick={() => { if (activeProject) void runFirstAnalysis(activeProject.id); }}
-                style={{
-                  background: tc.accent,
-                  color: "#fff",
-                  border: "none",
-                  borderRadius: 8,
-                  padding: "10px 28px",
-                  fontSize: 14,
-                  fontWeight: 600,
-                  cursor: "pointer",
-                  fontFamily: "inherit",
-                }}
-              >
-                Analizza progetto
-              </button>
-            )}
-            {!analysisInProgress && (
-              <div style={{ marginTop: 12 }}>
-                <button
-                  type="button"
-                  onClick={() => {
-                    // Permetti di entrare comunque senza analisi (power user)
-                    setActiveProject(prev => prev ? { ...prev, isAnalyzed: true, nexusReady: true } : prev);
-                  }}
-                  style={{
-                    background: "transparent",
-                    color: tc.textMuted,
-                    border: "none",
-                    fontSize: 11,
-                    cursor: "pointer",
-                    textDecoration: "underline",
-                    fontFamily: "inherit",
-                  }}
-                >
-                  Salta e continua senza analisi
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
+        />
       )}
 
       {/* ── Activity bar (icon column) ─────────────────────────────────────── */}
-      <aside
-        style={{
-          gridRow: "2 / 4",
-          gridColumn: "1",
-          borderRight: `1px solid ${tc.border}`,
-          background: tc.bgSidebar,
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          gap: 8,
-          padding: "10px 6px",
+      <ActivityBar
+        tc={tc}
+        activityButtonSize={activityButtonSize}
+        activeSidebarView={activeSidebarView}
+        onSelectView={(view) => {
+          if (activeSidebarView === view && primarySidebarVisible) {
+            // Clic sulla voce già attiva → chiude il pannello (toggle)
+            setPrimarySidebarVisible(false);
+          } else {
+            setActiveSidebarView(view);
+            setPrimarySidebarVisible(true);
+          }
         }}
-      >
-        {sidebarItems.map((item) => (
-          <button
-            key={item.key}
-            onClick={() => {
-              if (activeSidebarView === item.key && primarySidebarVisible) {
-                // Clic sulla voce già attiva → chiude il pannello (toggle)
-                setPrimarySidebarVisible(false);
-              } else {
-                setActiveSidebarView(item.key);
-                setPrimarySidebarVisible(true);
-              }
-            }}
-            title={item.label}
-            aria-label={item.label}
-            style={{
-              width: activityButtonSize,
-              height: activityButtonSize,
-              borderRadius: 8,
-              border: `1px solid ${activeSidebarView === item.key ? tc.accent : tc.border}`,
-              background: activeSidebarView === item.key ? tc.accentBg : "transparent",
-              color: activeSidebarView === item.key ? tc.accent : tc.textSecondary,
-              cursor: "pointer",
-              fontWeight: 700,
-              fontSize: 14,
-            }}
-          >
-            {item.icon}
-          </button>
-        ))}
-
-        {/* Spacer per spingere il menu utente in fondo */}
-        <div style={{ flex: 1 }} />
-
-        {/* Menu utente in fondo alla activity bar */}
-        <UserSidebarMenu buttonSize={activityButtonSize} tc={tc} />
-      </aside>
+      />
 
       {/* ── Primary sidebar ───────────────────────────────────────────────── */}
       <section
@@ -2450,38 +1948,14 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
           gridTemplateRows: "34px 1fr",
         }}
       >
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            borderBottom: `1px solid ${tc.border}`,
-            background: tc.bgHeader,
-            overflowX: "auto",
-          }}
-        >
-          {panelTabs.map((tab) => (
-            <PanelTabButton
-              key={tab.key}
-              tab={tab}
-              active={activePanelTab === tab.key}
-              tc={tc}
-              isMobileViewport={isMobileViewport}
-              onSelect={() => setActivePanelTab(tab.key)}
-            />
-          ))}
-          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8, paddingRight: 12 }}>
-            {activeProject && <QuotaBadge projectId={activeProject.id} />}
-            <button
-              type="button"
-              onClick={() => setBottomPanelVisible(false)}
-              title="Nascondi panel"
-              aria-label="Nascondi panel"
-              style={iconButton(tc)}
-            >
-              ✕
-            </button>
-          </div>
-        </div>
+        <BottomPanelHeader
+          tc={tc}
+          isMobileViewport={isMobileViewport}
+          activePanelTab={activePanelTab}
+          activeProject={activeProject}
+          onSelectTab={(tab) => setActivePanelTab(tab)}
+          onHide={() => setBottomPanelVisible(false)}
+        />
         <div style={{ minHeight: 0, overflow: "hidden" }}>
           <BottomPanelManager
             activePanelTab={activePanelTab}
@@ -2584,226 +2058,23 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
       </section>
 
       {/* ── Status bar ────────────────────────────────────────────────────── */}
-      <footer
-        style={{
-          gridColumn: "1 / 5",
-          gridRow: "4",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          padding: "0 10px",
-          borderTop: `1px solid ${tc.border}`,
-          background: tc.bgHeader,
-          color: tc.textMuted,
-          fontSize: 11,
-        }}
-      >
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <span>{currentBranch}</span>
-          <span>{activeProject?.name ?? "nessun progetto"}</span>
-          <span>{layoutMode}</span>
-          <span>{problemCount} problemi</span>
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <span>UTF-8</span>
-          <span>LF</span>
-          <span title={liveHealth.database ? "Database online" : "Database offline"} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-            <StatusDot ok={liveHealth.database} />
-            DB
-          </span>
-          <span title={liveHealth.redis ? "Redis online" : "Redis offline"} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-            <StatusDot ok={liveHealth.redis} />
-            Redis
-          </span>
-          <span title={
-            liveHealth.neural_core && liveHealth.brain_rest
-              ? "Brain (Python LangGraph) online — gRPC + REST ok"
-              : !liveHealth.neural_core && !liveHealth.brain_rest
-                ? "Brain offline — gRPC e REST irraggiungibili"
-                : !liveHealth.brain_rest
-                  ? "Brain REST (:8001) offline — gli agent run non funzioneranno"
-                  : "Brain gRPC (:50051) offline — la chat potrebbe non rispondere"
-          } style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-            <StatusDot ok={liveHealth.neural_core && !!liveHealth.brain_rest} />
-            Brain
-          </span>
-          <span title={liveHealth.tools_grpc ? "MCP Tools (gRPC :50071) online" : "MCP Tools offline — l'AI non potrà eseguire tool (read_file, str_replace, ecc.)"} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-            <StatusDot ok={!!liveHealth.tools_grpc} />
-            Tools
-          </span>
-        </div>
-      </footer>
+      <StatusBar
+        tc={tc}
+        currentBranch={currentBranch}
+        projectName={activeProject?.name ?? "nessun progetto"}
+        layoutMode={layoutMode}
+        problemCount={problemCount}
+        liveHealth={liveHealth}
+      />
 
       {/* ── Overlays ──────────────────────────────────────────────────────── */}
-      {projectBusy && (
-        <div
-          style={{
-            position: "fixed",
-            top: 12,
-            right: 12,
-            padding: "8px 12px",
-            borderRadius: 8,
-            background: tc.bgCard,
-            border: `1px solid ${tc.border}`,
-            color: tc.text,
-            fontSize: 12,
-          }}
-        >
-          Caricamento progetto...
-        </div>
-      )}
-
-      {projectError && (
-        <div
-          style={{
-            position: "fixed",
-            bottom: 36,
-            right: 12,
-            maxWidth: 520,
-            padding: "8px 12px",
-            borderRadius: 8,
-            background: `${tc.error}18`,
-            border: `1px solid ${tc.error}`,
-            color: tc.error,
-            fontSize: 12,
-            zIndex: 10,
-          }}
-        >
-          {projectError}
-        </div>
-      )}
-
-      {/* Banner Brain offline — visibile e prominente */}
-      {(!liveHealth.neural_core || !liveHealth.brain_rest) && (
-        <div
-          style={{
-            position: "fixed",
-            top: 38,
-            left: "50%",
-            transform: "translateX(-50%)",
-            padding: "8px 20px",
-            borderRadius: 8,
-            background: "#dc2626",
-            color: "#fff",
-            fontSize: 13,
-            fontWeight: 600,
-            zIndex: 9999,
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            boxShadow: "0 4px 12px rgba(220,38,38,0.4)",
-          }}
-        >
-          <span style={{ fontSize: 16 }}>!</span>
-          {!liveHealth.neural_core && !liveHealth.brain_rest
-            ? "Brain offline — la chat e gli agent run non funzioneranno"
-            : !liveHealth.brain_rest
-              ? "Brain REST offline — gli agent run non funzioneranno"
-              : "Brain gRPC offline — la chat potrebbe non rispondere"}
-        </div>
-      )}
+      <ShellOverlays
+        tc={tc}
+        projectBusy={projectBusy}
+        projectError={projectError}
+        liveHealth={liveHealth}
+      />
       <ToastStack />
     </main>
-  );
-}
-
-/**
- * Singolo tab del PanelDock con highlight effect quando dispatcher emette
- * HighlightPanel per la sua key.
- */
-function PanelTabButton({
-  tab,
-  active,
-  tc,
-  isMobileViewport,
-  onSelect,
-}: {
-  tab: { key: PanelTab; label: string };
-  active: boolean;
-  tc: ReturnType<typeof useThemeColors>;
-  isMobileViewport: boolean;
-  onSelect: () => void;
-}) {
-  const highlighted = usePanelHighlight(tab.key);
-  return (
-    <button
-      onClick={onSelect}
-      style={{
-        border: "none",
-        borderRight: `1px solid ${tc.border}`,
-        background: highlighted
-          ? "rgba(245,158,11,0.25)"
-          : active
-            ? tc.bg
-            : "transparent",
-        color: active ? tc.text : tc.textMuted,
-        padding: isMobileViewport ? "0 8px" : "0 14px",
-        height: "100%",
-        cursor: "pointer",
-        fontSize: isMobileViewport ? 11 : 12,
-        whiteSpace: "nowrap",
-        flexShrink: 0,
-        transition: "background-color 200ms ease-out",
-        boxShadow: highlighted ? "inset 0 -2px 0 #f59e0b" : "none",
-      }}
-    >
-      {tab.label}
-    </button>
-  );
-}
-
-// ── Tab bar pannello destro: switcha tra Editor (file Monaco) e SQL (pannello
-// gestore query). Vedi listener `nexus:sql:open` in ide-shell che imposta
-// rightView="sql" su richiesta dalla chat.
-function RightViewTabs({
-  rightView,
-  setRightView,
-  tc,
-}: {
-  rightView: "editor" | "sql";
-  setRightView: (v: "editor" | "sql") => void;
-  tc: ReturnType<typeof useThemeColors>;
-}) {
-  const Tab = ({
-    label,
-    active,
-    onClick,
-  }: {
-    label: string;
-    active: boolean;
-    onClick: () => void;
-  }) => (
-    <button
-      type="button"
-      onClick={onClick}
-      style={{
-        padding: "0 12px",
-        height: "100%",
-        background: active ? tc.bgActive : "transparent",
-        color: active ? tc.text : tc.textMuted,
-        border: "none",
-        borderRight: `1px solid ${tc.border}`,
-        cursor: "pointer",
-        fontSize: 12,
-        fontWeight: active ? 600 : 400,
-        whiteSpace: "nowrap",
-      }}
-    >
-      {label}
-    </button>
-  );
-  return (
-    <div
-      style={{
-        display: "flex",
-        alignItems: "stretch",
-        borderBottom: `1px solid ${tc.border}`,
-        background: tc.bgSidebar,
-        fontSize: 12,
-      }}
-    >
-      <Tab label="Editor" active={rightView === "editor"} onClick={() => setRightView("editor")} />
-      <Tab label="SQL" active={rightView === "sql"} onClick={() => setRightView("sql")} />
-    </div>
   );
 }

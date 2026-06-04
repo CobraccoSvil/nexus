@@ -11,7 +11,7 @@ source_files:
   - crates/mcp-core/src/meta_docs/generators/concepts.rs
 auto_generated: true
 created_at: 2026-05-23T11:08:58Z
-updated_at: 2026-06-04T08:31:40Z
+updated_at: 2026-06-04T08:41:44Z
 nexus_meta_version: 1
 ---
 
