@@ -434,14 +434,57 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
 
     if preflight_enabled {
         if let Some(missing) = preflight_check_chromium_libs().await {
-            return format!(
-                "[run_playwright_tests] BLOCKED — chromium-headless-shell non puo' avviarsi: {} librerie di sistema mancanti.\n\n\
-                Librerie not found dal binary: {}\n\n\
-                FIX:\n  sudo apt-get install -y libnspr4 libnss3 libnssutil3 libasound2t64 libxss1 libgbm1 libgtk-3-0 libpangocairo-1.0-0 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libxshmfence1\n\n\
-                Oppure: cd {} && npx playwright install-deps chromium\n\n\
-                Nessun processo Playwright e' stato lanciato. Una volta installate le librerie ritenta il run.",
-                missing.len(), missing.join(", "), root.display()
-            );
+            // ADR 0017: se Sudo Manager e' installato + purpose
+            // `playwright-install-deps` e' executable, tentiamo l'autofix.
+            let auto_installed = match crate::sudo_manager::is_executable(
+                &ctx.db, "playwright-install-deps",
+            ).await {
+                Ok(true) => {
+                    tracing::info!(
+                        "preflight: tentativo autofix via sudo_manager::execute(playwright-install-deps), {} libs mancanti",
+                        missing.len()
+                    );
+                    match crate::sudo_manager::execute(&ctx.db, "playwright-install-deps").await {
+                        Ok(o) if o.success => {
+                            tracing::info!(
+                                "preflight: autofix completato (exit=0, duration_ms={}), rivalidazione ldd",
+                                o.duration_ms
+                            );
+                            // Rivalida: se ora le librerie sono presenti, ok.
+                            preflight_check_chromium_libs().await.is_none()
+                        }
+                        Ok(o) => {
+                            tracing::warn!(
+                                "preflight: autofix exit_code={} stderr_excerpt={}",
+                                o.exit_code,
+                                o.stderr.chars().take(200).collect::<String>()
+                            );
+                            false
+                        }
+                        Err(e) => {
+                            tracing::warn!("preflight: sudo_manager::execute fallita: {}", e);
+                            false
+                        }
+                    }
+                }
+                _ => false,
+            };
+
+            if !auto_installed {
+                return format!(
+                    "[run_playwright_tests] BLOCKED — chromium-headless-shell non puo' avviarsi: {} librerie di sistema mancanti.\n\n\
+                    Librerie not found dal binary: {}\n\n\
+                    FIX (uno qualunque):\n\
+                      (1) ADR 0017 Sudo Manager: bash deploy/install-sudo-manager.sh\n\
+                          poi Admin UI -> Sudo Manager -> Esegui 'playwright-install-deps'\n\
+                          (oppure il preflight riprovera' da solo al prossimo run)\n\
+                      (2) Manuale: sudo apt-get install -y libnspr4 libnss3 libnssutil3 libasound2t64 libxss1 libgbm1 libgtk-3-0 libpangocairo-1.0-0 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libxshmfence1\n\
+                      (3) Playwright nativo: cd {} && npx playwright install-deps chromium\n\n\
+                    Nessun processo Playwright e' stato lanciato (zero job zombie).",
+                    missing.len(), missing.join(", "), root.display()
+                );
+            }
+            tracing::info!("preflight: autofix riuscito, procedo con il run playwright");
         }
     }
 

@@ -6,12 +6,12 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: 9589dff4464951c4c27a821246c0fdce1d5f7aa3
+source_commit: 171c2da1220f4e3ea87358c54516a91feafa8061
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T09:08:52Z
+updated_at: 2026-06-04T09:20:41Z
 nexus_meta_version: 1
 ---
 
@@ -300,7 +300,8 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0286_rag_pipeline_completion.sql` | Migrazione 0285 — ADR 0016: completamento pipeline RAG strutturale + safety net. |
 | `0287_agent_tool_result_cache.sql` | Migrazione 0287 — ADR 0016 Fase A.5: cache tool_result via Postgres. |
 | `0288_playwright_preflight_setting.sql` | Migrazione 0288 — Pre-flight check librerie chromium-headless-shell. |
+| `0289_sudo_manager.sql` | Migrazione 0289 — Sudo Manager Livello 1 (whitelist). |
 
-**Totale**: 279 migrazioni.
+**Totale**: 280 migrazioni.
 
-Ultima migrazione: `0288_playwright_preflight_setting.sql`.
+Ultima migrazione: `0289_sudo_manager.sql`.

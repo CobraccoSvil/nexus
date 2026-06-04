@@ -71,6 +71,10 @@ const nextConfig: NextConfig = {
         destination: `${backend}/api/admin/vector/:path*`,
       },
       {
+        source: "/api/admin/sudo/:path*",
+        destination: `${backend}/api/admin/sudo/:path*`,
+      },
+      {
         source: "/api/admin/:path*",
         destination: `${adminService}/api/admin/:path*`,
       },

@@ -140,6 +140,46 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
                 middleware::require_admin,
             )),
         )
+        // ─── Sudo Manager (ADR 0017 Livello 1) ───────────────────────────
+        .route(
+            "/api/admin/sudo/status",
+            get(sudo_routes::admin_sudo_status).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_admin,
+            )),
+        )
+        .route(
+            "/api/admin/sudo/purposes",
+            get(sudo_routes::admin_sudo_list_purposes)
+                .post(sudo_routes::admin_sudo_create_purpose)
+                .layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
+        )
+        .route(
+            "/api/admin/sudo/purposes/:id",
+            axum::routing::patch(sudo_routes::admin_sudo_patch_purpose)
+                .delete(sudo_routes::admin_sudo_delete_purpose)
+                .layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_admin,
+                )),
+        )
+        .route(
+            "/api/admin/sudo/execute",
+            post(sudo_routes::admin_sudo_execute).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_admin,
+            )),
+        )
+        .route(
+            "/api/admin/sudo/audit",
+            get(sudo_routes::admin_sudo_audit).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_admin,
+            )),
+        )
         .route(
             "/api/admin/learning/projects/:id/retrain-routing",
             post(chat_learning::admin_retrain_project_routing).layer(axum_mw::from_fn_with_state(

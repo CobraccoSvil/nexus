@@ -6,12 +6,12 @@ slug: postgres-tables
 tags:
   - schema
   - postgres
-source_commit: 9589dff4464951c4c27a821246c0fdce1d5f7aa3
+source_commit: 171c2da1220f4e3ea87358c54516a91feafa8061
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T09:08:52Z
+updated_at: 2026-06-04T09:20:41Z
 nexus_meta_version: 1
 ---
 
@@ -1205,6 +1205,36 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `source` | text | NO | `'db'::text` |
 | `created_at` | timestamp with time zone | NO | `now()` |
 | `completed_at` | timestamp with time zone | YES | `—` |
+
+## `nexus_sudo_audit_log`
+
+| Colonna | Tipo | Nullable | Default |
+|---|---|---|---|
+| `id` | uuid | NO | `gen_random_uuid()` |
+| `purpose_name` | text | NO | `—` |
+| `full_command` | text | NO | `—` |
+| `requested_by_service` | text | YES | `—` |
+| `requested_by_user` | text | YES | `—` |
+| `exit_code` | integer | YES | `—` |
+| `stdout_excerpt` | text | YES | `—` |
+| `stderr_excerpt` | text | YES | `—` |
+| `duration_ms` | integer | YES | `—` |
+| `executed_at` | timestamp with time zone | NO | `now()` |
+
+## `nexus_sudo_purposes`
+
+| Colonna | Tipo | Nullable | Default |
+|---|---|---|---|
+| `id` | uuid | NO | `gen_random_uuid()` |
+| `name` | text | NO | `—` |
+| `description` | text | NO | `—` |
+| `command_template` | text | NO | `—` |
+| `requires_confirm` | boolean | NO | `true` |
+| `enabled` | boolean | NO | `true` |
+| `category` | text | NO | `'general'::text` |
+| `created_by` | text | NO | `'system'::text` |
+| `created_at` | timestamp with time zone | NO | `now()` |
+| `updated_at` | timestamp with time zone | NO | `now()` |
 
 ## `orchestrator_audit_events`
 

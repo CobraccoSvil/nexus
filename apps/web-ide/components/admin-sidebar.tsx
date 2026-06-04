@@ -78,6 +78,7 @@ export function AdminSidebar({
         { label: t("admin.language"), href: "/admin/language" as Route, icon: "L" },
         { label: "Processi Lunghi", href: "/admin/long-running" as Route, icon: "PL" },
         { label: "Browser Bridge", href: "/admin/browser-bridge" as Route, icon: "BB" },
+        { label: "Sudo Manager", href: "/admin/sudo-manager" as Route, icon: "SM" },
       ],
     },
   ];

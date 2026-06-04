@@ -15,6 +15,7 @@
 export * from "./api/_shared";
 export * from "./api/system";
 export * from "./api/admin-settings";
+export * from "./api/admin-sudo";
 export * from "./api/prompts";
 export * from "./api/chat";
 export * from "./api/agent";

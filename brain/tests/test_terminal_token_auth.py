@@ -18,6 +18,7 @@ import json
 import time
 
 from brain.grpc_server import main
+from brain.grpc_server import runtime
 
 _SECRET = "test-terminal-secret"
 
@@ -42,9 +43,12 @@ def _claims(root: str, cwd: str) -> dict:
 
 
 def _patch(monkeypatch, allowed_roots, registered_roots):
-    monkeypatch.setattr(main, "_terminal_secret", lambda: _SECRET)
-    monkeypatch.setattr(main, "_allowed_roots", lambda: list(allowed_roots))
-    monkeypatch.setattr(main, "_registered_project_roots", lambda: set(registered_roots))
+    # Le funzioni di sicurezza terminale vivono ora in brain.grpc_server.runtime
+    # (main le re-esporta). Si patcha il modulo dove sono effettivamente
+    # definite/chiamate: _verify_terminal_token risolve i nomi nel namespace runtime.
+    monkeypatch.setattr(runtime, "_terminal_secret", lambda: _SECRET)
+    monkeypatch.setattr(runtime, "_allowed_roots", lambda: list(allowed_roots))
+    monkeypatch.setattr(runtime, "_registered_project_roots", lambda: set(registered_roots))
 
 
 def test_registered_root_outside_perimeter_is_authorized(monkeypatch, tmp_path):

@@ -2288,6 +2288,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-sudo-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "regex",
+ "sqlx",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "nexus-types"
 version = "0.1.0"
 dependencies = [

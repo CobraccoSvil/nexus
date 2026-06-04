@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: 9589dff4464951c4c27a821246c0fdce1d5f7aa3
+source_commit: 171c2da1220f4e3ea87358c54516a91feafa8061
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T09:08:53Z
+updated_at: 2026-06-04T09:20:43Z
 nexus_meta_version: 1
 ---
 
@@ -116,6 +116,9 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.reflection_cfg_ttl_seconds` | `60` | TTL cache reflection_config (H-52) |
 | `agent_router_enabled` | `true` | Abilita il server gRPC AgentRouter (porta 50072) che espone il router Q-Learning di nexus-orchestrator al brain Python. Quando attivo, il router_node consulta il Q-Learning per scegliere il profilo agente ottimale (es. coder, cloud_architect, tech_writer) in base alla cronologia dei reward osservati. Se disabilitato il brain usa il routing di fallback basato solo sull'intent. Richiede riavvio di mcp-core per applicare la modifica. |
 | `agent.subagent.default_max_iterations` | `25` | Max iterations default per subagent (H-50, era in yaml loader) |
+| `agent.sudo.audit_excerpt_max_bytes` | `4096` | Limite (bytes) di stdout/stderr troncati salvati in nexus_sudo_audit_log. Default 4096. |
+| `agent.sudo.manager_enabled` | `true` | Se true, mcp-core puo' invocare sudo_manager::execute per i purpose nella whitelist. Disattiva (false) per smoke test o ambienti dove sudoers.d non e' configurato. |
+| `agent.sudo.runner_path` | `/usr/local/bin/nexus-sudo-runner` | Path assoluto del binary nexus-sudo-runner. Modificabile se installato in path diverso (utili per multi-tenant). Configurato in /etc/sudoers.d/nexus-runner. |
 | `agent.summarizer.keep_recent` | `6` | Numero messaggi recenti preservati integralmente in summarization (H-47) |
 | `agent.summarizer.max_tokens` | `800` | max_tokens per summarization (H-48) |
 | `agent.summarizer.temperature` | `0.0` | Temperature LLM call summarizer (H-49 b) |
@@ -624,7 +627,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `default_model` | `claude-sonnet-4-6` | Default model for chat |
 | `default_provider` | `anthropic` | Default LLM provider |
 | `max_token_budget` | `32000` | Maximum token budget allowed |
-| `model_catalog_last_sync` | `2026-06-04T07:52:57.731627796+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
+| `model_catalog_last_sync` | `2026-06-04T09:13:37.576591125+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
 | `nexus_active_routing_pct` | `50` | Percentuale di richieste chat gestite dal router Q-Learning Nexus (0=off, 100=tutto). A/B testing: imposta 10-50 per un rollout graduale. |
 | `nexus_behavior_mode` | `dinamico` | Modalità comportamento Nexus: veloce|economica|bilanciata|approfondita |
 | `provider_hierarchy` | `anthropic,openai,google,deepseek,mistral` | Ordered fallback chain for chat providers |
@@ -713,4 +716,4 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 ---
 
-**Totale chiavi**: 511
+**Totale chiavi**: 514

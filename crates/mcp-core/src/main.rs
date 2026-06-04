@@ -76,6 +76,8 @@ mod sandbox;
 mod security;
 mod services_watchdog;
 mod settings;
+mod sudo_manager;
+mod sudo_routes;
 mod task_watchdog;
 mod tool_runner_server;
 mod vector_memory;
