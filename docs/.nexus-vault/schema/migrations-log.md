@@ -6,12 +6,12 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: a1dd3a174318e8a92a0808d9e39a37ac06afdf8a
+source_commit: ee22019f4f5739771259bbb3e71a653a058ebebb
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T04:27:55Z
+updated_at: 2026-06-04T08:05:29Z
 nexus_meta_version: 1
 ---
 
@@ -297,7 +297,9 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0283_wiki_backfill_revisions.sql` | Migrazione 0283: fase MIGRATE dell'unificazione wiki. |
 | `0284_wiki_unified_view.sql` | Migrazione 0284: VIEW unificata wiki_docs (read-only). |
 | `0285_fk_indexes.sql` | 0285: indici sulle foreign key prive di indice di supporto. |
+| `0286_rag_pipeline_completion.sql` | Migrazione 0285 — ADR 0016: completamento pipeline RAG strutturale + safety net. |
+| `0287_agent_tool_result_cache.sql` | Migrazione 0287 — ADR 0016 Fase A.5: cache tool_result via Postgres. |
 
-**Totale**: 276 migrazioni.
+**Totale**: 278 migrazioni.
 
-Ultima migrazione: `0285_fk_indexes.sql`.
+Ultima migrazione: `0287_agent_tool_result_cache.sql`.

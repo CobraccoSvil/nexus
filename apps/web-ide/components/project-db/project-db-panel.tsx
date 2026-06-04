@@ -6,7 +6,6 @@ import {
   useProjectStore,
   selectDbConfigUpdatedAt,
   selectMigrationsChangedAt,
-  selectDatabaseQueries,
 } from "../../lib/project-dispatcher/store";
 import {
   listProjectMigrations,
@@ -28,77 +27,23 @@ import {
   type ProjectDbConnection,
   type UserProjectDetails,
 } from "../../lib/api-client";
+import { useGlobalDialog } from "../global-dialog-provider";
+import {
+  statusColorMap,
+  parseConnectionString,
+  type ConnFields,
+  type DetectedConfig,
+} from "./db-helpers";
+import { CreateDbWizard } from "./create-db-wizard";
+import { ConnectionForm } from "./connection-form";
+import { DetectConfig } from "./detect-config";
+import { ConnectionList } from "./connection-list";
+import { MigrationsSection } from "./migrations-section";
+import { RecentQueriesSection } from "./recent-queries-section";
 
 interface Props {
   project: UserProjectDetails | null;
 }
-
-const statusColorMap: Record<string, string> = {
-  applied: "#22c55e",
-  pending: "#f59e0b",
-  failed: "#ef4444",
-  rolled_back: "#6b7280",
-  overridden: "#8b5cf6",
-};
-
-/** Classifica l'errore di test-connection per proporre azioni mirate.
- *  - `unreachable`: host/porta non raggiungibili (connection refused, timeout, DNS).
- *  - `no_database` : il database non esiste sul server (es. "database X does not exist").
- *  - `auth_failed` : credenziali sbagliate (password authentication failed, role does not exist).
- *  - `tables_missing`: connessione OK ma schema vuoto (table_count=0 senza migrazioni applicate).
- *  - `unknown`     : tutto il resto (errore SQL generico, sintassi, permessi su singolo oggetto).
- */
-type DbErrorCategory = "unreachable" | "no_database" | "auth_failed" | "tables_missing" | "unknown";
-function categorizeDbError(error: string | null | undefined, tableCount?: number | null): DbErrorCategory {
-  if ((tableCount ?? -1) === 0) return "tables_missing";
-  if (!error) return "unknown";
-  const lower = error.toLowerCase();
-  if (
-    lower.includes("connection refused") ||
-    lower.includes("connessione rifiutata") ||
-    lower.includes("no route to host") ||
-    lower.includes("network is unreachable") ||
-    lower.includes("lookup address information") ||
-    lower.includes("name or service not known") ||
-    lower.includes("could not connect") ||
-    lower.includes("timed out") ||
-    lower.includes("timeout") ||
-    lower.includes("server closed the connection")
-  ) return "unreachable";
-  if (
-    lower.includes("does not exist") && (lower.includes("database") || lower.includes("3d000")) ||
-    lower.includes("unknown database") ||
-    lower.includes("no such database")
-  ) return "no_database";
-  if (
-    lower.includes("password authentication failed") ||
-    lower.includes("authentication failed") ||
-    lower.includes("role") && lower.includes("does not exist") ||
-    lower.includes("access denied") ||
-    lower.includes("28p01") ||
-    lower.includes("28000")
-  ) return "auth_failed";
-  return "unknown";
-}
-
-/** Estrae host/port/db/user da una connection string semplificata. */
-function parseConnPartsForActions(connStr: string): { host: string; port: string; database: string } | null {
-  // postgres://user:pass@host:port/dbname o postgresql:// ; mysql:// ; mssql:// ; ecc.
-  const m = connStr.match(/^[a-z]+:\/\/(?:[^@]+@)?([^:/]+)(?::(\d+))?(?:\/([^?]+))?/i);
-  if (!m) return null;
-  return { host: m[1] ?? "", port: m[2] ?? "", database: (m[3] ?? "").split("?")[0] ?? "" };
-}
-
-/** Lista di host candidati quando il primo è unreachable (es. localhost dev → server prod). */
-function alternativeHostsFor(currentHost: string): string[] {
-  const local = ["localhost", "127.0.0.1", "::1"];
-  if (local.includes(currentHost)) return ["192.168.0.6", "192.168.0.3"];
-  if (currentHost === "192.168.0.6") return ["192.168.0.3", "localhost"];
-  if (currentHost === "192.168.0.3") return ["192.168.0.6", "localhost"];
-  return ["localhost", "192.168.0.6", "192.168.0.3"].filter((h) => h !== currentHost);
-}
-
-import { useGlobalDialog } from "../global-dialog-provider";
 
 export function ProjectDbPanel({ project }: Props) {
   const tc = useThemeColors();
@@ -165,14 +110,7 @@ export function ProjectDbPanel({ project }: Props) {
   const [connTestResults, setConnTestResults] = useState<Record<string, ProjectDbTestResult>>({});
   const [connTestingId, setConnTestingId] = useState<string | null>(null);
   const [connections, setConnections] = useState<ProjectDbConnection[]>([]);
-  const [detectedConfig, setDetectedConfig] = useState<{
-    engine?: string;
-    hosting_mode?: string;
-    migration_tool?: string;
-    migration_path?: string;
-    connection_string?: string;
-    hints: string[];
-  } | null>(null);
+  const [detectedConfig, setDetectedConfig] = useState<DetectedConfig | null>(null);
   const [detectedTestResult, setDetectedTestResult] = useState<ProjectDbTestResult | null>(null);
 
   // Wizard "Crea database": guida l utente su DOVE (internal/external) e COME (nome/engine).
@@ -182,7 +120,7 @@ export function ProjectDbPanel({ project }: Props) {
   const [provName, setProvName] = useState("primary");
   const [provDbName, setProvDbName] = useState("");
   const [provEngine, setProvEngine] = useState("postgres");
-  const [provExt, setProvExt] = useState({ host: "localhost", port: "5432", database: "", username: "", password: "" });
+  const [provExt, setProvExt] = useState<ConnFields>({ host: "localhost", port: "5432", database: "", username: "", password: "" });
   const [provBusy, setProvBusy] = useState(false);
   const [provResult, setProvResult] = useState<{ ok: boolean; message: string } | null>(null);
 
@@ -379,30 +317,6 @@ export function ProjectDbPanel({ project }: Props) {
   const isConfigured = !!config?.engine;
 
   const primaryConn = connections.find((c) => c.is_primary) ?? connections[0] ?? null;
-
-  // Parser per estrarre host/port/db/user/pass da una connection string
-  const parseConnectionString = (raw: string): { host: string; port: string; database: string; username: string; password: string } | null => {
-    const trimmed = raw.trim();
-    // Formato URL: postgres://user:pass@host:port/db
-    const urlMatch = trimmed.match(/^(?:postgres(?:ql)?|mysql):\/\/([^:]+):([^@]*)@([^:/?]+):?(\d+)?\/(.+)$/);
-    if (urlMatch) {
-      return { username: urlMatch[1], password: decodeURIComponent(urlMatch[2]), host: urlMatch[3], port: urlMatch[4] || "5432", database: urlMatch[5] };
-    }
-    // Formato ADO.NET: Host=...;Port=...;...
-    if (/[Hh]ost=|[Ss]erver=|[Dd]atabase=/.test(trimmed)) {
-      const get = (key: string) => {
-        const m = trimmed.match(new RegExp(`${key}\\s*=\\s*([^;]*)`, "i"));
-        return m ? m[1].trim() : "";
-      };
-      const host = get("Host") || get("Server") || get("Data Source");
-      const port = get("Port") || "5432";
-      const database = get("Database") || get("Initial Catalog");
-      const username = get("Username") || get("User Id") || get("User");
-      const password = get("Password");
-      if (host || database) return { host, port, database, username, password };
-    }
-    return null;
-  };
 
   const handleEditConfig = (conn?: ProjectDbConnection | null) => {
     const source = conn ?? primaryConn;
@@ -730,958 +644,46 @@ export function ProjectDbPanel({ project }: Props) {
       </div>
 
       <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
-      {showProvision && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            zIndex: 1000,
-            background: "rgba(0,0,0,0.55)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 16,
-          }}
-          onClick={() => { if (!provBusy) setShowProvision(false); }}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              width: 480,
-              maxWidth: "100%",
-              maxHeight: "90vh",
-              overflow: "auto",
-              background: tc.bgCard,
-              border: `1px solid ${tc.border}`,
-              borderRadius: 10,
-              padding: 16,
-              display: "flex",
-              flexDirection: "column",
-              gap: 12,
-            }}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <div style={{ fontSize: 14, fontWeight: 700, color: tc.text }}>Crea database</div>
-              <button
-                type="button"
-                onClick={() => { if (!provBusy) setShowProvision(false); }}
-                style={{ border: "none", background: "transparent", color: tc.textMuted, cursor: "pointer", fontSize: 16, lineHeight: 1 }}
-              >
-                x
-              </button>
-            </div>
+        {showProvision && (
+          <CreateDbWizard
+            tc={tc}
+            provStep={provStep}
+            setProvStep={setProvStep}
+            provMode={provMode}
+            setProvMode={setProvMode}
+            provName={provName}
+            setProvName={setProvName}
+            provDbName={provDbName}
+            setProvDbName={setProvDbName}
+            provEngine={provEngine}
+            setProvEngine={setProvEngine}
+            provExt={provExt}
+            setProvExt={setProvExt}
+            provBusy={provBusy}
+            provResult={provResult}
+            slugSuggestion={slugSuggestion}
+            onClose={() => setShowProvision(false)}
+            onProvision={() => void handleProvision()}
+          />
+        )}
 
-            <div style={{ display: "flex", gap: 8, fontSize: 11 }}>
-              <span style={{ color: provStep === "where" ? tc.accent : tc.textMuted, fontWeight: 700 }}>1. Dove</span>
-              <span style={{ color: tc.textMuted }}>-</span>
-              <span style={{ color: provStep === "how" ? tc.accent : tc.textMuted, fontWeight: 700 }}>2. Come</span>
-            </div>
-
-            {provStep === "where" && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                <button
-                  type="button"
-                  onClick={() => { setProvMode("internal"); setProvEngine("postgres"); }}
-                  style={{
-                    textAlign: "left",
-                    padding: 12,
-                    borderRadius: 8,
-                    border: `2px solid ${provMode === "internal" ? tc.accent : tc.border}`,
-                    background: provMode === "internal" ? `${tc.accent}12` : "transparent",
-                    color: tc.text,
-                    cursor: "pointer",
-                  }}
-                >
-                  <div style={{ fontSize: 12, fontWeight: 700 }}>Container dedicato (Nexus)</div>
-                  <div style={{ fontSize: 11, color: tc.textSecondary, marginTop: 4 }}>
-                    Nexus crea un PostgreSQL isolato per questo progetto nel cluster dedicato.
-                    Nessuna credenziale richiesta: il database e separato da quelli degli altri progetti.
-                  </div>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setProvMode("external")}
-                  style={{
-                    textAlign: "left",
-                    padding: 12,
-                    borderRadius: 8,
-                    border: `2px solid ${provMode === "external" ? tc.accent : tc.border}`,
-                    background: provMode === "external" ? `${tc.accent}12` : "transparent",
-                    color: tc.text,
-                    cursor: "pointer",
-                  }}
-                >
-                  <div style={{ fontSize: 12, fontWeight: 700 }}>Database esterno</div>
-                  <div style={{ fontSize: 11, color: tc.textSecondary, marginTop: 4 }}>
-                    Usa un database gia esistente fornendo host, porta e credenziali.
-                    La connessione viene testata prima di essere registrata.
-                  </div>
-                </button>
-              </div>
-            )}
-
-            {provStep === "how" && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  <label style={{ fontSize: 10, color: tc.textMuted }}>Nome connessione logica</label>
-                  <input
-                    type="text"
-                    value={provName}
-                    placeholder="primary"
-                    onChange={(e) => setProvName(e.target.value)}
-                    style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-                  />
-                </div>
-
-                {provMode === "internal" && (
-                  <>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                      <label style={{ fontSize: 10, color: tc.textMuted }}>Nome del database</label>
-                      <input
-                        type="text"
-                        value={provDbName}
-                        placeholder={slugSuggestion}
-                        onChange={(e) => setProvDbName(e.target.value)}
-                        style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-                      />
-                      <div style={{ fontSize: 10, color: tc.textMuted }}>
-                        Suggerito dallo slug del progetto. Caratteri non validi vengono sostituiti con underscore.
-                      </div>
-                    </div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                      <label style={{ fontSize: 10, color: tc.textMuted }}>Engine</label>
-                      <select
-                        value="postgres"
-                        disabled
-                        style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-                      >
-                        <option value="postgres">PostgreSQL</option>
-                      </select>
-                    </div>
-                  </>
-                )}
-
-                {provMode === "external" && (
-                  <>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                      <label style={{ fontSize: 10, color: tc.textMuted }}>Engine</label>
-                      <select
-                        value={provEngine}
-                        onChange={(e) => setProvEngine(e.target.value)}
-                        style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-                      >
-                        <option value="postgres">PostgreSQL</option>
-                        <option value="mysql">MySQL</option>
-                        <option value="sqlserver">SQL Server</option>
-                        <option value="sqlite">SQLite</option>
-                      </select>
-                    </div>
-                    {provEngine !== "sqlite" && (
-                      <div style={{ display: "flex", gap: 6 }}>
-                        <div style={{ flex: 2, display: "flex", flexDirection: "column", gap: 4 }}>
-                          <label style={{ fontSize: 10, color: tc.textMuted }}>Host</label>
-                          <input type="text" value={provExt.host} onChange={(e) => setProvExt((p) => ({ ...p, host: e.target.value }))}
-                            style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }} />
-                        </div>
-                        <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
-                          <label style={{ fontSize: 10, color: tc.textMuted }}>Porta</label>
-                          <input type="text" value={provExt.port} onChange={(e) => setProvExt((p) => ({ ...p, port: e.target.value }))}
-                            style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }} />
-                        </div>
-                      </div>
-                    )}
-                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                      <label style={{ fontSize: 10, color: tc.textMuted }}>{provEngine === "sqlite" ? "Percorso file" : "Nome database"}</label>
-                      <input type="text" value={provExt.database} onChange={(e) => setProvExt((p) => ({ ...p, database: e.target.value }))}
-                        style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }} />
-                    </div>
-                    {provEngine !== "sqlite" && (
-                      <div style={{ display: "flex", gap: 6 }}>
-                        <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
-                          <label style={{ fontSize: 10, color: tc.textMuted }}>Utente</label>
-                          <input type="text" value={provExt.username} onChange={(e) => setProvExt((p) => ({ ...p, username: e.target.value }))}
-                            style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }} />
-                        </div>
-                        <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
-                          <label style={{ fontSize: 10, color: tc.textMuted }}>Password</label>
-                          <input type="password" value={provExt.password} onChange={(e) => setProvExt((p) => ({ ...p, password: e.target.value }))}
-                            style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }} />
-                        </div>
-                      </div>
-                    )}
-                  </>
-                )}
-              </div>
-            )}
-
-            {provResult && (
-              <div
-                style={{
-                  fontSize: 11,
-                  padding: 8,
-                  borderRadius: 6,
-                  border: `1px solid ${provResult.ok ? "#22c55e" : "#ef4444"}`,
-                  background: provResult.ok ? "#22c55e18" : "#ef444418",
-                  color: tc.text,
-                  wordBreak: "break-all",
-                }}
-              >
-                {provResult.message}
-              </div>
-            )}
-
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginTop: 4 }}>
-              <button
-                type="button"
-                disabled={provBusy}
-                onClick={() => {
-                  if (provStep === "how") setProvStep("where");
-                  else setShowProvision(false);
-                }}
-                style={{
-                  padding: "7px 12px",
-                  borderRadius: 6,
-                  border: `1px solid ${tc.border}`,
-                  background: "transparent",
-                  color: tc.text,
-                  cursor: provBusy ? "not-allowed" : "pointer",
-                  fontSize: 12,
-                }}
-              >
-                {provStep === "how" ? "Indietro" : "Annulla"}
-              </button>
-              {provStep === "where" ? (
-                <button
-                  type="button"
-                  onClick={() => setProvStep("how")}
-                  style={{
-                    padding: "7px 14px",
-                    borderRadius: 6,
-                    border: "none",
-                    background: tc.accent,
-                    color: "#fff",
-                    cursor: "pointer",
-                    fontSize: 12,
-                    fontWeight: 700,
-                  }}
-                >
-                  Avanti
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  disabled={provBusy}
-                  onClick={() => void handleProvision()}
-                  style={{
-                    padding: "7px 14px",
-                    borderRadius: 6,
-                    border: "none",
-                    background: tc.accent,
-                    color: "#fff",
-                    cursor: provBusy ? "not-allowed" : "pointer",
-                    fontSize: 12,
-                    fontWeight: 700,
-                  }}
-                >
-                  {provBusy ? "Creazione in corso..." : "Crea"}
-                </button>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {!isConfigured && !showInit && !loading && (
-        <div style={{ padding: 10, borderBottom: `1px solid ${tc.border}`, background: `${tc.accent}10` }}>
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <div style={{ fontSize: 11, color: tc.textSecondary }}>
-              Database progetto non configurato. Crea il database scegliendo dove e come, oppure rileva la configurazione dai sorgenti.
-            </div>
-            <button
-              type="button"
-              onClick={openProvisionWizard}
-              style={{
-                padding: "8px 10px",
-                borderRadius: 6,
-                border: "none",
-                background: tc.accent,
-                color: "#fff",
-                cursor: "pointer",
-                fontSize: 12,
-                fontWeight: 700,
-              }}
-            >
-              Crea database
-            </button>
-            <button
-              type="button"
-              onClick={() => void handleDetect()}
-              disabled={busy}
-              style={{
-                padding: "6px 8px",
-                borderRadius: 6,
-                border: `1px solid ${tc.accent}`,
-                background: "transparent",
-                color: tc.accent,
-                cursor: busy ? "not-allowed" : "pointer",
-                fontSize: 12,
-                fontWeight: 600,
-              }}
-            >
-              {busy ? "Rilevamento…" : "Rileva dai sorgenti"}
-            </button>
-            <button
-              type="button"
-              onClick={() => setShowInit(true)}
-              style={{
-                padding: "6px 8px",
-                borderRadius: 6,
-                border: "none",
-                background: tc.accent,
-                color: "#fff",
-                cursor: "pointer",
-                fontSize: 12,
-                fontWeight: 600,
-              }}
-            >
-              Configura manualmente
-            </button>
-          </div>
-        </div>
-      )}
-
-      {showInit && (
-        <div style={{ padding: 10, borderBottom: `1px solid ${tc.border}`, background: `${tc.accent}10` }}>
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <div style={{ fontSize: 11, fontWeight: 600, color: tc.textSecondary }}>
-              {isConfigured ? "Modifica configurazione database" : "Nuovo database progetto"}
-            </div>
+        {!isConfigured && !showInit && !loading && (
+          <div style={{ padding: 10, borderBottom: `1px solid ${tc.border}`, background: `${tc.accent}10` }}>
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <label style={{ fontSize: 10, color: tc.textMuted }}>Nome connessione</label>
-              <input
-                type="text"
-                placeholder="primary, analytics, ..."
-                value={initForm.name}
-                onChange={(e) => setInitForm((f) => ({ ...f, name: e.target.value }))}
-                style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-              />
-              <label style={{ fontSize: 10, color: tc.textMuted }}>Engine</label>
-              <select
-                value={initForm.engine}
-                onChange={(e) => setInitForm((f) => ({ ...f, engine: e.target.value }))}
-                style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-              >
-                <option value="postgres">PostgreSQL</option>
-                <option value="mysql">MySQL</option>
-                <option value="sqlite">SQLite</option>
-                <option value="sqlserver">SQL Server</option>
-              </select>
-              <label style={{ fontSize: 10, color: tc.textMuted }}>Migration tool</label>
-              <select
-                value={initForm.migration_tool}
-                onChange={(e) => setInitForm((f) => ({ ...f, migration_tool: e.target.value }))}
-                style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-              >
-                <option value="generic_sql">Generic SQL</option>
-                <option value="alembic">Alembic</option>
-                <option value="prisma">Prisma</option>
-                <option value="knex">Knex</option>
-                <option value="flyway">Flyway</option>
-              </select>
-              <label style={{ fontSize: 10, color: tc.textMuted }}>Cartella migration</label>
-              <input
-                type="text"
-                value={initForm.migration_path}
-                onChange={(e) => setInitForm((f) => ({ ...f, migration_path: e.target.value }))}
-                style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-              />
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
-                <label style={{ fontSize: 10, color: tc.textMuted, margin: 0 }}>Connessione DB</label>
-                <button
-                  type="button"
-                  onClick={() => setUseConnFields(!useConnFields)}
-                  style={{ fontSize: 9, color: tc.accent ?? "#4a9eff", background: "none", border: "none", cursor: "pointer", padding: 0 }}
-                >
-                  {useConnFields ? "Usa stringa raw" : "Usa campi separati"}
-                </button>
+              <div style={{ fontSize: 11, color: tc.textSecondary }}>
+                Database progetto non configurato. Crea il database scegliendo dove e come, oppure rileva la configurazione dai sorgenti.
               </div>
-              {useConnFields && initForm.engine !== "sqlite" ? (
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 80px", gap: 4 }}>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                    <label style={{ fontSize: 9, color: tc.textMuted }}>Host</label>
-                    <input
-                      type="text"
-                      placeholder="localhost"
-                      value={connFields.host}
-                      onChange={(e) => setConnFields((f) => ({ ...f, host: e.target.value }))}
-                      style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-                    />
-                  </div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                    <label style={{ fontSize: 9, color: tc.textMuted }}>Porta</label>
-                    <input
-                      type="text"
-                      placeholder={initForm.engine === "mysql" ? "3306" : initForm.engine === "sqlserver" ? "1433" : "5432"}
-                      value={connFields.port}
-                      onChange={(e) => setConnFields((f) => ({ ...f, port: e.target.value }))}
-                      style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-                    />
-                  </div>
-                  <div style={{ gridColumn: "1 / -1", display: "flex", flexDirection: "column", gap: 2 }}>
-                    <label style={{ fontSize: 9, color: tc.textMuted }}>Database</label>
-                    <input
-                      type="text"
-                      placeholder="nome del DB applicativo (es. myapp_dev)"
-                      value={connFields.database}
-                      onChange={(e) => setConnFields((f) => ({ ...f, database: e.target.value }))}
-                      style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-                    />
-                  </div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                    <label style={{ fontSize: 9, color: tc.textMuted }}>Utente</label>
-                    <input
-                      type="text"
-                      placeholder="username"
-                      value={connFields.username}
-                      onChange={(e) => setConnFields((f) => ({ ...f, username: e.target.value }))}
-                      style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-                    />
-                  </div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                    <label style={{ fontSize: 9, color: tc.textMuted }}>Password</label>
-                    <input
-                      type="password"
-                      placeholder="password"
-                      value={connFields.password}
-                      onChange={(e) => setConnFields((f) => ({ ...f, password: e.target.value }))}
-                      style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-                    />
-                  </div>
-                  {buildConnectionString() && (
-                    <div style={{ gridColumn: "1 / -1", fontSize: 9, color: tc.textMuted, fontFamily: "monospace", wordBreak: "break-all", padding: "2px 4px", background: `${tc.border}30`, borderRadius: 3 }}>
-                      {buildConnectionString().replace(/[Pp]assword=([^;,"']+)/g, "Password=***")}
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <input
-                  type="text"
-                  placeholder={
-                    initForm.engine === "sqlserver"
-                      ? "Server=host,1433;Database=db;User Id=user;Password=pwd;TrustServerCertificate=True;"
-                      : initForm.engine === "mysql"
-                      ? "mysql://user:pass@host:3306/db"
-                      : initForm.engine === "sqlite"
-                      ? "/percorso/al/file.db"
-                      : "Host=host;Port=5432;Database=db;Username=user;Password=pass"
-                  }
-                  value={initForm.connection_string}
-                  onChange={(e) => setInitForm((f) => ({ ...f, connection_string: e.target.value }))}
-                  style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-                />
-              )}
-              <button
-                type="button"
-                onClick={() => void handleTestConnection()}
-                disabled={busy}
-                style={{
-                  padding: "4px 8px",
-                  borderRadius: 6,
-                  border: `1px solid ${tc.border}`,
-                  background: tc.bgCard,
-                  color: tc.text,
-                  cursor: busy ? "not-allowed" : "pointer",
-                  fontSize: 11,
-                  alignSelf: "flex-start",
-                }}
-              >
-                {busy ? "Test…" : "Testa connessione"}
-              </button>
-              {testResult && (
-                <div
-                  style={{
-                    fontSize: 10,
-                    padding: "4px 6px",
-                    borderRadius: 4,
-                    background: testResult.ok ? "#22c55e20" : `${tc.error}20`,
-                    border: `1px solid ${testResult.ok ? "#22c55e40" : `${tc.error}40`}`,
-                    color: testResult.ok ? "#22c55e" : tc.error,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  {testResult.ok
-                    ? `OK · ${testResult.server_version?.slice(0, 60) ?? ""} · ${testResult.table_count ?? 0} tabelle · ${testResult.latency_ms ?? 0}ms`
-                    : `Errore: ${testResult.error ?? "sconosciuto"}`}
-                  {!testResult.ok && testResult.hint && (
-                    <div style={{
-                      marginTop: 4,
-                      fontSize: 10,
-                      color: tc.textMuted,
-                      borderTop: `1px solid ${tc.border}`,
-                      paddingTop: 4,
-                    }}>
-                      {testResult.hint}
-                    </div>
-                  )}
-                </div>
-              )}
-              {detectHints && detectHints.length > 0 && (
-                <div style={{ fontSize: 10, color: tc.textMuted, lineHeight: 1.4 }}>
-                  <div style={{ fontWeight: 600, marginBottom: 2 }}>Indicatori rilevati:</div>
-                  {detectHints.map((h, i) => (
-                    <div key={i}>• {h}</div>
-                  ))}
-                </div>
-              )}
-              <label style={{ fontSize: 11, color: tc.textSecondary, display: "flex", alignItems: "center", gap: 6 }}>
-                <input
-                  type="checkbox"
-                  checked={initForm.allow_ddl_override}
-                  onChange={(e) => setInitForm((f) => ({ ...f, allow_ddl_override: e.target.checked }))}
-                />
-                Consenti DDL override manuale
-              </label>
-              <div style={{ display: "flex", gap: 6 }}>
-                <button
-                  type="button"
-                  onClick={() => void handleInit()}
-                  disabled={busy}
-                  style={{
-                    flex: 1,
-                    padding: "6px 8px",
-                    borderRadius: 6,
-                    border: "none",
-                    background: tc.accent,
-                    color: "#fff",
-                    cursor: busy ? "not-allowed" : "pointer",
-                    fontSize: 12,
-                    fontWeight: 600,
-                  }}
-                >
-                  {busy ? "…" : "Salva"}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setShowInit(false)}
-                  disabled={busy}
-                  style={{
-                    padding: "6px 8px",
-                    borderRadius: 6,
-                    border: `1px solid ${tc.border}`,
-                    background: tc.bgCard,
-                    color: tc.text,
-                    cursor: "pointer",
-                    fontSize: 12,
-                  }}
-                >
-                  Annulla
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Sezione "Rilevato dai sorgenti del progetto" — separata dal DB interno di Nexus */}
-      {detectedConfig && !showInit && (
-        <div
-          style={{
-            padding: "8px 10px",
-            borderBottom: `1px solid ${tc.border}`,
-            display: "flex",
-            flexDirection: "column",
-            gap: 4,
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-            <div style={{ fontSize: 10, fontWeight: 700, color: tc.textSecondary, textTransform: "uppercase", letterSpacing: "0.05em" }}>
-              Rilevato dai sorgenti del progetto
-            </div>
-            <button
-              type="button"
-              onClick={() => void load()}
-              title="Ri-analizza i file di config (utile dopo modifiche apportate dalla chat di Nexus)"
-              disabled={loading}
-              style={{
-                padding: "1px 8px", fontSize: 10,
-                borderRadius: 3, border: `1px solid ${tc.border}`,
-                background: "transparent", color: tc.textMuted,
-                cursor: loading ? "default" : "pointer",
-                fontFamily: '"JetBrains Mono", monospace',
-                opacity: loading ? 0.5 : 1,
-              }}
-            >
-              ↺ {loading ? "..." : "re-rileva"}
-            </button>
-          </div>
-          <div
-            style={{
-              background: `${tc.accent}10`,
-              border: `1px solid ${tc.accent}30`,
-              borderRadius: 6,
-              padding: "6px 8px",
-              display: "flex",
-              flexDirection: "column",
-              gap: 3,
-            }}
-          >
-            <div style={{ fontSize: 10, color: tc.textMuted, lineHeight: 1.6 }}>
-              {detectedConfig.engine && (
-                <div>
-                  <span style={{ color: tc.textSecondary }}>Engine:</span>{" "}
-                  <span style={{ color: tc.text, fontWeight: 600 }}>{detectedConfig.engine}</span>
-                  {detectedConfig.hosting_mode ? ` · ${detectedConfig.hosting_mode}` : ""}
-                </div>
-              )}
-              {detectedConfig.migration_tool && (
-                <div>
-                  <span style={{ color: tc.textSecondary }}>Tool:</span> {detectedConfig.migration_tool}
-                  {detectedConfig.migration_path ? ` · ${detectedConfig.migration_path}` : ""}
-                </div>
-              )}
-              {detectedConfig.connection_string && (
-                <div style={{ fontFamily: "monospace", fontSize: 9, color: tc.textMuted, wordBreak: "break-all", marginTop: 2 }}>
-                  <span style={{ color: tc.textSecondary }}>Connessione:</span>{" "}
-                  {/* Oscura password nella connection string per sicurezza */}
-                  {detectedConfig.connection_string.replace(/[Pp]assword=([^;,"']+)/g, "Password=***").replace(/:([^:@]+)@/, ":***@")}
-                </div>
-              )}
-              {detectedConfig.hints.length > 0 && (
-                <div style={{ marginTop: 2, color: tc.textMuted, fontSize: 9 }}>
-                  {detectedConfig.hints.slice(0, 4).join(" · ")}
-                </div>
-              )}
-            </div>
-            <button
-              type="button"
-              onClick={() => {
-                setInitForm((f) => ({
-                  ...f,
-                  name: "primary",
-                  engine: detectedConfig.engine ?? f.engine,
-                  hosting_mode: detectedConfig.hosting_mode ?? f.hosting_mode,
-                  migration_tool: detectedConfig.migration_tool ?? f.migration_tool,
-                  migration_path: detectedConfig.migration_path ?? f.migration_path,
-                  connection_string: detectedConfig.connection_string ?? f.connection_string,
-                }));
-                const parsed = detectedConfig.connection_string
-                  ? parseConnectionString(detectedConfig.connection_string)
-                  : null;
-                if (parsed) {
-                  setUseConnFields(true);
-                  setConnFields({
-                    host: parsed.host,
-                    port: parsed.port || "5432",
-                    database: parsed.database,
-                    username: parsed.username,
-                    password: parsed.password,
-                  });
-                }
-                setDetectHints(detectedConfig.hints);
-                setTestResult(null);
-                setShowInit(true);
-              }}
-              style={{
-                alignSelf: "flex-start",
-                padding: "2px 8px",
-                borderRadius: 4,
-                border: `1px solid ${tc.accent}`,
-                background: "transparent",
-                color: tc.accent,
-                cursor: "pointer",
-                fontSize: 10,
-                fontWeight: 600,
-                marginTop: 2,
-              }}
-            >
-              Usa questa configurazione
-            </button>
-
-            <button
-              type="button"
-              onClick={() => void handleTestDetected()}
-              disabled={busy || !detectedConfig.connection_string}
-              style={{
-                alignSelf: "flex-start",
-                padding: "2px 8px",
-                borderRadius: 4,
-                border: `1px solid ${tc.border}`,
-                background: tc.bgCard,
-                color: tc.textSecondary,
-                cursor: busy ? "not-allowed" : "pointer",
-                fontSize: 10,
-                fontWeight: 600,
-                marginTop: 2,
-              }}
-              title="Esegue un test di connessione usando la config rilevata (senza salvare)."
-            >
-              {busy ? "Test…" : "Testa config rilevata"}
-            </button>
-
-            {detectedTestResult && (
-              <div
-                style={{
-                  marginTop: 4,
-                  fontSize: 10,
-                  padding: "4px 6px",
-                  borderRadius: 4,
-                  background: detectedTestResult.ok ? "#22c55e20" : `${tc.error}20`,
-                  border: `1px solid ${detectedTestResult.ok ? "#22c55e40" : `${tc.error}40`}`,
-                  color: detectedTestResult.ok ? "#22c55e" : tc.error,
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-word",
-                }}
-              >
-                {detectedTestResult.ok
-                  ? `OK · ${detectedTestResult.server_version?.slice(0, 60) ?? ""} · ${detectedTestResult.table_count ?? 0} tabelle · ${detectedTestResult.latency_ms ?? 0}ms`
-                  : `Errore: ${detectedTestResult.error ?? "sconosciuto"}`}
-                {!detectedTestResult.ok && detectedTestResult.hint && (
-                  <div
-                    style={{
-                      marginTop: 4,
-                      fontSize: 10,
-                      color: tc.textMuted,
-                      borderTop: `1px solid ${tc.border}`,
-                      paddingTop: 4,
-                    }}
-                  >
-                    {detectedTestResult.hint}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Azioni suggerite quando il test della config rilevata fallisce.
-                La categorizzazione e' deterministica (parsing testo errore +
-                table_count) e le azioni sono context-aware: per "unreachable"
-                tentiamo automaticamente host alternativi sulla LAN; per
-                "no_database" generiamo un prompt agente per creare il DB;
-                per "tables_missing" suggeriamo di eseguire le migrazioni. */}
-            {detectedTestResult && !detectedTestResult.ok && detectedConfig?.connection_string && (() => {
-              const category = categorizeDbError(detectedTestResult.error, detectedTestResult.table_count);
-              const parts = parseConnPartsForActions(detectedConfig.connection_string ?? "");
-              const dbName = parts?.database || "<nome_db>";
-              const altHosts = parts ? alternativeHostsFor(parts.host) : [];
-              const labelByCategory: Record<DbErrorCategory, string> = {
-                unreachable: "Host non raggiungibile",
-                no_database: `Database "${dbName}" non esiste sul server`,
-                auth_failed: "Credenziali non valide",
-                tables_missing: "Connesso ma nessuna tabella",
-                unknown: "Errore non classificato",
-              };
-              const tryAlternativeHost = async (altHost: string) => {
-                if (!projectId || !parts) return;
-                const newConn = (detectedConfig.connection_string ?? "")
-                  .replace(`@${parts.host}`, `@${altHost}`)
-                  .replace(`//${parts.host}`, `//${altHost}`);
-                setBusy(true);
-                setDetectedTestResult(null);
-                try {
-                  const res = await testProjectDbConnection(projectId, {
-                    engine: detectedConfig?.engine ?? undefined,
-                    connection_string: newConn,
-                  });
-                  setDetectedTestResult(res);
-                  if (res.ok) {
-                    // Salva il connection_string corretto come override
-                    setDetectedConfig({
-                      ...detectedConfig,
-                      connection_string: newConn,
-                    });
-                  }
-                } catch (e) {
-                  setDetectedTestResult({
-                    ok: false,
-                    error: e instanceof Error ? e.message : `Test fallito su ${altHost}`,
-                  });
-                } finally {
-                  setBusy(false);
-                }
-              };
-              return (
-                <div
-                  style={{
-                    marginTop: 4,
-                    padding: "6px 8px",
-                    borderRadius: 4,
-                    background: tc.bgCard,
-                    border: `1px dashed ${tc.warning}80`,
-                  }}
-                >
-                  <div style={{ fontSize: 10, fontWeight: 700, color: tc.warning, marginBottom: 4 }}>
-                    {labelByCategory[category]} · Azioni suggerite
-                  </div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                    {category === "unreachable" && altHosts.length > 0 && (
-                      <>
-                        <div style={{ fontSize: 9, color: tc.textMuted }}>
-                          Cerca il DB su altre macchine della LAN:
-                        </div>
-                        {altHosts.map((h) => (
-                          <button
-                            key={h}
-                            type="button"
-                            disabled={busy}
-                            onClick={() => void tryAlternativeHost(h)}
-                            style={{
-                              alignSelf: "flex-start",
-                              padding: "2px 8px",
-                              borderRadius: 4,
-                              border: `1px solid ${tc.accent}`,
-                              background: "transparent",
-                              color: tc.accent,
-                              cursor: busy ? "not-allowed" : "pointer",
-                              fontSize: 10,
-                              fontWeight: 600,
-                            }}
-                          >
-                            Prova host {h}
-                          </button>
-                        ))}
-                      </>
-                    )}
-                    {category === "no_database" && (
-                      <>
-                        <div style={{ fontSize: 9, color: tc.textMuted }}>
-                          Il server e' raggiungibile ma manca il database <code>{dbName}</code>.
-                        </div>
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => {
-                            const prompt =
-                              `Crea il database "${dbName}" sul server PostgreSQL accessibile da ` +
-                              `${detectedConfig?.connection_string?.replace(/:([^:@]+)@/, ":***@") ?? "questa configurazione"}, ` +
-                              `quindi applica le migrazioni del progetto (cartella migrations) ` +
-                              `e verifica con un test di connessione.`;
-                            try {
-                              window.dispatchEvent(
-                                new CustomEvent("nexus:chat:send", { detail: { content: prompt } }),
-                              );
-                              setActionMsg(`Prompt inviato all'agente per creare "${dbName}".`);
-                            } catch {
-                              navigator.clipboard?.writeText(prompt).catch(() => {});
-                              setActionMsg("Prompt copiato negli appunti. Incollalo in chat.");
-                            }
-                          }}
-                          style={{
-                            alignSelf: "flex-start",
-                            padding: "2px 8px",
-                            borderRadius: 4,
-                            border: `1px solid ${tc.accent}`,
-                            background: "transparent",
-                            color: tc.accent,
-                            cursor: busy ? "not-allowed" : "pointer",
-                            fontSize: 10,
-                            fontWeight: 600,
-                          }}
-                        >
-                          Crea database "{dbName}" via agente
-                        </button>
-                      </>
-                    )}
-                    {category === "tables_missing" && (
-                      <>
-                        <div style={{ fontSize: 9, color: tc.textMuted }}>
-                          Connessione OK ma lo schema e' vuoto. Esegui le migrazioni del progetto.
-                        </div>
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => {
-                            setShowInit(true);
-                            setActionMsg("Configura connessione e poi clicca \"Esegui migrazioni\" nella sezione Migrazioni.");
-                          }}
-                          style={{
-                            alignSelf: "flex-start",
-                            padding: "2px 8px",
-                            borderRadius: 4,
-                            border: `1px solid ${tc.accent}`,
-                            background: "transparent",
-                            color: tc.accent,
-                            cursor: busy ? "not-allowed" : "pointer",
-                            fontSize: 10,
-                            fontWeight: 600,
-                          }}
-                        >
-                          Apri pannello migrazioni
-                        </button>
-                      </>
-                    )}
-                    {category === "auth_failed" && (
-                      <div style={{ fontSize: 9, color: tc.textMuted }}>
-                        Username/password sbagliati. Aggiorna i campi nella sezione "Usa questa configurazione" e ritesta.
-                      </div>
-                    )}
-                    {/* Azione comune sempre disponibile */}
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const parsedX = detectedConfig?.connection_string
-                          ? parseConnectionString(detectedConfig.connection_string)
-                          : null;
-                        setInitForm((f) => ({
-                          ...f,
-                          engine: detectedConfig?.engine ?? f.engine,
-                          hosting_mode: detectedConfig?.hosting_mode ?? f.hosting_mode,
-                          migration_tool: detectedConfig?.migration_tool ?? f.migration_tool,
-                          migration_path: detectedConfig?.migration_path ?? f.migration_path,
-                          connection_string: detectedConfig?.connection_string ?? f.connection_string,
-                        }));
-                        if (parsedX) {
-                          setUseConnFields(true);
-                          setConnFields({
-                            host: parsedX.host,
-                            port: parsedX.port || "5432",
-                            database: parsedX.database,
-                            username: parsedX.username,
-                            password: parsedX.password,
-                          });
-                        }
-                        setShowInit(true);
-                      }}
-                      style={{
-                        alignSelf: "flex-start",
-                        padding: "2px 8px",
-                        borderRadius: 4,
-                        border: `1px solid ${tc.border}`,
-                        background: "transparent",
-                        color: tc.textSecondary,
-                        cursor: "pointer",
-                        fontSize: 10,
-                        fontWeight: 600,
-                      }}
-                    >
-                      Configura manualmente
-                    </button>
-                  </div>
-                </div>
-              );
-            })()}
-          </div>
-        </div>
-      )}
-
-      {isConfigured && !showInit && (
-        <div style={{ padding: 10, display: "flex", flexDirection: "column", gap: 6, borderBottom: `1px solid ${tc.border}` }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <div style={{ fontSize: 11, fontWeight: 600, color: tc.text }}>
-              DB del progetto ({connections.length})
-            </div>
-            <div style={{ display: "flex", gap: 6 }}>
               <button
                 type="button"
                 onClick={openProvisionWizard}
-                disabled={busy}
                 style={{
-                  padding: "2px 8px",
-                  borderRadius: 4,
+                  padding: "8px 10px",
+                  borderRadius: 6,
                   border: "none",
                   background: tc.accent,
                   color: "#fff",
-                  cursor: busy ? "not-allowed" : "pointer",
-                  fontSize: 10,
+                  cursor: "pointer",
+                  fontSize: 12,
                   fontWeight: 700,
                 }}
               >
@@ -1689,519 +691,129 @@ export function ProjectDbPanel({ project }: Props) {
               </button>
               <button
                 type="button"
-                onClick={handleAddConnection}
+                onClick={() => void handleDetect()}
                 disabled={busy}
                 style={{
-                  padding: "2px 8px",
-                  borderRadius: 4,
+                  padding: "6px 8px",
+                  borderRadius: 6,
                   border: `1px solid ${tc.accent}`,
                   background: "transparent",
                   color: tc.accent,
                   cursor: busy ? "not-allowed" : "pointer",
-                  fontSize: 10,
+                  fontSize: 12,
                   fontWeight: 600,
                 }}
               >
-                + Aggiungi DB
+                {busy ? "Rilevamento…" : "Rileva dai sorgenti"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowInit(true)}
+                style={{
+                  padding: "6px 8px",
+                  borderRadius: 6,
+                  border: "none",
+                  background: tc.accent,
+                  color: "#fff",
+                  cursor: "pointer",
+                  fontSize: 12,
+                  fontWeight: 600,
+                }}
+              >
+                Configura manualmente
               </button>
             </div>
           </div>
-          {connections.map((c) => (
-            <div
-              key={c.id}
-              style={{
-                background: tc.bgCard,
-                border: `1px solid ${c.is_primary ? tc.accent : tc.border}`,
-                borderRadius: 6,
-                padding: "6px 8px",
-                display: "flex",
-                flexDirection: "column",
-                gap: 4,
-              }}
-            >
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
-                <div style={{ fontSize: 11, fontWeight: 600, color: tc.text, display: "flex", alignItems: "center", gap: 4 }}>
-                  {c.name}
-                  {c.is_primary && (
-                    <span
-                      style={{
-                        fontSize: 9,
-                        color: tc.accent,
-                        border: `1px solid ${tc.accent}`,
-                        borderRadius: 3,
-                        padding: "0 4px",
-                        fontWeight: 600,
-                      }}
-                    >
-                      PRIMARY
-                    </span>
-                  )}
-                </div>
-                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                  <button
-                    type="button"
-                    onClick={() => void handleTestSavedConnection(c)}
-                    disabled={busy || connTestingId === c.id}
-                    title="Testa questa connessione"
-                    style={{
-                      padding: "2px 6px",
-                      borderRadius: 4,
-                      border: `1px solid ${tc.border}`,
-                      background: "transparent",
-                      color: tc.textSecondary,
-                      cursor: busy || connTestingId === c.id ? "not-allowed" : "pointer",
-                      fontSize: 10,
-                    }}
-                  >
-                    {connTestingId === c.id ? "Test…" : "Testa"}
-                  </button>
-                  {!c.is_primary && (
-                    <button
-                      type="button"
-                      onClick={() => void handleSetPrimary(c.id)}
-                      disabled={busy}
-                      style={{
-                        padding: "2px 6px",
-                        borderRadius: 4,
-                        border: `1px solid ${tc.border}`,
-                        background: "transparent",
-                        color: tc.textSecondary,
-                        cursor: busy ? "not-allowed" : "pointer",
-                        fontSize: 10,
-                      }}
-                    >
-                      Set primary
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => handleEditConfig(c)}
-                    disabled={busy}
-                    style={{
-                      padding: "2px 6px",
-                      borderRadius: 4,
-                      border: `1px solid ${tc.border}`,
-                      background: "transparent",
-                      color: tc.textSecondary,
-                      cursor: busy ? "not-allowed" : "pointer",
-                      fontSize: 10,
-                    }}
-                  >
-                    Modifica
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void handleDeleteConnection(c)}
-                    disabled={busy}
-                    style={{
-                      padding: "2px 6px",
-                      borderRadius: 4,
-                      border: `1px solid ${tc.error}40`,
-                      background: "transparent",
-                      color: tc.error,
-                      cursor: busy ? "not-allowed" : "pointer",
-                      fontSize: 10,
-                    }}
-                  >
-                    Elimina
-                  </button>
-                </div>
-              </div>
-              {connTestResults[c.id] && (
-                <div
-                  style={{
-                    fontSize: 10,
-                    padding: "3px 6px",
-                    borderRadius: 4,
-                    background: connTestResults[c.id].ok ? "#22c55e20" : `${tc.error}20`,
-                    border: `1px solid ${connTestResults[c.id].ok ? "#22c55e40" : `${tc.error}40`}`,
-                    color: connTestResults[c.id].ok ? "#22c55e" : tc.error,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  {connTestResults[c.id].ok
-                    ? `OK · ${connTestResults[c.id].server_version?.slice(0, 60) ?? ""} · ${connTestResults[c.id].table_count ?? 0} tabelle · ${connTestResults[c.id].latency_ms ?? 0}ms`
-                    : `Errore: ${connTestResults[c.id].error ?? "sconosciuto"}`}
-                  {!connTestResults[c.id].ok && connTestResults[c.id].hint && (
-                    <div style={{
-                      marginTop: 4,
-                      fontSize: 10,
-                      color: tc.textMuted,
-                      borderTop: `1px solid ${tc.border}`,
-                      paddingTop: 4,
-                    }}>
-                      {connTestResults[c.id].hint}
-                    </div>
-                  )}
-                </div>
-              )}
-              <div style={{ fontSize: 10, color: tc.textMuted, lineHeight: 1.5 }}>
-                <div>
-                  <span style={{ color: tc.textSecondary }}>Engine:</span> {c.engine ?? "—"}
-                  {c.hosting_mode ? ` · ${c.hosting_mode}` : ""}
-                </div>
-                <div>
-                  <span style={{ color: tc.textSecondary }}>Tool:</span> {c.migration_tool ?? "—"}
-                  {c.migration_path ? ` · ${c.migration_path}` : ""}
-                </div>
-                <div>
-                  <span style={{ color: tc.textSecondary }}>DDL override:</span>{" "}
-                  {c.allow_ddl_override ? "abilitato" : "disabilitato"}
-                </div>
-              </div>
-            </div>
-          ))}
-          <div style={{ display: "flex", gap: 6 }}>
-            <button
-              type="button"
-              onClick={() => setShowNewMig((v) => !v)}
-              disabled={busy || !config?.allow_ddl_override}
-              title={config?.allow_ddl_override ? "Crea nuova migrazione" : "Abilita allow_ddl_override per creare migrazioni manuali"}
-              style={{
-                flex: 1,
-                padding: "6px 8px",
-                borderRadius: 6,
-                border: `1px solid ${tc.border}`,
-                background: tc.bgCard,
-                color: config?.allow_ddl_override ? tc.text : tc.textMuted,
-                cursor: config?.allow_ddl_override ? "pointer" : "not-allowed",
-                fontSize: 12,
-                fontWeight: 600,
-              }}
-            >
-              {showNewMig ? "Chiudi" : "Nuova migrazione"}
-            </button>
-          </div>
-        </div>
-      )}
+        )}
 
-      {showNewMig && isConfigured && (
-        <div style={{ padding: 10, borderBottom: `1px solid ${tc.border}`, display: "flex", flexDirection: "column", gap: 6 }}>
-          <label style={{ fontSize: 10, color: tc.textMuted }}>SQL</label>
-          <textarea
-            value={migForm.sql}
-            onChange={(e) => setMigForm((f) => ({ ...f, sql: e.target.value }))}
-            rows={6}
-            placeholder="CREATE TABLE ..."
-            style={{ padding: 6, fontSize: 11, fontFamily: "monospace", background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4, resize: "vertical" }}
+        {showInit && (
+          <ConnectionForm
+            tc={tc}
+            isConfigured={isConfigured}
+            initForm={initForm}
+            setInitForm={setInitForm}
+            connFields={connFields}
+            setConnFields={setConnFields}
+            useConnFields={useConnFields}
+            setUseConnFields={setUseConnFields}
+            busy={busy}
+            testResult={testResult}
+            detectHints={detectHints}
+            buildConnectionString={buildConnectionString}
+            onTestConnection={() => void handleTestConnection()}
+            onInit={() => void handleInit()}
+            onCancel={() => setShowInit(false)}
           />
-          <label style={{ fontSize: 10, color: tc.textMuted }}>Motivo (min 10 caratteri)</label>
-          <input
-            type="text"
-            value={migForm.reason}
-            onChange={(e) => setMigForm((f) => ({ ...f, reason: e.target.value }))}
-            style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
+        )}
+
+        {detectedConfig && !showInit && (
+          <DetectConfig
+            tc={tc}
+            projectId={projectId}
+            detectedConfig={detectedConfig}
+            detectedTestResult={detectedTestResult}
+            loading={loading}
+            busy={busy}
+            setBusy={setBusy}
+            setDetectedConfig={setDetectedConfig}
+            setDetectedTestResult={setDetectedTestResult}
+            setInitForm={setInitForm}
+            setUseConnFields={setUseConnFields}
+            setConnFields={setConnFields}
+            setDetectHints={setDetectHints}
+            setTestResult={setTestResult}
+            setShowInit={setShowInit}
+            setActionMsg={setActionMsg}
+            onReload={() => void load()}
+            onTestDetected={() => void handleTestDetected()}
           />
-          <button
-            type="button"
-            onClick={() => void handleCreateMigration()}
-            disabled={busy}
-            style={{
-              padding: "6px 8px",
-              borderRadius: 6,
-              border: "none",
-              background: tc.accent,
-              color: "#fff",
-              cursor: busy ? "not-allowed" : "pointer",
-              fontSize: 12,
-              fontWeight: 600,
-            }}
-          >
-            {busy ? "…" : "Crea ed esegui"}
-          </button>
-        </div>
-      )}
-
-      <div style={{ padding: 10, display: "flex", gap: 6, borderBottom: `1px solid ${tc.border}` }}>
-        <button
-          type="button"
-          onClick={() => void handleApply()}
-          disabled={busy || pending.length === 0}
-          title="Applica migrazioni pending"
-          style={{
-            flex: 1,
-            padding: "6px 8px",
-            borderRadius: 6,
-            border: "none",
-            background: pending.length > 0 ? tc.accent : tc.bgCard,
-            color: pending.length > 0 ? "#fff" : tc.textMuted,
-            cursor: pending.length > 0 && !busy ? "pointer" : "not-allowed",
-            fontSize: 12,
-            fontWeight: 600,
-          }}
-        >
-          {busy ? "…" : `Applica (${pending.length})`}
-        </button>
-        <button
-          type="button"
-          onClick={() => void handleRollback()}
-          disabled={busy || applied.length === 0}
-          title="Rollback ultima"
-          style={{
-            flex: 1,
-            padding: "6px 8px",
-            borderRadius: 6,
-            border: `1px solid ${tc.border}`,
-            background: tc.bgCard,
-            color: applied.length > 0 ? tc.text : tc.textMuted,
-            cursor: applied.length > 0 && !busy ? "pointer" : "not-allowed",
-            fontSize: 12,
-          }}
-        >
-          Rollback
-        </button>
-      </div>
-
-      <div style={{ padding: "14px 10px 12px", marginTop: 4, display: "flex", flexDirection: "column", gap: 6, borderBottom: `1px solid ${tc.border}` }}>
-        <button
-          type="button"
-          onClick={() => void handleImportSchema(selectedSchemaFile || undefined)}
-          disabled={busy}
-          title="Cerca un file schema nel progetto ed eseguilo sul database"
-          style={{
-            width: "100%",
-            padding: "8px 8px",
-            borderRadius: 6,
-            border: `1px solid ${tc.border}`,
-            background: tc.bgCard,
-            color: tc.text,
-            cursor: busy ? "not-allowed" : "pointer",
-            fontSize: 12,
-            fontWeight: 600,
-            textAlign: "center",
-          }}
-        >
-          {busy ? "…" : "Importa schema dai file"}
-        </button>
-        {schemaCandidates.length > 0 && (
-          <div style={{ display: "flex", gap: 6 }}>
-            <select
-              value={selectedSchemaFile}
-              onChange={(e) => setSelectedSchemaFile(e.target.value)}
-              style={{
-                flex: 1,
-                padding: "6px 8px",
-                borderRadius: 6,
-                border: `1px solid ${tc.border}`,
-                background: tc.bgCard,
-                color: tc.text,
-                fontSize: 11,
-              }}
-            >
-              {schemaCandidates.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
-            <button
-              type="button"
-              onClick={() => void handleImportSchema(selectedSchemaFile)}
-              disabled={busy || !selectedSchemaFile}
-              style={{
-                padding: "6px 10px",
-                borderRadius: 6,
-                border: "none",
-                background: tc.accent,
-                color: "#fff",
-                cursor: busy ? "not-allowed" : "pointer",
-                fontSize: 11,
-                fontWeight: 600,
-              }}
-            >
-              Importa
-            </button>
-          </div>
-        )}
-      </div>
-
-      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: 10, display: "flex", flexDirection: "column", gap: 6 }}>
-        {error && (
-          <div
-            style={{
-              color: tc.error,
-              background: `${tc.error}20`,
-              border: `1px solid ${tc.error}40`,
-              borderRadius: 6,
-              padding: "6px 8px",
-              fontSize: 11,
-            }}
-          >
-            {error}
-          </div>
-        )}
-        {actionMsg && (
-          <div
-            style={{
-              color: "#22c55e",
-              background: "#22c55e20",
-              border: "1px solid #22c55e40",
-              borderRadius: 6,
-              padding: "6px 8px",
-              fontSize: 11,
-            }}
-          >
-            {actionMsg}
-          </div>
         )}
 
-        {loading ? (
-          <div style={{ color: tc.textMuted, fontSize: 12 }}>Caricamento…</div>
-        ) : migrations.length === 0 ? (
-          <div
-            style={{
-              color: tc.textMuted,
-              fontSize: 12,
-              padding: 14,
-              textAlign: "center",
-              border: `1px dashed ${tc.border}`,
-              borderRadius: 6,
-            }}
-          >
-            Nessuna migrazione trovata.
-          </div>
-        ) : (
-          migrations.map((m) => (
-            <div
-              key={m.id}
-              style={{
-                background: tc.bgCard,
-                border: `1px solid ${tc.border}`,
-                borderRadius: 6,
-                padding: "8px 10px",
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-              }}
-            >
-              <span
-                style={{
-                  width: 8,
-                  height: 8,
-                  borderRadius: "50%",
-                  background: statusColor(m.status),
-                  flexShrink: 0,
-                }}
-              />
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div
-                  style={{
-                    fontSize: 12,
-                    fontWeight: 600,
-                    color: tc.text,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}
-                  title={m.filename}
-                >
-                  {m.filename}
-                </div>
-                {m.description && (
-                  <div
-                    style={{
-                      fontSize: 11,
-                      color: tc.textMuted,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                  >
-                    {m.description}
-                  </div>
-                )}
-              </div>
-              <span
-                style={{
-                  fontSize: 10,
-                  color: statusColor(m.status),
-                  fontWeight: 600,
-                  textTransform: "uppercase",
-                  letterSpacing: "0.04em",
-                  flexShrink: 0,
-                }}
-              >
-                {m.status}
-              </span>
-            </div>
-          ))
+        {isConfigured && !showInit && (
+          <ConnectionList
+            tc={tc}
+            connections={connections}
+            config={config}
+            busy={busy}
+            showNewMig={showNewMig}
+            connTestingId={connTestingId}
+            connTestResults={connTestResults}
+            onProvisionWizard={openProvisionWizard}
+            onAddConnection={handleAddConnection}
+            onTestSaved={(conn) => void handleTestSavedConnection(conn)}
+            onSetPrimary={(connId) => void handleSetPrimary(connId)}
+            onEditConfig={(conn) => handleEditConfig(conn)}
+            onDeleteConnection={(conn) => void handleDeleteConnection(conn)}
+            onToggleNewMig={() => setShowNewMig((v) => !v)}
+          />
         )}
+
+        <MigrationsSection
+          tc={tc}
+          showNewMig={showNewMig}
+          isConfigured={isConfigured}
+          migForm={migForm}
+          setMigForm={setMigForm}
+          busy={busy}
+          loading={loading}
+          error={error}
+          actionMsg={actionMsg}
+          migrations={migrations}
+          pending={pending}
+          applied={applied}
+          schemaCandidates={schemaCandidates}
+          selectedSchemaFile={selectedSchemaFile}
+          setSelectedSchemaFile={setSelectedSchemaFile}
+          statusColor={statusColor}
+          onCreateMigration={() => void handleCreateMigration()}
+          onApply={() => void handleApply()}
+          onRollback={() => void handleRollback()}
+          onImportSchema={(filePath) => void handleImportSchema(filePath)}
+        />
+
+        {/* ── Query recenti (event-driven via dispatcher) ─────────────────── */}
+        <RecentQueriesSection />
       </div>
-
-      {/* ── Query recenti (event-driven via dispatcher) ─────────────────── */}
-      <RecentQueriesSection />
-      </div>
-    </div>
-  );
-}
-
-// ── Sub-componente: query recenti dal dispatcher SSE ───────────────────────
-// Mostra le ultime DbQueryRun emesse dal tool project_db_query (max 100 in
-// store, qui ne renderizziamo 10). Live: niente API call, niente polling.
-function RecentQueriesSection() {
-  const tc = useThemeColors();
-  const queries = useProjectStore(selectDatabaseQueries);
-  const [collapsed, setCollapsed] = useState(true);
-
-  if (queries.length === 0) return null;
-
-  const recent = queries.slice(0, 10);
-  return (
-    <div style={{ marginTop: 16 }}>
-      <button
-        onClick={() => setCollapsed((c) => !c)}
-        style={{
-          width: "100%",
-          textAlign: "left",
-          background: "transparent",
-          border: `1px solid ${tc.border}`,
-          borderRadius: 6,
-          padding: "8px 10px",
-          color: tc.text,
-          fontSize: 12,
-          fontWeight: 600,
-          cursor: "pointer",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-        }}
-      >
-        <span>Query recenti ({queries.length})</span>
-        <span style={{ color: tc.textMuted, fontSize: 11 }}>{collapsed ? "▸" : "▾"}</span>
-      </button>
-      {!collapsed && (
-        <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
-          {recent.map((q, i) => (
-            <div
-              key={i}
-              style={{
-                fontSize: 11,
-                color: tc.textMuted,
-                padding: "4px 8px",
-                borderLeft: `2px solid ${q.kind === "select" ? "#22c55e" : "#f59e0b"}`,
-                background: tc.bgCard,
-                display: "flex",
-                gap: 8,
-                alignItems: "center",
-              }}
-            >
-              <span
-                style={{
-                  textTransform: "uppercase",
-                  fontWeight: 600,
-                  color: q.kind === "select" ? "#22c55e" : "#f59e0b",
-                  minWidth: 50,
-                }}
-              >
-                {q.kind}
-              </span>
-              <span style={{ flex: 1 }}>{q.rows} rows</span>
-              <span>{q.duration_ms}ms</span>
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   );
 }

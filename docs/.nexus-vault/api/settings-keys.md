@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: f37f83812614131fffad8695dac912138b8157f7
+source_commit: ee22019f4f5739771259bbb3e71a653a058ebebb
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T07:13:05Z
+updated_at: 2026-06-04T08:05:30Z
 nexus_meta_version: 1
 ---
 
@@ -47,15 +47,26 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.context.compress_start_iter` | `5` | Iterazione di executor a partire dalla quale attivare la compressione escalante dei tool_result. Prima viene applicata solo la dedup. Default 5 (FIX A). |
 | `agent.context.dedup_tool_results_enabled` | `true` | Se true (default) ogni iter executor applica _dedup_tool_results_history: tool_result vecchi con stessa signature (sha256(tool_name+args_json)) vengono sostituiti con placeholder, tenendo solo l ultimo. FIX B. |
 | `agent.context.drop_unused_base64_age` | `3` | Soglia (n messaggi successivi) entro la quale verificare se un blob base64 di un tool_result vecchio viene citato testualmente. Se non viene citato, il body base64 viene sostituito con un placeholder. FIX C. |
+| `agent.context.forced_rag_reminder_text` | `Il contesto disponibile e' parzialmente offloadato in too...` | Testo della reminder iniettata nel system prompt + ultimo HumanMessage quando est_tokens > forced_rag_threshold_ratio * window. Modificabile per A/B testing. |
+| `agent.context.forced_rag_threshold_ratio` | `0.40` | Sopra ratio*window scatta forced_rag_reminder nel system prompt: l'agente e' istruito a usare nexus_search_semantic prima di rispondere. Default 0.40 (40% del context window). |
+| `agent.context.hard_cap_ratio` | `0.95` | Cap hard finale: se dopo offload+upscale il payload supera ratio*window, errore esplicito (no hallucinazione silenziosa). Default 0.95. |
 | `agent.context.max_chars` | `400000` | Budget chars totale per il contesto agente. Oltre questa soglia i tool result vecchi vengono compressi/sommarizzati. Approx 3.5 chars/token. DB-driven, cache 60s. |
 | `agent.context.max_context_ratio` | `0.70` | Soglia (0.4-0.9) sul context_window del modello attivo: se la stima token del contesto in executor supera ratio*context_window, scatta la compressione aggressiva TOKEN-based che tronca anche i messaggi assistant lunghi. Default 0.70. |
 | `agent.context_offload_ttl_seconds` | `60` | TTL cache context_offload (H-55) |
+| `agent.context.overflow_message_key` | `system.context_overflow` | Chiave in nexus_prompt_templates per il messaggio di overflow visualizzato in UI. Permette override redazionale senza redeploy. |
 | `agent.context.predictive_cap_ratio` | `0.5` | Soglia (0.3-0.9) sul context_window del modello: se context_attuale + stima_tool_result supera ratio*context_window, la chiamata al tool viene intercettata e sostituita da tool_result sintetico di errore. FIX D. |
 | `agent.context.rag_offload.enabled` | `true` | Flag master offload RAG lossless. Se true (default), prima di troncare/comprimere/scartare un tool result o messaggio vecchio il brain indicizza il contenuto COMPLETO in Qdrant (tool_results_chunks) cosi' nessun dato viene perso e resta recuperabile via nexus_search_semantic. Se false, degrada al vecchio troncamento distruttivo. |
 | `agent.context.rag_offload.max_chunks_per_item` | `500` | Numero massimo di chunk indicizzati per singolo contenuto offloadato (anti-abuso: un file enorme non deve generare migliaia di point in un colpo). Oltre il cap il resto NON viene indicizzato e l'evento e' loggato come WARN. Default 500. |
 | `agent.context.rag_offload.min_chars` | `2000` | Soglia minima caratteri sotto la quale NON si indicizza un contenuto in RAG: sotto soglia il contenuto sta gia' intero nel prompt, nessuna perdita possibile. Default 2000. |
 | `agent.context.rag_offload.snippet_max_chars` | `4000` | Limite caratteri per ogni snippet RAG incluso nel contesto. Alzato da 400 (vecchio hardcoded) a 4000: snippet piu' ampi riducono i round-trip e non perdono il cuore del match. |
 | `agent.context.rag_offload.top_k` | `12` | Numero di interazioni/snippet recuperati dal RAG inline per turno. Alzato da 5 (vecchio hardcoded) a 12: con l'offload lossless il RAG e' la fonte di verita' del contenuto troncato, quindi il recupero non deve essere artificialmente stretto. |
+| `agent.context.rolling_keep_recent_turns` | `3` | Numero di turni recenti SEMPRE preservati integri (mai sostituiti dal summary). Default 3. |
+| `agent.context.rolling_summary_enabled` | `true` | Se true, ogni rolling_window_turns sostituisce i messaggi vecchi con un summary compatto (originali retrievabili via nexus_search_semantic source_kinds=chat_history). |
+| `agent.context.rolling_summary_model` | `google/gemini-2.5-flash-lite` | Modello usato per generare il summary di compaction. Deve essere veloce ed economico (input compresso). |
+| `agent.context.rolling_window_turns` | `5` | Frequenza compaction: ogni N turni esegue il rolling summary dei turni piu' vecchi. Default 5. |
+| `agent.context.system_prompt_offload_threshold_tokens` | `8000` | Soglia (token) sopra cui il system prompt + project context viene offloadato in Qdrant tool_results_chunks con source_kind=system_context. Sotto soglia: inline (default). Default 8000. |
+| `agent.context.system_prompt_summary_max_tokens` | `800` | Lunghezza massima (token) del summary che sostituisce il blocco offloadato. L'agente recupera i dettagli con nexus_search_semantic(source_kinds=system_context). |
+| `agent.context.tokenizer` | `cl100k_base` | Tokenizer per stima token (tiktoken). Valori: cl100k_base (default, accurato per Claude/GPT/Mistral), o200k_base (GPT-4o), p50k_base (legacy). |
 | `agent.context_window_ttl_seconds` | `120` | TTL cache context window per modello (H-35) |
 | `agent.ctx_mgmt_ttl_seconds` | `60` | TTL cache context management (H-34) |
 | `agent.db_query_timeout_seconds` | `5` | Timeout query DB nei nodi agente (H-39, H-44) |
@@ -79,6 +90,8 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.iteration_budget.base` | `40` | Numero base iterazioni LangGraph per ogni run agente. Sommato a per_complexity_point*complexity_score. |
 | `agent.iteration_budget.max` | `100` | Tetto massimo iterazioni anche per task molto complessi. Safety net runaway. |
 | `agent.iteration_budget.per_complexity_point` | `4` | Iterazioni aggiuntive per ogni punto di complessita del prompt (score 0-100). |
+| `agent.kb.cluster_method` | `embedding_kmeans` | Metodo di clustering per KB graph summary. Valori: embedding_kmeans (default), tags_groupby, manual. |
+| `agent.kb.graph_summary_threshold_topk` | `20` | Sopra top_k threshold, knowledge_search ritorna clusters {theme, count, sample_titles} invece di N body completi. Default 20. |
 | `agent.lang_reminder_ttl_seconds` | `60` | TTL cache language reminder (H-28) |
 | `agent.language_reminder_enabled` | `true` | Abilita l'iniezione del reminder di lingua resiliente al contesto in coda al system prompt e all'ultimo messaggio utente (bug #88). Disabilita con "false" per rollback immediato senza rideploy. |
 | `agent.language_reminder_text` | `Rispondi SEMPRE e SOLO in italiano. Mai cinese, giappones...` | Testo del reminder di lingua iniettato in coda al system prompt e all'ultimo messaggio utente per vincere il recency bias dei modelli small a contesto saturo (bug #88). |
@@ -114,11 +127,23 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.todos.live_events` | `true` | M15.1: emette eventi SSE live (TodoUpdated per todo + PlanUpdated finale) quando lo status di un todo cambia, dopo il commit della transazione. |
 | `agent.todos.user_editable` | `true` | M15.3: abilita l'endpoint POST /api/agent/todos/{run_id}/edit per modificare i todo del piano dall'interfaccia utente (add/edit/reorder/remove). |
 | `agent.tools.core_whitelist` | `read_file,write_file,edit_file,list_files,search_in_files...` | CSV dei tool CORE essenziali sempre esposti col tool tiering (slim, mig 0254). Gli altri restano scopribili via nexus_mcp_tool_search. Set ridotto per stabilita function-calling Gemini 2.5. |
+| `agent.tools.discovery_enabled` | `true` | Se true, attiva la modalita' tool discovery: solo i core inline, gli altri via nexus_mcp_tool_search. Default true per i nuovi run. |
 | `agent.tools.discovery_first_enabled` | `true` | M16: primo turno espone SOLO i tool di discovery (nexus_mcp_tool_search/call); i tool trovati diventano native per il turno successivo. Default ON dopo verifica E2E (mig 0257). |
 | `agent.tools.discovery_first_whitelist` | `nexus_mcp_tool_search,nexus_mcp_tool_call,list_files,read...` | Tool esposti al primo turno quando discovery-first e' attivo (CSV). Include i meta di discovery + i tool core del filesystem sempre disponibili (lettura/scrittura/comando). Gli altri tool restano scopribili via nexus_mcp_tool_search. |
 | `agent.tools.discovery_max_injected` | `20` | Numero massimo di tool scoperti via nexus_mcp_tool_search iniettati come native nel turno successivo. |
 | `agent.tools.discovery_schema_max_bytes` | `8192` | Cap dimensione (byte) dell input_schema di un singolo tool scoperto, per isolare schemi malformati da plugin esterni. |
+| `agent.tools.inline_core_count` | `15` | Numero di tool che restano inline nel prompt (i piu' usati statisticamente). Gli altri sono indicizzati in Qdrant agent_tools_descriptors e raggiungibili con nexus_mcp_tool_search. Default 15. |
+| `agent.tools.inline_core_whitelist` | `read_file,write_file,edit_file,list_files,search_in_files...` | CSV dei tool core sempre inline nel prompt agente. Modificabile via UI Admin/Agenti. |
+| `agent.tools.max_description_tokens` | `40` | Target massimo (token) per ciascuna description di tool. Lint redazionale in CI segnala violazioni. Default 40. |
+| `agent.tools.regression_test_enabled` | `true` | Worker tool_selection_regression_worker: confronta scelta tool su 30 prompt baseline vs definitions correnti. Soglia accettazione 95%. |
+| `agent.tools.result_cache_enabled` | `true` | Se true, tool_result vengono cachati in Redis con key sha256(tool_name+args). Replay identici ritornano cache_ref invece del payload. |
+| `agent.tools.result_cache_skip_for` | `run_command,run_tests,git_commit,git_push,write_file,edit...` | CSV dei tool con side-effect o output non deterministico, MAI cachati. Aggiungi qui tool nuovi con side effect. |
+| `agent.tools.result_cache_ttl_seconds` | `1800` | TTL della cache tool_result (Redis). Default 1800s = 30 min. |
 | `agent.tools.tiering_enabled` | `true` | Abilita il tool tiering: invia al modello solo il CORE di tool + discovery (nexus_mcp_tool_search/call). Disattivare per esporre tutti gli 80 tool. |
+| `agent.upscale.cost_cap_usd_per_run` | `0.50` | Cap di sicurezza: se il modello upscaled costerebbe > cap stimato per il singolo run, errore in UI invece di procedere. Default 0.50 USD. |
+| `agent.upscale.enabled` | `true` | Se true, prima di chiamare il provider, se est_tokens > 0.9*model.context_window cerca un modello con window maggiore nella routing matrix. |
+| `agent.upscale.preferred_targets` | `claude-opus-4-6,gemini-2.5-pro,gpt-5.5,claude-sonnet-4-6` | CSV ordinato dei modelli con window grande preferiti per l'upscale. Il primo disponibile e abilitato in ai_price_catalog viene scelto. |
+| `agent.upscale.target_overhead_ratio` | `1.2` | Margine di sicurezza: il modello upscaled deve avere context_window >= est_tokens * target_overhead_ratio. Default 1.2 (20% margine). |
 | `agent.verifier.fail_closed` | `true` | Se true il verifier_node, in assenza di acceptance_criteria sul todo software, esegue comunque i gate generali invece di marcare completed. |
 | `agent.vision.image_max_bytes` | `2097152` | Max byte immagine per vision describe (H-69) |
 | `agent.visual_compare.screenshot_timeout_secs` | `45` | Timeout (secondi) per la cattura dello screenshot via Playwright in nexus_visual_compare (launch + goto + wait + scatto). Default 45. |
@@ -598,7 +623,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `default_model` | `claude-sonnet-4-6` | Default model for chat |
 | `default_provider` | `anthropic` | Default LLM provider |
 | `max_token_budget` | `32000` | Maximum token budget allowed |
-| `model_catalog_last_sync` | `2026-06-03T22:04:32.963776514+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
+| `model_catalog_last_sync` | `2026-06-04T07:52:57.731627796+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
 | `nexus_active_routing_pct` | `50` | Percentuale di richieste chat gestite dal router Q-Learning Nexus (0=off, 100=tutto). A/B testing: imposta 10-50 per un rollout graduale. |
 | `nexus_behavior_mode` | `dinamico` | Modalità comportamento Nexus: veloce|economica|bilanciata|approfondita |
 | `provider_hierarchy` | `anthropic,openai,google,deepseek,mistral` | Ordered fallback chain for chat providers |
@@ -687,4 +712,4 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 ---
 
-**Totale chiavi**: 485
+**Totale chiavi**: 510

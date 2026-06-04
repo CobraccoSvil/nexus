@@ -6,12 +6,12 @@ slug: postgres-tables
 tags:
   - schema
   - postgres
-source_commit: a1dd3a174318e8a92a0808d9e39a37ac06afdf8a
+source_commit: ee22019f4f5739771259bbb3e71a653a058ebebb
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T04:27:55Z
+updated_at: 2026-06-04T08:05:29Z
 nexus_meta_version: 1
 ---
 
@@ -69,6 +69,10 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `completion_tokens` | integer | NO | `0` |
 | `total_tokens` | integer | NO | `0` |
 | `total_cost` | double precision | NO | `0.0` |
+| `upscale_from` | text | YES | `—` |
+| `upscale_to` | text | YES | `—` |
+| `upscale_reason` | text | YES | `—` |
+| `est_tokens_at_call` | integer | YES | `—` |
 
 ## `agent_steps`
 
@@ -82,6 +86,19 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `tool_result` | text | YES | `—` |
 | `status` | text | NO | `'running'::text` |
 | `created_at` | timestamp with time zone | NO | `now()` |
+
+## `agent_tool_result_cache`
+
+| Colonna | Tipo | Nullable | Default |
+|---|---|---|---|
+| `cache_key` | text | NO | `—` |
+| `tool_name` | text | NO | `—` |
+| `payload` | text | NO | `—` |
+| `payload_bytes` | integer | NO | `—` |
+| `hit_count` | integer | NO | `0` |
+| `created_at` | timestamp with time zone | NO | `now()` |
+| `last_hit_at` | timestamp with time zone | YES | `—` |
+| `expires_at` | timestamp with time zone | NO | `—` |
 
 ## `ai_model_health_history`
 
