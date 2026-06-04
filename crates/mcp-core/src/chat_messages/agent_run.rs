@@ -1027,6 +1027,7 @@ pub(crate) async fn spawn_agent_run(
                    FROM ai_price_catalog
                   WHERE is_enabled = true
                     AND supports_tool_use = true
+                    AND is_thinking = false
                     AND consecutive_failures = 0",
                 )
                 .fetch_one(&db_clone)
@@ -1108,9 +1109,16 @@ pub(crate) async fn spawn_agent_run(
                 "agent_run {}: ctx insufficiente per primario {}/{} ({} < {}), cerco modello con ctx >= {}",
                 run_id, current_provider, current_model, primary_ctx, ctx_needed, ctx_needed
             );
+                // Il re-routing context-aware e' un path AGENTICO (loop a tool
+                // forzati): deve escludere i thinking model (is_thinking=true),
+                // altrimenti sceglie il piu' economico a grande contesto — spesso
+                // un reasoner come deepseek-v4-pro (128k) — che fallisce il loop
+                // (reasoning_content 400) e vanifica il capability gate (mig 0317/
+                // 0318, ADR 0024). Stesso filtro di best_model_for_tier.
                 let alt: Option<(String, String)> = sqlx::query_as::<_, (String, String)>(
                     "SELECT provider, model FROM ai_price_catalog
                   WHERE is_enabled=true AND supports_tool_use=true
+                    AND is_thinking=false
                     AND consecutive_failures=0
                     AND context_window >= $1
                   ORDER BY input_cost_per_million_tokens ASC NULLS LAST
@@ -1465,6 +1473,7 @@ pub(crate) async fn spawn_agent_run(
                        FROM ai_price_catalog
                       WHERE is_enabled = true
                         AND supports_tool_use = true
+                        AND is_thinking = false
                         AND consecutive_failures = 0
                         AND NOT (provider = ANY($1))
                         AND context_window >= $2
