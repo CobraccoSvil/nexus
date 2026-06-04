@@ -6,12 +6,12 @@ slug: postgres-tables
 tags:
   - schema
   - postgres
-source_commit: d6f2c3dcd0c0ff77d19a6b136ff7058325d9981a
+source_commit: 8903d1f21d0ce7368e9eef518b9a2a248dbb2287
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-03T20:53:30Z
+updated_at: 2026-06-04T04:26:47Z
 nexus_meta_version: 1
 ---
 
@@ -791,6 +791,15 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `qdrant_point_id` | text | YES | `—` |
 | `created_at` | timestamp with time zone | NO | `now()` |
 | `updated_at` | timestamp with time zone | NO | `now()` |
+| `manually_edited` | boolean | NO | `false` |
+| `edit_lock` | text | NO | `'none'::text` |
+| `protected_sections` | ARRAY | NO | `'{}'::text[]` |
+| `generated_hash` | text | YES | `—` |
+| `edited_hash` | text | YES | `—` |
+| `last_generated_at` | timestamp with time zone | YES | `—` |
+| `last_edited_at` | timestamp with time zone | YES | `—` |
+| `edited_by` | text | YES | `—` |
+| `current_version` | integer | NO | `1` |
 
 ## `nexus_model_escalation_chain`
 
@@ -1442,6 +1451,15 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `deprecated_at` | timestamp with time zone | YES | `—` |
 | `superseded_by` | uuid | YES | `—` |
 | `archived_at` | timestamp with time zone | YES | `—` |
+| `manually_edited` | boolean | NO | `false` |
+| `edit_lock` | text | NO | `'none'::text` |
+| `protected_sections` | ARRAY | NO | `'{}'::text[]` |
+| `generated_hash` | text | YES | `—` |
+| `edited_hash` | text | YES | `—` |
+| `last_generated_at` | timestamp with time zone | YES | `—` |
+| `last_edited_at` | timestamp with time zone | YES | `—` |
+| `edited_by` | text | YES | `—` |
+| `current_version` | integer | NO | `1` |
 
 ## `project_knowledge_tags`
 
@@ -1883,6 +1901,24 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `requested_by` | uuid | YES | `—` |
 | `started_at` | timestamp with time zone | NO | `now()` |
 | `finished_at` | timestamp with time zone | YES | `—` |
+
+## `wiki_doc_revisions`
+
+| Colonna | Tipo | Nullable | Default |
+|---|---|---|---|
+| `id` | bigint | NO | `nextval('wiki_doc_revisions_id_seq'::regclass)` |
+| `scope` | text | NO | `—` |
+| `doc_id` | uuid | NO | `—` |
+| `project_id` | uuid | YES | `—` |
+| `version_no` | integer | NO | `—` |
+| `title` | text | NO | `—` |
+| `body_md` | text | NO | `—` |
+| `body_hash` | text | NO | `—` |
+| `tags` | ARRAY | NO | `'{}'::text[]` |
+| `source` | text | NO | `—` |
+| `author` | text | YES | `—` |
+| `edit_summary` | text | YES | `—` |
+| `created_at` | timestamp with time zone | NO | `now()` |
 
 ## `workspaces`
 

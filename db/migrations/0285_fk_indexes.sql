@@ -1,4 +1,4 @@
--- 0282: indici sulle foreign key prive di indice di supporto.
+-- 0285: indici sulle foreign key prive di indice di supporto.
 --
 -- Audit revisione codice (best practice DB). Postgres NON crea automaticamente
 -- un indice sulla colonna REFERENTE di una foreign key (indicizza solo la

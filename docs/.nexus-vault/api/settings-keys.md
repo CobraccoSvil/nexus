@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: 109bfafad79cbe4c32779f771e0982e92635cf47
+source_commit: 8903d1f21d0ce7368e9eef518b9a2a248dbb2287
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-03T20:57:34Z
+updated_at: 2026-06-04T04:26:49Z
 nexus_meta_version: 1
 ---
 
@@ -598,7 +598,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `default_model` | `claude-sonnet-4-6` | Default model for chat |
 | `default_provider` | `anthropic` | Default LLM provider |
 | `max_token_budget` | `32000` | Maximum token budget allowed |
-| `model_catalog_last_sync` | `2026-06-03T20:48:52.339139749+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
+| `model_catalog_last_sync` | `2026-06-03T22:04:32.963776514+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
 | `nexus_active_routing_pct` | `50` | Percentuale di richieste chat gestite dal router Q-Learning Nexus (0=off, 100=tutto). A/B testing: imposta 10-50 per un rollout graduale. |
 | `nexus_behavior_mode` | `dinamico` | Modalità comportamento Nexus: veloce|economica|bilanciata|approfondita |
 | `provider_hierarchy` | `anthropic,openai,google,deepseek,mistral` | Ordered fallback chain for chat providers |
@@ -672,6 +672,19 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `mcp_tool_search_min_score` | `0.35` | Score minimo coseno (0-1) per restituire un risultato dalla ricerca semantica tool MCP. Sotto soglia si usa ILIKE come fallback. |
 | `qdrant_mcp_tools_collection` | `mcp_tools` | Nome della collection Qdrant per gli embedding dei tool MCP (nexus_mcp_tool_search semantico). |
 
+## `wiki`
+
+| Chiave | Valore default | Descrizione |
+|---|---|---|
+| `wiki.lock_on_external_edit` | `true` | Se true, un edit esterno fuori dai blocchi manuali porta il doc a edit_lock=protected. |
+| `wiki.protect_manual_edits` | `true` | Se true, la rigenerazione non sovrascrive doc con modifiche manuali salvo edit_lock=none. |
+| `wiki.regen_section_merge` | `true` | Se true, la rigenerazione fa merge a livello di sezione preservando protected_sections. |
+| `wiki.retention_keep_all_manual` | `true` | Se true, le revisioni con source manual/revert non vengono mai potate. |
+| `wiki.retention_max_age_days` | `365` | Eta massima (giorni) delle revisioni auto prima della potatura. 0 = nessun limite. |
+| `wiki.retention_max_versions` | `50` | Numero massimo di revisioni conservate per doc (0 = illimitato). Le piu vecchie vengono potate, mantenendo sempre le manual. |
+| `wiki.retention_worker_interval_secs` | `86400` | Intervallo del worker di potatura revisioni (default giornaliero). |
+| `wiki.versioning_enabled` | `true` | Abilita lo storico revisioni per i doc wiki (meta + progetto). |
+
 ---
 
-**Totale chiavi**: 477
+**Totale chiavi**: 485

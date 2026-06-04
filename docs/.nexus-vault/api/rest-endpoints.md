@@ -6,18 +6,18 @@ slug: rest-endpoints
 tags:
   - api
   - rest
-source_commit: 109bfafad79cbe4c32779f771e0982e92635cf47
+source_commit: 8903d1f21d0ce7368e9eef518b9a2a248dbb2287
 source_files:
   - crates/mcp-core/src/main.rs
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-03T20:57:34Z
+updated_at: 2026-06-04T04:26:49Z
 nexus_meta_version: 1
 ---
 
 Endpoint REST esposti da mcp-core (axum). Generato parsando `crates/mcp-core/src/main.rs`.
 
-**Totale endpoint**: 266
+**Totale endpoint**: 274
 
 Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]].
 
@@ -205,9 +205,13 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 | Metodo | Path | Handler |
 |---|---|---|
 | `GET` | `/api/meta-docs/:id` | `meta_docs::routes::get_meta_doc` |
+| `GET` | `/api/meta-docs/:id/diff` | `docs_core::revisions::meta_diff` |
+| `GET` | `/api/meta-docs/:id/revisions` | `docs_core::revisions::meta_list_revisions` |
+| `GET` | `/api/meta-docs/:id/revisions/:version` | `docs_core::revisions::meta_get_revision` |
 | `GET` | `/api/meta-docs/export-archive` | `meta_docs::routes::export_vault_archive` |
 | `GET` | `/api/meta-docs/graph` | `meta_docs::routes::graph_handler` |
 | `GET` | `/api/meta-docs/list` | `meta_docs::routes::list_meta_docs` |
+| `POST` | `/api/meta-docs/:id/restore` | `docs_core::revisions::meta_restore` |
 | `POST` | `/api/meta-docs/ingest-commit` | `meta_docs::routes::ingest_commit_stub` |
 | `POST` | `/api/meta-docs/recompute-links` | `meta_docs::routes::recompute_meta_links` |
 | `POST` | `/api/meta-docs/refresh-all` | `meta_docs::routes::refresh_all_stub` |
@@ -282,6 +286,9 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 | `GET` | `/api/projects/:id/knowledge/graph` | `knowledge::routes::graph_handler` |
 | `GET` | `/api/projects/:id/knowledge/notes` | `knowledge::routes::list_notes` |
 | `GET` | `/api/projects/:id/knowledge/notes/:note_id` | `knowledge::routes::get_note` |
+| `GET` | `/api/projects/:id/knowledge/notes/:note_id/diff` | `docs_core::routes::proj_diff` |
+| `GET` | `/api/projects/:id/knowledge/notes/:note_id/revisions` | `docs_core::routes::proj_list_revisions` |
+| `GET` | `/api/projects/:id/knowledge/notes/:note_id/revisions/:version` | `docs_core::routes::proj_get_revision` |
 | `GET` | `/api/projects/:id/knowledge/obsidian-vault` | `knowledge::routes::get_obsidian_vault` |
 | `GET` | `/api/projects/:id/knowledge/tags` | `knowledge::routes::list_tags` |
 | `GET` | `/api/projects/:id/output/channels` | `project_workspace::get_output_channels` |
@@ -348,6 +355,7 @@ Vedi anche: [[crates-rust]], [[nexus-architetturale]], [[multi-provider-routing]
 | `POST` | `/api/projects/:id/knowledge/generate-rich` | `knowledge::routes::generate_rich_kb` |
 | `POST` | `/api/projects/:id/knowledge/init-or-refresh` | `knowledge::routes::init_or_refresh_knowledge` |
 | `POST` | `/api/projects/:id/knowledge/links` | `knowledge::routes::create_link` |
+| `POST` | `/api/projects/:id/knowledge/notes/:note_id/restore` | `docs_core::routes::proj_restore` |
 | `POST` | `/api/projects/:id/knowledge/notes/manual` | `knowledge::routes::create_note_manual` |
 | `POST` | `/api/projects/:id/knowledge/rebuild` | `knowledge::routes::rebuild_knowledge` |
 | `POST` | `/api/projects/:id/knowledge/recompute-links` | `knowledge::routes::recompute_links` |
