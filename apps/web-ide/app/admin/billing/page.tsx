@@ -62,7 +62,7 @@ export default function AdminBillingPage() {
   const [newPriceCatalogKey, setNewPriceCatalogKey] = useState<string>("");
   const [newPriceInput, setNewPriceInput] = useState<string>("");
   const [newPriceOutput, setNewPriceOutput] = useState<string>("");
-  const [newPriceCurrency, setNewPriceCurrency] = useState<string>("EUR");
+  const [newPriceCurrency, setNewPriceCurrency] = useState<string>("USD");
 
   // Form: nuova quota
   const [newQuota, setNewQuota] = useState({
@@ -71,7 +71,7 @@ export default function AdminBillingPage() {
     project_id: "",
     token_limit: "",
     cost_limit: "",
-    currency: "EUR",
+    currency: "USD",
     valid_from: "",
     valid_to: "",
     note: "",
@@ -173,7 +173,7 @@ export default function AdminBillingPage() {
     if (item) {
       setNewPriceInput(String(item.inputCostPerMillionTokens));
       setNewPriceOutput(String(item.outputCostPerMillionTokens));
-      setNewPriceCurrency(item.currency || "EUR");
+      setNewPriceCurrency(item.currency || "USD");
     }
   }, [newPriceCatalogKey, catalog]);
 
@@ -192,7 +192,7 @@ export default function AdminBillingPage() {
         model,
         input_cost_per_million_tokens: Number(newPriceInput || "0"),
         output_cost_per_million_tokens: Number(newPriceOutput || "0"),
-        currency: (newPriceCurrency || "EUR").trim().toUpperCase(),
+        currency: (newPriceCurrency || "USD").trim().toUpperCase(),
       });
       await loadBilling();
     } catch (saveError) {
@@ -235,7 +235,7 @@ export default function AdminBillingPage() {
         project_id: "",
         token_limit: "",
         cost_limit: "",
-        currency: "EUR",
+        currency: "USD",
         valid_from: "",
         valid_to: "",
         note: "",
@@ -357,7 +357,7 @@ export default function AdminBillingPage() {
 
         <div style={{ display: "flex", gap: 16, flexWrap: "wrap", fontSize: 13, marginBottom: 14, color: tc.text }}>
           <div>Token totali: <strong>{(usage?.summary.total_tokens ?? 0).toLocaleString('it-IT')}</strong></div>
-          <div>Costo totale: <strong>{(usage?.summary.total_cost ?? 0).toFixed(4)} EUR</strong></div>
+          <div>Costo totale: <strong>{(usage?.summary.total_cost ?? 0).toFixed(4)} USD</strong></div>
           <div>Run: <strong>{usage?.summary.total_runs ?? 0}</strong></div>
         </div>
 

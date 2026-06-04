@@ -118,12 +118,17 @@ type ApiError = (StatusCode, Json<Value>);
 type ApiResult = Result<Json<Value>, ApiError>;
 
 pub async fn get_platform_currency(db: &PgPool) -> anyhow::Result<String> {
+    // Default USD: i provider AI fatturano in dollari, ai_price_catalog e' in
+    // USD. Tenere "EUR" come default produceva ledger con currency='EUR' e
+    // total_cost=0 quando il fallback price-snapshot non trovava match
+    // (3.993 righe orfane osservate prima del fix 2026-06-04).
+    // Settings.billing_base_currency = 'USD' allineato in mig 0294.
     let currency = sqlx::query_scalar::<_, String>(
         "SELECT value FROM settings WHERE key = 'billing_base_currency'",
     )
     .fetch_optional(db)
     .await?
-    .unwrap_or_else(|| "EUR".to_string());
+    .unwrap_or_else(|| "USD".to_string());
 
     Ok(currency.trim().to_uppercase())
 }
@@ -134,7 +139,15 @@ pub async fn resolve_active_price(
     model: &str,
 ) -> anyhow::Result<PriceSnapshot> {
     let currency = get_platform_currency(db).await?;
-    // 1) Prima prova: currency di piattaforma (default EUR)
+    // NB IMPORTANTE: NON filtriamo per `is_enabled = TRUE`. Il billing deve
+    // conoscere il prezzo del modello effettivamente CHIAMATO, anche se nel
+    // catalogo il flag enabled e' stato disattivato dall'admin (es. mistral-
+    // large-2411 disabled ma usato da run legacy/pinning). Filtrare per enabled
+    // produceva cost=0 = sottostima silenziosa. Il filtro enabled e' invece
+    // corretto nel routing (chi puo' usare quale modello), non qui (quanto
+    // costa quella chiamata gia' avvenuta).
+    //
+    // 1) Match per (provider, model, currency di piattaforma).
     let price = sqlx::query_as::<_, PriceSnapshot>(
         r#"
         SELECT input_cost_per_million_tokens::float8,
@@ -144,7 +157,6 @@ pub async fn resolve_active_price(
         WHERE provider = $1
           AND model = $2
           AND currency = $3
-          AND is_enabled = TRUE
           AND effective_from <= NOW()
           AND (effective_to IS NULL OR effective_to > NOW())
         ORDER BY effective_from DESC
@@ -161,8 +173,8 @@ pub async fn resolve_active_price(
         return Ok(p);
     }
 
-    // 2) Fallback: se il catalogo è in USD (o altra currency) e la base è EUR,
-    //    scegli il prezzo attivo più recente in qualunque currency.
+    // 2) Fallback: prezzo attivo in QUALUNQUE currency (es. catalog tutto USD
+    //    ma platform_currency=EUR -> usa USD per non perdere il dato).
     let fallback = sqlx::query_as::<_, PriceSnapshot>(
         r#"
         SELECT input_cost_per_million_tokens::float8,
@@ -171,7 +183,6 @@ pub async fn resolve_active_price(
         FROM ai_price_catalog
         WHERE provider = $1
           AND model = $2
-          AND is_enabled = TRUE
           AND effective_from <= NOW()
           AND (effective_to IS NULL OR effective_to > NOW())
         ORDER BY effective_from DESC
@@ -183,8 +194,16 @@ pub async fn resolve_active_price(
     .fetch_optional(db)
     .await?;
 
-    // Ultimo fallback: se manca completamente la voce (provider/model non censiti),
-    // non bloccare l'esecuzione: registra comunque i token con costo=0 (verificabile).
+    // Ultimo fallback: provider/model non censiti -> log warning + cost=0.
+    // Audit `nexus_provider_empty_responses` puo' rilevarli e l'admin
+    // aggiunge la riga al catalog.
+    if fallback.is_none() {
+        tracing::warn!(
+            target: "billing",
+            "resolve_active_price: provider/model non in ai_price_catalog -> cost=0 (provider={}, model={})",
+            provider, model,
+        );
+    }
     Ok(fallback.unwrap_or(PriceSnapshot {
         input_cost_per_million_tokens: 0.0,
         output_cost_per_million_tokens: 0.0,
