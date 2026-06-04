@@ -6,13 +6,13 @@ slug: crates-rust
 tags:
   - architecture
   - rust
-source_commit: 171c2da1220f4e3ea87358c54516a91feafa8061
+source_commit: dc1ca99ab4cf4646b7bd228a2db10e639a9eb095
 source_files:
   - Cargo.toml
   - crates/
 auto_generated: true
 created_at: 2026-05-23T07:19:16Z
-updated_at: 2026-06-04T09:20:42Z
+updated_at: 2026-06-04T09:35:30Z
 nexus_meta_version: 1
 ---
 
@@ -40,7 +40,7 @@ Workspace members: **51**
 | `mcp-quality` | `crates/mcp-quality` | (senza descrizione) |
 | `mcp-token` | `crates/mcp-token` | (senza descrizione) |
 | `nexus-auth` | `crates/nexus-auth` | (senza descrizione) |
-| `crates/nexus-orchestrator", "crates/ruvector", "crates/nexus-http", "crates/xtask", "crates/browser-bridge-mcp", "crates/nexus-events"]` | `crates/nexus-orchestrator", "crates/ruvector", "crates/nexus-http", "crates/xtask", "crates/browser-bridge-mcp", "crates/nexus-events"]` | (senza descrizione) |
+| `crates/nexus-orchestrator", "crates/ruvector", "crates/nexus-http", "crates/xtask", "crates/browser-bridge-mcp", "crates/nexus-events", "crates/nexus-sudo-runner"]` | `crates/nexus-orchestrator", "crates/ruvector", "crates/nexus-http", "crates/xtask", "crates/browser-bridge-mcp", "crates/nexus-events", "crates/nexus-sudo-runner"]` | (senza descrizione) |
 | `nexus-types` | `crates/nexus-types` | (senza descrizione) |
 | `plugin-service` | `crates/plugin-service` | (senza descrizione) |
 | `dashmap = "5` | `dashmap = "5` | (senza descrizione) |
