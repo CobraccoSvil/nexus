@@ -296,7 +296,7 @@ impl Orchestrator {
             .map(str::to_string)
             .unwrap_or_else(|| routing_for_mode.behavior_mode.clone());
 
-        let (provider, model) = self
+        let (mut provider, mut model) = self
             .resolve_agent_provider(
                 db,
                 _project_id,
@@ -311,6 +311,21 @@ impl Orchestrator {
         // Riclassifica via classifier LLM (gemini-flash, cache 24h) con fallback
         // keyword + promozione agentic. Vedi `classify_intent_async`.
         let (intent, confidence) = self.classify_intent_with_db_thresholds(message).await;
+
+        // ── Gate di capability tool-use (ADR 0018, leva 0) ──────────────────
+        // Un RUN AGENTICO (intent != "chat") non deve MAI usare un modello con
+        // ai_price_catalog.supports_tool_use = false: il loop agentico forza il
+        // tool_choice e un modello non tool-capable produrrebbe lo stop
+        // narrativo / MALFORMED_FUNCTION_CALL. Caso reale: mistral-code-latest
+        // (supports_tool_use=false) raggiungibile dal routing agentico via
+        // nexus_routing_matrix. Il gate riusa i meccanismi di fallback gia'
+        // esistenti (best_model_for_tier, filtrato su supports_tool_use=TRUE) —
+        // nessun nome modello hardcoded (regola G).
+        if intent != "chat" && !provider.is_empty() && !model.is_empty() {
+            self.apply_tool_use_capability_gate(db, &mut provider, &mut model, intent, message)
+                .await;
+        }
+
         let risky = is_risky_task(message);
         let effective_mode = if risky && configured_behavior_mode != "approfondita" {
             "approfondita".to_string()
@@ -422,6 +437,107 @@ impl Orchestrator {
             no_capable_provider,
             providers_in_cooldown,
             error: None,
+        }
+    }
+
+    /// Gate di capability tool-use per i run AGENTICI (ADR 0018, leva 0).
+    ///
+    /// Se `(provider, model)` risolti puntano a un modello con
+    /// `ai_price_catalog.supports_tool_use = false`, sostituisce in-place con il
+    /// primo modello tool-capable secondo i meccanismi di fallback gia'
+    /// esistenti (`best_model_for_tier`, che filtra `supports_tool_use = TRUE`
+    /// ed esclude i provider in cooldown). Nessun nome modello hardcoded.
+    ///
+    /// Configurabile via setting `agent.require_tool_use_capability` (default
+    /// `true`). Se nessun modello tool-capable e' disponibile per quell'intent,
+    /// NON sostituisce ma logga un WARN esplicito (fail visibile, regola G):
+    /// il run proseguira' col modello originale, ma l'incidente e' tracciato.
+    async fn apply_tool_use_capability_gate(
+        &self,
+        db: &PgPool,
+        provider: &mut String,
+        model: &mut String,
+        intent: &str,
+        message: &str,
+    ) {
+        // Flag DB (default true). Stesso pattern di lettura settings usato
+        // altrove (es. agent.model_tool_failure_threshold in agent_run.rs).
+        let gate_enabled: bool = crate::settings::get_setting(db, "agent.require_tool_use_capability")
+            .await
+            .ok()
+            .flatten()
+            .map(|v| {
+                let t = v.trim().to_ascii_lowercase();
+                !(t == "false" || t == "0" || t == "no")
+            })
+            .unwrap_or(true);
+
+        // Capability del modello risolto dal catalog. None = modello assente
+        // (problema di sync, gestito conservativamente dalla funzione pura).
+        let supports: Option<bool> = sqlx::query_scalar::<_, bool>(
+            "SELECT supports_tool_use FROM ai_price_catalog \
+             WHERE provider = $1 AND model = $2 LIMIT 1",
+        )
+        .bind(&*provider)
+        .bind(&*model)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+
+        match decide_tool_capability_gate(intent, gate_enabled, supports) {
+            ToolCapabilityGate::KeepOriginal => {}
+            ToolCapabilityGate::NeedsFallback => {
+                // Tier/capability dell'intent dalla cache (mig 0110), stessi
+                // valori usati dal routing dinamico. Default light/chat se
+                // l'intent non e' mappato.
+                let estimated_tokens = estimate_complexity(message);
+                let icap_arc = self.intent_capability.current_async().await.ok();
+                let (tier, capability) = match icap_arc.as_deref() {
+                    Some(map) => match map.get(intent) {
+                        Some(c) => (
+                            c.tier_for_tokens(estimated_tokens),
+                            c.base_capability.clone(),
+                        ),
+                        None => ("light".to_string(), "chat".to_string()),
+                    },
+                    None => ("light".to_string(), "chat".to_string()),
+                };
+
+                // Fallback deterministico: miglior modello tool-capable del tier
+                // (degradazione di tier controllata in best_model_for_tier).
+                match best_model_for_tier(db, &tier, Some(&capability), true).await {
+                    Some((alt_provider, alt_model)) => {
+                        tracing::info!(
+                            "routing: {}/{} scartato per run agente (supports_tool_use=false) \
+                             -> fallback {}/{} (intent={}, tier={})",
+                            provider,
+                            model,
+                            alt_provider,
+                            alt_model,
+                            intent,
+                            tier,
+                        );
+                        *provider = alt_provider;
+                        *model = alt_model;
+                    }
+                    None => {
+                        // Nessun modello tool-capable disponibile: fail visibile.
+                        // Non sostituiamo silenziosamente con qualcosa di sbagliato.
+                        tracing::warn!(
+                            "routing: {}/{} non tool-capable per run agente (intent={}) ma \
+                             nessun modello tool-capable disponibile nel catalog (tier={}, \
+                             capability={}). Run proseguira' col modello originale — verifica \
+                             ai_price_catalog (supports_tool_use) e i provider in cooldown.",
+                            provider,
+                            model,
+                            intent,
+                            tier,
+                            capability,
+                        );
+                    }
+                }
+            }
         }
     }
 

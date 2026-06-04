@@ -671,3 +671,104 @@ pub(crate) fn completion_has_error(completion: &Value) -> bool {
         })
         .unwrap_or(false)
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Gate di capability sul routing agentico (ADR 0018, leva 0).
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Decisione del gate di capability per un run AGENTICO.
+///
+/// Un run agentico (intent != "chat") deve usare SOLO modelli con
+/// `ai_price_catalog.supports_tool_use = true`. Questa enum separa la LOGICA
+/// di decisione (pura, testabile senza DB) dall'I/O (query catalog + fallback),
+/// che resta nel chiamante `resolve_agent_provider_detailed`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ToolCapabilityGate {
+    /// Il modello risolto e' utilizzabile cosi' com'e'. Nessuna sostituzione.
+    /// Casi: intent non agentico, gate disabilitato, oppure modello gia'
+    /// tool-capable.
+    KeepOriginal,
+    /// Il modello risolto NON e' tool-capable: il chiamante deve cercare un
+    /// fallback tool-capable (via `best_model_for_tier` o default provider).
+    NeedsFallback,
+}
+
+/// Decide se applicare il gate di capability tool-use al modello risolto.
+///
+/// Funzione PURA: nessun accesso DB. Il chiamante fornisce i fatti gia' letti
+/// (intent agentico?, flag abilitato?, il modello supporta tool_use?).
+///
+/// Regole:
+/// - intent == "chat" (non agentico) -> `KeepOriginal` (il gate non si applica
+///   ai task non-agentici: classify, title, vision, embedding, completion).
+/// - gate disabilitato (`agent.require_tool_use_capability` = false) ->
+///   `KeepOriginal`.
+/// - intent agentico + gate abilitato + modello NON tool-capable ->
+///   `NeedsFallback`.
+/// - se la capability del modello e' sconosciuta (`None`, es. modello assente
+///   dal catalog) il gate e' CONSERVATIVO: NON sostituisce (KeepOriginal), per
+///   non degradare un modello potenzialmente valido solo perche' manca dal
+///   catalog. La mancanza nel catalog e' un problema di sync separato.
+pub(crate) fn decide_tool_capability_gate(
+    intent: &str,
+    gate_enabled: bool,
+    model_supports_tool_use: Option<bool>,
+) -> ToolCapabilityGate {
+    // Il gate si applica SOLO ai run agentici. Convenzione del progetto:
+    // intent == "chat" e' l'unico intent non-agentico (vedi agent_run.rs:1206
+    // `intent_uses_tools = classified_intent_for_loop != "chat"`).
+    if intent == "chat" {
+        return ToolCapabilityGate::KeepOriginal;
+    }
+    if !gate_enabled {
+        return ToolCapabilityGate::KeepOriginal;
+    }
+    match model_supports_tool_use {
+        // Modello esplicitamente non tool-capable -> serve fallback.
+        Some(false) => ToolCapabilityGate::NeedsFallback,
+        // Tool-capable, oppure capability ignota (conservativo) -> tieni.
+        Some(true) | None => ToolCapabilityGate::KeepOriginal,
+    }
+}
+
+#[cfg(test)]
+mod tool_capability_gate_tests {
+    use super::{decide_tool_capability_gate, ToolCapabilityGate};
+
+    #[test]
+    fn gate_scarta_modello_non_tool_capable_su_intent_agentico() {
+        // Caso reale ADR 0018: mistral-code-latest (supports_tool_use=false)
+        // risolto per un intent agentico (file_ops) -> deve richiedere fallback.
+        let d = decide_tool_capability_gate("file_ops", true, Some(false));
+        assert_eq!(d, ToolCapabilityGate::NeedsFallback);
+    }
+
+    #[test]
+    fn gate_lascia_passare_modello_tool_capable() {
+        let d = decide_tool_capability_gate("refactor", true, Some(true));
+        assert_eq!(d, ToolCapabilityGate::KeepOriginal);
+    }
+
+    #[test]
+    fn gate_disattivato_lascia_passare_anche_modello_non_capable() {
+        // Flag agent.require_tool_use_capability = false -> passthrough.
+        let d = decide_tool_capability_gate("file_ops", false, Some(false));
+        assert_eq!(d, ToolCapabilityGate::KeepOriginal);
+    }
+
+    #[test]
+    fn gate_non_si_applica_a_intent_chat() {
+        // Run non agentico: il gate non interviene neppure su modelli
+        // non-tool-capable (sono leciti per chat/title/vision/embedding).
+        let d = decide_tool_capability_gate("chat", true, Some(false));
+        assert_eq!(d, ToolCapabilityGate::KeepOriginal);
+    }
+
+    #[test]
+    fn gate_conservativo_su_capability_ignota() {
+        // Modello assente dal catalog (None): non degradare. La mancanza nel
+        // catalog e' un problema di sync, non un motivo per cambiare modello.
+        let d = decide_tool_capability_gate("debug", true, None);
+        assert_eq!(d, ToolCapabilityGate::KeepOriginal);
+    }
+}
