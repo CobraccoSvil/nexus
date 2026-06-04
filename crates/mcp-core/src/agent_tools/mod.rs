@@ -39,6 +39,7 @@ pub(crate) mod files;
 pub(crate) mod git;
 pub(crate) mod helpers;
 pub(crate) mod knowledge;
+pub(crate) mod monitor;
 pub(crate) mod port_scanner;
 pub(crate) mod ports;
 pub(crate) mod profile_tools;

@@ -153,33 +153,16 @@ pub(super) async fn tool_dispatcher_update_monitor(
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    // Aggiorna registry in-memory
-    {
-        let mut reg = ctx.monitor_registry.write();
-        let project_map = reg.entry(ctx.project_id).or_default();
-        project_map.insert(
-            monitor_id.clone(),
-            serde_json::json!({
-                "value": value,
-                "label": label,
-                "updated_at": chrono::Utc::now().to_rfc3339(),
-            }),
-        );
-    }
-
-    let env = dispatcher::emit(
+    // Riusa l'helper condiviso (regola H): aggiorna registry + emette MonitorUpdated.
+    let seq = super::monitor::set_monitor(
+        &ctx.monitor_registry,
         &ctx.project_channels,
         ctx.project_id,
-        ProjectEvent::MonitorUpdated {
-            monitor_id: monitor_id.clone(),
-            value: value.clone(),
-            label,
-        },
+        &monitor_id,
+        value.clone(),
+        label,
     );
-    format!(
-        "Monitor '{}' aggiornato a {} (seq={})",
-        monitor_id, value, env.seq
-    )
+    format!("Monitor '{}' aggiornato a {} (seq={})", monitor_id, value, seq)
 }
 
 pub(super) async fn tool_dispatcher_highlight_panel(

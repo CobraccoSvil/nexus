@@ -853,6 +853,12 @@ pub(crate) async fn spawn_agent_run(
     let session_id_cp = params.session_id;
     let project_id_cp = params.project_id;
     let user_message_id = params.user_message_id;
+    // Cloni per i monitor automatici del pannello Monitor (regola H: il run si
+    // auto-documenta senza dipendere dal fatto che il modello chiami
+    // `dispatcher_update_monitor`). Usati dal task ascoltatore sotto e dal
+    // monitor finale (completato/errore) emesso a fine run.
+    let monitor_registry_for_run = state.monitor_registry.clone();
+    let project_channels_for_run = state.project_channels.clone();
     // Cattura il provider che era stato impostato come preferenza di sessione.
     // Se al termine del run il gateway ha usato un provider locale diverso (vllm),
     // significa che è avvenuto un re-routing privacy → azzeriamo la preferenza.
@@ -913,6 +919,88 @@ pub(crate) async fn spawn_agent_run(
     let panic_session_id = session_id_cp;
     let panic_project_id = project_id_cp;
     let panic_user_msg_id = user_message_id;
+
+    // ── Monitor automatici del run (regola H, indipendenti dall'LLM) ─────────
+    // Il pannello Monitor si popola guardando lo STREAM degli step del run
+    // (eventi gia' prodotti dal parsing SSE del brain), non da chiamate del
+    // modello a `dispatcher_update_monitor`. Un task dedicato si sottoscrive al
+    // broadcast del run e traduce gli step in poche card chiave:
+    //   - `agent_run`  -> stato del run ("in corso", poi "completato"/"errore")
+    //   - `agent_tool` -> nome dell'ultimo tool eseguito (+ target file in label)
+    //   - `agent_files`-> contatore file toccati (write_file/edit_file)
+    // Sottoscriviamo PRIMA di spawnare il run cosi' nessun evento si perde.
+    {
+        let mut step_rx = tx_for_brain.subscribe();
+        let mon_reg = monitor_registry_for_run.clone();
+        let mon_ch = project_channels_for_run.clone();
+        let mon_project = project_id_cp;
+        // Stato iniziale immediato: il pannello mostra "in corso" appena parte.
+        crate::agent_tools::monitor::set_monitor(
+            &mon_reg,
+            &mon_ch,
+            mon_project,
+            "agent_run",
+            serde_json::Value::String("in corso".to_string()),
+            Some("avvio run agente".to_string()),
+        );
+        tokio::spawn(async move {
+            let mut files_touched: u64 = 0;
+            loop {
+                let ev = match step_rx.recv().await {
+                    Ok(ev) => ev,
+                    // Lagged: alcuni eventi persi (buffer pieno). Continuiamo:
+                    // i monitor sono best-effort, non un log esaustivo.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    // Tutti i sender chiusi: il run e' finito. Lo stato finale
+                    // (completato/errore) lo emette il corpo del run con
+                    // result.status (qui non lo conosciamo). Usciamo.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if ev.is_final {
+                    break;
+                }
+                let Some(step) = ev.step else { continue };
+                // Aggiorna `agent_tool` quando un tool inizia (status Running):
+                // value = nome tool, label = target file se ricavabile dall'input.
+                if step.status == AgentStepStatus::Running && !step.tool_name.is_empty() {
+                    let target = step
+                        .tool_input
+                        .get("file_path")
+                        .or_else(|| step.tool_input.get("path"))
+                        .or_else(|| step.tool_input.get("file"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    let label = target
+                        .clone()
+                        .map(|t| format!("step {} · {}", step.step_index, t))
+                        .unwrap_or_else(|| format!("step {}", step.step_index));
+                    crate::agent_tools::monitor::set_monitor(
+                        &mon_reg,
+                        &mon_ch,
+                        mon_project,
+                        "agent_tool",
+                        serde_json::Value::String(step.tool_name.clone()),
+                        Some(label),
+                    );
+                }
+                // Contatore file toccati: incrementa quando write_file/edit_file
+                // si completa con successo.
+                if step.status == AgentStepStatus::Completed
+                    && matches!(step.tool_name.as_str(), "write_file" | "edit_file")
+                {
+                    files_touched = files_touched.saturating_add(1);
+                    crate::agent_tools::monitor::set_monitor(
+                        &mon_reg,
+                        &mon_ch,
+                        mon_project,
+                        "agent_files",
+                        serde_json::Value::from(files_touched),
+                        Some("file modificati".to_string()),
+                    );
+                }
+            }
+        });
+    }
 
     tokio::spawn(async move {
         use futures::FutureExt;
@@ -1735,6 +1823,34 @@ pub(crate) async fn spawn_agent_run(
             .bind(result.nexus_task_type.as_deref())
             .execute(&db_clone)
             .await;
+
+            // ── Monitor finale del run (regola H, indipendente dall'LLM) ───────
+            // Porta la card `agent_run` allo stato terminale. Non cancelliamo i
+            // monitor: restano visibili come ultimo stato del run.
+            let (run_state, run_label): (&str, String) = match result.status {
+                AgentRunStatus::Completed => (
+                    "completato",
+                    format!("{} step · {} iter", result.steps.len(), result.iteration_count),
+                ),
+                AgentRunStatus::AwaitingConfirmation => {
+                    ("in attesa conferma", "conferma utente richiesta".to_string())
+                }
+                _ => (
+                    "errore",
+                    result
+                        .error_class
+                        .clone()
+                        .unwrap_or_else(|| status_str.to_string()),
+                ),
+            };
+            crate::agent_tools::monitor::set_monitor(
+                &monitor_registry_for_run,
+                &project_channels_for_run,
+                project_id_cp,
+                "agent_run",
+                serde_json::Value::String(run_state.to_string()),
+                Some(run_label),
+            );
 
             // ── G4: memorizza startup_command dopo avvio servizio riuscito ─────
             // Se il run è completato con successo e ha eseguito un `docker compose up`,
