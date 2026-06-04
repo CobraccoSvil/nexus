@@ -100,6 +100,7 @@ class MistralProvider(BaseProvider):
         tools: list[dict],
         max_tokens: int = 4096,
         system_text: str = "",
+        force_tool_choice: bool | None = None,
     ) -> ProviderResult:
         """Esegue un turno agente. Mistral Large supporta tool use, gli altri no."""
         if not self._api_key:
@@ -156,6 +157,7 @@ class MistralProvider(BaseProvider):
                     _tc = resolve_tool_choice(
                         cap, oai_messages,
                         weak_models=("small", "ministral", "nemo"),
+                        force_override=force_tool_choice,
                     )
                     if _tc is not None:
                         kwargs_call["tool_choice"] = _tc
@@ -163,6 +165,7 @@ class MistralProvider(BaseProvider):
                     kwargs_call["tool_choice"] = resolve_tool_choice_openai(
                         model, oai_messages,
                         weak_models=("small", "ministral", "nemo"),
+                        force_override=force_tool_choice,
                     )
 
             response = await client.chat.completions.create(**kwargs_call)

@@ -17,6 +17,8 @@ from .helpers import (
     _detect_action_request,
     _detect_unfulfilled_intent,
     _load_g1_max_nudges,
+    _load_tool_choice_forcing_config,
+    structural_unfulfilled_signal,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,12 +102,35 @@ def route_after_executor(state: AgentState) -> str:
             # e chiude. Cap g1_reroute_count previene loop su falsi positivi.
             _is_action_req = _detect_action_request(str(_first_human))
             _is_unfulfilled = _detect_unfulfilled_intent(state.get("result"))
-            if _is_action_req or _is_unfulfilled:
+            # ── ADR 0018 (c): segnale STRUTTURALE primario ───────────────────
+            # Il caso BookingPage (0 tool call su un task d'azione mentre i tool
+            # erano disponibili) scatta per via strutturale, indipendentemente
+            # dai verbi del testo. had_tools_available = tools_json non vuoto;
+            # no_tool_call_this_turn = nessun pending (gia' garantito dal gate
+            # `not pending` del ramo); action_oriented = richiesta utente
+            # d'azione. La soglia iterazione riusa il config del tool_choice
+            # forcing (stessa nozione di "primi turni d'azione").
+            _had_tools = bool(state.get("tools_json"))
+            _tc_enabled, _tc_max_iter = _load_tool_choice_forcing_config()
+            _structural_unfulfilled = structural_unfulfilled_signal(
+                had_tools_available=_had_tools,
+                no_tool_call_this_turn=not pending,
+                action_oriented=_is_action_req,
+                iteration=iterations,
+                max_iteration=_tc_max_iter,
+            )
+            if _structural_unfulfilled or _is_action_req or _is_unfulfilled:
                 _nudge_count_log = int(state.get("action_nudge_count") or 0)
+                if _structural_unfulfilled:
+                    _trigger = "structural(had_tools+no_tool_call+action)"
+                elif _is_action_req:
+                    _trigger = "textual(action-request)"
+                else:
+                    _trigger = "textual(intent-non-compiuta)"
                 logger.warning(
-                    "route_after_executor: G1 risposta descrittiva su %s "
+                    "route_after_executor: G1 risposta descrittiva, segnale=%s "
                     "(iter=%d reroute=%d/%d nudge=%d) -> re-executor",
-                    "action-request" if _is_action_req else "intent-non-compiuta",
+                    _trigger,
                     iterations, _reroute_count, _max_nudges, _nudge_count_log,
                 )
                 return "executor"

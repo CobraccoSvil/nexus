@@ -759,8 +759,16 @@ class ProviderRegistry:
         usage_run_id: str = "",
         usage_iteration: int = 0,
         usage_intent: str = "",
+        force_tool_choice: bool | None = None,
     ) -> ProviderResult:
         """Versione sincrona di generate_agent_turn, sicura da chiamare da thread gRPC.
+
+        ``force_tool_choice`` (ADR 0018 leva 2): override del tool_choice del
+        provider. True forza una tool call (turni d'azione); False disattiva la
+        forzatura (retry-senza-forcing dopo un MALFORMED_FUNCTION_CALL); None
+        lascia la decisione storica per-provider (first_turn_force da capability).
+        Passato solo ai provider che espongono il parametro (gli adapter
+        tool-mute lo ignorano).
 
         ``usage_run_id``/``usage_iteration``: contesto opzionale registrato nel
         ledger (colonna run_id + details). Quando l'executor LangGraph chiama
@@ -855,12 +863,25 @@ class ProviderRegistry:
                         metadata={"error": "quota_exceeded", "stop_reason": "billing_error"},
                     )
                 import concurrent.futures
+                # ADR 0018 (b): passa force_tool_choice solo ai provider che
+                # espongono il kwarg (anthropic/openai/google/mistral/deepseek).
+                # I provider tool-mute o legacy (ollama/vllm/base) non lo hanno:
+                # passarlo solleverebbe TypeError -> introspezione difensiva.
+                _agent_kwargs: dict[str, Any] = {"system_text": system_text}
+                if force_tool_choice is not None:
+                    try:
+                        import inspect as _inspect
+                        _sig = _inspect.signature(prov.generate_agent_turn)
+                        if "force_tool_choice" in _sig.parameters:
+                            _agent_kwargs["force_tool_choice"] = force_tool_choice
+                    except (TypeError, ValueError):
+                        pass
                 def _run():
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
                     try:
                         return loop.run_until_complete(
-                            prov.generate_agent_turn(prov_model, messages, tools, max_tokens, system_text=system_text)
+                            prov.generate_agent_turn(prov_model, messages, tools, max_tokens, **_agent_kwargs)
                         )
                     finally:
                         # Teardown sicuro: chiude i client async del provider e

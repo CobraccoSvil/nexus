@@ -216,6 +216,7 @@ def resolve_tool_choice_openai(
     messages: list[dict],
     *,
     weak_models: tuple[str, ...] = (),
+    force_override: bool | None = None,
 ) -> str:
     """Determina il tool_choice per provider con API OpenAI-compatible.
 
@@ -225,9 +226,17 @@ def resolve_tool_choice_openai(
 
     I modelli in `weak_models` usano sempre "auto" perche' "required"
     causa loop di safety-refusal (osservato su mistral-small, ministral).
+
+    `force_override` (ADR 0018 leva 2): True forza "required" anche oltre il
+    primo turno; False disattiva la forzatura (retry-senza-forcing); None =
+    comportamento storico. I modelli weak restano sempre "auto".
     """
     if weak_models and any(tag in model.lower() for tag in weak_models):
         return "auto"
+    if force_override is False:
+        return "auto"
+    if force_override is True:
+        return "required"
     if is_first_agent_turn(messages):
         return "required"
     return "auto"

@@ -1896,6 +1896,59 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             messages, system_text, _rag_est_tokens, _rag_window
         )
         anth_messages = _langchain_to_anthropic_messages(messages)
+        # ── ADR 0018 (b): decisione tool_choice forcing (funzione pura) ───────
+        # Forziamo una tool call nei turni d'azione iniziali cosi' il modello
+        # NON puo' chiudere narrando senza eseguire (stop narrativo alla radice).
+        # La decisione e' una funzione pura testabile + config DB (regola G).
+        _force_tc: bool | None = None
+        try:
+            from .helpers import (
+                _load_tool_choice_forcing_config,
+                provider_style_supports_forcing,
+                should_force_tool_choice,
+            )
+            _tc_enabled, _tc_max_iter = _load_tool_choice_forcing_config()
+            # action_oriented: riusa il rilevamento sul primo messaggio umano.
+            _first_human_tc = next(
+                (getattr(m, "content", "") for m in messages if hasattr(m, "type") and m.type == "human"),
+                "",
+            )
+            if isinstance(_first_human_tc, list):
+                _first_human_tc = " ".join(
+                    b.get("text", "") for b in _first_human_tc if isinstance(b, dict)
+                )
+            _action_oriented_tc = _detect_action_request(str(_first_human_tc))
+            # in_discovery_phase: turno M16 dove esponiamo solo il meta-tool di
+            # search (il forcing della search e' gia' gestito separatamente).
+            _names_tc = {t.get("name") for t in tools_json if isinstance(t, dict)}
+            _in_discovery = bool(_names_tc) and _names_tc <= {"nexus_mcp_tool_search"}
+            # provider_supports_forcing: dallo style della capability del modello.
+            _supports_forcing = False
+            try:
+                from brain.providers.capability_loader import load_capability
+                _cap_tc = load_capability(provider, model)
+                _supports_forcing = provider_style_supports_forcing(
+                    getattr(_cap_tc, "tool_choice_style", None)
+                )
+            except Exception:
+                _supports_forcing = False
+            if should_force_tool_choice(
+                tools_available=bool(tools_json),
+                action_oriented=_action_oriented_tc,
+                iteration=_current_iterations,
+                in_discovery_phase=_in_discovery,
+                provider_supports_forcing=_supports_forcing,
+                enabled=_tc_enabled,
+                max_iteration=_tc_max_iter,
+            ):
+                _force_tc = True
+                logger.info(
+                    "executor_node: tool_choice forcing attivo (iter=%d, max=%d, provider=%s)",
+                    _current_iterations, _tc_max_iter, provider,
+                )
+        except Exception as _tc_exc:
+            logger.warning("executor_node: decisione tool_choice forcing saltata (%s)", _tc_exc)
+            _force_tc = None
         try:
             # max_tokens dinamico: almeno 8192 per turni con tool, capped a 16384.
             # Il token_budget dallo state (stimato dal router_node) viene usato
@@ -1912,7 +1965,40 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 usage_run_id=str(state.get("thread_id") or ""),
                 usage_iteration=_current_iterations,
                 usage_intent=str(state.get("user_intent") or ""),
+                force_tool_choice=_force_tc,
             )
+            # ── ADR 0018 (b): retry-senza-forcing su errore di forcing ────────
+            # Se il forcing ha causato un errore provider (es.
+            # MALFORMED_FUNCTION_CALL o modello non tool-capable), ritentiamo
+            # UNA volta SENZA forcing per non far fallire il run. Niente
+            # payload/prompt nei log (regola F).
+            if _force_tc is True:
+                _meta_chk = prov_result.metadata or {}
+                _err_chk = str(_meta_chk.get("error") or "")
+                _stop_chk = _meta_chk.get("stop_reason")
+                _forcing_failed = (
+                    _stop_chk == "error"
+                    and (
+                        "MALFORMED_FUNCTION_CALL" in _err_chk
+                        or "tool_choice" in _err_chk.lower()
+                        or "function_call" in _err_chk.lower()
+                    )
+                )
+                if _forcing_failed:
+                    logger.warning(
+                        "executor_node: tool_choice forcing ha causato errore provider "
+                        "(%s/%s), retry SENZA forcing per questo turno",
+                        provider, model,
+                    )
+                    prov_result = await asyncio.to_thread(
+                        _providers.generate_agent_turn_sync,
+                        provider, model, anth_messages, tools_json,
+                        max_tokens=effective_max_tokens, system_text=system_text,
+                        usage_run_id=str(state.get("thread_id") or ""),
+                        usage_iteration=_current_iterations,
+                        usage_intent=str(state.get("user_intent") or ""),
+                        force_tool_choice=False,
+                    )
             # Aggiorna provider/model effettivamente usati se la cascade ha fatto fallback.
             # Salva anche come "sticky" per le iter successive (M61): evita di ri-tentare
             # il provider primario fallito ad ogni round, risparmiando latenza/cost.

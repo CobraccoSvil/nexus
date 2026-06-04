@@ -145,6 +145,155 @@ def _load_g1_max_nudges() -> int:
     return value
 
 
+# ── ADR 0018 (b): tool_choice forcing decisionale (cache 60s) ───────────────
+# Forzare `tool_choice` nei turni d'azione previene alla radice lo stop
+# narrativo (il modello chiude con solo testo invece di emettere tool call).
+# Due settings DB (regola G): abilitazione globale + soglia iterazione oltre la
+# quale NON si forza piu' (lasciando al modello la liberta' di chiudere il
+# task). I default valgono SOLO se il DB e' down (get_*_setting non solleva).
+_TC_FORCING_CACHE: dict[str, Any] = {
+    "loaded_at": 0.0,
+    "enabled": None,
+    "max_iteration": None,
+}
+_TC_FORCING_TTL_SEC = 60.0
+_TC_FORCING_DEFAULT_ENABLED = True
+_TC_FORCING_DEFAULT_MAX_ITER = 2
+
+# Stili di tool_choice (cap.tool_choice_style) che supportano il forcing. Lo
+# style "none" e "openai_auto" non permettono di OBBLIGARE una tool call:
+# per quei modelli il forcing va trattato come non applicabile.
+_TC_FORCING_SUPPORTED_STYLES: frozenset[str] = frozenset({
+    "anthropic_any",
+    "openai_required",
+    "google_function_calling_any",
+})
+
+
+def _load_tool_choice_forcing_config() -> tuple[bool, int]:
+    """Legge agent.tool_choice_forcing_enabled / _max_iteration dal DB (cache 60s).
+
+    Ritorna `(enabled, max_iteration)`. Default safe se DB down:
+    `(_TC_FORCING_DEFAULT_ENABLED, _TC_FORCING_DEFAULT_MAX_ITER)`. Mai solleva.
+    """
+    now = time.time()
+    if (
+        _TC_FORCING_CACHE["enabled"] is not None
+        and (now - _TC_FORCING_CACHE["loaded_at"]) < _TC_FORCING_TTL_SEC
+    ):
+        return bool(_TC_FORCING_CACHE["enabled"]), int(_TC_FORCING_CACHE["max_iteration"])
+    enabled = _TC_FORCING_DEFAULT_ENABLED
+    max_iter = _TC_FORCING_DEFAULT_MAX_ITER
+    try:
+        from brain.utils.settings_db import get_bool_setting, get_int_setting
+        enabled = bool(
+            get_bool_setting("agent.tool_choice_forcing_enabled", _TC_FORCING_DEFAULT_ENABLED)
+        )
+        max_iter = int(
+            get_int_setting("agent.tool_choice_forcing_max_iteration", _TC_FORCING_DEFAULT_MAX_ITER)
+        )
+        if max_iter < 0:
+            max_iter = _TC_FORCING_DEFAULT_MAX_ITER
+    except Exception as exc:
+        logger.warning(
+            "tool_choice_forcing: load DB fallito, uso default (%s, %d) (%s)",
+            _TC_FORCING_DEFAULT_ENABLED, _TC_FORCING_DEFAULT_MAX_ITER, exc,
+        )
+    _TC_FORCING_CACHE["enabled"] = enabled
+    _TC_FORCING_CACHE["max_iteration"] = max_iter
+    _TC_FORCING_CACHE["loaded_at"] = now
+    return enabled, max_iter
+
+
+def should_force_tool_choice(
+    *,
+    tools_available: bool,
+    action_oriented: bool,
+    iteration: int,
+    in_discovery_phase: bool,
+    provider_supports_forcing: bool,
+    enabled: bool = True,
+    max_iteration: int = _TC_FORCING_DEFAULT_MAX_ITER,
+) -> bool:
+    """Funzione PURA: decide se forzare `tool_choice` per il turno corrente.
+
+    ADR 0018 leva 2. Ritorna True solo quando TUTTE le condizioni sono vere:
+      - il flag DB `enabled` e' attivo;
+      - ci sono tool disponibili nel turno (`tools_available`);
+      - il task e' action-oriented (richiesta d'azione dell'utente o intento);
+      - siamo entro la soglia di iterazione (`iteration <= max_iteration`),
+        cosi' dopo i primi turni il modello resta libero di chiudere il task;
+      - NON siamo in una fase di discovery gia' gestita separatamente
+        (M16 espone solo nexus_mcp_tool_search e forza gia' la search);
+      - il provider/modello supporta il forcing (`provider_supports_forcing`).
+
+    Nessuna lettura DB qui dentro: i parametri `enabled`/`max_iteration` vanno
+    passati dal chiamante (caricati via `_load_tool_choice_forcing_config`).
+    Cosi' la funzione resta deterministica e testabile in isolamento.
+    """
+    if not enabled:
+        return False
+    if not tools_available:
+        return False
+    if not action_oriented:
+        return False
+    if in_discovery_phase:
+        return False
+    if not provider_supports_forcing:
+        return False
+    if iteration > max_iteration:
+        return False
+    return True
+
+
+def provider_style_supports_forcing(tool_choice_style: str | None) -> bool:
+    """True se lo style di tool_choice del provider permette di OBBLIGARE una
+    tool call (anthropic_any / openai_required / google_function_calling_any).
+
+    Pura, niente DB: lo style arriva dalla ProviderCapability gia' caricata.
+    """
+    if not tool_choice_style:
+        return False
+    return tool_choice_style in _TC_FORCING_SUPPORTED_STYLES
+
+
+def structural_unfulfilled_signal(
+    *,
+    had_tools_available: bool,
+    no_tool_call_this_turn: bool,
+    action_oriented: bool,
+    iteration: int,
+    max_iteration: int,
+) -> bool:
+    """Funzione PURA: segnale STRUTTURALE di stop prematuro (ADR 0018 leva 1/c).
+
+    Identifica il caso "BookingPage" (modello che annuncia un'azione e chiude
+    il turno senza emettere alcuna tool call) SENZA guardare i verbi del testo:
+
+      had_tools_available AND no_tool_call_this_turn AND action_oriented
+      AND iteration <= max_iteration
+
+    `had_tools_available`: nel turno il modello aveva tool a disposizione
+        (tools_json non vuoto).
+    `no_tool_call_this_turn`: il turno si e' chiuso senza tool_use pendenti
+        (stop_reason end_turn/stop/None e nessun pending_tool_uses).
+    `action_oriented`: la richiesta utente e' un'azione concreta (segnale di
+        contesto del task, non un'euristica sull'output del modello).
+
+    Deterministico, indipendente da lingua e modello. Il cap di reroute
+    (g1_reroute_count) resta a carico del chiamante per evitare loop.
+    """
+    if not had_tools_available:
+        return False
+    if not no_tool_call_this_turn:
+        return False
+    if not action_oriented:
+        return False
+    if iteration > max_iteration:
+        return False
+    return True
+
+
 # ── Loop-detection semantica: tool di sola esplorazione ─────────────────────
 # Tool che leggono/ispezionano allegati e file senza produrre codice o
 # side-effect. Quando il modello ne incatena troppi di fila (variando

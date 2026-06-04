@@ -41,12 +41,20 @@ def resolve_tool_choice(
     messages: list[dict],
     *,
     weak_models: tuple[str, ...] = (),
+    force_override: bool | None = None,
 ) -> Any:
     """Spec tool_choice nel dialetto del provider, in base a cap.tool_choice_style.
 
     Forza l'uso di un tool al primo turno (se cap.tool_choice_first_turn_force)
     per evitare il pattern narrate-without-act; ai turni successivi lascia auto.
     Ritorna None per i provider tool-mute (style 'none').
+
+    `force_override` (ADR 0018 leva 2): se valorizzato, fa OVERRIDE della
+    decisione interna `force_first`. True = forza la tool call; False =
+    disattiva la forzatura per questo turno (usato dal retry-senza-forcing dopo
+    un errore provider). None = comportamento storico (first_turn_force da cap).
+    Il guard `thinking`/`weak`/`style none` resta sempre prioritario: non si
+    forza mai un modello che l'API rifiuterebbe (es. DeepSeek thinking mode).
     """
     style = cap.tool_choice_style
     if style == "none":
@@ -60,12 +68,20 @@ def resolve_tool_choice(
     # ad "auto": il modello decide da se' quando invocare i tool, senza la
     # forzatura anti-narration del primo turno. Guard cross-provider, valido per
     # qualunque modello thinking presente o futuro (la verita' resta cap.thinking).
-    force_first = (
-        cap.tool_choice_first_turn_force
-        and not weak
-        and not cap.thinking
-        and is_first_agent_turn(messages)
-    )
+    if force_override is False:
+        # Override esplicito: il chiamante chiede di NON forzare (retry dopo
+        # errore di forcing). Si degrada ad auto per questo turno.
+        force_first = False
+    else:
+        # `force_override is True` rafforza la forzatura anche oltre il primo
+        # turno (turni d'azione iniziali, ADR 0018 (b)), ma sempre rispettando
+        # i guard hard (weak/thinking) che renderebbero il forcing un errore API.
+        _base_force = (
+            cap.tool_choice_first_turn_force and is_first_agent_turn(messages)
+            if force_override is None
+            else True
+        )
+        force_first = _base_force and not weak and not cap.thinking
 
     if style == "anthropic_any":
         return {"type": "any"} if force_first else {"type": "auto"}

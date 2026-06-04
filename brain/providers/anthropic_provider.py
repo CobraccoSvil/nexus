@@ -231,6 +231,7 @@ class AnthropicProvider(BaseProvider):
         max_tokens: int = 4096,
         system_text: str = "",
         extended_thinking: bool = False,
+        force_tool_choice: bool | None = None,
     ) -> ProviderResult:
         """Esegue un turno agente con tool_use support nativo Anthropic.
 
@@ -456,12 +457,18 @@ class AnthropicProvider(BaseProvider):
                 # Anthropic usa {"type": "any"} invece di "required".
                 if cap is not None:
                     from .adapter_base import resolve_tool_choice
-                    _tc = resolve_tool_choice(cap, effective_messages)
+                    _tc = resolve_tool_choice(
+                        cap, effective_messages, force_override=force_tool_choice
+                    )
                     if _tc is not None:
                         kwargs["tool_choice"] = _tc
                 else:
                     from ._schema_utils import is_first_agent_turn
-                    if is_first_agent_turn(effective_messages):
+                    # Senza capability: rispetta override esplicito, altrimenti
+                    # forza solo al primo turno (comportamento storico).
+                    if force_tool_choice is True or (
+                        force_tool_choice is None and is_first_agent_turn(effective_messages)
+                    ):
                         kwargs["tool_choice"] = {"type": "any"}
             if use_thinking:
                 kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}

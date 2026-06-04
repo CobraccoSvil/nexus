@@ -380,6 +380,7 @@ class GoogleProvider(BaseProvider):
         max_tokens: int = 4096,
         system_text: str = "",
         temperature: float = 0.7,
+        force_tool_choice: bool | None = None,
     ) -> ProviderResult:
         """Turno agente con function calling Google Gemini, normalizzato al formato Anthropic."""
         ok, reason = self._is_configured()
@@ -485,14 +486,20 @@ class GoogleProvider(BaseProvider):
                 _norm_msgs = [m if isinstance(m, dict) else {} for m in messages]
                 if cap is not None:
                     from .adapter_base import resolve_tool_choice
-                    _tc = resolve_tool_choice(cap, _norm_msgs)
+                    _tc = resolve_tool_choice(
+                        cap, _norm_msgs, force_override=force_tool_choice
+                    )
                     _mode = (_tc or {}).get("function_calling_config", {}).get("mode", "AUTO")
                     tool_config = types.ToolConfig(
                         function_calling_config=types.FunctionCallingConfig(mode=_mode)
                     )
                 else:
                     from ._schema_utils import is_first_agent_turn
-                    if is_first_agent_turn(_norm_msgs):
+                    # Senza capability: override esplicito ha priorita', altrimenti
+                    # forza solo al primo turno (comportamento storico).
+                    if force_tool_choice is True or (
+                        force_tool_choice is None and is_first_agent_turn(_norm_msgs)
+                    ):
                         tool_config = types.ToolConfig(
                             function_calling_config=types.FunctionCallingConfig(mode="ANY")
                         )

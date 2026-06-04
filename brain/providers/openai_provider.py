@@ -196,6 +196,7 @@ class OpenAIProvider(BaseProvider):
         tools: list[dict],
         max_tokens: int = 4096,
         system_text: str = "",
+        force_tool_choice: bool | None = None,
     ) -> ProviderResult:
         """Esegue un turno agente con function calling OpenAI, normalizza output al formato Anthropic."""
         if not self._api_key:
@@ -265,13 +266,15 @@ class OpenAIProvider(BaseProvider):
                 if not _is_o_series(model):
                     if cap is not None:
                         from .adapter_base import resolve_tool_choice
-                        _tc = resolve_tool_choice(cap, oai_messages)
+                        _tc = resolve_tool_choice(
+                            cap, oai_messages, force_override=force_tool_choice
+                        )
                         if _tc is not None:
                             kwargs_call["tool_choice"] = _tc
                     else:
                         from ._schema_utils import resolve_tool_choice_openai
                         kwargs_call["tool_choice"] = resolve_tool_choice_openai(
-                            model, oai_messages,
+                            model, oai_messages, force_override=force_tool_choice,
                         )
 
             response = await client.chat.completions.create(**kwargs_call)
