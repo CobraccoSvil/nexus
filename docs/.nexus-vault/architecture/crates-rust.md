@@ -6,13 +6,13 @@ slug: crates-rust
 tags:
   - architecture
   - rust
-source_commit: d5e5b1c8e40e9ba551b1b5820b0ffa6d547b22ac
+source_commit: a6c313604bccd14a13ad8223f2829daeeb798b34
 source_files:
   - Cargo.toml
   - crates/
 auto_generated: true
 created_at: 2026-05-23T07:19:16Z
-updated_at: 2026-06-04T10:26:51Z
+updated_at: 2026-06-04T10:27:23Z
 nexus_meta_version: 1
 ---
 
