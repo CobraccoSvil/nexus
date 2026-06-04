@@ -23,7 +23,7 @@
 //! Settings (mig 0240): `kb.autolink.enabled`, `kb.autolink.semantic_threshold`,
 //! `kb.autolink.semantic_top_k`, `kb.autolink.wikilink_max_per_note`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -244,12 +244,13 @@ pub async fn build_links_for_new_note(
         .await
         .max(0) as usize;
     if wikilink_cap > 0 {
+        // Raccogli prima tutti i titoli candidati distinti nell'ordine del
+        // documento, poi risolvili in UNA sola query (evita l'N+1 di una SELECT
+        // per ogni `[[Titolo]]`). Il loop di creazione link successivo conserva
+        // l'ordine, la dedup, il cap e la precedenza dei link gia' presenti.
+        let mut ordered_titles: Vec<String> = Vec::new();
         let mut titles_seen: HashSet<String> = HashSet::new();
-        let mut wikilink_count = 0usize;
         for cap in WIKILINK_RE.captures_iter(&input.body_md) {
-            if wikilink_count >= wikilink_cap {
-                break;
-            }
             let raw_title = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
             if raw_title.is_empty() {
                 continue;
@@ -264,9 +265,18 @@ pub async fn build_links_for_new_note(
             if title.is_empty() || !titles_seen.insert(title.clone()) {
                 continue;
             }
-            if let Some(target) =
-                resolve_note_by_title(db, input.project_id, &title, input.note_id).await
-            {
+            ordered_titles.push(title);
+        }
+
+        let resolved =
+            resolve_notes_by_titles(db, input.project_id, &ordered_titles, input.note_id).await;
+
+        let mut wikilink_count = 0usize;
+        for title in &ordered_titles {
+            if wikilink_count >= wikilink_cap {
+                break;
+            }
+            if let Some(&target) = resolved.get(title) {
                 if linked.contains(&target) {
                     continue;
                 }
@@ -348,32 +358,50 @@ async fn find_notes_by_file_paths(
         .collect()
 }
 
-/// Risolve una nota per titolo (case-insensitive, match esatto o prefisso),
-/// escludendo `exclude`. Preferisce note piu' vecchie (la nota "canonica" a cui
-/// la nuova fa riferimento dovrebbe precederla).
-async fn resolve_note_by_title(
+/// Risolve un insieme di titoli (case-insensitive, match esatto) in una sola
+/// query, escludendo `exclude`. Per ciascun titolo preferisce la nota piu'
+/// vecchia (la nota "canonica" a cui la nuova fa riferimento dovrebbe
+/// precederla), come faceva il lookup per-titolo `ORDER BY created_at ASC LIMIT 1`.
+///
+/// Ritorna una map `title_lower -> note_id`: i titoli non risolti sono
+/// semplicemente assenti, identico al `None` del lookup singolo.
+async fn resolve_notes_by_titles(
     db: &PgPool,
     project_id: Uuid,
-    title_lower: &str,
+    titles_lower: &[String],
     exclude: Uuid,
-) -> Option<Uuid> {
-    sqlx::query(
+) -> HashMap<String, Uuid> {
+    if titles_lower.is_empty() {
+        return HashMap::new();
+    }
+    let rows = sqlx::query(
         r#"
-        SELECT id FROM project_knowledge_notes
+        SELECT DISTINCT ON (lower(title))
+               lower(title) AS title_lower, id
+        FROM project_knowledge_notes
         WHERE project_id = $1
           AND status IN ('active', 'draft')
           AND id != $3
-          AND lower(title) = $2
-        ORDER BY created_at ASC
-        LIMIT 1
+          AND lower(title) = ANY($2)
+        ORDER BY lower(title), created_at ASC
         "#,
     )
     .bind(project_id)
-    .bind(title_lower)
+    .bind(titles_lower)
     .bind(exclude)
-    .fetch_optional(db)
+    .fetch_all(db)
     .await
     .ok()
-    .flatten()
-    .and_then(|row| row.try_get::<Uuid, _>("id").ok())
+    .unwrap_or_default();
+
+    let mut out = HashMap::with_capacity(rows.len());
+    for row in rows {
+        if let (Ok(title), Ok(id)) = (
+            row.try_get::<String, _>("title_lower"),
+            row.try_get::<Uuid, _>("id"),
+        ) {
+            out.insert(title, id);
+        }
+    }
+    out
 }

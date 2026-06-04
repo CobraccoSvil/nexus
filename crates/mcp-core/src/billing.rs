@@ -233,75 +233,91 @@ async fn read_active_quotas(
     Ok(quotas)
 }
 
-async fn current_usage_for_quota(
+/// Calcola l'usage corrente (tokens, cost) per TUTTE le quote attive in una sola
+/// query, evitando l'N+1 di una SELECT SUM() separata per ogni quota.
+///
+/// Ogni quota e' identificata posizionalmente: la riga i-esima del risultato
+/// (ordinata da `idx`) corrisponde a `quotas[i]`. La semantica per-quota e'
+/// preservata esattamente:
+///   - predicato di scope (`user` / `project` / `user_project`)
+///   - finestra temporale propria della quota (`valid_from`..`valid_to`)
+///   - status IN ('reserved', 'finalized')
+///
+/// Il LEFT JOIN garantisce una riga per ogni quota anche quando non c'e' alcun
+/// consumo (tokens=0, cost=0), come faceva il COALESCE(SUM(...), 0) per-query.
+/// Gira nella stessa transazione `tx` delle altre letture quota.
+async fn usage_for_quotas(
     tx: &mut Transaction<'_, Postgres>,
-    quota: &QuotaPolicy,
-) -> anyhow::Result<(i64, f64)> {
-    let row = match quota.scope_type.as_str() {
-        "user" => {
-            sqlx::query(
-                r#"
-                SELECT
-                    COALESCE(SUM(total_tokens), 0)::bigint AS tokens,
-                    COALESCE(SUM(total_cost), 0)::float8 AS cost
-                FROM ai_usage_ledger
-                WHERE status IN ('reserved', 'finalized')
-                  AND user_id = $1
-                  AND created_at >= $2
-                  AND created_at < $3
-                "#,
-            )
-            .bind(quota.user_id)
-            .bind(quota.valid_from)
-            .bind(quota.valid_to)
-            .fetch_one(&mut **tx)
-            .await?
-        }
-        "project" => {
-            sqlx::query(
-                r#"
-                SELECT
-                    COALESCE(SUM(total_tokens), 0)::bigint AS tokens,
-                    COALESCE(SUM(total_cost), 0)::float8 AS cost
-                FROM ai_usage_ledger
-                WHERE status IN ('reserved', 'finalized')
-                  AND project_id = $1
-                  AND created_at >= $2
-                  AND created_at < $3
-                "#,
-            )
-            .bind(quota.project_id)
-            .bind(quota.valid_from)
-            .bind(quota.valid_to)
-            .fetch_one(&mut **tx)
-            .await?
-        }
-        _ => {
-            sqlx::query(
-                r#"
-                SELECT
-                    COALESCE(SUM(total_tokens), 0)::bigint AS tokens,
-                    COALESCE(SUM(total_cost), 0)::float8 AS cost
-                FROM ai_usage_ledger
-                WHERE status IN ('reserved', 'finalized')
-                  AND user_id = $1
-                  AND project_id = $2
-                  AND created_at >= $3
-                  AND created_at < $4
-                "#,
-            )
-            .bind(quota.user_id)
-            .bind(quota.project_id)
-            .bind(quota.valid_from)
-            .bind(quota.valid_to)
-            .fetch_one(&mut **tx)
-            .await?
-        }
-    };
+    quotas: &[QuotaPolicy],
+) -> anyhow::Result<Vec<(i64, f64)>> {
+    if quotas.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    let tokens = row.try_get::<i64, _>("tokens").unwrap_or(0);
-    let cost = row.try_get::<f64, _>("cost").unwrap_or(0.0);
-    Ok((tokens, cost))
+    let mut idxs: Vec<i32> = Vec::with_capacity(quotas.len());
+    let mut scope_types: Vec<String> = Vec::with_capacity(quotas.len());
+    let mut user_ids: Vec<Uuid> = Vec::with_capacity(quotas.len());
+    let mut project_ids: Vec<Uuid> = Vec::with_capacity(quotas.len());
+    let mut valid_froms: Vec<DateTime<Utc>> = Vec::with_capacity(quotas.len());
+    let mut valid_tos: Vec<DateTime<Utc>> = Vec::with_capacity(quotas.len());
+    for (i, q) in quotas.iter().enumerate() {
+        idxs.push(i as i32);
+        scope_types.push(q.scope_type.clone());
+        // user_id/project_id possono essere NULL nelle quote di scope opposto;
+        // il predicato CASE per scope li usa solo quando rilevanti, quindi un
+        // valore segnaposto (nil) non altera il risultato.
+        user_ids.push(q.user_id.unwrap_or_else(Uuid::nil));
+        project_ids.push(q.project_id.unwrap_or_else(Uuid::nil));
+        valid_froms.push(q.valid_from);
+        valid_tos.push(q.valid_to);
+    }
+
+    let rows = sqlx::query(
+        r#"
+        WITH q AS (
+            SELECT * FROM UNNEST(
+                $1::int[], $2::text[], $3::uuid[], $4::uuid[],
+                $5::timestamptz[], $6::timestamptz[]
+            ) AS t(idx, scope_type, user_id, project_id, valid_from, valid_to)
+        )
+        SELECT
+            q.idx AS idx,
+            COALESCE(SUM(l.total_tokens), 0)::bigint AS tokens,
+            COALESCE(SUM(l.total_cost), 0)::float8 AS cost
+        FROM q
+        LEFT JOIN ai_usage_ledger l
+            ON l.status IN ('reserved', 'finalized')
+           AND l.created_at >= q.valid_from
+           AND l.created_at < q.valid_to
+           AND (
+                (q.scope_type = 'user' AND l.user_id = q.user_id)
+             OR (q.scope_type = 'project' AND l.project_id = q.project_id)
+             OR (q.scope_type = 'user_project'
+                 AND l.user_id = q.user_id AND l.project_id = q.project_id)
+           )
+        GROUP BY q.idx
+        ORDER BY q.idx
+        "#,
+    )
+    .bind(&idxs)
+    .bind(&scope_types)
+    .bind(&user_ids)
+    .bind(&project_ids)
+    .bind(&valid_froms)
+    .bind(&valid_tos)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut out = vec![(0i64, 0.0f64); quotas.len()];
+    for row in rows {
+        let idx = row.try_get::<i32, _>("idx").unwrap_or(0) as usize;
+        let tokens = row.try_get::<i64, _>("tokens").unwrap_or(0);
+        let cost = row.try_get::<f64, _>("cost").unwrap_or(0.0);
+        if let Some(slot) = out.get_mut(idx) {
+            *slot = (tokens, cost);
+        }
+    }
+    Ok(out)
 }
 
 pub async fn reserve_usage(
@@ -321,9 +337,9 @@ pub async fn reserve_usage(
 
     let mut tx = db.begin().await?;
     let quotas = read_active_quotas(&mut tx, user_id, project_id).await?;
+    let usage = usage_for_quotas(&mut tx, &quotas).await?;
 
-    for quota in &quotas {
-        let (used_tokens, used_cost) = current_usage_for_quota(&mut tx, quota).await?;
+    for (quota, &(used_tokens, used_cost)) in quotas.iter().zip(usage.iter()) {
         if let Some(limit) = quota.token_limit {
             let projected = used_tokens.saturating_add(estimated_total_tokens as i64);
             if projected > limit {
@@ -443,7 +459,7 @@ pub async fn finalize_usage(
     sqlx::query(
         r#"
         UPDATE ai_usage_ledger
-        SET run_id = (SELECT id FROM orchestrator_runs WHERE id = $2),
+        SET run_id = $2,
             prompt_tokens = $3,
             completion_tokens = $4,
             total_tokens = $5,
