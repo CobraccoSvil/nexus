@@ -6,12 +6,12 @@ slug: migrations-log
 tags:
   - schema
   - migrations
-source_commit: 501c438b36541671b6ce6f0a562baeeacd4f835c
+source_commit: 57c95686cfb271293a808dfa51b56c03c31cf7b6
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T10:06:29Z
+updated_at: 2026-06-04T10:20:48Z
 nexus_meta_version: 1
 ---
 
@@ -302,7 +302,8 @@ Vedi anche: [[postgres-tables]], [[nexus-architetturale]].
 | `0288_playwright_preflight_setting.sql` | Migrazione 0288 — Pre-flight check librerie chromium-headless-shell. |
 | `0289_sudo_manager.sql` | Migrazione 0289 — Sudo Manager Livello 1 (whitelist). |
 | `0290_playwright_deps_ubuntu24.sql` | Migrazione 0290 — Fix command_template playwright-install-deps per Ubuntu 24.04 noble. |
+| `0291_provider_empty_responses.sql` | Migrazione 0291 — Diagnostica empty/hollow completion provider (QW2). |
 
-**Totale**: 281 migrazioni.
+**Totale**: 282 migrazioni.
 
-Ultima migrazione: `0290_playwright_deps_ubuntu24.sql`.
+Ultima migrazione: `0291_provider_empty_responses.sql`.

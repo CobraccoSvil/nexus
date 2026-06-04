@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: 501c438b36541671b6ce6f0a562baeeacd4f835c
+source_commit: 57c95686cfb271293a808dfa51b56c03c31cf7b6
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T10:06:29Z
+updated_at: 2026-06-04T10:20:49Z
 nexus_meta_version: 1
 ---
 
@@ -72,6 +72,9 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.db_query_timeout_seconds` | `5` | Timeout query DB nei nodi agente (H-39, H-44) |
 | `agent.dev_diagnostics.max_findings` | `50` | Max findings per nexus_dev_server_diagnose (H-70 a) |
 | `agent.dev_diagnostics.max_log_bytes` | `200000` | Max byte log dev_diagnostics (H-70 b) |
+| `agent.diagnostics.empty_response_excerpt_max_bytes` | `8192` | Massima dimensione (bytes) del raw response salvato. Default 8192. |
+| `agent.diagnostics.empty_response_log_enabled` | `true` | Se true, brain salva una riga in nexus_provider_empty_responses ogni volta che un provider chiude un turno con content vuoto o RESIGNED. Utile per diagnostica provider-side. Default true. |
+| `agent.diagnostics.empty_response_retention_days` | `30` | Retention (giorni) per le righe in nexus_provider_empty_responses. Worker pulizia nightly. |
 | `agent.enforce_port_allocation` | `true` | Se true, write_file/edit_file rifiutano sorgenti con porte TCP hardcoded fuori dal bucket Nexus 20000-39999 (vedi ADR 0010). |
 | `agent.expand_max_tokens` | `512` | max_tokens per chiamata expand (H-41) |
 | `agent.exploration_loop.default_threshold` | `6` | Soglia exploration tool consecutive per loop detection (H-27 b) |
@@ -716,4 +719,4 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 ---
 
-**Totale chiavi**: 514
+**Totale chiavi**: 517

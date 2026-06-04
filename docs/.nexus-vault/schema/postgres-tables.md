@@ -6,12 +6,12 @@ slug: postgres-tables
 tags:
   - schema
   - postgres
-source_commit: 501c438b36541671b6ce6f0a562baeeacd4f835c
+source_commit: 57c95686cfb271293a808dfa51b56c03c31cf7b6
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T10:06:29Z
+updated_at: 2026-06-04T10:20:48Z
 nexus_meta_version: 1
 ---
 
@@ -954,6 +954,27 @@ Vedi anche: [[migrations-log]], [[qdrant-collections]], [[nexus-architetturale]]
 | `model_id` | text | NO | `—` |
 | `notes` | text | YES | `—` |
 | `updated_at` | timestamp with time zone | NO | `now()` |
+
+## `nexus_provider_empty_responses`
+
+| Colonna | Tipo | Nullable | Default |
+|---|---|---|---|
+| `id` | uuid | NO | `gen_random_uuid()` |
+| `occurred_at` | timestamp with time zone | NO | `now()` |
+| `agent_run_id` | uuid | YES | `—` |
+| `chat_session_id` | uuid | YES | `—` |
+| `project_id` | uuid | YES | `—` |
+| `provider` | text | NO | `—` |
+| `model` | text | NO | `—` |
+| `intent` | text | YES | `—` |
+| `kind` | text | NO | `—` |
+| `iteration` | integer | YES | `—` |
+| `steps_count` | integer | YES | `—` |
+| `final_answer_chars` | integer | YES | `—` |
+| `est_input_tokens` | integer | YES | `—` |
+| `est_output_tokens` | integer | YES | `—` |
+| `raw_response_excerpt` | text | YES | `—` |
+| `suspected_cause` | text | YES | `—` |
 
 ## `nexus_provider_health`
 

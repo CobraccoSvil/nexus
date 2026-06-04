@@ -1537,6 +1537,90 @@ pub(crate) async fn spawn_agent_run(
                     result.provider,
                     result.model
                 );
+
+                // ── QW2: diagnostica persistente in nexus_provider_empty_responses ──
+                // Toggle via setting agent.diagnostics.empty_response_log_enabled.
+                let diag_enabled: bool = sqlx::query_scalar::<_, String>(
+                    "SELECT value FROM settings WHERE key = 'agent.diagnostics.empty_response_log_enabled'",
+                )
+                .fetch_optional(&db_clone)
+                .await
+                .ok()
+                .flatten()
+                .map(|v| v.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(true);
+
+                if diag_enabled {
+                    let max_bytes: usize = sqlx::query_scalar::<_, String>(
+                        "SELECT value FROM settings WHERE key = 'agent.diagnostics.empty_response_excerpt_max_bytes'",
+                    )
+                    .fetch_optional(&db_clone)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(8192usize);
+
+                    let raw = result.final_answer.as_deref().unwrap_or("");
+                    let excerpt: String = if raw.len() > max_bytes {
+                        let mut end = max_bytes;
+                        while !raw.is_char_boundary(end) && end > 0 {
+                            end -= 1;
+                        }
+                        format!("{}\n[...truncated at {} bytes...]", &raw[..end], max_bytes)
+                    } else {
+                        raw.to_string()
+                    };
+
+                    let suspected = match result.hollow_completion_kind.as_str() {
+                        "EMPTY_ANSWER" | "EMPTY_ANSWER+NO_TOOLS" => {
+                            if raw.trim().is_empty() {
+                                "empty_completion_unknown"
+                            } else {
+                                "empty_after_text"
+                            }
+                        }
+                        "RESIGNED" => "resigned_after_few_steps",
+                        "NO_TOOLS" => "no_tool_calls",
+                        _ => "unknown",
+                    };
+
+                    let _ = sqlx::query(
+                        r#"
+                        INSERT INTO nexus_provider_empty_responses
+                            (agent_run_id, chat_session_id, project_id, provider, model,
+                             intent, kind, iteration, steps_count, final_answer_chars,
+                             est_input_tokens, est_output_tokens,
+                             raw_response_excerpt, suspected_cause)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                        "#,
+                    )
+                    .bind(run_id)
+                    .bind(session_id_cp)
+                    .bind(project_id_cp)
+                    .bind(&result.provider)
+                    .bind(&result.model)
+                    .bind(classified_intent_for_loop.as_ref() as &str)
+                    .bind(if result.hollow_completion_kind.is_empty() {
+                        "UNKNOWN"
+                    } else {
+                        result.hollow_completion_kind.as_ref()
+                    })
+                    .bind(result.iteration_count as i32)
+                    .bind(result.steps.len() as i32)
+                    .bind(raw.len() as i32)
+                    .bind(result.prompt_tokens as i32)
+                    .bind(result.completion_tokens as i32)
+                    .bind(&excerpt)
+                    .bind(suspected)
+                    .execute(&db_clone)
+                    .await
+                    .inspect_err(|e| {
+                        tracing::debug!(
+                            "diagnostica empty_response: INSERT best-effort fallita: {e}"
+                        );
+                    });
+                }
             }
 
             // Save final answer as assistant message.
