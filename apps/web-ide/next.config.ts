@@ -54,6 +54,22 @@ const nextConfig: NextConfig = {
         source: "/api/admin/providers/:path*",
         destination: `${backend}/api/admin/providers/:path*`,
       },
+      // Project learning + feedback + vector compaction → mcp-core (porta 4000):
+      // gli handler vivono in crates/mcp-core/src/chat_learning.rs (le tabelle
+      // sono nel DB Nexus, non in admin-service). Pattern identico a embeddings
+      // e providers: rewrite specifica PRIMA della generica /api/admin/:path*.
+      {
+        source: "/api/admin/learning/:path*",
+        destination: `${backend}/api/admin/learning/:path*`,
+      },
+      {
+        source: "/api/admin/feedback/:path*",
+        destination: `${backend}/api/admin/feedback/:path*`,
+      },
+      {
+        source: "/api/admin/vector/:path*",
+        destination: `${backend}/api/admin/vector/:path*`,
+      },
       {
         source: "/api/admin/:path*",
         destination: `${adminService}/api/admin/:path*`,

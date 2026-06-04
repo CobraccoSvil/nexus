@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm";
 import { useThemeColors } from "../../lib/theme";
 import { ExecutableCodeBlock } from "./executable-code-block";
 import { MermaidDiagram } from "../common/mermaid-diagram";
+import { slugify, transformWikilinks } from "../wiki/markdown-wiki-extras";
 
 function normalizeContent(raw: string): string {
   let s = raw;
@@ -79,13 +80,28 @@ export const MarkdownBlock = React.memo(function MarkdownBlock({
   content,
   skipNormalize = false,
   projectId,
+  enableHeadingAnchors = false,
+  slugPrefix = "",
+  onWikiLink,
 }: {
   content: string;
   skipNormalize?: boolean;
   projectId?: string;
+  /** Se true, i heading h1..h4 ricevono un id stabile (slug + slugPrefix) per il TOC. */
+  enableHeadingAnchors?: boolean;
+  /** Prefisso applicato agli id heading per evitare collisioni tra piu' MarkdownBlock nella stessa pagina. */
+  slugPrefix?: string;
+  /** Se definito, abilita i wikilink Obsidian `[[Target]]`: vengono trasformati in
+   *  link cliccabili che invocano onWikiLink(target). Senza questa prop, il
+   *  comportamento e' identico a prima (zero rischio regressione chat). */
+  onWikiLink?: (target: string) => void;
 }) {
   const tc = useThemeColors();
-  const normalized = skipNormalize ? (content ?? "") : normalizeContent(content ?? "");
+  const wikiLinksEnabled = !!onWikiLink;
+  const preprocessed = wikiLinksEnabled
+    ? transformWikilinks(content ?? "")
+    : (content ?? "");
+  const normalized = skipNormalize ? preprocessed : normalizeContent(preprocessed);
 
   const components = React.useMemo(() => ({
           p: ({ children }: { children?: React.ReactNode }) => (
@@ -93,17 +109,41 @@ export const MarkdownBlock = React.memo(function MarkdownBlock({
           ),
           strong: ({ children }: { children?: React.ReactNode }) => <strong>{children}</strong>,
           em: ({ children }: { children?: React.ReactNode }) => <em>{children}</em>,
-          a: (({ href, children }: { href?: string; children?: React.ReactNode }) => (
-            <a
-              href={href}
-              target="_blank"
-              rel="noreferrer"
-              style={{ color: tc.accent, textDecoration: "underline" }}
-            >
-              {children}
-            </a>
+          a: (({ href, children }: { href?: string; children?: React.ReactNode }) => {
+            // Wikilink Obsidian: href "wiki:<encoded-target>" -> chiama onWikiLink.
+            if (href && href.startsWith("wiki:") && onWikiLink) {
+              const target = decodeURIComponent(href.slice("wiki:".length));
+              return (
+                <a
+                  href={`#wiki-${slugify(target)}`}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    onWikiLink(target);
+                  }}
+                  style={{
+                    color: tc.accent,
+                    textDecoration: "underline",
+                    textDecorationStyle: "dashed",
+                    cursor: "pointer",
+                  }}
+                  title={`Apri ${target}`}
+                >
+                  {children}
+                </a>
+              );
+            }
+            return (
+              <a
+                href={href}
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: tc.accent, textDecoration: "underline" }}
+              >
+                {children}
+              </a>
+            );
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          )) as any,
+          }) as any,
           code: (({ className, children }: { className?: string; children?: React.ReactNode }) => {
             // Block code (dentro <pre>): preserva intero contenuto compreso
             // di newline e caratteri ASCII per diagrammi (es. ┌─┐│└─┘).
@@ -252,26 +292,46 @@ export const MarkdownBlock = React.memo(function MarkdownBlock({
             );
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           }) as any,
-          h1: ({ children }: { children?: React.ReactNode }) => (
-            <div style={{ fontWeight: 700, fontSize: 18, color: tc.text, margin: "18px 0 8px", borderBottom: `1px solid ${tc.border}`, paddingBottom: 4 }}>
-              {children}
-            </div>
-          ),
-          h2: ({ children }: { children?: React.ReactNode }) => (
-            <div style={{ fontWeight: 700, fontSize: 16, color: tc.text, margin: "16px 0 6px", borderBottom: `1px solid ${tc.border}`, paddingBottom: 3 }}>
-              {children}
-            </div>
-          ),
-          h3: ({ children }: { children?: React.ReactNode }) => (
-            <div style={{ fontWeight: 700, fontSize: 14, color: tc.text, margin: "14px 0 6px" }}>
-              {children}
-            </div>
-          ),
-          h4: ({ children }: { children?: React.ReactNode }) => (
-            <div style={{ fontWeight: 600, fontSize: 13, color: tc.text, margin: "12px 0 4px" }}>
-              {children}
-            </div>
-          ),
+          h1: ({ children }: { children?: React.ReactNode }) => {
+            const id = enableHeadingAnchors
+              ? `${slugPrefix}${slugify(extractText(children))}`
+              : undefined;
+            return (
+              <div id={id} style={{ fontWeight: 700, fontSize: 18, color: tc.text, margin: "18px 0 8px", borderBottom: `1px solid ${tc.border}`, paddingBottom: 4, scrollMarginTop: 80 }}>
+                {children}
+              </div>
+            );
+          },
+          h2: ({ children }: { children?: React.ReactNode }) => {
+            const id = enableHeadingAnchors
+              ? `${slugPrefix}${slugify(extractText(children))}`
+              : undefined;
+            return (
+              <div id={id} style={{ fontWeight: 700, fontSize: 16, color: tc.text, margin: "16px 0 6px", borderBottom: `1px solid ${tc.border}`, paddingBottom: 3, scrollMarginTop: 80 }}>
+                {children}
+              </div>
+            );
+          },
+          h3: ({ children }: { children?: React.ReactNode }) => {
+            const id = enableHeadingAnchors
+              ? `${slugPrefix}${slugify(extractText(children))}`
+              : undefined;
+            return (
+              <div id={id} style={{ fontWeight: 700, fontSize: 14, color: tc.text, margin: "14px 0 6px", scrollMarginTop: 80 }}>
+                {children}
+              </div>
+            );
+          },
+          h4: ({ children }: { children?: React.ReactNode }) => {
+            const id = enableHeadingAnchors
+              ? `${slugPrefix}${slugify(extractText(children))}`
+              : undefined;
+            return (
+              <div id={id} style={{ fontWeight: 600, fontSize: 13, color: tc.text, margin: "12px 0 4px", scrollMarginTop: 80 }}>
+                {children}
+              </div>
+            );
+          },
           ul: ({ children }: { children?: React.ReactNode }) => (
             <ul style={{ margin: "8px 0", paddingLeft: 20 }}>{children}</ul>
           ),
@@ -316,7 +376,7 @@ export const MarkdownBlock = React.memo(function MarkdownBlock({
             </td>
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           )) as any,
-  }), [tc, projectId]);
+  }), [tc, projectId, enableHeadingAnchors, slugPrefix, onWikiLink]);
 
   return (
     <div style={{ lineHeight: 1.7, fontSize: 13.5 }}>

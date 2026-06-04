@@ -1953,14 +1953,15 @@ export function ProjectDbPanel({ project }: Props) {
         </button>
       </div>
 
-      <div style={{ padding: "0 10px 10px", display: "flex", flexDirection: "column", gap: 6, borderBottom: `1px solid ${tc.border}` }}>
+      <div style={{ padding: "14px 10px 12px", marginTop: 4, display: "flex", flexDirection: "column", gap: 6, borderBottom: `1px solid ${tc.border}` }}>
         <button
           type="button"
           onClick={() => void handleImportSchema(selectedSchemaFile || undefined)}
           disabled={busy}
           title="Cerca un file schema nel progetto ed eseguilo sul database"
           style={{
-            padding: "6px 8px",
+            width: "100%",
+            padding: "8px 8px",
             borderRadius: 6,
             border: `1px solid ${tc.border}`,
             background: tc.bgCard,
@@ -1968,6 +1969,7 @@ export function ProjectDbPanel({ project }: Props) {
             cursor: busy ? "not-allowed" : "pointer",
             fontSize: 12,
             fontWeight: 600,
+            textAlign: "center",
           }}
         >
           {busy ? "…" : "Importa schema dai file"}

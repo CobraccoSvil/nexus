@@ -31,33 +31,60 @@ pub async fn apply_generated_doc(
     let doc_id_new = Uuid::new_v4();
     let now = Utc::now();
 
-    // Cerca eventuale doc esistente con stesso vault_file_path
+    // Cerca eventuale doc esistente con stesso vault_file_path.
+    // Carica anche le colonne di protezione (mig 0282): manually_edited,
+    // edit_lock. Sostituisce il vecchio check "auto_generated=false" cieco di
+    // `apply.rs:112` (regola H: il flag veniva resettato a TRUE ad ogni
+    // rigenerazione, cancellando le edit utente).
     let existing_row = sqlx::query(
-        "SELECT id, vault_file_hash, auto_generated FROM nexus_meta_docs WHERE vault_file_path = $1",
+        "SELECT id, vault_file_hash, auto_generated, manually_edited, edit_lock \
+         FROM nexus_meta_docs WHERE vault_file_path = $1",
     )
     .bind(&doc.vault_file_path)
     .fetch_optional(&state.db)
     .await
     .context("query nexus_meta_docs by path")?;
 
-    let (doc_id, created_at_existing, was_user_curated) = if let Some(row) = &existing_row {
-        let id: Uuid = row.try_get("id")?;
-        let user_curated: bool = !row.try_get::<bool, _>("auto_generated").unwrap_or(true);
-        let created_at_existing: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
-            "SELECT created_at FROM nexus_meta_docs WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(now);
-        (id, created_at_existing, user_curated)
-    } else {
-        (doc_id_new, now, false)
-    };
+    let (doc_id, created_at_existing, manually_edited, edit_lock) =
+        if let Some(row) = &existing_row {
+            let id: Uuid = row.try_get("id")?;
+            let me: bool = row.try_get("manually_edited").unwrap_or(false);
+            let lock: String = row
+                .try_get("edit_lock")
+                .unwrap_or_else(|_| "none".to_string());
+            let created_at_existing: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+                "SELECT created_at FROM nexus_meta_docs WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(now);
+            (id, created_at_existing, me, lock)
+        } else {
+            (doc_id_new, now, false, "none".to_string())
+        };
 
-    // Se la doc esistente e' stata curata manualmente (auto_generated=false), NON sovrascrivere
-    if was_user_curated {
+    // Protezione rigenerazione:
+    //   - edit_lock=frozen  -> mai sovrascrivere (skip totale)
+    //   - manually_edited && (edit_lock=protected || protect_manual_edits=true)
+    //                       -> skip (preserva edit utente)
+    //   - altrimenti        -> regen consentita
+    if edit_lock == "frozen" {
         return Ok((doc_id, false));
+    }
+    if manually_edited {
+        let protect_enabled: bool = sqlx::query_scalar::<_, String>(
+            "SELECT value FROM settings WHERE key = 'wiki.protect_manual_edits'",
+        )
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(true);
+        if protect_enabled || edit_lock == "protected" {
+            return Ok((doc_id, false));
+        }
     }
 
     let body_full = vault::serialize_meta_doc(
@@ -98,6 +125,10 @@ pub async fn apply_generated_doc(
 
     // UPSERT in DB
     if existing_row.is_some() {
+        // NB: auto_generated NON viene forzato a TRUE (regola H): se l'utente
+        // aveva impostato auto_generated=FALSE in passato, l'edit_lock 'frozen'
+        // dovrebbe bloccare la rigenerazione; se siamo qui significa che la
+        // rigenerazione e' consentita ma manteniamo il flag attuale.
         sqlx::query(
             r#"
             UPDATE nexus_meta_docs SET
@@ -109,7 +140,8 @@ pub async fn apply_generated_doc(
                 source_commit = $6,
                 source_files = $7,
                 tags = $8,
-                auto_generated = TRUE,
+                generated_hash = $5,
+                last_generated_at = NOW(),
                 updated_at = NOW()
             WHERE id = $9
             "#,
@@ -131,8 +163,9 @@ pub async fn apply_generated_doc(
             r#"
             INSERT INTO nexus_meta_docs
                 (id, kind, title, slug, body_md, vault_file_path, vault_file_hash,
-                 source_commit, source_files, tags, auto_generated)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)
+                 source_commit, source_files, tags, auto_generated,
+                 generated_hash, last_generated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, $7, NOW())
             "#,
         )
         .bind(doc_id)
@@ -148,6 +181,24 @@ pub async fn apply_generated_doc(
         .execute(&state.db)
         .await
         .context("INSERT nexus_meta_docs")?;
+    }
+
+    // Registra la revisione di versioning (dedup per body_hash: no-op se il
+    // contenuto e' invariato). Fonte 'auto' = rigenerazione da generatore.
+    if let Err(e) = crate::docs_core::revisions::record_revision(
+        &state.db,
+        crate::docs_core::revisions::DocScope::Meta,
+        doc_id,
+        &doc.title,
+        &doc.body_md,
+        &doc.tags,
+        "auto",
+        None,
+        doc.source_commit.as_deref(),
+    )
+    .await
+    {
+        tracing::debug!(slug = %doc.slug, error = %e, "meta-doc record_revision fallita");
     }
 
     // Genera embedding + upsert in Qdrant `nexus_meta_docs` per linking semantico

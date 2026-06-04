@@ -12,4 +12,7 @@
 // search/tree/revisions/protect/watcher vengono aggiunti nelle fasi successive.
 // ═══════════════════════════════════════════════════════════════════════════
 
+pub mod revisions;
+pub mod routes;
+pub mod storage;
 pub mod vault;

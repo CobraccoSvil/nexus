@@ -385,6 +385,41 @@ pub async fn patch_note(
         },
     );
 
+    // Versioning condiviso (Fase 2/3 wiki): registra una revisione 'manual'
+    // se il body e' cambiato. Idempotente per body_hash, dedup nella CTE di
+    // record_revision (vedi docs_core/revisions.rs). Una SOLA query SELECT
+    // legge title+tags correnti in un colpo (no N+1).
+    if let Some(ref new_body) = body.body_md {
+        let row = sqlx::query(
+            "SELECT title, tags FROM project_knowledge_notes WHERE id = $1",
+        )
+        .bind(note_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+        if let Some(r) = row {
+            let title_now: String = r.try_get("title").unwrap_or_default();
+            let tags_now: Vec<String> = body
+                .tags
+                .clone()
+                .or_else(|| r.try_get::<Vec<String>, _>("tags").ok())
+                .unwrap_or_default();
+            let _ = crate::docs_core::revisions::record_revision(
+                &state.db,
+                crate::docs_core::revisions::DocScope::Project(project_id),
+                note_id,
+                &title_now,
+                new_body,
+                &tags_now,
+                "manual",
+                Some(&claims.sub),
+                None,
+            )
+            .await;
+        }
+    }
+
     Ok(Json(json!({ "ok": true, "noteId": note_id.to_string() })))
 }
 

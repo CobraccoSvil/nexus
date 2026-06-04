@@ -1668,6 +1668,34 @@ async fn main() -> anyhow::Result<()> {
                 )),
             )
             .route(
+                "/api/projects/:id/knowledge/notes/:note_id/revisions",
+                get(docs_core::routes::proj_list_revisions).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/projects/:id/knowledge/notes/:note_id/revisions/:version",
+                get(docs_core::routes::proj_get_revision).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/projects/:id/knowledge/notes/:note_id/diff",
+                get(docs_core::routes::proj_diff).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/projects/:id/knowledge/notes/:note_id/restore",
+                post(docs_core::routes::proj_restore).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
                 "/api/projects/:id/knowledge/notes/:note_id",
                 get(knowledge::routes::get_note)
                     .patch(knowledge::routes::patch_note)
@@ -1813,7 +1841,37 @@ async fn main() -> anyhow::Result<()> {
             )
             .route(
                 "/api/meta-docs/:id",
-                get(meta_docs::routes::get_meta_doc).layer(axum_mw::from_fn_with_state(
+                get(meta_docs::routes::get_meta_doc)
+                    .patch(docs_core::routes::patch_meta_doc)
+                    .layer(axum_mw::from_fn_with_state(
+                        state.clone(),
+                        middleware::require_auth,
+                    )),
+            )
+            .route(
+                "/api/meta-docs/:id/revisions",
+                get(docs_core::revisions::meta_list_revisions).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/meta-docs/:id/revisions/:version",
+                get(docs_core::revisions::meta_get_revision).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/meta-docs/:id/diff",
+                get(docs_core::revisions::meta_diff).layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+            )
+            .route(
+                "/api/meta-docs/:id/restore",
+                post(docs_core::revisions::meta_restore).layer(axum_mw::from_fn_with_state(
                     state.clone(),
                     middleware::require_auth,
                 )),
