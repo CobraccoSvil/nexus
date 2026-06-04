@@ -51,9 +51,9 @@ const SEARCH_STOPWORDS: &[&str] = &[
     "negli", "alla", "allo", "agli", "dal", "dalla", "tra", "fra", "gli", "lei", "lui", "noi",
     "voi", "loro", "suo", "sua", "mio", "mia", "tuo", "tua", "fare", "essere", "avere", "esegui",
     "eseguire", "crea", "creare", "vuoi", "puoi", // inglese
-    "and", "the", "for", "with", "that", "this", "from", "into", "your", "you", "can", "are", "was",
-    "were", "has", "have", "his", "her", "its", "our", "their", "want", "create", "make", "run",
-    "exec", "execute",
+    "and", "the", "for", "with", "that", "this", "from", "into", "your", "you", "can", "are",
+    "was", "were", "has", "have", "his", "her", "its", "our", "their", "want", "create", "make",
+    "run", "exec", "execute",
 ];
 
 // ── Helpers DB settings ───────────────────────────────────────────────────────

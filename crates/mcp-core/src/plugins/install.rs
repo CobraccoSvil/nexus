@@ -615,18 +615,14 @@ pub async fn migrate_legacy_mcp_server(
     let url: Option<String> = row.try_get("url").unwrap_or(None);
     let command: Option<String> = row.try_get("command").unwrap_or(None);
     let args: Value = row.try_get("args").unwrap_or(json!([]));
-    let catalog_slug = detect_legacy_catalog_slug(
-        &transport,
-        url.as_deref(),
-        command.as_deref(),
-        &args,
-    )
-    .ok_or_else(|| {
-        api_error(
+    let catalog_slug =
+        detect_legacy_catalog_slug(&transport, url.as_deref(), command.as_deref(), &args)
+            .ok_or_else(|| {
+                api_error(
             StatusCode::BAD_REQUEST,
             "Questo MCP legacy non e' mappabile automaticamente a un plugin del catalogo curato",
         )
-    })?;
+            })?;
 
     let catalog = get_catalog_by_install_request(
         &state.db,

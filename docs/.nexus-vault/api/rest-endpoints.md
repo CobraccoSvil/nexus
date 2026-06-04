@@ -6,12 +6,12 @@ slug: rest-endpoints
 tags:
   - api
   - rest
-source_commit: a1dd3a174318e8a92a0808d9e39a37ac06afdf8a
+source_commit: f9041b2dbe81653f3ff9a090b24a702602b6840e
 source_files:
   - crates/mcp-core/src/main.rs
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T04:27:55Z
+updated_at: 2026-06-04T04:42:34Z
 nexus_meta_version: 1
 ---
 

@@ -1,0 +1,102 @@
+//! Route meta-docs (Nexus self-documentation vault).
+//!
+//! Estratte da `main.rs` durante il refactor del god-file. Nessun
+//! cambiamento di path, metodo HTTP, handler o middleware.
+
+use crate::routes::prelude::*;
+use crate::*;
+
+pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
+    router
+        // ── meta-docs (Nexus self-documentation vault) ────────
+        .route(
+            "/api/claude-agents/preview",
+            get(claude_agents::preview_handler).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
+        .route(
+            "/api/claude-agents/regenerate",
+            post(claude_agents::regenerate_handler).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
+        .route(
+            "/api/meta-docs/list",
+            get(meta_docs::routes::list_meta_docs).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
+        .route(
+            "/api/meta-docs/refresh-all",
+            post(meta_docs::routes::refresh_all_stub).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
+        .route(
+            "/api/meta-docs/ingest-commit",
+            post(meta_docs::routes::ingest_commit_stub),
+        )
+        .route(
+            "/api/meta-docs/:id",
+            get(meta_docs::routes::get_meta_doc)
+                .patch(docs_core::routes::patch_meta_doc)
+                .layer(axum_mw::from_fn_with_state(
+                    state.clone(),
+                    middleware::require_auth,
+                )),
+        )
+        .route(
+            "/api/meta-docs/:id/revisions",
+            get(docs_core::revisions::meta_list_revisions).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
+        .route(
+            "/api/meta-docs/:id/revisions/:version",
+            get(docs_core::revisions::meta_get_revision).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
+        .route(
+            "/api/meta-docs/:id/diff",
+            get(docs_core::revisions::meta_diff).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
+        .route(
+            "/api/meta-docs/:id/restore",
+            post(docs_core::revisions::meta_restore).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
+        .route(
+            "/api/meta-docs/graph",
+            get(meta_docs::routes::graph_handler).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
+        .route(
+            "/api/meta-docs/recompute-links",
+            post(meta_docs::routes::recompute_meta_links).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
+        .route(
+            "/api/meta-docs/export-archive",
+            get(meta_docs::routes::export_vault_archive).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
+}

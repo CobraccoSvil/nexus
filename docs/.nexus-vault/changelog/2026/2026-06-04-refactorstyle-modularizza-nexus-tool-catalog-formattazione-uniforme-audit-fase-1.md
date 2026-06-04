@@ -1,0 +1,1163 @@
+---
+id: a161890f-ff9b-4b2b-8121-631c567a2ffc
+kind: changelog
+title: "refactor+style: modularizza nexus_tool_catalog + formattazione uniforme (audit fase 1)"
+slug: refactorstyle-modularizza-nexus-tool-catalog-formattazione-uniforme-audit-fase-1
+tags:
+  - changelog
+source_commit: f9041b2dbe81653f3ff9a090b24a702602b6840e
+source_files:
+  - crates/mcp-core/src/admin/mod.rs
+  - crates/mcp-core/src/admin/projects.rs
+  - crates/mcp-core/src/admin/routing.rs
+  - crates/mcp-core/src/admin/users.rs
+  - crates/mcp-core/src/agent_processes.rs
+  - crates/mcp-core/src/agent_router_server.rs
+  - crates/mcp-core/src/agent_todos_routes.rs
+  - crates/mcp-core/src/agent_tools/archive_tools.rs
+  - crates/mcp-core/src/agent_tools/attachment_inspector.rs
+  - crates/mcp-core/src/agent_tools/attachments.rs
+  - crates/mcp-core/src/agent_tools/command.rs
+  - crates/mcp-core/src/agent_tools/command_hints.rs
+  - crates/mcp-core/src/agent_tools/dev_diagnostics.rs
+  - crates/mcp-core/src/agent_tools/dispatcher.rs
+  - crates/mcp-core/src/agent_tools/document_tools.rs
+  - crates/mcp-core/src/agent_tools/figma_tools.rs
+  - crates/mcp-core/src/agent_tools/files.rs
+  - crates/mcp-core/src/agent_tools/git.rs
+  - crates/mcp-core/src/agent_tools/knowledge.rs
+  - crates/mcp-core/src/agent_tools/mod.rs
+  - crates/mcp-core/src/agent_tools/port_scanner.rs
+  - crates/mcp-core/src/agent_tools/project_db_query.rs
+  - crates/mcp-core/src/agent_tools/read_cache.rs
+  - crates/mcp-core/src/agent_tools/safety.rs
+  - crates/mcp-core/src/agent_tools/sandbox.rs
+  - crates/mcp-core/src/agent_tools/scaffold_verifier.rs
+  - crates/mcp-core/src/agent_tools/service.rs
+  - crates/mcp-core/src/agent_tools/shadcn_setup.rs
+  - crates/mcp-core/src/agent_tools/subagent.rs
+  - crates/mcp-core/src/agent_tools/testing.rs
+  - crates/mcp-core/src/agent_tools/todos.rs
+  - crates/mcp-core/src/agent_tools/vision_tools.rs
+  - crates/mcp-core/src/agent_tools/visual_compare.rs
+  - crates/mcp-core/src/agent_types.rs
+  - crates/mcp-core/src/auth.rs
+  - crates/mcp-core/src/brain_agent_client.rs
+  - crates/mcp-core/src/change_drafts.rs
+  - crates/mcp-core/src/chat_agent.rs
+  - crates/mcp-core/src/chat_attachments.rs
+  - crates/mcp-core/src/chat_learning.rs
+  - crates/mcp-core/src/chat_messages.rs
+  - crates/mcp-core/src/chat_sessions.rs
+  - crates/mcp-core/src/claude_agents.rs
+  - crates/mcp-core/src/context_settings.rs
+  - crates/mcp-core/src/deepseek_balance_sync.rs
+  - crates/mcp-core/src/dispatcher_routes.rs
+  - crates/mcp-core/src/dlp.rs
+  - crates/mcp-core/src/docs_core/revisions.rs
+  - crates/mcp-core/src/docs_core/routes.rs
+  - crates/mcp-core/src/docs_core/storage.rs
+  - crates/mcp-core/src/docs_core/vault.rs
+  - crates/mcp-core/src/documents.rs
+  - crates/mcp-core/src/domain.rs
+  - crates/mcp-core/src/environment.rs
+  - crates/mcp-core/src/github.rs
+  - crates/mcp-core/src/internal_learning.rs
+  - crates/mcp-core/src/internal_routing.rs
+  - crates/mcp-core/src/knowledge/auto_link.rs
+  - crates/mcp-core/src/knowledge/code_doc.rs
+  - crates/mcp-core/src/knowledge/code_graph.rs
+  - crates/mcp-core/src/knowledge/functional_spec_agent.rs
+  - crates/mcp-core/src/knowledge/generators.rs
+  - crates/mcp-core/src/knowledge/graph_import.rs
+  - crates/mcp-core/src/knowledge/impact.rs
+  - crates/mcp-core/src/knowledge/ingest_run.rs
+  - crates/mcp-core/src/knowledge/mod.rs
+  - crates/mcp-core/src/knowledge/routes.rs
+  - crates/mcp-core/src/knowledge_watcher.rs
+  - crates/mcp-core/src/knowledge_workers.rs
+  - crates/mcp-core/src/long_running.rs
+  - crates/mcp-core/src/main.rs
+  - crates/mcp-core/src/mcp_client.rs
+  - crates/mcp-core/src/mcp_connectors.rs
+  - crates/mcp-core/src/meta_docs/apply.rs
+  - crates/mcp-core/src/meta_docs/generators/api.rs
+  - crates/mcp-core/src/meta_docs/generators/architecture.rs
+  - crates/mcp-core/src/meta_docs/generators/changelog.rs
+  - crates/mcp-core/src/meta_docs/generators/concepts.rs
+  - crates/mcp-core/src/meta_docs/generators/decisions.rs
+  - crates/mcp-core/src/meta_docs/generators/mod.rs
+  - crates/mcp-core/src/meta_docs/generators/schema.rs
+  - crates/mcp-core/src/meta_docs/mod.rs
+  - crates/mcp-core/src/meta_docs/routes.rs
+  - crates/mcp-core/src/meta_docs/vault.rs
+  - crates/mcp-core/src/meta_docs_watcher.rs
+  - crates/mcp-core/src/meta_docs_workers.rs
+  - crates/mcp-core/src/middleware.rs
+  - crates/mcp-core/src/model_catalog_sync.rs
+  - crates/mcp-core/src/model_health_probe.rs
+  - crates/mcp-core/src/models.rs
+  - crates/mcp-core/src/nexus_bridge.rs
+  - crates/mcp-core/src/nexus_builtin/docs.rs
+  - crates/mcp-core/src/nexus_builtin/git.rs
+  - crates/mcp-core/src/nexus_builtin/mcp_runtime.rs
+  - crates/mcp-core/src/nexus_builtin/mod.rs
+  - crates/mcp-core/src/nexus_builtin/project.rs
+  - crates/mcp-core/src/nexus_builtin/prompt_admin.rs
+  - crates/mcp-core/src/nexus_builtin/run_config.rs
+  - crates/mcp-core/src/nexus_builtin/services.rs
+  - crates/mcp-core/src/nexus_database_stats.rs
+  - crates/mcp-core/src/nexus_routing.rs
+  - crates/mcp-core/src/nexus_tool_catalog.rs
+  - crates/mcp-core/src/nexus_tool_catalog/build_deploy.rs
+  - crates/mcp-core/src/nexus_tool_catalog/code_analysis.rs
+  - crates/mcp-core/src/nexus_tool_catalog/database.rs
+  - crates/mcp-core/src/nexus_tool_catalog/dependencies.rs
+  - crates/mcp-core/src/nexus_tool_catalog/documentation.rs
+  - crates/mcp-core/src/nexus_tool_catalog/github.rs
+  - crates/mcp-core/src/nexus_tool_catalog/memory_meta.rs
+  - crates/mcp-core/src/nexus_tool_catalog/mod.rs
+  - crates/mcp-core/src/nexus_tool_catalog/performance.rs
+  - crates/mcp-core/src/nexus_tool_catalog/security.rs
+  - crates/mcp-core/src/nexus_tool_catalog/testing.rs
+  - crates/mcp-core/src/nexus_tool_catalog/utility.rs
+  - crates/mcp-core/src/nexus_tool_catalog/vcs.rs
+  - crates/mcp-core/src/nexus_tools/api_endpoint_list.rs
+  - crates/mcp-core/src/nexus_tools/api_graphql_check.rs
+  - crates/mcp-core/src/nexus_tools/api_grpc_check.rs
+  - crates/mcp-core/src/nexus_tools/api_handler_count.rs
+  - crates/mcp-core/src/nexus_tools/api_middleware_count.rs
+  - crates/mcp-core/src/nexus_tools/api_openapi_files.rs
+  - crates/mcp-core/src/nexus_tools/api_postman_check.rs
+  - crates/mcp-core/src/nexus_tools/api_route_count.rs
+  - crates/mcp-core/src/nexus_tools/ast_parse.rs
+  - crates/mcp-core/src/nexus_tools/ast_query.rs
+  - crates/mcp-core/src/nexus_tools/base64_decode.rs
+  - crates/mcp-core/src/nexus_tools/base64_encode.rs
+  - crates/mcp-core/src/nexus_tools/bench_run.rs
+  - crates/mcp-core/src/nexus_tools/build_artifact_age.rs
+  - crates/mcp-core/src/nexus_tools/build_debug_size.rs
+  - crates/mcp-core/src/nexus_tools/build_incremental_dir.rs
+  - crates/mcp-core/src/nexus_tools/build_lockfile_age.rs
+  - crates/mcp-core/src/nexus_tools/build_log_tail.rs
+  - crates/mcp-core/src/nexus_tools/build_profile_list.rs
+  - crates/mcp-core/src/nexus_tools/build_project.rs
+  - crates/mcp-core/src/nexus_tools/build_release_size.rs
+  - crates/mcp-core/src/nexus_tools/build_rerun_checks.rs
+  - crates/mcp-core/src/nexus_tools/build_script_count.rs
+  - crates/mcp-core/src/nexus_tools/build_target_list.rs
+  - crates/mcp-core/src/nexus_tools/build_workspace_check.rs
+  - crates/mcp-core/src/nexus_tools/ca_attr_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_complexity_estimate.rs
+  - crates/mcp-core/src/nexus_tools/ca_derive_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_doc_comment_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_enum_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_fn_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_generic_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_if_let_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_impl_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_inline_comment_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_lifetime_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_macro_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_match_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_mod_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_pub_fn_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_struct_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_todo_fixme_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_trait_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_use_count.rs
+  - crates/mcp-core/src/nexus_tools/ca_while_let_count.rs
+  - crates/mcp-core/src/nexus_tools/cargo_audit.rs
+  - crates/mcp-core/src/nexus_tools/cargo_bench.rs
+  - crates/mcp-core/src/nexus_tools/cargo_build.rs
+  - crates/mcp-core/src/nexus_tools/cargo_build_artifact_check.rs
+  - crates/mcp-core/src/nexus_tools/cargo_check.rs
+  - crates/mcp-core/src/nexus_tools/cargo_check_all_features.rs
+  - crates/mcp-core/src/nexus_tools/cargo_check_release.rs
+  - crates/mcp-core/src/nexus_tools/cargo_clean.rs
+  - crates/mcp-core/src/nexus_tools/cargo_clean_dry.rs
+  - crates/mcp-core/src/nexus_tools/cargo_dep_versions.rs
+  - crates/mcp-core/src/nexus_tools/cargo_doc.rs
+  - crates/mcp-core/src/nexus_tools/cargo_doc_check.rs
+  - crates/mcp-core/src/nexus_tools/cargo_edition_detect.rs
+  - crates/mcp-core/src/nexus_tools/cargo_env_overrides.rs
+  - crates/mcp-core/src/nexus_tools/cargo_features_list.rs
+  - crates/mcp-core/src/nexus_tools/cargo_install_list.rs
+  - crates/mcp-core/src/nexus_tools/cargo_locate_project.rs
+  - crates/mcp-core/src/nexus_tools/cargo_lockfile_check.rs
+  - crates/mcp-core/src/nexus_tools/cargo_metadata.rs
+  - crates/mcp-core/src/nexus_tools/cargo_msrv_detect.rs
+  - crates/mcp-core/src/nexus_tools/cargo_outdated.rs
+  - crates/mcp-core/src/nexus_tools/cargo_pkgid.rs
+  - crates/mcp-core/src/nexus_tools/cargo_publish_dry.rs
+  - crates/mcp-core/src/nexus_tools/cargo_run.rs
+  - crates/mcp-core/src/nexus_tools/cargo_search.rs
+  - crates/mcp-core/src/nexus_tools/cargo_size_estimate.rs
+  - crates/mcp-core/src/nexus_tools/cargo_targets_list.rs
+  - crates/mcp-core/src/nexus_tools/cargo_test.rs
+  - crates/mcp-core/src/nexus_tools/cargo_test_doc.rs
+  - crates/mcp-core/src/nexus_tools/cargo_test_lib.rs
+  - crates/mcp-core/src/nexus_tools/cargo_tree.rs
+  - crates/mcp-core/src/nexus_tools/cargo_update.rs
+  - crates/mcp-core/src/nexus_tools/cargo_workspace_members.rs
+  - crates/mcp-core/src/nexus_tools/clippy_lint.rs
+  - crates/mcp-core/src/nexus_tools/consensus_vote.rs
+  - crates/mcp-core/src/nexus_tools/count_loc.rs
+  - crates/mcp-core/src/nexus_tools/db_active_queries.rs
+  - crates/mcp-core/src/nexus_tools/db_bloat_check.rs
+  - crates/mcp-core/src/nexus_tools/db_connection_info.rs
+  - crates/mcp-core/src/nexus_tools/db_constraint_list.rs
+  - crates/mcp-core/src/nexus_tools/db_dead_tuples.rs
+  - crates/mcp-core/src/nexus_tools/db_extension_list.rs
+  - crates/mcp-core/src/nexus_tools/db_foreign_keys.rs
+  - crates/mcp-core/src/nexus_tools/db_helper.rs
+  - crates/mcp-core/src/nexus_tools/db_index_list.rs
+  - crates/mcp-core/src/nexus_tools/db_lock_list.rs
+  - crates/mcp-core/src/nexus_tools/db_migration_list.rs
+  - crates/mcp-core/src/nexus_tools/db_ping.rs
+  - crates/mcp-core/src/nexus_tools/db_query_explain.rs
+  - crates/mcp-core/src/nexus_tools/db_replication_status.rs
+  - crates/mcp-core/src/nexus_tools/db_role_list.rs
+  - crates/mcp-core/src/nexus_tools/db_schema_inspect.rs
+  - crates/mcp-core/src/nexus_tools/db_seq_list.rs
+  - crates/mcp-core/src/nexus_tools/db_size.rs
+  - crates/mcp-core/src/nexus_tools/db_table_count.rs
+  - crates/mcp-core/src/nexus_tools/db_table_list.rs
+  - crates/mcp-core/src/nexus_tools/db_table_size.rs
+  - crates/mcp-core/src/nexus_tools/db_unused_indexes.rs
+  - crates/mcp-core/src/nexus_tools/db_view_list.rs
+  - crates/mcp-core/src/nexus_tools/deploy_ansible_check.rs
+  - crates/mcp-core/src/nexus_tools/deploy_check.rs
+  - crates/mcp-core/src/nexus_tools/deploy_compose_check.rs
+  - crates/mcp-core/src/nexus_tools/deploy_dockerfile_count.rs
+  - crates/mcp-core/src/nexus_tools/deploy_env_files_count.rs
+  - crates/mcp-core/src/nexus_tools/deploy_helm_check.rs
+  - crates/mcp-core/src/nexus_tools/deploy_k8s_check.rs
+  - crates/mcp-core/src/nexus_tools/deploy_nginx_check.rs
+  - crates/mcp-core/src/nexus_tools/deploy_release_artifacts.rs
+  - crates/mcp-core/src/nexus_tools/deploy_systemd_check.rs
+  - crates/mcp-core/src/nexus_tools/deploy_terraform_check.rs
+  - crates/mcp-core/src/nexus_tools/deps_audit.rs
+  - crates/mcp-core/src/nexus_tools/deps_tree.rs
+  - crates/mcp-core/src/nexus_tools/doc_api_list.rs
+  - crates/mcp-core/src/nexus_tools/doc_changelog_check.rs
+  - crates/mcp-core/src/nexus_tools/doc_codeblocks_count.rs
+  - crates/mcp-core/src/nexus_tools/doc_codeblocks_extract.rs
+  - crates/mcp-core/src/nexus_tools/doc_codeowners_check.rs
+  - crates/mcp-core/src/nexus_tools/doc_contributing_check.rs
+  - crates/mcp-core/src/nexus_tools/doc_examples_list.rs
+  - crates/mcp-core/src/nexus_tools/doc_frontmatter_parse.rs
+  - crates/mcp-core/src/nexus_tools/doc_generate.rs
+  - crates/mcp-core/src/nexus_tools/doc_heading_depth.rs
+  - crates/mcp-core/src/nexus_tools/doc_image_list.rs
+  - crates/mcp-core/src/nexus_tools/doc_license_detect.rs
+  - crates/mcp-core/src/nexus_tools/doc_link_check_local.rs
+  - crates/mcp-core/src/nexus_tools/doc_links_extract.rs
+  - crates/mcp-core/src/nexus_tools/doc_md_lint.rs
+  - crates/mcp-core/src/nexus_tools/doc_orphan_md.rs
+  - crates/mcp-core/src/nexus_tools/doc_readme_check.rs
+  - crates/mcp-core/src/nexus_tools/doc_security_md_check.rs
+  - crates/mcp-core/src/nexus_tools/doc_size_report.rs
+  - crates/mcp-core/src/nexus_tools/doc_toc_extract.rs
+  - crates/mcp-core/src/nexus_tools/doc_word_count.rs
+  - crates/mcp-core/src/nexus_tools/docker_build.rs
+  - crates/mcp-core/src/nexus_tools/docker_compose_down.rs
+  - crates/mcp-core/src/nexus_tools/docker_compose_up.rs
+  - crates/mcp-core/src/nexus_tools/docker_logs.rs
+  - crates/mcp-core/src/nexus_tools/docker_ps.rs
+  - crates/mcp-core/src/nexus_tools/docker_rm.rs
+  - crates/mcp-core/src/nexus_tools/docker_run.rs
+  - crates/mcp-core/src/nexus_tools/docker_stop.rs
+  - crates/mcp-core/src/nexus_tools/exec.rs
+  - crates/mcp-core/src/nexus_tools/extract_function.rs
+  - crates/mcp-core/src/nexus_tools/find_pubapi.rs
+  - crates/mcp-core/src/nexus_tools/find_todos.rs
+  - crates/mcp-core/src/nexus_tools/find_unsafe.rs
+  - crates/mcp-core/src/nexus_tools/format_code.rs
+  - crates/mcp-core/src/nexus_tools/fs_glob.rs
+  - crates/mcp-core/src/nexus_tools/fs_grep.rs
+  - crates/mcp-core/src/nexus_tools/fs_list.rs
+  - crates/mcp-core/src/nexus_tools/fs_read.rs
+  - crates/mcp-core/src/nexus_tools/fs_stat.rs
+  - crates/mcp-core/src/nexus_tools/fs_tree.rs
+  - crates/mcp-core/src/nexus_tools/fs_write.rs
+  - crates/mcp-core/src/nexus_tools/gh_issue_close.rs
+  - crates/mcp-core/src/nexus_tools/gh_issue_comment.rs
+  - crates/mcp-core/src/nexus_tools/gh_issue_create.rs
+  - crates/mcp-core/src/nexus_tools/gh_issue_list.rs
+  - crates/mcp-core/src/nexus_tools/gh_issue_view.rs
+  - crates/mcp-core/src/nexus_tools/gh_label_list.rs
+  - crates/mcp-core/src/nexus_tools/gh_pr_checks.rs
+  - crates/mcp-core/src/nexus_tools/gh_pr_close.rs
+  - crates/mcp-core/src/nexus_tools/gh_pr_create.rs
+  - crates/mcp-core/src/nexus_tools/gh_pr_diff.rs
+  - crates/mcp-core/src/nexus_tools/gh_pr_files.rs
+  - crates/mcp-core/src/nexus_tools/gh_pr_list.rs
+  - crates/mcp-core/src/nexus_tools/gh_pr_merge.rs
+  - crates/mcp-core/src/nexus_tools/gh_pr_review.rs
+  - crates/mcp-core/src/nexus_tools/gh_pr_view.rs
+  - crates/mcp-core/src/nexus_tools/gh_release_create.rs
+  - crates/mcp-core/src/nexus_tools/gh_release_list.rs
+  - crates/mcp-core/src/nexus_tools/gh_release_view.rs
+  - crates/mcp-core/src/nexus_tools/gh_repo_clone_url.rs
+  - crates/mcp-core/src/nexus_tools/gh_repo_fork_list.rs
+  - crates/mcp-core/src/nexus_tools/gh_run_cancel.rs
+  - crates/mcp-core/src/nexus_tools/gh_run_list.rs
+  - crates/mcp-core/src/nexus_tools/gh_run_logs.rs
+  - crates/mcp-core/src/nexus_tools/gh_run_view.rs
+  - crates/mcp-core/src/nexus_tools/gh_workflow_list.rs
+  - crates/mcp-core/src/nexus_tools/gh_workflow_run.rs
+  - crates/mcp-core/src/nexus_tools/gh_workflow_view.rs
+  - crates/mcp-core/src/nexus_tools/git_archive_dry.rs
+  - crates/mcp-core/src/nexus_tools/git_blame.rs
+  - crates/mcp-core/src/nexus_tools/git_branch_list.rs
+  - crates/mcp-core/src/nexus_tools/git_bundle_verify.rs
+  - crates/mcp-core/src/nexus_tools/git_cat_file.rs
+  - crates/mcp-core/src/nexus_tools/git_check_ignore.rs
+  - crates/mcp-core/src/nexus_tools/git_clean_dry.rs
+  - crates/mcp-core/src/nexus_tools/git_config_list.rs
+  - crates/mcp-core/src/nexus_tools/git_count_objects.rs
+  - crates/mcp-core/src/nexus_tools/git_diff.rs
+  - crates/mcp-core/src/nexus_tools/git_diff_stat.rs
+  - crates/mcp-core/src/nexus_tools/git_for_each_ref.rs
+  - crates/mcp-core/src/nexus_tools/git_fsck.rs
+  - crates/mcp-core/src/nexus_tools/git_gc_dry.rs
+  - crates/mcp-core/src/nexus_tools/git_grep.rs
+  - crates/mcp-core/src/nexus_tools/git_log.rs
+  - crates/mcp-core/src/nexus_tools/git_log_graph.rs
+  - crates/mcp-core/src/nexus_tools/git_ls_files.rs
+  - crates/mcp-core/src/nexus_tools/git_ls_tree.rs
+  - crates/mcp-core/src/nexus_tools/git_merge_base.rs
+  - crates/mcp-core/src/nexus_tools/git_reflog.rs
+  - crates/mcp-core/src/nexus_tools/git_remote_list.rs
+  - crates/mcp-core/src/nexus_tools/git_rev_parse.rs
+  - crates/mcp-core/src/nexus_tools/git_shortlog.rs
+  - crates/mcp-core/src/nexus_tools/git_show.rs
+  - crates/mcp-core/src/nexus_tools/git_show_branch.rs
+  - crates/mcp-core/src/nexus_tools/git_stash_list.rs
+  - crates/mcp-core/src/nexus_tools/git_status.rs
+  - crates/mcp-core/src/nexus_tools/git_submodule_list.rs
+  - crates/mcp-core/src/nexus_tools/git_tag_list.rs
+  - crates/mcp-core/src/nexus_tools/git_worktree_list.rs
+  - crates/mcp-core/src/nexus_tools/hash_content.rs
+  - crates/mcp-core/src/nexus_tools/http_request.rs
+  - crates/mcp-core/src/nexus_tools/json_get.rs
+  - crates/mcp-core/src/nexus_tools/json_parse.rs
+  - crates/mcp-core/src/nexus_tools/license_check.rs
+  - crates/mcp-core/src/nexus_tools/memory_evict_stats.rs
+  - crates/mcp-core/src/nexus_tools/memory_namespace_count.rs
+  - crates/mcp-core/src/nexus_tools/memory_ns.rs
+  - crates/mcp-core/src/nexus_tools/memory_pattern_list.rs
+  - crates/mcp-core/src/nexus_tools/memory_recent_writes.rs
+  - crates/mcp-core/src/nexus_tools/memory_size_estimate.rs
+  - crates/mcp-core/src/nexus_tools/memory_topkeys.rs
+  - crates/mcp-core/src/nexus_tools/meta_catalog_count.rs
+  - crates/mcp-core/src/nexus_tools/meta_categories_list.rs
+  - crates/mcp-core/src/nexus_tools/meta_health_summary.rs
+  - crates/mcp-core/src/nexus_tools/meta_self_test.rs
+  - crates/mcp-core/src/nexus_tools/meta_version_info.rs
+  - crates/mcp-core/src/nexus_tools/mod.rs
+  - crates/mcp-core/src/nexus_tools/openapi_validate.rs
+  - crates/mcp-core/src/nexus_tools/perf_arc_mutex.rs
+  - crates/mcp-core/src/nexus_tools/perf_async_funcs.rs
+  - crates/mcp-core/src/nexus_tools/perf_binary_size.rs
+  - crates/mcp-core/src/nexus_tools/perf_box_count.rs
+  - crates/mcp-core/src/nexus_tools/perf_cargo_bloat.rs
+  - crates/mcp-core/src/nexus_tools/perf_cargo_build_time.rs
+  - crates/mcp-core/src/nexus_tools/perf_clone_count.rs
+  - crates/mcp-core/src/nexus_tools/perf_codegen_units.rs
+  - crates/mcp-core/src/nexus_tools/perf_compile_units.rs
+  - crates/mcp-core/src/nexus_tools/perf_dep_count.rs
+  - crates/mcp-core/src/nexus_tools/perf_largest_files.rs
+  - crates/mcp-core/src/nexus_tools/perf_loc_per_crate.rs
+  - crates/mcp-core/src/nexus_tools/perf_lto_check.rs
+  - crates/mcp-core/src/nexus_tools/perf_optimization_check.rs
+  - crates/mcp-core/src/nexus_tools/perf_panic_count.rs
+  - crates/mcp-core/src/nexus_tools/perf_scan.rs
+  - crates/mcp-core/src/nexus_tools/perf_string_alloc.rs
+  - crates/mcp-core/src/nexus_tools/perf_target_dir_size.rs
+  - crates/mcp-core/src/nexus_tools/perf_test_count.rs
+  - crates/mcp-core/src/nexus_tools/perf_unsafe_blocks.rs
+  - crates/mcp-core/src/nexus_tools/perf_unused_deps.rs
+  - crates/mcp-core/src/nexus_tools/profile_run.rs
+  - crates/mcp-core/src/nexus_tools/project_db_analyze.rs
+  - crates/mcp-core/src/nexus_tools/project_db_apply_migration.rs
+  - crates/mcp-core/src/nexus_tools/project_db_backup.rs
+  - crates/mcp-core/src/nexus_tools/project_db_connections.rs
+  - crates/mcp-core/src/nexus_tools/project_db_create_migration.rs
+  - crates/mcp-core/src/nexus_tools/project_db_diff_schema.rs
+  - crates/mcp-core/src/nexus_tools/project_db_dump_schema.rs
+  - crates/mcp-core/src/nexus_tools/project_db_kill_query.rs
+  - crates/mcp-core/src/nexus_tools/project_db_query.rs
+  - crates/mcp-core/src/nexus_tools/project_db_reindex.rs
+  - crates/mcp-core/src/nexus_tools/project_db_restore.rs
+  - crates/mcp-core/src/nexus_tools/project_db_rollback.rs
+  - crates/mcp-core/src/nexus_tools/project_db_schema.rs
+  - crates/mcp-core/src/nexus_tools/project_db_set_connection.rs
+  - crates/mcp-core/src/nexus_tools/project_db_status.rs
+  - crates/mcp-core/src/nexus_tools/project_db_tables.rs
+  - crates/mcp-core/src/nexus_tools/project_db_vacuum.rs
+  - crates/mcp-core/src/nexus_tools/project_delete.rs
+  - crates/mcp-core/src/nexus_tools/project_info.rs
+  - crates/mcp-core/src/nexus_tools/project_register_existing_dir.rs
+  - crates/mcp-core/src/nexus_tools/project_register_from_git.rs
+  - crates/mcp-core/src/nexus_tools/project_run_configs.rs
+  - crates/mcp-core/src/nexus_tools/project_set_default_branch.rs
+  - crates/mcp-core/src/nexus_tools/project_workspace_init.rs
+  - crates/mcp-core/src/nexus_tools/regex_match.rs
+  - crates/mcp-core/src/nexus_tools/regex_replace.rs
+  - crates/mcp-core/src/nexus_tools/rename_symbol.rs
+  - crates/mcp-core/src/nexus_tools/rustc_explain.rs
+  - crates/mcp-core/src/nexus_tools/ruvector_insert.rs
+  - crates/mcp-core/src/nexus_tools/ruvector_search.rs
+  - crates/mcp-core/src/nexus_tools/ruvector_stats.rs
+  - crates/mcp-core/src/nexus_tools/sast_scan.rs
+  - crates/mcp-core/src/nexus_tools/sec_audit_summary.rs
+  - crates/mcp-core/src/nexus_tools/sec_cmd_injection_check.rs
+  - crates/mcp-core/src/nexus_tools/sec_cors_check.rs
+  - crates/mcp-core/src/nexus_tools/sec_dependency_count.rs
+  - crates/mcp-core/src/nexus_tools/sec_dockerfile_user_check.rs
+  - crates/mcp-core/src/nexus_tools/sec_env_files_check.rs
+  - crates/mcp-core/src/nexus_tools/sec_env_var_check.rs
+  - crates/mcp-core/src/nexus_tools/sec_eval_check.rs
+  - crates/mcp-core/src/nexus_tools/sec_git_secrets_check.rs
+  - crates/mcp-core/src/nexus_tools/sec_http_url_count.rs
+  - crates/mcp-core/src/nexus_tools/sec_jwt_secret_check.rs
+  - crates/mcp-core/src/nexus_tools/sec_localhost_count.rs
+  - crates/mcp-core/src/nexus_tools/sec_md5_sha1_check.rs
+  - crates/mcp-core/src/nexus_tools/sec_panic_count.rs
+  - crates/mcp-core/src/nexus_tools/sec_random_check.rs
+  - crates/mcp-core/src/nexus_tools/sec_secret_patterns.rs
+  - crates/mcp-core/src/nexus_tools/sec_sql_injection_check.rs
+  - crates/mcp-core/src/nexus_tools/sec_tls_check.rs
+  - crates/mcp-core/src/nexus_tools/sec_unwrap_count.rs
+  - crates/mcp-core/src/nexus_tools/sec_workflow_perms_check.rs
+  - crates/mcp-core/src/nexus_tools/secret_scan.rs
+  - crates/mcp-core/src/nexus_tools/shell_exec.rs
+  - crates/mcp-core/src/nexus_tools/test_assert_count.rs
+  - crates/mcp-core/src/nexus_tools/test_bench_count.rs
+  - crates/mcp-core/src/nexus_tools/test_count_files.rs
+  - crates/mcp-core/src/nexus_tools/test_coverage.rs
+  - crates/mcp-core/src/nexus_tools/test_coverage_summary.rs
+  - crates/mcp-core/src/nexus_tools/test_doc_count.rs
+  - crates/mcp-core/src/nexus_tools/test_failed_log.rs
+  - crates/mcp-core/src/nexus_tools/test_fixtures_list.rs
+  - crates/mcp-core/src/nexus_tools/test_generate.rs
+  - crates/mcp-core/src/nexus_tools/test_ignored_count.rs
+  - crates/mcp-core/src/nexus_tools/test_mock_count.rs
+  - crates/mcp-core/src/nexus_tools/test_module_count.rs
+  - crates/mcp-core/src/nexus_tools/test_playwright.rs
+  - crates/mcp-core/src/nexus_tools/test_proptest_count.rs
+  - crates/mcp-core/src/nexus_tools/test_quickcheck_count.rs
+  - crates/mcp-core/src/nexus_tools/test_run_integration.rs
+  - crates/mcp-core/src/nexus_tools/test_run_quiet.rs
+  - crates/mcp-core/src/nexus_tools/test_run_unit.rs
+  - crates/mcp-core/src/nexus_tools/test_run_workspace.rs
+  - crates/mcp-core/src/nexus_tools/test_should_panic_count.rs
+  - crates/mcp-core/src/nexus_tools/test_snapshots_list.rs
+  - crates/mcp-core/src/nexus_tools/test_stale_snapshots.rs
+  - crates/mcp-core/src/nexus_tools/test_workflow_files.rs
+  - crates/mcp-core/src/nexus_tools/text_diff.rs
+  - crates/mcp-core/src/nexus_tools/util_cpu_count.rs
+  - crates/mcp-core/src/nexus_tools/util_disk_free.rs
+  - crates/mcp-core/src/nexus_tools/util_hostname.rs
+  - crates/mcp-core/src/nexus_tools/util_now_iso.rs
+  - crates/mcp-core/src/nexus_tools/util_pid.rs
+  - crates/mcp-core/src/nexus_tools/util_uptime.rs
+  - crates/mcp-core/src/nexus_tools/uuid_generate.rs
+  - crates/mcp-core/src/orchestrator.rs
+  - crates/mcp-core/src/playwright_live.rs
+  - crates/mcp-core/src/plugins/figma.rs
+  - crates/mcp-core/src/plugins/install.rs
+  - crates/mcp-core/src/plugins/integrate.rs
+  - crates/mcp-core/src/plugins/mod.rs
+  - crates/mcp-core/src/plugins/runtime.rs
+  - crates/mcp-core/src/port_registry.rs
+  - crates/mcp-core/src/profiles.rs
+  - crates/mcp-core/src/project_context.rs
+  - crates/mcp-core/src/project_db/adapters/alembic.rs
+  - crates/mcp-core/src/project_db/adapters/django.rs
+  - crates/mcp-core/src/project_db/adapters/flyway.rs
+  - crates/mcp-core/src/project_db/adapters/generic_sql.rs
+  - crates/mcp-core/src/project_db/adapters/knex.rs
+  - crates/mcp-core/src/project_db/adapters/liquibase.rs
+  - crates/mcp-core/src/project_db/adapters/mod.rs
+  - crates/mcp-core/src/project_db/adapters/prisma.rs
+  - crates/mcp-core/src/project_db/adapters/rails.rs
+  - crates/mcp-core/src/project_db/adapters/sqlx_migrate.rs
+  - crates/mcp-core/src/project_db/detector.rs
+  - crates/mcp-core/src/project_db/exec.rs
+  - crates/mcp-core/src/project_db/runner.rs
+  - crates/mcp-core/src/project_db_routes.rs
+  - crates/mcp-core/src/project_files.rs
+  - crates/mcp-core/src/project_git.rs
+  - crates/mcp-core/src/project_workspace/allocate_port.rs
+  - crates/mcp-core/src/project_workspace/browser_check.rs
+  - crates/mcp-core/src/project_workspace/changes.rs
+  - crates/mcp-core/src/project_workspace/execute_cmd.rs
+  - crates/mcp-core/src/project_workspace/fs_events.rs
+  - crates/mcp-core/src/project_workspace/logs.rs
+  - crates/mcp-core/src/project_workspace/mod.rs
+  - crates/mcp-core/src/project_workspace/playwright_install.rs
+  - crates/mcp-core/src/project_workspace/port_recovery.rs
+  - crates/mcp-core/src/project_workspace/processes.rs
+  - crates/mcp-core/src/project_workspace/run_configs.rs
+  - crates/mcp-core/src/project_workspace/runtime_issues.rs
+  - crates/mcp-core/src/project_workspace/scan_ports.rs
+  - crates/mcp-core/src/project_workspace/services.rs
+  - crates/mcp-core/src/project_workspace/sync_ports.rs
+  - crates/mcp-core/src/project_workspace/wizard.rs
+  - crates/mcp-core/src/project_workspace/workbench.rs
+  - crates/mcp-core/src/projects/analyze.rs
+  - crates/mcp-core/src/projects/cleanup.rs
+  - crates/mcp-core/src/projects/clone.rs
+  - crates/mcp-core/src/projects/crud.rs
+  - crates/mcp-core/src/projects/custom_instructions.rs
+  - crates/mcp-core/src/projects/deep_analyze.rs
+  - crates/mcp-core/src/projects/deep_review.rs
+  - crates/mcp-core/src/projects/file_watcher.rs
+  - crates/mcp-core/src/projects/indexing.rs
+  - crates/mcp-core/src/projects/mod.rs
+  - crates/mcp-core/src/projects/quality.rs
+  - crates/mcp-core/src/projects/terminal.rs
+  - crates/mcp-core/src/prompt_templates.rs
+  - crates/mcp-core/src/provider_cooldown.rs
+  - crates/mcp-core/src/provider_health_probe.rs
+  - crates/mcp-core/src/quality_guard.rs
+  - crates/mcp-core/src/rag/chunker.rs
+  - crates/mcp-core/src/rag/config.rs
+  - crates/mcp-core/src/rag/indexer.rs
+  - crates/mcp-core/src/rag/mod.rs
+  - crates/mcp-core/src/rag/qdrant_client.rs
+  - crates/mcp-core/src/rag/search.rs
+  - crates/mcp-core/src/routing_config.rs
+  - crates/mcp-core/src/routing_matrix.rs
+  - crates/mcp-core/src/routing_matrix_auto_promoter.rs
+  - crates/mcp-core/src/routing_slots.rs
+  - crates/mcp-core/src/sandbox.rs
+  - crates/mcp-core/src/security/api.rs
+  - crates/mcp-core/src/security/audit.rs
+  - crates/mcp-core/src/security/port_enforcer.rs
+  - crates/mcp-core/src/services_watchdog.rs
+  - crates/mcp-core/src/settings.rs
+  - crates/mcp-core/src/task_watchdog.rs
+  - crates/mcp-core/src/tool_runner_server.rs
+  - crates/mcp-core/src/vector_memory.rs
+  - crates/mcp-core/tests/agent_runs_endpoints.rs
+  - crates/mcp-core/tests/agent_tools_safety.rs
+  - crates/mcp-core/tests/m71_cost_breakdown.rs
+  - crates/mcp-core/tests/orchestrator_db_schema.rs
+  - crates/mcp-core/tests/postgres_app_isolation.rs
+  - crates/mcp-core/tests/subagent_workflow.rs
+  - docs/.nexus-vault/adr/0016-rag-pipeline-completion.md
+  - docs/.nexus-vault/api/rest-endpoints.md
+  - docs/.nexus-vault/api/settings-keys.md
+  - docs/.nexus-vault/changelog/2026/2026-06-04-fix-rinomina-migrazione-indici-fk-0282-0285-conflitto-numerazione-con-migrazioni.md
+  - docs/.nexus-vault/concepts/auto-fix-workflow.md
+  - docs/.nexus-vault/concepts/change-drafter.md
+  - docs/.nexus-vault/concepts/glossario.md
+  - docs/.nexus-vault/concepts/isolamento-progetti.md
+  - docs/.nexus-vault/concepts/knowledge-base-funzionamento.md
+  - docs/.nexus-vault/concepts/meta-vault-architettura.md
+  - docs/.nexus-vault/concepts/multi-provider-routing.md
+  - docs/.nexus-vault/concepts/nexus-architetturale.md
+  - docs/.nexus-vault/concepts/nexus-funzionale.md
+  - docs/.nexus-vault/concepts/pattern-learning-worker.md
+  - docs/.nexus-vault/concepts/pattern-mcp-tool.md
+  - docs/.nexus-vault/concepts/sub-agents-claude-code.md
+  - docs/.nexus-vault/schema/migrations-log.md
+  - docs/.nexus-vault/schema/postgres-tables.md
+  - docs/.nexus-vault/schema/qdrant-collections.md
+auto_generated: true
+created_at: 2026-06-04T04:42:34Z
+updated_at: 2026-06-04T04:42:33Z
+nexus_meta_version: 1
+---
+
+# refactor+style: modularizza nexus_tool_catalog + formattazione uniforme (audit fase 1)
+
+**Commit**: `f9041b2dbe81653f3ff9a090b24a702602b6840e` (2026-06-04 04:42 UTC)
+
+**Significance**: 0.60
+
+## File toccati
+
+- `crates/mcp-core/src/admin/mod.rs`
+- `crates/mcp-core/src/admin/projects.rs`
+- `crates/mcp-core/src/admin/routing.rs`
+- `crates/mcp-core/src/admin/users.rs`
+- `crates/mcp-core/src/agent_processes.rs`
+- `crates/mcp-core/src/agent_router_server.rs`
+- `crates/mcp-core/src/agent_todos_routes.rs`
+- `crates/mcp-core/src/agent_tools/archive_tools.rs`
+- `crates/mcp-core/src/agent_tools/attachment_inspector.rs`
+- `crates/mcp-core/src/agent_tools/attachments.rs`
+- `crates/mcp-core/src/agent_tools/command.rs`
+- `crates/mcp-core/src/agent_tools/command_hints.rs`
+- `crates/mcp-core/src/agent_tools/dev_diagnostics.rs`
+- `crates/mcp-core/src/agent_tools/dispatcher.rs`
+- `crates/mcp-core/src/agent_tools/document_tools.rs`
+- `crates/mcp-core/src/agent_tools/figma_tools.rs`
+- `crates/mcp-core/src/agent_tools/files.rs`
+- `crates/mcp-core/src/agent_tools/git.rs`
+- `crates/mcp-core/src/agent_tools/knowledge.rs`
+- `crates/mcp-core/src/agent_tools/mod.rs`
+- `crates/mcp-core/src/agent_tools/port_scanner.rs`
+- `crates/mcp-core/src/agent_tools/project_db_query.rs`
+- `crates/mcp-core/src/agent_tools/read_cache.rs`
+- `crates/mcp-core/src/agent_tools/safety.rs`
+- `crates/mcp-core/src/agent_tools/sandbox.rs`
+- `crates/mcp-core/src/agent_tools/scaffold_verifier.rs`
+- `crates/mcp-core/src/agent_tools/service.rs`
+- `crates/mcp-core/src/agent_tools/shadcn_setup.rs`
+- `crates/mcp-core/src/agent_tools/subagent.rs`
+- `crates/mcp-core/src/agent_tools/testing.rs`
+- `crates/mcp-core/src/agent_tools/todos.rs`
+- `crates/mcp-core/src/agent_tools/vision_tools.rs`
+- `crates/mcp-core/src/agent_tools/visual_compare.rs`
+- `crates/mcp-core/src/agent_types.rs`
+- `crates/mcp-core/src/auth.rs`
+- `crates/mcp-core/src/brain_agent_client.rs`
+- `crates/mcp-core/src/change_drafts.rs`
+- `crates/mcp-core/src/chat_agent.rs`
+- `crates/mcp-core/src/chat_attachments.rs`
+- `crates/mcp-core/src/chat_learning.rs`
+- `crates/mcp-core/src/chat_messages.rs`
+- `crates/mcp-core/src/chat_sessions.rs`
+- `crates/mcp-core/src/claude_agents.rs`
+- `crates/mcp-core/src/context_settings.rs`
+- `crates/mcp-core/src/deepseek_balance_sync.rs`
+- `crates/mcp-core/src/dispatcher_routes.rs`
+- `crates/mcp-core/src/dlp.rs`
+- `crates/mcp-core/src/docs_core/revisions.rs`
+- `crates/mcp-core/src/docs_core/routes.rs`
+- `crates/mcp-core/src/docs_core/storage.rs`
+- `crates/mcp-core/src/docs_core/vault.rs`
+- `crates/mcp-core/src/documents.rs`
+- `crates/mcp-core/src/domain.rs`
+- `crates/mcp-core/src/environment.rs`
+- `crates/mcp-core/src/github.rs`
+- `crates/mcp-core/src/internal_learning.rs`
+- `crates/mcp-core/src/internal_routing.rs`
+- `crates/mcp-core/src/knowledge/auto_link.rs`
+- `crates/mcp-core/src/knowledge/code_doc.rs`
+- `crates/mcp-core/src/knowledge/code_graph.rs`
+- `crates/mcp-core/src/knowledge/functional_spec_agent.rs`
+- `crates/mcp-core/src/knowledge/generators.rs`
+- `crates/mcp-core/src/knowledge/graph_import.rs`
+- `crates/mcp-core/src/knowledge/impact.rs`
+- `crates/mcp-core/src/knowledge/ingest_run.rs`
+- `crates/mcp-core/src/knowledge/mod.rs`
+- `crates/mcp-core/src/knowledge/routes.rs`
+- `crates/mcp-core/src/knowledge_watcher.rs`
+- `crates/mcp-core/src/knowledge_workers.rs`
+- `crates/mcp-core/src/long_running.rs`
+- `crates/mcp-core/src/main.rs`
+- `crates/mcp-core/src/mcp_client.rs`
+- `crates/mcp-core/src/mcp_connectors.rs`
+- `crates/mcp-core/src/meta_docs/apply.rs`
+- `crates/mcp-core/src/meta_docs/generators/api.rs`
+- `crates/mcp-core/src/meta_docs/generators/architecture.rs`
+- `crates/mcp-core/src/meta_docs/generators/changelog.rs`
+- `crates/mcp-core/src/meta_docs/generators/concepts.rs`
+- `crates/mcp-core/src/meta_docs/generators/decisions.rs`
+- `crates/mcp-core/src/meta_docs/generators/mod.rs`
+- `crates/mcp-core/src/meta_docs/generators/schema.rs`
+- `crates/mcp-core/src/meta_docs/mod.rs`
+- `crates/mcp-core/src/meta_docs/routes.rs`
+- `crates/mcp-core/src/meta_docs/vault.rs`
+- `crates/mcp-core/src/meta_docs_watcher.rs`
+- `crates/mcp-core/src/meta_docs_workers.rs`
+- `crates/mcp-core/src/middleware.rs`
+- `crates/mcp-core/src/model_catalog_sync.rs`
+- `crates/mcp-core/src/model_health_probe.rs`
+- `crates/mcp-core/src/models.rs`
+- `crates/mcp-core/src/nexus_bridge.rs`
+- `crates/mcp-core/src/nexus_builtin/docs.rs`
+- `crates/mcp-core/src/nexus_builtin/git.rs`
+- `crates/mcp-core/src/nexus_builtin/mcp_runtime.rs`
+- `crates/mcp-core/src/nexus_builtin/mod.rs`
+- `crates/mcp-core/src/nexus_builtin/project.rs`
+- `crates/mcp-core/src/nexus_builtin/prompt_admin.rs`
+- `crates/mcp-core/src/nexus_builtin/run_config.rs`
+- `crates/mcp-core/src/nexus_builtin/services.rs`
+- `crates/mcp-core/src/nexus_database_stats.rs`
+- `crates/mcp-core/src/nexus_routing.rs`
+- `crates/mcp-core/src/nexus_tool_catalog.rs`
+- `crates/mcp-core/src/nexus_tool_catalog/build_deploy.rs`
+- `crates/mcp-core/src/nexus_tool_catalog/code_analysis.rs`
+- `crates/mcp-core/src/nexus_tool_catalog/database.rs`
+- `crates/mcp-core/src/nexus_tool_catalog/dependencies.rs`
+- `crates/mcp-core/src/nexus_tool_catalog/documentation.rs`
+- `crates/mcp-core/src/nexus_tool_catalog/github.rs`
+- `crates/mcp-core/src/nexus_tool_catalog/memory_meta.rs`
+- `crates/mcp-core/src/nexus_tool_catalog/mod.rs`
+- `crates/mcp-core/src/nexus_tool_catalog/performance.rs`
+- `crates/mcp-core/src/nexus_tool_catalog/security.rs`
+- `crates/mcp-core/src/nexus_tool_catalog/testing.rs`
+- `crates/mcp-core/src/nexus_tool_catalog/utility.rs`
+- `crates/mcp-core/src/nexus_tool_catalog/vcs.rs`
+- `crates/mcp-core/src/nexus_tools/api_endpoint_list.rs`
+- `crates/mcp-core/src/nexus_tools/api_graphql_check.rs`
+- `crates/mcp-core/src/nexus_tools/api_grpc_check.rs`
+- `crates/mcp-core/src/nexus_tools/api_handler_count.rs`
+- `crates/mcp-core/src/nexus_tools/api_middleware_count.rs`
+- `crates/mcp-core/src/nexus_tools/api_openapi_files.rs`
+- `crates/mcp-core/src/nexus_tools/api_postman_check.rs`
+- `crates/mcp-core/src/nexus_tools/api_route_count.rs`
+- `crates/mcp-core/src/nexus_tools/ast_parse.rs`
+- `crates/mcp-core/src/nexus_tools/ast_query.rs`
+- `crates/mcp-core/src/nexus_tools/base64_decode.rs`
+- `crates/mcp-core/src/nexus_tools/base64_encode.rs`
+- `crates/mcp-core/src/nexus_tools/bench_run.rs`
+- `crates/mcp-core/src/nexus_tools/build_artifact_age.rs`
+- `crates/mcp-core/src/nexus_tools/build_debug_size.rs`
+- `crates/mcp-core/src/nexus_tools/build_incremental_dir.rs`
+- `crates/mcp-core/src/nexus_tools/build_lockfile_age.rs`
+- `crates/mcp-core/src/nexus_tools/build_log_tail.rs`
+- `crates/mcp-core/src/nexus_tools/build_profile_list.rs`
+- `crates/mcp-core/src/nexus_tools/build_project.rs`
+- `crates/mcp-core/src/nexus_tools/build_release_size.rs`
+- `crates/mcp-core/src/nexus_tools/build_rerun_checks.rs`
+- `crates/mcp-core/src/nexus_tools/build_script_count.rs`
+- `crates/mcp-core/src/nexus_tools/build_target_list.rs`
+- `crates/mcp-core/src/nexus_tools/build_workspace_check.rs`
+- `crates/mcp-core/src/nexus_tools/ca_attr_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_complexity_estimate.rs`
+- `crates/mcp-core/src/nexus_tools/ca_derive_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_doc_comment_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_enum_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_fn_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_generic_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_if_let_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_impl_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_inline_comment_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_lifetime_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_macro_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_match_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_mod_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_pub_fn_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_struct_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_todo_fixme_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_trait_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_use_count.rs`
+- `crates/mcp-core/src/nexus_tools/ca_while_let_count.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_audit.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_bench.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_build.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_build_artifact_check.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_check.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_check_all_features.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_check_release.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_clean.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_clean_dry.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_dep_versions.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_doc.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_doc_check.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_edition_detect.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_env_overrides.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_features_list.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_install_list.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_locate_project.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_lockfile_check.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_metadata.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_msrv_detect.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_outdated.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_pkgid.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_publish_dry.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_run.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_search.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_size_estimate.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_targets_list.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_test.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_test_doc.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_test_lib.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_tree.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_update.rs`
+- `crates/mcp-core/src/nexus_tools/cargo_workspace_members.rs`
+- `crates/mcp-core/src/nexus_tools/clippy_lint.rs`
+- `crates/mcp-core/src/nexus_tools/consensus_vote.rs`
+- `crates/mcp-core/src/nexus_tools/count_loc.rs`
+- `crates/mcp-core/src/nexus_tools/db_active_queries.rs`
+- `crates/mcp-core/src/nexus_tools/db_bloat_check.rs`
+- `crates/mcp-core/src/nexus_tools/db_connection_info.rs`
+- `crates/mcp-core/src/nexus_tools/db_constraint_list.rs`
+- `crates/mcp-core/src/nexus_tools/db_dead_tuples.rs`
+- `crates/mcp-core/src/nexus_tools/db_extension_list.rs`
+- `crates/mcp-core/src/nexus_tools/db_foreign_keys.rs`
+- `crates/mcp-core/src/nexus_tools/db_helper.rs`
+- `crates/mcp-core/src/nexus_tools/db_index_list.rs`
+- `crates/mcp-core/src/nexus_tools/db_lock_list.rs`
+- `crates/mcp-core/src/nexus_tools/db_migration_list.rs`
+- `crates/mcp-core/src/nexus_tools/db_ping.rs`
+- `crates/mcp-core/src/nexus_tools/db_query_explain.rs`
+- `crates/mcp-core/src/nexus_tools/db_replication_status.rs`
+- `crates/mcp-core/src/nexus_tools/db_role_list.rs`
+- `crates/mcp-core/src/nexus_tools/db_schema_inspect.rs`
+- `crates/mcp-core/src/nexus_tools/db_seq_list.rs`
+- `crates/mcp-core/src/nexus_tools/db_size.rs`
+- `crates/mcp-core/src/nexus_tools/db_table_count.rs`
+- `crates/mcp-core/src/nexus_tools/db_table_list.rs`
+- `crates/mcp-core/src/nexus_tools/db_table_size.rs`
+- `crates/mcp-core/src/nexus_tools/db_unused_indexes.rs`
+- `crates/mcp-core/src/nexus_tools/db_view_list.rs`
+- `crates/mcp-core/src/nexus_tools/deploy_ansible_check.rs`
+- `crates/mcp-core/src/nexus_tools/deploy_check.rs`
+- `crates/mcp-core/src/nexus_tools/deploy_compose_check.rs`
+- `crates/mcp-core/src/nexus_tools/deploy_dockerfile_count.rs`
+- `crates/mcp-core/src/nexus_tools/deploy_env_files_count.rs`
+- `crates/mcp-core/src/nexus_tools/deploy_helm_check.rs`
+- `crates/mcp-core/src/nexus_tools/deploy_k8s_check.rs`
+- `crates/mcp-core/src/nexus_tools/deploy_nginx_check.rs`
+- `crates/mcp-core/src/nexus_tools/deploy_release_artifacts.rs`
+- `crates/mcp-core/src/nexus_tools/deploy_systemd_check.rs`
+- `crates/mcp-core/src/nexus_tools/deploy_terraform_check.rs`
+- `crates/mcp-core/src/nexus_tools/deps_audit.rs`
+- `crates/mcp-core/src/nexus_tools/deps_tree.rs`
+- `crates/mcp-core/src/nexus_tools/doc_api_list.rs`
+- `crates/mcp-core/src/nexus_tools/doc_changelog_check.rs`
+- `crates/mcp-core/src/nexus_tools/doc_codeblocks_count.rs`
+- `crates/mcp-core/src/nexus_tools/doc_codeblocks_extract.rs`
+- `crates/mcp-core/src/nexus_tools/doc_codeowners_check.rs`
+- `crates/mcp-core/src/nexus_tools/doc_contributing_check.rs`
+- `crates/mcp-core/src/nexus_tools/doc_examples_list.rs`
+- `crates/mcp-core/src/nexus_tools/doc_frontmatter_parse.rs`
+- `crates/mcp-core/src/nexus_tools/doc_generate.rs`
+- `crates/mcp-core/src/nexus_tools/doc_heading_depth.rs`
+- `crates/mcp-core/src/nexus_tools/doc_image_list.rs`
+- `crates/mcp-core/src/nexus_tools/doc_license_detect.rs`
+- `crates/mcp-core/src/nexus_tools/doc_link_check_local.rs`
+- `crates/mcp-core/src/nexus_tools/doc_links_extract.rs`
+- `crates/mcp-core/src/nexus_tools/doc_md_lint.rs`
+- `crates/mcp-core/src/nexus_tools/doc_orphan_md.rs`
+- `crates/mcp-core/src/nexus_tools/doc_readme_check.rs`
+- `crates/mcp-core/src/nexus_tools/doc_security_md_check.rs`
+- `crates/mcp-core/src/nexus_tools/doc_size_report.rs`
+- `crates/mcp-core/src/nexus_tools/doc_toc_extract.rs`
+- `crates/mcp-core/src/nexus_tools/doc_word_count.rs`
+- `crates/mcp-core/src/nexus_tools/docker_build.rs`
+- `crates/mcp-core/src/nexus_tools/docker_compose_down.rs`
+- `crates/mcp-core/src/nexus_tools/docker_compose_up.rs`
+- `crates/mcp-core/src/nexus_tools/docker_logs.rs`
+- `crates/mcp-core/src/nexus_tools/docker_ps.rs`
+- `crates/mcp-core/src/nexus_tools/docker_rm.rs`
+- `crates/mcp-core/src/nexus_tools/docker_run.rs`
+- `crates/mcp-core/src/nexus_tools/docker_stop.rs`
+- `crates/mcp-core/src/nexus_tools/exec.rs`
+- `crates/mcp-core/src/nexus_tools/extract_function.rs`
+- `crates/mcp-core/src/nexus_tools/find_pubapi.rs`
+- `crates/mcp-core/src/nexus_tools/find_todos.rs`
+- `crates/mcp-core/src/nexus_tools/find_unsafe.rs`
+- `crates/mcp-core/src/nexus_tools/format_code.rs`
+- `crates/mcp-core/src/nexus_tools/fs_glob.rs`
+- `crates/mcp-core/src/nexus_tools/fs_grep.rs`
+- `crates/mcp-core/src/nexus_tools/fs_list.rs`
+- `crates/mcp-core/src/nexus_tools/fs_read.rs`
+- `crates/mcp-core/src/nexus_tools/fs_stat.rs`
+- `crates/mcp-core/src/nexus_tools/fs_tree.rs`
+- `crates/mcp-core/src/nexus_tools/fs_write.rs`
+- `crates/mcp-core/src/nexus_tools/gh_issue_close.rs`
+- `crates/mcp-core/src/nexus_tools/gh_issue_comment.rs`
+- `crates/mcp-core/src/nexus_tools/gh_issue_create.rs`
+- `crates/mcp-core/src/nexus_tools/gh_issue_list.rs`
+- `crates/mcp-core/src/nexus_tools/gh_issue_view.rs`
+- `crates/mcp-core/src/nexus_tools/gh_label_list.rs`
+- `crates/mcp-core/src/nexus_tools/gh_pr_checks.rs`
+- `crates/mcp-core/src/nexus_tools/gh_pr_close.rs`
+- `crates/mcp-core/src/nexus_tools/gh_pr_create.rs`
+- `crates/mcp-core/src/nexus_tools/gh_pr_diff.rs`
+- `crates/mcp-core/src/nexus_tools/gh_pr_files.rs`
+- `crates/mcp-core/src/nexus_tools/gh_pr_list.rs`
+- `crates/mcp-core/src/nexus_tools/gh_pr_merge.rs`
+- `crates/mcp-core/src/nexus_tools/gh_pr_review.rs`
+- `crates/mcp-core/src/nexus_tools/gh_pr_view.rs`
+- `crates/mcp-core/src/nexus_tools/gh_release_create.rs`
+- `crates/mcp-core/src/nexus_tools/gh_release_list.rs`
+- `crates/mcp-core/src/nexus_tools/gh_release_view.rs`
+- `crates/mcp-core/src/nexus_tools/gh_repo_clone_url.rs`
+- `crates/mcp-core/src/nexus_tools/gh_repo_fork_list.rs`
+- `crates/mcp-core/src/nexus_tools/gh_run_cancel.rs`
+- `crates/mcp-core/src/nexus_tools/gh_run_list.rs`
+- `crates/mcp-core/src/nexus_tools/gh_run_logs.rs`
+- `crates/mcp-core/src/nexus_tools/gh_run_view.rs`
+- `crates/mcp-core/src/nexus_tools/gh_workflow_list.rs`
+- `crates/mcp-core/src/nexus_tools/gh_workflow_run.rs`
+- `crates/mcp-core/src/nexus_tools/gh_workflow_view.rs`
+- `crates/mcp-core/src/nexus_tools/git_archive_dry.rs`
+- `crates/mcp-core/src/nexus_tools/git_blame.rs`
+- `crates/mcp-core/src/nexus_tools/git_branch_list.rs`
+- `crates/mcp-core/src/nexus_tools/git_bundle_verify.rs`
+- `crates/mcp-core/src/nexus_tools/git_cat_file.rs`
+- `crates/mcp-core/src/nexus_tools/git_check_ignore.rs`
+- `crates/mcp-core/src/nexus_tools/git_clean_dry.rs`
+- `crates/mcp-core/src/nexus_tools/git_config_list.rs`
+- `crates/mcp-core/src/nexus_tools/git_count_objects.rs`
+- `crates/mcp-core/src/nexus_tools/git_diff.rs`
+- `crates/mcp-core/src/nexus_tools/git_diff_stat.rs`
+- `crates/mcp-core/src/nexus_tools/git_for_each_ref.rs`
+- `crates/mcp-core/src/nexus_tools/git_fsck.rs`
+- `crates/mcp-core/src/nexus_tools/git_gc_dry.rs`
+- `crates/mcp-core/src/nexus_tools/git_grep.rs`
+- `crates/mcp-core/src/nexus_tools/git_log.rs`
+- `crates/mcp-core/src/nexus_tools/git_log_graph.rs`
+- `crates/mcp-core/src/nexus_tools/git_ls_files.rs`
+- `crates/mcp-core/src/nexus_tools/git_ls_tree.rs`
+- `crates/mcp-core/src/nexus_tools/git_merge_base.rs`
+- `crates/mcp-core/src/nexus_tools/git_reflog.rs`
+- `crates/mcp-core/src/nexus_tools/git_remote_list.rs`
+- `crates/mcp-core/src/nexus_tools/git_rev_parse.rs`
+- `crates/mcp-core/src/nexus_tools/git_shortlog.rs`
+- `crates/mcp-core/src/nexus_tools/git_show.rs`
+- `crates/mcp-core/src/nexus_tools/git_show_branch.rs`
+- `crates/mcp-core/src/nexus_tools/git_stash_list.rs`
+- `crates/mcp-core/src/nexus_tools/git_status.rs`
+- `crates/mcp-core/src/nexus_tools/git_submodule_list.rs`
+- `crates/mcp-core/src/nexus_tools/git_tag_list.rs`
+- `crates/mcp-core/src/nexus_tools/git_worktree_list.rs`
+- `crates/mcp-core/src/nexus_tools/hash_content.rs`
+- `crates/mcp-core/src/nexus_tools/http_request.rs`
+- `crates/mcp-core/src/nexus_tools/json_get.rs`
+- `crates/mcp-core/src/nexus_tools/json_parse.rs`
+- `crates/mcp-core/src/nexus_tools/license_check.rs`
+- `crates/mcp-core/src/nexus_tools/memory_evict_stats.rs`
+- `crates/mcp-core/src/nexus_tools/memory_namespace_count.rs`
+- `crates/mcp-core/src/nexus_tools/memory_ns.rs`
+- `crates/mcp-core/src/nexus_tools/memory_pattern_list.rs`
+- `crates/mcp-core/src/nexus_tools/memory_recent_writes.rs`
+- `crates/mcp-core/src/nexus_tools/memory_size_estimate.rs`
+- `crates/mcp-core/src/nexus_tools/memory_topkeys.rs`
+- `crates/mcp-core/src/nexus_tools/meta_catalog_count.rs`
+- `crates/mcp-core/src/nexus_tools/meta_categories_list.rs`
+- `crates/mcp-core/src/nexus_tools/meta_health_summary.rs`
+- `crates/mcp-core/src/nexus_tools/meta_self_test.rs`
+- `crates/mcp-core/src/nexus_tools/meta_version_info.rs`
+- `crates/mcp-core/src/nexus_tools/mod.rs`
+- `crates/mcp-core/src/nexus_tools/openapi_validate.rs`
+- `crates/mcp-core/src/nexus_tools/perf_arc_mutex.rs`
+- `crates/mcp-core/src/nexus_tools/perf_async_funcs.rs`
+- `crates/mcp-core/src/nexus_tools/perf_binary_size.rs`
+- `crates/mcp-core/src/nexus_tools/perf_box_count.rs`
+- `crates/mcp-core/src/nexus_tools/perf_cargo_bloat.rs`
+- `crates/mcp-core/src/nexus_tools/perf_cargo_build_time.rs`
+- `crates/mcp-core/src/nexus_tools/perf_clone_count.rs`
+- `crates/mcp-core/src/nexus_tools/perf_codegen_units.rs`
+- `crates/mcp-core/src/nexus_tools/perf_compile_units.rs`
+- `crates/mcp-core/src/nexus_tools/perf_dep_count.rs`
+- `crates/mcp-core/src/nexus_tools/perf_largest_files.rs`
+- `crates/mcp-core/src/nexus_tools/perf_loc_per_crate.rs`
+- `crates/mcp-core/src/nexus_tools/perf_lto_check.rs`
+- `crates/mcp-core/src/nexus_tools/perf_optimization_check.rs`
+- `crates/mcp-core/src/nexus_tools/perf_panic_count.rs`
+- `crates/mcp-core/src/nexus_tools/perf_scan.rs`
+- `crates/mcp-core/src/nexus_tools/perf_string_alloc.rs`
+- `crates/mcp-core/src/nexus_tools/perf_target_dir_size.rs`
+- `crates/mcp-core/src/nexus_tools/perf_test_count.rs`
+- `crates/mcp-core/src/nexus_tools/perf_unsafe_blocks.rs`
+- `crates/mcp-core/src/nexus_tools/perf_unused_deps.rs`
+- `crates/mcp-core/src/nexus_tools/profile_run.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_analyze.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_apply_migration.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_backup.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_connections.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_create_migration.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_diff_schema.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_dump_schema.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_kill_query.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_query.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_reindex.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_restore.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_rollback.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_schema.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_set_connection.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_status.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_tables.rs`
+- `crates/mcp-core/src/nexus_tools/project_db_vacuum.rs`
+- `crates/mcp-core/src/nexus_tools/project_delete.rs`
+- `crates/mcp-core/src/nexus_tools/project_info.rs`
+- `crates/mcp-core/src/nexus_tools/project_register_existing_dir.rs`
+- `crates/mcp-core/src/nexus_tools/project_register_from_git.rs`
+- `crates/mcp-core/src/nexus_tools/project_run_configs.rs`
+- `crates/mcp-core/src/nexus_tools/project_set_default_branch.rs`
+- `crates/mcp-core/src/nexus_tools/project_workspace_init.rs`
+- `crates/mcp-core/src/nexus_tools/regex_match.rs`
+- `crates/mcp-core/src/nexus_tools/regex_replace.rs`
+- `crates/mcp-core/src/nexus_tools/rename_symbol.rs`
+- `crates/mcp-core/src/nexus_tools/rustc_explain.rs`
+- `crates/mcp-core/src/nexus_tools/ruvector_insert.rs`
+- `crates/mcp-core/src/nexus_tools/ruvector_search.rs`
+- `crates/mcp-core/src/nexus_tools/ruvector_stats.rs`
+- `crates/mcp-core/src/nexus_tools/sast_scan.rs`
+- `crates/mcp-core/src/nexus_tools/sec_audit_summary.rs`
+- `crates/mcp-core/src/nexus_tools/sec_cmd_injection_check.rs`
+- `crates/mcp-core/src/nexus_tools/sec_cors_check.rs`
+- `crates/mcp-core/src/nexus_tools/sec_dependency_count.rs`
+- `crates/mcp-core/src/nexus_tools/sec_dockerfile_user_check.rs`
+- `crates/mcp-core/src/nexus_tools/sec_env_files_check.rs`
+- `crates/mcp-core/src/nexus_tools/sec_env_var_check.rs`
+- `crates/mcp-core/src/nexus_tools/sec_eval_check.rs`
+- `crates/mcp-core/src/nexus_tools/sec_git_secrets_check.rs`
+- `crates/mcp-core/src/nexus_tools/sec_http_url_count.rs`
+- `crates/mcp-core/src/nexus_tools/sec_jwt_secret_check.rs`
+- `crates/mcp-core/src/nexus_tools/sec_localhost_count.rs`
+- `crates/mcp-core/src/nexus_tools/sec_md5_sha1_check.rs`
+- `crates/mcp-core/src/nexus_tools/sec_panic_count.rs`
+- `crates/mcp-core/src/nexus_tools/sec_random_check.rs`
+- `crates/mcp-core/src/nexus_tools/sec_secret_patterns.rs`
+- `crates/mcp-core/src/nexus_tools/sec_sql_injection_check.rs`
+- `crates/mcp-core/src/nexus_tools/sec_tls_check.rs`
+- `crates/mcp-core/src/nexus_tools/sec_unwrap_count.rs`
+- `crates/mcp-core/src/nexus_tools/sec_workflow_perms_check.rs`
+- `crates/mcp-core/src/nexus_tools/secret_scan.rs`
+- `crates/mcp-core/src/nexus_tools/shell_exec.rs`
+- `crates/mcp-core/src/nexus_tools/test_assert_count.rs`
+- `crates/mcp-core/src/nexus_tools/test_bench_count.rs`
+- `crates/mcp-core/src/nexus_tools/test_count_files.rs`
+- `crates/mcp-core/src/nexus_tools/test_coverage.rs`
+- `crates/mcp-core/src/nexus_tools/test_coverage_summary.rs`
+- `crates/mcp-core/src/nexus_tools/test_doc_count.rs`
+- `crates/mcp-core/src/nexus_tools/test_failed_log.rs`
+- `crates/mcp-core/src/nexus_tools/test_fixtures_list.rs`
+- `crates/mcp-core/src/nexus_tools/test_generate.rs`
+- `crates/mcp-core/src/nexus_tools/test_ignored_count.rs`
+- `crates/mcp-core/src/nexus_tools/test_mock_count.rs`
+- `crates/mcp-core/src/nexus_tools/test_module_count.rs`
+- `crates/mcp-core/src/nexus_tools/test_playwright.rs`
+- `crates/mcp-core/src/nexus_tools/test_proptest_count.rs`
+- `crates/mcp-core/src/nexus_tools/test_quickcheck_count.rs`
+- `crates/mcp-core/src/nexus_tools/test_run_integration.rs`
+- `crates/mcp-core/src/nexus_tools/test_run_quiet.rs`
+- `crates/mcp-core/src/nexus_tools/test_run_unit.rs`
+- `crates/mcp-core/src/nexus_tools/test_run_workspace.rs`
+- `crates/mcp-core/src/nexus_tools/test_should_panic_count.rs`
+- `crates/mcp-core/src/nexus_tools/test_snapshots_list.rs`
+- `crates/mcp-core/src/nexus_tools/test_stale_snapshots.rs`
+- `crates/mcp-core/src/nexus_tools/test_workflow_files.rs`
+- `crates/mcp-core/src/nexus_tools/text_diff.rs`
+- `crates/mcp-core/src/nexus_tools/util_cpu_count.rs`
+- `crates/mcp-core/src/nexus_tools/util_disk_free.rs`
+- `crates/mcp-core/src/nexus_tools/util_hostname.rs`
+- `crates/mcp-core/src/nexus_tools/util_now_iso.rs`
+- `crates/mcp-core/src/nexus_tools/util_pid.rs`
+- `crates/mcp-core/src/nexus_tools/util_uptime.rs`
+- `crates/mcp-core/src/nexus_tools/uuid_generate.rs`
+- `crates/mcp-core/src/orchestrator.rs`
+- `crates/mcp-core/src/playwright_live.rs`
+- `crates/mcp-core/src/plugins/figma.rs`
+- `crates/mcp-core/src/plugins/install.rs`
+- `crates/mcp-core/src/plugins/integrate.rs`
+- `crates/mcp-core/src/plugins/mod.rs`
+- `crates/mcp-core/src/plugins/runtime.rs`
+- `crates/mcp-core/src/port_registry.rs`
+- `crates/mcp-core/src/profiles.rs`
+- `crates/mcp-core/src/project_context.rs`
+- `crates/mcp-core/src/project_db/adapters/alembic.rs`
+- `crates/mcp-core/src/project_db/adapters/django.rs`
+- `crates/mcp-core/src/project_db/adapters/flyway.rs`
+- `crates/mcp-core/src/project_db/adapters/generic_sql.rs`
+- `crates/mcp-core/src/project_db/adapters/knex.rs`
+- `crates/mcp-core/src/project_db/adapters/liquibase.rs`
+- `crates/mcp-core/src/project_db/adapters/mod.rs`
+- `crates/mcp-core/src/project_db/adapters/prisma.rs`
+- `crates/mcp-core/src/project_db/adapters/rails.rs`
+- `crates/mcp-core/src/project_db/adapters/sqlx_migrate.rs`
+- `crates/mcp-core/src/project_db/detector.rs`
+- `crates/mcp-core/src/project_db/exec.rs`
+- `crates/mcp-core/src/project_db/runner.rs`
+- `crates/mcp-core/src/project_db_routes.rs`
+- `crates/mcp-core/src/project_files.rs`
+- `crates/mcp-core/src/project_git.rs`
+- `crates/mcp-core/src/project_workspace/allocate_port.rs`
+- `crates/mcp-core/src/project_workspace/browser_check.rs`
+- `crates/mcp-core/src/project_workspace/changes.rs`
+- `crates/mcp-core/src/project_workspace/execute_cmd.rs`
+- `crates/mcp-core/src/project_workspace/fs_events.rs`
+- `crates/mcp-core/src/project_workspace/logs.rs`
+- `crates/mcp-core/src/project_workspace/mod.rs`
+- `crates/mcp-core/src/project_workspace/playwright_install.rs`
+- `crates/mcp-core/src/project_workspace/port_recovery.rs`
+- `crates/mcp-core/src/project_workspace/processes.rs`
+- `crates/mcp-core/src/project_workspace/run_configs.rs`
+- `crates/mcp-core/src/project_workspace/runtime_issues.rs`
+- `crates/mcp-core/src/project_workspace/scan_ports.rs`
+- `crates/mcp-core/src/project_workspace/services.rs`
+- `crates/mcp-core/src/project_workspace/sync_ports.rs`
+- `crates/mcp-core/src/project_workspace/wizard.rs`
+- `crates/mcp-core/src/project_workspace/workbench.rs`
+- `crates/mcp-core/src/projects/analyze.rs`
+- `crates/mcp-core/src/projects/cleanup.rs`
+- `crates/mcp-core/src/projects/clone.rs`
+- `crates/mcp-core/src/projects/crud.rs`
+- `crates/mcp-core/src/projects/custom_instructions.rs`
+- `crates/mcp-core/src/projects/deep_analyze.rs`
+- `crates/mcp-core/src/projects/deep_review.rs`
+- `crates/mcp-core/src/projects/file_watcher.rs`
+- `crates/mcp-core/src/projects/indexing.rs`
+- `crates/mcp-core/src/projects/mod.rs`
+- `crates/mcp-core/src/projects/quality.rs`
+- `crates/mcp-core/src/projects/terminal.rs`
+- `crates/mcp-core/src/prompt_templates.rs`
+- `crates/mcp-core/src/provider_cooldown.rs`
+- `crates/mcp-core/src/provider_health_probe.rs`
+- `crates/mcp-core/src/quality_guard.rs`
+- `crates/mcp-core/src/rag/chunker.rs`
+- `crates/mcp-core/src/rag/config.rs`
+- `crates/mcp-core/src/rag/indexer.rs`
+- `crates/mcp-core/src/rag/mod.rs`
+- `crates/mcp-core/src/rag/qdrant_client.rs`
+- `crates/mcp-core/src/rag/search.rs`
+- `crates/mcp-core/src/routing_config.rs`
+- `crates/mcp-core/src/routing_matrix.rs`
+- `crates/mcp-core/src/routing_matrix_auto_promoter.rs`
+- `crates/mcp-core/src/routing_slots.rs`
+- `crates/mcp-core/src/sandbox.rs`
+- `crates/mcp-core/src/security/api.rs`
+- `crates/mcp-core/src/security/audit.rs`
+- `crates/mcp-core/src/security/port_enforcer.rs`
+- `crates/mcp-core/src/services_watchdog.rs`
+- `crates/mcp-core/src/settings.rs`
+- `crates/mcp-core/src/task_watchdog.rs`
+- `crates/mcp-core/src/tool_runner_server.rs`
+- `crates/mcp-core/src/vector_memory.rs`
+- `crates/mcp-core/tests/agent_runs_endpoints.rs`
+- `crates/mcp-core/tests/agent_tools_safety.rs`
+- `crates/mcp-core/tests/m71_cost_breakdown.rs`
+- `crates/mcp-core/tests/orchestrator_db_schema.rs`
+- `crates/mcp-core/tests/postgres_app_isolation.rs`
+- `crates/mcp-core/tests/subagent_workflow.rs`
+- `docs/.nexus-vault/adr/0016-rag-pipeline-completion.md`
+- `docs/.nexus-vault/api/rest-endpoints.md`
+- `docs/.nexus-vault/api/settings-keys.md`
+- `docs/.nexus-vault/changelog/2026/2026-06-04-fix-rinomina-migrazione-indici-fk-0282-0285-conflitto-numerazione-con-migrazioni.md`
+- `docs/.nexus-vault/concepts/auto-fix-workflow.md`
+- `docs/.nexus-vault/concepts/change-drafter.md`
+- `docs/.nexus-vault/concepts/glossario.md`
+- `docs/.nexus-vault/concepts/isolamento-progetti.md`
+- `docs/.nexus-vault/concepts/knowledge-base-funzionamento.md`
+- `docs/.nexus-vault/concepts/meta-vault-architettura.md`
+- `docs/.nexus-vault/concepts/multi-provider-routing.md`
+- `docs/.nexus-vault/concepts/nexus-architetturale.md`
+- `docs/.nexus-vault/concepts/nexus-funzionale.md`
+- `docs/.nexus-vault/concepts/pattern-learning-worker.md`
+- `docs/.nexus-vault/concepts/pattern-mcp-tool.md`
+- `docs/.nexus-vault/concepts/sub-agents-claude-code.md`
+- `docs/.nexus-vault/schema/migrations-log.md`
+- `docs/.nexus-vault/schema/postgres-tables.md`
+- `docs/.nexus-vault/schema/qdrant-collections.md`
+
+## Cosa cambia
+
+refactor+style: modularizza nexus_tool_catalog + formattazione uniforme (audit fase 1)
+
+## Riferimenti
+
+- Vedi diff git: `git show f9041b2dbe81653f3ff9a090b24a702602b6840e`
+
+## Documenti correlati
+
+- [[crates-rust]]
+- [[rest-endpoints]]
+- [[qdrant-collections]]
+- [[knowledge-base-funzionamento]]
+- [[meta-vault-architettura]]
+- [[multi-provider-routing]]
+- [[routing-matrix]]
