@@ -439,26 +439,40 @@ async fn process_semantic(
     };
 
     for hit in hits {
-        // Self-skip (Qdrant include sempre se threshold permette).
-        if hit.point_id == doc.id.to_string() {
+        // `hit.point_id` e' l'id del punto Qdrant, che NON coincide sempre con
+        // `wiki_docs.id`: i worker run_summary/chat_note generano un UUID
+        // dedicato per il punto e lo salvano in `wiki_docs.qdrant_point_id`
+        // (solo il re-ingest del vault meta usa `point_id == doc.id`). Per
+        // mappare il punto al documento autorevole risolviamo sempre via
+        // `qdrant_point_id`; in fallback (dati storici allineati) accettiamo
+        // anche il match diretto su `id`.
+        // Self-skip: confronta con il point_id del doc sorgente, non con il suo id.
+        if doc
+            .qdrant_point_id
+            .as_deref()
+            .is_some_and(|p| p == hit.point_id)
+        {
             continue;
         }
-        let Ok(target_id) = Uuid::parse_str(&hit.point_id) else {
-            continue;
-        };
         // ACL semantica: il target deve essere visibile nello stesso scope del
         // sorgente OR essere meta public_read. Il payload Qdrant ha `scope` e
         // `project_id` ma per coerenza forte ricontrolliamo il DB (l'autorevole).
-        let target_meta: Option<(String, Option<Uuid>, bool)> = sqlx::query_as(
-            "SELECT scope, project_id, public_read FROM wiki_docs WHERE id = $1",
+        let target_meta: Option<(Uuid, String, Option<Uuid>, bool)> = sqlx::query_as(
+            "SELECT id, scope, project_id, public_read FROM wiki_docs \
+             WHERE qdrant_point_id = $1 OR id::text = $1 \
+             ORDER BY (qdrant_point_id = $1) DESC LIMIT 1",
         )
-        .bind(target_id)
+        .bind(&hit.point_id)
         .fetch_optional(db)
         .await
         .context("SELECT wiki_docs target semantic")?;
-        let Some((target_scope, target_pid, target_public)) = target_meta else {
+        let Some((target_id, target_scope, target_pid, target_public)) = target_meta else {
             continue;
         };
+        // Self-skip anche per id (caso point_id == doc.id sul re-ingest meta).
+        if target_id == doc.id {
+            continue;
+        }
 
         let allowed = match (doc.scope.as_str(), target_scope.as_str()) {
             // Stesso scope + stesso project (o entrambi meta).

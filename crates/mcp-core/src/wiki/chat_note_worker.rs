@@ -315,10 +315,21 @@ async fn ingest_message(
         content
     };
     let combined = format!("{title}\n\n{snippet}");
+    // Id documento fissato qui per usarlo come id del punto Qdrant: il contratto
+    // `wiki_docs.id == qdrant_point_id == payload.doc_id` e' richiesto dal link
+    // semantico (process_semantic). Su re-run riusiamo l'id esistente.
+    let doc_uuid: Uuid = sqlx::query_scalar(
+        "SELECT id FROM wiki_docs WHERE scope = 'project' AND project_id = $1 AND slug = $2",
+    )
+    .bind(project_id)
+    .bind(&slug)
+    .fetch_optional(&state.db)
+    .await
+    .context("SELECT id wiki_docs chat_note esistente")?
+    .unwrap_or_else(Uuid::new_v4);
     let qdrant_point_id: Option<String> =
         match state.orchestrator.neural.embed_text("", &combined).await {
             Ok(vector) => {
-                let doc_uuid = Uuid::new_v4();
                 let point_id = doc_uuid.to_string();
                 let payload = json!({
                     "scope": "project",
@@ -358,13 +369,13 @@ async fn ingest_message(
     sqlx::query(
         r#"
         INSERT INTO wiki_docs (
-            scope, project_id, slug, title, body_md, body_hash,
+            id, scope, project_id, slug, title, body_md, body_hash,
             kind, tags, qdrant_point_id, edited_by,
             edit_lock, protected_sections, manually_edited,
             generated_hash, edited_hash,
             current_version, auto_generated, public_read
         ) VALUES (
-            'project', $1, $2, $3, $4, $5,
+            $8, 'project', $1, $2, $3, $4, $5,
             'chat_note', $6, $7, 'chat_message',
             'none', '{}', FALSE,
             $5, NULL,
@@ -372,6 +383,7 @@ async fn ingest_message(
         )
         ON CONFLICT (scope, COALESCE(project_id::text,''), slug) DO UPDATE SET
             -- Aggiorna solo metadati: il body chat non cambia (i messaggi sono immutabili).
+            qdrant_point_id = COALESCE(wiki_docs.qdrant_point_id, EXCLUDED.qdrant_point_id),
             updated_at = NOW()
         "#,
     )
@@ -382,6 +394,7 @@ async fn ingest_message(
     .bind(&body_hash)
     .bind(&tags)
     .bind(qdrant_point_id.as_deref())
+    .bind(doc_uuid)
     .execute(&state.db)
     .await
     .context("INSERT wiki_docs chat_note")?;

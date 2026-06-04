@@ -333,10 +333,24 @@ async fn ingest_run(
         body_md.as_str()
     };
     let combined = format!("{title}\n\n{snippet}");
+    // L'id del documento viene fissato qui (non lasciato al DEFAULT della
+    // tabella) per poterlo usare come id del punto Qdrant. Mantenere
+    // `wiki_docs.id == qdrant_point_id == payload.doc_id` e' il contratto su
+    // cui si basa il link semantico (process_semantic risolve il target via
+    // questi campi). Su re-run (slug gia' presente) riusiamo l'id esistente,
+    // altrimenti ne generiamo uno nuovo.
+    let doc_uuid: Uuid = sqlx::query_scalar(
+        "SELECT id FROM wiki_docs WHERE scope = 'project' AND project_id = $1 AND slug = $2",
+    )
+    .bind(project_id)
+    .bind(&slug)
+    .fetch_optional(&state.db)
+    .await
+    .context("SELECT id wiki_docs run_summary esistente")?
+    .unwrap_or_else(Uuid::new_v4);
     let qdrant_point_id: Option<String> =
         match state.orchestrator.neural.embed_text("", &combined).await {
             Ok(vector) => {
-                let doc_uuid = Uuid::new_v4();
                 let point_id = doc_uuid.to_string();
                 let payload = json!({
                     "scope": "project",
@@ -382,13 +396,13 @@ async fn ingest_run(
     sqlx::query(
         r#"
         INSERT INTO wiki_docs (
-            scope, project_id, slug, title, body_md, body_hash,
+            id, scope, project_id, slug, title, body_md, body_hash,
             kind, tags, qdrant_point_id, edited_by,
             edit_lock, protected_sections, manually_edited,
             generated_hash, edited_hash,
             current_version, auto_generated, public_read
         ) VALUES (
-            'project', $1, $2, $3, $4, $5,
+            $8, 'project', $1, $2, $3, $4, $5,
             'run_summary', $6, $7, 'agent_run',
             'none', '{}', FALSE,
             $5, NULL,
@@ -409,6 +423,7 @@ async fn ingest_run(
     .bind(&body_hash)
     .bind(&tags)
     .bind(qdrant_point_id.as_deref())
+    .bind(doc_uuid)
     .execute(&state.db)
     .await
     .context("INSERT wiki_docs run_summary")?;
