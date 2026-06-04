@@ -21,6 +21,73 @@ use tokio::io::AsyncReadExt;
 const PLAYWRIGHT_DEFAULT_TIMEOUT: u64 = 600;
 const PLAYWRIGHT_MAX_TIMEOUT: u64 = 900;
 
+/// Pre-flight check: lancia `ldd` sul binary chromium-headless-shell di
+/// Playwright e raccoglie la lista delle librerie sistema marcate "not found".
+/// Ritorna `None` se tutto ok, `Some(libs)` con i nomi delle librerie mancanti.
+///
+/// Logica:
+/// - Risolve `$HOME/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell`
+///   (glob sulla versione installata: `1223`, futuro `1240`, ecc.).
+/// - Se il binary non esiste -> ritorna None (Playwright non installato; il
+///   check precedente has_playwright_nm gestisce gia' il caso).
+/// - Esegue `ldd <binary>`, parsa le righe "X => not found", restituisce la
+///   lista distinct (es. ["libnspr4.so", "libnss3.so", ...]).
+/// - Best-effort: errori ldd / glob falliti ritornano None (no falsi positivi).
+async fn preflight_check_chromium_libs() -> Option<Vec<String>> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let cache_root = format!("{home}/.cache/ms-playwright");
+    let entries = match tokio::fs::read_dir(&cache_root).await {
+        Ok(rd) => rd,
+        Err(_) => return None, // Playwright cache assente: non bloccare qui
+    };
+    let mut entries = entries;
+    let mut binary_path: Option<std::path::PathBuf> = None;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with("chromium_headless_shell-") {
+            let candidate = entry
+                .path()
+                .join("chrome-headless-shell-linux64")
+                .join("chrome-headless-shell");
+            if candidate.is_file() {
+                binary_path = Some(candidate);
+                break;
+            }
+        }
+    }
+    let binary = binary_path?;
+
+    let out = match tokio::process::Command::new("ldd")
+        .arg(&binary)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(_) => return None, // ldd assente sul sistema, skip check
+    };
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut missing: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        let l = line.trim();
+        if l.contains("=> not found") {
+            // Format tipo "    libnspr4.so => not found"
+            let lib = l.split("=>").next().unwrap_or("").trim().to_string();
+            if !lib.is_empty() && !missing.contains(&lib) {
+                missing.push(lib);
+            }
+        }
+    }
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing)
+    }
+}
+
 /// Porta preferita tra quelle allocate al progetto.
 /// Priorità: label "dev" > label "app" > label "http" > porta numericamente minore.
 fn pick_dev_port(allocations: &[(i32, String)]) -> Option<i32> {
@@ -342,6 +409,40 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
              Poi inizializza: run_command({{\"command\": \"npx playwright install --with-deps chromium\", \"working_dir\": \"app\"}}).",
             ctx.root_path.display()
         );
+    }
+
+    // ── 2bis. Pre-flight check librerie sistema chromium-headless-shell ──────
+    // Regola H: fail-fast esplicito se mancano libnss3/libnspr4/libasound2/...
+    // invece di lasciare playwright lanciare 13×3 launch falliti in 1ms ciascuno
+    // e produrre un job zombie running per minuti senza progresso (incident
+    // Beauty-Book chat 6: 6:49 min senza UPDATE, browser non avviato mai).
+    // Toggle via setting agent.testing.preflight_check_enabled (default true).
+    let preflight_enabled = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'agent.testing.preflight_check_enabled'",
+    )
+    .fetch_optional(&*ctx.db)
+    .await
+    .ok()
+    .flatten()
+    .map(|v| {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "off" | "no" | ""
+        )
+    })
+    .unwrap_or(true);
+
+    if preflight_enabled {
+        if let Some(missing) = preflight_check_chromium_libs().await {
+            return format!(
+                "[run_playwright_tests] BLOCKED — chromium-headless-shell non puo' avviarsi: {} librerie di sistema mancanti.\n\n\
+                Librerie not found dal binary: {}\n\n\
+                FIX:\n  sudo apt-get install -y libnspr4 libnss3 libnssutil3 libasound2t64 libxss1 libgbm1 libgtk-3-0 libpangocairo-1.0-0 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libxshmfence1\n\n\
+                Oppure: cd {} && npx playwright install-deps chromium\n\n\
+                Nessun processo Playwright e' stato lanciato. Una volta installate le librerie ritenta il run.",
+                missing.len(), missing.join(", "), root.display()
+            );
+        }
     }
 
     // ── 3. Leggi porte allocate al progetto dal DB ────────────────────────────

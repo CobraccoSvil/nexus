@@ -93,7 +93,10 @@ pub async fn tool_knowledge_search(ctx: &AgentToolContext, input: &Value) -> Str
                 })
             })
             .collect();
-        let total: i32 = clusters.iter().filter_map(|c| c.get("count").and_then(|v| v.as_i64())).sum::<i64>() as i32;
+        let total: i32 = clusters
+            .iter()
+            .filter_map(|c| c.get("count").and_then(|v| v.as_i64()))
+            .sum::<i64>() as i32;
         return json!({
             "mode": "summary",
             "clusters": clusters,

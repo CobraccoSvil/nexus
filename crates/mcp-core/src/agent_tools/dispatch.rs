@@ -1,0 +1,270 @@
+//! Dispatch centrale dei tool agente: mappa nome-tool -> handler.
+//!
+//! Estratto da mod.rs (refactor god-file). Nessun cambiamento di routing:
+//! stessi nomi tool mappati agli stessi handler.
+
+use serde_json::Value;
+
+use super::profile_tools::{tool_create_profile, tool_dispatch_subtask, tool_update_profile};
+use super::quality_tools::{tool_batch_analyze_code, tool_scan_code_quality};
+use super::semantic_tools::{
+    tool_recall_context, tool_search_codebase_semantic, tool_search_file_semantic,
+};
+use super::{
+    archive_tools, attachment_inspector, attachments, command, dev_diagnostics, dispatcher,
+    document_tools, figma_tools, files, git, knowledge, ports, project_db_query, rag_search,
+    sandbox, scaffold_verifier, service, shadcn_setup, subagent, testing, todos, vision_tools,
+    visual_compare, AgentToolContext,
+};
+
+/// Esegue un tool per conto dell'agente.
+/// Ritorna sempre una stringa: il risultato in caso di successo, o un messaggio d'errore.
+pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Value) -> String {
+    match name {
+        "read_file" => files::tool_read_file(ctx, input).await,
+        "read_file_lines" => files::tool_read_file_lines(ctx, input).await,
+        "write_file" => files::tool_write_file(ctx, input).await,
+        "list_files" => files::tool_list_files(ctx, input).await,
+        "search_in_files" => files::tool_search_in_files(ctx, input).await,
+        "git_status" => git::tool_git_status(ctx).await,
+        "git_stage" => git::tool_git_stage(ctx, input).await,
+        "git_commit" => git::tool_git_commit(ctx, input).await,
+        "git_push" => git::tool_git_push(ctx).await,
+        "git_pull" => git::tool_git_pull(ctx).await,
+        "git_remote_add" => git::tool_git_remote_add(ctx, input).await,
+        // Fix M51: tool dedicato per allocazione porta (evita curl via run_command).
+        "request_port" => ports::tool_request_port(ctx, input).await,
+        // PR-1 Plan/Act/Verify: emette/aggiorna la TODO list del planner.
+        "nexus_todo_write" => todos::tool_nexus_todo_write(ctx, input).await,
+        // PR-3 sub-agents: delega a un sub-agent isolato (riabilita ex M55).
+        "dispatch_subagent" => subagent::tool_dispatch_subagent(ctx, input).await,
+        // Comp.0/3b: batch parallelo di sub-agent (base del DAG scheduler).
+        "dispatch_subagents" => subagent::tool_dispatch_subagents(ctx, input).await,
+        // PR-3 sub-agents: poll + resume per background runs.
+        "nexus_subagent_poll" => subagent::tool_nexus_subagent_poll(ctx, input).await,
+        "nexus_subagent_resume" => subagent::tool_nexus_subagent_resume(ctx, input).await,
+        "run_in_terminal" => service::tool_run_service(ctx, input, "task").await,
+        "run_service" => service::tool_run_service(ctx, input, "service").await,
+        "read_terminal_output" => service::tool_read_service_output(ctx, input).await,
+        "read_service_output" => service::tool_read_service_output(ctx, input).await,
+        "stop_service" => service::tool_stop_service(ctx, input).await,
+        "service_restart" => service::tool_service_restart(ctx, input).await,
+        "tail_service_logs" => service::tool_tail_service_logs(ctx, input).await,
+        "list_active_services" => service::tool_list_active_services(ctx, input).await,
+        "fs_mkdir" => files::tool_fs_mkdir(ctx, input).await,
+        "fs_copy" => files::tool_fs_copy(ctx, input).await,
+        "fs_move" => files::tool_fs_move(ctx, input).await,
+        "run_specific_test" => testing::tool_run_specific_test(ctx, input).await,
+        "run_lint_fix" => testing::tool_run_lint_fix(ctx, input).await,
+        "format_file" => testing::tool_format_file(ctx, input).await,
+        "delete_file" => files::tool_delete_file(ctx, input).await,
+        "rename_file" => files::tool_rename_file(ctx, input).await,
+        "edit_file" => files::tool_edit_file(ctx, input).await,
+        "run_command" => command::tool_run_command(ctx, input).await,
+        "dispatch_subtask" => tool_dispatch_subtask(ctx.clone(), input.clone()).await,
+        "create_profile" => tool_create_profile(ctx, input).await,
+        "update_profile" => tool_update_profile(ctx, input).await,
+        "set_sandbox_config" => sandbox::tool_set_sandbox_config(ctx, input).await,
+        "get_sandbox_config" => sandbox::tool_get_sandbox_config(ctx).await,
+        "build_project_image" => service::tool_build_project_image(ctx).await,
+        "scan_code_quality" => tool_scan_code_quality(ctx, input).await,
+        "search_codebase_semantic" => {
+            let query = input
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let limit = input
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(8)
+                .min(20) as usize;
+            tool_search_codebase_semantic(ctx, &query, limit).await
+        }
+        "search_file_semantic" => {
+            let path = input
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let query = input
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let top_k = input
+                .get("top_k")
+                .and_then(Value::as_u64)
+                .unwrap_or(5)
+                .min(10) as usize;
+            let chunk_lines = input
+                .get("chunk_lines")
+                .and_then(Value::as_u64)
+                .unwrap_or(50)
+                .max(10)
+                .min(200) as usize;
+            tool_search_file_semantic(ctx, &path, &query, top_k, chunk_lines).await
+        }
+        "recall_context" => {
+            let query = input
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let source = input
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or("all")
+                .to_string();
+            let limit = input
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(5)
+                .min(10) as usize;
+            tool_recall_context(ctx, &query, &source, limit).await
+        }
+        "run_playwright_tests" => testing::tool_run_playwright_tests(ctx, input).await,
+        "batch_analyze_code" => tool_batch_analyze_code(ctx, input).await,
+        // ── Dispatcher centrale (pilotaggio pannelli) ──────────────────────
+        "dispatcher_emit_event" => dispatcher::tool_dispatcher_emit_event(ctx, input).await,
+        "dispatcher_post_notification" => {
+            dispatcher::tool_dispatcher_post_notification(ctx, input).await
+        }
+        "dispatcher_set_flag" => dispatcher::tool_dispatcher_set_flag(ctx, input).await,
+        "dispatcher_update_monitor" => dispatcher::tool_dispatcher_update_monitor(ctx, input).await,
+        "dispatcher_highlight_panel" => {
+            dispatcher::tool_dispatcher_highlight_panel(ctx, input).await
+        }
+        // ── Knowledge Base per-progetto ────────────────────────────────────
+        "knowledge_search" => knowledge::tool_knowledge_search(ctx, input).await,
+        "code_doc" => knowledge::tool_code_doc(ctx, input).await,
+        "knowledge_get_note" => knowledge::tool_knowledge_get_note(ctx, input).await,
+        "knowledge_create_note" => knowledge::tool_knowledge_create_note(ctx, input).await,
+        // Comp.0: navigazione/modifica del grafo KB (link, sottografo, pertinenza)
+        "knowledge_get_links" => knowledge::tool_knowledge_get_links(ctx, input).await,
+        "knowledge_get_subgraph" => knowledge::tool_knowledge_get_subgraph(ctx, input).await,
+        "knowledge_create_link" => knowledge::tool_knowledge_create_link(ctx, input).await,
+        "knowledge_set_relevance" => knowledge::tool_knowledge_set_relevance(ctx, input).await,
+        // Comp.2: import di grafi esterni nella KB (JSON node-link / Mermaid / DOT)
+        "knowledge_import_graph" => knowledge::tool_knowledge_import_graph(ctx, input).await,
+        // ── Allegati chat (ADR 0010) ───────────────────────────────────────
+        "nexus_list_attachments" => attachments::tool_nexus_list_attachments(ctx, input).await,
+        "nexus_read_attachment" => attachments::tool_nexus_read_attachment(ctx, input).await,
+        // ── Ingestion intelligente allegati (ADR 0011) ─────────────────────
+        "nexus_inspect_attachment" => {
+            attachment_inspector::tool_nexus_inspect_attachment(ctx, input).await
+        }
+        "nexus_list_archive_entries" => {
+            archive_tools::tool_nexus_list_archive_entries(ctx, input).await
+        }
+        "nexus_read_archive_entry" => {
+            archive_tools::tool_nexus_read_archive_entry(ctx, input).await
+        }
+        "nexus_extract_pdf_text" => document_tools::tool_nexus_extract_pdf_text(ctx, input).await,
+        "nexus_extract_docx_text" => document_tools::tool_nexus_extract_docx_text(ctx, input).await,
+        "nexus_extract_xlsx_data" => document_tools::tool_nexus_extract_xlsx_data(ctx, input).await,
+        "nexus_extract_figma_structure" => {
+            figma_tools::tool_nexus_extract_figma_structure(ctx, input).await
+        }
+        "nexus_extract_figma_code" => figma_tools::tool_nexus_extract_figma_code(ctx, input).await,
+        "nexus_describe_image_attachment" => {
+            vision_tools::tool_nexus_describe_image_attachment(ctx, input).await
+        }
+        "nexus_install_shadcn_components" => {
+            shadcn_setup::tool_nexus_install_shadcn_components(ctx, input).await
+        }
+        "nexus_dev_server_diagnose" => {
+            dev_diagnostics::tool_nexus_dev_server_diagnose(ctx, input).await
+        }
+        "nexus_verify_scaffold" => scaffold_verifier::tool_nexus_verify_scaffold(ctx, input).await,
+        "nexus_db_query" => project_db_query::tool_nexus_db_query(ctx, input).await,
+        "nexus_db_tables" => project_db_query::tool_nexus_db_tables(ctx, input).await,
+        "nexus_db_describe" => project_db_query::tool_nexus_db_describe(ctx, input).await,
+        // FASE 2 "resa Figma Make": verifica visiva (screenshot vs design).
+        "nexus_visual_compare" => visual_compare::tool_nexus_visual_compare(ctx, input).await,
+        "nexus_search_semantic" => rag_search::tool_nexus_search_semantic(ctx, input).await,
+        // ── Nexus Builtin tool (prefisso nexus_*) ──────────────────────────
+        // Dispatch verso nexus_builtin::execute_with_neural per usare
+        // la ricerca semantica quando neural è disponibile (Qdrant).
+        // Caso speciale: nexus_mcp_tool_call con server_id="builtin" reindirizza
+        // ricorsivamente a execute_agent_tool, consentendo al modello di
+        // invocare via mcp_tool_call qualsiasi tool builtin (es. quelli
+        // suggeriti da next_action_recommended di nexus_inspect_attachment)
+        // senza doverli avere in toolspec. Sistema lazy discovery preservato.
+        "nexus_mcp_tool_call" => {
+            let server_id = input
+                .get("server_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if server_id.eq_ignore_ascii_case("builtin")
+                || server_id == "00000000-0000-0000-0000-000000000000"
+            {
+                let inner_tool = input
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if inner_tool.is_empty() {
+                    return serde_json::json!({
+                        "error": "tool_name richiesto per nexus_mcp_tool_call con server_id=builtin"
+                    })
+                    .to_string();
+                }
+                if inner_tool == "nexus_mcp_tool_call" {
+                    return serde_json::json!({
+                        "error": "ricorsione builtin -> builtin non permessa"
+                    })
+                    .to_string();
+                }
+                let inner_args = input
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                return Box::pin(execute_agent_tool(ctx, inner_tool, &inner_args)).await;
+            }
+            crate::nexus_builtin::execute_with_neural(
+                &ctx.db,
+                ctx.user_id,
+                ctx.project_id,
+                &ctx.user_role,
+                &ctx.neural,
+                "nexus_mcp_tool_call",
+                input.clone(),
+            )
+            .await
+        }
+        other if other.starts_with("nexus_") => {
+            crate::nexus_builtin::execute_with_neural(
+                &ctx.db,
+                ctx.user_id,
+                ctx.project_id,
+                &ctx.user_role,
+                &ctx.neural,
+                other,
+                input.clone(),
+            )
+            .await
+        }
+        other => {
+            // Suggerisci il tool corretto in base al nome errato chiamato
+            let hint = match other {
+                "mcp" | "execute" | "shell" | "bash" | "cmd" | "exec" | "terminal" | "command" =>
+                    " Per eseguire comandi shell usa il tool `run_command` con il parametro `command`. Es: run_command({\"command\": \"which dotnet\"}).",
+                "install" | "apt" | "brew" | "pip" | "npm_install" | "cargo_install" =>
+                    " Per installare pacchetti usa `run_command` con il comando appropriato. Es: run_command({\"command\": \"sudo apt-get install -y <pacchetto>\"}).",
+                "read" | "open" | "cat" | "file_read" =>
+                    " Per leggere file usa `read_file` (parametro: path) oppure `read_file_lines` (parametri: path, start_line, end_line).",
+                "write" | "save" | "file_write" =>
+                    " Per scrivere file usa `write_file` (parametri: path, content) oppure `edit_file` per modifiche parziali.",
+                "search" | "grep" | "find" =>
+                    " Per cercare testo usa `search_in_files` (parametri: query, path). Per cercare file usa `list_files`.",
+                "git" | "git_cmd" | "git_command" =>
+                    " Per operazioni Git usa i tool dedicati: `git_status`, `git_stage`, `git_commit`, `git_push`, `git_pull`.",
+                _ =>
+                    " Controlla la lista dei tool disponibili. Se hai bisogno di eseguire comandi shell usa `run_command`.",
+            };
+            format!("❌ Tool '{other}' non esiste.{hint}")
+        }
+    }
+}

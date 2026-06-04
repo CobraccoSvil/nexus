@@ -1,0 +1,273 @@
+//! Tool agente di analisi qualita codice: scan singolo/progetto e batch.
+//!
+//! Estratto da mod.rs (refactor god-file).
+
+use serde_json::Value;
+use sqlx::Row;
+
+use super::AgentToolContext;
+
+pub(super) async fn tool_scan_code_quality(ctx: &AgentToolContext, input: &Value) -> String {
+    let file_path = input.get("file_path").and_then(Value::as_str);
+    let severity_filter = input
+        .get("severity_filter")
+        .and_then(Value::as_str)
+        .unwrap_or("all");
+
+    if let Some(rel_path) = file_path {
+        // Single file analysis
+        let full_path = ctx.root_path.join(rel_path);
+        let content = match tokio::fs::read_to_string(&full_path).await {
+            Ok(c) => c,
+            Err(e) => return format!("Errore lettura file: {}", e),
+        };
+
+        if rel_path.ends_with(".sql") {
+            let db_report = mcp_db::analyze_query(&content);
+            let findings: Vec<String> = db_report
+                .findings
+                .iter()
+                .map(|f| {
+                    format!(
+                        "[{}][{}] {} -- {}",
+                        f.severity.to_uppercase(),
+                        f.category,
+                        f.title,
+                        f.detail
+                    )
+                })
+                .collect();
+            if findings.is_empty() {
+                return format!("Nessun problema trovato in `{}`", rel_path);
+            }
+            return format!("Analisi SQL `{}`:\n{}", rel_path, findings.join("\n"));
+        }
+
+        let report = mcp_quality::analyze_source(rel_path, &content);
+
+        let filtered: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| match severity_filter {
+                "high" => f.severity == "high",
+                "medium" => f.severity == "high" || f.severity == "medium",
+                _ => true,
+            })
+            .collect();
+
+        if filtered.is_empty() {
+            return format!(
+                "Nessun problema trovato in `{}` (filtro: {})",
+                rel_path, severity_filter
+            );
+        }
+
+        let lines: Vec<String> = filtered
+            .iter()
+            .map(|f| {
+                let loc = f.line.map(|l| format!(":{}", l)).unwrap_or_default();
+                format!(
+                    "[{}][{}] {}{} -- {}",
+                    f.severity.to_uppercase(),
+                    f.category,
+                    rel_path,
+                    loc,
+                    f.title
+                )
+            })
+            .collect();
+
+        format!("Analisi `{}`:\n{}\n\nMetriche: {} righe totali, complessità max: {}, lunghezza media funzioni: {:.0}",
+            rel_path, lines.join("\n"),
+            report.metrics.total_lines, report.metrics.max_complexity, report.metrics.avg_function_length)
+    } else {
+        // Full project scan: read from DB if available
+        let rows = sqlx::query(
+            "SELECT file_path, category, severity, title, line_number \
+             FROM project_quality_findings WHERE project_id = $1 AND fixed_at IS NULL \
+             ORDER BY CASE severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END \
+             LIMIT 30",
+        )
+        .bind(ctx.project_id)
+        .fetch_all(&*ctx.db)
+        .await;
+
+        match rows {
+            Ok(rows) if !rows.is_empty() => {
+                let lines: Vec<String> = rows.iter().map(|r| {
+                    let fp: String = r.try_get("file_path").unwrap_or_default();
+                    let cat: String = r.try_get("category").unwrap_or_default();
+                    let sev: String = r.try_get("severity").unwrap_or_default();
+                    let title: String = r.try_get("title").unwrap_or_default();
+                    let line: Option<i32> = r.try_get("line_number").ok().flatten();
+                    let loc = line.map(|l| format!(":{}", l)).unwrap_or_default();
+                    format!("[{}][{}] {}{} -- {}", sev.to_uppercase(), cat, fp, loc, title)
+                }).collect();
+                format!("Top findings del progetto (da ultimo scan):\n{}\n\nUsa scan_code_quality(file_path) per analizzare un file specifico.", lines.join("\n"))
+            }
+            _ => {
+                "Nessun dato di qualità disponibile. Esegui prima una scansione completa dal pannello Ottimizzazione, oppure specifica un file_path per analizzare un file singolo.".to_string()
+            }
+        }
+    }
+}
+
+pub(super) async fn tool_batch_analyze_code(ctx: &AgentToolContext, input: &Value) -> String {
+    let task = input
+        .get("task")
+        .and_then(Value::as_str)
+        .unwrap_or("analyze");
+    let files_arr = match input.get("files").and_then(Value::as_array) {
+        Some(a) => a.clone(),
+        None => return "[batch_analyze_code] Campo 'files' mancante o non è un array".to_string(),
+    };
+    if files_arr.is_empty() {
+        return "[batch_analyze_code] Nessun file specificato".to_string();
+    }
+    if files_arr.len() > 20 {
+        return "[batch_analyze_code] Massimo 20 file per batch".to_string();
+    }
+
+    let system_prompt = match task {
+        "document" => "Sei un esperto di documentazione tecnica. Analizza il codice e genera commenti/docstring chiari e concisi in italiano. Concentrati sul WHY, non sul WHAT.",
+        "optimize" => "Sei un esperto di ottimizzazione del codice. Identifica problemi di performance, complessità eccessiva, codice duplicato e suggerisci refactoring concreti.",
+        _ => "Sei un esperto di revisione del codice. Identifica bug potenziali, problemi di sicurezza, violazioni di pattern architetturali e punti di miglioramento.",
+    };
+
+    // Leggi il contenuto dei file non forniti
+    let mut requests: Vec<serde_json::Value> = Vec::new();
+    for (i, file_obj) in files_arr.iter().enumerate() {
+        let path_str = match file_obj.get("path").and_then(Value::as_str) {
+            Some(p) => p.to_string(),
+            None => continue,
+        };
+        let content = if let Some(c) = file_obj
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            c.to_string()
+        } else {
+            // Leggi il file dalla root del progetto
+            let abs_path = ctx.root_path.join(&path_str);
+            match tokio::fs::read_to_string(&abs_path).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        "batch_analyze_code: impossibile leggere {}: {}",
+                        path_str,
+                        e
+                    );
+                    format!("[Errore lettura file: {e}]")
+                }
+            }
+        };
+        requests.push(serde_json::json!({
+            "custom_id": format!("file-{}", i),
+            "system": system_prompt,
+            "prompt": format!("File: {}\n\n```\n{}\n```\n\nEsegui il task '{}' su questo file.", path_str, &content[..content.len().min(32000)], task),
+        }));
+    }
+
+    if requests.is_empty() {
+        return "[batch_analyze_code] Nessun file valido trovato".to_string();
+    }
+
+    let brain_http_url =
+        std::env::var("BRAIN_HTTP_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+    let client = reqwest::Client::new();
+
+    // Sottomette il batch
+    let submit_resp = match client
+        .post(format!("{brain_http_url}/batch-analyze/submit"))
+        .json(&serde_json::json!({ "requests": requests }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return format!("[batch_analyze_code] Errore sottomissione batch: {e}"),
+    };
+    let batch_id = match submit_resp.json::<serde_json::Value>().await {
+        Ok(v) => match v.get("batch_id").and_then(Value::as_str) {
+            Some(id) => id.to_string(),
+            None => return format!("[batch_analyze_code] Risposta batch non valida: {v}"),
+        },
+        Err(e) => return format!("[batch_analyze_code] Errore parsing risposta submit: {e}"),
+    };
+
+    // Poll con backoff esponenziale (max 10 minuti)
+    let mut wait_secs = 2u64;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+        wait_secs = (wait_secs * 2).min(60);
+
+        let status_resp = match client
+            .get(format!("{brain_http_url}/batch-analyze/{batch_id}/status"))
+            .send()
+            .await
+            .and_then(|r| Ok(r))
+        {
+            Ok(r) => r,
+            Err(e) => return format!("[batch_analyze_code] Errore polling status: {e}"),
+        };
+        let status_json = match status_resp.json::<serde_json::Value>().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let processing_status = status_json
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if processing_status == "ended" {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return format!(
+                "[batch_analyze_code] Timeout: il batch {} non ha terminato in 10 minuti",
+                batch_id
+            );
+        }
+    }
+
+    // Recupera i risultati
+    let results_resp = match client
+        .get(format!("{brain_http_url}/batch-analyze/{batch_id}/results"))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return format!("[batch_analyze_code] Errore recupero risultati: {e}"),
+    };
+    let results: Vec<serde_json::Value> = match results_resp.json().await {
+        Ok(v) => v,
+        Err(e) => return format!("[batch_analyze_code] Errore parsing risultati: {e}"),
+    };
+
+    // Formatta output
+    let mut output_parts: Vec<String> = Vec::new();
+    for (i, file_obj) in files_arr.iter().enumerate() {
+        let path_str = file_obj.get("path").and_then(Value::as_str).unwrap_or("?");
+        let custom_id = format!("file-{i}");
+        if let Some(result) = results
+            .iter()
+            .find(|r| r.get("custom_id").and_then(Value::as_str) == Some(&custom_id))
+        {
+            if let Some(content) = result.get("content").and_then(Value::as_str) {
+                output_parts.push(format!("### {path_str}\n\n{content}"));
+            } else if let Some(err) = result.get("error").and_then(Value::as_str) {
+                output_parts.push(format!("### {path_str}\n\n[Errore: {err}]"));
+            }
+        }
+    }
+
+    if output_parts.is_empty() {
+        format!("[batch_analyze_code] Nessun risultato per il batch {batch_id}")
+    } else {
+        format!(
+            "## Analisi batch ({task}) — {} file\n\n{}",
+            output_parts.len(),
+            output_parts.join("\n\n---\n\n")
+        )
+    }
+}
