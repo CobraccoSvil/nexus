@@ -170,7 +170,14 @@ pub const AGENT_ACT_FIRST_SUFFIX: &str = r#"
   • `dispatcher_emit_event(kind, resource, payload)` — emette un evento custom sul bus eventi del progetto.
   • `dispatcher_highlight_panel(panel, duration_ms)` — flash animation su un pannello IDE (playwright|database|services|monitor|...).
   ATTENZIONE: questi sono tool function call come write_file o read_file. Chiamali direttamente come tool — NON eseguirli con run_command.
-  Usali proattivamente: quando avvii una build setta build_in_progress=true, quando finisce settalo a false. Quando lanci test setta test_running=true. Posta notifica quando completi un task importante.
+  PROTOCOLLO MONITOR (OBBLIGATORIO per ogni operazione che dura piu' di pochi secondi o ha piu' fasi: build, test, scan qualita', deploy, install dipendenze, migrazioni DB, refactor multi-file, generazione/analisi batch):
+    1. ALL'INIZIO: apri un monitor di progresso e, se pertinente, un flag di stato.
+       Es: dispatcher_set_flag("build_in_progress", true); dispatcher_update_monitor("build_progress", 0, "Compilazione").
+    2. DURANTE: aggiorna lo STESSO monitor_id agli stadi chiave (non a ogni micro-passo).
+       Es: dispatcher_update_monitor("tests", "12/40", "Test in corso"); dispatcher_update_monitor("scan_critical", 3, "Issue critiche").
+    3. ALLA FINE: porta il monitor al valore finale, azzera il flag e posta UNA notifica di esito.
+       Es: dispatcher_update_monitor("build_progress", 100, "Build OK"); dispatcher_set_flag("build_in_progress", false); dispatcher_post_notification("success", "Build completata").
+  Riusa lo stesso monitor_id per aggiornare la stessa card (non crearne uno nuovo a ogni step). Niente monitor per azioni istantanee: servono a dare all'utente visibilita' real-time su operazioni lunghe, non a fare rumore. Se l'operazione fallisce: monitor al valore di errore + dispatcher_post_notification("error", ...).
 === FINE REGOLE ===
 "#;
 
