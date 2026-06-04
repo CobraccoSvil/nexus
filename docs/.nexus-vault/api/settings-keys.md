@@ -6,12 +6,12 @@ slug: settings-keys
 tags:
   - api
   - settings
-source_commit: d5e5b1c8e40e9ba551b1b5820b0ffa6d547b22ac
+source_commit: c5aeabb28cfd0186984ea494be6e8fc993e365a2
 source_files:
   - db/migrations/
 auto_generated: true
 created_at: 2026-05-23T07:20:00Z
-updated_at: 2026-06-04T10:26:52Z
+updated_at: 2026-06-04T11:31:37Z
 nexus_meta_version: 1
 ---
 
@@ -68,6 +68,10 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.context.system_prompt_summary_max_tokens` | `800` | Lunghezza massima (token) del summary che sostituisce il blocco offloadato. L'agente recupera i dettagli con nexus_search_semantic(source_kinds=system_context). |
 | `agent.context.tokenizer` | `cl100k_base` | Tokenizer per stima token (tiktoken). Valori: cl100k_base (default, accurato per Claude/GPT/Mistral), o200k_base (GPT-4o), p50k_base (legacy). |
 | `agent.context_window_ttl_seconds` | `120` | TTL cache context window per modello (H-35) |
+| `agent.continuation.auto_restart_enabled` | `true` | Se true, quando un turno chiude con end_turn ma final_answer matcha pattern di continuazione (sto procedendo / I'll proceed) senza marker di completamento, Nexus rilancia automaticamente l'agente con il follow_up_prompt. Solo se automation_mode in (automatic, continuous) e supervisor_mode in (continuous, every_step, on_anomaly). Default true. |
+| `agent.continuation.follow_up_prompt` | `Hai dichiarato di voler proseguire ma hai chiuso il turno...` | Prompt iniettato come messaggio utente nel turno auto-restartato. Spiega al modello che deve agire (NON narrare) e fornisce il marker esplicito da usare per dichiarare il completamento (TASK COMPLETATO). |
+| `agent.continuation.max_auto_restarts` | `3` | Limite di auto-restart consecutivi per lo stesso run (evita loop infiniti su modelli ostinati). Default 3. |
+| `agent.continuation.min_promise_recency_chars` | `200` | Lunghezza (caratteri) della coda del final_answer in cui cercare i pattern di continuazione. Una promessa in mezzo al testo seguita da azioni finali NON conta. Default 200. |
 | `agent.ctx_mgmt_ttl_seconds` | `60` | TTL cache context management (H-34) |
 | `agent.db_query_timeout_seconds` | `5` | Timeout query DB nei nodi agente (H-39, H-44) |
 | `agent.dev_diagnostics.max_findings` | `50` | Max findings per nexus_dev_server_diagnose (H-70 a) |
@@ -630,7 +634,7 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `default_model` | `claude-sonnet-4-6` | Default model for chat |
 | `default_provider` | `anthropic` | Default LLM provider |
 | `max_token_budget` | `32000` | Maximum token budget allowed |
-| `model_catalog_last_sync` | `2026-06-04T09:39:38.002498224+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
+| `model_catalog_last_sync` | `2026-06-04T10:30:02.608640429+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
 | `nexus_active_routing_pct` | `50` | Percentuale di richieste chat gestite dal router Q-Learning Nexus (0=off, 100=tutto). A/B testing: imposta 10-50 per un rollout graduale. |
 | `nexus_behavior_mode` | `dinamico` | Modalità comportamento Nexus: veloce|economica|bilanciata|approfondita |
 | `provider_hierarchy` | `anthropic,openai,google,deepseek,mistral` | Ordered fallback chain for chat providers |
@@ -719,4 +723,4 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 
 ---
 
-**Totale chiavi**: 517
+**Totale chiavi**: 521
