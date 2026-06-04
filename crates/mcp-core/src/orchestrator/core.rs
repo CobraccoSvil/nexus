@@ -490,8 +490,10 @@ impl Orchestrator {
 
         // Capability del modello risolto dal catalog. None = modello assente
         // (problema di sync, gestito conservativamente dalla funzione pura).
-        let supports: Option<bool> = sqlx::query_scalar::<_, bool>(
-            "SELECT supports_tool_use FROM ai_price_catalog \
+        // Leggiamo anche is_thinking: un modello thinking (anche se
+        // supports_tool_use=true) non regge il tool-forcing agentico (mig 0317).
+        let caps: Option<(bool, bool)> = sqlx::query_as::<_, (bool, bool)>(
+            "SELECT supports_tool_use, is_thinking FROM ai_price_catalog \
              WHERE provider = $1 AND model = $2 LIMIT 1",
         )
         .bind(&*provider)
@@ -500,8 +502,10 @@ impl Orchestrator {
         .await
         .ok()
         .flatten();
+        let supports: Option<bool> = caps.map(|(s, _)| s);
+        let is_thinking: Option<bool> = caps.map(|(_, t)| t);
 
-        match decide_tool_capability_gate(intent, gate_enabled, supports) {
+        match decide_tool_capability_gate(intent, gate_enabled, supports, is_thinking) {
             ToolCapabilityGate::KeepOriginal => {}
             ToolCapabilityGate::NeedsFallback => {
                 // Tier/capability dell'intent dalla cache (mig 0110), stessi
