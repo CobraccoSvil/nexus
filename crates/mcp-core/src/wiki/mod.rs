@@ -16,8 +16,11 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub mod acl;
+pub mod chat_note_worker;
+pub mod code_graph;
 pub mod internal;
 pub mod links_worker;
+pub mod run_summary_worker;
 pub mod model;
 pub mod redirects;
 pub mod reingest;
@@ -27,3 +30,4 @@ pub mod search;
 pub mod storage;
 pub mod triple_extractor;
 pub mod vault;
+pub mod watcher;

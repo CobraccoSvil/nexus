@@ -194,12 +194,11 @@ pub async fn send_chat_message(
     );
 
     // ── Hook: auto-creazione nota Knowledge Base ───────────────────────────
-    // ADR 0017 v2 F8: la pipeline `knowledge::create_note_from_user_message`
-    // (auto-classificazione intent + INSERT su `project_knowledge_notes` +
-    // embedding + vault push) e' stata rimossa col modulo `knowledge/`. Va
-    // reimplementata su `wiki_docs` (scope=project) + `wiki_content` come
-    // worker dedicato (vedi `wiki::reingest` per il pattern). Per ora il
-    // turno chat NON popola piu' la KB automaticamente.
+    // ADR 0017 v2 TODO 6: il worker `wiki::chat_note_worker` (avviato in
+    // main.rs, intervallo 30s default) scansiona periodicamente i messaggi
+    // utente e li ingesta in `wiki_docs` (scope=project, kind='chat_note').
+    // Il flag `chat_messages.kb_ingested` (mig 0303) garantisce idempotenza.
+    // Niente inline qui per non rallentare il path di risposta chat.
 
     // ── Rilevamento cambio modello esplicito ────────────────────────────────
     // Se il messaggio è un comando "usa mistral / cambia a claude / ecc." e
@@ -574,10 +573,11 @@ pub async fn send_chat_message(
                         )
                         .await;
 
-                        // ADR 0017 v2 F8: `knowledge::ingest_run::ingest_run_summary_to_kb`
-                        // rimosso col modulo `knowledge/`. L'ingestione
-                        // automatica del resoconto run nella KB va
-                        // reimplementata su `wiki_docs` + `wiki_content`.
+                        // ADR 0017 v2 TODO 7: il worker
+                        // `wiki::run_summary_worker` (avviato in main.rs,
+                        // intervallo 60s default) ingesta i run terminali in
+                        // `wiki_docs` (scope=project, kind='run_summary').
+                        // Idempotenza via `agent_runs.kb_ingested` (mig 0304).
                         let _ = (
                             &db_clone2,
                             &neural2,

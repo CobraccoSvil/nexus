@@ -240,6 +240,44 @@ fn collect_markdown_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// Reingest di un singolo file (API pubblica usata dal watcher).
+///
+/// `abs_path` deve essere assoluto. `vault_root` e' la radice del vault dello
+/// scope (`docs/.nexus-vault/` per meta, `<repo>/.nexus-vault/` per project)
+/// e serve solo a calcolare il `vault_file_path` relativo memorizzato nel DB.
+/// Se `abs_path` non e' figlio di `vault_root`, viene comunque accettato e
+/// il rel_path coincide con `abs_path` (best-effort).
+///
+/// Errori del filesystem o di DB risalgono; lo skip silenzioso (slug vuoto,
+/// estensione non `.md`) ritorna `Ok(false)`.
+pub async fn reingest_path(
+    state: &AppState,
+    scope: WikiScope,
+    project_id: Option<Uuid>,
+    abs_path: &Path,
+    vault_root: &Path,
+) -> Result<bool> {
+    // Filtra subito i file non .md: il watcher puo' triggerare su qualunque
+    // file della cartella; vogliamo essere robusti.
+    if abs_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| !e.eq_ignore_ascii_case("md"))
+        .unwrap_or(true)
+    {
+        return Ok(false);
+    }
+    if !abs_path.is_file() {
+        return Ok(false);
+    }
+    let rel_path = abs_path
+        .strip_prefix(vault_root)
+        .unwrap_or(abs_path)
+        .to_string_lossy()
+        .to_string();
+    ingest_one_file(state, scope, project_id, abs_path, &rel_path).await
+}
+
 /// Ingest di un singolo file. Ritorna `Ok(true)` se la riga e' stata creata o
 /// aggiornata in DB, `Ok(false)` se il file e' stato saltato (frontmatter
 /// invalido, slug vuoto, ecc.).

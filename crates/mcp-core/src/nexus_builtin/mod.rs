@@ -1510,10 +1510,31 @@ async fn handle_open_file_in_editor(db: &PgPool, project_id: Uuid, arguments: &V
     .to_string()
 }
 
-/// M13.2 — nexus_impact_brief: dato un seed (file modificati), ritorna impact
-/// set strutturale + note KB pertinenti + test che lo coprono. Consultivo.
-/// arguments: { "paths": ["src/a.rs", ...] } oppure { "path": "src/a.rs" }.
+/// M13.2 — nexus_impact_brief: dato un seed (file modificati o doc id), ritorna
+/// l'impact set semantico: dipendenze outbound (cosa richiede questo doc),
+/// dipendenze inbound (chi dipende da questo doc) e concept liberi citati,
+/// ricostruito dalle `wiki_concept_triples` (ADR 0017 v2 F5 — triple extractor).
+///
+/// arguments:
+///   - { "doc_id": "<uuid>" }  — modalita' diretta su un doc gia' noto;
+///   - { "paths": ["src/a.rs", ...] } oppure { "path": "src/a.rs" } —
+///     modalita' "by-path": risolve i seed in `wiki_docs` matchando
+///     `vault_file_path` o `tags`/`title` su qualunque scope visibile al progetto
+///     corrente (scope=project con project_id corrente oppure scope=meta).
+///
+/// L'output e' un array `briefs` (uno per seed), ciascuno con `depends_on`,
+/// `impacts` e `concepts_mentioned` ordinati per confidence DESC. Soglia di
+/// confidence minima: 0.6 (best practice ADR 0017). Predicati di dipendenza:
+/// `depends_on`, `implements`, `tests`, `refines`, `blocks`, `blocked_by`.
 async fn handle_impact_brief(db: &PgPool, project_id: Uuid, arguments: &Value) -> String {
+    // ── Risoluzione seed ──────────────────────────────────────────────────
+    let mut seed_doc_ids: Vec<Uuid> = Vec::new();
+    if let Some(s) = arguments.get("doc_id").and_then(|v| v.as_str()) {
+        if let Ok(id) = Uuid::parse_str(s.trim()) {
+            seed_doc_ids.push(id);
+        }
+    }
+
     let mut seed_paths: Vec<String> = Vec::new();
     if let Some(arr) = arguments.get("paths").and_then(|v| v.as_array()) {
         for v in arr {
@@ -1529,23 +1550,186 @@ async fn handle_impact_brief(db: &PgPool, project_id: Uuid, arguments: &Value) -
             seed_paths.push(p.to_string());
         }
     }
-    if seed_paths.is_empty() {
+
+    if seed_doc_ids.is_empty() && seed_paths.is_empty() {
         return json!({
-            "error": "nexus_impact_brief richiede 'paths' (array) o 'path' (stringa) con i file seed."
+            "error": "nexus_impact_brief richiede 'doc_id' (UUID) oppure 'paths' (array) / 'path' (stringa)."
         })
         .to_string();
     }
-    // ADR 0017 v2 F8: `knowledge::impact::impact_brief` rimosso assieme al
-    // modulo `knowledge/`. La feature "impact analysis" basata su grafo
-    // codice (`code_graph`) non e' stata reimplementata sul nuovo schema
-    // `wiki_docs`/`wiki_concept_triples` e va riprogettata. Per evitare
-    // confondere l'agente con dati arbitrari, ritorniamo un payload
-    // esplicito che ne segnala la dismissione.
-    let _ = (db, project_id, seed_paths);
+
+    // Predicati di dipendenza per filtraggio (CHECK in mig 0295).
+    const DEP_PREDICATES: &[&str] = &[
+        "depends_on",
+        "implements",
+        "tests",
+        "refines",
+        "blocks",
+        "blocked_by",
+    ];
+    const MIN_CONFIDENCE: f32 = 0.6;
+
+    // ── Path -> doc_id resolution (best effort, scope progetto + meta) ────
+    for path in &seed_paths {
+        let resolved: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM wiki_docs \
+             WHERE (project_id = $1 OR scope = 'meta') \
+               AND (vault_file_path = $2 \
+                    OR vault_file_path LIKE $3 \
+                    OR title = $2)",
+        )
+        .bind(project_id)
+        .bind(path)
+        .bind(format!("%{path}"))
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+        for id in resolved {
+            if !seed_doc_ids.contains(&id) {
+                seed_doc_ids.push(id);
+            }
+        }
+    }
+
+    if seed_doc_ids.is_empty() {
+        return json!({
+            "ok": true,
+            "briefs": Vec::<Value>::new(),
+            "message": "Nessun documento KB trovato per i seed forniti (vault_file_path/title senza match nello scope corrente)."
+        })
+        .to_string();
+    }
+
+    // ── Per ogni seed, costruisce il brief ────────────────────────────────
+    let mut briefs: Vec<Value> = Vec::with_capacity(seed_doc_ids.len());
+    for doc_id in &seed_doc_ids {
+        // Header doc: usato come "self" nel payload.
+        let header: Option<(String, String, String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT title, slug, scope, project_id FROM wiki_docs WHERE id = $1",
+        )
+        .bind(doc_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+        let Some((title, slug, scope, doc_project_id)) = header else {
+            briefs.push(json!({
+                "doc_id": doc_id.to_string(),
+                "error": "documento non trovato",
+            }));
+            continue;
+        };
+
+        // Outbound: cosa questo doc dipende da (`obj_doc_id` -> altro doc).
+        let dep_rows: Vec<(String, String, Uuid, f32)> = sqlx::query_as(
+            "SELECT t.predicate, d.title, d.id, t.confidence \
+             FROM wiki_concept_triples t \
+             JOIN wiki_docs d ON d.id = t.obj_doc_id \
+             WHERE t.subj_doc_id = $1 \
+               AND t.predicate = ANY($2) \
+               AND t.confidence >= $3 \
+             ORDER BY t.confidence DESC \
+             LIMIT 20",
+        )
+        .bind(doc_id)
+        .bind(DEP_PREDICATES)
+        .bind(MIN_CONFIDENCE)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+        let depends_on: Vec<Value> = dep_rows
+            .into_iter()
+            .map(|(predicate, t_title, t_id, conf)| {
+                json!({
+                    "predicate": predicate,
+                    "doc_id": t_id.to_string(),
+                    "title": t_title,
+                    "confidence": conf,
+                })
+            })
+            .collect();
+
+        // Inbound: chi dipende da questo doc.
+        let imp_rows: Vec<(String, String, Uuid, f32)> = sqlx::query_as(
+            "SELECT t.predicate, d.title, d.id, t.confidence \
+             FROM wiki_concept_triples t \
+             JOIN wiki_docs d ON d.id = t.subj_doc_id \
+             WHERE t.obj_doc_id = $1 \
+               AND t.predicate = ANY($2) \
+               AND t.confidence >= $3 \
+             ORDER BY t.confidence DESC \
+             LIMIT 20",
+        )
+        .bind(doc_id)
+        .bind(DEP_PREDICATES)
+        .bind(MIN_CONFIDENCE)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+        let impacts: Vec<Value> = imp_rows
+            .into_iter()
+            .map(|(predicate, t_title, t_id, conf)| {
+                json!({
+                    "predicate": predicate,
+                    "doc_id": t_id.to_string(),
+                    "title": t_title,
+                    "confidence": conf,
+                })
+            })
+            .collect();
+
+        // Concept liberi (obj_text non null) -- predicate qualsiasi.
+        let concept_rows: Vec<(String, String, f32)> = sqlx::query_as(
+            "SELECT predicate, obj_text, confidence \
+             FROM wiki_concept_triples \
+             WHERE subj_doc_id = $1 \
+               AND obj_text IS NOT NULL \
+               AND confidence >= $2 \
+             ORDER BY confidence DESC \
+             LIMIT 20",
+        )
+        .bind(doc_id)
+        .bind(MIN_CONFIDENCE)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+        let concepts_mentioned: Vec<Value> = concept_rows
+            .into_iter()
+            .map(|(predicate, obj_text, conf)| {
+                json!({
+                    "predicate": predicate,
+                    "concept": obj_text,
+                    "confidence": conf,
+                })
+            })
+            .collect();
+
+        briefs.push(json!({
+            "doc_id": doc_id.to_string(),
+            "title": title,
+            "slug": slug,
+            "scope": scope,
+            "project_id": doc_project_id,
+            "depends_on": depends_on,
+            "impacts": impacts,
+            "concepts_mentioned": concepts_mentioned,
+            "counts": {
+                "depends_on": depends_on.len(),
+                "impacts": impacts.len(),
+                "concepts_mentioned": concepts_mentioned.len(),
+            }
+        }));
+    }
+
     json!({
-        "deprecated": true,
-        "reason": "impact_brief rimosso in ADR 0017 F8 (knowledge/impact). \
-                   Da reimplementare sul knowledge graph unificato.",
+        "ok": true,
+        "briefs": briefs,
+        "seeds": {
+            "doc_ids": seed_doc_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+            "paths": seed_paths,
+        },
+        "min_confidence": MIN_CONFIDENCE,
+        "predicates": DEP_PREDICATES,
     })
     .to_string()
 }

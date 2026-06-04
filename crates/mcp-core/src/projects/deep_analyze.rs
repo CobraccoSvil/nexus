@@ -401,21 +401,32 @@ pub async fn deep_analyze_project(
             duration_ms
         );
 
-        // ADR 0017 v2 F8: `knowledge::seed_knowledge_from_insights` rimosso
-        // assieme al modulo `knowledge/`. Lo "seeding" automatico della KB
-        // dagli insights di deep-analyze va reimplementato come INSERT diretto
-        // su `wiki_docs` (scope=project) con embedding `wiki_content`. Per
-        // ora il deep-analyze produce solo `project_insights` come prima,
-        // ma non popola piu' note nel grafo.
-        let _ = (
-            db,
-            neural,
-            project_id,
-            insights_payload,
-            repo_root_str,
-            project_channels,
-            status_str.clone(),
-        );
+        // ADR 0017 v2 TODO 4 — seed knowledge da insights deep-analyze.
+        // Reimplementazione su `wiki_docs` (scope=project, kind='insight')
+        // con embedding upsert in collection unificata `wiki_content`. Solo
+        // sui run completati con successo (lo status_str == 'completed'):
+        // sui run falliti il payload e' tipicamente vuoto/parziale.
+        if status_str == "completed" {
+            let neural_for_seed = neural.clone();
+            let db_for_seed = db.clone();
+            if let Err(e) = seed_insights_to_wiki(
+                &db_for_seed,
+                &neural_for_seed,
+                project_id,
+                run_id,
+                &insights_payload,
+            )
+            .await
+            {
+                tracing::warn!(
+                    project_id = %project_id,
+                    run_id = run_id,
+                    error = %e,
+                    "deep_analyze: seed insights su wiki_docs fallito (best-effort)"
+                );
+            }
+        }
+        let _ = (repo_root_str, project_channels);
     });
 
     // Risposta immediata 202 Accepted con run_id per polling client-side
@@ -492,5 +503,317 @@ pub async fn get_project_insights(
             })))
         }
         None => Ok(Json(json!({ "exists": false }))),
+    }
+}
+
+// ── ADR 0017 v2 TODO 4 — seed insights -> wiki_docs ──────────────────────────
+//
+// Materializza il payload `insights` del deep-analyzer in uno o piu' documenti
+// `wiki_docs` (scope=project, kind='insight'). Strategia:
+//
+//   1. Se il payload e' un oggetto con chiave `findings` / `insights` / `items`
+//      contenente un array di oggetti -> uno wiki_doc per item.
+//   2. Altrimenti un singolo wiki_doc "riepilogo" per run, body=JSON pretty.
+//
+// Idempotenza: lo slug e' deterministico (`insight-{run_id}` o
+// `insight-{run_id}-{i}`) e usiamo ON CONFLICT DO UPDATE sull'indice unico
+// `uq_wiki_docs_slug (scope, project_id, slug)`. Rieseguire la stessa
+// analisi sullo stesso run aggiorna i doc esistenti senza duplicare.
+//
+// Embedding + upsert Qdrant: best-effort (best practice ADR 0017 v2). Se il
+// brain e' down il doc resta in DB senza `qdrant_point_id`.
+async fn seed_insights_to_wiki(
+    db: &PgPool,
+    neural: &crate::orchestrator::NeuralCoreClient,
+    project_id: Uuid,
+    run_id: i64,
+    insights: &Value,
+) -> anyhow::Result<()> {
+    let items = extract_insight_items(insights);
+    if items.is_empty() {
+        tracing::debug!(
+            project_id = %project_id,
+            run_id = run_id,
+            "deep_analyze.seed: nessun item da seedare (payload vuoto o non strutturato)"
+        );
+        return Ok(());
+    }
+
+    let mut seeded = 0usize;
+    for (idx, item) in items.iter().enumerate() {
+        let slug = if items.len() == 1 {
+            format!("insight-run-{run_id}")
+        } else {
+            format!("insight-run-{run_id}-{idx:02}")
+        };
+        let title = item
+            .title
+            .clone()
+            .unwrap_or_else(|| format!("Insight run #{run_id}"));
+        let body_md = item.body_md.clone();
+
+        // Tag base + tag per file rilevati (usati per facet search).
+        let mut tags: Vec<String> = vec!["insight".to_string(), "deep-analyze".to_string()];
+        if let Some(category) = &item.category {
+            tags.push(category.clone());
+        }
+        for fp in &item.file_paths {
+            tags.push(format!("file:{fp}"));
+        }
+        // dedup stabile
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        tags.retain(|t| seen.insert(t.clone()));
+
+        // Embed + upsert Qdrant (best-effort).
+        let snippet = if body_md.len() > 2000 {
+            &body_md[..2000]
+        } else {
+            body_md.as_str()
+        };
+        let combined = format!("{title}\n\n{snippet}");
+        let qdrant_point_id: Option<String> = match neural.embed_text("", &combined).await {
+            Ok(vector) => {
+                let doc_uuid = Uuid::new_v4();
+                let point_id = doc_uuid.to_string();
+                let payload = json!({
+                    "scope": "project",
+                    "project_id": project_id.to_string(),
+                    "doc_id": point_id,
+                    "title": title,
+                    "kind": "insight",
+                    "intent": item.category.clone().unwrap_or_default(),
+                });
+                match vector_memory::upsert_wiki_content_point(db, &point_id, vector, payload).await
+                {
+                    Ok(_) => Some(point_id),
+                    Err(e) => {
+                        tracing::debug!(
+                            slug = %slug,
+                            error = %e,
+                            "deep_analyze.seed: upsert Qdrant fallito (proseguo)"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    slug = %slug,
+                    error = %e,
+                    "deep_analyze.seed: embed_text fallito (proseguo senza vector)"
+                );
+                None
+            }
+        };
+
+        let body_hash = crate::wiki::vault::sha256_hex(&body_md);
+        let res = sqlx::query(
+            r#"
+            INSERT INTO wiki_docs (
+                scope, project_id, slug, title, body_md, body_hash,
+                kind, intent, tags, qdrant_point_id,
+                edit_lock, protected_sections, manually_edited,
+                generated_hash, edited_hash,
+                current_version, auto_generated, public_read
+            ) VALUES (
+                'project', $1, $2, $3, $4, $5,
+                'insight', $6, $7, $8,
+                'none', '{}', FALSE,
+                $5, NULL,
+                1, TRUE, FALSE
+            )
+            ON CONFLICT (scope, COALESCE(project_id::text,''), slug) DO UPDATE SET
+                title           = EXCLUDED.title,
+                body_md         = EXCLUDED.body_md,
+                body_hash       = EXCLUDED.body_hash,
+                tags            = EXCLUDED.tags,
+                qdrant_point_id = COALESCE(EXCLUDED.qdrant_point_id, wiki_docs.qdrant_point_id),
+                generated_hash  = CASE
+                                    WHEN wiki_docs.manually_edited THEN wiki_docs.generated_hash
+                                    ELSE EXCLUDED.body_hash
+                                  END,
+                updated_at      = NOW()
+            "#,
+        )
+        .bind(project_id)
+        .bind(&slug)
+        .bind(&title)
+        .bind(&body_md)
+        .bind(&body_hash)
+        .bind(item.category.as_deref())
+        .bind(&tags)
+        .bind(qdrant_point_id.as_deref())
+        .execute(db)
+        .await;
+
+        match res {
+            Ok(_) => {
+                seeded += 1;
+                tracing::info!(
+                    project_id = %project_id,
+                    run_id = run_id,
+                    slug = %slug,
+                    "wiki.deep_analyze: insight seedato come wiki_doc"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    run_id = run_id,
+                    slug = %slug,
+                    error = %e,
+                    "deep_analyze.seed: INSERT wiki_docs fallito"
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        project_id = %project_id,
+        run_id = run_id,
+        seeded,
+        total = items.len(),
+        "deep_analyze.seed: completato"
+    );
+    Ok(())
+}
+
+/// Item normalizzato estratto dal payload insights (categorie LLM-agnostiche).
+#[derive(Debug, Default, Clone)]
+struct InsightItem {
+    title: Option<String>,
+    body_md: String,
+    category: Option<String>,
+    file_paths: Vec<String>,
+}
+
+/// Estrazione robusta degli "insight items" dal payload del brain. Il formato
+/// concreto puo' variare (il prompt del project-analyzer e' DB-driven); qui
+/// supportiamo le forme piu' comuni:
+///
+///   - { findings: [ {title, summary|description, category|kind, files: [..]} , ... ] }
+///   - { insights: [ ... ] }
+///   - { items: [ ... ] }
+///   - oggetto top-level con campi 'summary', 'overview', ecc. -> singolo item
+///   - tutto il resto -> singolo item con body = JSON pretty
+fn extract_insight_items(insights: &Value) -> Vec<InsightItem> {
+    // 1) Cerca array in keys note.
+    for key in ["findings", "insights", "items", "results"] {
+        if let Some(arr) = insights.get(key).and_then(|v| v.as_array()) {
+            let items: Vec<InsightItem> = arr
+                .iter()
+                .filter_map(|el| el.as_object().map(parse_insight_object))
+                .filter(|it| !it.body_md.trim().is_empty())
+                .collect();
+            if !items.is_empty() {
+                return items;
+            }
+        }
+    }
+
+    // 2) Se il payload e' un oggetto top-level con `summary` o `overview` lo
+    //    trasformiamo in un singolo item descrittivo.
+    if let Some(obj) = insights.as_object() {
+        // Vuoto -> niente da seedare.
+        if obj.is_empty() {
+            return Vec::new();
+        }
+        let title = obj
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let body = obj
+            .get("summary")
+            .or_else(|| obj.get("overview"))
+            .or_else(|| obj.get("description"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                // Fallback: dump JSON intero come body markdown.
+                format!(
+                    "```json\n{}\n```",
+                    serde_json::to_string_pretty(insights).unwrap_or_default()
+                )
+            });
+        if body.trim().is_empty() {
+            return Vec::new();
+        }
+        return vec![InsightItem {
+            title,
+            body_md: body,
+            category: obj
+                .get("category")
+                .or_else(|| obj.get("kind"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            file_paths: Vec::new(),
+        }];
+    }
+
+    Vec::new()
+}
+
+fn parse_insight_object(obj: &serde_json::Map<String, Value>) -> InsightItem {
+    let title = obj
+        .get("title")
+        .or_else(|| obj.get("name"))
+        .or_else(|| obj.get("headline"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let body_md = obj
+        .get("body_md")
+        .or_else(|| obj.get("body"))
+        .or_else(|| obj.get("description"))
+        .or_else(|| obj.get("summary"))
+        .or_else(|| obj.get("text"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            // Se non c'e' un campo testuale, dump JSON dell'item.
+            format!(
+                "```json\n{}\n```",
+                serde_json::to_string_pretty(&Value::Object(obj.clone())).unwrap_or_default()
+            )
+        });
+
+    let category = obj
+        .get("category")
+        .or_else(|| obj.get("kind"))
+        .or_else(|| obj.get("type"))
+        .or_else(|| obj.get("severity"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let mut file_paths: Vec<String> = Vec::new();
+    for key in ["files", "file_paths", "evidence_files", "paths"] {
+        if let Some(arr) = obj.get(key).and_then(|v| v.as_array()) {
+            for el in arr {
+                if let Some(s) = el.as_str() {
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        file_paths.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    // Singolo path in chiave `file`.
+    if let Some(s) = obj.get("file").and_then(|v| v.as_str()) {
+        let s = s.trim();
+        if !s.is_empty() {
+            file_paths.push(s.to_string());
+        }
+    }
+    file_paths.sort();
+    file_paths.dedup();
+
+    InsightItem {
+        title,
+        body_md,
+        category,
+        file_paths,
     }
 }

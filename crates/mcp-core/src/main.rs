@@ -741,6 +741,22 @@ async fn main() -> anyhow::Result<()> {
     // rispettando i cap diurni configurati in settings.
     wiki::triple_extractor::start_triple_extractor_worker(state.clone());
 
+    // ── ADR 0017 v2 TODO 1 — watcher bidirezionale vault->DB ──────────────
+    // Osserva `docs/.nexus-vault/` e `<project_root>/.nexus-vault/` per i
+    // progetti registrati al boot. Su evento Create/Modify di un file `.md`
+    // chiama `wiki::reingest::reingest_path`. Settings DB-driven (mig 0301).
+    // TODO: i progetti registrati post-startup vengono osservati solo dopo un
+    // restart di mcp-core (vedi nota in `wiki::watcher`).
+    wiki::watcher::start_wiki_watcher(std::sync::Arc::new(state.clone()));
+
+    // ── ADR 0017 v2 TODO 6+7 — chat-note + run-summary worker ─────────────
+    // Due loop periodici (delay iniziale rispettivamente 60s e 90s) che
+    // ingestano i messaggi chat utente e i resoconti dei run terminali come
+    // wiki_docs (kind='chat_note' / 'run_summary'). Settings DB-driven sotto
+    // chiave `agent.wiki.chat_note_*` e `agent.wiki.run_summary_*` (mig 0305).
+    wiki::chat_note_worker::start_chat_note_worker(std::sync::Arc::new(state.clone()));
+    wiki::run_summary_worker::start_run_summary_worker(std::sync::Arc::new(state.clone()));
+
     // ── PR hardening: avvio writer audit centralizzato + port enforcer ───
     // Audit writer: consuma il canale `record_audit(...)` e fa batch INSERT
     // in `nexus_resource_audit` ogni 100 eventi o 5s.

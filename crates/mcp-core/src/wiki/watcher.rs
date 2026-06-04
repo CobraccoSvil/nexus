@@ -1,0 +1,402 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// wiki/watcher.rs — Watcher bidirezionale vault -> DB (ADR 0017 v2 TODO 1).
+//
+// Quando un utente modifica un file `.md` direttamente in:
+//   - `docs/.nexus-vault/` (meta-vault Nexus)
+//   - `<project_root>/.nexus-vault/` (vault per progetto)
+//
+// questo worker osserva il filesystem via `notify` (inotify su Linux), debouncea
+// gli eventi e chiama `wiki::reingest::reingest_path` per il singolo file. Cosi'
+// l'editing diretto da Obsidian/CLI si propaga su `wiki_docs` + Qdrant senza
+// passare dalla UI.
+//
+// Settings DB-driven (mig 0301):
+//   - agent.wiki.watcher_enabled            (default true)
+//   - agent.wiki.watcher_debounce_ms        (default 500)
+//   - agent.wiki.watcher_poll_interval_secs (default 60)
+//
+// TODO post-MVP: hot-reload dei progetti. Attualmente lo snapshot dei progetti
+// e' calcolato una sola volta all'avvio; nuovi progetti registrati post-startup
+// (o `.nexus-vault/` creati dopo il primo scan) richiedono il restart di
+// mcp-core per essere osservati. Un loop di rescan periodico ridurrebbe la
+// finestra ma non e' implementato qui per non complicare il path: notify
+// supporta `watcher.watch(path, ...)` runtime ma serve riconciliare lo stato
+// con la lista corrente.
+// ═══════════════════════════════════════════════════════════════════════════
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use notify::{Event, EventKind, RecursiveMode, Watcher};
+use sqlx::PgPool;
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+use crate::wiki::model::WikiScope;
+use crate::wiki::reingest::reingest_path;
+use crate::wiki::vault::vault_root_for_scope;
+use crate::AppState;
+
+/// Settings caricate al boot (con safe defaults se il DB non li ha ancora).
+#[derive(Debug, Clone, Copy)]
+struct WatcherSettings {
+    enabled: bool,
+    debounce_ms: u64,
+}
+
+impl WatcherSettings {
+    const fn safe_defaults() -> Self {
+        Self {
+            enabled: true,
+            debounce_ms: 500,
+        }
+    }
+}
+
+async fn load_settings(db: &PgPool) -> WatcherSettings {
+    let mut out = WatcherSettings::safe_defaults();
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT key, value FROM settings WHERE key IN \
+         ('agent.wiki.watcher_enabled','agent.wiki.watcher_debounce_ms')",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    for (k, v) in rows {
+        match k.as_str() {
+            "agent.wiki.watcher_enabled" => {
+                out.enabled = !matches!(v.trim().to_lowercase().as_str(), "false" | "0" | "off");
+            }
+            "agent.wiki.watcher_debounce_ms" => {
+                if let Ok(n) = v.trim().parse::<u64>() {
+                    if (50..=10_000).contains(&n) {
+                        out.debounce_ms = n;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Mappatura di una root osservata al suo scope + project_id.
+#[derive(Debug, Clone)]
+struct WatchedRoot {
+    path: PathBuf,
+    scope: WikiScope,
+    project_id: Option<Uuid>,
+}
+
+/// Risolve `path` (assoluto, da evento notify) verso una delle root osservate.
+/// Ritorna la root proprietaria col path piu' lungo che e' prefisso (per
+/// gestire correttamente vault innestati, sebbene improbabili).
+fn resolve_root<'a>(path: &Path, roots: &'a [WatchedRoot]) -> Option<&'a WatchedRoot> {
+    let mut best: Option<&WatchedRoot> = None;
+    for r in roots {
+        if path.starts_with(&r.path) {
+            match best {
+                None => best = Some(r),
+                Some(prev) if r.path.as_os_str().len() > prev.path.as_os_str().len() => {
+                    best = Some(r)
+                }
+                _ => {}
+            }
+        }
+    }
+    best
+}
+
+/// Avvia il watcher in background. Idempotente: chiamata multipla, ignora le
+/// successive (gate sul flag in `AppState.watching_projects` rifratto in una
+/// const dedicata? Per ora il chiamante deve invocarla una volta sola in main).
+pub fn start_wiki_watcher(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        if let Err(e) = run(state).await {
+            tracing::error!(error = %e, "wiki.watcher: terminato con errore");
+        }
+    });
+}
+
+async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
+    let settings = load_settings(&state.db).await;
+    if !settings.enabled {
+        tracing::info!("wiki.watcher: disabilitato via settings, no-op");
+        return Ok(());
+    }
+
+    // ── Costruzione lista root da osservare ──────────────────────────────
+    let mut roots: Vec<WatchedRoot> = Vec::new();
+
+    // Meta-vault (sempre, se directory esiste).
+    match vault_root_for_scope(&state, WikiScope::Meta, None).await {
+        Ok(p) => {
+            let path = PathBuf::from(&p);
+            if path.is_dir() {
+                roots.push(WatchedRoot {
+                    path,
+                    scope: WikiScope::Meta,
+                    project_id: None,
+                });
+            } else {
+                tracing::warn!(path = %p, "wiki.watcher: vault meta non esiste, skip");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "wiki.watcher: vault_root_for_scope(meta) fallito");
+        }
+    }
+
+    // Vault per progetto.
+    let project_rows: Vec<(Uuid, Option<String>)> = sqlx::query_as::<_, (Uuid, Option<String>)>(
+        "SELECT id, repository_root_path FROM projects \
+         WHERE repository_root_path IS NOT NULL AND repository_root_path <> ''",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    for (pid, _root) in project_rows {
+        match vault_root_for_scope(&state, WikiScope::Project, Some(pid)).await {
+            Ok(p) => {
+                let path = PathBuf::from(&p);
+                if path.is_dir() {
+                    roots.push(WatchedRoot {
+                        path,
+                        scope: WikiScope::Project,
+                        project_id: Some(pid),
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::debug!(project_id = %pid, error = %e, "wiki.watcher: vault_root_for_scope(project) skip");
+            }
+        }
+    }
+
+    if roots.is_empty() {
+        tracing::info!("wiki.watcher: nessuna root da osservare, exit");
+        return Ok(());
+    }
+
+    // ── Avvio notify watcher ─────────────────────────────────────────────
+    let (tx, mut rx) = mpsc::channel::<notify::Result<Event>>(1024);
+    let tx_sync = tx.clone();
+    let mut watcher = notify::recommended_watcher(move |res| {
+        let _ = tx_sync.blocking_send(res);
+    })?;
+
+    for r in &roots {
+        match watcher.watch(&r.path, RecursiveMode::Recursive) {
+            Ok(_) => tracing::info!(
+                scope = r.scope.as_str(),
+                project_id = ?r.project_id,
+                path = %r.path.display(),
+                "wiki.watcher: avviato"
+            ),
+            Err(e) => tracing::warn!(
+                scope = r.scope.as_str(),
+                path = %r.path.display(),
+                error = %e,
+                "wiki.watcher: watch fallita su root"
+            ),
+        }
+    }
+
+    // ── Loop di debounce ──────────────────────────────────────────────────
+    // Buffer di path pendenti -> ultimo Instant in cui sono stati toccati.
+    // Quando passa `debounce_ms` senza nuovi eventi, flush.
+    let debounce = Duration::from_millis(settings.debounce_ms);
+    let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
+
+    loop {
+        // Calcola il prossimo deadline = min(pending.values) + debounce.
+        let timeout = pending
+            .values()
+            .min()
+            .copied()
+            .map(|earliest| {
+                let target = earliest + debounce;
+                let now = Instant::now();
+                if target > now {
+                    target - now
+                } else {
+                    Duration::ZERO
+                }
+            })
+            // Se non c'e' niente in coda, dormiamo "molto" (1h) — la recv ci
+            // sveglia al prossimo evento.
+            .unwrap_or_else(|| Duration::from_secs(3600));
+
+        tokio::select! {
+            maybe_event = rx.recv() => {
+                match maybe_event {
+                    None => break, // canale chiuso (shutdown)
+                    Some(Ok(event)) => {
+                        enqueue_event(&mut pending, &event);
+                    }
+                    Some(Err(e)) => {
+                        tracing::debug!(error = %e, "wiki.watcher: notify error");
+                    }
+                }
+            }
+            _ = tokio::time::sleep(timeout) => {
+                if !pending.is_empty() {
+                    flush(&state, &roots, &mut pending, debounce).await;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Aggiunge i path dell'evento al buffer (solo .md, solo Create/Modify).
+fn enqueue_event(pending: &mut HashMap<PathBuf, Instant>, event: &Event) {
+    match &event.kind {
+        EventKind::Create(_) => {}
+        EventKind::Modify(notify::event::ModifyKind::Data(_)) => {}
+        EventKind::Modify(notify::event::ModifyKind::Any) => {}
+        EventKind::Modify(notify::event::ModifyKind::Name(_)) => {}
+        _ => return,
+    }
+    let now = Instant::now();
+    for p in &event.paths {
+        if p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("md"))
+            .unwrap_or(false)
+        {
+            // Salta cartelle escluse (best-effort: `.git`, `.obsidian`, `node_modules`).
+            let lossy = p.to_string_lossy();
+            if lossy.contains("/.git/")
+                || lossy.contains("/.obsidian/")
+                || lossy.contains("/node_modules/")
+                || lossy.contains("/target/")
+            {
+                continue;
+            }
+            pending.insert(p.clone(), now);
+        }
+    }
+}
+
+/// Esegue il reingest dei path il cui ultimo evento e' piu' vecchio di
+/// `debounce`. I path piu' freschi restano in coda per il prossimo giro.
+async fn flush(
+    state: &Arc<AppState>,
+    roots: &[WatchedRoot],
+    pending: &mut HashMap<PathBuf, Instant>,
+    debounce: Duration,
+) {
+    let now = Instant::now();
+    let ready: Vec<PathBuf> = pending
+        .iter()
+        .filter_map(|(p, t)| {
+            if now.duration_since(*t) >= debounce {
+                Some(p.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for p in &ready {
+        pending.remove(p);
+    }
+
+    for abs_path in ready {
+        let Some(root) = resolve_root(&abs_path, roots) else {
+            tracing::debug!(path = %abs_path.display(), "wiki.watcher: nessuna root proprietaria, skip");
+            continue;
+        };
+        let started = Instant::now();
+        match reingest_path(state, root.scope, root.project_id, &abs_path, &root.path).await {
+            Ok(true) => {
+                tracing::info!(
+                    scope = root.scope.as_str(),
+                    project_id = ?root.project_id,
+                    path = %abs_path.display(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "wiki.reingest: doc aggiornato (watcher)"
+                );
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    path = %abs_path.display(),
+                    "wiki.watcher: file ignorato dal reingest (skip)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %abs_path.display(),
+                    error = %e,
+                    "wiki.watcher: reingest fallito"
+                );
+            }
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Tests
+// ───────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_root_picks_longest_prefix() {
+        let roots = vec![
+            WatchedRoot {
+                path: PathBuf::from("/tmp/a"),
+                scope: WikiScope::Meta,
+                project_id: None,
+            },
+            WatchedRoot {
+                path: PathBuf::from("/tmp/a/sub"),
+                scope: WikiScope::Project,
+                project_id: Some(Uuid::nil()),
+            },
+        ];
+        let r = resolve_root(Path::new("/tmp/a/sub/file.md"), &roots).unwrap();
+        assert_eq!(r.path, PathBuf::from("/tmp/a/sub"));
+        let r2 = resolve_root(Path::new("/tmp/a/other.md"), &roots).unwrap();
+        assert_eq!(r2.path, PathBuf::from("/tmp/a"));
+        assert!(resolve_root(Path::new("/elsewhere/x.md"), &roots).is_none());
+    }
+
+    #[test]
+    fn enqueue_event_filters_non_md_and_excluded() {
+        let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![
+                PathBuf::from("/tmp/vault/a.md"),
+                PathBuf::from("/tmp/vault/b.txt"),
+                PathBuf::from("/tmp/vault/.git/c.md"),
+                PathBuf::from("/tmp/vault/sub/.obsidian/d.md"),
+            ],
+            attrs: Default::default(),
+        };
+        enqueue_event(&mut pending, &event);
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key(&PathBuf::from("/tmp/vault/a.md")));
+    }
+
+    #[test]
+    fn enqueue_event_ignores_non_create_modify() {
+        let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
+        let event = Event {
+            kind: EventKind::Access(notify::event::AccessKind::Read),
+            paths: vec![PathBuf::from("/tmp/vault/a.md")],
+            attrs: Default::default(),
+        };
+        enqueue_event(&mut pending, &event);
+        assert!(pending.is_empty());
+    }
+}
