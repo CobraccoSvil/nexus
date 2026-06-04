@@ -244,6 +244,12 @@ def _intake_gate(state: AgentState, user_msg: str, cfg: dict) -> dict | None:
     try:
         decision = _routing_client.purpose_model(purpose="intake_gate")
         provider, model = decision.provider, decision.model
+        # Sentinella gate (ADR 0020): __router_unavailable__ o
+        # __no_capable_provider__ (purpose su provider in cooldown). Niente
+        # provider valido -> skip enrichment invece di chiamare un provider morto.
+        if not provider or provider.startswith("__"):
+            logger.debug("intake_gate: nessun provider disponibile (%s), skip", provider)
+            return {"relation": "nuova", "related": None, "candidates": results}
     except Exception as exc:
         logger.debug("intake_gate: purpose_model fallito (%s)", exc)
         return {"relation": "nuova", "related": None, "candidates": results}
@@ -669,6 +675,11 @@ async def clarify_or_expand_node(state: AgentState) -> dict[str, Any]:
     try:
         decision = _routing_client.purpose_model(purpose="clarify_expand")
         provider, model = decision.provider, decision.model
+        # Sentinella gate (ADR 0020): nessun provider disponibile (irraggiungibile
+        # o purpose su provider in cooldown) -> skip invece di chiamare un morto.
+        if not provider or provider.startswith("__"):
+            logger.info("clarify_or_expand: nessun provider disponibile (%s), skip", provider)
+            return {}
         logger.info("clarify_or_expand: purpose_model -> %s/%s", provider, model)
     except Exception as exc:
         logger.warning("clarify_or_expand: purpose_model fallito (%s), skip", exc)

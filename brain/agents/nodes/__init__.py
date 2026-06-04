@@ -1623,6 +1623,23 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                     "Verifica che mcp-core sia attivo e la migrazione 0102 sia applicata."
                 ) from e
 
+        # Sentinella gate (ADR 0020): la risoluzione automatica (route_model o
+        # purpose_model) puo' ritornare __no_capable_provider__ quando TUTTI i
+        # provider capable sono in cooldown billing/quota, o __router_unavailable__
+        # se il gate e' giu'. NON proseguire chiamando un provider morto: fermarsi
+        # con errore chiaro (no blocco silenzioso). Lo sticky/override utente,
+        # risolto sopra, non passa mai di qui (e' una scelta esplicita, vincolante).
+        if provider in ("__no_capable_provider__", "__router_unavailable__") or model in (
+            "__no_capable_provider__",
+            "__router_unavailable__",
+        ):
+            raise RuntimeError(
+                "Nessun provider AI disponibile (tutti i provider capable sono in "
+                f"cooldown billing/quota oppure il gate di routing non risponde): "
+                f"provider={provider}. Il run si ferma invece di ritentare provider morti "
+                "(ADR 0020). Riprova quando un provider torna disponibile."
+            )
+
     logger.info(
         "executor_node: provider=%s model=%s intent=%s tools=%d",
         provider, model, intent, len(tools_json),
@@ -2159,6 +2176,21 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 fallback_provider: str | None = None
                 fallback_model: str | None = None
 
+                # Cooldown gate (ADR 0020): se il provider corrente e' in
+                # cooldown billing/quota secondo il gate Rust (fonte unica),
+                # NON tentare la catena intra-provider (Tier 1) che resterebbe
+                # sullo stesso provider morto. Si salta direttamente al Tier 2
+                # cross-provider, gia' filtrato dal gate.
+                _cooldown_set: set[str] = set()
+                try:
+                    from brain.router.service import _routing_client_singleton as _rcs
+                    _cd = _rcs().cooldown_providers()
+                    if _cd is not None:
+                        _cooldown_set = _cd
+                except Exception:
+                    _cooldown_set = set()
+                _provider_in_cooldown = (provider or "").strip().lower() in _cooldown_set
+
                 # === Tier 1: catena intra-provider ===
                 try:
                     import psycopg2  # type: ignore[import]
@@ -2176,7 +2208,7 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                                 (provider, model, escalations + 1),
                             )
                             _rows = _cur.fetchall()
-                    if _rows and len(_rows) > escalations:
+                    if _rows and len(_rows) > escalations and not _provider_in_cooldown:
                         # Prende la posizione corrispondente al numero di escalation già fatte
                         candidate_model = _rows[escalations][0]
                         if _providers._providers.get(provider):  # type: ignore[attr-defined]

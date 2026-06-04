@@ -989,8 +989,22 @@ def _pick_escalation_model(
     dal cap G1 (modello che descrive senza agire): in entrambi i casi
     l'orchestratore promuove il turno a un modello migliore invece di arrendersi.
     """
+    # Cooldown gate (ADR 0020): consulta la fonte di verita' unica (gate Rust)
+    # PRIMA di scegliere. La catena intra-provider (Tier 1) resta sullo stesso
+    # provider: se quel provider e' in cooldown billing/quota, escalare su di
+    # lui sprecherebbe un turno (incidente reale). In quel caso saltiamo Tier 1
+    # e andiamo al Tier 2 cross-provider, che il gate filtra gia'.
+    cooldown_set: set[str] = set()
+    try:
+        from brain.router.service import _routing_client_singleton
+        _cd = _routing_client_singleton().cooldown_providers()
+        if _cd is not None:
+            cooldown_set = _cd
+    except Exception:
+        cooldown_set = set()
+
     # Tier 1: catena intra-provider (stesso provider, tier superiore).
-    if provider and model:
+    if provider and model and provider.strip().lower() not in cooldown_set:
         try:
             import psycopg2  # type: ignore[import]
             import os as _os

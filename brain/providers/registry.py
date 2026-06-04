@@ -77,14 +77,48 @@ def _db_cooldown_providers() -> set[str]:
     return _db_cooldown_set_cached
 
 
+def _gate_cooldown_providers() -> set[str] | None:
+    """Provider in cooldown secondo il GATE Rust — fonte di verita' unica a
+    runtime (ADR 0020).
+
+    Il gate accumula sia i cooldown che osserva direttamente sia quelli che il
+    brain stesso gli riporta via `provider-error` (cooldown_bridge). Consultarlo
+    qui fa convergere la cascade-fallback del brain sulla stessa vista del gate,
+    eliminando la divergenza storica tra i due store (era la causa per cui il
+    brain ritentava anthropic/openai gia' noti morti). La logica locale
+    (in-memory + DB `nexus_provider_health`) resta come writer del bridge e come
+    degrado offline se il gate e' irraggiungibile, NON come fonte primaria.
+
+    Ritorna `None` se il gate non risponde (il caller usa la vista locale).
+    """
+    try:
+        from brain.router.service import _routing_client_singleton
+        return _routing_client_singleton().cooldown_providers()
+    except Exception as e:
+        logger.debug("gate cooldown read fallito: %s", e)
+        return None
+
+
 def _is_in_billing_cooldown(provider: str) -> bool:
-    """True se il provider e' in cooldown billing-error attivo (in-memory o DB)."""
+    """True se il provider e' in cooldown billing/quota attivo.
+
+    Ordine delle fonti (ADR 0020): GATE Rust (autoritativo) -> in-memory locale
+    -> DB `nexus_provider_health` (degrado offline). Un provider e' considerato
+    in cooldown se QUALSIASI fonte autoritativa lo segnala: cosi' la cascade
+    fallback non ritenta mai un provider che il gate considera morto.
+    """
     key = provider.lower()
+    # Fonte primaria: gate Rust (include i cooldown riportati dal brain stesso).
+    gate = _gate_cooldown_providers()
+    if gate is not None and key in gate:
+        return True
+    # Vista locale in-memory (writer del bridge; valida anche se il gate e' giu').
     until = _provider_cooldown_until.get(key)
     if until is not None:
         if time.monotonic() < until:
             return True
         _provider_cooldown_until.pop(key, None)
+    # Degrado: DB persistente, usato soprattutto quando il gate non risponde.
     return key in _db_cooldown_providers()
 
 

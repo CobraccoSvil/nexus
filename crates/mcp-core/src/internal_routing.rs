@@ -108,10 +108,26 @@ pub struct PurposeResolveResponse {
     pub provider: String,
     pub model: String,
     pub rationale: String,
+    /// True quando il purpose NON e' risolvibile su un provider disponibile:
+    /// il (provider, model) configurato e' in cooldown billing/quota e non
+    /// esiste alternativa capable (tier-based) fuori cooldown. In questo caso
+    /// l'handler ritorna HTTP 503 e il chiamante (brain) DEVE saltare il
+    /// fallback su quel purpose invece di ritentare un provider morto
+    /// (ADR 0020). Niente blocco silenzioso: errore esplicito.
+    #[serde(default)]
+    pub no_capable_provider: bool,
 }
 
 /// Handler `GET /api/internal/routing/purpose?purpose=...`
 /// Risolve (provider, model) da `nexus_purpose_model` tramite RoutingMatrixCache.
+///
+/// Cooldown enforcement (ADR 0020): il purpose e' una decisione AUTO (nessuna
+/// forzatura utente), quindi il cooldown billing/quota e' VINCOLANTE. Se il
+/// (provider, model) configurato e' in cooldown:
+///   - se il purpose ha una regola tier (mig 0203), `best_model_for_tier` ha
+///     gia' scelto un provider capable fuori cooldown (filtra il cooldown);
+///   - altrimenti l'handler ritorna 503 con `no_capable_provider=true` invece
+///     di restituire un provider morto che il brain ritenterebbe a vuoto.
 pub async fn resolve_purpose(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<PurposeQuery>,
@@ -153,6 +169,7 @@ pub async fn resolve_purpose(
                     provider,
                     model,
                     rationale: format!("purpose_model:tier={}:auto", rule.tier),
+                    no_capable_provider: false,
                 }),
             )
                 .into_response();
@@ -160,28 +177,98 @@ pub async fn resolve_purpose(
         tracing::warn!(
             purpose = %purpose,
             tier = %rule.tier,
-            "resolve_purpose: nessun modello catalog per il tier — fallback statico"
+            "resolve_purpose: nessun modello catalog per il tier (tutti in cooldown?) — fallback statico"
         );
         // prosegue al fallback statico sotto.
     }
 
     match matrix.purpose_model(purpose) {
-        Some((provider, model)) => (
-            StatusCode::OK,
-            Json(PurposeResolveResponse {
-                purpose: purpose.to_string(),
-                provider,
-                model,
-                rationale: "purpose_model".to_string(),
-            }),
-        )
-            .into_response(),
+        Some((provider, model)) => {
+            // Cooldown enforcement (ADR 0020): il purpose statico NON filtrava il
+            // cooldown (codepath parallelo al gate). Se il provider configurato e'
+            // in cooldown billing/quota lo segnaliamo come no_capable invece di
+            // restituirlo: il brain lo ritenterebbe a vuoto (incidente reale:
+            // loop_fallback_default -> anthropic in credit_balance_too_low).
+            if crate::provider_cooldown::is_provider_in_cooldown(&provider) {
+                tracing::warn!(
+                    purpose = %purpose,
+                    provider = %provider,
+                    "resolve_purpose: provider in cooldown e nessuna alternativa tier-based -> no_capable (503)"
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(PurposeResolveResponse {
+                        purpose: purpose.to_string(),
+                        provider,
+                        model,
+                        rationale: "purpose_model:in_cooldown".to_string(),
+                        no_capable_provider: true,
+                    }),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::OK,
+                Json(PurposeResolveResponse {
+                    purpose: purpose.to_string(),
+                    provider,
+                    model,
+                    rationale: "purpose_model".to_string(),
+                    no_capable_provider: false,
+                }),
+            )
+                .into_response()
+        }
         None => (
             StatusCode::NOT_FOUND,
             format!("purpose model non trovato: {purpose}"),
         )
             .into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/internal/routing/cooldown — fonte di verita' unica del cooldown
+// ---------------------------------------------------------------------------
+
+/// Risposta di `GET /api/internal/routing/cooldown`.
+/// Espone lo stato di cooldown autoritativo del gate Rust (in-memory +
+/// propagazione DB), cosi' il brain Python NON deve mantenere una sua logica
+/// reattiva duplicata (ADR 0020, regola H): consulta questo endpoint come
+/// unica fonte di verita' a runtime.
+#[derive(Debug, serde::Serialize)]
+pub struct CooldownEntry {
+    pub provider: String,
+    pub seconds_remaining: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct CooldownSnapshotResponse {
+    /// Lista dei provider attualmente in cooldown (billing/quota/rate-limit).
+    pub providers: Vec<CooldownEntry>,
+}
+
+/// Handler `GET /api/internal/routing/cooldown`.
+/// Ritorna l'elenco dei provider in cooldown secondo il gate Rust. Il brain
+/// usa questa lista per saltare i provider morti in fallback/escalation senza
+/// duplicare il ragionamento sul cooldown (deprecazione di
+/// `registry._is_in_billing_cooldown` come fonte primaria).
+pub async fn cooldown_snapshot_handler(State(_state): State<AppState>) -> impl IntoResponse {
+    let providers: Vec<CooldownEntry> = crate::provider_cooldown::cooldown_snapshot()
+        .into_iter()
+        .map(|(provider, seconds_remaining, reason)| CooldownEntry {
+            provider,
+            seconds_remaining,
+            reason,
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(CooldownSnapshotResponse { providers }),
+    )
+        .into_response()
 }
 
 /// Body della richiesta `POST /api/internal/routing/decide`.

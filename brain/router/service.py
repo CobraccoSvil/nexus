@@ -159,6 +159,8 @@ class _RoutingClient:
             or get_setting("mcp_core_url", "http://127.0.0.1:4000")
         ).rstrip("/")
         self._cache: dict[tuple[str, str], tuple[float, RoutingDecision]] = {}
+        # Cache del set provider in cooldown (ADR 0020), TTL condiviso.
+        self._cooldown_cache: tuple[float, set[str]] | None = None
 
     def decide(self, *, message: str, behavior_mode: str) -> RoutingDecision:
         import time
@@ -301,6 +303,27 @@ class _RoutingClient:
             self._cache[key] = (now, decision)
             return decision
         except urllib.error.HTTPError as he:
+            # 503 = il purpose risolve su un provider in cooldown e non c'e'
+            # alternativa capable (ADR 0020). Il gate ce lo dice esplicitamente:
+            # propaghiamo __no_capable_provider__ cosi' il chiamante (escalation/
+            # loop_fallback) SALTA il fallback invece di ritentare un provider
+            # morto. Distinto da __router_unavailable__ (Rust irraggiungibile).
+            if he.code == 503:
+                try:
+                    body = _json.loads(he.read().decode("utf-8"))
+                    rationale = body.get("rationale", "purpose in cooldown")
+                except Exception:
+                    rationale = "purpose in cooldown"
+                logger.warning(
+                    "Routing purpose 503: nessun provider disponibile per '%s' (%s)",
+                    p, rationale,
+                )
+                return RoutingDecision(
+                    provider="__no_capable_provider__",
+                    model="__no_capable_provider__",
+                    rationale=f"NESSUN PROVIDER DISPONIBILE (purpose): {rationale}",
+                    confidence=0.0,
+                )
             logger.warning("Routing purpose HTTP error: %s", he)
             return RoutingDecision(
                 provider="__router_unavailable__",
@@ -316,6 +339,46 @@ class _RoutingClient:
                 rationale=f"purpose non disponibile: {e}",
                 confidence=0.0,
             )
+
+    def cooldown_providers(self) -> set[str] | None:
+        """Provider attualmente in cooldown secondo il gate Rust (ADR 0020).
+
+        Fonte di verita' UNICA a runtime per il cooldown: il gate Rust accumula
+        sia i cooldown osservati direttamente sia quelli riportati dal brain via
+        `provider-error` (cooldown_bridge). Consultando questo endpoint il brain
+        non duplica il ragionamento sul cooldown (regola H) e salta in
+        fallback/escalation gli stessi provider che il gate considera morti.
+
+        Ritorna l'insieme dei nomi provider (lowercase) in cooldown, oppure
+        `None` se il gate e' irraggiungibile (il chiamante decide se ripiegare
+        sulla propria vista locale come degrado, non come fonte primaria).
+        Cache TTL condivisa 30s per non martellare l'endpoint nel turno.
+        """
+        import time
+        import urllib.request
+        import urllib.error
+        import json as _json
+
+        now = time.monotonic()
+        entry = self._cooldown_cache
+        if entry is not None and now - entry[0] < self._CACHE_TTL_S:
+            return entry[1]
+
+        url = f"{self._base}/api/internal/routing/cooldown"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=self._DEFAULT_TIMEOUT_S) as resp:
+                payload = _json.loads(resp.read().decode("utf-8"))
+            providers = {
+                str(e.get("provider", "")).strip().lower()
+                for e in (payload.get("providers") or [])
+                if str(e.get("provider", "")).strip()
+            }
+            self._cooldown_cache = (now, providers)
+            return providers
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, _json.JSONDecodeError, OSError) as e:
+            logger.warning("Routing cooldown set non raggiungibile (%s)", e)
+            return None
 
 
 _ROUTING_CLIENT_INSTANCE: _RoutingClient | None = None

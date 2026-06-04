@@ -90,6 +90,15 @@ pub struct RoutingResolveResult {
     /// rate limit, billing). Continuare comunque produrrebbe lo stesso
     /// errore in loop.
     pub no_capable_provider: bool,
+    /// True se la decisione deriva da una FORZATURA esplicita dell'utente
+    /// (`provider_override` / `model_override` dal dropdown chat, non Auto).
+    /// In questo caso il cooldown billing/quota e' deliberatamente IGNORATO:
+    /// l'utente ha scelto consapevolmente quel provider/modello e va usato
+    /// anche se in cooldown (ADR 0020). Il chiamante puo' mostrare un avviso
+    /// "stai forzando un provider in cooldown" ma NON deve bloccare il run.
+    /// Quando true, `no_capable_provider` e' sempre false (la scelta utente
+    /// e' per definizione "capable" dal suo punto di vista).
+    pub user_override: bool,
     /// Lista provider in cooldown al momento della decisione, ordinata
     /// come la hierarchy. Permette al frontend di mostrare un alert
     /// dettagliato ("anthropic e openai sono in cooldown — solo deepseek
@@ -102,6 +111,23 @@ pub struct RoutingResolveResult {
     /// un caso da nascondere.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Regola di disponibilita' provider (ADR 0020), estratta come funzione pura
+/// per renderla testabile senza DB.
+///
+/// - Modalita' AUTO (nessuna forzatura): il cooldown e' VINCOLANTE. Se il
+///   provider scelto e' in cooldown, o tutti i provider noti lo sono, la
+///   decisione e' `no_capable_provider = true` (il chiamante deve fermarsi e
+///   avvertire, non ritentare un provider morto).
+/// - Forzatura ESPLICITA utente (`user_override`): la scelta e' consapevole e
+///   non e' mai "no_capable" — il provider va usato anche se in cooldown.
+pub(crate) fn compute_no_capable_provider(
+    user_override: bool,
+    chosen_provider_in_cooldown: bool,
+    all_known_in_cooldown: bool,
+) -> bool {
+    !user_override && (chosen_provider_in_cooldown || all_known_in_cooldown)
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +151,27 @@ pub(crate) fn estimate_complexity(message: &str) -> u32 {
 // route_model_local rimossa: era dead_code dopo l'introduzione di route_model_from_catalog
 // (refactor 0101 model-registry). Tutti i call site usano route_model_with_mode con la
 // matrice DB passata esplicitamente.
+
+/// Ricava il provider di un modello dal catalogo prezzi (ADR 0023).
+/// Usato quando l'utente forza un `model_override` senza `provider_override`:
+/// un modello identifica univocamente il suo provider.
+/// Deterministico: se piu' provider espongono lo stesso `model`, prende quello
+/// abilitato col costo input piu' basso (NULL per ultimo). Ritorna `None` se il
+/// modello non e' nel catalogo (il chiamante fa fallback al routing per intent,
+/// senza inventare provider — regola G).
+pub(crate) async fn provider_for_model(db: &PgPool, model: &str) -> Option<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT provider FROM ai_price_catalog
+         WHERE model = $1 AND is_enabled = true
+         ORDER BY input_cost_per_million_tokens ASC NULLS LAST
+         LIMIT 1",
+    )
+    .bind(model)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
 
 /// Seleziona il modello ottimale dal catalogo DB per la modalità richiesta.
 /// La modalità "dinamico" sceglie il modello più adatto per capability+tier,
@@ -733,7 +780,7 @@ pub(crate) fn decide_tool_capability_gate(
 
 #[cfg(test)]
 mod tool_capability_gate_tests {
-    use super::{decide_tool_capability_gate, ToolCapabilityGate};
+    use super::{compute_no_capable_provider, decide_tool_capability_gate, ToolCapabilityGate};
 
     #[test]
     fn gate_scarta_modello_non_tool_capable_su_intent_agentico() {
@@ -770,5 +817,35 @@ mod tool_capability_gate_tests {
         // catalog e' un problema di sync, non un motivo per cambiare modello.
         let d = decide_tool_capability_gate("debug", true, None);
         assert_eq!(d, ToolCapabilityGate::KeepOriginal);
+    }
+
+    // ── ADR 0020: regola di disponibilita' provider (cooldown vincolante) ──
+
+    #[test]
+    fn auto_provider_in_cooldown_e_no_capable() {
+        // Modalita' AUTO, provider scelto in cooldown -> no_capable.
+        assert!(compute_no_capable_provider(false, true, false));
+    }
+
+    #[test]
+    fn auto_tutti_in_cooldown_e_no_capable() {
+        // Modalita' AUTO, tutti i provider noti in cooldown -> no_capable.
+        assert!(compute_no_capable_provider(false, false, true));
+    }
+
+    #[test]
+    fn auto_provider_disponibile_non_e_no_capable() {
+        // Modalita' AUTO, provider scelto fuori cooldown -> capable.
+        assert!(!compute_no_capable_provider(false, false, false));
+    }
+
+    #[test]
+    fn user_override_bypassa_il_cooldown() {
+        // Forzatura utente: anche se il provider scelto e' in cooldown e tutti
+        // i provider noti lo sono, la scelta NON e' mai no_capable (l'utente
+        // decide consapevolmente, ADR 0020).
+        assert!(!compute_no_capable_provider(true, true, true));
+        assert!(!compute_no_capable_provider(true, true, false));
+        assert!(!compute_no_capable_provider(true, false, true));
     }
 }

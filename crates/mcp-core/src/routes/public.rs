@@ -74,6 +74,16 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
             "/api/internal/routing/purpose",
             get(internal_routing::resolve_purpose),
         )
+        // /api/internal/routing/cooldown — fonte di verita' unica del cooldown
+        // provider (ADR 0020). Snapshot in-memory leggero del gate Rust, che
+        // accumula anche i cooldown riportati dal brain via provider-error.
+        // Il brain lo consulta in fallback/escalation per saltare i provider
+        // morti senza duplicare il ragionamento sul cooldown (regola H).
+        // Distinto da /providers/status (UI, fa merge col brain + DB health).
+        .route(
+            "/api/internal/routing/cooldown",
+            get(internal_routing::cooldown_snapshot_handler),
+        )
         // /api/internal/learning/feedback — sostituisce la chiamata gRPC
         // submit_feedback da brain Python. Rust diventa unico writer
         // della Q-table (vedi internal_learning.rs).

@@ -168,6 +168,23 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
         except Exception as exc:
             logger.error("planner_node: purpose_model(planner) fallito: %s — skip", exc)
             return {"plan_phase_active": False, "plan_phase_skip_reason": f"purpose_model_error:{exc}"}
+        # Sentinella gate (ADR 0020): se non c'e' provider disponibile (gate
+        # irraggiungibile o purpose 'planner' su provider in cooldown senza
+        # alternativa), NON chiamare un provider morto: skip della fase di
+        # pianificazione. L'executor a valle gestira' il no_capable con un
+        # messaggio chiaro invece di sprecare tentativi.
+        if (
+            not planner_provider
+            or planner_provider in ("__router_unavailable__", "__no_capable_provider__")
+        ):
+            logger.warning(
+                "planner_node: nessun provider disponibile per 'planner' (%s) — skip",
+                planner_provider,
+            )
+            return {
+                "plan_phase_active": False,
+                "plan_phase_skip_reason": f"no_capable_provider:{planner_provider}",
+            }
 
     # ── Carica prompt dal registry DB (cache TTL 60s) ────────────────────────
     prompt_key = orchestrator_config.planner_prompt_key()
@@ -695,6 +712,10 @@ async def _detect_clarifications(state: AgentState, cfg: dict) -> dict[str, Any]
         decision = _routing_client.purpose_model(purpose="planner")
         provider, model = decision.provider, decision.model
     except Exception:
+        return None
+    # Sentinella gate (ADR 0020): nessun provider disponibile -> skip detection
+    # clarifying invece di chiamare un provider morto.
+    if not provider or provider.startswith("__"):
         return None
     # Tool semplice per la struttura della risposta.
     tools_json = [{

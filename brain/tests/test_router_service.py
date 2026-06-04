@@ -54,14 +54,75 @@ def test_route_model_delegates_to_rust_endpoint() -> None:
 
 
 def test_route_model_fallback_when_rust_unreachable() -> None:
-    """Se il client HTTP fallisce, route_model deve restituire un fallback safe
-    (openai/gpt-4.1-mini), mai sollevare eccezione."""
+    """Se il client HTTP fallisce, `decide` NON inventa un modello (regola G:
+    niente magic fallback): ritorna la sentinella __router_unavailable__ con
+    confidence 0, mai sollevare eccezione. Il chiamante a monte intercetta la
+    sentinella e ferma il flusso invece di usare un modello arbitrario."""
     from brain.router.service import _RoutingClient
     client = _RoutingClient(base_url="http://127.0.0.1:1")  # porta sicuramente chiusa
     decision = client.decide(message="anything", behavior_mode="bilanciata")
-    assert decision.provider == "openai"
-    assert decision.model == "gpt-4.1-mini"
-    assert decision.confidence < 0.9, "fallback deve avere confidence ridotta"
+    assert decision.provider == "__router_unavailable__"
+    assert decision.model == "__router_unavailable__"
+    assert decision.confidence == 0.0
+
+
+def test_purpose_model_503_returns_no_capable() -> None:
+    """ADR 0020: se il gate ritorna 503 (purpose su provider in cooldown senza
+    alternativa), il client deve propagare __no_capable_provider__ — non
+    __router_unavailable__ — cosi' il chiamante salta il fallback morto."""
+    import io
+    import urllib.error
+    from brain.router.service import _RoutingClient
+
+    def _raise_503(req, timeout=None):  # noqa: ARG001
+        raise urllib.error.HTTPError(
+            url="http://test/api/internal/routing/purpose",
+            code=503,
+            msg="Service Unavailable",
+            hdrs=None,
+            fp=io.BytesIO(b'{"rationale":"purpose_model:in_cooldown","no_capable_provider":true}'),
+        )
+
+    client = _RoutingClient(base_url="http://test")
+    with patch("urllib.request.urlopen", side_effect=_raise_503):
+        d = client.purpose_model(purpose="loop_fallback_default")
+    assert d.provider == "__no_capable_provider__"
+    assert d.model == "__no_capable_provider__"
+    assert d.confidence == 0.0
+
+
+def test_cooldown_providers_parses_lowercase_set() -> None:
+    """cooldown_providers() ritorna l'insieme dei provider in cooldown dal gate."""
+    import io
+    from brain.router.service import _RoutingClient
+
+    class _Resp:
+        def __init__(self, payload: bytes) -> None:
+            self._b = io.BytesIO(payload)
+
+        def __enter__(self):  # noqa: ANN001
+            return self
+
+        def __exit__(self, *a):  # noqa: ANN001
+            return False
+
+        def read(self) -> bytes:
+            return self._b.read()
+
+    payload = b'{"providers":[{"provider":"Anthropic","seconds_remaining":60},{"provider":"openai","seconds_remaining":30}]}'
+    client = _RoutingClient(base_url="http://test")
+    with patch("urllib.request.urlopen", return_value=_Resp(payload)):
+        out = client.cooldown_providers()
+    assert out == {"anthropic", "openai"}
+
+
+def test_cooldown_providers_none_when_unreachable() -> None:
+    """Se il gate non risponde, cooldown_providers() ritorna None (il caller usa
+    la vista locale come degrado, non come fonte primaria)."""
+    from brain.router.service import _RoutingClient
+
+    client = _RoutingClient(base_url="http://127.0.0.1:1")  # porta chiusa
+    assert client.cooldown_providers() is None
 
 
 def test_routing_client_caches_per_message() -> None:

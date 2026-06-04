@@ -278,6 +278,7 @@ impl Orchestrator {
                     source: "error".to_string(),
                     configured_behavior_mode: "unknown".to_string(),
                     no_capable_provider: true,
+                    user_override: false,
                     providers_in_cooldown: vec![],
                     error: Some(format!(
                         "Configurazione routing mancante: {e}. \
@@ -342,7 +343,11 @@ impl Orchestrator {
         //   - se behavior_mode e' "dinamico" e il task NON e' rischioso e il
         //     model non corrisponde a quello della matrix statica, source = "catalog"
         //   - altrimenti source = "matrix"
-        let source: &'static str = if provider_override.filter(|v| !v.trim().is_empty()).is_some() {
+        // ADR 0023: un override esplicito puo' essere sul provider, sul modello,
+        // o su entrambi. Anche un model_override da solo conta come "override".
+        let has_provider_override = provider_override.filter(|v| !v.trim().is_empty()).is_some();
+        let has_model_override = model_override.filter(|v| !v.trim().is_empty()).is_some();
+        let source: &'static str = if has_provider_override || has_model_override {
             "override"
         } else if configured_behavior_mode == "dinamico" && !risky {
             // In modalita' dinamica non rischiosa il catalogo prezzi e' autoritativo.
@@ -370,11 +375,21 @@ impl Orchestrator {
             .filter(|p| is_provider_in_cooldown(p))
             .map(|p| p.to_string())
             .collect();
+        // Forzatura esplicita utente (ADR 0020): se l'utente ha scelto
+        // provider/modello dal dropdown (non Auto), il cooldown e' deliberatamente
+        // ignorato. `user_override` segnala al chiamante che la scelta e'
+        // consapevole e non va bloccata anche se il provider e' in cooldown.
+        let user_override = has_provider_override || has_model_override;
         // Nessun provider capable = il provider scelto e' lui stesso in
         // cooldown (succede quando tutti gli altri della hierarchy sono
         // anch'essi in cooldown e l'algoritmo riusa l'originale).
-        let no_capable_provider = is_provider_in_cooldown(&provider)
-            || providers_in_cooldown.len() >= known_providers.len();
+        // In modalita' AUTO il cooldown e' VINCOLANTE. Con forzatura utente
+        // (user_override) NON e' mai "no_capable": l'utente decide (ADR 0020).
+        let no_capable_provider = compute_no_capable_provider(
+            user_override,
+            is_provider_in_cooldown(&provider),
+            providers_in_cooldown.len() >= known_providers.len(),
+        );
 
         let cooldown_note = if no_capable_provider {
             " ⚠ NESSUN PROVIDER DISPONIBILE — fermarsi e avvertire utente"
@@ -435,6 +450,7 @@ impl Orchestrator {
             source: source.to_string(),
             configured_behavior_mode,
             no_capable_provider,
+            user_override,
             providers_in_cooldown,
             error: None,
         }
@@ -569,16 +585,47 @@ impl Orchestrator {
             }
         };
         let matrix = &*matrix_arc;
-        // Se l'utente ha forzato un provider specifico, lo rispettiamo.
-        // Se ha forzato anche il modello, lo usiamo direttamente senza
-        // passare per resolve_model (che applicherebbe override admin).
-        if let Some(p) = provider_override.filter(|v| !v.trim().is_empty()) {
-            if let Some(m) = model_override.filter(|v| !v.trim().is_empty()) {
+        // Override espliciti utente (ADR 0023). Gestiamo i quattro casi della
+        // coppia (provider_override, model_override):
+        //   (Some, Some) -> rispetta entrambi cosi' come sono.
+        //   (None, Some) -> un modello identifica univocamente il suo provider:
+        //                   lo ricaviamo dal catalogo prezzi (provider_for_model).
+        //                   Se non trovato, fallback al routing per intent (sotto).
+        //   (Some, None) -> provider forzato, modello dal routing/default provider.
+        //   (None, None) -> routing per intent (nessun ramo qui).
+        let provider_ov = provider_override.filter(|v| !v.trim().is_empty());
+        let model_ov = model_override.filter(|v| !v.trim().is_empty());
+        match (provider_ov, model_ov) {
+            (Some(p), Some(m)) => {
                 return (p.to_string(), m.to_string());
             }
-            let routing = Self::load_routing_config(db).await.unwrap_or_default();
-            let model = routing.resolve_model(matrix, p, Some(p), model_override);
-            return (p.to_string(), model);
+            (Some(p), None) => {
+                let routing = Self::load_routing_config(db).await.unwrap_or_default();
+                let model = routing.resolve_model(matrix, p, Some(p), model_override);
+                return (p.to_string(), model);
+            }
+            (None, Some(m)) => {
+                // model_override da solo: ricava il provider dal catalogo.
+                match provider_for_model(db, m).await {
+                    Some(provider) => {
+                        tracing::info!(
+                            "Agent routing (model_override): '{}' -> provider '{}' dal catalogo",
+                            m,
+                            provider
+                        );
+                        return (provider, m.to_string());
+                    }
+                    None => {
+                        // Niente provider hardcoded (regola G): se il modello non
+                        // e' nel catalogo, cadiamo nel routing per intent sotto.
+                        tracing::warn!(
+                            "model_override '{}' non trovato nel catalogo, fallback routing per intent",
+                            m
+                        );
+                    }
+                }
+            }
+            (None, None) => {}
         }
 
         // Routing locale — zero latenza gRPC

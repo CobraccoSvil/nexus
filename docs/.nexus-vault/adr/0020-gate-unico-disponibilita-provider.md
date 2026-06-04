@@ -21,7 +21,48 @@ nexus_meta_version: 1
 
 ## Stato
 
-Proposto (2026-06-04). Implementazione in 2 fasi (A: mcp-core, B: brain).
+Implementato (2026-06-04). Fase A (mcp-core) e Fase B (brain) completate.
+
+### Riepilogo implementazione
+
+Fase A (mcp-core):
+- `RoutingResolveResult` espone `user_override: bool`
+  (`orchestrator/model_routing.rs`); popolato in
+  `resolve_agent_provider_detailed` (`orchestrator/core.rs`). Con forzatura
+  utente il cooldown e' ignorato e `no_capable_provider` e' sempre false.
+- Regola di disponibilita' estratta in `compute_no_capable_provider()` (pura,
+  testata): in AUTO il cooldown e' vincolante, con override no.
+- `/api/internal/routing/purpose` (`internal_routing.rs::resolve_purpose`)
+  ora filtra il cooldown: se il (provider, model) statico e' in cooldown e non
+  c'e' alternativa tier-based, ritorna HTTP 503 con `no_capable_provider=true`
+  invece di restituire un provider morto.
+- Nuovo endpoint `GET /api/internal/routing/cooldown`
+  (`internal_routing.rs::cooldown_snapshot_handler`): snapshot in-memory
+  leggero del gate Rust, fonte di verita' unica a runtime del cooldown
+  (distinto da `/providers/status`, che fa merge col brain + DB health).
+
+Fase B (brain):
+- `router/service.py`: `purpose_model()` propaga 503 -> sentinella
+  `__no_capable_provider__` (prima collassava tutto su `__router_unavailable__`);
+  nuovo metodo `cooldown_providers()` che consulta `/routing/cooldown`.
+- `providers/registry.py`: `_is_in_billing_cooldown()` consulta il gate Rust
+  come fonte PRIMARIA; in-memory + DB `nexus_provider_health` restano writer
+  del bridge e degrado offline. Cosi' la cascade-fallback non ritenta i
+  provider che il gate considera morti (causa radice dell'incidente: due store
+  cooldown divergenti).
+- `_pick_escalation_model` (`nodes/helpers.py`) e loop-fallback
+  (`nodes/__init__.py`): saltano la catena intra-provider (Tier 1) se il
+  provider e' in cooldown secondo il gate; il Tier 2 cross-provider e' gia'
+  filtrato dal gate.
+- Tutti i call site di `purpose_model` dei nodi
+  (planner/verifier/clarify/understanding/subagent + executor) gestiscono le
+  sentinelle: skip o stop con errore chiaro, mai chiamata a provider morto.
+
+> Nota: il `cooldown_bridge` (brain -> `/api/internal/provider-error`) NON e'
+> rimosso: e' il meccanismo che alimenta il gate con gli errori billing/quota
+> osservati dal brain, quindi resta essenziale perche' il gate sia la fonte
+> autoritativa. Cio' che e' deprecato e' la DECISIONE autonoma del brain, non
+> la sua segnalazione al gate.
 
 > Nota di numerazione: esiste gia' una nota con basename `0019` per il file
 > picking robusto ([[0019-file-picking-robusto-verify-chain]]). Questo ADR copre
