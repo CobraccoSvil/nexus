@@ -813,6 +813,19 @@ async def router_node(state: AgentState) -> dict[str, Any]:
         title = f"Intent: {intent}"
         if profile_name:
             title += f" — profilo {profile_name}"
+        # Provider+model noti al routing-time (potranno cambiare in cascade,
+        # ma e' il valore deciso dalla routing matrix per QUESTO turno).
+        # Risolvi provider via _provider_from_model (ai_price_catalog, cache).
+        _routing_model = (
+            state.get("model_override")
+            or state.get("sticky_model")
+            or locals().get("initial_model")
+        )
+        _routing_provider = (
+            state.get("provider_override")
+            or state.get("sticky_provider")
+            or (_provider_from_model(_routing_model) if _routing_model else None)
+        )
         routing_meta = meta_steps.make(
             kind="routing",
             title=title,
@@ -822,6 +835,10 @@ async def router_node(state: AgentState) -> dict[str, Any]:
                 "profile_name": profile_name,
                 "behavior_mode": behavior_mode,
                 "token_budget": token_budget,
+                # Per-turn provider/model — visualizzati nel badge UI con
+                # colore brand-specific + tonalita' basata sul costo.
+                "provider": _routing_provider,
+                "model": _routing_model,
             },
         )
         if routing_meta:
@@ -2611,6 +2628,22 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     # converte questi "meta_steps" in eventi `meta_step` che la UI rende
     # come fumetti progressivi (kind=tool_executed, vedi agent-meta-step-card.tsx).
     _tool_steps: list[dict] = []
+    # Provider+model attuali del turno (chi ha emesso questi tool_use): noto via
+    # state come `provider_used`/`model_used` (popolato da executor_node prima
+    # del dispatch). Fallback su sticky_* per tool eseguiti senza un turno
+    # executor immediatamente precedente. Permette al badge UI di colorare
+    # ogni card tool con il provider responsabile (es. claude/anthropic vs
+    # gemini/google) anche durante cascade fallback intra-run.
+    _exec_provider = (
+        state.get("provider_used")
+        or state.get("sticky_provider")
+        or state.get("provider_override")
+    )
+    _exec_model = (
+        state.get("model_used")
+        or state.get("sticky_model")
+        or state.get("model_override")
+    )
     for b, r in zip(pending, results):
         _ms_tool = b.get("name", "?")
         _ms_input = b.get("input", {}) or {}
@@ -2631,6 +2664,9 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
                 "target": _ms_target,
                 "is_error": _ms_err,
                 "tool_use_id": b.get("id"),
+                # Per-turn provider/model emittente del tool_use (UI badge).
+                "provider": _exec_provider,
+                "model": _exec_model,
             },
         )
         if _step:

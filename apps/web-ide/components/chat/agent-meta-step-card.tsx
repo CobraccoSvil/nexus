@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useEventOfKind } from "../../lib/project-dispatcher/hooks";
+import { ProviderBadge } from "./provider-badge";
 
 /**
  * Card collassabile per visualizzare i meta-step semantici pubblicati dal
@@ -189,6 +190,24 @@ export function AgentMetaStepCard({ data }: { data: AgentMetaStepData }) {
   const desc = KIND_MAP[data.kind] ?? DEFAULT_DESC;
   const [open, setOpen] = useState(desc.defaultOpen);
 
+  // Provider/model per il turno (per il badge colorato per provider+costo).
+  // - routing      -> popolato direttamente nel payload (provider/model)
+  // - tool_executed -> idem
+  // - fallback     -> usa to_provider/to_model (destinazione del fallback)
+  // Per gli altri kind (plan, clarify, reflection) il badge non e' mostrato:
+  // non hanno semantica di "scelta del modello per il turno".
+  const provider = (data.payload?.provider
+    ?? data.payload?.to_provider
+    ?? null) as string | null;
+  const model = (data.payload?.model
+    ?? data.payload?.to_model
+    ?? null) as string | null;
+  const showBadge =
+    (provider || model) &&
+    (data.kind === "routing" ||
+      data.kind === "tool_executed" ||
+      data.kind === "fallback");
+
   return (
     <div
       data-meta-step-kind={data.kind}
@@ -204,6 +223,7 @@ export function AgentMetaStepCard({ data }: { data: AgentMetaStepData }) {
         <span aria-hidden className="font-mono">{desc.icon}</span>
         <span className="font-medium">{desc.label}</span>
         <span className="opacity-70 truncate text-left flex-1">{data.title}</span>
+        {showBadge && <ProviderBadge provider={provider} model={model} />}
       </button>
       {open && (
         <div className="px-3 pb-2">
