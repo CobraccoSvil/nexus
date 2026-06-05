@@ -659,6 +659,14 @@ pub async fn run_via_brain(
     // B5: metadata routing propagati dal brain Python nell'evento end_turn
     let mut nexus_task_type: Option<String> = None;
     let mut nexus_agent_type: Option<String> = None;
+    // Provider/model EFFETTIVI dell'ultima iterazione, propagati dal brain
+    // nell'evento end_turn quando avviene un cascade fallback sticky intra-run
+    // (es. deepseek -> google/gemini-2.5-pro). Default al provider/model iniziale
+    // della routing decision; sovrascritti se il brain segnala il fallback.
+    // Il risultato finale usa QUESTI valori cosi' il messaggio assistant mostra
+    // il modello reale che ha prodotto la risposta, non quello iniziale.
+    let mut effective_provider = provider.clone();
+    let mut effective_model = model.clone();
 
     // Timeout per-silence: se il brain non emette alcun chunk SSE (inclusi i
     // ping heartbeat ogni ~30s) per `sse_max_silence_secs` secondi, il run
@@ -889,6 +897,18 @@ pub async fn run_via_brain(
                     }
                     if let Some(at) = evt.get("nexus_agent_type").and_then(|v| v.as_str()) {
                         nexus_agent_type = Some(at.to_string());
+                    }
+                    // Provider/model effettivi dopo cascade fallback sticky:
+                    // sovrascrivono i valori iniziali nel risultato finale.
+                    if let Some(pu) = evt.get("provider_used").and_then(|v| v.as_str()) {
+                        if !pu.trim().is_empty() {
+                            effective_provider = pu.to_string();
+                        }
+                    }
+                    if let Some(mu) = evt.get("model_used").and_then(|v| v.as_str()) {
+                        if !mu.trim().is_empty() {
+                            effective_model = mu.to_string();
+                        }
                     }
                     if last_stop_reason.is_none() {
                         last_stop_reason = Some(
@@ -1205,8 +1225,8 @@ pub async fn run_via_brain(
             };
             Some(answer)
         },
-        provider,
-        model,
+        provider: effective_provider,
+        model: effective_model,
         iteration_count: iteration,
         nexus_override_applied: nexus_agent_type.is_some(),
         nexus_agent_type,

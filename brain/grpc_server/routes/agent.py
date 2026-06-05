@@ -745,6 +745,13 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
         # Metadata routing (B5): catturati dal nodo router per propagare a Rust
         nexus_task_type: str | None = None
         nexus_agent_type: str | None = None
+        # Provider/model EFFETTIVI dell'ultima iterazione executor: catturano il
+        # cascade fallback sticky intra-run (es. deepseek -> google/gemini-2.5-pro).
+        # Propagati nell'evento end_turn cosi' mcp-core salva su agent_runs il
+        # modello reale che ha prodotto la risposta finale, non quello iniziale
+        # della routing decision (vedi brain_agent_client.rs::run_via_brain).
+        effective_provider: str | None = None
+        effective_model: str | None = None
         try:
             # Heartbeat: ogni attesa di evento ha un timeout di 30s.
             # Se il brain e' in elaborazione senza produrre output (tool lento,
@@ -861,6 +868,12 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                         acc_completion_tokens += int(delta.get("completion_tokens") or 0)
                         acc_total_tokens += int(delta.get("total_tokens") or 0)
                         acc_total_cost += float(delta.get("total_cost_usd") or 0.0)
+                        # Cattura provider/model effettivi dell'iterazione corrente
+                        # (riflettono il cascade fallback sticky se avvenuto).
+                        if delta.get("provider_used"):
+                            effective_provider = delta["provider_used"]
+                        if delta.get("model_used"):
+                            effective_model = delta["model_used"]
 
                         result_text = delta.get("result") or ""
                         if result_text:
@@ -897,6 +910,13 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                                 end_turn_payload["nexus_task_type"] = nexus_task_type
                             if nexus_agent_type:
                                 end_turn_payload["nexus_agent_type"] = nexus_agent_type
+                            # Provider/model effettivi (cascade fallback sticky):
+                            # mcp-core li usa per salvare il modello reale nel
+                            # messaggio assistant invece di quello iniziale.
+                            if effective_provider:
+                                end_turn_payload["provider_used"] = effective_provider
+                            if effective_model:
+                                end_turn_payload["model_used"] = effective_model
                             yield (
                                 "data: "
                                 + _json.dumps(end_turn_payload)
@@ -936,6 +956,10 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                             _final_payload["nexus_task_type"] = nexus_task_type
                         if nexus_agent_type:
                             _final_payload["nexus_agent_type"] = nexus_agent_type
+                        if effective_provider:
+                            _final_payload["provider_used"] = effective_provider
+                        if effective_model:
+                            _final_payload["model_used"] = effective_model
                         yield "data: " + _json.dumps(_final_payload) + "\n\n"
                     yield 'data: {"type":"done"}\n\n'
                     done_emitted = True
