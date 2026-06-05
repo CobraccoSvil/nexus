@@ -413,15 +413,41 @@ pub(crate) async fn compact_session_core(
     let messages_json =
         serde_json::to_string(&msgs).map_err(|e| CompactError::internal(e.to_string()))?;
 
-    // Risolvi provider/modello dalla routing matrix (purpose 'conversation_summary')
-    // cosi' la compattazione usa lo stesso router dei modelli della chat.
-    let (summary_provider, summary_model) =
-        match state.orchestrator.routing_matrix.current_async().await {
-            Ok(matrix) => matrix
-                .purpose_model("conversation_summary")
-                .unwrap_or(("openai".to_string(), "gpt-4.1-mini".to_string())),
-            Err(_) => ("openai".to_string(), "gpt-4.1-mini".to_string()),
-        };
+    // Risolvi provider/modello dal PUNTO UNICO resolve_purpose_model (regola G +
+    // regola L): niente modello hardcoded, niente fallback a un provider morto.
+    // Rispetta tier-rule, cooldown, disponibilita'. Se nessun provider e'
+    // disponibile, propaga errore chiaro all'utente.
+    let (summary_provider, summary_model) = {
+        use crate::internal_routing::{resolve_purpose_model, PurposeResolution};
+        match resolve_purpose_model(state, "conversation_summary").await {
+            PurposeResolution::Resolved {
+                provider, model, ..
+            } => (provider, model),
+            PurposeResolution::InCooldown { provider, .. } => {
+                return Err(CompactError::new(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "Compattazione non disponibile: il provider '{provider}' e' in \
+                         cooldown (credito/quota esaurito) e non ci sono alternative. \
+                         Riprova piu' tardi o ricarica il credito del provider."
+                    ),
+                ));
+            }
+            PurposeResolution::NotFound => {
+                return Err(CompactError::new(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "Compattazione non disponibile: purpose 'conversation_summary' \
+                     non configurato in nexus_purpose_model. Aggiungi la configurazione \
+                     dall'admin panel.",
+                ));
+            }
+            PurposeResolution::MatrixUnavailable(e) => {
+                return Err(CompactError::internal(format!(
+                    "Compattazione non disponibile: routing matrix irraggiungibile ({e})"
+                )));
+            }
+        }
+    };
 
     let summary_resp = state
         .orchestrator
