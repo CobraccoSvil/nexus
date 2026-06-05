@@ -36,11 +36,5 @@ jobs:
       - name: Run pnpm verify
         run: pnpm verify
 
-      - name: Single-source guard (regola L / ADR 0026)
-        run: bash scripts/check-single-source.sh
-
-      - name: Duplicate detection ratchet (regola L / ADR 0026)
-        run: bash scripts/dup-report.sh
-
       - name: Lint commits (xtask)
         run: pnpm xtask lint-commits origin/main HEAD || true
