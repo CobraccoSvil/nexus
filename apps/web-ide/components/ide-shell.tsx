@@ -1959,6 +1959,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
         <div style={{ minHeight: 0, overflow: "hidden" }}>
           <BottomPanelManager
             activePanelTab={activePanelTab}
+            onSelectPanelTab={(tab) => setActivePanelTab(tab)}
             project={activeProject}
             problemItems={problemItems}
             outputChannels={outputChannels}

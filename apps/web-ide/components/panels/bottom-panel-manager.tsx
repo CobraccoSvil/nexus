@@ -21,7 +21,7 @@ import type {
   UserProjectDetails,
 } from "../../lib/api-client";
 import { subscribePlaywrightRunStream } from "../../lib/api-client";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useGlobalDialog } from "../global-dialog-provider";
 
 export type PanelTab =
@@ -57,6 +57,9 @@ export interface BottomPanelManagerProps {
   onKillPort?: (port: number) => void | Promise<void>;
   agentRunEndSignal?: number;
   onClearTraces?: () => void;
+  // Permette al TerminalPanel (sempre montato) di portarsi in primo piano
+  // quando l'agente inietta un comando via SSE mentre l'utente e' su un altro tab.
+  onSelectPanelTab?: (tab: PanelTab) => void;
 }
 
 function listRowButton(tc: ReturnType<typeof useThemeColors>) {
@@ -111,9 +114,44 @@ export function BottomPanelManager({
   onAutoSendToChat,
   onKillPort,
   agentRunEndSignal,
+  onSelectPanelTab,
 }: BottomPanelManagerProps) {
   const tc = useThemeColors();
   const { confirmDialog } = useGlobalDialog();
+
+  // ── Output del terminale condiviso con il pannello Debug ──
+  // Il TerminalPanel apre una shell PTY dedicata via WebSocket (vedi
+  // terminal-panel.tsx). Il pannello Debug NON puo' aprire una seconda
+  // connessione: ogni connessione a /ws/terminal/{sid} crea una shell PTY
+  // separata (brain/grpc_server/routes/terminal.py), quindi vedrebbe una
+  // shell vuota e diversa da quella in cui l'utente lancia i comandi. Per
+  // questo solleviamo qui l'output della shell visibile (callback onOutput
+  // del TerminalPanel) e lo passiamo al DebugPanel come righe gia' spezzate.
+  // Il residuo parziale (chunk senza newline finale) resta nel ref finche'
+  // non arriva il resto della riga.
+  const terminalResidualRef = useRef<string>("");
+  const [terminalLines, setTerminalLines] = useState<string[]>([]);
+
+  const handleTerminalOutput = useCallback((chunk: string) => {
+    if (!chunk) return;
+    const combined = terminalResidualRef.current + chunk;
+    const parts = combined.split(/\r?\n/);
+    // L'ultimo elemento e' il residuo non terminato da newline.
+    terminalResidualRef.current = parts.pop() ?? "";
+    const complete = parts.filter((l) => l.length > 0);
+    if (complete.length === 0) return;
+    // Cap difensivo: il DebugPanel riclassifica solo ERROR/WARN/INFO/DEBUG,
+    // ma evitiamo di trascinare un array illimitato in memoria.
+    setTerminalLines((prev) => [...prev, ...complete].slice(-2000));
+  }, []);
+
+  // Reset del buffer al cambio progetto: le righe della shell precedente non
+  // devono mescolarsi con quelle del nuovo progetto.
+  const projectIdForTerminal = project?.id;
+  useEffect(() => {
+    terminalResidualRef.current = "";
+    setTerminalLines([]);
+  }, [projectIdForTerminal]);
 
   const clearBar = (tab: PanelTab, hasContent: boolean) =>
     (hasContent || onRefreshPanel) ? (
@@ -160,6 +198,12 @@ export function BottomPanelManager({
   // perdendo autoFixEnabled, pendingMarkOnNextRunRef e i segnali agentRunEndSignal
   // arrivati mentre il pannello era nascosto. Con display:none lo stato React resta vivo.
   const optimizationVisible = !project || activePanelTab === "optimization";
+
+  // TerminalPanel: SEMPRE montato (display:none quando non attivo), stessa
+  // logica di OptimizationPanel. Cosi' la shell PTY resta viva al cambio tab
+  // (un dev server lanciato nel terminale non viene piu' ucciso passando al
+  // tab Debug) e il suo output continua ad alimentare il DebugPanel.
+  const terminalVisible = !!project && activePanelTab === "terminal";
 
   // Pannello corrente (tutti gli altri tab usano conditional rendering normale)
   const otherPanel = () => {
@@ -247,7 +291,9 @@ export function BottomPanelManager({
       />
     );
 
-    if (activePanelTab === "debug") return <DebugPanel projectId={project.id} onSendToChat={onSendToChat} />;
+    if (activePanelTab === "debug") return (
+      <DebugPanel projectId={project.id} terminalLines={terminalLines} onSendToChat={onSendToChat} />
+    );
 
     if (activePanelTab === "run") return (
       <RunPanel
@@ -258,9 +304,10 @@ export function BottomPanelManager({
       />
     );
 
-    if (activePanelTab === "terminal") return (
-      <TerminalPanel projectId={project.id} projectLabel={project.name} embedded />
-    );
+    // Il pannello "terminal" non e' gestito qui: il TerminalPanel e' montato
+    // SEMPRE (display:none quando non attivo) fuori da otherPanel(), per non
+    // perdere l'output della shell quando l'utente passa al tab Debug e per
+    // condividere quell'output con il DebugPanel (vedi handleTerminalOutput).
 
     if (activePanelTab === "ports") return (
       <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
@@ -517,8 +564,29 @@ export function BottomPanelManager({
           />
         )}
       </div>
-      {/* Tutti gli altri pannelli: montati solo quando attivi */}
-      {!optimizationVisible && (
+      {/* TerminalPanel: sempre montato (display:none quando non attivo) per
+          mantenere viva la shell PTY e alimentare il DebugPanel via onOutput. */}
+      {project && (
+        <div style={{
+          display: terminalVisible ? "flex" : "none",
+          flexDirection: "column",
+          height: "100%",
+          minHeight: 0,
+          flex: 1,
+          minWidth: 0,
+        }}>
+          <TerminalPanel
+            projectId={project.id}
+            projectLabel={project.name}
+            embedded
+            onActivate={() => onSelectPanelTab?.("terminal")}
+            onOutput={handleTerminalOutput}
+          />
+        </div>
+      )}
+      {/* Tutti gli altri pannelli: montati solo quando attivi.
+          Esclude optimization e terminal (gestiti sopra come sempre-montati). */}
+      {!optimizationVisible && !terminalVisible && (
         <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0, flex: 1, minWidth: 0 }}>
           {otherPanel()}
         </div>

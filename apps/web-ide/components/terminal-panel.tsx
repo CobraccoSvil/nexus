@@ -373,11 +373,15 @@ export function TerminalPanel({
   projectLabel,
   embedded = false,
   onActivate,
+  onOutput,
 }: {
   projectId?: string;
   projectLabel?: string;
   embedded?: boolean;
   onActivate?: () => void;
+  // Inoltra ogni chunk grezzo della shell (con ANSI) a un consumer esterno,
+  // es. il BottomPanelManager che alimenta il pannello Debug.
+  onOutput?: (chunk: string) => void;
 }) {
   const tc = useThemeColors();
   const { resolved } = useTheme();
@@ -387,6 +391,8 @@ export function TerminalPanel({
   // Map tabId → writer function per command injection (true se inviato al backend terminale)
   const writeRefs = useRef<Record<string, (data: string) => boolean>>({});
   const outputRef = useRef<string>("");
+  const onOutputRef = useRef(onOutput);
+  onOutputRef.current = onOutput;
   const consumerIdRef = useRef<string>(`terminal-${Date.now()}-${Math.random().toString(16).slice(2)}`);
 
   const projectIdRef = useRef<string | undefined>(projectId);
@@ -642,6 +648,8 @@ export function TerminalPanel({
               if (!chunk) return;
               const next = `${outputRef.current}${chunk}`;
               outputRef.current = next.length > 8000 ? next.slice(-8000) : next;
+              // Inoltra al consumer esterno (es. pannello Debug)
+              onOutputRef.current?.(chunk);
             }}
           />
         ))}

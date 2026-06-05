@@ -27,8 +27,8 @@ const LOG_PATTERNS: Array<{
   pattern: RegExp;
   level: DebugLevel;
 }> = [
-  { pattern: /\[ERROR\]|\berror\s*TS\d+\b|^Error:|^\s+Error:|\bException\b|\bFAIL|FATAL|panicked|\bfailed\b/i, level: "ERROR" },
-  { pattern: /\[WARN\]|\bWarning:|\bwarn\b/i, level: "WARN" },
+  { pattern: /\[ERROR\]|\berror\s*TS\d+\b|^Error:|^\s+Error:|\bException\b|\bFAIL|FATAL|panicked|\bfailed\b|\[vite\][^\n]*\berror\b|\bERR_|Internal server error/i, level: "ERROR" },
+  { pattern: /\[WARN\]|\bWarning:|\bwarn\b|\[vite\][^\n]*\bwarn/i, level: "WARN" },
   { pattern: /\[INFO\]|\binfo:/i, level: "INFO" },
   { pattern: /\[DEBUG\]|\bdebug:/i, level: "DEBUG" },
   { pattern: /^\s+at\s+\S+[\s.(]/, level: "ERROR" },
@@ -88,10 +88,6 @@ const LEVEL_ICONS: Record<DebugLevel, string> = {
   DEBUG: "•",
 };
 
-const NEURAL_WS = (
-  process.env.NEXT_PUBLIC_NEURAL_URL || "http://localhost:8001"
-).replace(/^http/, "ws");
-
 /** Righe vicine nella lista Debug (ordine di arrivo) per stack/eccezioni multi-riga */
 const DEBUG_CHAT_CTX_BEFORE = 15;
 const DEBUG_CHAT_CTX_AFTER = 15;
@@ -125,7 +121,6 @@ export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPane
   });
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>("all");
   const [serviceNames, setServiceNames] = useState<string[]>([]);
-  const wsRef = useRef<WebSocket | null>(null);
   const lineBufferRef = useRef<string[]>([]);
   const seenLogIdsRef = useRef<Set<string>>(new Set());
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -201,68 +196,33 @@ export function DebugPanel({ projectId, terminalLines, onSendToChat }: DebugPane
     };
   }, [projectId, serviceNames]);
 
-  // Righe da prop
+  // Righe dal terminale (prop terminalLines, accumulata incrementalmente dal
+  // BottomPanelManager). L'array cresce nel tempo: processiamo SOLO le righe
+  // nuove rispetto all'ultima volta per evitare di riclassificare e duplicare
+  // tutto lo storico ad ogni cambiamento.
+  const processedTerminalRef = useRef(0);
   useEffect(() => {
-    if (!terminalLines || terminalLines.length === 0) return;
-    const parsed = parseLines(terminalLines, "terminal");
+    const lines = terminalLines ?? [];
+    // Se l'array si e' accorciato (reset al cambio progetto nel manager),
+    // riparti da zero.
+    if (lines.length < processedTerminalRef.current) {
+      processedTerminalRef.current = 0;
+    }
+    const fresh = lines.slice(processedTerminalRef.current);
+    processedTerminalRef.current = lines.length;
+    if (fresh.length === 0) return;
+    const parsed = parseLines(fresh, "terminal");
     if (parsed.length > 0) {
       setEntries((prev) => [...prev, ...parsed].slice(-800));
     }
   }, [terminalLines]);
 
-  // WebSocket terminale
-  useEffect(() => {
-    if (!projectId) return;
-
-    const url = `${NEURAL_WS}/ws/terminal/${projectId}`;
-    let active = true;
-
-    const connect = () => {
-      try {
-        const ws = new WebSocket(url);
-        wsRef.current = ws;
-
-        ws.onmessage = (event) => {
-          if (!active) return;
-          try {
-            const data =
-              typeof event.data === "string"
-                ? event.data
-                : JSON.parse(event.data as string);
-            const text =
-              typeof data === "string"
-                ? data
-                : typeof data.output === "string"
-                  ? data.output
-                  : "";
-            if (!text) return;
-            const lines = text.split(/\r?\n/);
-            lineBufferRef.current = [...lineBufferRef.current, ...lines].slice(
-              -2000,
-            );
-            const parsed = parseLines(lines, "terminal");
-            if (parsed.length > 0) {
-              setEntries((prev) => [...prev, ...parsed].slice(-800));
-            }
-          } catch {
-            // ignora errori di parsing
-          }
-        };
-
-        ws.onerror = () => {};
-      } catch {
-        // ignora errori di connessione
-      }
-    };
-
-    connect();
-
-    return () => {
-      active = false;
-      wsRef.current?.close();
-      wsRef.current = null;
-    };
-  }, [projectId]);
+  // Nota: il pannello Debug NON apre una propria connessione WebSocket al
+  // terminale. Ogni connessione a /ws/terminal/{sid} crea una shell PTY
+  // dedicata lato brain (brain/grpc_server/routes/terminal.py), quindi una
+  // connessione qui vedrebbe una shell vuota e diversa da quella visibile.
+  // L'output della shell visibile arriva invece tramite la prop terminalLines,
+  // sollevata dal BottomPanelManager (callback onOutput del TerminalPanel).
 
   const toggleFilter = useCallback((level: DebugLevel) => {
     setFilters((prev) => ({ ...prev, [level]: !prev[level] }));
