@@ -58,6 +58,49 @@ async fn read_comm(pid: u32) -> Option<String> {
     Some(raw.trim().to_string())
 }
 
+/// Scansiona /proc e ritorna i `(pid, comm)` dei processi il cui process group
+/// (`pgrp`) coincide con `pgid` e il cui `comm` appartiene all'infrastruttura
+/// Nexus (mcp-core, brain, gateway, microservizi). Difesa-in-profondita' per
+/// `kill_process_tree`: il confronto `target_pgid == own_pgid` (check 2) si basa
+/// sul solo `read_pgid(own_pid)`; questa enumerazione usa invece il `comm` REALE
+/// di OGNI membro del gruppo, criterio indipendente, e copre il caso in cui un
+/// qualunque servizio Nexus condivida il gruppo bersaglio (regola E: mai abbattere
+/// l'infrastruttura).
+async fn nexus_processes_in_group(pgid: u32) -> Vec<(u32, String)> {
+    const NEXUS_COMMS: &[&str] = &[
+        "mcp-core",
+        "brain",
+        "nexus-gateway",
+        "admin-service",
+        "chat-service",
+        "doc-service",
+        "billing-service",
+        "plugin-service",
+        "browser-bridge",
+    ];
+    let mut hits = Vec::new();
+    let mut entries = match tokio::fs::read_dir("/proc").await {
+        Ok(e) => e,
+        Err(_) => return hits,
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let pid: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+        if read_pgid(pid).await != Some(pgid) {
+            continue;
+        }
+        if let Some(comm) = read_comm(pid).await {
+            let c = comm.to_lowercase();
+            if NEXUS_COMMS.iter().any(|n| c.contains(n)) {
+                hits.push((pid, comm));
+            }
+        }
+    }
+    hits
+}
+
 /// Termina l'intero PROCESS GROUP di `pid` (SIGTERM, poi SIGKILL dopo 500ms se
 /// ancora vivo). Cosi' una catena `pnpm dev -> node -> vite` viene fermata per
 /// intero e il processo padre non rilancia il figlio che reggeva il listener
@@ -77,6 +120,11 @@ async fn read_comm(pid: u32) -> Option<String> {
 ///      che ha trovato un proprio thread). Abort.
 ///   3. comm != mcp-core: ultima difesa di identita' — se il nome del processo
 ///      e' "mcp-core" il PID e' stato riciclato per il binario stesso, abort.
+///   4. nessun servizio Nexus nel gruppo bersaglio: enumerazione EFFETTIVA dei
+///      membri del process group (comm reale, non solo confronto pgid del check 2);
+///      se contiene mcp-core/brain/gateway/microservizi, abort (incidente
+///      2026-06-06: una catena dev-server scambiata per duplicati portava a un
+///      kill di gruppo che abbatteva mcp-core).
 pub(crate) async fn kill_process_tree(pid: u32) {
     let own_pid = std::process::id();
 
@@ -123,6 +171,25 @@ pub(crate) async fn kill_process_tree(pid: u32) {
                 "kill_process_tree: RIFIUTO — il PGID del target coincide col gruppo di mcp-core (PID riciclato o spawn senza setsid)"
             );
             return;
+        }
+
+        // Check 4 (difesa-in-profondita'): enumerazione EFFETTIVA dei membri del
+        // process group bersaglio. Il check 2 confronta solo `read_pgid(own_pid)`;
+        // se un QUALSIASI servizio Nexus (non solo mcp-core) condividesse il gruppo
+        // bersaglio, il `kill -TERM -<pgid>` lo abbatterebbe. Verifica il comm reale
+        // dei membri e abort se trova infrastruttura Nexus (regola E, anti-suicidio).
+        if target_pgid > 1 {
+            let nexus_in_group = nexus_processes_in_group(target_pgid).await;
+            if !nexus_in_group.is_empty() {
+                tracing::error!(
+                    target = "port_recovery",
+                    pid,
+                    target_pgid,
+                    nexus_members = ?nexus_in_group,
+                    "kill_process_tree: RIFIUTO — il process group bersaglio contiene infrastruttura Nexus (anti-suicidio, regola E)"
+                );
+                return;
+            }
         }
     }
 

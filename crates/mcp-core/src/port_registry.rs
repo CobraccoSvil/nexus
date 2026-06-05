@@ -8,7 +8,7 @@
 //! Il registro viene consultato da `find_free_port()` per evitare conflitti
 //! e dagli endpoint API per assegnazioni manuali.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -554,15 +554,63 @@ fn read_start_time(pid: u32) -> Option<u64> {
     fields.get(19).and_then(|s| s.parse::<u64>().ok())
 }
 
+/// Legge il PPID (campo 4 globale di /proc/{pid}/stat) del processo. None se non
+/// leggibile/parsabile. Serve a riconoscere le catene padre-figlio fra dev-server
+/// della stessa cwd: un albero `pnpm dev -> node vite -> esbuild` ha UNA sola
+/// radice e NON va trattato come N duplicati (incidente 2026-06-06: il kill di
+/// gruppo di un anello della catena abbatteva l'intero process group, mcp-core
+/// incluso).
+fn read_ppid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit_once(')')?.1;
+    let mut fields = after.split_whitespace();
+    let _state = fields.next()?; // campo 3 (state)
+    fields.next()?.parse::<u32>().ok() // campo 4 (ppid)
+}
+
+/// Punto unico (regola L) della logica di dedup dei dev-server di una stessa cwd.
+/// Input: lista `(pid, start_time, ppid)` dei candidati di un gruppo cwd. Output:
+/// i PID delle RADICI da terminare (tutte le radici tranne la piu' recente).
+///
+/// Una "radice" e' un processo il cui padre NON e' un altro membro del gruppo: una
+/// catena `pnpm dev -> node vite -> esbuild` nella stessa cwd e' UN solo albero con
+/// UNA radice, quindi NON un duplicato (ritorna vuoto). Sono veri duplicati solo
+/// 2+ alberi con radici indipendenti: si tiene la radice piu' recente (start time
+/// piu' alto) e si terminano le altre. Estratta da `cleanup_duplicate_dev_servers`
+/// per essere testabile senza /proc reale e per fissare la regressione 2026-06-06
+/// (catena scambiata per duplicati -> kill di gruppo che abbatteva mcp-core).
+fn dev_server_roots_to_kill(procs: &[(u32, u64, u32)]) -> Vec<u32> {
+    if procs.len() < 2 {
+        return Vec::new();
+    }
+    let pids_in_group: HashSet<u32> = procs.iter().map(|(p, _, _)| *p).collect();
+    let mut roots: Vec<(u32, u64)> = procs
+        .iter()
+        .filter(|(_, _, ppid)| !pids_in_group.contains(ppid))
+        .map(|(p, s, _)| (*p, *s))
+        .collect();
+    if roots.len() < 2 {
+        return Vec::new();
+    }
+    // Ordina per start time decrescente: la prima radice e' la piu' recente, da tenere.
+    roots.sort_by(|a, b| b.1.cmp(&a.1));
+    roots.iter().skip(1).map(|(p, _)| *p).collect()
+}
+
 /// Termina i dev-server duplicati per progetto avviati fuori dal registry (es.
 /// `pnpm dev`/`vite` rilanciati a mano: Vite auto-incrementa la porta lasciando
 /// le istanze precedenti vive e non tracciate in `nexus_port_allocations`).
 ///
 /// Scansiona /proc, raggruppa i candidati per cwd risolto (= project_root sotto
-/// `/home/administrator/projects/`) e in ogni gruppo con piu' di un processo tiene
-/// solo il piu' recente (start time piu' alto), terminando gli altri via
-/// `kill_process_tree`. Ritorna quanti processi sono stati terminati. Gated da
-/// `agent.port_gc.dedupe_dev_servers` (regola G).
+/// `/home/administrator/projects/`) e, in ogni gruppo, individua le RADICI degli
+/// alberi di processo (un dev-server e' tipicamente la catena `pnpm dev -> node
+/// vite -> esbuild`: una sola radice). Se ci sono 2+ radici indipendenti sotto la
+/// stessa cwd tiene la piu' recente (start time piu' alto) e termina le altre via
+/// `kill_process_tree`. Deduplicare per radice (e non per singolo processo) evita
+/// di scambiare gli anelli figli di una catena per duplicati e di abbattere il
+/// process group del dev-server vivo (incidente 2026-06-06). Ritorna quanti
+/// processi sono stati terminati. Gated da `agent.port_gc.dedupe_dev_servers`
+/// (regola G).
 pub async fn cleanup_duplicate_dev_servers(db: &PgPool) -> u64 {
     let enabled = crate::settings::get_setting(db, "agent.port_gc.dedupe_dev_servers")
         .await
@@ -575,8 +623,9 @@ pub async fn cleanup_duplicate_dev_servers(db: &PgPool) -> u64 {
     }
 
     let own_pid = std::process::id();
-    // cwd risolto -> lista (pid, start_time).
-    let mut groups: HashMap<String, Vec<(u32, u64)>> = HashMap::new();
+    // cwd risolto -> lista (pid, start_time, ppid). Il ppid serve a distinguere
+    // i veri duplicati (alberi indipendenti) dalle catene padre-figlio.
+    let mut groups: HashMap<String, Vec<(u32, u64, u32)>> = HashMap::new();
 
     let entries = match std::fs::read_dir("/proc") {
         Ok(e) => e,
@@ -616,18 +665,19 @@ pub async fn cleanup_duplicate_dev_servers(db: &PgPool) -> u64 {
         }
 
         let start = read_start_time(pid).unwrap_or(0);
-        groups.entry(cwd_str).or_default().push((pid, start));
+        let ppid = read_ppid(pid).unwrap_or(0);
+        groups.entry(cwd_str).or_default().push((pid, start, ppid));
     }
 
     let mut killed = 0u64;
-    for (cwd, mut procs) in groups {
-        if procs.len() < 2 {
-            continue;
-        }
-        // Ordina per start time decrescente: il primo e' il piu' recente, da tenere.
-        procs.sort_by(|a, b| b.1.cmp(&a.1));
-        let keep = procs[0].0;
-        for (pid, _) in procs.iter().skip(1) {
+    for (cwd, procs) in groups {
+        // Dedup-per-radice nel punto unico testabile (regola L): ritorna i PID
+        // delle radici da terminare (vuoto se la cwd ha un solo albero/dev-server,
+        // es. la catena `pnpm dev -> node vite -> esbuild`). Evita di scambiare gli
+        // anelli figli per duplicati e di abbattere il process group del dev-server
+        // vivo, mcp-core incluso (incidente 2026-06-06).
+        let to_kill = dev_server_roots_to_kill(&procs);
+        for pid in &to_kill {
             // Anti-race: verifica che tra lo scan e la kill il PID non sia stato
             // riciclato (processo morto, kernel assegna lo stesso numero a un
             // nuovo processo non-dev-server, eventualmente mcp-core stesso).
@@ -662,8 +712,8 @@ pub async fn cleanup_duplicate_dev_servers(db: &PgPool) -> u64 {
             }
 
             info!(
-                "cleanup_duplicate_dev_servers: terminato dev-server duplicato pid={} cwd={} (tengo pid piu' recente {})",
-                pid, cwd, keep
+                "cleanup_duplicate_dev_servers: terminato dev-server duplicato (radice) pid={} cwd={}",
+                pid, cwd
             );
             crate::project_workspace::port_recovery::kill_process_tree(*pid).await;
             killed += 1;
@@ -737,4 +787,50 @@ fn extract_ports_from_unit_content(content: &str) -> Vec<u16> {
     ports.sort_unstable();
     ports.dedup();
     ports
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dev_server_roots_to_kill;
+
+    #[test]
+    fn catena_padre_figlio_non_e_duplicato() {
+        // pnpm(100) -> vite(200) -> esbuild(300): una sola radice (100, padre fuori
+        // gruppo). NON e' un duplicato, nessun kill. Fissa la regressione del
+        // 2026-06-06 (catena scambiata per duplicati -> suicidio di mcp-core).
+        let procs = vec![(100u32, 10u64, 1u32), (200, 20, 100), (300, 30, 200)];
+        assert!(dev_server_roots_to_kill(&procs).is_empty());
+    }
+
+    #[test]
+    fn due_alberi_indipendenti_sono_duplicati() {
+        // Due catene pnpm->vite indipendenti (radici 100 e 400, padri fuori gruppo).
+        // Tiene la radice piu' recente (400, start 40), termina l'altra (100).
+        let procs = vec![
+            (100u32, 10u64, 1u32),
+            (200, 20, 100),
+            (400, 40, 1),
+            (500, 50, 400),
+        ];
+        assert_eq!(dev_server_roots_to_kill(&procs), vec![100]);
+    }
+
+    #[test]
+    fn tre_radici_tiene_solo_la_piu_recente() {
+        // Tre radici indipendenti; tiene 20 (start 9, piu' recente), termina 10 e 30.
+        let procs = vec![(10u32, 5u64, 1u32), (20, 9, 1), (30, 7, 1)];
+        let mut k = dev_server_roots_to_kill(&procs);
+        k.sort_unstable();
+        assert_eq!(k, vec![10, 30]);
+    }
+
+    #[test]
+    fn singolo_processo_nessun_kill() {
+        assert!(dev_server_roots_to_kill(&[(1u32, 1u64, 0u32)]).is_empty());
+    }
+
+    #[test]
+    fn gruppo_vuoto_nessun_kill() {
+        assert!(dev_server_roots_to_kill(&[]).is_empty());
+    }
 }
