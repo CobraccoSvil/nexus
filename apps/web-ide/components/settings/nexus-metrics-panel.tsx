@@ -6,6 +6,14 @@ import { useThemeColors } from "../../lib/theme";
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 const POLL_INTERVAL_MS = 5000;
 
+interface PersistedTotals {
+  pairs: number;
+  visits: number;
+  successes: number;
+  failures: number;
+  avg_q_value: number;
+}
+
 interface RouterStats {
   total_decisions: number;
   exploration_count: number;
@@ -14,6 +22,8 @@ interface RouterStats {
   avg_decision_time_us: number;
   total_rewards: number;
   current_epsilon: number;
+  // Stato APPRESO persistente (DB nexus_q_values): non azzerato dai restart.
+  persisted?: PersistedTotals | null;
 }
 
 interface SchedulerStats {
@@ -162,8 +172,62 @@ export function NexusMetricsPanel() {
         </div>
       ) : (
         <>
+          {/* Stato APPRESO persistente (DB): sopravvive ai restart. Distingue
+              la "conoscenza" accumulata dalla mera attivita' di sessione, cosi'
+              un riavvio del backend non fa sembrare il router 'spento'. */}
+          {(() => {
+            const p = r?.persisted;
+            const successRate =
+              p && p.successes + p.failures > 0
+                ? pct(p.successes, p.successes + p.failures)
+                : "—";
+            return (
+              <>
+                <div style={{ fontSize: 12, fontWeight: 700, color: tc.textSecondary, marginBottom: 2 }}>
+                  Stato appreso (persistente)
+                </div>
+                <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 8 }}>
+                  Conoscenza Q-Learning accumulata nel DB — non si azzera ai riavvii del backend.
+                </div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
+                  <StatCard
+                    label="Coppie task/agent"
+                    value={p ? p.pairs : "—"}
+                    sub="apprese"
+                    color="#a855f7"
+                    tc={tc}
+                  />
+                  <StatCard
+                    label="Visite totali"
+                    value={p ? p.visits : "—"}
+                    sub="cumulate (tutte le sessioni)"
+                    color="#a855f7"
+                    tc={tc}
+                  />
+                  <StatCard
+                    label="Tasso successo"
+                    value={successRate}
+                    sub={p ? `${p.successes} ok / ${p.failures} ko` : "—"}
+                    color="#22c55e"
+                    tc={tc}
+                  />
+                  <StatCard
+                    label="Q-value medio"
+                    value={p ? p.avg_q_value.toFixed(3) : "—"}
+                    sub="media appresa"
+                    color="#06b6d4"
+                    tc={tc}
+                  />
+                </div>
+              </>
+            );
+          })()}
+
           {/* Router Q-Learning stats */}
-          <div style={{ fontSize: 12, fontWeight: 700, color: tc.textSecondary, marginBottom: 8 }}>Router Q-Learning</div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: tc.textSecondary, marginBottom: 2 }}>Router Q-Learning — sessione corrente</div>
+          <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 8 }}>
+            Contatori da quando il backend e&apos; stato avviato (azzerati a ogni restart).
+          </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
             <StatCard
               label="Decisioni totali"

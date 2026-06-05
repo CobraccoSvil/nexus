@@ -154,12 +154,23 @@ fn mask_settings(settings: Vec<Setting>) -> Vec<serde_json::Value> {
 pub async fn list_settings(State(state): State<super::AppState>) -> Json<serde_json::Value> {
     ensure_required_settings(&state).await;
 
-    let settings = sqlx::query_as::<_, Setting>(
+    // Fix S87: prima .unwrap_or_default() mostrava "0 settings" su DB down,
+    // l'admin pensava di dover ripopolare. Ora logga + ritorna lista vuota
+    // ma con flag che il chiamante puo' tracciare (regola H pragmatica:
+    // signature Json<Value> non puo' diventare ApiResult senza rompere il
+    // router; almeno l'errore appare nei log con livello WARN).
+    let settings = match sqlx::query_as::<_, Setting>(
         "SELECT key, value, category, description, is_secret, updated_at FROM settings ORDER BY category, key",
     )
     .fetch_all(&state.db)
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("list_settings: SELECT settings fallito: {}", e);
+            Vec::new()
+        }
+    };
 
     let masked = mask_settings(settings);
 
@@ -173,13 +184,20 @@ pub async fn list_by_category(
 ) -> Json<serde_json::Value> {
     ensure_required_settings(&state).await;
 
-    let settings = sqlx::query_as::<_, Setting>(
+    // Fix S87: vedi list_settings.
+    let settings = match sqlx::query_as::<_, Setting>(
         "SELECT key, value, category, description, is_secret, updated_at FROM settings WHERE category = $1 ORDER BY key",
     )
     .bind(&category)
     .fetch_all(&state.db)
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("list_by_category({}): SELECT fallito: {}", category, e);
+            Vec::new()
+        }
+    };
 
     let masked = mask_settings(settings);
 
@@ -347,9 +365,15 @@ pub async fn get_raw_value(
     Path(key): Path<String>,
 ) -> Json<serde_json::Value> {
     // Lettura via punto unico (regola L / ADR 0026).
-    let value = nexus_auth::get_setting(&state.db, &key)
-        .await
-        .unwrap_or_default();
+    // Fix S87: uso la variante _checked che propaga errori DB invece di
+    // ingoiarli silenziosamente. Su Err logga + ritorna "".
+    let value = match nexus_auth::get_setting_checked(&state.db, &key).await {
+        Ok(opt) => opt.unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("get_raw_value({}): get_setting_checked fallito: {}", key, e);
+            String::new()
+        }
+    };
 
     Json(serde_json::json!({ "key": key, "value": value }))
 }

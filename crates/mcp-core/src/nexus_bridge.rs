@@ -866,6 +866,38 @@ impl NexusBridge {
         self.router.stats()
     }
 
+    /// Totali CUMULATIVI dell'apprendimento Q-Learning letti da `nexus_q_values`
+    /// (PostgreSQL). A differenza di `router_stats()` (contatori in-memory
+    /// azzerati a ogni restart del processo), questi sopravvivono ai riavvii e
+    /// rappresentano la "conoscenza" appresa: # coppie task/agent, visite totali,
+    /// successi/fallimenti, Q-value medio. Usati dal pannello metriche per
+    /// distinguere "attivita' di sessione" da "stato appreso persistente"
+    /// (un restart non deve far sembrare il router 'spento').
+    ///
+    /// Ritorna `None` se non c'e' pool o la query fallisce (best-effort).
+    pub async fn q_learning_persisted_totals(&self) -> Option<serde_json::Value> {
+        let pool = self.pool.as_ref()?;
+        let row = sqlx::query_as::<_, (i64, Option<i64>, Option<i64>, Option<i64>, Option<f32>)>(
+            r#"SELECT
+                 count(*)                       AS pairs,
+                 COALESCE(sum(visit_count), 0)   AS visits,
+                 COALESCE(sum(success_count), 0) AS successes,
+                 COALESCE(sum(failure_count), 0) AS failures,
+                 AVG(q_value)::real              AS avg_q
+               FROM nexus_q_values"#,
+        )
+        .fetch_one(pool.as_ref())
+        .await
+        .ok()?;
+        Some(serde_json::json!({
+            "pairs": row.0,
+            "visits": row.1.unwrap_or(0),
+            "successes": row.2.unwrap_or(0),
+            "failures": row.3.unwrap_or(0),
+            "avg_q_value": row.4.unwrap_or(0.0),
+        }))
+    }
+
     /// Statistiche dei learning workers
     pub fn scheduler_stats(&self) -> nexus_orchestrator::SchedulerStats {
         self.scheduler.stats()
@@ -1005,6 +1037,9 @@ pub async fn nexus_stats() -> impl IntoResponse {
 
     let r = bridge.router_stats();
     let s = bridge.scheduler_stats();
+    // Totali cumulativi persistiti (sopravvivono ai restart): distinguono lo
+    // stato APPRESO dalla mera attivita' di sessione (vedi metodo sopra).
+    let persisted = bridge.q_learning_persisted_totals().await;
 
     // Per-worker stats serializzate manualmente (no Serialize derive)
     let mut per_worker = serde_json::Map::new();
@@ -1031,6 +1066,8 @@ pub async fn nexus_stats() -> impl IntoResponse {
                 "avg_decision_time_us": r.avg_decision_time_us,
                 "total_rewards": r.total_rewards,
                 "current_epsilon": r.current_epsilon,
+                // Stato APPRESO persistente (DB): non azzerato dai restart.
+                "persisted": persisted,
             },
             "scheduler": {
                 "workers_registered": bridge.scheduler().len(),

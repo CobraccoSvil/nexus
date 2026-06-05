@@ -88,9 +88,13 @@ pub async fn create_directory(Json(body): Json<CreateDirectoryRequest>) -> ApiRe
 pub async fn list_settings(State(state): State<AppState>) -> Json<Value> {
     ensure_required_settings(&state).await;
 
-    let settings = sqlx::query_as::<_, Setting>(
+    // Fix S87: prima .unwrap_or_default() mostrava "0 settings" su DB down.
+    let settings = match sqlx::query_as::<_, Setting>(
         "SELECT key, value, category, description, is_secret, updated_at FROM settings ORDER BY category, key",
-    ).fetch_all(&state.db).await.unwrap_or_default();
+    ).fetch_all(&state.db).await {
+        Ok(rows) => rows,
+        Err(e) => { tracing::warn!("list_settings: SELECT fallito: {}", e); Vec::new() }
+    };
 
     let masked: Vec<Value> = settings.into_iter().map(|s| {
         let display_value = if s.is_secret && !s.value.is_empty() {
@@ -108,9 +112,13 @@ pub async fn list_by_category(
 ) -> Json<Value> {
     ensure_required_settings(&state).await;
 
-    let settings = sqlx::query_as::<_, Setting>(
+    // Fix S87: vedi list_settings.
+    let settings = match sqlx::query_as::<_, Setting>(
         "SELECT key, value, category, description, is_secret, updated_at FROM settings WHERE category = $1 ORDER BY key",
-    ).bind(&category).fetch_all(&state.db).await.unwrap_or_default();
+    ).bind(&category).fetch_all(&state.db).await {
+        Ok(rows) => rows,
+        Err(e) => { tracing::warn!("list_by_category({}): SELECT fallito: {}", category, e); Vec::new() }
+    };
 
     let masked: Vec<Value> = settings.into_iter().map(|s| {
         let display_value = if s.is_secret && !s.value.is_empty() {
@@ -178,7 +186,11 @@ pub async fn get_raw_value(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> Json<Value> {
-    let value = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind(&key).fetch_optional(&state.db).await.ok().flatten().unwrap_or_default();
+    // Fix S87: prima ingoiava silenziosamente errore DB.
+    let value = match sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
+        .bind(&key).fetch_optional(&state.db).await {
+        Ok(opt) => opt.unwrap_or_default(),
+        Err(e) => { tracing::warn!("get_raw_value({}): SELECT fallito: {}", key, e); String::new() }
+    };
     Json(json!({ "key": key, "value": value }))
 }
