@@ -325,15 +325,80 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
   );
 
   // ─── Render ──────────────────────────────────────────────────────────
-  const treeWidth = isDesktop ? 250 : isTablet ? 220 : 280;
-  const railWidth = 300;
+  // Larghezze pannelli (tree sinistro + rail destro): default sensati per
+  // breakpoint, override utente persistito in localStorage. Min 160px (tree)
+  // / 220px (rail) per restare usabili; max 720px per non comprimere il main.
+  const DEFAULT_TREE = isDesktop ? 250 : isTablet ? 220 : 280;
+  const DEFAULT_RAIL = 300;
+  const PANE_MIN_TREE = 160;
+  const PANE_MIN_RAIL = 220;
+  const PANE_MAX = 720;
+
+  const [treeWidth, setTreeWidth] = React.useState<number>(() => {
+    if (typeof window === "undefined") return DEFAULT_TREE;
+    const raw = window.localStorage.getItem("nexus.wiki.tree.width");
+    const n = raw ? parseInt(raw, 10) : NaN;
+    return Number.isFinite(n) && n >= PANE_MIN_TREE && n <= PANE_MAX ? n : DEFAULT_TREE;
+  });
+  const [railWidth, setRailWidth] = React.useState<number>(() => {
+    if (typeof window === "undefined") return DEFAULT_RAIL;
+    const raw = window.localStorage.getItem("nexus.wiki.rail.width");
+    const n = raw ? parseInt(raw, 10) : NaN;
+    return Number.isFinite(n) && n >= PANE_MIN_RAIL && n <= PANE_MAX ? n : DEFAULT_RAIL;
+  });
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("nexus.wiki.tree.width", String(treeWidth));
+  }, [treeWidth]);
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("nexus.wiki.rail.width", String(railWidth));
+  }, [railWidth]);
+
+  /** Drag handler riusabile per i divisori dei pannelli. `dir` definisce
+   *  se il pannello cresce verso destra (tree) o verso sinistra (rail). */
+  const startPaneDrag = React.useCallback(
+    (
+      ev: React.MouseEvent,
+      current: number,
+      setter: (n: number) => void,
+      dir: "right" | "left",
+      min: number,
+    ) => {
+      ev.preventDefault();
+      const startX = ev.clientX;
+      const startW = current;
+      const move = (e: MouseEvent) => {
+        const delta = e.clientX - startX;
+        const next = dir === "right" ? startW + delta : startW - delta;
+        setter(Math.max(min, Math.min(PANE_MAX, next)));
+      };
+      const up = () => {
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+      document.body.style.cursor = "col-resize";
+      // Evita selezione testo accidentale durante il drag.
+      document.body.style.userSelect = "none";
+    },
+    [PANE_MAX],
+  );
 
   const treeColumn = (
     <aside
       style={{
+        // flex 0 + width fissa (non shrinkare), cosi' la larghezza driven da
+        // state non viene compressa dal flex layout quando il main e' grande.
+        flex: "0 0 auto",
         width: isMobile ? "100%" : treeWidth,
         minWidth: 0,
-        borderRight: !isMobile ? `1px solid ${tc.border}` : undefined,
+        // borderRight rimosso su desktop: il PaneResizer (6px col-resize)
+        // funge da bordo. Su mobile/tablet (drawer) lo manteniamo.
+        borderRight: isMobile ? undefined : isTablet ? `1px solid ${tc.border}` : undefined,
         background: tc.bgCard,
         display: "flex",
         flexDirection: "column",
@@ -384,9 +449,13 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
   const rail = (
     <aside
       style={{
+        // flex 0 + width fissa, vedi commento in treeColumn.
+        flex: "0 0 auto",
         width: isMobile ? "100%" : railWidth,
         minWidth: 0,
-        borderLeft: !isMobile ? `1px solid ${tc.border}` : undefined,
+        // borderLeft rimosso su desktop: il PaneResizer e' il bordo. Sui
+        // drawer (mobile) lo manteniamo.
+        borderLeft: undefined,
         background: tc.bgCard,
         padding: "12px 14px",
         overflowY: "auto",
@@ -758,6 +827,15 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
       }}
     >
       {isDesktop && treeColumn}
+      {isDesktop && (
+        <PaneResizer
+          tc={tc}
+          onMouseDown={(e) =>
+            startPaneDrag(e, treeWidth, setTreeWidth, "right", PANE_MIN_TREE)
+          }
+          title="Trascina per ridimensionare la sidebar"
+        />
+      )}
       {isTablet && treeColumn}
       {mainContent}
       {/* La rail destra (metadata/tag/backlink del documento) ha senso solo
@@ -765,6 +843,15 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
        *  (triples / graph) la nascondiamo cosi' la tabella/grafo usa tutto lo
        *  spazio rimanente (richiesta UX: "la lista deve occupare tutto lo
        *  spazio"). */}
+      {isDesktop && tab !== "triples" && tab !== "graph" && (
+        <PaneResizer
+          tc={tc}
+          onMouseDown={(e) =>
+            startPaneDrag(e, railWidth, setRailWidth, "left", PANE_MIN_RAIL)
+          }
+          title="Trascina per ridimensionare il pannello dettagli"
+        />
+      )}
       {isDesktop && tab !== "triples" && tab !== "graph" && rail}
 
       {/* Drawer mobile / tablet */}
@@ -786,6 +873,41 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 type Translator = ReturnType<typeof useI18n>["t"];
+
+/** Divisore verticale draggabile tra due pannelli del layout (tree | main | rail).
+ *  Larghezza 6px con indicatore visivo (border laterale) + hit area allargata
+ *  via padding implicito; cursor col-resize. Il drag handler vero e' iniettato
+ *  dal genitore via `onMouseDown` cosi' lo stato delle larghezze resta li'
+ *  (single source of truth + persistenza localStorage). */
+function PaneResizer({
+  tc,
+  onMouseDown,
+  title,
+}: {
+  tc: ThemeColors;
+  onMouseDown: (ev: React.MouseEvent) => void;
+  title?: string;
+}) {
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      title={title}
+      onMouseDown={onMouseDown}
+      style={{
+        flex: "0 0 auto",
+        width: 6,
+        height: "100%",
+        cursor: "col-resize",
+        // Indicatore visivo del divisore: barra sottile centrata del colore
+        // del border. Hover non e' inline (no JS), ma l'utente trova il
+        // divisore grazie al cursor + al colore del bordo gia' presente.
+        background: tc.border,
+        userSelect: "none",
+      }}
+    />
+  );
+}
 
 function RailSection({ title, children }: { title: string; children: React.ReactNode }) {
   const tc = useThemeColors();
