@@ -65,12 +65,7 @@ fn walk_todos(
         }
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.')
-            || name == "node_modules"
-            || name == "target"
-            || name == "dist"
-            || name == "build"
-        {
+        if super::is_skipped_dir(&name) {
             continue;
         }
         let meta = match entry.metadata() {

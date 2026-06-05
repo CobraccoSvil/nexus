@@ -123,18 +123,11 @@ pub async fn create_directory(Json(body): Json<CreateDirectoryRequest>) -> ApiRe
     })))
 }
 
-/// GET /api/settings — all settings (secrets are masked)
-pub async fn list_settings(State(state): State<super::AppState>) -> Json<serde_json::Value> {
-    ensure_required_settings(&state).await;
-
-    let settings = sqlx::query_as::<_, Setting>(
-        "SELECT key, value, category, description, is_secret, updated_at FROM settings ORDER BY category, key",
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-
-    let masked: Vec<serde_json::Value> = settings
+/// Mascheramento valori secret per la response JSON: prima/ultime 4 lettere + `****`.
+/// Punto unico (regola L, S23) per i 2 handler `list_settings` e `list_by_category`
+/// che applicavano lo stesso identico mapping.
+fn mask_settings(settings: Vec<Setting>) -> Vec<serde_json::Value> {
+    settings
         .into_iter()
         .map(|s| {
             let display_value = if s.is_secret && !s.value.is_empty() {
@@ -154,7 +147,21 @@ pub async fn list_settings(State(state): State<super::AppState>) -> Json<serde_j
                 "has_value": !s.value.is_empty(),
             })
         })
-        .collect();
+        .collect()
+}
+
+/// GET /api/settings — all settings (secrets are masked)
+pub async fn list_settings(State(state): State<super::AppState>) -> Json<serde_json::Value> {
+    ensure_required_settings(&state).await;
+
+    let settings = sqlx::query_as::<_, Setting>(
+        "SELECT key, value, category, description, is_secret, updated_at FROM settings ORDER BY category, key",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let masked = mask_settings(settings);
 
     Json(serde_json::json!({ "settings": masked }))
 }
@@ -174,27 +181,7 @@ pub async fn list_by_category(
     .await
     .unwrap_or_default();
 
-    let masked: Vec<serde_json::Value> = settings
-        .into_iter()
-        .map(|s| {
-            let display_value = if s.is_secret && !s.value.is_empty() {
-                format!("{}...{}", &s.value[..4.min(s.value.len())], "****")
-            } else if s.is_secret {
-                String::new()
-            } else {
-                s.value.clone()
-            };
-            serde_json::json!({
-                "key": s.key,
-                "value": display_value,
-                "category": s.category,
-                "description": s.description,
-                "is_secret": s.is_secret,
-                "updated_at": s.updated_at,
-                "has_value": !s.value.is_empty(),
-            })
-        })
-        .collect();
+    let masked = mask_settings(settings);
 
     Json(serde_json::json!({ "settings": masked }))
 }

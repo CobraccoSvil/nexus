@@ -25,6 +25,17 @@
 pub mod exec;
 pub mod parse_ndjson;
 
+/// Directory che vengono SEMPRE saltate dai tool che scansionano il filesystem
+/// (find_todos, fs_grep, ecc.). Punto unico (regola L, S24): prima ogni walk
+/// aveva la sua catena di `name == "node_modules" || name == "target" || ...`.
+pub fn is_skipped_dir(name: &str) -> bool {
+    name.starts_with('.')
+        || name == "node_modules"
+        || name == "target"
+        || name == "dist"
+        || name == "build"
+}
+
 // ── Rust toolchain ────────────────────────────────────────────────────────
 pub mod rustc_explain;
 pub mod rustc_version;
@@ -440,6 +451,7 @@ pub mod project_db_vacuum;
 pub mod docker_build;
 pub mod docker_compose_down;
 pub mod docker_compose_up;
+pub mod docker_helpers;
 pub mod docker_logs;
 pub mod docker_ps;
 pub mod docker_rm;

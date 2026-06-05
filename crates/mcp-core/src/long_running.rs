@@ -4,33 +4,13 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-#[serde(rename_all = "camelCase")]
-pub struct LongRunningPattern {
-    pub id: uuid::Uuid,
-    pub pattern: String,
-    pub description: String,
-    pub enabled: bool,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CreatePatternRequest {
-    pub pattern: String,
-    #[serde(default)]
-    pub description: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdatePatternRequest {
-    pub pattern: Option<String>,
-    pub description: Option<String>,
-    pub enabled: Option<bool>,
-}
+// Tipi DTO: punto unico in nexus_types::long_running_dto (regola L, S21).
+pub use nexus_types::long_running_dto::{
+    CreatePatternRequest, LongRunningPattern, UpdatePatternRequest,
+};
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
 

@@ -3,6 +3,50 @@
 import type { Theme } from "../../lib/theme";
 import type { ConnFields } from "./db-helpers";
 
+/** Stile input compatto del wizard (regola L, S26): prima ripetuto inline su 8+ input. */
+function fieldInputStyle(tc: Theme): React.CSSProperties {
+  return {
+    padding: "5px 7px",
+    fontSize: 11,
+    background: tc.bg,
+    color: tc.text,
+    border: `1px solid ${tc.border}`,
+    borderRadius: 4,
+  };
+}
+
+/** Label + input compatto del wizard, con stile uniforme. */
+function WizardField({
+  tc,
+  label,
+  type = "text",
+  value,
+  onChange,
+  placeholder,
+  flex,
+}: {
+  tc: Theme;
+  label: string;
+  type?: "text" | "password";
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  flex?: number;
+}) {
+  return (
+    <div style={{ flex, display: "flex", flexDirection: "column", gap: 4 }}>
+      <label style={{ fontSize: 10, color: tc.textMuted }}>{label}</label>
+      <input
+        type={type}
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        style={fieldInputStyle(tc)}
+      />
+    </div>
+  );
+}
+
 interface Props {
   tc: Theme;
   provStep: "where" | "how";
@@ -137,27 +181,23 @@ export function CreateDbWizard({
 
         {provStep === "how" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <label style={{ fontSize: 10, color: tc.textMuted }}>Nome connessione logica</label>
-              <input
-                type="text"
-                value={provName}
-                placeholder="primary"
-                onChange={(e) => setProvName(e.target.value)}
-                style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-              />
-            </div>
+            <WizardField
+              tc={tc}
+              label="Nome connessione logica"
+              value={provName}
+              onChange={setProvName}
+              placeholder="primary"
+            />
 
             {provMode === "internal" && (
               <>
                 <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  <label style={{ fontSize: 10, color: tc.textMuted }}>Nome del database</label>
-                  <input
-                    type="text"
+                  <WizardField
+                    tc={tc}
+                    label="Nome del database"
                     value={provDbName}
+                    onChange={setProvDbName}
                     placeholder={slugSuggestion}
-                    onChange={(e) => setProvDbName(e.target.value)}
-                    style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
                   />
                   <div style={{ fontSize: 10, color: tc.textMuted }}>
                     Suggerito dallo slug del progetto. Caratteri non validi vengono sostituiti con underscore.
@@ -165,11 +205,7 @@ export function CreateDbWizard({
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                   <label style={{ fontSize: 10, color: tc.textMuted }}>Engine</label>
-                  <select
-                    value="postgres"
-                    disabled
-                    style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-                  >
+                  <select value="postgres" disabled style={fieldInputStyle(tc)}>
                     <option value="postgres">PostgreSQL</option>
                   </select>
                 </div>
@@ -183,7 +219,7 @@ export function CreateDbWizard({
                   <select
                     value={provEngine}
                     onChange={(e) => setProvEngine(e.target.value)}
-                    style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
+                    style={fieldInputStyle(tc)}
                   >
                     <option value="postgres">PostgreSQL</option>
                     <option value="mysql">MySQL</option>
@@ -193,34 +229,25 @@ export function CreateDbWizard({
                 </div>
                 {provEngine !== "sqlite" && (
                   <div style={{ display: "flex", gap: 6 }}>
-                    <div style={{ flex: 2, display: "flex", flexDirection: "column", gap: 4 }}>
-                      <label style={{ fontSize: 10, color: tc.textMuted }}>Host</label>
-                      <input type="text" value={provExt.host} onChange={(e) => setProvExt((p) => ({ ...p, host: e.target.value }))}
-                        style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }} />
-                    </div>
-                    <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
-                      <label style={{ fontSize: 10, color: tc.textMuted }}>Porta</label>
-                      <input type="text" value={provExt.port} onChange={(e) => setProvExt((p) => ({ ...p, port: e.target.value }))}
-                        style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }} />
-                    </div>
+                    <WizardField tc={tc} label="Host" value={provExt.host} flex={2}
+                      onChange={(v) => setProvExt((p) => ({ ...p, host: v }))} />
+                    <WizardField tc={tc} label="Porta" value={provExt.port} flex={1}
+                      onChange={(v) => setProvExt((p) => ({ ...p, port: v }))} />
                   </div>
                 )}
-                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  <label style={{ fontSize: 10, color: tc.textMuted }}>{provEngine === "sqlite" ? "Percorso file" : "Nome database"}</label>
-                  <input type="text" value={provExt.database} onChange={(e) => setProvExt((p) => ({ ...p, database: e.target.value }))}
-                    style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }} />
-                </div>
+                <WizardField
+                  tc={tc}
+                  label={provEngine === "sqlite" ? "Percorso file" : "Nome database"}
+                  value={provExt.database}
+                  onChange={(v) => setProvExt((p) => ({ ...p, database: v }))}
+                />
                 {provEngine !== "sqlite" && (
                   <div style={{ display: "flex", gap: 6 }}>
-                    <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
-                      <label style={{ fontSize: 10, color: tc.textMuted }}>Utente</label>
-                      <input type="text" value={provExt.username} onChange={(e) => setProvExt((p) => ({ ...p, username: e.target.value }))}
-                        style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }} />
-                    </div>
-                    <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
-                      <label style={{ fontSize: 10, color: tc.textMuted }}>Password</label>
-                      <input type="password" value={provExt.password} onChange={(e) => setProvExt((p) => ({ ...p, password: e.target.value }))}
-                        style={{ padding: "5px 7px", fontSize: 11, background: tc.bg, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }} />
+                    <WizardField tc={tc} label="Utente" value={provExt.username} flex={1}
+                      onChange={(v) => setProvExt((p) => ({ ...p, username: v }))} />
+                    <div style={{ flex: 1 }}>
+                    <WizardField tc={tc} label="Password" type="password" value={provExt.password}
+                      onChange={(v) => setProvExt((p) => ({ ...p, password: v }))} />
                     </div>
                   </div>
                 )}

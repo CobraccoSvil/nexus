@@ -17,10 +17,7 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
         // Il path e' confinato rigorosamente alla project_root in
         // static_preview::serve_preview (regola E). `*path` cattura l'intero
         // sotto-percorso; path vuoto -> index.html.
-        .route(
-            "/preview/:project_id/*path",
-            get(static_preview::serve_preview),
-        )
+        .route("/preview/*rest", get(static_preview::serve_preview))
         // Nexus (Fase 8) — observability endpoint pubblici
         .route("/nexus/healthz", get(nexus_bridge::nexus_healthz))
         .route("/nexus/stats", get(nexus_bridge::nexus_stats))

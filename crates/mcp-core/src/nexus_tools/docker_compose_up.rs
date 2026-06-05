@@ -10,29 +10,8 @@ use serde_json::{json, Value};
 
 pub struct DockerComposeUpTool;
 
-fn validate_compose_path(
-    root: &std::path::Path,
-    compose_file: &str,
-) -> Result<String, NexusToolError> {
-    if compose_file.is_empty() {
-        return Err(NexusToolError::BadInput(
-            "Parametro 'compose_file' obbligatorio. Non e' permesso usare compose globali.".into(),
-        ));
-    }
-
-    let full = root.join(compose_file);
-    let canonical = full.canonicalize().map_err(|_| {
-        NexusToolError::BadInput(format!("File compose '{}' non trovato", compose_file))
-    })?;
-
-    if !canonical.starts_with(root) {
-        return Err(NexusToolError::BadInput(
-            "File compose fuori dalla root del progetto. Path traversal non permesso.".into(),
-        ));
-    }
-
-    Ok(canonical.to_string_lossy().to_string())
-}
+// validate_compose_path: punto unico in docker_helpers (regola L, step S32).
+use super::docker_helpers::validate_compose_path;
 
 #[async_trait]
 impl NexusToolHandler for DockerComposeUpTool {

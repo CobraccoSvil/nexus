@@ -125,40 +125,25 @@ export default function NexusDatabasePage() {
 
       {data && (
         <>
-          {/* Statistiche generali */}
+          {/* Statistiche generali — 4 card con stessa shape (regola L, S25). */}
           <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 28 }}>
-            <div style={statCardStyle}>
-              <div style={{ fontSize: 11, color: tc.textMuted, textTransform: "uppercase", letterSpacing: "0.08em" }}>
-                Dimensione DB
+            {(
+              [
+                ["Dimensione DB", formatMB(data.stats.database_size_mb)],
+                ["Righe totali", data.stats.total_rows.toLocaleString("it-IT")],
+                ["Connessioni attive", String(data.stats.active_connections)],
+                ["Tabelle monitorate", String(data.stats.table_count)],
+              ] as const
+            ).map(([label, value]) => (
+              <div key={label} style={statCardStyle}>
+                <div style={{ fontSize: 11, color: tc.textMuted, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                  {label}
+                </div>
+                <div style={{ fontSize: 26, fontWeight: 700, marginTop: 6, color: tc.accent }}>
+                  {value}
+                </div>
               </div>
-              <div style={{ fontSize: 26, fontWeight: 700, marginTop: 6, color: tc.accent }}>
-                {formatMB(data.stats.database_size_mb)}
-              </div>
-            </div>
-            <div style={statCardStyle}>
-              <div style={{ fontSize: 11, color: tc.textMuted, textTransform: "uppercase", letterSpacing: "0.08em" }}>
-                Righe totali
-              </div>
-              <div style={{ fontSize: 26, fontWeight: 700, marginTop: 6, color: tc.accent }}>
-                {data.stats.total_rows.toLocaleString("it-IT")}
-              </div>
-            </div>
-            <div style={statCardStyle}>
-              <div style={{ fontSize: 11, color: tc.textMuted, textTransform: "uppercase", letterSpacing: "0.08em" }}>
-                Connessioni attive
-              </div>
-              <div style={{ fontSize: 26, fontWeight: 700, marginTop: 6, color: tc.accent }}>
-                {data.stats.active_connections}
-              </div>
-            </div>
-            <div style={statCardStyle}>
-              <div style={{ fontSize: 11, color: tc.textMuted, textTransform: "uppercase", letterSpacing: "0.08em" }}>
-                Tabelle monitorate
-              </div>
-              <div style={{ fontSize: 26, fontWeight: 700, marginTop: 6, color: tc.accent }}>
-                {data.stats.table_count}
-              </div>
-            </div>
+            ))}
           </div>
 
           {/* Ricerca e ordinamento */}

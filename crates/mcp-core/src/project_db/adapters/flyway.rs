@@ -1,6 +1,6 @@
 //! Adapter Flyway (JVM) — crea migration nel formato `V<ver>__<nome>.sql`.
 
-use super::{sha256_hex, MigrationAdapter};
+use super::MigrationAdapter;
 use crate::project_db::{
     AppliedMigration, Migration, ProjectDbContext, ProjectDbError, RolledBackMigration,
 };
@@ -12,35 +12,11 @@ pub struct FlywayAdapter;
 #[async_trait]
 impl MigrationAdapter for FlywayAdapter {
     async fn list_pending(&self, ctx: &ProjectDbContext) -> Result<Vec<Migration>, ProjectDbError> {
-        let dir = ctx.project_root.join(&ctx.migration_path);
-        if !dir.exists() {
-            return Ok(vec![]);
-        }
-        let mut files: Vec<_> = std::fs::read_dir(&dir)?
-            .flatten()
-            .filter(|e| {
-                let n = e.file_name().to_string_lossy().to_string();
-                (n.starts_with('V') || n.starts_with('R')) && n.ends_with(".sql")
-            })
-            .collect();
-        files.sort_by_key(|e| e.file_name());
-        let mut result = Vec::new();
-        for entry in files {
-            let path = entry.path();
-            let content = std::fs::read_to_string(&path).unwrap_or_default();
-            let filename = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            result.push(Migration {
-                filename: filename.clone(),
-                checksum: sha256_hex(&content),
-                description: Some(filename.clone()),
-                sql: Some(content),
-            });
-        }
-        Ok(result)
+        super::list_pending_files(
+            ctx,
+            |n| (n.starts_with('V') || n.starts_with('R')) && n.ends_with(".sql"),
+            true,
+        )
     }
 
     async fn create_migration(
