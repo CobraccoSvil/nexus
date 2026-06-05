@@ -2,6 +2,7 @@
 
 import { useTheme, useThemeColors, type ThemeMode } from "../../../lib/theme";
 import { useI18n } from "../../../lib/i18n";
+import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
 
 export default function AppearancePage() {
   const { mode, setMode } = useTheme();
@@ -16,10 +17,10 @@ export default function AppearancePage() {
 
   return (
     <div>
-      <h1 style={{ fontSize: 20, fontWeight: 600, marginBottom: 6 }}>{t("admin.appearance")}</h1>
-      <p style={{ color: tc.textMuted, fontSize: 13, marginBottom: 28 }}>
-        {t("admin.appearance.desc")}
-      </p>
+      <AdminPageHeader
+        title={t("admin.appearance")}
+        description={t("admin.appearance.desc")}
+      />
 
       <div style={{ display: "flex", gap: 16 }}>
         {options.map((opt) => {

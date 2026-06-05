@@ -8,10 +8,16 @@ const PROTECTED_PREFIX: &str = "ideai-";
 
 /// Vieta operazioni distruttive sui container infrastrutturali (prefix `ideai-`).
 pub fn validate_not_protected(name: &str) -> Result<(), NexusToolError> {
+    validate_not_protected_with_verb(name, "rimuoverlo")
+}
+
+/// Variante di `validate_not_protected` con verbo personalizzabile per il
+/// messaggio errore (es. "fermarlo", "rimuoverlo").
+pub fn validate_not_protected_with_verb(name: &str, verb: &str) -> Result<(), NexusToolError> {
     if name.starts_with(PROTECTED_PREFIX) {
         return Err(NexusToolError::BadInput(format!(
-            "Container '{}' e' infrastruttura Nexus. VIETATO rimuoverlo.",
-            name
+            "Container '{}' e' infrastruttura Nexus. VIETATO {}.",
+            name, verb
         )));
     }
     Ok(())
@@ -46,11 +52,12 @@ pub fn validate_compose_path(
 
 /// Verifica che `name` sia un container appartenente al `slug` del progetto
 /// (label `com.docker.compose.project`). Rifiuta operazioni su container di
-/// altri progetti.
-pub async fn verify_container_label(
+/// altri progetti, con `action` (es. "Stop negato.") concatenata al messaggio.
+pub async fn verify_container_label_with_action(
     name: &str,
     slug: &str,
     project_root: &std::path::Path,
+    action_msg: &str,
 ) -> Result<(), NexusToolError> {
     let out = exec::run_cmd(
         "docker",
@@ -68,9 +75,18 @@ pub async fn verify_container_label(
     let container_slug = out.stdout.trim();
     if container_slug != slug {
         return Err(NexusToolError::BadInput(format!(
-            "Container '{}' non appartiene al progetto corrente. Rimozione negata.",
-            name
+            "Container '{}' non appartiene al progetto corrente. {}",
+            name, action_msg
         )));
     }
     Ok(())
+}
+
+/// Variante "rimozione" usata dalle operazioni distruttive (docker_rm).
+pub async fn verify_container_label(
+    name: &str,
+    slug: &str,
+    project_root: &std::path::Path,
+) -> Result<(), NexusToolError> {
+    verify_container_label_with_action(name, slug, project_root, "Rimozione negata.").await
 }

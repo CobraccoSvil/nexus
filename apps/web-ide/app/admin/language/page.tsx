@@ -2,6 +2,7 @@
 
 import { useThemeColors } from "../../../lib/theme";
 import { useI18n, LOCALE_LABELS, type Locale } from "../../../lib/i18n";
+import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
 
 const locales: { code: Locale; flag: string }[] = [
   { code: "en", flag: "EN" },
@@ -15,10 +16,10 @@ export default function LanguagePage() {
 
   return (
     <div>
-      <h1 style={{ fontSize: 20, fontWeight: 600, marginBottom: 6 }}>{t("admin.language")}</h1>
-      <p style={{ color: tc.textMuted, fontSize: 13, marginBottom: 28 }}>
-        {t("admin.language.desc")}
-      </p>
+      <AdminPageHeader
+        title={t("admin.language")}
+        description={t("admin.language.desc")}
+      />
 
       <div style={{ display: "flex", gap: 16 }}>
         {locales.map((loc) => {

@@ -10,16 +10,11 @@ use serde_json::{json, Value};
 
 pub struct DockerStopTool;
 
-const PROTECTED_PREFIX: &str = "ideai-";
+// Helper container: punto unico in nexus_tools::docker_helpers (regola L, S43).
+use super::docker_helpers::{validate_not_protected_with_verb, verify_container_label_with_action};
 
 fn validate_not_protected(name: &str) -> Result<(), NexusToolError> {
-    if name.starts_with(PROTECTED_PREFIX) {
-        return Err(NexusToolError::BadInput(format!(
-            "Container '{}' e' infrastruttura Nexus. VIETATO fermarlo da agenti progetto.",
-            name
-        )));
-    }
-    Ok(())
+    validate_not_protected_with_verb(name, "fermarlo da agenti progetto")
 }
 
 async fn verify_container_label(
@@ -27,27 +22,7 @@ async fn verify_container_label(
     slug: &str,
     project_root: &std::path::Path,
 ) -> Result<(), NexusToolError> {
-    let out = exec::run_cmd(
-        "docker",
-        &[
-            "inspect",
-            "--format",
-            "{{index .Config.Labels \"com.docker.compose.project\"}}",
-            name,
-        ],
-        project_root,
-        10,
-    )
-    .await?;
-
-    let container_slug = out.stdout.trim();
-    if container_slug != slug {
-        return Err(NexusToolError::BadInput(format!(
-            "Container '{}' non appartiene al progetto corrente (label='{}', atteso='{}'). Stop negato.",
-            name, container_slug, slug
-        )));
-    }
-    Ok(())
+    verify_container_label_with_action(name, slug, project_root, "Stop negato.").await
 }
 
 #[async_trait]
