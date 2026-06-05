@@ -4,21 +4,25 @@ Sostituisce gli array hardcoded `list_models()` in tutti i provider cloud
 (anthropic, openai, google, mistral, deepseek).
 
 Pattern: ogni provider chiama `load_provider_catalog(provider_name)` in
-`list_models()`. Cache 60s in-process per evitare query a ogni call.
+`list_models()`. Cache 60s in-process (via ``brain.utils.ttl_cache.TtlCache``,
+punto unico, regola L / ADR 0026) per evitare query a ogni call.
 
 Sorgente DB: tabella `ai_price_catalog` (provider, model, capabilities,
 is_enabled). Quando un modello viene aggiunto/rimosso/deprecato, basta
 UPDATE/INSERT lì — niente patch + redeploy.
 
-**Niente fallback hardcoded**. Se DB irraggiungibile o tabella vuota per
-il provider, solleva `ProviderCatalogUnavailable` — il chiamante decide
-se mostrare lista vuota all'admin o ritornare errore.
+**Niente fallback hardcoded** (regola G): se ``DATABASE_URL`` non e' impostata
+o il DB e' irraggiungibile o la tabella e' vuota per il provider, solleva
+``ProviderCatalogUnavailable``. La connessione passa per
+``brain.utils.db_pool.connect``: nessuna connection string copiata qui.
 """
 from __future__ import annotations
 
+import json
 import logging
-import os
-import time
+
+from brain.utils.db_pool import DbUrlUnavailable, connect
+from brain.utils.ttl_cache import TtlCache
 
 from .base import ProviderCatalogEntry
 
@@ -32,29 +36,21 @@ class ProviderCatalogUnavailable(Exception):
     pass
 
 
-# Cache 60s per provider
-_CACHE: dict[str, list[ProviderCatalogEntry]] = {}
-_CACHE_TS: dict[str, float] = {}
-_TTL_S = 60.0
+# Cache TTL 60s per provider (punto unico TtlCache).
+_CACHE: TtlCache[str, list[ProviderCatalogEntry]] = TtlCache(ttl_seconds=60.0)
 
 
 def _load_from_db(provider: str) -> list[ProviderCatalogEntry]:
     """Carica i modelli enabled per `provider` da `ai_price_catalog`.
     Solleva eccezione se DB irraggiungibile."""
-    import psycopg2  # type: ignore[import]
-    db_url = os.environ.get(
-        "DATABASE_URL",
-        "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
-    )
-    with psycopg2.connect(db_url) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT model, capabilities FROM ai_price_catalog "
-                "WHERE provider = %s AND is_enabled = TRUE "
-                "ORDER BY is_featured DESC, input_cost_per_million_tokens ASC",
-                (provider,),
-            )
-            rows = cur.fetchall()
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT model, capabilities FROM ai_price_catalog "
+            "WHERE provider = %s AND is_enabled = TRUE "
+            "ORDER BY is_featured DESC, input_cost_per_million_tokens ASC",
+            (provider,),
+        )
+        rows = cur.fetchall()
     out: list[ProviderCatalogEntry] = []
     for model, capabilities in rows:
         # capabilities e' jsonb (lista) o NULL
@@ -62,8 +58,6 @@ def _load_from_db(provider: str) -> list[ProviderCatalogEntry]:
         if isinstance(capabilities, list):
             caps = [str(c) for c in capabilities]
         elif isinstance(capabilities, str):
-            # Stringa JSON
-            import json
             try:
                 parsed = json.loads(capabilities)
                 caps = [str(c) for c in parsed] if isinstance(parsed, list) else ["chat"]
@@ -79,26 +73,22 @@ def load_provider_catalog(provider: str) -> list[ProviderCatalogEntry]:
     """Restituisce la lista dei modelli per `provider`, letti da DB con cache 60s.
     Solleva `ProviderCatalogUnavailable` se DB irraggiungibile o nessun
     modello configurato per quel provider."""
-    now = time.time()
-    try:
-        from brain.utils.settings_db import get_int_setting
-        _ttl = float(get_int_setting("providers.catalog_cache_ttl_seconds", 60))
-    except Exception:
-        _ttl = _TTL_S
-    if provider in _CACHE and (now - _CACHE_TS.get(provider, 0.0)) < _ttl:
-        return _CACHE[provider]
+    cached = _CACHE.get(provider)
+    if cached is not None:
+        return cached
     try:
         rows = _load_from_db(provider)
+    except DbUrlUnavailable as e:
+        raise ProviderCatalogUnavailable(str(e)) from e
     except Exception as e:
         raise ProviderCatalogUnavailable(
             f"DB irraggiungibile per provider '{provider}': {e}. "
             "Verifica Postgres e tabella ai_price_catalog."
-        )
+        ) from e
     if not rows:
         raise ProviderCatalogUnavailable(
             f"Nessun modello configurato in ai_price_catalog per provider '{provider}'. "
             "Esegui INSERT con i modelli supportati."
         )
-    _CACHE[provider] = rows
-    _CACHE_TS[provider] = now
+    _CACHE.set(provider, rows)
     return rows

@@ -58,17 +58,12 @@ DEFAULT_LLM_TIMEOUT_SECONDS = 5.0
 # TTL della cache di configurazione (legge da settings ogni 60s)
 _CONFIG_CACHE_TTL_SECONDS = 60.0
 
-# Intent ammessi (devono coincidere con quelli in nexus_routing_matrix).
-# "code_read" aggiunto per distinguere la LETTURA di file/codice dalla
-# PRODUZIONE di documentazione ("docs"). Senza questo intent separato,
-# "leggi il file X" e "elenca i file" cadevano su `docs` e il RAG inline
-# (BP7 in nodes.py _RAG_INTENTS) non si attivava mai.
-ALLOWED_INTENTS = {
-    "chat", "debug", "fix", "refactor", "test", "docs",
-    "architecture", "file_ops", "system_admin", "code_read",
-}
-
-ALLOWED_COMPLEXITY = {"low", "medium", "high"}
+# Intent ammessi e complessita' canoniche: punto unico in brain/router/intents.py
+# (regola L / ADR 0026). "code_read" aggiunto per distinguere la LETTURA di
+# file/codice dalla PRODUZIONE di documentazione ("docs"). Senza questo intent
+# separato, "leggi il file X" e "elenca i file" cadevano su `docs` e il RAG
+# inline (BP7 in nodes.py _RAG_INTENTS) non si attivava mai.
+from brain.router.intents import ALLOWED_COMPLEXITY, ALLOWED_INTENTS  # noqa: E402,F401
 
 
 # ── Loader configurazione da settings DB (mig 0111) ─────────────────────────

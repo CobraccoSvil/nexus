@@ -1,76 +1,116 @@
-"""Lettura sincrona delle impostazioni dalla tabella settings di Nexus.
+"""Lettura sincrona delle impostazioni dalla tabella ``settings`` di Nexus.
 
 Usato dai moduli Python che si inizializzano al momento dell'import
 (provider, registry, ecc.) e non hanno accesso a un event loop async.
-L'env var corrispondente resta come override di emergenza con priorita'
-piu' alta: ogni funzione del modulo chiamante dovrebbe controllare prima
-l'env var e ricadere qui solo se assente.
 
-Strategia di fallback:
-  1. Env var specifica (override emergenza, priorita' massima)
-  2. Tabella settings nel DB (valore canonico)
-  3. Default hardcoded nella chiamata get_setting(key, default)
+API (paritetica al lato Rust ``nexus-auth::settings`` dopo Wave 3 della
+campagna de-duplicazione):
 
-Il modulo non importa nulla di Nexus per evitare dipendenze circolari:
-usa solo psycopg2 (gia' presente nel venv brain) e os.
+- ``get_setting(key, default)`` / ``get_bool_setting`` / ``get_int_setting``
+  varianti legacy ``best-effort``: ingoiano l'errore DB e tornano al
+  ``default`` passato. Mantenute per i call site storici dei provider.
+- ``get_setting_checked`` / ``get_bool_setting_checked`` /
+  ``get_int_setting_checked``: propagano l'errore DB e non accettano
+  fallback hardcoded (regola G + H). Preferibili per il codice NUOVO.
+
+La connessione passa per ``brain.utils.db_pool.connect`` (punto unico DB,
+regola L / ADR 0026). Niente connection string copiata qui.
 """
 from __future__ import annotations
 
 import logging
-import os
 from typing import Optional
+
+from brain.utils.db_pool import DbUrlUnavailable, connect, get_db_url  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
 
-def _db_url() -> str:
-    return os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL", "")
+def _read_setting_raw(key: str) -> Optional[str]:
+    """Query unica della tabella ``settings``: punto di verita' della lettura
+    (regola L / ADR 0026). Tutti gli altri helper di questo modulo delegano qui.
 
+    Solleva l'eccezione DB sottostante (``DbUrlUnavailable`` / errori
+    psycopg2): le varianti ``*_checked`` la propagano, le legacy la ingoiano.
+    """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+# ── Varianti CHECKED (preferite per il codice nuovo): propagano l'errore. ────
+
+def get_setting_checked(key: str) -> Optional[str]:
+    """Legge una setting propagando l'errore DB (regola H). Valore RAW.
+
+    Solleva ``DbUrlUnavailable`` se ``DATABASE_URL``/``POSTGRES_URL`` non sono
+    impostate, oppure l'eccezione psycopg2 originale se il DB e' irraggiungibile.
+    Ritorna ``None`` se la chiave non esiste.
+    """
+    return _read_setting_raw(key)
+
+
+def get_bool_setting_checked(key: str) -> Optional[bool]:
+    """Variante booleana di ``get_setting_checked``. Valori veri:
+    ``true|1|yes|on`` (case-insensitive)."""
+    raw = get_setting_checked(key)
+    if raw is None:
+        return None
+    return raw.strip().lower() in ("true", "1", "yes", "on")
+
+
+def get_int_setting_checked(key: str) -> Optional[int]:
+    """Variante intera di ``get_setting_checked``. Solleva ``ValueError`` se
+    il valore non e' un intero."""
+    raw = get_setting_checked(key)
+    if raw is None:
+        return None
+    return int(raw.strip())
+
+
+# ── Varianti LEGACY (best-effort, ingoiano gli errori). ─────────────────────
 
 def get_setting(key: str, default: str = "") -> str:
     """Legge il valore di un'impostazione dalla tabella settings.
 
-    Ritorna `default` se il DB non e' raggiungibile, la chiave non esiste
-    o psycopg2 non e' installato. Non solleva mai eccezioni.
+    Ritorna ``default`` se il DB non e' raggiungibile, la chiave non esiste o
+    psycopg2 non e' installato. Non solleva mai eccezioni (best-effort).
+    Mantenuta per i call site dei provider che si inizializzano all'import
+    (non possono propagare). Per il codice NUOVO preferire ``get_setting_checked``.
     """
-    db_url = _db_url()
-    if not db_url:
-        logger.debug("settings_db: DATABASE_URL assente, uso default=%r per key=%r", default, key)
-        return default
     try:
-        import psycopg2
-        conn = psycopg2.connect(db_url)
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
-                row = cur.fetchone()
-                value = row[0] if row else default
-                logger.debug("settings_db: key=%r value=%r (fonte=%s)",
-                             key, value, "DB" if row else "default")
-                return value
-        finally:
-            conn.close()
+        raw = _read_setting_raw(key)
+    except DbUrlUnavailable:
+        logger.debug("settings_db: db_url assente, uso default=%r per key=%r", default, key)
+        return default
     except Exception as exc:
         logger.debug("settings_db.get_setting(%r) fallito: %s — uso default=%r", key, exc, default)
         return default
+    if raw is None:
+        logger.debug("settings_db: key=%r non in DB, uso default=%r", key, default)
+        return default
+    logger.debug("settings_db: key=%r value=%r (DB)", key, raw)
+    return raw
 
 
 def get_bool_setting(key: str, default: bool = False) -> bool:
-    """Legge un'impostazione booleana dalla tabella settings.
-
-    Valori considerati True: true, 1, yes, on (case-insensitive).
-    """
-    raw = get_setting(key, "true" if default else "false").strip().lower()
-    return raw in ("true", "1", "yes", "on")
+    """Variante booleana legacy. Vedi ``get_bool_setting_checked``."""
+    return get_setting(key, "true" if default else "false").strip().lower() in (
+        "true", "1", "yes", "on",
+    )
 
 
 def get_int_setting(key: str, default: int = 0) -> int:
-    """Legge un'impostazione intera dalla tabella settings."""
+    """Variante intera legacy. Vedi ``get_int_setting_checked``."""
     raw = get_setting(key, str(default)).strip()
     try:
         return int(raw)
     except ValueError:
-        logger.debug("settings_db: key=%r valore=%r non e' un intero, uso default=%r", key, raw, default)
+        logger.debug(
+            "settings_db: key=%r valore=%r non e' un intero, uso default=%r",
+            key, raw, default,
+        )
         return default
 
 
@@ -78,31 +118,31 @@ def resolve_port(key: str) -> int:
     """Risolve una porta di bind leggendola ESCLUSIVAMENTE dal DB (tabella
     settings, regola G: il DB e' l'unica fonte di verita'). Nessun default
     hardcoded e nessuna env var: se il valore non e' disponibile solleva
-    RuntimeError. Coerente con `nexus_auth::resolve_port` lato Rust.
+    ``RuntimeError``. Coerente con ``nexus_auth::resolve_port`` lato Rust.
 
-    - DB irraggiungibile: retry 5 tentativi x 5s, poi RuntimeError.
-    - chiave assente / valore non valido: RuntimeError immediato (config errata
-      o migrazione 0239 non applicata): meglio non partire che fare bind su una
-      porta sbagliata silenziosamente.
+    - DB url assente: ``RuntimeError`` immediato.
+    - DB irraggiungibile: retry 5 tentativi x 5s, poi ``RuntimeError``.
+    - chiave assente / valore non valido: ``RuntimeError`` immediato (meglio non
+      partire che fare bind su una porta sbagliata silenziosamente).
+
+    La connessione passa per ``db_pool.connect`` (punto unico, regola L).
     """
     import time
 
-    db_url = _db_url()
-    if not db_url:
+    import psycopg2  # type: ignore[import]
+
+    try:
+        get_db_url()  # fail-fast con DbUrlUnavailable se non configurata
+    except DbUrlUnavailable as exc:
         raise RuntimeError(
-            f"resolve_port: DATABASE_URL/POSTGRES_URL assente, impossibile leggere settings.{key}"
-        )
-    import psycopg2
+            f"resolve_port: {exc} (key={key})"
+        ) from exc
 
     for attempt in range(1, 6):
         try:
-            conn = psycopg2.connect(db_url)
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
-                    row = cur.fetchone()
-            finally:
-                conn.close()
+            with connect() as conn, conn.cursor() as cur:
+                cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
+                row = cur.fetchone()
         except psycopg2.OperationalError as exc:
             if attempt < 5:
                 logger.warning(
