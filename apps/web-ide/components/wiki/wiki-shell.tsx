@@ -288,6 +288,7 @@ export function WikiShell({ scope, title, toolbar }: WikiShellProps) {
               borderRadius: 4,
               color: tc.text,
               fontSize: 12,
+              boxSizing: "border-box",
             }}
           />
           <div style={{ fontSize: 11, color: tc.textSecondary, marginTop: 6 }}>

@@ -344,6 +344,7 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
             color: tc.text,
             borderRadius: 4,
             fontSize: 12,
+            boxSizing: "border-box",
           }}
         />
         <div style={{ fontSize: 11, color: tc.textSecondary, marginTop: 6 }}>
