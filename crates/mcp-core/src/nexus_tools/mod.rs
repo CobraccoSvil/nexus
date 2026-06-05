@@ -25,6 +25,56 @@
 pub mod exec;
 pub mod parse_ndjson;
 
+/// Valida che `path` non contenga `..` (path traversal) e che, joined con
+/// `project_root`, resti dentro la root. Punto unico (regola L, S59) per i
+/// check di path traversal duplicati in piu' tool.
+pub fn validate_no_path_traversal(
+    project_root: &std::path::Path,
+    path: &str,
+) -> Result<std::path::PathBuf, NexusToolError> {
+    use std::path::Component;
+    let pb = std::path::PathBuf::from(path);
+    if pb.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(NexusToolError::BadInput("path traversal denied".into()));
+    }
+    let full = project_root.join(&pb);
+    if !full.starts_with(project_root) {
+        return Err(NexusToolError::BadInput("path traversal denied".into()));
+    }
+    Ok(full)
+}
+
+/// Esegue `cargo test <subset_flag>` (es. `--lib`, `--doc`, `--bins`) e ritorna
+/// il JSON canonico `{ok, exit_code, passed, failed, stdout_preview, duration_ms}`.
+/// Punto unico (regola L, S53) per il pattern duplicato fra
+/// cargo_test_lib/cargo_test_doc/cargo_test_bins.
+pub async fn run_cargo_test_subset(
+    ctx: &NexusToolContext,
+    subset_flag: &str,
+) -> Result<serde_json::Value, NexusToolError> {
+    let out = exec::run_cmd(
+        "cargo",
+        &["test", subset_flag],
+        &ctx.project_root,
+        ctx.timeout_secs.max(300),
+    )
+    .await?;
+    let passed = out.stdout.lines().filter(|l| l.contains(" ... ok")).count();
+    let failed = out
+        .stdout
+        .lines()
+        .filter(|l| l.contains(" ... FAILED"))
+        .count();
+    Ok(serde_json::json!({
+        "ok": out.success(),
+        "exit_code": out.exit_code,
+        "passed": passed,
+        "failed": failed,
+        "stdout_preview": out.stdout.chars().take(2000).collect::<String>(),
+        "duration_ms": out.duration_ms,
+    }))
+}
+
 /// Directory che vengono SEMPRE saltate dai tool che scansionano il filesystem
 /// (find_todos, fs_grep, ecc.). Punto unico (regola L, S24): prima ogni walk
 /// aveva la sua catena di `name == "node_modules" || name == "target" || ...`.

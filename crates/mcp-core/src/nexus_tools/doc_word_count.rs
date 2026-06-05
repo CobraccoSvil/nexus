@@ -1,8 +1,9 @@
 //! `documentation::doc_word_count` — conta parole/righe in un file Markdown.
-use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
+use super::{
+    validate_no_path_traversal, NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety,
+};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::Component;
 
 pub struct DocWordCountTool;
 
@@ -13,14 +14,7 @@ impl NexusToolHandler for DocWordCountTool {
             .get("path")
             .and_then(Value::as_str)
             .unwrap_or("README.md");
-        let pb = std::path::PathBuf::from(path);
-        if pb.components().any(|c| matches!(c, Component::ParentDir)) {
-            return Err(NexusToolError::BadInput("path traversal denied".into()));
-        }
-        let full = ctx.project_root.join(&pb);
-        if !full.starts_with(&ctx.project_root) {
-            return Err(NexusToolError::BadInput("path traversal denied".into()));
-        }
+        let full = validate_no_path_traversal(&ctx.project_root, path)?;
         let content = std::fs::read_to_string(&full).map_err(NexusToolError::Io)?;
         let lines = content.lines().count();
         let words = content.split_whitespace().count();

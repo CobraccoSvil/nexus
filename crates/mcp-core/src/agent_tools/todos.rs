@@ -127,6 +127,12 @@ async fn create_plan(
         .get("alternatives")
         .cloned()
         .unwrap_or_else(|| json!([]));
+    // Intent e behavior_mode di creazione del piano (mig 0328): permettono al
+    // planner di invalidare il riuso quando l'intent corrente diverge (fix
+    // plan-reuse intent-aware). Nullable: i piani senza questi campi restano
+    // riusabili come prima.
+    let plan_user_intent = input.get("user_intent").and_then(|v| v.as_str());
+    let plan_behavior_mode = input.get("behavior_mode").and_then(|v| v.as_str());
 
     let mut tx = match ctx.db.begin().await {
         Ok(t) => t,
@@ -137,14 +143,16 @@ async fn create_plan(
     let plan_res = sqlx::query(
         r#"INSERT INTO nexus_agent_plans
              (run_id, project_id, thread_id, acceptance_criteria, planner_model,
-              rationale, constraints, alternatives)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+              rationale, constraints, alternatives, user_intent, behavior_mode)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
            ON CONFLICT (run_id) DO UPDATE SET
              acceptance_criteria = EXCLUDED.acceptance_criteria,
              planner_model = EXCLUDED.planner_model,
              rationale = EXCLUDED.rationale,
              constraints = EXCLUDED.constraints,
              alternatives = EXCLUDED.alternatives,
+             user_intent = EXCLUDED.user_intent,
+             behavior_mode = EXCLUDED.behavior_mode,
              plan_revisions = nexus_agent_plans.plan_revisions"#,
     )
     .bind(run_id)
@@ -155,6 +163,8 @@ async fn create_plan(
     .bind(plan_rationale)
     .bind(&plan_constraints)
     .bind(&plan_alternatives)
+    .bind(plan_user_intent)
+    .bind(plan_behavior_mode)
     .execute(&mut *tx)
     .await;
     if let Err(e) = plan_res {

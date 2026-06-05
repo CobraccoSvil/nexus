@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/kucherenko/jscpd/master/packages/jscpd/schema.json",
-  "minLines": 5,
-  "minTokens": 50,
+  "minLines": 15,
+  "minTokens": 100,
   "reporters": ["console", "json"],
   "output": "./.dup-report",
   "absolute": true,

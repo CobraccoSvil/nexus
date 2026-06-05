@@ -2,6 +2,35 @@
 
 use super::*;
 
+/// Verifica che `user_id` abbia accesso al progetto (presenza in
+/// `project_members`). Punto unico (regola L, S54) per il pattern duplicato
+/// nei 3+ handler terminale (presence/ack/finish/stream).
+async fn ensure_project_membership(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    project_id: Uuid,
+) -> Result<(), ApiError> {
+    let access = sqlx::query("SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2")
+        .bind(project_id)
+        .bind(user_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if access.is_none() {
+        return Err(api_error(StatusCode::FORBIDDEN, "Accesso negato"));
+    }
+    Ok(())
+}
+
+/// Valida `consumer_id` non vuoto. Pattern duplicato in 3 handler.
+fn require_consumer_id(consumer_id: &str) -> Result<&str, ApiError> {
+    let trimmed = consumer_id.trim();
+    if trimmed.is_empty() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "consumerId obbligatorio"));
+    }
+    Ok(trimmed)
+}
+
 /// SSE stream per inviare comandi ai terminali IDE dell'utente.
 pub async fn terminal_commands_stream(
     State(state): State<AppState>,
@@ -98,24 +127,8 @@ pub async fn terminal_presence(
     Json(body): Json<TerminalPresenceRequest>,
 ) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
-    let consumer_id = body.consumer_id.trim();
-    if consumer_id.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "consumerId obbligatorio",
-        ));
-    }
-
-    let access = sqlx::query("SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2")
-        .bind(project_id)
-        .bind(user_id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if access.is_none() {
-        return Err(api_error(StatusCode::FORBIDDEN, "Accesso negato"));
-    }
+    let _consumer_id = require_consumer_id(&body.consumer_id)?;
+    ensure_project_membership(&state.db, user_id, project_id).await?;
 
     let key = terminal_consumer_key(user_id, project_id);
     if body.connected {
@@ -143,24 +156,8 @@ pub async fn terminal_command_ack(
     Json(body): Json<TerminalAckRequest>,
 ) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
-    let consumer_id = body.consumer_id.trim();
-    if consumer_id.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "consumerId obbligatorio",
-        ));
-    }
-
-    let access = sqlx::query("SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2")
-        .bind(project_id)
-        .bind(user_id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if access.is_none() {
-        return Err(api_error(StatusCode::FORBIDDEN, "Accesso negato"));
-    }
+    let consumer_id = require_consumer_id(&body.consumer_id)?;
+    ensure_project_membership(&state.db, user_id, project_id).await?;
 
     let preview = body.output_preview.map(|value| {
         let mut trimmed = value.trim().to_string();
@@ -224,24 +221,8 @@ pub async fn terminal_command_finish(
     Json(body): Json<TerminalFinishRequest>,
 ) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
-    let consumer_id = body.consumer_id.trim();
-    if consumer_id.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "consumerId obbligatorio",
-        ));
-    }
-
-    let access = sqlx::query("SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2")
-        .bind(project_id)
-        .bind(user_id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if access.is_none() {
-        return Err(api_error(StatusCode::FORBIDDEN, "Accesso negato"));
-    }
+    let _consumer_id = require_consumer_id(&body.consumer_id)?;
+    ensure_project_membership(&state.db, user_id, project_id).await?;
 
     let full_output = {
         let trimmed = body.full_output.trim().to_string();

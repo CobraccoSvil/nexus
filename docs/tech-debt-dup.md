@@ -45,6 +45,22 @@ Aggiornare questa tabella a ogni wave che riduce il debito.
 | Wave C2 (admin_dto) | post-C1 | 5.24% | **1098** | Nuovo modulo `nexus_types::admin_dto`: 17 tipi DTO (UserResponse, UserWithProjectsResponse, UserProjectRole, UpdateUser*, ListUsers*, SearchUsersQuery, ProjectMemberResponse, AddProject*, ListAllProjectsResponse, AdminProjectSummary, PortProjects*, PortDetail) prima duplicati fra admin-service/src/admin_{users,projects}.rs e mcp-core/src/admin/{users,projects}.rs. Gli handler axum restano nei due crate (divergenze runtime: logging, endpoint extra, decisione architetturale rimandata su chi e' autoritativo). -3 cloni, -135 righe (13497 -> 13362). |
 | Wave C3 (provider mixin) | post-C2 | 5.23% | **1098** | Mixin `ApiKeyClientMixin` in `brain/providers/base.py`: punto unico per il pattern `_api_key_provider`/`_cached_key`/`_client`/`_get_client` prima duplicato pari-pari (43L) in deepseek_provider, mistral_provider, openai_provider. Le sottoclassi implementano solo `_create_client(api_key)` (il client SDK specifico). Conteggio cloni invariato (1098: il pattern 43L scompare ma jscpd rivela un clone minimo precedentemente "coperto"), righe duplicate -28 (13362 -> 13334). |
 
+## Soglie e razionale
+
+`jscpd.json` usa `minLines=15, minTokens=100`. Razionale (dopo S52-S58):
+
+- **minLines<10** cattura troppi pattern idiomatici (handler axum CRUD,
+  `tool_use` arms del trait NexusToolHandler, getter/setter, `<th>` table
+  headers, render boilerplate React) che NON sono veri "copy-paste da
+  consolidare" ma pattern strutturali del linguaggio/framework.
+- **minLines=15** cattura solo copy-paste reali di blocchi business.
+- **minTokens=100** filtra blocchi semanticamente sostanziali.
+
+Le esclusioni `ignore` in `scripts/dup-report.sh` riflettono lo stesso
+principio: tests/fixtures/mocks/examples/docs/generated/.spec/.test/__mocks__
+sono pattern fisiologicamente ripetitivi (test fixture devono essere simili
+per design), e includerli inquinerebbe la metrica.
+
 ## Hotspot noti (da consolidare)
 
 Riferimento al piano di campagna; i punti unici target sono nel catalogo di ADR 0026.

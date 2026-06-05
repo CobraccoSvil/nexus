@@ -11,6 +11,64 @@ enum BuildGraphPreflight {
     Block(String),
 }
 
+/// Risolve il path di SCRITTURA fornito dall'LLM in un path assoluto confinato
+/// alla `root`, de-duplicando la root se il modello l'ha gia' inclusa nel path.
+///
+/// Root cause del bug "path duplicato" (`<root>/<root>/file`): l'LLM passava un
+/// path che gia' conteneva la project_root (es. `home/administrator/projects/
+/// Marco/index.html`, relativo ma rappresentante la root). Il vecchio codice
+/// faceva `root.join(path)` senza riconoscerlo, concatenando la root due volte.
+/// A differenza di `resolve_relative_path` (lettura), questa NON richiede che il
+/// file esista (canonicalize fallirebbe sui file nuovi): normalizza testualmente
+/// e confina. Gestisce: (1) assoluto dentro la root -> strip; (2) relativo che
+/// duplica la root -> strip; (3) relativo normale; (4) assoluto fuori root o
+/// `..` -> errore. Punto unico riusabile dai tool di scrittura (regola L).
+fn resolve_write_target(root: &std::path::Path, path_str: &str) -> Result<PathBuf, String> {
+    let raw = path_str.trim();
+    if raw.is_empty() {
+        return Err("percorso vuoto".to_string());
+    }
+    let root_str = root.to_string_lossy();
+    let root_str = root_str.trim_end_matches('/');
+
+    // Forma "candidata assoluta": un relativo viene visto come assoluto per
+    // riconoscere se duplica la root (caso 2 del bug).
+    let candidate_abs = if raw.starts_with('/') {
+        raw.to_string()
+    } else {
+        format!("/{}", raw)
+    };
+
+    let relative = if candidate_abs == root_str {
+        String::new()
+    } else if let Some(rest) = candidate_abs.strip_prefix(&format!("{}/", root_str)) {
+        // Dentro la root (assoluto o relativo-che-duplica): usa solo il resto.
+        rest.to_string()
+    } else if raw.starts_with('/') {
+        // Assoluto FUORI dalla root: rifiuta (no scrittura fuori progetto).
+        return Err(format!(
+            "percorso assoluto fuori dalla root del progetto: {raw}"
+        ));
+    } else {
+        // Relativo normale (non duplica la root).
+        raw.to_string()
+    };
+
+    let rel_path = PathBuf::from(&relative);
+    if rel_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("percorso non consentito (contiene '..')".to_string());
+    }
+    let target = root.join(&rel_path);
+    // Confinamento finale (difesa in profondita').
+    if !target.starts_with(root) {
+        return Err("percorso fuori dalla root del progetto".to_string());
+    }
+    Ok(target)
+}
+
 /// Esegue il preflight ADR 0020 su `path_str`. Ritorna `Allow` se il file e'
 /// nel build graph o entry point o linguaggio non riconosciuto; `Warn` se
 /// e' fuori dal build graph (warning non bloccante); `Block` se in directory
@@ -259,22 +317,13 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
         BuildGraphPreflight::Allow => None,
     };
 
-    // Calcola il path assoluto con sicurezza path-traversal
-    let clean = path_str.trim().trim_start_matches(['\\', '/']);
-    let target = ctx.root_path.join(clean);
-    // Verifica che sia dentro la root (anche per path non esistenti)
-    let normalized =
-        target
-            .components()
-            .collect::<Vec<_>>()
-            .iter()
-            .fold(PathBuf::new(), |mut acc, c| {
-                acc.push(c);
-                acc
-            });
-    if !normalized.starts_with(&ctx.root_path) {
-        return "[Errore: percorso non autorizzato (fuori dalla root del progetto)]".to_string();
-    }
+    // Risoluzione path con de-duplicazione della root + confinamento (regola L).
+    // Corregge il bug "<root>/<root>/file": un path che gia' contiene la root
+    // (assoluto o relativo) viene normalizzato a relativo prima del join.
+    let target = match resolve_write_target(&ctx.root_path, path_str) {
+        Ok(p) => p,
+        Err(e) => return format!("[Errore: {e}]"),
+    };
 
     // Crea directory intermedie se necessario
     if let Some(parent) = target.parent() {

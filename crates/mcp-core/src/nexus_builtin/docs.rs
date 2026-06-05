@@ -39,6 +39,33 @@ pub(super) async fn get_project_slug(db: &PgPool, project_id: Uuid) -> Result<St
 // Handler: documents
 // ---------------------------------------------------------------------------
 
+/// True se il documento non ha ALCUN contenuto reale: tutte le sezioni e
+/// sottosezioni hanno `content` vuoto/assente. In quel caso il .docx avrebbe
+/// solo l'indice (i titoli) senza corpo: va considerato una generazione fallita
+/// e NON salvato in silenzio (regola H). Capita quando il modello docs_generator
+/// risponde con la sola struttura (titoli) senza riempire i content.
+fn doc_content_is_empty(content: &Value) -> bool {
+    fn section_has_text(sec: &Value) -> bool {
+        let own = sec
+            .get("content")
+            .and_then(|c| c.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if own {
+            return true;
+        }
+        if let Some(subs) = sec.get("subsections").and_then(|s| s.as_array()) {
+            return subs.iter().any(section_has_text);
+        }
+        false
+    }
+    match content.get("sections").and_then(|s| s.as_array()) {
+        Some(sections) => !sections.iter().any(section_has_text),
+        // Nessun array "sections": consideriamo vuoto (struttura non valida).
+        None => true,
+    }
+}
+
 pub(super) async fn handle_doc_generate(
     db: &PgPool,
     project_id: Uuid,
@@ -243,6 +270,25 @@ pub(super) async fn handle_doc_generate(
             content_val
         }
     };
+
+    // Validazione anti-documento-vuoto (regola H): se tutte le sezioni hanno
+    // content vuoto, il .docx avrebbe solo l'indice. Non salviamo un documento
+    // vuoto in silenzio: ritorniamo un errore esplicito e azionabile. Vale sia
+    // per l'auto-generazione (modello che produce solo titoli) sia per un
+    // content_json fornito a mano ma vuoto.
+    if doc_content_is_empty(&content) {
+        tracing::warn!(
+            doc_type = %doc_type,
+            "nexus_doc_generate: contenuto vuoto (solo indice) — generazione rifiutata"
+        );
+        return format!(
+            "[Errore] Generazione documento '{}' fallita: tutte le sezioni risultano prive di contenuto \
+             (il documento avrebbe solo l'indice). Il modello docs_generator non ha prodotto testo. \
+             Riprova la generazione; se il problema persiste, verifica il provider/modello configurato \
+             in nexus_purpose_model (purpose='docs_generator').",
+            doc_type
+        );
+    }
 
     // Determina versione (incrementa se lo stesso doc_type esiste già)
     let existing = sqlx::query("SELECT version FROM project_documents WHERE project_id = $1 AND doc_type = $2 ORDER BY created_at DESC LIMIT 1")
