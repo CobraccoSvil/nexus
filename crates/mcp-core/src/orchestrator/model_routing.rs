@@ -363,7 +363,17 @@ pub(crate) async fn select_agentic_model(
             idx += 1;
             sql.push_str(&format!(" AND context_window >= ${idx}"));
         }
-        sql.push_str(&format!(" ORDER BY {order_by} LIMIT 1"));
+        // ADR 0025 (estensione regola L): preferisci i modelli NATIVAMENTE
+        // non-thinking (`agentic_thinking_policy = 'none'`) ai dual-mode
+        // (`disable_for_tools`/`native`). Nei run a tool il non-thinking e' la
+        // modalita' corretta (gli adapter lo forzano comunque sui dual-mode);
+        // un modello nativamente non-thinking e' pero' piu' AFFIDABILE sotto
+        // `tool_choice` forzato (planner/clarify), dove i thinking model
+        // ritornano talvolta MALFORMED/empty -> apparente "completamento vuoto".
+        // E' un solo punto di ordinamento, valido per OGNI call site agentico.
+        sql.push_str(&format!(
+            " ORDER BY (agentic_thinking_policy = 'none') DESC, {order_by} LIMIT 1"
+        ));
 
         let mut q = sqlx::query_as::<_, (String, String)>(&sql).bind(&excluded);
         if let Some(t) = tier {

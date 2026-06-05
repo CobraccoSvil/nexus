@@ -794,6 +794,7 @@ class ProviderRegistry:
         usage_iteration: int = 0,
         usage_intent: str = "",
         force_tool_choice: bool | None = None,
+        soft_failure_fallback: bool = True,
     ) -> ProviderResult:
         """Versione sincrona di generate_agent_turn, sicura da chiamare da thread gRPC.
 
@@ -803,6 +804,17 @@ class ProviderRegistry:
         lascia la decisione storica per-provider (first_turn_force da capability).
         Passato solo ai provider che espongono il parametro (gli adapter
         tool-mute lo ignorano).
+
+        ``soft_failure_fallback`` (ADR 0025): abilita la cascata su soft-failure
+        M4 (chiusura naturale senza tool, contenuto sotto soglia). E' una
+        euristica pensata per l'EXECUTOR (un modello che "molla" senza usare i
+        tool a inizio task). Va disattivata (`False`) per chiamate con
+        tool_choice forzato e fallback dedicato — il planner_node forza
+        `nexus_todo_write` e gestisce in proprio il retry tool-robust via
+        `purpose_model('planner_fallback')`: senza questo flag la cascata M4
+        generica escalerebbe ai default model dei provider (es. gemini-2.5-pro)
+        producendo l'apparenza di "completamento vuoto". Il fallback su errori
+        retriable reali (billing/quota/timeout) resta sempre attivo.
 
         ``usage_run_id``/``usage_iteration``: contesto opzionale registrato nel
         ledger (colonna run_id + details). Quando l'executor LangGraph chiama
@@ -1003,6 +1015,12 @@ class ProviderRegistry:
             best-effort: se la capability manca, viene ignorato (nessun crash)."""
             if res.metadata.get("stop_reason") in _RETRIABLE_STOPS or res.content.startswith("[Error:"):
                 return True
+            # ADR 0025: la cascata su soft-failure M4 e' un'euristica executor.
+            # Per chiamate con tool_choice forzato + fallback dedicato (planner)
+            # va disattivata: altrimenti escala ai default model dei provider
+            # (gemini-2.5-pro) generando l'apparenza di "completamento vuoto".
+            if not soft_failure_fallback:
+                return False
             try:
                 from .capability_loader import load_capability
                 from .adapter_base import is_soft_failure

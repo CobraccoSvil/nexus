@@ -335,6 +335,11 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
             _providers.generate_agent_turn_sync,
             planner_provider, planner_model, anth_messages, tools_json,
             max_tokens=4096, system_text=hinted_system,
+            # ADR 0025: il planner forza tool_choice su nexus_todo_write e gestisce
+            # il retry tool-robust con purpose_model('planner_fallback'). Disattiva
+            # la cascata M4 generica del registry (euristica executor) che
+            # altrimenti escalerebbe ai default model (gemini-2.5-pro) -> hollow.
+            soft_failure_fallback=False,
         )
     except Exception as exc:
         logger.error("planner_node: LLM call fallita: %s", exc)
@@ -384,6 +389,7 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
                     _providers.generate_agent_turn_sync,
                     fb_provider, fb_model, anth_messages, tools_json,
                     max_tokens=4096, system_text=hinted_system,
+                    soft_failure_fallback=False,  # ADR 0025: vedi sopra
                 )
                 fb_meta = fb_result.metadata or {}
                 pending_tool_uses = list(fb_meta.get("tool_use_blocks") or [])
@@ -749,6 +755,7 @@ async def _detect_clarifications(state: AgentState, cfg: dict) -> dict[str, Any]
             _providers.generate_agent_turn_sync,
             provider, model, anth_messages, tools_json,
             max_tokens=512, system_text=system_text,
+            soft_failure_fallback=False,  # ADR 0025: clarifying ha tool dedicato
         )
     except Exception as exc:
         logger.debug("_detect_clarifications: LLM call fallita: %s", exc)
