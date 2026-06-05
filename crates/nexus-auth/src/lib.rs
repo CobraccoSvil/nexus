@@ -20,15 +20,62 @@ pub struct Claims {
 }
 
 // --- Helpers ---
+//
+// Lettura settings: punto unico (regola L / ADR 0026). La query SQL vive solo
+// in `read_setting_raw`; tutte le viste (Result/Option, raw/trim, bool/int)
+// delegano qui. Niente query `SELECT ... FROM settings` duplicate nei crate.
 
-pub async fn get_setting(db: &PgPool, key: &str) -> Option<String> {
+/// Query unica della tabella `settings`. Punto di verita' della lettura.
+async fn read_setting_raw(db: &PgPool, key: &str) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
         .bind(key)
         .fetch_optional(db)
         .await
+}
+
+/// Legge una setting propagando l'errore DB (regola H: non ingoiare). Valore
+/// RAW: nessun trim, nessun filtro sui vuoti.
+pub async fn get_setting_checked(db: &PgPool, key: &str) -> anyhow::Result<Option<String>> {
+    read_setting_raw(db, key)
+        .await
+        .map_err(|e| anyhow::anyhow!("lettura setting '{key}' fallita: {e}"))
+}
+
+/// Come `get_setting_checked` ma con `trim()` e scartando i valori vuoti.
+pub async fn get_setting_nonempty(db: &PgPool, key: &str) -> anyhow::Result<Option<String>> {
+    Ok(get_setting_checked(db, key)
+        .await?
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty()))
+}
+
+/// Variante best-effort che ingoia l'errore DB ritornando `None` (con trim e
+/// scarto dei vuoti). Mantenuta per i call site storici; per il codice NUOVO
+/// preferire `get_setting_checked`/`get_setting_nonempty`, che propagano.
+pub async fn get_setting(db: &PgPool, key: &str) -> Option<String> {
+    read_setting_raw(db, key)
+        .await
         .ok()
         .flatten()
+        .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// Legge una setting booleana (`true`/`1`/`yes`/`on` => true). Propaga l'errore DB.
+pub async fn get_bool_setting(db: &PgPool, key: &str) -> anyhow::Result<Option<bool>> {
+    Ok(get_setting_nonempty(db, key)
+        .await?
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")))
+}
+
+/// Legge una setting intera. Propaga l'errore DB; valore non numerico => errore.
+pub async fn get_int_setting(db: &PgPool, key: &str) -> anyhow::Result<Option<i64>> {
+    match get_setting_nonempty(db, key).await? {
+        Some(v) => Ok(Some(v.parse::<i64>().map_err(|e| {
+            anyhow::anyhow!("setting '{key}' non e' un intero valido ('{v}'): {e}")
+        })?)),
+        None => Ok(None),
+    }
 }
 
 /// Risolve la porta di bind di un servizio leggendola ESCLUSIVAMENTE dal DB

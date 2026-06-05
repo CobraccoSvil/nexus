@@ -58,16 +58,8 @@ const SEARCH_STOPWORDS: &[&str] = &[
 
 // ── Helpers DB settings ───────────────────────────────────────────────────────
 
-async fn get_setting(db: &PgPool, key: &str) -> Option<String> {
-    sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind(key)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
+// Lettura setting: punto unico in nexus-auth (regola L / ADR 0026).
+use nexus_auth::get_setting;
 
 async fn qdrant_url(db: &PgPool) -> String {
     get_setting(db, "qdrant_url")

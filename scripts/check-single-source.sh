@@ -53,7 +53,7 @@ assert_single "TtlCache" 'struct TtlCache' 'crates/nexus-cache/src/lib.rs' crate
 assert_single "TemplateCache" 'struct TemplateCache' 'crates/nexus-types/src/templates.rs' crates
 
 # Wave 3:
-# assert_single "get_setting" 'fn get_setting[^_a-zA-Z]' 'crates/nexus-auth/src/*.rs' crates
+assert_single "get_setting" 'fn get_setting[^_a-zA-Z]' 'crates/nexus-auth/src/lib.rs' crates
 
 # Wave 6a:
 # assert_single "psycopg2.connect" 'psycopg2\.connect\(' 'brain/utils/db_pool.py' brain

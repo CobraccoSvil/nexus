@@ -599,23 +599,14 @@ pub async fn get_raw_value(
     State(state): State<super::AppState>,
     Path(key): Path<String>,
 ) -> Json<serde_json::Value> {
-    let value = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind(&key)
-        .fetch_optional(&state.db)
+    // Lettura via punto unico (regola L / ADR 0026).
+    let value = nexus_auth::get_setting(&state.db, &key)
         .await
-        .ok()
-        .flatten()
         .unwrap_or_default();
 
     Json(serde_json::json!({ "key": key, "value": value }))
 }
 
-/// Read a single setting value from the DB by key.
-/// Returns `Ok(None)` if the key does not exist.
-pub async fn get_setting(db: &PgPool, key: &str) -> anyhow::Result<Option<String>> {
-    let value = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind(key)
-        .fetch_optional(db)
-        .await?;
-    Ok(value)
-}
+/// Lettura setting: punto unico in nexus-auth (regola L / ADR 0026).
+/// Re-export con la firma storica (Result, valore raw, propaga l'errore DB).
+pub use nexus_auth::get_setting_checked as get_setting;

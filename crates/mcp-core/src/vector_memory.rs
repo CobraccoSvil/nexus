@@ -16,16 +16,9 @@ pub struct VectorPointHit {
     pub payload: Value,
 }
 
-pub(crate) async fn get_setting(db: &PgPool, key: &str) -> anyhow::Result<Option<String>> {
-    let value = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = $1")
-        .bind(key)
-        .fetch_optional(db)
-        .await
-        .with_context(|| format!("failed to read setting {key}"))?;
-    Ok(value
-        .map(|raw| raw.trim().to_string())
-        .filter(|raw| !raw.is_empty()))
-}
+/// Lettura setting: punto unico in nexus-auth (regola L / ADR 0026).
+/// Re-export con la semantica storica (Result, trim + scarto dei vuoti).
+pub(crate) use nexus_auth::get_setting_nonempty as get_setting;
 
 async fn qdrant_config(db: &PgPool) -> anyhow::Result<(String, String)> {
     let url = get_setting(db, "qdrant_url").await?.unwrap_or_else(|| {
