@@ -192,7 +192,12 @@ pub async fn validate_token(
     .bind(&token_hash)
     .fetch_one(db)
     .await
-    .unwrap_or(false);
+    .map_err(|e| {
+        // Fix regola H: prima `.unwrap_or(false)` -> tutti gli utenti
+        // ricevevano 401 quando il DB cadeva, diagnosi sbagliata garantita.
+        tracing::error!("verify_session_token: SELECT sessions fallita: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     if !session_exists {
         return Err(StatusCode::UNAUTHORIZED);

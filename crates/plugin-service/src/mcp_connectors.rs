@@ -122,7 +122,10 @@ pub async fn list_mcp_servers(
     )
     .fetch_all(&state.db)
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|e| {
+        tracing::warn!("linked_templates per tool_server fallita: {e}");
+        Vec::new()
+    });
 
     let mut linked_by_server: HashMap<String, i64> = HashMap::new();
     for r in counts_rows {
