@@ -33,8 +33,12 @@ case "${1:-}" in
 esac
 
 echo -e "${YELLOW}==> dup-report: esecuzione jscpd${NC}"
-# jscpd legge i parametri da jscpd.json; forziamo il reporter json nell'output dir.
-pnpm exec jscpd --silent --reporters json --output "$OUT_DIR" . || true
+# Passa i path da scansionare ESPLICITAMENTE: il campo "path" del jscpd.json
+# non e' rispettato come filtro restrittivo (jscpd scansiona tutto da cwd se
+# non si passano path CLI). Vedi jscpd.json per i path canonici, mantenere
+# allineati. Gli "ignore" del config valgono comunque entro questi root.
+pnpm exec jscpd --silent --reporters json --output "$OUT_DIR" \
+    apps packages crates brain || true
 
 if [[ ! -f "$REPORT_JSON" ]]; then
   echo -e "${RED}!! dup-report: report jscpd non generato ($REPORT_JSON)${NC}" >&2
