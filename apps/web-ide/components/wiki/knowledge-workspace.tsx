@@ -165,6 +165,15 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
     return buildTree(filtered);
   }, [docs, filter]);
 
+  // Mappa id -> titolo per la tab Concetti (TripleBrowser). Risolve l'UX
+  // di "voglio leggere il titolo non l'UID" senza fetch extra: docs e' gia'
+  // caricato dalla list.
+  const docTitleMap = React.useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const d of docs) m[d.id] = d.title;
+    return m;
+  }, [docs]);
+
   // ─── Salvataggio ─────────────────────────────────────────────────────
   const dirty =
     !!selected &&
@@ -702,10 +711,17 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
         )}
 
         {tab === "triples" && (
-          <TripleBrowser scope={scope} projectId={projectId} onOpenDoc={(id) => {
-            setSelectedId(id);
-            setTab("edit");
-          }} />
+          <TripleBrowser
+            scope={scope}
+            projectId={projectId}
+            // Mappa id -> titolo: la prima colonna mostra il titolo del
+            // documento sorgente invece dell'UID (richiesta UX).
+            docTitles={docTitleMap}
+            onOpenDoc={(id) => {
+              setSelectedId(id);
+              setTab("edit");
+            }}
+          />
         )}
 
         {tab === "history" && selected && (
@@ -744,7 +760,12 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
       {isDesktop && treeColumn}
       {isTablet && treeColumn}
       {mainContent}
-      {isDesktop && rail}
+      {/* La rail destra (metadata/tag/backlink del documento) ha senso solo
+       *  quando si lavora su UN documento (tab edit/history). Per i tab globali
+       *  (triples / graph) la nascondiamo cosi' la tabella/grafo usa tutto lo
+       *  spazio rimanente (richiesta UX: "la lista deve occupare tutto lo
+       *  spazio"). */}
+      {isDesktop && tab !== "triples" && tab !== "graph" && rail}
 
       {/* Drawer mobile / tablet */}
       {(isMobile || isTablet) && drawerTree && (

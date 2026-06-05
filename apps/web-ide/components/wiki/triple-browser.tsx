@@ -18,7 +18,31 @@ interface Props {
   scope: WikiScope;
   projectId?: string;
   onOpenDoc?: (docId: string) => void;
+  /** Mappa id -> titolo del documento. Usata per mostrare il titolo invece
+   *  dell'UID nelle colonne Soggetto/Oggetto. Se la mappa non contiene l'id
+   *  (es. doc cancellato) si mostra fallback UID corto. */
+  docTitles?: Record<string, string>;
 }
+
+/** Larghezze iniziali delle colonne in pixel (override via resize). */
+const COL_DEFAULTS = {
+  subject: 220,
+  predicate: 130,
+  object: 240,
+  source: 90,
+  confidence: 100,
+  created: 110,
+} as const;
+type ColKey = keyof typeof COL_DEFAULTS;
+const COL_ORDER: ColKey[] = [
+  "subject",
+  "predicate",
+  "object",
+  "source",
+  "confidence",
+  "created",
+];
+const COL_MIN_WIDTH = 60;
 
 const PREDICATES: string[] = [
   "relates",
@@ -55,7 +79,7 @@ const SOURCE_COLOR: Record<WikiTripleSource, string> = {
   external: "#737373",
 };
 
-export function TripleBrowser({ scope, projectId, onOpenDoc }: Props) {
+export function TripleBrowser({ scope, projectId, onOpenDoc, docTitles }: Props) {
   const tc = useThemeColors();
   const { t } = useI18n();
 
@@ -68,6 +92,56 @@ export function TripleBrowser({ scope, projectId, onOpenDoc }: Props) {
   const [offset, setOffset] = React.useState(0);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+
+  // ── Larghezze colonne (resize) ─────────────────────────────────────────
+  // Persistenza in localStorage cosi' l'utente non perde il layout fra reload.
+  const [colWidths, setColWidths] = React.useState<Record<ColKey, number>>(() => {
+    if (typeof window === "undefined") return { ...COL_DEFAULTS };
+    try {
+      const raw = window.localStorage.getItem("nexus.wiki.triples.colwidths");
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<Record<ColKey, number>>;
+        return { ...COL_DEFAULTS, ...parsed };
+      }
+    } catch {
+      /* ignore */
+    }
+    return { ...COL_DEFAULTS };
+  });
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        "nexus.wiki.triples.colwidths",
+        JSON.stringify(colWidths),
+      );
+    } catch {
+      /* ignore */
+    }
+  }, [colWidths]);
+
+  /** Resize draggabile: rileva mouse down sul handle, traccia delta col mouse
+   *  move, applica la nuova larghezza alla colonna. minWidth = COL_MIN_WIDTH. */
+  const onResizeStart = React.useCallback(
+    (col: ColKey, ev: React.MouseEvent) => {
+      ev.preventDefault();
+      const startX = ev.clientX;
+      const startW = colWidths[col];
+      const move = (e: MouseEvent) => {
+        const next = Math.max(COL_MIN_WIDTH, startW + (e.clientX - startX));
+        setColWidths((prev) => ({ ...prev, [col]: next }));
+      };
+      const up = () => {
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+        document.body.style.cursor = "";
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+      document.body.style.cursor = "col-resize";
+    },
+    [colWidths],
+  );
 
   const limit = 50;
 
@@ -199,12 +273,20 @@ export function TripleBrowser({ scope, projectId, onOpenDoc }: Props) {
       <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
         <table
           style={{
+            // table-layout: fixed e' essenziale perche' le larghezze del
+            // <colgroup> siano rispettate (col-resize affidabile).
+            tableLayout: "fixed",
             width: "100%",
             borderCollapse: "collapse",
             fontSize: 12,
             color: tc.text,
           }}
         >
+          <colgroup>
+            {COL_ORDER.map((c) => (
+              <col key={c} style={{ width: colWidths[c] }} />
+            ))}
+          </colgroup>
           <thead>
             <tr
               style={{
@@ -215,12 +297,24 @@ export function TripleBrowser({ scope, projectId, onOpenDoc }: Props) {
                 textAlign: "left",
               }}
             >
-              <Th>{t("wiki.triples.subject")}</Th>
-              <Th>{t("wiki.triples.predicate")}</Th>
-              <Th>{t("wiki.triples.object")}</Th>
-              <Th>{t("wiki.triples.source")}</Th>
-              <Th>{t("wiki.triples.confidence")}</Th>
-              <Th>{t("wiki.triples.created")}</Th>
+              <Th onResizeStart={(e) => onResizeStart("subject", e)} tc={tc}>
+                {t("wiki.triples.subject")}
+              </Th>
+              <Th onResizeStart={(e) => onResizeStart("predicate", e)} tc={tc}>
+                {t("wiki.triples.predicate")}
+              </Th>
+              <Th onResizeStart={(e) => onResizeStart("object", e)} tc={tc}>
+                {t("wiki.triples.object")}
+              </Th>
+              <Th onResizeStart={(e) => onResizeStart("source", e)} tc={tc}>
+                {t("wiki.triples.source")}
+              </Th>
+              <Th onResizeStart={(e) => onResizeStart("confidence", e)} tc={tc}>
+                {t("wiki.triples.confidence")}
+              </Th>
+              <Th onResizeStart={(e) => onResizeStart("created", e)} tc={tc}>
+                {t("wiki.triples.created")}
+              </Th>
             </tr>
           </thead>
           <tbody>
@@ -244,25 +338,35 @@ export function TripleBrowser({ scope, projectId, onOpenDoc }: Props) {
                 style={{ borderBottom: `1px solid ${tc.border}` }}
               >
                 <Td>
-                  <DocLink id={tr.subj_doc_id} onOpenDoc={onOpenDoc} tc={tc} />
+                  <DocLink
+                    id={tr.subj_doc_id}
+                    label={docTitles?.[tr.subj_doc_id]}
+                    onOpenDoc={onOpenDoc}
+                    tc={tc}
+                  />
                 </Td>
                 <Td>
                   <code style={predicateChip(tc)}>{tr.predicate}</code>
                 </Td>
                 <Td>
                   {tr.obj_doc_id ? (
-                    <DocLink id={tr.obj_doc_id} onOpenDoc={onOpenDoc} tc={tc} />
+                    <DocLink
+                      id={tr.obj_doc_id}
+                      label={docTitles?.[tr.obj_doc_id]}
+                      onOpenDoc={onOpenDoc}
+                      tc={tc}
+                    />
                   ) : tr.obj_external ? (
                     <a
                       href={tr.obj_external}
                       target="_blank"
                       rel="noreferrer"
-                      style={{ color: tc.accent }}
+                      style={{ color: tc.accent, ...truncStyle }}
                     >
                       {tr.obj_external}
                     </a>
                   ) : (
-                    <span style={{ color: tc.textSecondary }}>{tr.obj_text}</span>
+                    <span style={{ color: tc.textSecondary, ...truncStyle }}>{tr.obj_text}</span>
                   )}
                 </Td>
                 <Td>
@@ -333,13 +437,82 @@ export function TripleBrowser({ scope, projectId, onOpenDoc }: Props) {
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
-function Th({ children }: { children: React.ReactNode }) {
-  return <th style={{ padding: "8px 12px", fontWeight: 600 }}>{children}</th>;
+/** Header con resize handle a destra (draggabile per allargare la colonna).
+ *  Il bordo del handle e' un thin strip (4px) con cursor col-resize. */
+function Th({
+  children,
+  onResizeStart,
+  tc,
+}: {
+  children: React.ReactNode;
+  onResizeStart?: (ev: React.MouseEvent) => void;
+  tc?: ThemeColors;
+}) {
+  return (
+    <th
+      style={{
+        padding: "8px 12px",
+        fontWeight: 600,
+        position: "relative",
+        userSelect: "none",
+        overflow: "hidden",
+      }}
+    >
+      <span
+        style={{
+          display: "block",
+          whiteSpace: "nowrap",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+        }}
+      >
+        {children}
+      </span>
+      {onResizeStart && (
+        <span
+          aria-hidden
+          onMouseDown={onResizeStart}
+          title="Trascina per ridimensionare"
+          style={{
+            position: "absolute",
+            top: 0,
+            right: 0,
+            width: 6,
+            height: "100%",
+            cursor: "col-resize",
+            // hover visivo discreto: barra verticale sul bordo destro
+            borderRight: `2px solid ${tc?.border ?? "transparent"}`,
+          }}
+        />
+      )}
+    </th>
+  );
 }
 
+/** Cella con troncamento di default. La cella in se non taglia; gli elementi
+ *  interni che hanno bisogno di ellipsis usano `truncStyle`. */
 function Td({ children }: { children: React.ReactNode }) {
-  return <td style={{ padding: "6px 12px", verticalAlign: "top" }}>{children}</td>;
+  return (
+    <td
+      style={{
+        padding: "6px 12px",
+        verticalAlign: "top",
+        overflow: "hidden",
+      }}
+    >
+      {children}
+    </td>
+  );
 }
+
+/** Stile per troncare il testo con ellipsis in cella ridimensionabile. */
+const truncStyle: React.CSSProperties = {
+  display: "block",
+  whiteSpace: "nowrap",
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  minWidth: 0,
+};
 
 function FilterField({
   label,
@@ -361,17 +534,25 @@ function FilterField({
 
 function DocLink({
   id,
+  label,
   onOpenDoc,
   tc,
 }: {
   id: string;
+  /** Titolo leggibile del documento. Se mancante (es. doc cancellato) si
+   *  ripiega all'UID corto cosi' il riferimento resta identificabile. */
+  label?: string;
   onOpenDoc?: (id: string) => void;
   tc: ThemeColors;
 }) {
+  const display = label && label.trim() ? label : `${id.slice(0, 8)}…`;
   return (
     <button
       type="button"
       onClick={() => onOpenDoc?.(id)}
+      // `title` mostra l'UID completo come fallback hover (utile per debug
+      // quando il titolo del doc e' molto generico tipo "Senza titolo").
+      title={label ? `${label}\n${id}` : id}
       style={{
         background: "transparent",
         border: "none",
@@ -381,10 +562,11 @@ function DocLink({
         fontSize: 12,
         padding: 0,
         textAlign: "left",
+        ...truncStyle,
+        width: "100%",
       }}
-      title={id}
     >
-      {id.slice(0, 8)}…
+      {display}
     </button>
   );
 }
