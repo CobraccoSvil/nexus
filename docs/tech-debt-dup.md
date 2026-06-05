@@ -32,6 +32,7 @@ Aggiornare questa tabella a ogni wave che riduce il debito.
 | Wave 0 | 0 | 5.27% (16899 righe) | 1234 | Baseline iniziale, pre-consolidamento (2648 file, 20 formati) |
 | Wave 2 | 2 | 5.26% | 1234 | Consolidate TemplateCache/TtlCache + get_template_or_default in nexus-cache/nexus-types. Conteggio jscpd invariato: le due copie differivano nel formato, quindi non erano exact-clone; la duplicazione era strutturale, ora coperta dal guard check-single-source. |
 | Wave 3 | 3 | 5.26% | 1233 | get_setting: 4 implementazioni divergenti consolidate in una query unica (read_setting_raw) + viste in nexus-auth; i 3 def-site di mcp-core ora re-export. -1 clone. |
+| Wave 4 | 4 | 5.26% | 1233 | Capability gia' fonte unica via ADR 0024 (vista v_model_capabilities): nessun churn. Aggiunto solo guard sul classificatore (classify_capabilities/infer_capabilities_from_name). Cloni invariati. |
 
 ## Hotspot noti (da consolidare)
 

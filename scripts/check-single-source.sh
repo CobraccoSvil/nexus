@@ -55,6 +55,11 @@ assert_single "TemplateCache" 'struct TemplateCache' 'crates/nexus-types/src/tem
 # Wave 3:
 assert_single "get_setting" 'fn get_setting[^_a-zA-Z]' 'crates/nexus-auth/src/lib.rs' crates
 
+# Wave 4 (capability: la fonte DATI e' gia' unica via ADR 0024, vista
+# v_model_capabilities; qui si protegge il classificatore di scrittura).
+assert_single "classify_capabilities" 'fn classify_capabilities' 'crates/mcp-core/src/model_catalog_sync.rs' crates
+assert_single "infer_capabilities_from_name" 'fn infer_capabilities_from_name' 'crates/mcp-core/src/model_catalog_sync.rs' crates
+
 # Wave 6a:
 # assert_single "psycopg2.connect" 'psycopg2\.connect\(' 'brain/utils/db_pool.py' brain
 

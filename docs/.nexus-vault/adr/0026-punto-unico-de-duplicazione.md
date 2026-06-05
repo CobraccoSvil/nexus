@@ -72,7 +72,7 @@ condividere codice (fragile base class, accoppiamento al genitore).
 |---|---|---|
 | Gate disponibilita' provider | gate unico (ADR 0020) | esistente |
 | SQL-injection detector | detector unificato (ADR 0021) | esistente |
-| Capability modello (vision/tool/thinking) | vista `0318` + `mcp-core/src/capability.rs` (ADR 0024) | in corso (Wave 4) |
+| Capability modello (vision/tool/thinking) | vista `v_model_capabilities` (mig 0318) + classificatore `model_catalog_sync.rs::{classify_capabilities, infer_capabilities_from_name}` (ADR 0024) | esistente |
 | Routing/default/purpose model | `routing_matrix.rs` + tabelle mig 0101/0102 | esistente |
 | Identita' utente/progetto | `crates/nexus-types/src/lib.rs` | Wave 1 |
 | Cache TTL (Rust) | crate `nexus-cache` (`TtlCache<K,V>`) | Wave 2 |
