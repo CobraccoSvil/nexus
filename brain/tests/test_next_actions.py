@@ -69,16 +69,32 @@ def test_coerce_scarta_entry_malformate_e_applica_cap() -> None:
     assert all(len(c["label"]) <= na._MAX_LABEL_CHARS for c in out)
 
 
-def test_looks_like_choices_euristica() -> None:
-    """L'euristica scatta su domande multiple o formule italiane di proposta."""
-    # Due punti interrogativi -> scatta.
-    assert na.looks_like_choices("Vuoi una galleria? Aggiungo un form?") is True
-    # Due formule di proposta (anche con un solo "?") -> scatta.
-    assert na.looks_like_choices("Vuoi che aggiunga immagini? Preferisci un form?") is True
-    # Conservativa: un solo segnale non basta.
-    assert na.looks_like_choices("Vuoi che aggiunga immagini al sito.") is False
-    assert na.looks_like_choices("Ho completato il lavoro richiesto.") is False
+def test_regex_looks_like_choices_rete_sicurezza() -> None:
+    """La rete lessicale (deterministica, no embedding) scatta sui segnali ovvi.
+
+    E' il complemento/fallback del detector semantico: qui verifichiamo solo la
+    parte testuale, deterministica e indipendente dal modello.
+    """
+    assert na._regex_looks_like_choices("Vuoi una galleria? Aggiungo un form?") is True
+    assert na._regex_looks_like_choices("Vuoi che aggiunga immagini? Preferisci un form?") is True
+    # Conservativa: un solo segnale lessicale non basta.
+    assert na._regex_looks_like_choices("Vuoi che aggiunga immagini al sito.") is False
+    assert na._regex_looks_like_choices("Ho completato il lavoro richiesto.") is False
+    assert na._regex_looks_like_choices("") is False
+    # Termine di scelta + elenco di >=2 voci (senza "?") -> scatta.
+    assert (
+        na._regex_looks_like_choices(
+            "Ecco 3 opzioni:\n1. Galleria\n2. Form\n3. Blog\nScegli quella che preferisci."
+        )
+        is True
+    )
+
+
+def test_looks_like_choices_robusto() -> None:
+    """looks_like_choices (detector semantico OR rete lessicale): casi robusti,
+    indipendenti dal modello di embedding (la rete garantisce questi esiti)."""
     assert na.looks_like_choices("") is False
+    assert na.looks_like_choices("Vuoi una galleria? Aggiungo un form?") is True
 
 
 def test_build_step_none_se_vuoto() -> None:

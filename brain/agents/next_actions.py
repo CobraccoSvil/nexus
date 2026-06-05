@@ -19,9 +19,11 @@ Approccio IBRIDO ("entrambi, robusto"):
          </suggested_actions>
 
      Qui lo estraiamo, lo PARSIAMO e lo RIMUOVIAMO dal testo visibile.
-  2. FALLBACK — se l'agente NON ha emesso il blocco ma la risposta SEMBRA
-     contenere scelte (euristica leggera), un modello leggero (purpose
-     'choices_extractor', mig 0330) estrae le scelte in formato {label, prompt}.
+  2. FALLBACK — se l'agente NON ha emesso il blocco ma la risposta propone
+     scelte (rilevate con un detector SEMANTICO a embedding, lo stesso
+     meccanismo del SemanticRouter — niente regex come unico criterio), un
+     modello leggero (purpose 'choices_extractor', mig 0330) estrae le scelte
+     in formato {label, prompt}.
 
 Regole rispettate: niente modello hardcoded (G, via purpose_model), nessun leak
 di prompt/response in chiaro nei log (F, solo hash/lunghezze), punto unico (L).
@@ -70,6 +72,112 @@ _LIST_ITEM_RE = re.compile(r"(?m)^\s*(?:\d+[.)]|[-*•])\s+\S")
 
 def _list_item_count(text: str) -> int:
     return len(_LIST_ITEM_RE.findall(text or ""))
+
+
+# ── Detector semantico ("la risposta propone scelte all'utente?") ────────────
+# Riusa lo STESSO meccanismo embedding+exemplars+cosine del SemanticRouter
+# (brain/router/service.py::_classify_by_embedding) e lo STESSO EmbeddingService
+# (MiniLM) condiviso del runtime — niente modello aggiuntivo caricato, niente
+# duplicazione della logica di interpretazione dei termini (regola L). La
+# euristica testuale resta SOLO come rete di sicurezza/fallback.
+_CHOICE_EXEMPLARS_POS = [
+    "Vuoi che aggiunga immagini reali nella home page?",
+    "Preferisci integrare un form di prenotazione direttamente nella home?",
+    "Vuoi aggiungere una sezione Testimonianze o Offerte speciali?",
+    "Ecco tre possibili migliorie future tra cui puoi scegliere:",
+    "Quale di queste opzioni preferisci per proseguire?",
+    "Scegli quella che piu' si allinea ai tuoi obiettivi.",
+    "Posso procedere in due modi diversi: quale preferisci?",
+    "Ti propongo alcune alternative, fammi sapere come vuoi continuare.",
+    "Dimmi quale direzione vuoi prendere tra queste.",
+]
+_CHOICE_EXEMPLARS_NEG = [
+    "Ho completato la modifica del file come richiesto.",
+    "Il file e' stato salvato correttamente.",
+    "Ho corretto l'errore e ora i test passano.",
+    "Ecco il riepilogo delle operazioni che ho eseguito.",
+    "La configurazione e' terminata con successo.",
+    "Ho letto il contenuto del file e procedo con l'analisi.",
+]
+
+# Soglie auto-calibranti: 'propone scelte' se il testo e' piu' vicino agli
+# exemplar positivi che ai negativi, oltre una similarita' minima assoluta.
+_CHOICE_MIN_POS = 0.34
+_CHOICE_MARGIN = 0.02
+
+_choice_pos_vecs: list[list[float]] | None = None
+_choice_neg_vecs: list[list[float]] | None = None
+_choice_ready: bool | None = None  # None=non inizializzato, False=non disponibile
+
+
+def _shared_embeddings() -> Any:
+    """EmbeddingService (MiniLM) condiviso del runtime. Lazy import per evitare
+    cicli (runtime importa il grafo agenti). None se non disponibile."""
+    try:
+        from brain.grpc_server import runtime
+
+        return getattr(runtime, "embeddings", None)
+    except Exception:
+        return None
+
+
+def _init_choice_vectors() -> None:
+    """Pre-calcola gli embedding degli exemplars (come _init_intent_vectors del
+    router). Idempotente; su errore disabilita il detector (fallback testuale)."""
+    global _choice_pos_vecs, _choice_neg_vecs, _choice_ready
+    if _choice_ready is not None:
+        return
+    svc = _shared_embeddings()
+    if svc is None:
+        _choice_ready = False
+        return
+    try:
+        _choice_pos_vecs = [v.values for v in svc.embed_batch("", _CHOICE_EXEMPLARS_POS)]
+        _choice_neg_vecs = [v.values for v in svc.embed_batch("", _CHOICE_EXEMPLARS_NEG)]
+        _choice_ready = True
+        logger.info("next_actions: detector scelte inizializzato (embedding semantici)")
+    except Exception as exc:
+        logger.warning(
+            "next_actions: init detector semantico fallito (%s), uso fallback testuale", exc
+        )
+        _choice_ready = False
+
+
+def _top_mean_cosine(query_vec: Any, vecs: list[list[float]], k: int = 3) -> float:
+    """Media delle top-k cosine similarity (stesso scoring del SemanticRouter)."""
+    import numpy as np
+
+    if not vecs:
+        return -1.0
+    sims = [
+        float(
+            np.dot(query_vec, np.array(v))
+            / (np.linalg.norm(query_vec) * np.linalg.norm(np.array(v)) + 1e-8)
+        )
+        for v in vecs
+    ]
+    sims.sort(reverse=True)
+    top = sims[: min(k, len(sims))]
+    return sum(top) / len(top)
+
+
+def _semantic_looks_like_choices(text: str) -> bool | None:
+    """Detector a embedding. Ritorna bool se disponibile, None altrimenti
+    (cosi' il chiamante ricade sulla rete testuale)."""
+    _init_choice_vectors()
+    if not _choice_ready or not _choice_pos_vecs:
+        return None
+    try:
+        import numpy as np
+
+        svc = _shared_embeddings()
+        qv = np.array(svc.embed_text("", text[:2000]).values)
+        pos = _top_mean_cosine(qv, _choice_pos_vecs)
+        neg = _top_mean_cosine(qv, _choice_neg_vecs or [])
+        return pos >= _CHOICE_MIN_POS and pos > neg + _CHOICE_MARGIN
+    except Exception as exc:
+        logger.debug("next_actions: detector semantico errore (%s)", exc)
+        return None
 
 
 def _redact(text: str) -> str:
@@ -147,13 +255,10 @@ def extract_block(text: str) -> tuple[list[dict[str, str]], str]:
     return choices, cleaned
 
 
-def looks_like_choices(text: str) -> bool:
-    """Euristica leggera per decidere se vale la pena invocare il fallback LLM.
-
-    Vero se il testo presenta segnali di "proposta di scelte": piu' punti
-    interrogativi oppure formule italiane tipiche ("Vuoi", "Preferisci", ...).
-    Volutamente conservativa per non sprecare chiamate LLM su risposte normali.
-    """
+def _regex_looks_like_choices(text: str) -> bool:
+    """Rete di sicurezza lessicale (no embedding): segnali ovvi di proposta di
+    scelte. Usata in OR col detector semantico e come fallback quando gli
+    embedding non sono disponibili."""
     if not text:
         return False
     if text.count("?") >= 2:
@@ -162,11 +267,27 @@ def looks_like_choices(text: str) -> bool:
     if hints >= 2:
         return True
     # Un termine di scelta + un elenco di almeno 2 voci (es. "Ecco 3 opzioni:
-    # 1. ... 2. ... 3. ... Scegli quella che..."): pattern tipico di proposta
-    # di alternative anche senza punti interrogativi.
+    # 1. ... 2. ... 3. ... Scegli quella che...").
     if hints >= 1 and _list_item_count(text) >= 2:
         return True
     return False
+
+
+def looks_like_choices(text: str) -> bool:
+    """Decide se la risposta propone scelte all'utente (gate del fallback LLM).
+
+    PRIMARIO: detector semantico a embedding (stesso meccanismo del
+    SemanticRouter, regola L) — interpreta i termini per significato, non per
+    keyword. La rete testuale resta come complemento per i segnali lessicali
+    ovvi e come fallback quando gli embedding non sono disponibili. Un eventuale
+    falso positivo costa al massimo una chiamata a `choices_extractor` che
+    ritorna [] (nessun meta_step), quindi si privilegia la copertura.
+    """
+    if not text:
+        return False
+    if _semantic_looks_like_choices(text) is True:
+        return True
+    return _regex_looks_like_choices(text)
 
 
 def _build_extractor_prompt(assistant_text: str) -> str:
