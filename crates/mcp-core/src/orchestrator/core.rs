@@ -493,8 +493,12 @@ impl Orchestrator {
         // Leggiamo agentic_thinking_policy: solo 'exclude' (reasoning-only senza
         // function calling) va scartato dagli agentici; i dual-mode (deepseek-v4,
         // claude, gemini-2.5) restano e l'adapter forza il non-thinking (ADR 0025).
-        let caps: Option<(bool, String)> = sqlx::query_as::<_, (bool, String)>(
-            "SELECT supports_tool_use, agentic_thinking_policy FROM ai_price_catalog \
+        // Leggiamo anche is_enabled: un modello DISABILITATO (es. legacy pruned
+        // dalla mig 0320, raggiunto via una config di default stale) non e'
+        // chiamabile -> va comunque sostituito su un run agentico (robustezza
+        // oltre alla policy).
+        let caps: Option<(bool, String, bool)> = sqlx::query_as::<_, (bool, String, bool)>(
+            "SELECT supports_tool_use, agentic_thinking_policy, is_enabled FROM ai_price_catalog \
              WHERE provider = $1 AND model = $2 LIMIT 1",
         )
         .bind(&*provider)
@@ -503,10 +507,17 @@ impl Orchestrator {
         .await
         .ok()
         .flatten();
-        let supports: Option<bool> = caps.as_ref().map(|(s, _)| *s);
-        let policy: Option<&str> = caps.as_ref().map(|(_, p)| p.as_str());
+        let supports: Option<bool> = caps.as_ref().map(|(s, _, _)| *s);
+        let policy: Option<&str> = caps.as_ref().map(|(_, p, _)| p.as_str());
+        let model_disabled = matches!(caps.as_ref(), Some((_, _, false)));
 
-        match decide_tool_capability_gate(intent, gate_enabled, supports, policy) {
+        let gate_decision =
+            if model_disabled && intent != "chat" && gate_enabled {
+                ToolCapabilityGate::NeedsFallback
+            } else {
+                decide_tool_capability_gate(intent, gate_enabled, supports, policy)
+            };
+        match gate_decision {
             ToolCapabilityGate::KeepOriginal => {}
             ToolCapabilityGate::NeedsFallback => {
                 // Tier/capability dell'intent dalla cache (mig 0110), stessi
