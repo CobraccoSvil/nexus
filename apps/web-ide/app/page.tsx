@@ -32,6 +32,29 @@ const C = {
   accentGlow: "rgba(91,163,230,0.25)",
 };
 
+/** Titolo + sottotitolo centrato per le Band della landing (regola L, S39):
+ *  prima ripetuto inline in piu' sezioni. */
+function SectionHeading({
+  mobile,
+  title,
+  subtitle,
+}: {
+  mobile: boolean;
+  title: string;
+  subtitle: string;
+}) {
+  return (
+    <div style={{ textAlign: "center", marginBottom: 32 }}>
+      <h2 style={{ fontSize: mobile ? 24 : 36, fontWeight: 800, color: C.light.text }}>
+        {title}
+      </h2>
+      <p style={{ fontSize: 16, color: C.light.muted, maxWidth: 560, margin: "8px auto 0" }}>
+        {subtitle}
+      </p>
+    </div>
+  );
+}
+
 /** Sezione "testo + immagine fianco a fianco" usata in 2+ Band della landing.
  *  Punto unico per il pattern duplicato (regola L / ADR 0026). */
 function TextWithImageSection({
@@ -111,14 +134,11 @@ export default function LandingPage() {
 
       {/* ─── LIVE IDE PREVIEW (light) ─── */}
       <Band tone="light" id="preview">
-        <div style={{ textAlign: "center", marginBottom: 32 }}>
-          <h2 style={{ fontSize: mobile ? 24 : 36, fontWeight: 800, color: C.light.text }}>
-            {t("landing.v2.preview.title")}
-          </h2>
-          <p style={{ fontSize: 16, color: C.light.muted, maxWidth: 560, margin: "8px auto 0" }}>
-            {t("landing.v2.preview.subtitle")}
-          </p>
-        </div>
+        <SectionHeading
+          mobile={mobile}
+          title={t("landing.v2.preview.title")}
+          subtitle={t("landing.v2.preview.subtitle")}
+        />
         <div
           style={{
             borderRadius: 12,
@@ -166,14 +186,11 @@ export default function LandingPage() {
 
       {/* ─── MULTI-PROVIDER CASCADE (light) ─── */}
       <Band tone="light">
-        <div style={{ textAlign: "center", marginBottom: 40 }}>
-          <h2 style={{ fontSize: mobile ? 24 : 36, fontWeight: 800, color: C.light.text }}>
-            {t("landing.v2.providers.title")}
-          </h2>
-          <p style={{ fontSize: 16, color: C.light.muted, maxWidth: 560, margin: "8px auto 0" }}>
-            {t("landing.v2.providers.subtitle")}
-          </p>
-        </div>
+        <SectionHeading
+          mobile={mobile}
+          title={t("landing.v2.providers.title")}
+          subtitle={t("landing.v2.providers.subtitle")}
+        />
         <div
           style={{
             display: "flex",
@@ -207,14 +224,11 @@ export default function LandingPage() {
 
       {/* ─── INTEGRATIONS & TOOLS (light) ─── */}
       <Band tone="light">
-        <div style={{ textAlign: "center", marginBottom: 40 }}>
-          <h2 style={{ fontSize: mobile ? 24 : 36, fontWeight: 800, color: C.light.text }}>
-            {t("landing.v2.integrations.title")}
-          </h2>
-          <p style={{ fontSize: 16, color: C.light.muted }}>
-            {t("landing.v2.integrations.subtitle")}
-          </p>
-        </div>
+        <SectionHeading
+          mobile={mobile}
+          title={t("landing.v2.integrations.title")}
+          subtitle={t("landing.v2.integrations.subtitle")}
+        />
         <div
           style={{
             display: "grid",

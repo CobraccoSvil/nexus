@@ -410,33 +410,8 @@ fn detect_from_csproj(project_root: &Path) -> Option<DbEngine> {
         project_root.join("src"),
     ];
     for dir in &search_dirs {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if !name.ends_with(".csproj") {
-                    continue;
-                }
-                if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                    let lc = content.to_ascii_lowercase();
-                    if lc.contains("entityframeworkcore.sqlserver")
-                        || lc.contains("microsoft.data.sqlclient")
-                    {
-                        return Some(DbEngine::Sqlserver);
-                    }
-                    if lc.contains("npgsql.entityframeworkcore.postgresql") || lc.contains("npgsql")
-                    {
-                        return Some(DbEngine::Postgres);
-                    }
-                    if lc.contains("pomelo.entityframeworkcore.mysql")
-                        || lc.contains("mysqlconnector")
-                    {
-                        return Some(DbEngine::Mysql);
-                    }
-                    if lc.contains("microsoft.entityframeworkcore.sqlite") {
-                        return Some(DbEngine::Sqlite);
-                    }
-                }
-            }
+        if let Some(engine) = scan_csproj_in(dir) {
+            return Some(engine);
         }
         // Cerca anche in sottodirectory del livello successivo
         if let Ok(subdirs) = std::fs::read_dir(dir) {
@@ -444,36 +419,45 @@ fn detect_from_csproj(project_root: &Path) -> Option<DbEngine> {
                 if !sub.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     continue;
                 }
-                if let Ok(entries) = std::fs::read_dir(sub.path()) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if !name.ends_with(".csproj") {
-                            continue;
-                        }
-                        if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                            let lc = content.to_ascii_lowercase();
-                            if lc.contains("entityframeworkcore.sqlserver")
-                                || lc.contains("microsoft.data.sqlclient")
-                            {
-                                return Some(DbEngine::Sqlserver);
-                            }
-                            if lc.contains("npgsql.entityframeworkcore.postgresql")
-                                || lc.contains("npgsql")
-                            {
-                                return Some(DbEngine::Postgres);
-                            }
-                            if lc.contains("pomelo.entityframeworkcore.mysql")
-                                || lc.contains("mysqlconnector")
-                            {
-                                return Some(DbEngine::Mysql);
-                            }
-                            if lc.contains("microsoft.entityframeworkcore.sqlite") {
-                                return Some(DbEngine::Sqlite);
-                            }
-                        }
-                    }
+                if let Some(engine) = scan_csproj_in(&sub.path()) {
+                    return Some(engine);
                 }
             }
+        }
+    }
+    None
+}
+
+/// Scansiona `dir` cercando .csproj e rilevando il package EF Core/SqlClient.
+/// Punto unico (regola L, S35) per il pattern di detection duplicato fra
+/// search_dirs root e sub-dirs.
+fn scan_csproj_in(dir: &Path) -> Option<DbEngine> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".csproj") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(entry.path()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let lc = content.to_ascii_lowercase();
+        if lc.contains("entityframeworkcore.sqlserver")
+            || lc.contains("microsoft.data.sqlclient")
+        {
+            return Some(DbEngine::Sqlserver);
+        }
+        if lc.contains("npgsql.entityframeworkcore.postgresql") || lc.contains("npgsql") {
+            return Some(DbEngine::Postgres);
+        }
+        if lc.contains("pomelo.entityframeworkcore.mysql")
+            || lc.contains("mysqlconnector")
+        {
+            return Some(DbEngine::Mysql);
+        }
+        if lc.contains("microsoft.entityframeworkcore.sqlite") {
+            return Some(DbEngine::Sqlite);
         }
     }
     None

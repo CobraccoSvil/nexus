@@ -452,26 +452,24 @@ function ProfileCard({
             </>
           ) : (
             <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
-              <div>
-                <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 2 }}>Provider</div>
-                <div style={{ fontSize: 13, color: tc.text }}>
-                  {profile.defaultProvider || <em style={{ opacity: 0.4 }}>Predefinito</em>}
+              {(
+                [
+                  ["Provider", profile.defaultProvider, "Predefinito"],
+                  ["Modello", profile.defaultModel, "Predefinito"],
+                  [
+                    "Automazione",
+                    AUTOMATION_OPTIONS.find((o) => o.value === profile.defaultAutomation)?.label.split(" — ")[0],
+                    "Predefinita",
+                  ],
+                ] as const
+              ).map(([label, value, placeholder]) => (
+                <div key={label}>
+                  <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 2 }}>{label}</div>
+                  <div style={{ fontSize: 13, color: tc.text }}>
+                    {value || <em style={{ opacity: 0.4 }}>{placeholder}</em>}
+                  </div>
                 </div>
-              </div>
-              <div>
-                <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 2 }}>Modello</div>
-                <div style={{ fontSize: 13, color: tc.text }}>
-                  {profile.defaultModel || <em style={{ opacity: 0.4 }}>Predefinito</em>}
-                </div>
-              </div>
-              <div>
-                <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 2 }}>Automazione</div>
-                <div style={{ fontSize: 13, color: tc.text }}>
-                  {AUTOMATION_OPTIONS.find((o) => o.value === profile.defaultAutomation)?.label.split(" — ")[0] || (
-                    <em style={{ opacity: 0.4 }}>Predefinita</em>
-                  )}
-                </div>
-              </div>
+              ))}
             </div>
           )}
         </div>

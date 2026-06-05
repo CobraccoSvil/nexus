@@ -99,7 +99,6 @@ pub async fn serve_preview(
     State(state): State<AppState>,
     AxumPath(rest): AxumPath<String>,
 ) -> Response<Body> {
-    tracing::warn!("PREVIEW_REST raw_rest={:?}", rest);
     // UNA sola route wildcard `/preview/*rest`: `rest` = "<project_id>/<path...>".
     // Splittiamo manualmente il primo segmento. Motivo: in axum 0.7 il pattern
     // misto `:project_id/*path` lasciava `:project_id` VUOTO (il wildcard
@@ -188,11 +187,15 @@ async fn serve_preview_inner(
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-/// Rileva se il progetto e' un sito statico servibile (esiste un `index.html`
-/// nella root). Usato dal wizard servizi e dal pannello per mostrare la card
-/// "Sito statico" con il pulsante Apri.
+/// Rileva se il progetto e' un sito statico servibile e quale file usare come
+/// entry. Preferisce `index.html`/`index.htm`; se assenti, ripiega su un altro
+/// nome comune (`home.html`, `main.html`) e infine sul primo file `.html`/`.htm`
+/// in ordine alfabetico nella root. Questo rende la feature utile anche per i
+/// siti che non seguono la convenzione index.html (es. progetti generati
+/// dall'agente con pagine flotta.html/prenota.html ma senza index).
 pub async fn detect_static_entry(root: &str) -> Option<String> {
-    for entry in ["index.html", "index.htm"] {
+    // 1) Entry canoniche, in ordine di preferenza.
+    for entry in ["index.html", "index.htm", "home.html", "main.html"] {
         if tokio::fs::metadata(format!("{}/{}", root, entry))
             .await
             .map(|m| m.is_file())
@@ -201,7 +204,23 @@ pub async fn detect_static_entry(root: &str) -> Option<String> {
             return Some(entry.to_string());
         }
     }
-    None
+
+    // 2) Fallback: primo file .html/.htm nella root (solo top-level, niente
+    //    ricorsione: l'entry di un sito sta in root).
+    let mut html_files: Vec<String> = Vec::new();
+    if let Ok(mut dir) = tokio::fs::read_dir(root).await {
+        while let Ok(Some(e)) = dir.next_entry().await {
+            let name = e.file_name().to_string_lossy().to_string();
+            let lower = name.to_ascii_lowercase();
+            if (lower.ends_with(".html") || lower.ends_with(".htm"))
+                && e.file_type().await.map(|t| t.is_file()).unwrap_or(false)
+            {
+                html_files.push(name);
+            }
+        }
+    }
+    html_files.sort();
+    html_files.into_iter().next()
 }
 
 /// Handler protetto: `GET /api/projects/:id/static-site`.

@@ -64,66 +64,8 @@ impl NexusToolHandler for CargoCheckTool {
         )
         .await?;
 
-        // Parse NDJSON stream di compiler-message
-        let mut errors: Vec<Value> = Vec::new();
-        let mut warnings: Vec<Value> = Vec::new();
-
-        for line in out.stdout.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let parsed: Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => continue, // linea non-JSON (raro, ignoriamo)
-            };
-
-            // Ci interessano solo i messaggi di compilatore
-            if parsed.get("reason").and_then(Value::as_str) != Some("compiler-message") {
-                continue;
-            }
-            let message = match parsed.get("message") {
-                Some(m) => m,
-                None => continue,
-            };
-            let level = message.get("level").and_then(Value::as_str).unwrap_or("");
-            let text = message
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            // Primo span primario (se presente) → file + line
-            let (file, line_no) = message
-                .get("spans")
-                .and_then(Value::as_array)
-                .and_then(|spans| {
-                    spans
-                        .iter()
-                        .find(|s| s.get("is_primary") == Some(&json!(true)))
-                })
-                .map(|span| {
-                    (
-                        span.get("file_name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        span.get("line_start").and_then(Value::as_u64).unwrap_or(0),
-                    )
-                })
-                .unwrap_or_default();
-
-            let entry = json!({
-                "file": file,
-                "line": line_no,
-                "message": text,
-            });
-
-            match level {
-                "error" | "error: internal compiler error" => errors.push(entry),
-                "warning" => warnings.push(entry),
-                _ => {}
-            }
-        }
+        // Punto unico in nexus_tools::parse_ndjson::extract_cargo_diagnostics (regola L, S42).
+        let (errors, warnings) = super::parse_ndjson::extract_cargo_diagnostics(&out.stdout);
 
         Ok(json!({
             "ok": out.success(),

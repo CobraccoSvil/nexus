@@ -18,6 +18,29 @@ interface Props {
   onBack: () => void;
 }
 
+/** Lista di link (outgoing o backlinks) con stesso layout. Punto unico (regola L, S41). */
+function LinksList({
+  title,
+  items,
+}: {
+  title: string;
+  items: { id: string; title?: string; relType: string; confidence: number }[];
+}) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <h5 style={{ fontSize: 12, fontWeight: 600, color: "#525252", margin: "0 0 6px" }}>{title}</h5>
+      {items.map((link) => (
+        <div key={link.id} style={{ fontSize: 12, padding: "4px 0", color: "#171717" }}>
+          <span style={{ color: "#6366f1" }}>{link.title}</span>
+          <span style={{ color: "#a3a3a3", marginLeft: 8 }}>
+            ({link.relType}, {(link.confidence * 100).toFixed(0)}%)
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function NoteDetail({ projectId, noteId, onBack }: Props) {
   const { t } = useI18n();
   const [note, setNote] = useState<KnowledgeNote | null>(null);
@@ -123,36 +146,28 @@ export function NoteDetail({ projectId, noteId, onBack }: Props) {
 
       {/* Link in uscita */}
       {note.outgoing && note.outgoing.length > 0 && (
-        <div style={{ marginBottom: 12 }}>
-          <h5 style={{ fontSize: 12, fontWeight: 600, color: "#525252", margin: "0 0 6px" }}>
-            {t("knowledge.links.outgoing")}
-          </h5>
-          {note.outgoing.map((link) => (
-            <div key={link.linkId} style={{ fontSize: 12, padding: "4px 0", color: "#171717" }}>
-              <span style={{ color: "#6366f1" }}>{link.toTitle}</span>
-              <span style={{ color: "#a3a3a3", marginLeft: 8 }}>
-                ({link.relType}, {(link.confidence * 100).toFixed(0)}%)
-              </span>
-            </div>
-          ))}
-        </div>
+        <LinksList
+          title={t("knowledge.links.outgoing")}
+          items={note.outgoing.map((link) => ({
+            id: link.linkId,
+            title: link.toTitle,
+            relType: link.relType,
+            confidence: link.confidence,
+          }))}
+        />
       )}
 
       {/* Backlink */}
       {note.backlinks && note.backlinks.length > 0 && (
-        <div style={{ marginBottom: 12 }}>
-          <h5 style={{ fontSize: 12, fontWeight: 600, color: "#525252", margin: "0 0 6px" }}>
-            {t("knowledge.links.backlinks")}
-          </h5>
-          {note.backlinks.map((link) => (
-            <div key={link.linkId} style={{ fontSize: 12, padding: "4px 0", color: "#171717" }}>
-              <span style={{ color: "#6366f1" }}>{link.fromTitle}</span>
-              <span style={{ color: "#a3a3a3", marginLeft: 8 }}>
-                ({link.relType}, {(link.confidence * 100).toFixed(0)}%)
-              </span>
-            </div>
-          ))}
-        </div>
+        <LinksList
+          title={t("knowledge.links.backlinks")}
+          items={note.backlinks.map((link) => ({
+            id: link.linkId,
+            title: link.fromTitle,
+            relType: link.relType,
+            confidence: link.confidence,
+          }))}
+        />
       )}
 
       {!note.outgoing?.length && !note.backlinks?.length && (

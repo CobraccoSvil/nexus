@@ -1209,6 +1209,45 @@ async fn main() -> anyhow::Result<()> {
 
     let app = routes::build_app_router(state, cors);
 
+    // Single-instance guard (regola L: un solo punto di verita' per "istanza
+    // attiva"). Un flock esclusivo non-bloccante legato alla porta garantisce
+    // UNA sola istanza di mcp-core: se un'altra e' gia' viva (es. un restart che
+    // ha lasciato il vecchio processo appeso), usciamo SUBITO con un messaggio
+    // chiaro invece di rischiare due processi che servono richieste a
+    // intermittenza (route vecchie vs nuove). Difesa indipendente dal deploy.
+    // Il File viene "dimenticato" cosi' il lock resta tenuto per tutta la vita
+    // del processo; il kernel lo rilascia automaticamente alla terminazione.
+    {
+        use std::os::unix::io::AsRawFd;
+        let lock_path = std::env::var("NEXUS_MCP_CORE_LOCK")
+            .unwrap_or_else(|_| format!("/tmp/nexus-mcp-core-{mcp_http_port}.lock"));
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(lock_file) => {
+                let rc =
+                    unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if rc != 0 {
+                    eprintln!(
+                        "mcp-core: un'altra istanza e' gia' attiva (lock {lock_path} occupato). \
+                         Esco per non coesistere sulla porta {mcp_http_port} (evita richieste \
+                         servite a caso da codice vecchio). Ferma il processo vecchio e riprova."
+                    );
+                    std::process::exit(1);
+                }
+                std::mem::forget(lock_file); // tieni il lock per tutta la vita del processo
+                tracing::info!("mcp-core: single-instance lock acquisito ({lock_path})");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "mcp-core: impossibile aprire il lock file {lock_path}: {e} (proseguo senza guard)"
+                );
+            }
+        }
+    }
+
     let addr = SocketAddr::from(([0, 0, 0, 0], mcp_http_port));
     tracing::info!("mcp-core listening on {}", addr);
 

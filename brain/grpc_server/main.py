@@ -30,6 +30,44 @@ from __future__ import annotations
 import logging
 import threading
 
+# Single-instance guard: il fd del lock va tenuto APERTO per tutta la vita del
+# processo (chiuderlo rilascerebbe il flock). Lo conserviamo a livello modulo.
+_SINGLE_INSTANCE_LOCK_FD: int | None = None
+
+
+def _acquire_single_instance_lock(grpc_port: int) -> None:
+    """Garantisce UNA sola istanza del brain (regola L: punto unico).
+
+    Acquisisce un flock esclusivo non-bloccante su un file legato alla porta
+    gRPC. Se un'altra istanza e' gia' viva (es. un restart che ha lasciato il
+    vecchio processo appeso), il bind fallisce e usciamo SUBITO con un messaggio
+    chiaro, invece di coesistere e servire richieste dal codice vecchio. Difesa
+    indipendente da SO_REUSEPORT, dal deploy e da systemd.
+    """
+    global _SINGLE_INSTANCE_LOCK_FD
+    import fcntl
+    import os
+    import sys
+
+    lock_path = os.environ.get("NEXUS_BRAIN_LOCK", f"/tmp/nexus-brain-{grpc_port}.lock")
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        logger.error(
+            "Un'altra istanza del brain e' gia' attiva (lock %s occupato). "
+            "Esco per non coesistere sulla porta %d (evita richieste servite "
+            "a caso da codice vecchio). Ferma il processo vecchio e riprova.",
+            lock_path, grpc_port,
+        )
+        sys.exit(1)
+    # Scrivi il PID per diagnostica; mantieni il fd aperto (NON chiudere).
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    _SINGLE_INSTANCE_LOCK_FD = fd
+    logger.info("Single-instance lock acquisito (%s, pid=%d)", lock_path, os.getpid())
+
 # App FastAPI gia' costruita con middleware, lifespan e router inclusi.
 from brain.grpc_server.app import app
 
@@ -64,6 +102,10 @@ def main() -> None:
     from brain.utils import settings_db
     grpc_port = settings_db.resolve_port("brain_grpc_port")
     rest_port = settings_db.resolve_port("brain_rest_port")
+
+    # Single-instance guard PRIMA di bindare qualunque porta: se un'altra
+    # istanza e' viva, esce subito invece di coesistere (vedi funzione sopra).
+    _acquire_single_instance_lock(grpc_port)
 
     # Load API keys from DB at startup
     result = runtime._load_keys_from_db()

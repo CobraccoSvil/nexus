@@ -26,6 +26,10 @@ export function middleware(request: NextRequest) {
     pathname.startsWith("/_next") ||
     pathname.startsWith("/favicon") ||
     pathname.startsWith("/screenshots/") ||
+    // Preview dei siti HTML statici dei progetti: pubblico, deve essere
+    // apribile in una nuova scheda. Il proxy /preview inoltra alla route
+    // pubblica /preview di mcp-core (confinata alla project_root).
+    pathname.startsWith("/preview/") ||
     pathname === "/pricing"
   ) {
     return NextResponse.next();

@@ -38,7 +38,7 @@ echo -e "${YELLOW}==> dup-report: esecuzione jscpd${NC}"
 # non si passano path CLI). Vedi jscpd.json per i path canonici, mantenere
 # allineati. Gli "ignore" del config valgono comunque entro questi root.
 pnpm exec jscpd --silent --reporters json --output "$OUT_DIR" \
-    --ignore "**/generated/**,**/_pb2.py,**/_pb2_grpc.py,**/*_pb2.py,**/*_pb2_grpc.py,**/*.pb.rs,**/*.backup*,**/tests/**,**/__tests__/**,**/test_*.py,**/*_test.py,**/*.test.ts,**/*.test.tsx,**/*.test.js,**/*.test.jsx,**/*.spec.ts,**/*.spec.tsx,**/*.spec.js,**/*.spec.jsx" \
+    --ignore "**/generated/**,**/_pb2.py,**/_pb2_grpc.py,**/*_pb2.py,**/*_pb2_grpc.py,**/*.pb.rs,**/*.backup*,**/tests/**,**/__tests__/**,**/test_*.py,**/*_test.py,**/*.test.ts,**/*.test.tsx,**/*.test.js,**/*.test.jsx,**/*.spec.ts,**/*.spec.tsx,**/*.spec.js,**/*.spec.jsx,**/e2e/**,**/profiles/*.yaml,**/profiles/*.yml" \
     apps packages crates brain || true
 
 if [[ ! -f "$REPORT_JSON" ]]; then

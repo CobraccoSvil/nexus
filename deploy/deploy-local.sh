@@ -166,6 +166,31 @@ if $SYNC_ONLY; then
     exit 0
 fi
 
+# Ferma in modo AFFIDABILE tutti i processi che matchano il pattern (regola H):
+# SIGTERM -> attende l'uscita graceful (poll) -> SIGKILL se non muore entro il
+# timeout. Sostituisce il vecchio `pkill + sleep 1` che lasciava una RACE: il
+# nuovo processo veniva avviato mentre il vecchio era ancora attaccato alla
+# porta, lasciando due istanze a servire richieste a intermittenza (binario
+# vecchio vs nuovo). Insieme al single-instance lock nel codice (mcp-core/brain)
+# garantisce una sola istanza per porta.
+_stop_pattern() {
+    local pattern="$1"
+    local label="${2:-$pattern}"
+    pgrep -f "$pattern" >/dev/null 2>&1 || return 0  # nessun processo: nulla da fare
+    pkill -TERM -f "$pattern" 2>/dev/null || true
+    local i=0
+    while pgrep -f "$pattern" >/dev/null 2>&1; do
+        i=$((i + 1))
+        if [ "$i" -gt 30 ]; then  # ~15s di graceful, poi forza
+            log "stop ${label}: ancora vivo dopo 15s -> SIGKILL"
+            pkill -KILL -f "$pattern" 2>/dev/null || true
+            sleep 1
+            break
+        fi
+        sleep 0.5
+    done
+}
+
 stop_service() {
     local name="$1"
     # Root cause (regola H): `pkill -f "$name"` su nudo nome di servizio matcha
@@ -190,9 +215,8 @@ stop_service() {
     # trova processi (caso normale: servizio gia' fermo) -> senza `|| true` il
     # `set -e` farebbe terminare lo script proprio qui. Il `|| true` e' quindi
     # obbligatorio, non cosmetico.
-    pkill -f "target/(debug|release)/${name}([[:space:]]|\$)" 2>/dev/null || true
-    pkill -f "cargo run -p ${name}" 2>/dev/null || true
-    sleep 1
+    _stop_pattern "target/(debug|release)/${name}([[:space:]]|\$)" "$name"
+    _stop_pattern "cargo run -p ${name}" "${name} (cargo)"
     return 0
 }
 
@@ -240,8 +264,7 @@ start_service_with_env() {
 }
 
 stop_brain() {
-    pkill -f 'brain.grpc_server.main' 2>/dev/null || true
-    sleep 1
+    _stop_pattern 'brain.grpc_server.main' 'brain'
 }
 
 start_brain() {

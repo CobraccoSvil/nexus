@@ -377,6 +377,13 @@ def serve(port: int = 50051) -> None:
         options=[
             ("grpc.max_send_message_length", max_msg),
             ("grpc.max_receive_message_length", max_msg),
+            # SINGLE-INSTANCE: gRPC abilita SO_REUSEPORT di DEFAULT (=1), cosi'
+            # due processi brain possono bindare la STESSA porta :50051 e il
+            # kernel distribuisce le richieste a caso tra binario vecchio e nuovo
+            # (incidente ricorrente dopo i restart: route/codice vecchio servito a
+            # intermittenza). Lo forziamo a 0: un secondo processo che tenta il
+            # bind fallisce subito invece di coesistere.
+            ("grpc.so_reuseport", 0),
         ],
     )
     pb2_grpc.add_NeuralCoreServiceServicer_to_server(NeuralCoreServicer(), server)
