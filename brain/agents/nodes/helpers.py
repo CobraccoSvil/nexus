@@ -1207,6 +1207,23 @@ _SCAFFOLD_OBJECTS: tuple[str, ...] = (
 # applicativo. Gestisce articoli/apostrofi ("un'app", "l'applicazione",
 # "una app") perche' l'oggetto e' cercato come parola intera in una finestra
 # successiva al verbo. La regex e' costruita una sola volta a import-time.
+# Anti-pattern: termini di DOCUMENTAZIONE che escludono lo scaffolding.
+# Bug osservato: "Genera l'analisi funzionale del progetto" matchava
+# (genera + progetto) e il router dirottava da intent=docs a
+# intent=architecture, l'agente partiva in modalita' "scaffold app" e
+# il documento non veniva generato. Una richiesta di documentazione NON
+# e' uno scaffolding anche se cita "progetto/sistema/applicazione".
+_SCAFFOLD_DOC_TERMS: tuple[str, ...] = (
+    "analisi", "documento", "documentazione", "documenti", "specifica",
+    "specifiche", "report", "relazione", "manuale", "docx", "release notes",
+    "analysis", "document", "documentation", "specification", "specifications",
+    "spec", "specs", "diagramma", "diagram", "er diagram",
+)
+_SCAFFOLD_DOC_RE = _re_budget.compile(
+    r"\b(?:" + "|".join(_re_budget.escape(d) for d in _SCAFFOLD_DOC_TERMS) + r")\b",
+    _re_budget.IGNORECASE,
+)
+
 _SCAFFOLD_VERB_RE = _re_budget.compile(
     r"\b(?:" + "|".join(_re_budget.escape(v) for v in _SCAFFOLD_VERBS) + r")\b",
     _re_budget.IGNORECASE,
@@ -1224,11 +1241,20 @@ def _detect_scaffolding_intent(text: str) -> bool:
     frase (oggetto cercato in una finestra che segue il primo verbo). Robusto
     con articoli e apostrofi ("crea un'app", "fai una app per X"). La presenza
     di "nel file allegato" NON declassa il match: vince il verbo di creazione.
+
+    Esclusione: se la frase contiene termini di DOCUMENTAZIONE
+    (`_SCAFFOLD_DOC_TERMS`), NON e' scaffolding ma una richiesta di doc.
+    Esempio reale: "Genera l'analisi funzionale del progetto" -> matchava
+    (genera+progetto) e dirottava da intent=docs a intent=architecture,
+    il documento non veniva generato.
     """
     if not text or not text.strip():
         return False
     # Normalizza apostrofi tipografici per uniformare i confini di parola.
     normalized = text.replace("’", "'")
+    # Esclude esplicitamente le richieste di documentazione (regola anti-scaffolding).
+    if _SCAFFOLD_DOC_RE.search(normalized):
+        return False
     verb_match = _SCAFFOLD_VERB_RE.search(normalized)
     if verb_match is None:
         return False
