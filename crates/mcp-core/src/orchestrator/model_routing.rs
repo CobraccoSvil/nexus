@@ -301,7 +301,14 @@ pub async fn best_model_for_tier(
 ///   - `supports_tool_use = TRUE`
 ///   - `agentic_thinking_policy <> 'exclude'` (i dual-mode sono ammessi; l'adapter
 ///     forza il non-thinking nei tool-loop, ADR 0025)
-///   - `consecutive_failures = 0` (modelli sani)
+///   - NB: la salute del modello e' gia' garantita da `is_enabled = TRUE`. Il
+///     `model_health_probe` fa AUTO-DISABLE (`is_enabled=false`) quando
+///     `consecutive_failures >= failure_threshold`; quindi un modello enabled ha
+///     per costruzione `consecutive_failures < threshold`. NON filtriamo qui
+///     `consecutive_failures = 0`: era ridondante con is_enabled e DANNOSO ->
+///     creava starvation (un modello con 1 fail transitorio veniva escluso dai
+///     run reali, quindi mai piu' scelto, quindi il counter mai resettato -> fuori
+///     dal pool per sempre). Vedi ADR 0025.
 ///   - provider NON in cooldown (snapshot in-memory) e NON in `exclude_providers`
 ///
 /// Filtri opzionali:
@@ -348,7 +355,6 @@ pub(crate) async fn select_agentic_model(
              WHERE is_enabled = TRUE \
                AND supports_tool_use = TRUE \
                AND agentic_thinking_policy <> 'exclude' \
-               AND consecutive_failures = 0 \
                AND LOWER(provider) <> ALL($1)",
         );
         if tier.is_some() {
