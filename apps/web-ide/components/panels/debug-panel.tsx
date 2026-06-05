@@ -41,8 +41,26 @@ function classifyLine(line: string): DebugLevel | null {
   return null;
 }
 
+// Rimuove TUTTE le sequenze di escape ANSI/VT100, non solo SGR.
+// La regex precedente (`\x1b\[[0-9;]*[mGKHFJABCDSTu]`) ignorava le sequenze CSI
+// private come bracketed-paste (`\x1b[?2004h` / `\x1b[?2004l`): il `?` non era
+// in `[0-9;]` e i terminatori `h`/`l` non erano nella classe finale, percio'
+// nel Console Debug comparivano residui tipo `[?2004h` o `B[?20041`.
+// Pattern costruito da escape \u (niente byte di controllo letterali nel
+// sorgente): cattura CSI con byte privati/intermedi, OSC (terminato da BEL) e
+// le designazioni di charset (`\x1b(B`, `\x1b)0`, ...).
+const ANSI_PATTERN = new RegExp(
+  "[\\u001B\\u009B][[\\]()#;?]*" +
+    "(?:" +
+    "(?:(?:[a-zA-Z\\d]*(?:;[a-zA-Z\\d]*)*)?\\u0007)" + // OSC ... BEL
+    "|(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PR-TZcf-ntqry=><~]" + // CSI finale
+    "|[()][AB0-9]" + // designazione charset G0/G1
+    ")",
+  "g",
+);
+
 function stripAnsi(str: string): string {
-  return str.replace(/\x1b\[[0-9;]*[mGKHFJABCDSTu]/g, "");
+  return str.replace(ANSI_PATTERN, "");
 }
 
 let globalIdCounter = 0;
