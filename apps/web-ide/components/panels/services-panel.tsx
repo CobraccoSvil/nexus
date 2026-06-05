@@ -15,6 +15,24 @@ interface ServicesPanelProps {
   onSendToChat?: (message: string) => void;
 }
 
+/** Stile condiviso per i bottoni d'azione della toolbar (Apri/Invia/Stop).
+ *  Punto unico (regola L / ADR 0026) per evitare il clone 44L intra-file. */
+function actionBtnStyle(background: string): React.CSSProperties {
+  return {
+    background,
+    color: "#fff",
+    border: "none",
+    borderRadius: 4,
+    padding: "2px 10px",
+    fontSize: 11,
+    cursor: "pointer",
+    flexShrink: 0,
+    display: "flex",
+    alignItems: "center",
+    gap: 4,
+  };
+}
+
 export function ServicesPanel({ projectId, projectName, onSendToChat }: ServicesPanelProps) {
   const tc = useThemeColors();
   const [processes, setProcesses] = useState<OutputChannel[]>([]);
@@ -329,11 +347,7 @@ ${outputBlock}${truncatedNote}
               <button
                 onClick={openInBrowser}
                 title={`Apri ${previewUrl} in una nuova scheda`}
-                style={{
-                  background: "#10b981", color: "#fff", border: "none", borderRadius: 4,
-                  padding: "2px 10px", fontSize: 11, cursor: "pointer", flexShrink: 0,
-                  display: "flex", alignItems: "center", gap: 4,
-                }}
+                style={actionBtnStyle("#10b981")}
               >
                 <span>🌐</span> Apri
               </button>
@@ -342,11 +356,7 @@ ${outputBlock}${truncatedNote}
               <button
                 onClick={sendErrorToChat}
                 title="Invia output e contesto a Nexus per analizzare l'errore"
-                style={{
-                  background: tc.accent, color: "#fff", border: "none", borderRadius: 4,
-                  padding: "2px 10px", fontSize: 11, cursor: "pointer", flexShrink: 0,
-                  display: "flex", alignItems: "center", gap: 4,
-                }}
+                style={actionBtnStyle(tc.accent)}
               >
                 <span>💬</span> Invia a Nexus
               </button>
@@ -361,10 +371,7 @@ ${outputBlock}${truncatedNote}
                     fetchProcesses();
                   } catch { /* ignore */ }
                 }}
-                style={{
-                  background: tc.error, color: "#fff", border: "none", borderRadius: 4,
-                  padding: "2px 10px", fontSize: 11, cursor: "pointer", flexShrink: 0,
-                }}
+                style={{ ...actionBtnStyle(tc.error), display: "inline-block", gap: undefined }}
               >
                 Stop
               </button>

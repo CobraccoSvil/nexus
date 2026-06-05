@@ -71,6 +71,7 @@ mod sandbox;
 mod security;
 mod services_watchdog;
 mod settings;
+mod static_preview;
 mod sudo_manager;
 mod sudo_routes;
 mod task_watchdog;

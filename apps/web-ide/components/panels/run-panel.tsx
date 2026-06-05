@@ -47,6 +47,7 @@ import { type ServiceAction } from "./run/shared";
 import { WizardInstallModal } from "./run/wizard-install-modal";
 import { NexusServicesSection } from "./run/nexus-services-section";
 import { SystemdServicesSection } from "./run/systemd-services-section";
+import { StaticSiteSection } from "./run/static-site-section";
 import { PortAllocationsSection } from "./run/port-allocations-section";
 import { WizardOverlay } from "./run/wizard-overlay";
 
@@ -453,6 +454,8 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
         setDiagSentFor={setDiagSentFor}
         setDiagResult={setDiagResult}
       />
+
+      <StaticSiteSection tc={tc} projectId={projectId} />
 
       <PortAllocationsSection
         tc={tc}

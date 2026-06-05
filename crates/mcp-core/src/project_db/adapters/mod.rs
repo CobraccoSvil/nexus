@@ -86,6 +86,53 @@ pub(crate) fn sha256_hex(input: &str) -> String {
     )
 }
 
+/// Elenca le migration nella `migration_path` del progetto applicando il filtro
+/// dato (es. `*.sql`, `*.py` senza prefisso `__`). Helper condiviso fra adapter
+/// che leggono file-based migrations dal filesystem — punto unico (regola L /
+/// ADR 0026, step S10). Prima questo loop era duplicato in alembic.rs e
+/// sqlx_migrate.rs (cluster 40L).
+///
+/// - `file_filter`: predicato che riceve il nome file e decide se includerlo.
+/// - `include_sql`: se `true` il campo `Migration.sql` riceve il contenuto del
+///   file (sqlx-style); se `false` resta `None` (alembic-style, dove il vero
+///   SQL e' all'interno della Migration via Alembic API).
+pub(crate) fn list_pending_files(
+    ctx: &ProjectDbContext,
+    file_filter: impl Fn(&str) -> bool,
+    include_sql: bool,
+) -> Result<Vec<Migration>, ProjectDbError> {
+    let dir = ctx.project_root.join(&ctx.migration_path);
+    if !dir.exists() {
+        return Ok(vec![]);
+    }
+    let mut files: Vec<_> = std::fs::read_dir(&dir)?
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            file_filter(&name)
+        })
+        .collect();
+    files.sort_by_key(|e| e.file_name());
+
+    let mut result = Vec::new();
+    for entry in files {
+        let path = entry.path();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let filename = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        result.push(Migration {
+            filename: filename.clone(),
+            checksum: sha256_hex(&content),
+            description: Some(filename.clone()),
+            sql: if include_sql { Some(content) } else { None },
+        });
+    }
+    Ok(result)
+}
+
 /// Genera un timestamp per il nome del file migration: `YYYYMMDD_HHMMSS`.
 pub(crate) fn migration_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};

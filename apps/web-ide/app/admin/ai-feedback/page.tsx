@@ -1,14 +1,60 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import {
   getAdminFeedbackErrors,
   reviewAdminFeedbackError,
   type AdminFeedbackItem,
 } from "../../../lib/api-client";
-import { useThemeColors } from "../../../lib/theme";
+import { useThemeColors, type Theme } from "../../../lib/theme";
 import { useGlobalDialog } from "../../../components/global-dialog-provider";
 import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
+
+/** Blocco "label + preview boxed". Punto unico per i 3 preview ripetuti
+ *  (Domanda utente, Risposta AI errata, Feedback utente). Prima i 3 blocchi
+ *  con stessa struttura `<div><div>LABEL</div><div STYLED>CONTENT</div></div>`
+ *  causavano un clone 50L intra-file. */
+function LabeledPreview({
+  tc,
+  label,
+  content,
+  boxStyle,
+}: {
+  tc: Theme;
+  label: string;
+  content: string;
+  boxStyle?: CSSProperties;
+}) {
+  return (
+    <div>
+      <div
+        style={{
+          fontSize: 11,
+          color: tc.textMuted,
+          marginBottom: 3,
+          textTransform: "uppercase",
+          letterSpacing: "0.05em",
+        }}
+      >
+        {label}
+      </div>
+      <div
+        style={{
+          fontSize: 12,
+          color: tc.text,
+          background: tc.bg,
+          border: `1px solid ${tc.border}`,
+          borderRadius: 6,
+          padding: "6px 8px",
+          whiteSpace: "pre-wrap",
+          ...boxStyle,
+        }}
+      >
+        {content}
+      </div>
+    </div>
+  );
+}
 
 export default function AdminAiFeedbackPage() {
   const tc = useThemeColors();
@@ -128,49 +174,27 @@ export default function AdminAiFeedbackPage() {
 
             {/* Domanda utente che ha generato la risposta sbagliata */}
             {(item as AdminFeedbackItem & { userQuestionPreview?: string }).userQuestionPreview && (
-              <div>
-                <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 3, textTransform: "uppercase", letterSpacing: "0.05em" }}>
-                  Domanda utente
-                </div>
-                <div
-                  style={{
-                    fontSize: 12,
-                    color: tc.text,
-                    background: tc.bg,
-                    border: `1px solid ${tc.border}`,
-                    borderRadius: 6,
-                    padding: "6px 8px",
-                    whiteSpace: "pre-wrap",
-                    fontStyle: "italic",
-                  }}
-                >
-                  {(item as AdminFeedbackItem & { userQuestionPreview?: string }).userQuestionPreview}
-                </div>
-              </div>
+              <LabeledPreview
+                tc={tc}
+                label="Domanda utente"
+                content={(item as AdminFeedbackItem & { userQuestionPreview?: string }).userQuestionPreview!}
+                boxStyle={{ fontStyle: "italic" }}
+              />
             )}
 
             {/* Preview risposta AI sbagliata */}
             {(item as AdminFeedbackItem & { aiResponsePreview?: string }).aiResponsePreview && (
-              <div>
-                <div style={{ fontSize: 11, color: tc.textMuted, marginBottom: 3, textTransform: "uppercase", letterSpacing: "0.05em" }}>
-                  Risposta AI (errata)
-                </div>
-                <div
-                  style={{
-                    fontSize: 12,
-                    color: tc.error,
-                    background: tc.bg,
-                    border: `1px solid ${tc.error}44`,
-                    borderRadius: 6,
-                    padding: "6px 8px",
-                    whiteSpace: "pre-wrap",
-                    maxHeight: 120,
-                    overflow: "auto",
-                  }}
-                >
-                  {(item as AdminFeedbackItem & { aiResponsePreview?: string }).aiResponsePreview}
-                </div>
-              </div>
+              <LabeledPreview
+                tc={tc}
+                label="Risposta AI (errata)"
+                content={(item as AdminFeedbackItem & { aiResponsePreview?: string }).aiResponsePreview!}
+                boxStyle={{
+                  color: tc.error,
+                  border: `1px solid ${tc.error}44`,
+                  maxHeight: 120,
+                  overflow: "auto",
+                }}
+              />
             )}
 
             {/* Commento utente */}

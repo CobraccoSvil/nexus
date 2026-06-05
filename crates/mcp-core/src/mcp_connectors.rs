@@ -37,7 +37,8 @@ pub use nexus_mcp_client::server_storage::{
 };
 use nexus_mcp_client::server_storage::{
     apply_update_and_fetch, build_config, can_manage_server, delete_mcp_server as ss_delete,
-    fetch_owner_scope, insert_mcp_server, row_to_json, set_enabled,
+    fetch_owner_scope, insert_mcp_server, list_cached_tools, list_servers_for_user, row_to_json,
+    set_enabled,
 };
 
 // build_config: punto unico in nexus_mcp_client::server_storage (regola L /
@@ -85,38 +86,16 @@ pub async fn list_mcp_servers(
 ) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
 
-    let rows = sqlx::query(
-        "SELECT id, plugin_instance_id, name, description, icon_url, transport, url, command, args, env_vars, headers,
-                enabled, scope, user_id, created_at
-         FROM mcp_servers
-         WHERE user_id = $1 OR scope = 'global'
-         ORDER BY created_at DESC",
-    )
-    .bind(user_id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Punto unico SQL in nexus_mcp_client::server_storage (regola L).
+    let rows = list_servers_for_user(&state.db, user_id)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Per ogni server, legge anche i tool cached
     let mut servers: Vec<Value> = Vec::new();
     for r in &rows {
         let mut s = row_to_json(r, can_manage_server(r, user_id, &claims.role));
         let srv_id: Uuid = r.try_get("id").unwrap_or(Uuid::nil());
-        let tools = sqlx::query(
-            "SELECT tool_name, description FROM mcp_server_tools WHERE server_id = $1 ORDER BY tool_name",
-        )
-        .bind(srv_id)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default()
-        .iter()
-        .map(|t| json!({
-            "name": t.try_get::<String, _>("tool_name").unwrap_or_default(),
-            "description": t.try_get::<Option<String>, _>("description").unwrap_or(None),
-        }))
-        .collect::<Vec<_>>();
-
-        s["tools"] = json!(tools);
+        s["tools"] = json!(list_cached_tools(&state.db, srv_id).await);
         servers.push(s);
     }
 

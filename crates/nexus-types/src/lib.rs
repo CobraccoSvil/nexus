@@ -14,6 +14,7 @@ pub use fs_browse::{
 };
 
 pub mod admin_dto;
+pub mod settings_dto;
 
 // --- Shared API types ---
 

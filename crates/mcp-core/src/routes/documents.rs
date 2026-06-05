@@ -91,6 +91,16 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
                 middleware::require_auth,
             )),
         )
+        // Rileva se il progetto e' un sito HTML statico servibile dal server
+        // integrato (static_preview), con entry e URL di preview. Il pannello
+        // SERVIZI mostra la card "Sito statico" con il pulsante Apri.
+        .route(
+            "/api/projects/:id/static-site",
+            get(static_preview::static_site_info).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
         .route(
             "/api/projects/:id/services/wizard/install",
             post(project_workspace::wizard_install_service).layer(axum_mw::from_fn_with_state(

@@ -32,6 +32,62 @@ const C = {
   accentGlow: "rgba(91,163,230,0.25)",
 };
 
+/** Sezione "testo + immagine fianco a fianco" usata in 2+ Band della landing.
+ *  Punto unico per il pattern duplicato (regola L / ADR 0026). */
+function TextWithImageSection({
+  mobile,
+  title,
+  desc,
+  imgSrc,
+  imgAlt,
+  imgShadow,
+}: {
+  mobile: boolean;
+  title: string;
+  desc: string;
+  imgSrc: string;
+  imgAlt: string;
+  imgShadow?: boolean;
+}) {
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: mobile ? "1fr" : "1fr 1fr",
+        gap: 48,
+        alignItems: "center",
+      }}
+    >
+      <div>
+        <h2 style={{ fontSize: mobile ? 24 : 36, fontWeight: 800, color: C.light.text }}>
+          {title}
+        </h2>
+        <p style={{ fontSize: 16, lineHeight: 1.7, color: C.light.muted, marginTop: 16 }}>
+          {desc}
+        </p>
+      </div>
+      <div
+        style={{
+          borderRadius: 12,
+          overflow: "hidden",
+          border: `1px solid ${C.light.border}`,
+          aspectRatio: "16/10",
+          background: "#fff",
+          ...(imgShadow ? { boxShadow: "0 4px 24px rgba(0,0,0,0.08)" } : {}),
+        }}
+      >
+        <img
+          src={imgSrc}
+          alt={imgAlt}
+          style={{ width: "100%", height: "100%", objectFit: "cover" }}
+          loading="lazy"
+          onError={(e) => { (e.target as HTMLImageElement).style.opacity = "0"; }}
+        />
+      </div>
+    </div>
+  );
+}
+
 export default function LandingPage() {
   const { t } = useI18n();
   const [mobile, setMobile] = useState(false);
@@ -98,41 +154,14 @@ export default function LandingPage() {
 
       {/* ─── AGENTS (light) ─── */}
       <Band tone="light" id="features" style={{ background: "#f5f5f4" }}>
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: mobile ? "1fr" : "1fr 1fr",
-            gap: 48,
-            alignItems: "center",
-          }}
-        >
-          <div>
-            <h2 style={{ fontSize: mobile ? 24 : 36, fontWeight: 800, color: C.light.text }}>
-              {t("landing.v2.agents.title")}
-            </h2>
-            <p style={{ fontSize: 16, lineHeight: 1.7, color: C.light.muted, marginTop: 16 }}>
-              {t("landing.v2.agents.desc")}
-            </p>
-          </div>
-          <div
-            style={{
-              borderRadius: 12,
-              overflow: "hidden",
-              border: `1px solid ${C.light.border}`,
-              aspectRatio: "16/10",
-              background: "#fff",
-              boxShadow: "0 4px 24px rgba(0,0,0,0.08)",
-            }}
-          >
-            <img
-              src="/screenshots/orchestrator.jpg"
-              alt="Orchestrator"
-              style={{ width: "100%", height: "100%", objectFit: "cover" }}
-              loading="lazy"
-              onError={(e) => { (e.target as HTMLImageElement).style.opacity = "0"; }}
-            />
-          </div>
-        </div>
+        <TextWithImageSection
+          mobile={mobile}
+          title={t("landing.v2.agents.title")}
+          desc={t("landing.v2.agents.desc")}
+          imgSrc="/screenshots/orchestrator.jpg"
+          imgAlt="Orchestrator"
+          imgShadow
+        />
       </Band>
 
       {/* ─── MULTI-PROVIDER CASCADE (light) ─── */}
@@ -223,40 +252,13 @@ export default function LandingPage() {
 
       {/* ─── PERSISTENT MEMORY (light) ─── */}
       <Band tone="light">
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: mobile ? "1fr" : "1fr 1fr",
-            gap: 48,
-            alignItems: "center",
-          }}
-        >
-          <div>
-            <h2 style={{ fontSize: mobile ? 24 : 36, fontWeight: 800, color: C.light.text }}>
-              {t("landing.v2.memory.title")}
-            </h2>
-            <p style={{ fontSize: 16, lineHeight: 1.7, color: C.light.muted, marginTop: 16 }}>
-              {t("landing.v2.memory.desc")}
-            </p>
-          </div>
-          <div
-            style={{
-              borderRadius: 12,
-              overflow: "hidden",
-              border: `1px solid ${C.light.border}`,
-              background: "#fff",
-              aspectRatio: "16/10",
-            }}
-          >
-            <img
-              src="/screenshots/cost-breakdown.jpg"
-              alt="Cost breakdown"
-              style={{ width: "100%", height: "100%", objectFit: "cover" }}
-              loading="lazy"
-              onError={(e) => { (e.target as HTMLImageElement).style.opacity = "0"; }}
-            />
-          </div>
-        </div>
+        <TextWithImageSection
+          mobile={mobile}
+          title={t("landing.v2.memory.title")}
+          desc={t("landing.v2.memory.desc")}
+          imgSrc="/screenshots/cost-breakdown.jpg"
+          imgAlt="Cost breakdown"
+        />
       </Band>
 
       {/* ─── KNOWLEDGE BASE (light, alternato) ─── */}

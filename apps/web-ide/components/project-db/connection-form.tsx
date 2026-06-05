@@ -4,6 +4,55 @@ import type { Theme } from "../../lib/theme";
 import type { ProjectDbTestResult } from "../../lib/api-client";
 import type { InitForm, ConnFields } from "./db-helpers";
 
+/** Field label+input renderer. Punto unico per i 5 input identici di
+ *  connessione DB (regola L / ADR 0026). Prima i blocchi
+ *  `<div><label/><input/></div>` con stesso styling erano ripetuti 5 volte
+ *  e il blocco al riga 99/121 risultava un clone di 100L. */
+function DbField({
+  tc,
+  label,
+  type = "text",
+  placeholder,
+  value,
+  onChange,
+  fullWidth,
+}: {
+  tc: Theme;
+  label: string;
+  type?: "text" | "password";
+  placeholder?: string;
+  value: string;
+  onChange: (v: string) => void;
+  fullWidth?: boolean;
+}) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 2,
+        ...(fullWidth ? { gridColumn: "1 / -1" } : {}),
+      }}
+    >
+      <label style={{ fontSize: 9, color: tc.textMuted }}>{label}</label>
+      <input
+        type={type}
+        placeholder={placeholder}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        style={{
+          padding: "4px 6px",
+          fontSize: 11,
+          background: tc.bgCard,
+          color: tc.text,
+          border: `1px solid ${tc.border}`,
+          borderRadius: 4,
+        }}
+      />
+    </div>
+  );
+}
+
 interface Props {
   tc: Theme;
   isConfigured: boolean;
@@ -97,56 +146,43 @@ export function ConnectionForm({
           </div>
           {useConnFields && initForm.engine !== "sqlite" ? (
             <div style={{ display: "grid", gridTemplateColumns: "1fr 80px", gap: 4 }}>
-              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                <label style={{ fontSize: 9, color: tc.textMuted }}>Host</label>
-                <input
-                  type="text"
-                  placeholder="localhost"
-                  value={connFields.host}
-                  onChange={(e) => setConnFields((f) => ({ ...f, host: e.target.value }))}
-                  style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-                />
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                <label style={{ fontSize: 9, color: tc.textMuted }}>Porta</label>
-                <input
-                  type="text"
-                  placeholder={initForm.engine === "mysql" ? "3306" : initForm.engine === "sqlserver" ? "1433" : "5432"}
-                  value={connFields.port}
-                  onChange={(e) => setConnFields((f) => ({ ...f, port: e.target.value }))}
-                  style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-                />
-              </div>
-              <div style={{ gridColumn: "1 / -1", display: "flex", flexDirection: "column", gap: 2 }}>
-                <label style={{ fontSize: 9, color: tc.textMuted }}>Database</label>
-                <input
-                  type="text"
-                  placeholder="nome del DB applicativo (es. myapp_dev)"
-                  value={connFields.database}
-                  onChange={(e) => setConnFields((f) => ({ ...f, database: e.target.value }))}
-                  style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-                />
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                <label style={{ fontSize: 9, color: tc.textMuted }}>Utente</label>
-                <input
-                  type="text"
-                  placeholder="username"
-                  value={connFields.username}
-                  onChange={(e) => setConnFields((f) => ({ ...f, username: e.target.value }))}
-                  style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-                />
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                <label style={{ fontSize: 9, color: tc.textMuted }}>Password</label>
-                <input
-                  type="password"
-                  placeholder="password"
-                  value={connFields.password}
-                  onChange={(e) => setConnFields((f) => ({ ...f, password: e.target.value }))}
-                  style={{ padding: "4px 6px", fontSize: 11, background: tc.bgCard, color: tc.text, border: `1px solid ${tc.border}`, borderRadius: 4 }}
-                />
-              </div>
+              <DbField
+                tc={tc}
+                label="Host"
+                placeholder="localhost"
+                value={connFields.host}
+                onChange={(v) => setConnFields((f) => ({ ...f, host: v }))}
+              />
+              <DbField
+                tc={tc}
+                label="Porta"
+                placeholder={initForm.engine === "mysql" ? "3306" : initForm.engine === "sqlserver" ? "1433" : "5432"}
+                value={connFields.port}
+                onChange={(v) => setConnFields((f) => ({ ...f, port: v }))}
+              />
+              <DbField
+                tc={tc}
+                label="Database"
+                placeholder="nome del DB applicativo (es. myapp_dev)"
+                value={connFields.database}
+                onChange={(v) => setConnFields((f) => ({ ...f, database: v }))}
+                fullWidth
+              />
+              <DbField
+                tc={tc}
+                label="Utente"
+                placeholder="username"
+                value={connFields.username}
+                onChange={(v) => setConnFields((f) => ({ ...f, username: v }))}
+              />
+              <DbField
+                tc={tc}
+                label="Password"
+                type="password"
+                placeholder="password"
+                value={connFields.password}
+                onChange={(v) => setConnFields((f) => ({ ...f, password: v }))}
+              />
               {buildConnectionString() && (
                 <div style={{ gridColumn: "1 / -1", fontSize: 9, color: tc.textMuted, fontFamily: "monospace", wordBreak: "break-all", padding: "2px 4px", background: `${tc.border}30`, borderRadius: 3 }}>
                   {buildConnectionString().replace(/[Pp]assword=([^;,"']+)/g, "Password=***")}

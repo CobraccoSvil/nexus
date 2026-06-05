@@ -12,6 +12,19 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
         .route("/health", get(health))
         .route("/api/health", get(health))
         .route("/api/dashboard", get(dashboard))
+        // Server statico integrato per progetti HTML (no auth: deve essere
+        // apribile in una nuova scheda del browser, che non porta il JWT).
+        // Il path e' confinato rigorosamente alla project_root in
+        // static_preview::serve_preview (regola E). `*path` cattura l'intero
+        // sotto-percorso; path vuoto -> index.html.
+        .route(
+            "/preview/:project_id/*path",
+            get(static_preview::serve_preview),
+        )
+        .route(
+            "/preview/:project_id",
+            get(static_preview::serve_preview_root),
+        )
         // Nexus (Fase 8) — observability endpoint pubblici
         .route("/nexus/healthz", get(nexus_bridge::nexus_healthz))
         .route("/nexus/stats", get(nexus_bridge::nexus_stats))

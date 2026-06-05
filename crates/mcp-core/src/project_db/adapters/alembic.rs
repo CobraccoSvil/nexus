@@ -4,7 +4,7 @@
 //! oppure, se Alembic non è disponibile nel PATH del progetto, genera un file
 //! SQL generico nella cartella migrations/ dell'applicazione Python.
 
-use super::{migration_timestamp, sha256_hex, MigrationAdapter};
+use super::{list_pending_files, migration_timestamp, MigrationAdapter};
 use crate::project_db::{
     AppliedMigration, Migration, ProjectDbContext, ProjectDbError, RolledBackMigration,
 };
@@ -16,35 +16,8 @@ pub struct AlembicAdapter;
 #[async_trait]
 impl MigrationAdapter for AlembicAdapter {
     async fn list_pending(&self, ctx: &ProjectDbContext) -> Result<Vec<Migration>, ProjectDbError> {
-        let dir = ctx.project_root.join(&ctx.migration_path);
-        if !dir.exists() {
-            return Ok(vec![]);
-        }
-        let mut files: Vec<_> = std::fs::read_dir(&dir)?
-            .flatten()
-            .filter(|e| {
-                let n = e.file_name().to_string_lossy().to_string();
-                n.ends_with(".py") && !n.starts_with("__")
-            })
-            .collect();
-        files.sort_by_key(|e| e.file_name());
-        let mut result = Vec::new();
-        for entry in files {
-            let path = entry.path();
-            let content = std::fs::read_to_string(&path).unwrap_or_default();
-            let filename = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            result.push(Migration {
-                filename: filename.clone(),
-                checksum: sha256_hex(&content),
-                description: Some(filename.clone()),
-                sql: None,
-            });
-        }
-        Ok(result)
+        // Punto unico: scansione file-based via `list_pending_files` (regola L).
+        list_pending_files(ctx, |n| n.ends_with(".py") && !n.starts_with("__"), false)
     }
 
     async fn create_migration(

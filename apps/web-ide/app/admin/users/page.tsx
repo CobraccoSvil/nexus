@@ -129,61 +129,28 @@ export default function UsersPage() {
                     background: tc.bgHover,
                   }}
                 >
-                  <th
-                    style={{
-                      padding: "12px 16px",
-                      textAlign: "left",
-                      fontWeight: 600,
-                      fontSize: 12,
-                      color: tc.textMuted,
-                    }}
-                  >
-                    Email
-                  </th>
-                  <th
-                    style={{
-                      padding: "12px 16px",
-                      textAlign: "left",
-                      fontWeight: 600,
-                      fontSize: 12,
-                      color: tc.textMuted,
-                    }}
-                  >
-                    Nome
-                  </th>
-                  <th
-                    style={{
-                      padding: "12px 16px",
-                      textAlign: "left",
-                      fontWeight: 600,
-                      fontSize: 12,
-                      color: tc.textMuted,
-                    }}
-                  >
-                    Ruolo
-                  </th>
-                  <th
-                    style={{
-                      padding: "12px 16px",
-                      textAlign: "left",
-                      fontWeight: 600,
-                      fontSize: 12,
-                      color: tc.textMuted,
-                    }}
-                  >
-                    Data Creazione
-                  </th>
-                  <th
-                    style={{
-                      padding: "12px 16px",
-                      textAlign: "right",
-                      fontWeight: 600,
-                      fontSize: 12,
-                      color: tc.textMuted,
-                    }}
-                  >
-                    Azioni
-                  </th>
+                  {(
+                    [
+                      ["Email", "left"],
+                      ["Nome", "left"],
+                      ["Ruolo", "left"],
+                      ["Data Creazione", "left"],
+                      ["Azioni", "right"],
+                    ] as const
+                  ).map(([label, align]) => (
+                    <th
+                      key={label}
+                      style={{
+                        padding: "12px 16px",
+                        textAlign: align,
+                        fontWeight: 600,
+                        fontSize: 12,
+                        color: tc.textMuted,
+                      }}
+                    >
+                      {label}
+                    </th>
+                  ))}
                 </tr>
               </thead>
               <tbody>

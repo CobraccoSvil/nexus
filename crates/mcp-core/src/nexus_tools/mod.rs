@@ -430,6 +430,7 @@ pub mod project_db_analyze;
 pub mod project_db_backup;
 pub mod project_db_diff_schema;
 pub mod project_db_dump_schema;
+pub mod project_db_helpers;
 pub mod project_db_kill_query;
 pub mod project_db_reindex;
 pub mod project_db_restore;

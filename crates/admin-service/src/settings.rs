@@ -3,48 +3,16 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
 use crate::AppState;
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct Setting {
-    pub key: String,
-    pub value: String,
-    pub category: String,
-    pub description: String,
-    pub is_secret: bool,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateSettingRequest {
-    pub value: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BulkUpdateRequest {
-    pub settings: Vec<BulkSettingEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BulkSettingEntry {
-    pub key: String,
-    pub value: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct FsBrowseQuery {
-    pub path: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CreateDirectoryRequest {
-    pub parent_path: String,
-    pub name: String,
-}
+// Tipi DTO: punto unico in nexus_types::settings_dto (regola L / ADR 0026, S8).
+pub use nexus_types::settings_dto::{
+    BulkSettingEntry, BulkUpdateRequest, CreateDirectoryRequest, FsBrowseQuery, Setting,
+    UpdateSettingRequest,
+};
 
 // FS browse: punto unico in nexus_types::fs_browse (regola L / ADR 0026).
 // Prima `BrowseDirectoryNode`, `list_root_candidates`, `list_directories` e

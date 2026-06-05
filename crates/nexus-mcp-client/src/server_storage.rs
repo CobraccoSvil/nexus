@@ -335,3 +335,44 @@ pub async fn set_enabled(
         .await
         .map(|_| ())
 }
+
+/// SELECT * FROM mcp_servers WHERE user_id=$1 OR scope='global' ORDER BY created_at DESC.
+/// Lista i server visibili a un utente (propri + scope global).
+pub async fn list_servers_for_user(
+    db: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<PgRow>, sqlx::Error> {
+    sqlx::query(
+        "SELECT id, plugin_instance_id, name, description, icon_url, transport, url, command, args, env_vars, headers,
+                enabled, scope, user_id, created_at
+         FROM mcp_servers
+         WHERE user_id = $1 OR scope = 'global'
+         ORDER BY created_at DESC",
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await
+}
+
+/// SELECT tool_name, description FROM mcp_server_tools WHERE server_id=$1 ORDER BY tool_name.
+/// Ritorna i tool cached con shape JSON `{name, description}` pronto per la response.
+pub async fn list_cached_tools(
+    db: &PgPool,
+    server_id: Uuid,
+) -> Vec<Value> {
+    sqlx::query(
+        "SELECT tool_name, description FROM mcp_server_tools WHERE server_id = $1 ORDER BY tool_name",
+    )
+    .bind(server_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|t| {
+        json!({
+            "name": t.try_get::<String, _>("tool_name").unwrap_or_default(),
+            "description": t.try_get::<Option<String>, _>("description").unwrap_or(None),
+        })
+    })
+    .collect()
+}

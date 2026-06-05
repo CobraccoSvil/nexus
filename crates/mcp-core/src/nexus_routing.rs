@@ -340,65 +340,11 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Instant;
 
-    fn test_matrix() -> RoutingMatrix {
-        let mut purpose_models = HashMap::new();
-        purpose_models.insert(
-            TIER_OPUS.to_string(),
-            (
-                "test_provider_opus".to_string(),
-                "test_model_opus".to_string(),
-            ),
-        );
-        purpose_models.insert(
-            TIER_SONNET.to_string(),
-            (
-                "test_provider_sonnet".to_string(),
-                "test_model_sonnet".to_string(),
-            ),
-        );
-        purpose_models.insert(
-            TIER_HAIKU.to_string(),
-            (
-                "test_provider_haiku".to_string(),
-                "test_model_haiku".to_string(),
-            ),
-        );
-        RoutingMatrix {
-            by_intent_mode: HashMap::new(),
-            default_models: HashMap::new(),
-            purpose_models,
-            purpose_tiers: HashMap::new(),
-            escalations: HashMap::new(),
-            loaded_at: Instant::now(),
-        }
-    }
-
-    #[test]
-    fn test_agent_type_to_model_core_agents() {
-        let m = test_matrix();
-        let sonnet = Some((
-            "test_provider_sonnet".to_string(),
-            "test_model_sonnet".to_string(),
-        ));
-        let haiku = Some((
-            "test_provider_haiku".to_string(),
-            "test_model_haiku".to_string(),
-        ));
-        let opus = Some((
-            "test_provider_opus".to_string(),
-            "test_model_opus".to_string(),
-        ));
-
-        assert_eq!(agent_type_to_model(&AgentType::Coder, &m), sonnet);
-        assert_eq!(agent_type_to_model(&AgentType::Tester, &m), haiku);
-        assert_eq!(agent_type_to_model(&AgentType::Reviewer, &m), sonnet);
-        assert_eq!(agent_type_to_model(&AgentType::Architect, &m), opus);
-    }
-
-    #[test]
-    fn test_agent_type_to_model_all_60_variants_mapped() {
-        let m = test_matrix();
-        let registered: Vec<AgentType> = vec![
+    /// Lista canonica dei 60 AgentType registrati. Punto unico (regola L /
+    /// ADR 0026) per evitare duplicazione fra i test che iterano sulle varianti
+    /// (prima la stessa lista 60-righe viveva in 2 test diversi: 65L clone).
+    fn all_registered_agent_types() -> Vec<AgentType> {
+        vec![
             AgentType::Coder,
             AgentType::Tester,
             AgentType::Reviewer,
@@ -459,7 +405,68 @@ mod tests {
             AgentType::TestAutomationEngineer,
             AgentType::ReportingEngineer,
             AgentType::I18nEngineer,
-        ];
+        ]
+    }
+
+    fn test_matrix() -> RoutingMatrix {
+        let mut purpose_models = HashMap::new();
+        purpose_models.insert(
+            TIER_OPUS.to_string(),
+            (
+                "test_provider_opus".to_string(),
+                "test_model_opus".to_string(),
+            ),
+        );
+        purpose_models.insert(
+            TIER_SONNET.to_string(),
+            (
+                "test_provider_sonnet".to_string(),
+                "test_model_sonnet".to_string(),
+            ),
+        );
+        purpose_models.insert(
+            TIER_HAIKU.to_string(),
+            (
+                "test_provider_haiku".to_string(),
+                "test_model_haiku".to_string(),
+            ),
+        );
+        RoutingMatrix {
+            by_intent_mode: HashMap::new(),
+            default_models: HashMap::new(),
+            purpose_models,
+            purpose_tiers: HashMap::new(),
+            escalations: HashMap::new(),
+            loaded_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn test_agent_type_to_model_core_agents() {
+        let m = test_matrix();
+        let sonnet = Some((
+            "test_provider_sonnet".to_string(),
+            "test_model_sonnet".to_string(),
+        ));
+        let haiku = Some((
+            "test_provider_haiku".to_string(),
+            "test_model_haiku".to_string(),
+        ));
+        let opus = Some((
+            "test_provider_opus".to_string(),
+            "test_model_opus".to_string(),
+        ));
+
+        assert_eq!(agent_type_to_model(&AgentType::Coder, &m), sonnet);
+        assert_eq!(agent_type_to_model(&AgentType::Tester, &m), haiku);
+        assert_eq!(agent_type_to_model(&AgentType::Reviewer, &m), sonnet);
+        assert_eq!(agent_type_to_model(&AgentType::Architect, &m), opus);
+    }
+
+    #[test]
+    fn test_agent_type_to_model_all_60_variants_mapped() {
+        let m = test_matrix();
+        let registered = all_registered_agent_types();
         assert_eq!(registered.len(), 60, "expected 60 registered variants");
         for variant in &registered {
             assert!(
@@ -597,68 +604,7 @@ mod tests {
     #[test]
     fn test_agent_type_to_prompt_key_all_60_non_empty() {
         // Tutti i 60 variant concreti devono avere una prompt key non vuota.
-        let registered: Vec<AgentType> = vec![
-            AgentType::Coder,
-            AgentType::Tester,
-            AgentType::Reviewer,
-            AgentType::Architect,
-            AgentType::SecurityArchitect,
-            AgentType::PerformanceEngineer,
-            AgentType::DatabaseDesigner,
-            AgentType::FrontendSpecialist,
-            AgentType::BackendSpecialist,
-            AgentType::DevOpsEngineer,
-            AgentType::CloudArchitect,
-            AgentType::MobileSpecialist,
-            AgentType::DataScientist,
-            AgentType::MLEngineer,
-            AgentType::QASpecialist,
-            AgentType::TechLead,
-            AgentType::GitHubPRManager,
-            AgentType::GitHubCodeReviewer,
-            AgentType::GitHubIssueAnalyzer,
-            AgentType::GitHubReleaseManager,
-            AgentType::GitHubWorkflowManager,
-            AgentType::GitHubSecurityAnalyzer,
-            AgentType::GitHubDependencyManager,
-            AgentType::GitHubProjectManager,
-            AgentType::GitHubWikiManager,
-            AgentType::GitHubDiscussionModerator,
-            AgentType::GitHubActionsOptimizer,
-            AgentType::GitHubStatusMonitor,
-            AgentType::GitHubIntegrationBot,
-            AgentType::Researcher,
-            AgentType::Analyst,
-            AgentType::Optimizer,
-            AgentType::Documenter,
-            AgentType::SREEngineer,
-            AgentType::APIDesigner,
-            AgentType::PromptEngineer,
-            AgentType::AgentEngineer,
-            AgentType::Debugger,
-            AgentType::Refactorer,
-            AgentType::Profiler,
-            AgentType::InfraEngineer,
-            AgentType::DatabaseAdmin,
-            AgentType::SecurityAuditor,
-            AgentType::ComplianceOfficer,
-            AgentType::UIDesigner,
-            AgentType::AccessibilityEngineer,
-            AgentType::DataEngineer,
-            AgentType::ETLEngineer,
-            AgentType::AutomationEngineer,
-            AgentType::IntegrationEngineer,
-            AgentType::MonitoringEngineer,
-            AgentType::MigrationEngineer,
-            AgentType::ChatbotEngineer,
-            AgentType::EmbeddingEngineer,
-            AgentType::TechWriter,
-            AgentType::ProductOwner,
-            AgentType::BenchmarkEngineer,
-            AgentType::TestAutomationEngineer,
-            AgentType::ReportingEngineer,
-            AgentType::I18nEngineer,
-        ];
+        let registered = all_registered_agent_types();
         assert_eq!(registered.len(), 60, "expected 60 registered variants");
         for variant in &registered {
             let key = agent_type_to_prompt_key(variant);
