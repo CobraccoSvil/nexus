@@ -66,3 +66,31 @@ pub async fn ensure_project_access(
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_user_id, Claims};
+    use axum::http::StatusCode;
+
+    fn claims_with_sub(sub: &str) -> Claims {
+        Claims {
+            sub: sub.to_string(),
+            role: "user".to_string(),
+            exp: 0,
+        }
+    }
+
+    #[test]
+    fn parse_user_id_accetta_uuid_valido() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let parsed = parse_user_id(&claims_with_sub(id)).expect("uuid valido accettato");
+        assert_eq!(parsed.to_string(), id);
+    }
+
+    #[test]
+    fn parse_user_id_rifiuta_uuid_invalido() {
+        let err =
+            parse_user_id(&claims_with_sub("non-un-uuid")).expect_err("uuid invalido rifiutato");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+}

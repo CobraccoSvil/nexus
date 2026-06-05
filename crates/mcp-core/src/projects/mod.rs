@@ -30,6 +30,11 @@ use crate::{auth::Claims, vector_memory, AppState};
 pub(crate) type ApiError = (StatusCode, Json<Value>);
 pub(crate) type ApiResult = Result<Json<Value>, ApiError>;
 
+// Helper di identita'/errore HTTP: il punto unico e' in nexus-types
+// (regola L / ADR 0026). Qui solo re-export per i call site interni che usano
+// `crate::projects::{api_error, parse_user_id}`.
+pub(crate) use nexus_types::{api_error, parse_user_id};
+
 // ── Costanti condivise ────────────────────────────────────────────────────────
 
 pub(crate) const EXCLUDED_NAMES: &[&str] = &[
@@ -348,10 +353,6 @@ pub struct GeneratePromptRequest {
 
 // ── Helper pubblici condivisi ─────────────────────────────────────────────────
 
-pub(crate) fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
-    (status, Json(json!({ "error": message.into() })))
-}
-
 pub(crate) fn terminal_shell() -> String {
     if cfg!(windows) {
         std::env::var("TERMINAL_SHELL").unwrap_or_else(|_| "powershell.exe".to_string())
@@ -385,11 +386,6 @@ pub(crate) fn sign_terminal_token(payload_base64: &str, secret: &str) -> String 
     hasher.update(b":");
     hasher.update(payload_base64.as_bytes());
     format!("{:x}", hasher.finalize())
-}
-
-pub(crate) fn parse_user_id(claims: &Claims) -> Result<Uuid, ApiError> {
-    Uuid::parse_str(&claims.sub)
-        .map_err(|_| api_error(StatusCode::UNAUTHORIZED, "Sessione utente non valida"))
 }
 
 pub(crate) fn terminal_consumer_key(user_id: Uuid, project_id: Uuid) -> String {

@@ -46,7 +46,7 @@ assert_single() {
 # --- Check attivi (decommentare alla chiusura della wave corrispondente) ---
 
 # Wave 1:
-# assert_single "parse_user_id" 'fn parse_user_id' 'crates/nexus-types/src/lib.rs' crates
+assert_single "parse_user_id" 'fn parse_user_id' 'crates/nexus-types/src/lib.rs' crates
 
 # Wave 2:
 # assert_single "TemplateCache" 'struct TemplateCache' 'crates/nexus-cache/src/*.rs' crates
