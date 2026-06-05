@@ -453,16 +453,42 @@ async def _warmup_google_provider() -> None:
             logger.info("Vertex warmup: provider google non configurato (%s), skip", reason)
             return
 
+        # Regola G: niente nome modello in codice. Risolvi un modello google
+        # qualsiasi enabled dal catalog per il warmup (e' una chiamata tecnica
+        # di pre-warm del client SDK, non una scelta di routing).
+        def _resolve_warmup_model() -> str | None:
+            try:
+                import psycopg2  # type: ignore[import-untyped]
+                from brain.utils.settings_db import get_db_url
+                with psycopg2.connect(get_db_url()) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT model FROM ai_price_catalog "
+                            "WHERE provider = 'google' AND is_enabled = TRUE "
+                            "ORDER BY is_featured DESC, input_cost_per_million_tokens ASC NULLS LAST "
+                            "LIMIT 1"
+                        )
+                        row = cur.fetchone()
+                        return row[0] if row else None
+            except Exception as exc:
+                logger.info("Vertex warmup: risoluzione modello fallita (%s)", exc)
+                return None
+
+        warmup_model = _resolve_warmup_model()
+        if not warmup_model:
+            logger.info("Vertex warmup: nessun modello google enabled nel catalog, skip")
+            return
+
         def _do_warmup() -> int:
             client = provider._get_client()
-            response = client.models.count_tokens(model="gemini-2.5-flash", contents="warmup")
+            response = client.models.count_tokens(model=warmup_model, contents="warmup")
             return int(getattr(response, "total_tokens", 0))
 
         loop = _aio.get_running_loop()
         tokens = await loop.run_in_executor(None, _do_warmup)
         logger.info(
-            "Vertex warmup OK: client genai pre-inizializzato (model=gemini-2.5-flash, total_tokens=%d)",
-            tokens,
+            "Vertex warmup OK: client genai pre-inizializzato (model=%s, total_tokens=%d)",
+            warmup_model, tokens,
         )
     except Exception as exc:
         logger.info("Vertex warmup: skipped (%s)", exc)

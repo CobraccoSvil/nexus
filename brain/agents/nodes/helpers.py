@@ -1550,14 +1550,14 @@ def _offload_system_prompt_if_huge(system_text: str, embeddings: Any | None) -> 
 
 # ── Smart upscale (ADR 0016 Fase C) ─────────────────────────────────────────
 # Quando il context stimato supera 0.9*window del modello attivo, cerca nella
-# routing matrix un modello con context_window >= est_tokens*overhead_ratio
-# tra quelli `preferred_targets`. Lo switch e' visibile in UI e tracciato in
-# `agent_runs.upscale_*`.
+# catalog un modello con context_window >= est_tokens*overhead_ratio
+# nel tier configurato (`agent.upscale.target_tier`, default 'heavy').
+# Lo switch e' visibile in UI e tracciato in `agent_runs.upscale_*`.
 _UPSCALE_CACHE: dict[str, Any] = {
     "loaded_at": 0.0,
     "enabled": None,
     "overhead": None,
-    "targets": None,
+    "target_tier": None,
     "cost_cap": None,
 }
 _UPSCALE_TTL_SEC = 60.0
@@ -1572,28 +1572,31 @@ def _load_upscale_config() -> dict[str, Any]:
         return {
             "enabled": _UPSCALE_CACHE["enabled"],
             "overhead": _UPSCALE_CACHE["overhead"],
-            "targets": _UPSCALE_CACHE["targets"],
+            "target_tier": _UPSCALE_CACHE["target_tier"],
             "cost_cap": _UPSCALE_CACHE["cost_cap"],
         }
     enabled = True
     overhead = 1.2
-    targets: list[str] = ["claude-opus-4-6", "gemini-2.5-pro", "gpt-5.5", "claude-sonnet-4-6"]
+    # Regola G: niente nomi modello in codice. Il tier di escalation e' nel DB
+    # (agent.upscale.target_tier, default 'heavy'); _smart_upscale_model
+    # interroga ai_price_catalog scegliendo il modello con il context_window
+    # piu' grande tra quelli enabled+abbastanza capienti per la richiesta.
+    target_tier = "heavy"
     cost_cap = 0.50
     try:
         from brain.utils.settings_db import get_bool_setting, get_setting
         enabled = get_bool_setting("agent.upscale.enabled", True)
         overhead = float(get_setting("agent.upscale.target_overhead_ratio", "1.2") or "1.2")
-        raw_targets = get_setting("agent.upscale.preferred_targets", ",".join(targets)) or ""
-        targets = [t.strip() for t in raw_targets.split(",") if t.strip()]
+        target_tier = (get_setting("agent.upscale.target_tier", "heavy") or "heavy").strip()
         cost_cap = float(get_setting("agent.upscale.cost_cap_usd_per_run", "0.50") or "0.50")
     except Exception as exc:
         logger.warning("upscale: load DB fallito, uso default (%s)", exc)
     _UPSCALE_CACHE["loaded_at"] = now
     _UPSCALE_CACHE["enabled"] = enabled
     _UPSCALE_CACHE["overhead"] = overhead
-    _UPSCALE_CACHE["targets"] = targets
+    _UPSCALE_CACHE["target_tier"] = target_tier
     _UPSCALE_CACHE["cost_cap"] = cost_cap
-    return {"enabled": enabled, "overhead": overhead, "targets": targets, "cost_cap": cost_cap}
+    return {"enabled": enabled, "overhead": overhead, "target_tier": target_tier, "cost_cap": cost_cap}
 
 
 _PROVIDER_FROM_MODEL_CACHE: dict[str, str] = {}
@@ -1632,9 +1635,10 @@ def _smart_upscale_model(
 ) -> tuple[str, str] | None:
     """Ritorna `(new_model, reason)` se trova un modello con window adeguato.
 
-    None se non serve upscale o non c'e' alternativa. Cerca nei `preferred_targets`
-    in ordine, scegliendo il primo con `context_window >= est_tokens*overhead`
-    e abilitato in `ai_price_catalog`.
+    Regola G: la scelta e' tier-based (settings.agent.upscale.target_tier, default
+    'heavy'), niente nomi modello in codice ne' in settings DB. Sceglie dal
+    catalog il modello con context_window piu' grande nel tier configurato che
+    sia abilitato e capable per tool use (run agentici).
     """
     cfg = _load_upscale_config()
     if not cfg["enabled"] or est_tokens <= 0 or current_window <= 0:
@@ -1643,31 +1647,34 @@ def _smart_upscale_model(
         return None  # il modello attuale ce la fa
 
     required = int(est_tokens * cfg["overhead"])
+    target_tier = cfg["target_tier"]
     try:
-        import os as _os
         import psycopg2  # type: ignore[import-untyped]
         db_url = get_db_url()  # regola G: niente fallback hardcoded
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
-                # Costruisce l'ordering dei target via array_position per rispettare la preferenza CSV
-                placeholders = ",".join(["%s"] * len(cfg["targets"]))
+                # Scelta DINAMICA dal catalog: tier + capability + context window.
+                # Niente whitelist hardcoded: il miglior modello disponibile vince.
                 cur.execute(
-                    f"""
+                    """
                     SELECT model, context_window
                     FROM ai_price_catalog
-                    WHERE model IN ({placeholders})
+                    WHERE performance_tier = %s
                       AND is_enabled = TRUE
+                      AND supports_tool_use = TRUE
+                      AND agentic_thinking_policy <> 'exclude'
                       AND context_window >= %s
-                    ORDER BY array_position(ARRAY[{placeholders}]::text[], model)
+                    ORDER BY context_window DESC, is_featured DESC,
+                             input_cost_per_million_tokens ASC NULLS LAST
                     LIMIT 1
                     """,
-                    (*cfg["targets"], required, *cfg["targets"]),
+                    (target_tier, required),
                 )
                 row = cur.fetchone()
                 if not row:
                     logger.warning(
-                        "upscale: nessun modello con window >= %d tra %s",
-                        required, cfg["targets"],
+                        "upscale: nessun modello tier=%s con window >= %d",
+                        target_tier, required,
                     )
                     return None
                 new_model = row[0]
@@ -1675,10 +1682,10 @@ def _smart_upscale_model(
                 if new_model == current_model:
                     return None
                 logger.info(
-                    "upscale: %s (window=%d) -> %s (window=%d) per est_tokens=%d",
-                    current_model, current_window, new_model, new_window, est_tokens,
+                    "upscale: %s (window=%d) -> %s (window=%d, tier=%s) per est_tokens=%d",
+                    current_model, current_window, new_model, new_window, target_tier, est_tokens,
                 )
-                return (new_model, f"context_overflow:est={est_tokens}:from_window={current_window}")
+                return (new_model, f"context_overflow:est={est_tokens}:from_window={current_window}:tier={target_tier}")
     except Exception as exc:
         logger.warning("upscale: lookup DB fallito (%s), no switch", exc)
         return None
