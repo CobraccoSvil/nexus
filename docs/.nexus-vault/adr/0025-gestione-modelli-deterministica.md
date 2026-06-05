@@ -62,6 +62,26 @@ Due problemi accumulati come stratificazione di toppe:
   i call site (route_model_from_catalog, best_model_for_tier, cooldown-fallback in
   core.rs, re-route/cascade in agent_run.rs) delegano ad esso. Eleggibilita'
   definita una sola volta; niente query SQL duplicate.
+- Ordinamento: `select_agentic_model` antepone `(agentic_thinking_policy = 'none')
+  DESC` alla clausola del chiamante -> preferisce i modelli NATIVAMENTE
+  non-thinking ai dual-mode (`disable_for_tools`). Estensione naturale del
+  principio "non-thinking nei tool-loop": un modello nativamente non-thinking e'
+  piu' affidabile sotto `tool_choice` forzato. Auto-allineante e applicato in un
+  solo punto.
+
+### Cascata soft-failure M4: euristica executor, non planner
+
+- Il "completamento vuoto" (soft-failure M4: chiusura naturale, nessun tool,
+  contenuto sotto soglia al primo turno) e' un'euristica per l'EXECUTOR. Le
+  chiamate con `tool_choice` forzato e fallback dedicata (planner_node ->
+  `nexus_todo_write` + purpose `planner_fallback`; `_detect_clarifications`)
+  passano `soft_failure_fallback=False` a `registry.generate_agent_turn_sync`:
+  la cascata M4 generica non deve escalare ai default model dei provider (es.
+  gemini-2.5-pro) producendo l'apparenza di hollow. Il fallback su errori
+  retriable reali (billing/quota/timeout) resta sempre attivo.
+- Nota: `resolve_purpose` risolve PRIMA via tier-rule (`best_model_for_tier`) e
+  solo in assenza cade sul valore statico di `nexus_purpose_model`. Riconciliare
+  il solo valore statico (mig 0322) non basta per i purpose con `tier` valorizzato.
 
 ## Conseguenze
 
