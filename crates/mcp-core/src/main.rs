@@ -478,6 +478,14 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Restore COMPLEMENTARE dal DB persistente (ADR 0020): se Redis e' stato
+    // svuotato/riavviato, il blocco sopra non ripristina nulla e il gate parte
+    // VUOTO -> il primo run dopo il restart "scopre" i provider esausti
+    // chiamandoli (anthropic 400 / openai 429 ad ogni turno). nexus_provider_health
+    // e' la fonte persistente piu' affidabile: riallinea il gate allo stato noto
+    // cosi' il run li salta senza ri-testarli (il polling resta l'unico tester).
+    crate::provider_cooldown::restore_billing_cooldowns_from_db(&db).await;
+
     let neural_client = {
         let mut attempts = 0u32;
         // Resilienza all'avvio (regola H): il brain (Neural Core) puo' avere un

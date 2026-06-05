@@ -541,6 +541,51 @@ pub fn restore_cooldown(provider: &str, remaining_secs: u64, reason: &str) {
     }
 }
 
+/// Bootstrap del cooldown billing dal DB persistente al riavvio (ADR 0020).
+///
+/// Principio: il polling di health e' l'UNICO che testa i provider; un run di
+/// produzione deve CONSULTARE lo stato gia' accertato, non scoprirlo chiamando
+/// il provider. Lo store del gate e' pero' in-memory e si azzera ad ogni restart
+/// di mcp-core. Il `restore_cooldown` da Redis (main.rs) copre il caso comune ma
+/// fallisce se Redis e' stato svuotato/riavviato. `nexus_provider_health`
+/// (scritta dal brain via cooldown_bridge e dal gate) e' la fonte PERSISTENTE
+/// piu' affidabile: la leggiamo al boot e rimettiamo i provider esausti in
+/// cooldown lungo, cosi' il PRIMO run dopo un restart li salta senza ri-testarli
+/// (era la causa del loop "anthropic 400 / openai 429 ad ogni turno").
+///
+/// I provider il cui credito e' stato nel frattempo ricaricato vengono riabilitati
+/// dal `billing_cooldown_recovery_loop` (probe-then-reenable) al primo giro.
+pub async fn restore_billing_cooldowns_from_db(db: &sqlx::PgPool) {
+    let rows = match sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT LOWER(provider), last_error \
+         FROM nexus_provider_health \
+         WHERE billing_cooldown_until IS NOT NULL AND billing_cooldown_until > NOW()",
+    )
+    .fetch_all(db)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("restore_billing_cooldowns_from_db: query fallita: {e}");
+            return;
+        }
+    };
+    let n = rows.len();
+    for (provider, reason) in rows {
+        // Billing/quota e' persistente -> cooldown lungo (6h). Il recovery loop
+        // (probe-then-reenable) lo rimuovera' appena il provider torna 200.
+        put_provider_in_long_cooldown(
+            &provider,
+            reason.as_deref().unwrap_or("billing_cooldown (ripristino DB al boot)"),
+        );
+    }
+    if n > 0 {
+        tracing::info!(
+            "restore_billing_cooldowns_from_db: {n} provider in cooldown billing ripristinati dal DB al boot (gate allineato allo stato persistente)"
+        );
+    }
+}
+
 /// Controlla se tutti i provider nell'ordine di fallback sono in cooldown.
 /// Restituisce `Some(secondi_rimanenti)` se tutti sono in cooldown, `None` se almeno uno è disponibile.
 #[allow(dead_code)]

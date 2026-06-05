@@ -35,6 +35,60 @@ pub(crate) fn trunc_chars(s: String, max: usize) -> String {
         s.chars().take(max).collect()
     }
 }
+
+/// Resoconto deterministico delle azioni eseguite dall'agente (ADR 0025).
+///
+/// Usato come risposta finale quando il modello chiude il turno senza body
+/// (hollow / completamento vuoto) MA ha comunque eseguito tool: invece di un
+/// generico "nessuna risposta", l'utente vede cosa e' stato fatto. Nessuna
+/// chiamata LLM: rete di sicurezza garantita, indipendente da provider/cooldown.
+/// Ritorna `None` se non c'e' alcuna azione concreta (l'agente non ha fatto
+/// nulla) — in quel caso il chiamante usa il placeholder generico.
+fn build_action_recap(steps: &[AgentStep]) -> Option<String> {
+    use std::collections::BTreeSet;
+    let mut lines: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut files_touched: BTreeSet<String> = BTreeSet::new();
+    for step in steps {
+        if step.status != AgentStepStatus::Completed || step.tool_name.is_empty() {
+            continue;
+        }
+        // Dettaglio leggibile dall'input del tool, in ordine di preferenza.
+        let detail = ["path", "file", "command", "pattern", "query"]
+            .iter()
+            .find_map(|k| step.tool_input.get(*k).and_then(|v| v.as_str()))
+            .map(|s| trunc_chars(s.to_string(), 120));
+        let line = match &detail {
+            Some(d) => format!("- `{}`: {}", step.tool_name, d),
+            None => format!("- `{}`", step.tool_name),
+        };
+        if seen.insert(line.clone()) {
+            lines.push(line);
+        }
+        if matches!(
+            step.tool_name.as_str(),
+            "write_file" | "edit_file" | "create_file" | "apply_patch"
+        ) {
+            if let Some(p) = step.tool_input.get("path").and_then(|v| v.as_str()) {
+                files_touched.insert(p.to_string());
+            }
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let mut out = String::from("Task completato. Azioni eseguite dall'agente:\n");
+    out.push_str(&lines.join("\n"));
+    if !files_touched.is_empty() {
+        let files: Vec<String> = files_touched.iter().map(|f| format!("`{f}`")).collect();
+        out.push_str(&format!("\n\nFile creati/modificati: {}", files.join(", ")));
+    }
+    out.push_str(
+        "\n\n_(Riepilogo generato automaticamente: l'agente ha eseguito le azioni \
+         sopra ma non ha prodotto un messaggio finale. Verifica i risultati.)_",
+    );
+    Some(out)
+}
 /// Costruisce il messaggio iniziale per il brain arricchendolo con il contenuto
 /// reale degli allegati (pre-extraction nel prompt — ADR 0010/0011/0012).
 ///
@@ -1726,16 +1780,20 @@ pub(crate) async fn spawn_agent_run(
             // sistema abbia "fatto qualcosa" che in realta' non e' avvenuto.
             let answer_owned: Option<String> = match result.final_answer.as_ref() {
                 Some(s) if !s.trim().is_empty() => Some(s.clone()),
-                // Final answer mancante o vuoto: fabrichiamo un placeholder solo
-                // se siamo arrivati qui DOPO il retry loop (hollow_completion
-                // confermato e tentativi esauriti). Altrimenti il body fantasma
-                // confonderebbe la storia turni.
-                _ if report_hollow => Some(format!(
-                    "_(Nessuna risposta utile prodotta dall'agente — {} / {} ha chiuso \
-                 il turno con un completamento vuoto dopo aver esaurito i tentativi \
-                 di fallback. Riformula la richiesta o cambia provider/modello manualmente.)_",
-                    result.provider, result.model
-                )),
+                // Final answer mancante o vuoto: siamo qui DOPO il retry loop
+                // (hollow_completion confermato e tentativi esauriti). Se l'agente
+                // ha comunque ESEGUITO azioni concrete (tool completati), produci
+                // un recap deterministico (ADR 0025) cosi' l'utente vede cosa e'
+                // stato fatto invece di un generico "nessuna risposta". Solo se
+                // non c'e' alcuna azione si usa il placeholder generico.
+                _ if report_hollow => build_action_recap(&result.steps).or_else(|| {
+                    Some(format!(
+                        "_(Nessuna risposta utile prodotta dall'agente — {} / {} ha chiuso \
+                     il turno con un completamento vuoto dopo aver esaurito i tentativi \
+                     di fallback. Riformula la richiesta o cambia provider/modello manualmente.)_",
+                        result.provider, result.model
+                    ))
+                }),
                 _ => None,
             };
 
