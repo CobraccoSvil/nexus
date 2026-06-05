@@ -28,6 +28,19 @@
     "**/*_pb2.py",
     "**/*_pb2_grpc.py",
     "**/*.pb.rs",
-    "**/page.tsx.backup*"
+    "**/page.tsx.backup*",
+    "tests/**",
+    "**/tests/**",
+    "**/__tests__/**",
+    "**/test_*.py",
+    "**/*_test.py",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/*.test.js",
+    "**/*.test.jsx",
+    "**/*.spec.ts",
+    "**/*.spec.tsx",
+    "**/*.spec.js",
+    "**/*.spec.jsx"
   ]
 }

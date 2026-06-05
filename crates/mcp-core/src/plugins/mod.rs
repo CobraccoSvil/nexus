@@ -945,6 +945,56 @@ pub(super) async fn resolve_plugin_runtime_config(
     }
 }
 
+/// Applica la tool policy di default presente nel catalog a un plugin
+/// instance appena creato (UPSERT in `plugin_instance_tool_policies`).
+/// Punto unico (regola L / ADR 0026, step S20): prima questo blocco era
+/// duplicato pari-pari in `install.rs` su 2 handler diversi (~34L cluster
+/// jscpd). Best-effort: errori SQL ignorati.
+pub(super) async fn apply_default_tool_policy(
+    db: &PgPool,
+    plugin_instance_id: Uuid,
+    catalog: &CatalogConfig,
+    user_id: Uuid,
+) {
+    let policy_mode = catalog
+        .default_tool_policy
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("allowlist")
+        .to_string();
+    let policy_tools = catalog
+        .default_tool_policy
+        .get("tools")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let policy_blocked = catalog
+        .default_tool_policy
+        .get("blockedTools")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO plugin_instance_tool_policies
+            (plugin_instance_id, mode, tools, blocked_tools, updated_by_user_id)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (plugin_instance_id)
+        DO UPDATE SET
+            mode = EXCLUDED.mode,
+            tools = EXCLUDED.tools,
+            blocked_tools = EXCLUDED.blocked_tools,
+            updated_by_user_id = EXCLUDED.updated_by_user_id,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(plugin_instance_id)
+    .bind(policy_mode)
+    .bind(policy_tools)
+    .bind(policy_blocked)
+    .bind(user_id)
+    .execute(db)
+    .await;
+}
+
 pub(super) async fn get_catalog_by_install_request(
     db: &PgPool,
     body: &InstallPluginRequest,

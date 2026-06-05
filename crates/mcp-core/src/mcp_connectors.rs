@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::Claims,
-    chat_learning::{api_error, parse_user_id, ApiResult},
+    chat_learning::{api_error, parse_user_id, ApiError, ApiResult},
     mcp_client::{self, McpServerConfig, McpTransport},
     AppState,
 };
@@ -37,44 +37,44 @@ pub use nexus_mcp_client::server_storage::{
 };
 use nexus_mcp_client::server_storage::{
     apply_update_and_fetch, build_config, can_manage_server, delete_mcp_server as ss_delete,
-    fetch_owner_scope, insert_mcp_server, list_cached_tools, list_servers_for_user, row_to_json,
-    set_enabled,
+    fetch_owner_scope, fetch_server_for_test, insert_mcp_server, is_tool_allowed_by_policy,
+    list_cached_tools, list_cached_tools_with_schema, list_servers_for_user, parse_json_string_set,
+    row_to_json, set_enabled, upsert_discovered_tools,
 };
 
 // build_config: punto unico in nexus_mcp_client::server_storage (regola L /
 // ADR 0026). Prima duplicato qui e in plugin-service.
 
-fn parse_json_string_set(raw: &Value) -> HashSet<String> {
-    raw.as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default()
-}
+// parse_json_string_set + is_tool_allowed_by_policy: punto unico in
+// nexus_mcp_client::server_storage (regola L / ADR 0026, step S12').
 
-fn is_tool_allowed_by_policy(
-    mode: Option<&str>,
-    allowed_tools: &HashSet<String>,
-    blocked_tools: &HashSet<String>,
-    tool_name: &str,
-) -> bool {
-    if blocked_tools.contains(tool_name) {
-        return false;
+/// Pattern condiviso degli handler che modificano un server MCP:
+/// 1. parse_user_id dal claims
+/// 2. parse Uuid del path :id
+/// 3. fetch_owner_scope (NOT_FOUND se assente)
+/// 4. can_manage_server (NOT_FOUND mascherato se non autorizzato)
+///
+/// Punto unico (regola L, step S14') per i 4 handler `update`/`delete`/
+/// `toggle`/`test` che condividevano questo prologo riga-per-riga.
+/// Ritorna `(user_id, server_id)` se autorizzato.
+async fn authorize_server_mutation(
+    state: &AppState,
+    claims: &Claims,
+    server_id_str: &str,
+) -> Result<(Uuid, Uuid), ApiError> {
+    let user_id = parse_user_id(claims)?;
+    let server_id = Uuid::parse_str(server_id_str)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Server id non valido"))?;
+    let existing = fetch_owner_scope(&state.db, server_id)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let Some(existing) = existing else {
+        return Err(api_error(StatusCode::NOT_FOUND, "Server non trovato"));
+    };
+    if !can_manage_server(&existing, user_id, &claims.role) {
+        return Err(api_error(StatusCode::NOT_FOUND, "Server non modificabile"));
     }
-    match mode.unwrap_or("all") {
-        "allowlist" => {
-            if allowed_tools.is_empty() {
-                true
-            } else {
-                allowed_tools.contains(tool_name)
-            }
-        }
-        "denylist" | "all" => true,
-        _ => true,
-    }
+    Ok((user_id, server_id))
 }
 
 // ── Handlers ───────────────────────────────────────────────────────────────
@@ -144,20 +144,7 @@ pub async fn update_mcp_server(
     AxumPath(server_id): AxumPath<String>,
     Json(body): Json<UpdateMcpServerRequest>,
 ) -> ApiResult {
-    let user_id = parse_user_id(&claims)?;
-    let server_id = Uuid::parse_str(&server_id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Server id non valido"))?;
-
-    // Punto unico SQL in nexus_mcp_client::server_storage (regola L).
-    let existing = fetch_owner_scope(&state.db, server_id)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let Some(existing) = existing else {
-        return Err(api_error(StatusCode::NOT_FOUND, "Server non trovato"));
-    };
-    if !can_manage_server(&existing, user_id, &claims.role) {
-        return Err(api_error(StatusCode::NOT_FOUND, "Server non modificabile"));
-    }
+    let (_user_id, server_id) = authorize_server_mutation(&state, &claims, &server_id).await?;
 
     let row = apply_update_and_fetch(&state.db, server_id, &body)
         .await
@@ -172,19 +159,7 @@ pub async fn delete_mcp_server(
     Extension(claims): Extension<Claims>,
     AxumPath(server_id): AxumPath<String>,
 ) -> ApiResult {
-    let user_id = parse_user_id(&claims)?;
-    let server_id = Uuid::parse_str(&server_id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Server id non valido"))?;
-
-    let existing = fetch_owner_scope(&state.db, server_id)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let Some(existing) = existing else {
-        return Err(api_error(StatusCode::NOT_FOUND, "Server non trovato"));
-    };
-    if !can_manage_server(&existing, user_id, &claims.role) {
-        return Err(api_error(StatusCode::NOT_FOUND, "Server non modificabile"));
-    }
+    let (_user_id, server_id) = authorize_server_mutation(&state, &claims, &server_id).await?;
 
     ss_delete(&state.db, server_id)
         .await
@@ -200,20 +175,7 @@ pub async fn toggle_mcp_server(
     AxumPath(server_id): AxumPath<String>,
     Json(body): Json<ToggleRequest>,
 ) -> ApiResult {
-    let user_id = parse_user_id(&claims)?;
-    let server_id = Uuid::parse_str(&server_id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Server id non valido"))?;
-
-    // Punto unico SQL in nexus_mcp_client::server_storage (regola L).
-    let existing = fetch_owner_scope(&state.db, server_id)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let Some(existing) = existing else {
-        return Err(api_error(StatusCode::NOT_FOUND, "Server non trovato"));
-    };
-    if !can_manage_server(&existing, user_id, &claims.role) {
-        return Err(api_error(StatusCode::NOT_FOUND, "Server non modificabile"));
-    }
+    let (_user_id, server_id) = authorize_server_mutation(&state, &claims, &server_id).await?;
 
     set_enabled(&state.db, server_id, body.enabled)
         .await
@@ -235,16 +197,10 @@ pub async fn test_mcp_server(
     let server_id = Uuid::parse_str(&server_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Server id non valido"))?;
 
-    let row = sqlx::query(
-        "SELECT id, name, transport, url, command, args, env_vars, headers
-         FROM mcp_servers WHERE id=$1 AND (user_id=$2 OR scope='global')",
-    )
-    .bind(server_id)
-    .bind(user_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
+    // Punto unico SQL in nexus_mcp_client::server_storage (regola L).
+    let row = fetch_server_for_test(&state.db, server_id, user_id)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let Some(row) = row else {
         return Err(api_error(StatusCode::NOT_FOUND, "Server non trovato"));
     };
@@ -254,21 +210,7 @@ pub async fn test_mcp_server(
 
     // Per il server builtin: restituisce i tool già cached nel DB senza chiamate esterne
     if transport == "builtin" {
-        let cached_tools = sqlx::query(
-            "SELECT tool_name, description, input_schema FROM mcp_server_tools WHERE server_id=$1 ORDER BY tool_name"
-        )
-        .bind(server_id)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
-
-        let tool_list: Vec<Value> = cached_tools.iter().map(|r| {
-            let tool_name: String = r.try_get("tool_name").unwrap_or_default();
-            let description: Option<String> = r.try_get("description").unwrap_or(None);
-            let input_schema: Value = r.try_get::<Value, _>("input_schema").unwrap_or(json!({}));
-            json!({ "name": tool_name, "description": description, "inputSchema": input_schema })
-        }).collect();
-
+        let tool_list = list_cached_tools_with_schema(&state.db, server_id).await;
         return Ok(Json(json!({
             "success": true,
             "toolCount": tool_list.len(),
@@ -282,22 +224,17 @@ pub async fn test_mcp_server(
     match mcp_client::list_tools(&config).await {
         Ok(tools) => {
             // Salva/aggiorna tool cache nel DB
-            for t in &tools {
-                let schema = serde_json::to_value(&t.input_schema).unwrap_or(json!({}));
-                sqlx::query(
-                    "INSERT INTO mcp_server_tools (server_id, tool_name, description, input_schema, discovered_at)
-                     VALUES ($1,$2,$3,$4,NOW())
-                     ON CONFLICT (server_id, tool_name) DO UPDATE
-                     SET description=$3, input_schema=$4, discovered_at=NOW()",
-                )
-                .bind(server_id)
-                .bind(&t.name)
-                .bind(&t.description)
-                .bind(schema)
-                .execute(&state.db)
-                .await
-                .ok();
-            }
+            let tools_for_upsert: Vec<(String, Option<String>, Value)> = tools
+                .iter()
+                .map(|t| {
+                    (
+                        t.name.clone(),
+                        t.description.clone(),
+                        serde_json::to_value(&t.input_schema).unwrap_or(json!({})),
+                    )
+                })
+                .collect();
+            upsert_discovered_tools(&state.db, server_id, &tools_for_upsert).await;
 
             // Indicizzazione semantica Qdrant (fire-and-forget)
             {

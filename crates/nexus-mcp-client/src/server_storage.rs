@@ -7,7 +7,7 @@
 //! Tipi pure (request/toggle) sono qui per evitare il drift fra le copie
 //! delle due definizioni axum.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -167,6 +167,44 @@ pub fn build_config(
         name: name.to_string(),
         transport: mcp_transport,
         enabled: true,
+    }
+}
+
+// -- Helper policy/tool sets --
+
+/// Converte un valore JSON (atteso come array di stringhe) in `HashSet<String>`.
+/// Valori non-stringa vengono silently skippati. Punto unico (regola L / ADR
+/// 0026, step S12'): prima duplicato in mcp-core e plugin-service mcp_connectors.
+pub fn parse_json_string_set(raw: &Value) -> HashSet<String> {
+    raw.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default()
+}
+
+/// Valuta se un tool e' ammesso dalla policy del server. `mode`:
+/// - `"allowlist"`: ammesso solo se `allowed_tools.is_empty()` o se `allowed_tools.contains(tool_name)`
+/// - `"denylist"` / `"all"`: ammesso (modulo `blocked_tools`)
+/// - altro: ammesso (modulo `blocked_tools`)
+///
+/// `blocked_tools` ha precedenza assoluta su `allowed_tools`.
+pub fn is_tool_allowed_by_policy(
+    mode: Option<&str>,
+    allowed_tools: &HashSet<String>,
+    blocked_tools: &HashSet<String>,
+    tool_name: &str,
+) -> bool {
+    if blocked_tools.contains(tool_name) {
+        return false;
+    }
+    match mode.unwrap_or("all") {
+        "allowlist" => allowed_tools.is_empty() || allowed_tools.contains(tool_name),
+        "denylist" | "all" => true,
+        _ => true,
     }
 }
 
@@ -352,6 +390,66 @@ pub async fn list_servers_for_user(
     .bind(user_id)
     .fetch_all(db)
     .await
+}
+
+/// Fetch leggero del server (id + transport + connection fields) per il path
+/// `POST /api/mcp-servers/:id/test`, con filtro proprieta' `user_id=$1 OR scope='global'`.
+pub async fn fetch_server_for_test(
+    db: &PgPool,
+    server_id: Uuid,
+    user_id: Uuid,
+) -> Result<Option<PgRow>, sqlx::Error> {
+    sqlx::query(
+        "SELECT id, name, transport, url, command, args, env_vars, headers
+         FROM mcp_servers WHERE id=$1 AND (user_id=$2 OR scope='global')",
+    )
+    .bind(server_id)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+}
+
+/// Lista i tool cached completi (con `input_schema`) per il path `builtin` di
+/// `test_mcp_server`. Ritorna shape JSON pronta per la response.
+pub async fn list_cached_tools_with_schema(db: &PgPool, server_id: Uuid) -> Vec<Value> {
+    sqlx::query(
+        "SELECT tool_name, description, input_schema FROM mcp_server_tools WHERE server_id=$1 ORDER BY tool_name",
+    )
+    .bind(server_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| {
+        let tool_name: String = r.try_get("tool_name").unwrap_or_default();
+        let description: Option<String> = r.try_get("description").unwrap_or(None);
+        let input_schema: Value = r.try_get::<Value, _>("input_schema").unwrap_or(json!({}));
+        json!({ "name": tool_name, "description": description, "inputSchema": input_schema })
+    })
+    .collect()
+}
+
+/// UPSERT in `mcp_server_tools` per i tool scoperti dal test (best-effort: gli
+/// errori per-tool vengono ignorati). Usata dopo `list_tools()` di un server reale.
+pub async fn upsert_discovered_tools(
+    db: &PgPool,
+    server_id: Uuid,
+    tools: &[(String, Option<String>, Value)],
+) {
+    for (name, description, schema) in tools {
+        let _ = sqlx::query(
+            "INSERT INTO mcp_server_tools (server_id, tool_name, description, input_schema, discovered_at)
+             VALUES ($1,$2,$3,$4,NOW())
+             ON CONFLICT (server_id, tool_name) DO UPDATE
+             SET description=$3, input_schema=$4, discovered_at=NOW()",
+        )
+        .bind(server_id)
+        .bind(name)
+        .bind(description)
+        .bind(schema)
+        .execute(db)
+        .await;
+    }
 }
 
 /// SELECT tool_name, description FROM mcp_server_tools WHERE server_id=$1 ORDER BY tool_name.

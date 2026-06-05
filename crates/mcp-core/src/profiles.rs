@@ -64,6 +64,43 @@ pub struct SetProfileMcpServersRequest {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
+/// Valori trimmati e normalizzati di un `UpdateProfileRequest`: chi e' empty
+/// dopo il trim diventa `None`. Punto unico (regola L / ADR 0026, step S15) per
+/// la logica di binding usata sia in `update_profile` (user-scoped) sia in
+/// `admin_update_profile` (admin-scoped): prima i 7 blocchi `.bind(...)` con
+/// stessa `as_deref().map(trim).filter(non_empty)` erano duplicati pari-pari.
+struct ProfileUpdateBinds<'a> {
+    name: Option<&'a str>,
+    description: Option<&'a str>,
+    avatar_emoji: Option<&'a str>,
+    system_prompt: Option<&'a str>,
+    default_provider: Option<&'a str>,
+    default_model: Option<&'a str>,
+    default_automation: Option<&'a str>,
+}
+
+impl<'a> ProfileUpdateBinds<'a> {
+    fn from(body: &'a UpdateProfileRequest) -> Self {
+        let non_empty = |s: &'a str| -> Option<&'a str> {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        };
+        Self {
+            name: body.name.as_deref().and_then(non_empty),
+            description: body.description.as_deref().map(str::trim),
+            avatar_emoji: body.avatar_emoji.as_deref().and_then(non_empty),
+            system_prompt: body.system_prompt.as_deref().map(str::trim),
+            default_provider: body.default_provider.as_deref().and_then(non_empty),
+            default_model: body.default_model.as_deref().and_then(non_empty),
+            default_automation: body.default_automation.as_deref().and_then(non_empty),
+        }
+    }
+}
+
 fn row_to_json(r: &sqlx::postgres::PgRow) -> Value {
     json!({
         "id": r.try_get::<Uuid, _>("id").ok().map(|v| v.to_string()),
@@ -180,6 +217,7 @@ pub async fn update_profile(
     let profile_uuid = Uuid::parse_str(&profile_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Profile id non valido"))?;
 
+    let binds = ProfileUpdateBinds::from(&body);
     let row = sqlx::query(
         r#"
         UPDATE user_profiles SET
@@ -197,38 +235,13 @@ pub async fn update_profile(
     )
     .bind(profile_uuid)
     .bind(user_id)
-    .bind(
-        body.name
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
-    )
-    .bind(body.description.as_deref().map(str::trim))
-    .bind(
-        body.avatar_emoji
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
-    )
-    .bind(body.system_prompt.as_deref().map(str::trim))
-    .bind(
-        body.default_provider
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::trim),
-    )
-    .bind(
-        body.default_model
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::trim),
-    )
-    .bind(
-        body.default_automation
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::trim),
-    )
+    .bind(binds.name)
+    .bind(binds.description)
+    .bind(binds.avatar_emoji)
+    .bind(binds.system_prompt)
+    .bind(binds.default_provider)
+    .bind(binds.default_model)
+    .bind(binds.default_automation)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -627,6 +640,7 @@ pub async fn admin_update_profile(
     let profile_uuid = Uuid::parse_str(&profile_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Profile id non valido"))?;
 
+    let binds = ProfileUpdateBinds::from(&body);
     let row = sqlx::query(
         r#"
         UPDATE user_profiles SET
@@ -643,38 +657,13 @@ pub async fn admin_update_profile(
         "#,
     )
     .bind(profile_uuid)
-    .bind(
-        body.name
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
-    )
-    .bind(body.description.as_deref().map(str::trim))
-    .bind(
-        body.avatar_emoji
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty()),
-    )
-    .bind(body.system_prompt.as_deref().map(str::trim))
-    .bind(
-        body.default_provider
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::trim),
-    )
-    .bind(
-        body.default_model
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::trim),
-    )
-    .bind(
-        body.default_automation
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::trim),
-    )
+    .bind(binds.name)
+    .bind(binds.description)
+    .bind(binds.avatar_emoji)
+    .bind(binds.system_prompt)
+    .bind(binds.default_provider)
+    .bind(binds.default_model)
+    .bind(binds.default_automation)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?

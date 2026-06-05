@@ -10,7 +10,18 @@ import {
   pullGit,
   pushGit,
 } from "../../../lib/api-client";
-import { useThemeColors } from "../../../lib/theme";
+import type { ReactNode } from "react";
+import { useThemeColors, type Theme } from "../../../lib/theme";
+
+/** Cella label + valore. Punto unico (regola L) per i 4 div ripetuti del grid. */
+function KeyValueCell({ tc, label, children }: { tc: Theme; label: string; children: ReactNode }) {
+  return (
+    <div style={{ color: tc.textSecondary }}>
+      {label}
+      <div style={{ color: tc.text, marginTop: 4 }}>{children}</div>
+    </div>
+  );
+}
 import {
   cardStyle,
   inputStyle,
@@ -123,33 +134,25 @@ export function RemoteCard({
           gap: 8,
         }}
       >
-        <div style={{ color: tc.textSecondary }}>
-          Repo GitHub
-          <div style={{ color: tc.text, marginTop: 4 }}>
-            {/* Fix M12: messaggio coerente con reason invece di "Non disponibile" generico */}
-            {githubStatus?.repoFullName
-              ?? githubStatus?.remoteUrl
-              ?? (githubStatus?.reason === "missing_origin_remote"
-                ? "Nessun remote configurato"
-                : githubStatus?.reason === "not_git_repo"
-                ? "Progetto non e' un repo Git"
-                : "Non disponibile")}
-          </div>
-        </div>
-        <div style={{ color: tc.textSecondary }}>
-          Branch
-          <div style={{ color: tc.text, marginTop: 4 }}>{branchName ?? "Non disponibile"}</div>
-        </div>
-        <div style={{ color: tc.textSecondary }}>
-          Upstream
-          <div style={{ color: tc.text, marginTop: 4 }}>{githubStatus?.upstream ?? "Non configurato"}</div>
-        </div>
-        <div style={{ color: tc.textSecondary }}>
-          Sync
-          <div style={{ color: tc.text, marginTop: 4 }}>
-            ahead {githubStatus?.ahead ?? 0} · behind {githubStatus?.behind ?? 0}
-          </div>
-        </div>
+        <KeyValueCell tc={tc} label="Repo GitHub">
+          {/* Fix M12: messaggio coerente con reason invece di "Non disponibile" generico */}
+          {githubStatus?.repoFullName
+            ?? githubStatus?.remoteUrl
+            ?? (githubStatus?.reason === "missing_origin_remote"
+              ? "Nessun remote configurato"
+              : githubStatus?.reason === "not_git_repo"
+              ? "Progetto non e' un repo Git"
+              : "Non disponibile")}
+        </KeyValueCell>
+        <KeyValueCell tc={tc} label="Branch">
+          {branchName ?? "Non disponibile"}
+        </KeyValueCell>
+        <KeyValueCell tc={tc} label="Upstream">
+          {githubStatus?.upstream ?? "Non configurato"}
+        </KeyValueCell>
+        <KeyValueCell tc={tc} label="Sync">
+          ahead {githubStatus?.ahead ?? 0} · behind {githubStatus?.behind ?? 0}
+        </KeyValueCell>
       </div>
 
       {githubStatus?.apiError ? (

@@ -21,10 +21,6 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
             "/preview/:project_id/*path",
             get(static_preview::serve_preview),
         )
-        .route(
-            "/preview/:project_id",
-            get(static_preview::serve_preview_root),
-        )
         // Nexus (Fase 8) — observability endpoint pubblici
         .route("/nexus/healthz", get(nexus_bridge::nexus_healthz))
         .route("/nexus/stats", get(nexus_bridge::nexus_stats))

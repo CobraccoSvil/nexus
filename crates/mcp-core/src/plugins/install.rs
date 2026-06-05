@@ -146,44 +146,8 @@ pub async fn install_plugin(
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let plugin_instance_id: Uuid = plugin_instance_row.try_get("id").unwrap_or(Uuid::nil());
 
-    let policy_mode = catalog
-        .default_tool_policy
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("allowlist")
-        .to_string();
-    let policy_tools = catalog
-        .default_tool_policy
-        .get("tools")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let policy_blocked = catalog
-        .default_tool_policy
-        .get("blockedTools")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-
-    let _ = sqlx::query(
-        r#"
-        INSERT INTO plugin_instance_tool_policies
-            (plugin_instance_id, mode, tools, blocked_tools, updated_by_user_id)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (plugin_instance_id)
-        DO UPDATE SET
-            mode = EXCLUDED.mode,
-            tools = EXCLUDED.tools,
-            blocked_tools = EXCLUDED.blocked_tools,
-            updated_by_user_id = EXCLUDED.updated_by_user_id,
-            updated_at = NOW()
-        "#,
-    )
-    .bind(plugin_instance_id)
-    .bind(&policy_mode)
-    .bind(&policy_tools)
-    .bind(&policy_blocked)
-    .bind(user_id)
-    .execute(&state.db)
-    .await;
+    // Punto unico in plugins::apply_default_tool_policy (regola L / step S20).
+    super::apply_default_tool_policy(&state.db, plugin_instance_id, &catalog, user_id).await;
 
     let config_url = config
         .get("url")
@@ -740,43 +704,8 @@ pub async fn migrate_legacy_mcp_server(
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let plugin_instance_id: Uuid = plugin_row.try_get("id").unwrap_or(Uuid::nil());
 
-    let policy_mode = catalog
-        .default_tool_policy
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("allowlist")
-        .to_string();
-    let policy_tools = catalog
-        .default_tool_policy
-        .get("tools")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let policy_blocked = catalog
-        .default_tool_policy
-        .get("blockedTools")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let _ = sqlx::query(
-        r#"
-        INSERT INTO plugin_instance_tool_policies
-            (plugin_instance_id, mode, tools, blocked_tools, updated_by_user_id)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (plugin_instance_id)
-        DO UPDATE SET
-            mode = EXCLUDED.mode,
-            tools = EXCLUDED.tools,
-            blocked_tools = EXCLUDED.blocked_tools,
-            updated_by_user_id = EXCLUDED.updated_by_user_id,
-            updated_at = NOW()
-        "#,
-    )
-    .bind(plugin_instance_id)
-    .bind(policy_mode)
-    .bind(policy_tools)
-    .bind(policy_blocked)
-    .bind(user_id)
-    .execute(&state.db)
-    .await;
+    // Punto unico in plugins::apply_default_tool_policy (regola L / step S20).
+    super::apply_default_tool_policy(&state.db, plugin_instance_id, &catalog, user_id).await;
 
     sqlx::query("UPDATE mcp_servers SET plugin_instance_id = $2, updated_at = NOW() WHERE id = $1")
         .bind(server_id)

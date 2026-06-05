@@ -97,19 +97,15 @@ async fn project_root(state: &AppState, project_id: Uuid) -> Option<String> {
 /// il Content-Type corretto, confinato alla root del progetto.
 pub async fn serve_preview(
     State(state): State<AppState>,
-    AxumPath((project_id, req_path)): AxumPath<(String, String)>,
+    AxumPath(params): AxumPath<std::collections::HashMap<String, String>>,
 ) -> Response<Body> {
+    // Estrazione per CHIAVE esplicita: con un mix di `:project_id` e wildcard
+    // `*path`, l'estrazione posizionale (tupla/struct) di axum 0.7 invertiva i
+    // valori (project_id riceveva il path). La HashMap legge per nome ed e'
+    // deterministica.
+    let project_id = params.get("project_id").cloned().unwrap_or_default();
+    let req_path = params.get("path").cloned().unwrap_or_default();
     serve_preview_inner(state, project_id, req_path).await
-}
-
-/// Handler: `GET /preview/:project_id` (senza sotto-percorso). Serve l'entry
-/// di default (`index.html`). Esiste come route separata perche' axum non
-/// fa matchare il glob `*path` quando il segmento e' assente.
-pub async fn serve_preview_root(
-    State(state): State<AppState>,
-    AxumPath(project_id): AxumPath<String>,
-) -> Response<Body> {
-    serve_preview_inner(state, project_id, String::new()).await
 }
 
 async fn serve_preview_inner(

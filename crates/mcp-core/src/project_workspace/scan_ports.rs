@@ -18,6 +18,25 @@
 use super::*;
 use regex::Regex;
 
+/// Estrae le porte valide (1024..65535) da un blob di testo applicando una lista
+/// di regex etichettate. Punto unico (regola L / ADR 0026, step S17) per la
+/// logica di scansione condivisa fra le versioni sync e async di `scan_file`.
+fn scan_content(content: &str, patterns: &[(Regex, &str)]) -> Vec<(i32, String)> {
+    let mut found = Vec::new();
+    for (re, label) in patterns {
+        for cap in re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                if let Ok(p) = m.as_str().parse::<i32>() {
+                    if (1024..65535).contains(&p) {
+                        found.push((p, label.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Fix M31: scansiona il filesystem del progetto e ritorna le porte rilevate.
 /// Helper sync senza dipendenze HTTP, riusabile da auto_populate_port_allocations
 /// e dall'handler scan_ports REST.
@@ -26,23 +45,10 @@ pub fn compute_detected_ports(root: &std::path::Path) -> Vec<(i32, String, Strin
     let mut detected: Vec<(i32, String, String)> = Vec::new();
 
     fn scan_file(path: &std::path::Path, patterns: &[(Regex, &str)]) -> Vec<(i32, String)> {
-        let content = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let mut found = Vec::new();
-        for (re, label) in patterns {
-            for cap in re.captures_iter(&content) {
-                if let Some(m) = cap.get(1) {
-                    if let Ok(p) = m.as_str().parse::<i32>() {
-                        if p >= 1024 && p < 65535 {
-                            found.push((p, label.to_string()));
-                        }
-                    }
-                }
-            }
+        match std::fs::read_to_string(path) {
+            Ok(s) => scan_content(&s, patterns),
+            Err(_) => Vec::new(),
         }
-        found
     }
 
     // 1) package.json (root + frontend/ + backend/)
@@ -181,23 +187,10 @@ pub async fn scan_ports(
 
     // Helper per scansionare un file con regex
     async fn scan_file(path: &std::path::Path, patterns: &[(Regex, &str)]) -> Vec<(i32, String)> {
-        let content = match tokio::fs::read_to_string(path).await {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let mut found = Vec::new();
-        for (re, label) in patterns {
-            for cap in re.captures_iter(&content) {
-                if let Some(m) = cap.get(1) {
-                    if let Ok(p) = m.as_str().parse::<i32>() {
-                        if p >= 1024 && p < 65535 {
-                            found.push((p, label.to_string()));
-                        }
-                    }
-                }
-            }
+        match tokio::fs::read_to_string(path).await {
+            Ok(s) => scan_content(&s, patterns),
+            Err(_) => Vec::new(),
         }
-        found
     }
 
     // 1) package.json (root + frontend/ + backend/)

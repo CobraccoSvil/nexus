@@ -7,6 +7,27 @@ import { actionButtonStyle } from "./plugin-styles";
 
 const BUILTIN_TOOL_HINTS = ["nexus_mcp_tool_search", "nexus_mcp_tool_call"];
 
+/** Badge "pillola" verde con uppercase. Punto unico (regola L) per i 3 badge
+ *  con stesso stile ripetuti nella card del server: "integrato", "integrato",
+ *  "migrabile → slug". */
+function GreenPill({ title, children }: { title?: string; children: React.ReactNode }) {
+  return (
+    <span
+      title={title}
+      style={{
+        fontSize: 10,
+        border: "1px solid #22c55e66",
+        borderRadius: 999,
+        padding: "2px 6px",
+        color: "#16a34a",
+        textTransform: "uppercase",
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
 interface LegacyMcpListProps {
   tc: Theme;
   legacyConnectors: McpServer[];
@@ -64,49 +85,16 @@ export function LegacyMcpList({
                 {server.enabled ? "enabled" : "disabled"}
               </span>
               {isBuiltin && (
-                <span
-                  style={{
-                    fontSize: 10,
-                    border: "1px solid #22c55e66",
-                    borderRadius: 999,
-                    padding: "2px 6px",
-                    color: "#16a34a",
-                    textTransform: "uppercase",
-                  }}
-                  title="MCP integrato nel core Nexus (non è un legacy da migrare)"
-                >
+                <GreenPill title="MCP integrato nel core Nexus (non è un legacy da migrare)">
                   integrato
-                </span>
+                </GreenPill>
               )}
               {isNexusBridge && !isBuiltin && (
-                <span
-                  style={{
-                    fontSize: 10,
-                    border: "1px solid #22c55e66",
-                    borderRadius: 999,
-                    padding: "2px 6px",
-                    color: "#16a34a",
-                    textTransform: "uppercase",
-                  }}
-                  title="Connettore locale Nexus Browser Bridge: è già un MCP HTTP pronto all'uso (migrazione non necessaria)."
-                >
+                <GreenPill title="Connettore locale Nexus Browser Bridge: è già un MCP HTTP pronto all'uso (migrazione non necessaria).">
                   integrato
-                </span>
+                </GreenPill>
               )}
-              {slug && (
-                <span
-                  style={{
-                    fontSize: 10,
-                    border: "1px solid #22c55e66",
-                    borderRadius: 999,
-                    padding: "2px 6px",
-                    color: "#16a34a",
-                    textTransform: "uppercase",
-                  }}
-                >
-                  migrabile → {slug}
-                </span>
-              )}
+              {slug && <GreenPill>migrabile → {slug}</GreenPill>}
             </div>
             <div style={{ marginTop: 4, fontSize: 11, color: tc.textMuted }}>
               {server.transport === "http"
