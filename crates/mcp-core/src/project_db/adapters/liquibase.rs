@@ -1,6 +1,6 @@
 //! Adapter Liquibase — crea changeset XML nella directory changelog.
 
-use super::{migration_timestamp, MigrationAdapter};
+use super::MigrationAdapter;
 use crate::project_db::{
     AppliedMigration, Migration, ProjectDbContext, ProjectDbError, RolledBackMigration,
 };
@@ -25,29 +25,13 @@ impl MigrationAdapter for LiquibaseAdapter {
         name: &str,
         sql: &str,
     ) -> Result<PathBuf, ProjectDbError> {
-        let dir = ctx.project_root.join(&ctx.migration_path);
-        std::fs::create_dir_all(&dir)?;
-        let ts = migration_timestamp();
-        let safe_name: String = name
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let filename = format!("{}_{}.sql", ts, safe_name);
-        let path = dir.join(&filename);
-        std::fs::write(
-            &path,
+        // Punto unico in super::write_timestamped_sql_migration (regola L, S68).
+        super::write_timestamped_sql_migration(ctx, name, sql, |n, ts, body| {
             format!(
                 "-- Liquibase changeset: {}\n-- id: {}\n\n{}\n",
-                name, ts, sql
-            ),
-        )?;
-        Ok(path)
+                n, ts, body
+            )
+        })
     }
 
     async fn apply_pending(

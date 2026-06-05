@@ -18,6 +18,28 @@
 use super::*;
 use regex::Regex;
 
+/// I 3 path package.json scansionati (root + frontend/ + backend/) con la
+/// label canonica associata. Punto unico (regola L, S71) per il pattern
+/// duplicato fra le versioni sync (`compute_detected_ports`) e async
+/// (`auto_populate_port_allocations`).
+fn package_json_path_labels(root: &std::path::Path) -> [(std::path::PathBuf, &'static str); 3] {
+    [
+        (root.join("package.json"), "app"),
+        (root.join("frontend").join("package.json"), "frontend"),
+        (root.join("backend").join("package.json"), "backend"),
+    ]
+}
+
+/// Le 3 regex (--port=, "PORT": "...", PORT=...) per estrarre porte da
+/// `package.json` con la label base passata.
+fn package_json_regex_patterns(label_base: &'static str) -> Vec<(Regex, &'static str)> {
+    vec![
+        (Regex::new(r"--port[= ](\d+)").unwrap(), label_base),
+        (Regex::new(r#""PORT"\s*:\s*"?(\d+)"?"#).unwrap(), label_base),
+        (Regex::new(r"PORT=(\d+)").unwrap(), label_base),
+    ]
+}
+
 /// Estrae le porte valide (1024..65535) da un blob di testo applicando una lista
 /// di regex etichettate. Punto unico (regola L / ADR 0026, step S17) per la
 /// logica di scansione condivisa fra le versioni sync e async di `scan_file`.
@@ -51,28 +73,13 @@ pub fn compute_detected_ports(root: &std::path::Path) -> Vec<(i32, String, Strin
         }
     }
 
-    // 1) package.json (root + frontend/ + backend/)
-    let pkg_paths = [
-        root.join("package.json"),
-        root.join("frontend").join("package.json"),
-        root.join("backend").join("package.json"),
-    ];
-    for (i, pkg) in pkg_paths.iter().enumerate() {
+    // 1) package.json (root + frontend/ + backend/): punto unico S71.
+    for (pkg, label_base) in package_json_path_labels(root) {
         if !pkg.is_file() {
             continue;
         }
-        let label_base = match i {
-            0 => "app",
-            1 => "frontend",
-            2 => "backend",
-            _ => "app",
-        };
-        let patterns: Vec<(Regex, &str)> = vec![
-            (Regex::new(r"--port[= ](\d+)").unwrap(), label_base),
-            (Regex::new(r#""PORT"\s*:\s*"?(\d+)"?"#).unwrap(), label_base),
-            (Regex::new(r"PORT=(\d+)").unwrap(), label_base),
-        ];
-        for (p, lbl) in scan_file(pkg, &patterns) {
+        let patterns = package_json_regex_patterns(label_base);
+        for (p, lbl) in scan_file(&pkg, &patterns) {
             detected.push((p, lbl, format!("package.json:{}", label_base)));
         }
     }
@@ -193,28 +200,13 @@ pub async fn scan_ports(
         }
     }
 
-    // 1) package.json (root + frontend/ + backend/)
-    let pkg_paths = [
-        root.join("package.json"),
-        root.join("frontend").join("package.json"),
-        root.join("backend").join("package.json"),
-    ];
-    for (i, pkg) in pkg_paths.iter().enumerate() {
+    // 1) package.json (root + frontend/ + backend/): punto unico S71.
+    for (pkg, label_base) in package_json_path_labels(root) {
         if !pkg.is_file() {
             continue;
         }
-        let label_base = match i {
-            0 => "app",
-            1 => "frontend",
-            2 => "backend",
-            _ => "app",
-        };
-        let patterns = vec![
-            (Regex::new(r"--port[= ](\d+)").unwrap(), label_base),
-            (Regex::new(r#""PORT"\s*:\s*"?(\d+)"?"#).unwrap(), label_base),
-            (Regex::new(r"PORT=(\d+)").unwrap(), label_base),
-        ];
-        let found = scan_file(pkg, &patterns).await;
+        let patterns = package_json_regex_patterns(label_base);
+        let found = scan_file(&pkg, &patterns).await;
         for (p, lbl) in found {
             detected.push((p, lbl, format!("package.json:{}", label_base)));
         }

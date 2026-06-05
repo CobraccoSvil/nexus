@@ -44,6 +44,87 @@ pub fn validate_no_path_traversal(
     Ok(full)
 }
 
+/// Esito di una esecuzione `pg_dump`: success/duration/size/stderr + exit_code.
+pub struct PgDumpOutcome {
+    pub success: bool,
+    pub duration_ms: u64,
+    pub size_bytes: u64,
+    pub stderr_truncated: String,
+    pub exit_code: i32,
+}
+
+/// Esegue `pg_dump` con `PGPASSWORD` impostato e stdin chiuso. Misura la
+/// durata, raccoglie size del file di backup e stderr troncato. Punto unico
+/// (regola L, S74) per il pattern duplicato fra `project_db_backup` e
+/// `project_db_dump_schema`.
+pub async fn run_pg_dump(
+    args: &[&str],
+    password: &str,
+    current_dir: Option<&std::path::Path>,
+    backup_path: &std::path::Path,
+) -> Result<PgDumpOutcome, NexusToolError> {
+    let start = std::time::Instant::now();
+    let mut cmd = tokio::process::Command::new("pg_dump");
+    cmd.args(args)
+        .env("PGPASSWORD", password)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(dir) = current_dir {
+        cmd.current_dir(dir);
+    }
+    let child = cmd
+        .output()
+        .await
+        .map_err(|e| NexusToolError::BadInput(format!("pg_dump: {}", e)))?;
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let success = child.status.success();
+    let size_bytes = if success {
+        tokio::fs::metadata(backup_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let stderr_truncated = String::from_utf8_lossy(&child.stderr)
+        .chars()
+        .take(2000)
+        .collect();
+    Ok(PgDumpOutcome {
+        success,
+        duration_ms,
+        size_bytes,
+        stderr_truncated,
+        exit_code: child.status.code().unwrap_or(-1),
+    })
+}
+
+/// Esegue `npm run <script_name>` nel project_root e ritorna il JSON canonico
+/// `{ok, stack: "node", exit_code, duration_ms, stdout, stderr}`. Punto unico
+/// (regola L, S65) per i tool che lanciano script npm (es. `bench_run`,
+/// `coverage_report`) e condividono il pattern run_cmd+response.
+pub async fn run_npm_script_node_stack(
+    ctx: &NexusToolContext,
+    script_name: &str,
+) -> Result<serde_json::Value, NexusToolError> {
+    let out = exec::run_cmd(
+        "npm",
+        &["run", script_name],
+        &ctx.project_root,
+        ctx.timeout_secs,
+    )
+    .await?;
+    Ok(serde_json::json!({
+        "ok": out.success(),
+        "stack": "node",
+        "exit_code": out.exit_code,
+        "duration_ms": out.duration_ms,
+        "stdout": out.stdout,
+        "stderr": out.stderr,
+    }))
+}
+
 /// Esegue `cargo test <subset_flag>` (es. `--lib`, `--doc`, `--bins`) e ritorna
 /// il JSON canonico `{ok, exit_code, passed, failed, stdout_preview, duration_ms}`.
 /// Punto unico (regola L, S53) per il pattern duplicato fra

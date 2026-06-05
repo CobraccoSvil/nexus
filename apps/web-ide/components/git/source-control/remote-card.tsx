@@ -30,6 +30,7 @@ import {
   statusBadgeStyle,
 } from "./styles";
 import { remoteReasonLabel } from "./labels";
+import { CreateGithubRepoForm } from "./create-github-repo-form";
 
 interface RemoteCardProps {
   project: UserProjectDetails;
@@ -239,48 +240,22 @@ export function RemoteCard({
           style={{
             borderTop: `1px solid ${tc.border}`,
             paddingTop: 10,
-            display: "flex",
-            flexDirection: "column",
-            gap: 8,
           }}
         >
-          <div style={{ color: tc.text, fontWeight: 700 }}>Crea repository GitHub</div>
-          <input
-            value={createRepoName}
-            onChange={(e) => setCreateRepoName(e.target.value)}
-            placeholder="Nome repository (alfanumerico, '-', '_', '.')"
-            style={inputStyle(tc)}
+          <CreateGithubRepoForm
+            tc={tc}
+            title="Crea repository GitHub"
+            createRepoName={createRepoName}
+            setCreateRepoName={setCreateRepoName}
+            createRepoDesc={createRepoDesc}
+            setCreateRepoDesc={setCreateRepoDesc}
+            createRepoPrivate={createRepoPrivate}
+            setCreateRepoPrivate={setCreateRepoPrivate}
+            createRepoBusy={createRepoBusy}
+            confirmLabels={{ idle: "Crea repo", busy: "Creazione..." }}
+            onConfirm={onCreateGithubRepo}
+            onCancel={() => setCreateRepoOpen(false)}
           />
-          <input
-            value={createRepoDesc}
-            onChange={(e) => setCreateRepoDesc(e.target.value)}
-            placeholder="Descrizione (opzionale)"
-            style={inputStyle(tc)}
-          />
-          <label style={{ display: "flex", alignItems: "center", gap: 8, color: tc.text }}>
-            <input
-              type="checkbox"
-              checked={createRepoPrivate}
-              onChange={(e) => setCreateRepoPrivate(e.target.checked)}
-            />
-            Repository privato
-          </label>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button
-              disabled={createRepoBusy || !createRepoName.trim()}
-              onClick={() => void onCreateGithubRepo()}
-              style={smallButtonStyle(tc, createRepoBusy || !createRepoName.trim())}
-            >
-              {createRepoBusy ? "Creazione..." : "Crea repo"}
-            </button>
-            <button
-              disabled={createRepoBusy}
-              onClick={() => setCreateRepoOpen(false)}
-              style={smallButtonStyle(tc, createRepoBusy)}
-            >
-              Annulla
-            </button>
-          </div>
         </div>
       ) : null}
 

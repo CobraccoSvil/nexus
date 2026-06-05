@@ -51,26 +51,13 @@ impl MigrationAdapter for GenericSqlAdapter {
         name: &str,
         sql: &str,
     ) -> Result<PathBuf, ProjectDbError> {
-        let dir = ctx.project_root.join(&ctx.migration_path);
-        std::fs::create_dir_all(&dir)?;
-
-        let ts = migration_timestamp();
-        let safe_name: String = name
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let filename = format!("{}_{}.sql", ts, safe_name);
-        let file_path = dir.join(&filename);
-
-        let header = format!("-- Migration: {}\n-- Creata da Nexus il {}\n\n", name, ts);
-        std::fs::write(&file_path, format!("{}{}", header, sql))?;
-        Ok(file_path)
+        // Punto unico in super::write_timestamped_sql_migration (regola L, S68).
+        super::write_timestamped_sql_migration(ctx, name, sql, |n, ts, body| {
+            format!(
+                "-- Migration: {}\n-- Creata da Nexus il {}\n\n{}",
+                n, ts, body
+            )
+        })
     }
 
     async fn apply_pending(

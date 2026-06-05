@@ -17,6 +17,7 @@
 
 pub mod acl;
 pub mod chat_note_worker;
+pub mod code_docs_enricher;
 pub mod code_graph;
 pub mod internal;
 pub mod links_worker;

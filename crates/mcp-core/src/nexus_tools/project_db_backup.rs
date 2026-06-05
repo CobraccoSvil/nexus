@@ -178,27 +178,15 @@ impl NexusToolHandler for ProjectDbBackupTool {
 
         let args_ref: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
 
-        // pg_dump con PGPASSWORD
-        let start = std::time::Instant::now();
-        let child = tokio::process::Command::new("pg_dump")
-            .args(&args_ref)
-            .current_dir(&ctx.project_root)
-            .env("PGPASSWORD", &password)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| NexusToolError::BadInput(format!("pg_dump: {}", e)))?;
-
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        if child.status.success() {
-            let size = tokio::fs::metadata(&backup_path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
-
+        // Punto unico in nexus_tools::run_pg_dump (regola L, S74).
+        let outcome = super::run_pg_dump(
+            &args_ref,
+            &password,
+            Some(&ctx.project_root),
+            &backup_path,
+        )
+        .await?;
+        if outcome.success {
             Ok(json!({
                 "ok": true,
                 "path": backup_path_str,
@@ -206,15 +194,14 @@ impl NexusToolHandler for ProjectDbBackupTool {
                 "database": dbname,
                 "format": format,
                 "schema_only": schema_only,
-                "size_bytes": size,
-                "duration_ms": duration_ms,
+                "size_bytes": outcome.size_bytes,
+                "duration_ms": outcome.duration_ms,
             }))
         } else {
-            let stderr = String::from_utf8_lossy(&child.stderr);
             Ok(json!({
                 "ok": false,
-                "error": stderr.chars().take(2000).collect::<String>(),
-                "exit_code": child.status.code().unwrap_or(-1),
+                "error": outcome.stderr_truncated,
+                "exit_code": outcome.exit_code,
             }))
         }
     }

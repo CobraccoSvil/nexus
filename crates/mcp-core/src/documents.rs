@@ -168,19 +168,8 @@ pub async fn get_document(
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("DB error: {e}")))?
     .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Documento non trovato"))?;
 
-    Ok(Json(json!({
-        "id": row.get::<Uuid, _>("id").to_string(),
-        "project_id": row.get::<Uuid, _>("project_id").to_string(),
-        "doc_type": row.get::<String, _>("doc_type"),
-        "title": row.get::<String, _>("title"),
-        "version": row.get::<String, _>("version"),
-        "file_path": row.get::<String, _>("file_path"),
-        "structure_json": row.get::<Value, _>("structure_json"),
-        "status": row.get::<String, _>("status"),
-        "metadata": row.get::<Value, _>("metadata"),
-        "created_at": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
-        "updated_at": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at").to_rfc3339(),
-    })))
+    // Punto unico mapping JSON in nexus_types::documents_dto (regola L, S62).
+    Ok(Json(nexus_types::documents_dto::document_row_to_json(&row)))
 }
 
 /// GET /api/projects/:id/documents/:doc_id/download

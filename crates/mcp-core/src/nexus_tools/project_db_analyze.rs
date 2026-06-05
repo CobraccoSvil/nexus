@@ -17,26 +17,11 @@ impl NexusToolHandler for ProjectDbAnalyzeTool {
             .and_then(Value::as_str)
             .map(|s| s.trim().to_string());
 
+        // Punto unico validate_table_name + open_project_pool (regola L, S75).
         if let Some(ref t) = table {
-            if !t
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
-            {
-                return Err(NexusToolError::BadInput(
-                    "Nome tabella contiene caratteri non validi".into(),
-                ));
-            }
+            db_helper::validate_table_name(t)?;
         }
-
-        let nexus_pool = db_helper::get_pool()
-            .await
-            .map_err(|e| NexusToolError::BadInput(format!("nexus db: {}", e)))?;
-
-        let project_pool = db_helper::get_pool_for_project(&nexus_pool, ctx.project_id)
-            .await
-            .map_err(|e| NexusToolError::BadInput(e))?;
-
-        nexus_pool.close().await;
+        let project_pool = db_helper::open_project_pool(ctx).await?;
 
         let sql = match &table {
             Some(t) => format!("ANALYZE {}", t),

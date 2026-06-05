@@ -15,7 +15,13 @@ def _is_deepseek_reasoning(model: str) -> bool:
     model_lower = model.lower()
     return model_lower in _DEEPSEEK_REASONING_MODELS or "deepseek-r" in model_lower
 
-from .base import ApiKeyClientMixin, BaseProvider, ProviderCatalogEntry, ProviderResult
+from .base import (
+    ApiKeyClientMixin,
+    BaseProvider,
+    ProviderCatalogEntry,
+    ProviderResult,
+    build_openai_compatible_client,
+)
 from .error_handler import format_error_result
 from .openai_provider import _anthropic_tool_to_openai, _convert_messages_to_openai
 from ._schema_utils import compress_tool_list
@@ -38,13 +44,8 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
         self._init_api_key_cache()
 
     def _create_client(self, api_key: str) -> Any:
-        from openai import AsyncOpenAI
-        from .dns_transport import get_global_dns_transport
-        import httpx
-
-        transport = get_global_dns_transport()
-        http_client = httpx.AsyncClient(transport=transport) if transport is not None else None
-        return AsyncOpenAI(api_key=api_key, base_url=BASE_URL, http_client=http_client)
+        # Punto unico build_openai_compatible_client (regola L, S70).
+        return build_openai_compatible_client(api_key, base_url=BASE_URL)
 
     def list_models(self) -> list[ProviderCatalogEntry]:
         # Lista modelli letta da DB (ai_price_catalog) con cache 60s.

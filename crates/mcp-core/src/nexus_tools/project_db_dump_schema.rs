@@ -36,52 +36,28 @@ impl NexusToolHandler for ProjectDbDumpSchemaTool {
         let backup_path = backup_dir.join(&filename);
         let backup_path_str = backup_path.to_string_lossy().to_string();
 
-        let start = std::time::Instant::now();
-
-        let child = tokio::process::Command::new("pg_dump")
-            .args([
-                "-h",
-                &host,
-                "-p",
-                &port,
-                "-U",
-                &user,
-                "-d",
-                &dbname,
-                "--schema-only",
-                "-f",
-                &backup_path_str,
-            ])
-            .env("PGPASSWORD", &password)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| NexusToolError::BadInput(format!("pg_dump: {}", e)))?;
-
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        if child.status.success() {
-            let size = tokio::fs::metadata(&backup_path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
-
+        // Punto unico in nexus_tools::run_pg_dump (regola L, S74).
+        let outcome = super::run_pg_dump(
+            &[
+                "-h", &host, "-p", &port, "-U", &user, "-d", &dbname,
+                "--schema-only", "-f", &backup_path_str,
+            ],
+            &password,
+            None,
+            &backup_path,
+        )
+        .await?;
+        if outcome.success {
             Ok(json!({
                 "ok": true,
                 "path": backup_path_str,
                 "filename": filename,
                 "database": dbname,
-                "size_bytes": size,
-                "duration_ms": duration_ms,
+                "size_bytes": outcome.size_bytes,
+                "duration_ms": outcome.duration_ms,
             }))
         } else {
-            let stderr = String::from_utf8_lossy(&child.stderr);
-            Ok(json!({
-                "ok": false,
-                "error": stderr.chars().take(2000).collect::<String>(),
-            }))
+            Ok(json!({ "ok": false, "error": outcome.stderr_truncated }))
         }
     }
 

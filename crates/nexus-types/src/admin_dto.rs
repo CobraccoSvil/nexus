@@ -9,6 +9,8 @@
 //! grande - vedi nota Wave C2 in docs/tech-debt-dup.md).
 
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
 
 // -- Users --
 
@@ -144,4 +146,87 @@ pub struct PortDetail {
     pub id: String,
     pub old_path: String,
     pub new_path: String,
+}
+
+// -- Query SQL condivise (regola L / ADR 0026, step S63) --
+
+/// SELECT progetti con member_count per la view `list_all_projects` dell'admin.
+/// Punto unico fra admin-service e mcp-core (prima 28L cluster jscpd).
+pub async fn fetch_all_projects_summary(
+    db: &PgPool,
+) -> Result<Vec<AdminProjectSummary>, sqlx::Error> {
+    let rows: Vec<(String, String, String, String, Option<String>, i64)> = sqlx::query_as(
+        r#"
+        SELECT
+            p.id::text,
+            p.name,
+            p.slug,
+            p.owner_user_id::text,
+            u.email,
+            (SELECT COUNT(*)::bigint FROM project_members pm WHERE pm.project_id = p.id)
+        FROM projects p
+        LEFT JOIN users u ON u.id = p.owner_user_id AND u.deleted_at IS NULL
+        ORDER BY p.name ASC
+        "#,
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, name, slug, owner_user_id, owner_email, member_count)| AdminProjectSummary {
+                id,
+                name,
+                slug,
+                owner_user_id,
+                owner_email,
+                member_count,
+            },
+        )
+        .collect())
+}
+
+/// SELECT membri di un progetto (join con users), best-effort: ritorna vec vuoto
+/// su errore SQL. Punto unico per `list_project_members` admin.
+pub async fn fetch_project_members(db: &PgPool, project_uuid: Uuid) -> Vec<ProjectMemberResponse> {
+    sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        ),
+    >(
+        r#"
+        SELECT u.id, u.email, u.display_name, u.github_username, u.avatar_url, pm.role, pm.created_at::text
+        FROM project_members pm
+        JOIN users u ON pm.user_id = u.id
+        WHERE pm.project_id = $1 AND u.deleted_at IS NULL
+        ORDER BY pm.created_at DESC
+        "#,
+    )
+    .bind(project_uuid)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(
+        |(user_id, email, display_name, github_username, avatar_url, role, created_at)| {
+            ProjectMemberResponse {
+                user_id,
+                email,
+                display_name,
+                github_username,
+                avatar_url,
+                role,
+                created_at,
+            }
+        },
+    )
+    .collect()
 }

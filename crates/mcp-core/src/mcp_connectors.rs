@@ -36,10 +36,10 @@ pub use nexus_mcp_client::server_storage::{
     CreateMcpServerRequest, ToggleRequest, UpdateMcpServerRequest,
 };
 use nexus_mcp_client::server_storage::{
-    apply_update_and_fetch, build_config, can_manage_server, delete_mcp_server as ss_delete,
-    fetch_owner_scope, fetch_server_for_test, insert_mcp_server, is_tool_allowed_by_policy,
-    list_cached_tools, list_cached_tools_with_schema, list_servers_for_user, parse_json_string_set,
-    row_to_json, set_enabled, upsert_discovered_tools,
+    apply_update_and_fetch, build_config, build_tool_upsert_args, can_manage_server,
+    delete_mcp_server as ss_delete, fetch_owner_scope, fetch_server_for_test, insert_mcp_server,
+    is_tool_allowed_by_policy, list_cached_tools, list_cached_tools_with_schema,
+    list_servers_for_user, parse_json_string_set, row_to_json, set_enabled, upsert_discovered_tools,
 };
 
 // build_config: punto unico in nexus_mcp_client::server_storage (regola L /
@@ -223,17 +223,8 @@ pub async fn test_mcp_server(
 
     match mcp_client::list_tools(&config).await {
         Ok(tools) => {
-            // Salva/aggiorna tool cache nel DB
-            let tools_for_upsert: Vec<(String, Option<String>, Value)> = tools
-                .iter()
-                .map(|t| {
-                    (
-                        t.name.clone(),
-                        t.description.clone(),
-                        serde_json::to_value(&t.input_schema).unwrap_or(json!({})),
-                    )
-                })
-                .collect();
+            // Salva/aggiorna tool cache nel DB (punto unico build_tool_upsert_args, S67).
+            let tools_for_upsert = build_tool_upsert_args(&tools);
             upsert_discovered_tools(&state.db, server_id, &tools_for_upsert).await;
 
             // Indicizzazione semantica Qdrant (fire-and-forget)

@@ -325,6 +325,41 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
     );
   }
 
+  // Props comuni di <ProviderSettings>: punto unico (regola L, S69) per i
+  // 2 rami if/else che prima ripetevano 18 prop identici (cluster top
+  // intra-file 24L). Differiscono solo per `gatewayProviders` nel ramo
+  // "category === providers".
+  const providerSettingsCommonProps = {
+    items,
+    editValues,
+    saving,
+    saved,
+    testResults,
+    isBrowsingRoot,
+    browseBusy,
+    browseError,
+    browseData,
+    newDirectoryName,
+    onEditChange: (key: string, value: string) =>
+      setEditValues((current) => ({ ...current, [key]: value })),
+    onSave: handleSave,
+    onSaveImmediate: handleSaveImmediate,
+    onTestProvider: handleTestProvider,
+    onReloadProvider: handleReloadProvider,
+    onOpenBrowse: (currentValue: string) => {
+      setIsBrowsingRoot(true);
+      if (!browseData) {
+        void loadAdminDirectories(currentValue);
+      }
+    },
+    onCloseBrowse: () => setIsBrowsingRoot(false),
+    onLoadDirectories: loadAdminDirectories,
+    onCreateDirectory: createAdminDirectory,
+    onSetNewDirectoryName: setNewDirectoryName,
+    onSelectDirectory: (path: string) =>
+      setEditValues((current) => ({ ...current, projects_base_root: path })),
+  };
+
   return (
     <div>
       <h1 className="text-2xl font-semibold" style={{ marginBottom: 6 }}>{title}</h1>
@@ -384,34 +419,9 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
       ) : category === "providers" ? (
         <>
           <ProviderSettings
-          items={items}
-          editValues={editValues}
-          saving={saving}
-          saved={saved}
-          testResults={testResults}
-          gatewayProviders={gatewayProviders}
-          isBrowsingRoot={isBrowsingRoot}
-          browseBusy={browseBusy}
-          browseError={browseError}
-          browseData={browseData}
-          newDirectoryName={newDirectoryName}
-          onEditChange={(key, value) => setEditValues((current) => ({ ...current, [key]: value }))}
-          onSave={handleSave}
-          onSaveImmediate={handleSaveImmediate}
-          onTestProvider={handleTestProvider}
-          onReloadProvider={handleReloadProvider}
-          onOpenBrowse={(currentValue) => {
-            setIsBrowsingRoot(true);
-            if (!browseData) {
-              void loadAdminDirectories(currentValue);
-            }
-          }}
-          onCloseBrowse={() => setIsBrowsingRoot(false)}
-          onLoadDirectories={loadAdminDirectories}
-          onCreateDirectory={createAdminDirectory}
-          onSetNewDirectoryName={setNewDirectoryName}
-          onSelectDirectory={(path) => setEditValues((current) => ({ ...current, projects_base_root: path }))}
-        />
+            {...providerSettingsCommonProps}
+            gatewayProviders={gatewayProviders}
+          />
           {/* ── Sezione Catalogo modelli ── */}
           <CatalogMaintenance />
           {/* ── Sezione Budget mensile provider ── */}
@@ -430,34 +440,7 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
           </div>
         </>
       ) : (
-        <ProviderSettings
-          items={items}
-          editValues={editValues}
-          saving={saving}
-          saved={saved}
-          testResults={testResults}
-          isBrowsingRoot={isBrowsingRoot}
-          browseBusy={browseBusy}
-          browseError={browseError}
-          browseData={browseData}
-          newDirectoryName={newDirectoryName}
-          onEditChange={(key, value) => setEditValues((current) => ({ ...current, [key]: value }))}
-          onSave={handleSave}
-          onSaveImmediate={handleSaveImmediate}
-          onTestProvider={handleTestProvider}
-          onReloadProvider={handleReloadProvider}
-          onOpenBrowse={(currentValue) => {
-            setIsBrowsingRoot(true);
-            if (!browseData) {
-              void loadAdminDirectories(currentValue);
-            }
-          }}
-          onCloseBrowse={() => setIsBrowsingRoot(false)}
-          onLoadDirectories={loadAdminDirectories}
-          onCreateDirectory={createAdminDirectory}
-          onSetNewDirectoryName={setNewDirectoryName}
-          onSelectDirectory={(path) => setEditValues((current) => ({ ...current, projects_base_root: path }))}
-        />
+        <ProviderSettings {...providerSettingsCommonProps} />
       )}
     </div>
   );

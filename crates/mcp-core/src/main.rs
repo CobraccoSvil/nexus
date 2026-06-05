@@ -782,6 +782,9 @@ async fn main() -> anyhow::Result<()> {
     // cap diurno del title_gen resta applicato per-scope (no spam LLM).
     wiki::links_worker::start_links_worker(std::sync::Arc::new(state.clone()));
     wiki::title_gen::start_title_gen_worker(std::sync::Arc::new(state.clone()));
+    // Arricchimento LLM dei wiki_docs kind=code (placeholder -> scheda + embedding).
+    // Modello come categoria/tier configurabile da admin (mig 0331, regola G/L).
+    wiki::code_docs_enricher::start_code_docs_enricher_worker(std::sync::Arc::new(state.clone()));
 
     // ── PR hardening: avvio writer audit centralizzato + port enforcer ───
     // Audit writer: consuma il canale `record_audit(...)` e fa batch INSERT

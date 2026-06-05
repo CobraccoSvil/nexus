@@ -1,0 +1,72 @@
+"""Parser response provider OpenAI-compatible (punto unico, regola L / ADR 0026).
+
+Prima il blocco "parse choice + tool_calls + fallback inline_tool_invocations"
+era duplicato pari-pari (34L cluster jscpd) in:
+  - brain/providers/openai_provider.py::generate_agent_turn
+  - brain/providers/mistral_provider.py::generate_agent_turn
+  - brain/providers/deepseek_provider.py::generate_agent_turn (in parte)
+
+Ora vive qui. La funzione e' deliberatamente "pura" sull'output (no chiamate
+SDK), per essere paritetica fra i tre provider OpenAI-compatible.
+"""
+from __future__ import annotations
+
+import json
+from typing import Any
+
+
+def parse_openai_compatible_choice(
+    msg: Any,
+    finish_reason: str | None,
+    tools: list[dict],
+    text_content: str,
+) -> tuple[str, str, list[dict], list[dict]]:
+    """Interpreta una `choice.message` di un SDK OpenAI-compatible.
+
+    Ritorna ``(stop_reason, text_content, tool_use_blocks, assistant_content)``.
+
+    - Se ``finish_reason == "tool_calls"`` e ``msg.tool_calls`` non e' vuoto,
+      estrae i tool_use_blocks dai tool_calls (deserializzando ``function.arguments``
+      come JSON; fallback a dict vuoto su errore parse).
+    - Altrimenti tenta di estrarre XML inline tool invocations dal testo (vedi
+      ``_schema_utils.parse_inline_tool_invocations``); se trovate, le promuove
+      a tool_use_blocks e ripulisce il testo.
+    - In assenza di tool calls, ``assistant_content`` contiene il solo blocco
+      `{"type": "text", ...}` se il testo non e' vuoto.
+
+    ``stop_reason`` parte da ``"end_turn"`` e diventa ``"tool_use"`` se almeno
+    un blocco tool e' stato emesso.
+    """
+    stop_reason = "end_turn"
+    tool_use_blocks: list[dict] = []
+    assistant_content: list[dict] = []
+
+    if finish_reason == "tool_calls" and getattr(msg, "tool_calls", None):
+        stop_reason = "tool_use"
+        for tc in msg.tool_calls:
+            try:
+                args = json.loads(tc.function.arguments)
+            except Exception:
+                args = {}
+            block = {"id": tc.id, "name": tc.function.name, "input": args}
+            tool_use_blocks.append(block)
+            assistant_content.append({"type": "tool_use", **block})
+        return stop_reason, text_content, tool_use_blocks, assistant_content
+
+    # Fallback: XML inline tool invocations dentro il testo
+    tool_names = {t.get("name", "") for t in tools if t.get("name")}
+    from ._schema_utils import parse_inline_tool_invocations
+
+    xml_blocks, cleaned_text = parse_inline_tool_invocations(text_content, tool_names)
+    if xml_blocks:
+        stop_reason = "tool_use"
+        for blk in xml_blocks:
+            tool_use_blocks.append(blk)
+            assistant_content.append({"type": "tool_use", **blk})
+        if cleaned_text.strip():
+            assistant_content.insert(0, {"type": "text", "text": cleaned_text})
+        text_content = cleaned_text
+    elif text_content:
+        assistant_content.append({"type": "text", "text": text_content})
+
+    return stop_reason, text_content, tool_use_blocks, assistant_content

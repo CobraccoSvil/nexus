@@ -19,37 +19,10 @@ pub use nexus_types::admin_dto::{
 pub async fn list_all_projects(
     State(state): State<AppState>,
 ) -> Result<Json<ListAllProjectsResponse>, StatusCode> {
-    let rows: Vec<(String, String, String, String, Option<String>, i64)> = sqlx::query_as(
-        r#"
-        SELECT
-            p.id::text,
-            p.name,
-            p.slug,
-            p.owner_user_id::text,
-            u.email,
-            (SELECT COUNT(*)::bigint FROM project_members pm WHERE pm.project_id = p.id)
-        FROM projects p
-        LEFT JOIN users u ON u.id = p.owner_user_id AND u.deleted_at IS NULL
-        ORDER BY p.name ASC
-        "#,
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let projects = rows
-        .into_iter()
-        .map(
-            |(id, name, slug, owner_user_id, owner_email, member_count)| AdminProjectSummary {
-                id,
-                name,
-                slug,
-                owner_user_id,
-                owner_email,
-                member_count,
-            },
-        )
-        .collect();
+    // Punto unico SQL in nexus_types::admin_dto (regola L, S63).
+    let projects = nexus_types::admin_dto::fetch_all_projects_summary(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(ListAllProjectsResponse { projects }))
 }
@@ -73,30 +46,7 @@ pub async fn list_project_members(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let members: Vec<ProjectMemberResponse> = sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>, String, String)>(
-        r#"
-        SELECT u.id, u.email, u.display_name, u.github_username, u.avatar_url, pm.role, pm.created_at::text
-        FROM project_members pm
-        JOIN users u ON pm.user_id = u.id
-        WHERE pm.project_id = $1 AND u.deleted_at IS NULL
-        ORDER BY pm.created_at DESC
-        "#,
-    )
-    .bind(project_uuid)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .map(|(user_id, email, display_name, github_username, avatar_url, role, created_at)| ProjectMemberResponse {
-        user_id,
-        email,
-        display_name,
-        github_username,
-        avatar_url,
-        role,
-        created_at,
-    })
-    .collect();
+    let members = nexus_types::admin_dto::fetch_project_members(&state.db, project_uuid).await;
 
     Ok(Json(ListProjectMembersResponse {
         project_id,

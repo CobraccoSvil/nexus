@@ -17,7 +17,9 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use mcp_proto::neural::{
+// Re-export: i submodule fanno `use super::*` e ottengono questi tipi senza
+// duplicare il blocco `use mcp_proto::neural::{...}` (regola L, S73).
+pub(crate) use mcp_proto::neural::{
     neural_core_service_client::NeuralCoreServiceClient, ClassifyIntentRequest, EmbedTextRequest,
     GenerateAgentTurnRequest, GenerateCompletionRequest, RouteModelRequest,
 };

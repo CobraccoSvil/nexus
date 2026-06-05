@@ -23,8 +23,24 @@ export interface RoutingConfigState {
   tokenBudget: string;
   maxTokenBudget: string;
   behaviorMode: BehaviorMode;
-  purposeModels: Record<string, { provider: ProviderName; model_id: string; notes?: string | null }>;
+  purposeModels: Record<string, PurposeModelConfig>;
 }
+
+export interface PurposeModelConfig {
+  provider: ProviderName;
+  model_id: string;
+  notes?: string | null;
+  tier?: string | null;
+  required_capability?: string | null;
+  requires_tool_use?: boolean;
+}
+
+export const PURPOSE_TIER_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "", label: "Statico (modello fisso)" },
+  { value: "light", label: "Light" },
+  { value: "medium", label: "Medium" },
+  { value: "heavy", label: "Heavy" },
+];
 
 export const PROVIDERS: ProviderName[] = ["anthropic", "openai", "google", "deepseek", "mistral"];
 
@@ -232,4 +248,5 @@ export const PURPOSE_KEYS: Array<{ key: string; label: string; desc: string }> =
   { key: "agent_tier_opus", label: "Agent tier: Opus", desc: "Tier per agent ad alto impatto." },
   { key: "agent_tier_sonnet", label: "Agent tier: Sonnet", desc: "Tier per agent general purpose." },
   { key: "agent_tier_haiku", label: "Agent tier: Haiku", desc: "Tier per task rapidi/low-cost." },
+  { key: "wiki_code_docs_enricher", label: "Wiki code-docs", desc: "Arricchimento schede descrittive dei file di codice per la knowledge base" },
 ];

@@ -5,6 +5,7 @@ import {
   PROVIDER_MODELS,
   PROVIDERS,
   PURPOSE_KEYS,
+  PURPOSE_TIER_OPTIONS,
   inputStyle,
   labelProvider,
   type ProviderName,
@@ -66,14 +67,16 @@ export function PurposeModelsSection({
       )}
       <div style={{ display: "grid", gap: 10 }}>
         {PURPOSE_KEYS.map((p) => {
-          const pm = config.purposeModels[p.key] ?? { provider: "anthropic" as ProviderName, model_id: PROVIDER_MODELS.anthropic[0], notes: null };
+          const pm = config.purposeModels[p.key] ?? { provider: "anthropic" as ProviderName, model_id: PROVIDER_MODELS.anthropic[0], notes: null, tier: null };
+          const currentTier = pm.tier ?? "";
+          const tierActive = currentTier !== "";
           const savingThis = !!purposeSaving[p.key];
           const testBusy = !!purposeTestBusy[p.key];
           const testMsg = purposeTestMsg[p.key];
           return (
             <div key={p.key} style={{
               display: "grid",
-              gridTemplateColumns: "170px 160px 1fr auto auto",
+              gridTemplateColumns: "170px 150px 160px 1fr auto auto",
               gap: 10,
               alignItems: "center",
               padding: "8px 10px",
@@ -89,12 +92,38 @@ export function PurposeModelsSection({
                   {p.desc}
                 </div>
                 <div style={{ fontSize: 10, color: tc.textMuted, marginTop: 2, fontFamily: "monospace" }}>{p.key}</div>
+                {tierActive && (
+                  <div style={{ marginTop: 4, fontSize: 10, color: tc.textMuted }}>
+                    Selezione dinamica dal catalog per categoria. Provider/modello sono usati solo come fallback statico.
+                  </div>
+                )}
                 {!!testMsg && (
                   <div style={{ marginTop: 4, fontSize: 10, color: testMsg.startsWith("OK:") ? tc.success : tc.error }}>
                     {testMsg}
                   </div>
                 )}
               </div>
+
+              <select
+                value={currentTier}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  const tier = raw === "" ? null : raw;
+                  setConfig((c) => ({
+                    ...c,
+                    purposeModels: {
+                      ...c.purposeModels,
+                      [p.key]: { ...pm, tier },
+                    },
+                  }));
+                }}
+                style={{ ...inputStyle(tc), padding: "6px 8px", fontSize: 12 }}
+                title="Categoria modello (tier). Statico = modello fisso scelto manualmente."
+              >
+                {PURPOSE_TIER_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
 
               <select
                 value={pm.provider}

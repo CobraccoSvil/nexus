@@ -10,6 +10,65 @@
 //! ```
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
+use super::{NexusToolContext, NexusToolError};
+
+/// Valida che un identifier SQL sia ASCII alfanumerico + underscore (no punto,
+/// no spazi, no virgolette). Punto unico (regola L, S76) per i tool DB stretti
+/// che NON accettano notazione schema.table (es. db_table_count, db_table_size).
+pub fn ident_ok(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Estrae `(schema, table)` da un args JSON dei tool DB, applicando default
+/// `schema = "public"` e validando entrambi con `ident_ok`. Punto unico
+/// (regola L, S76) per db_table_count + db_table_size + altri tool simili.
+pub fn extract_schema_table(args: &serde_json::Value) -> Result<(String, String), NexusToolError> {
+    let table = args
+        .get("table")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| NexusToolError::BadInput("table required".into()))?
+        .to_string();
+    let schema = args
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("public")
+        .to_string();
+    if !ident_ok(&table) || !ident_ok(&schema) {
+        return Err(NexusToolError::BadInput("invalid identifier".into()));
+    }
+    Ok((schema, table))
+}
+
+/// Valida che un nome tabella SQL contenga solo caratteri sicuri (alfanumerici,
+/// underscore, punto per schema.table). Punto unico (regola L, S75): prima
+/// duplicato in project_db_analyze + project_db_vacuum.
+pub fn validate_table_name(t: &str) -> Result<(), NexusToolError> {
+    if !t
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    {
+        return Err(NexusToolError::BadInput(
+            "Nome tabella contiene caratteri non validi".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Apre un pool sul DB di progetto risolvendo via `db_helper::get_pool` +
+/// `get_pool_for_project`, e chiude il pool nexus intermedio. Punto unico
+/// (regola L, S75): prima duplicato in project_db_analyze + project_db_vacuum
+/// + altri tool DB del progetto.
+pub async fn open_project_pool(ctx: &NexusToolContext) -> Result<PgPool, NexusToolError> {
+    let nexus_pool = get_pool()
+        .await
+        .map_err(|e| NexusToolError::BadInput(format!("nexus db: {}", e)))?;
+    let project_pool = get_pool_for_project(&nexus_pool, ctx.project_id)
+        .await
+        .map_err(NexusToolError::BadInput)?;
+    nexus_pool.close().await;
+    Ok(project_pool)
+}
+
 /// Parole chiave DDL che richiedono il blocco quando il target è un progetto utente.
 const DDL_KEYWORDS: &[&str] = &[
     "CREATE TABLE",

@@ -781,6 +781,15 @@ pub async fn reindex_single_file_inner(
         &content,
     )
     .await;
+    // Segnala al code-docs enricher che il sorgente e' cambiato: marca stale il
+    // doc kind=code cosi' il worker rigenera la scheda (best-effort, mig 0331).
+    crate::wiki::code_docs_enricher::mark_code_doc_stale_if_changed(
+        db,
+        project_id,
+        &relative_path,
+        &content,
+    )
+    .await;
     let _ = (root, &content_hash);
 
     tracing::debug!("reindex_single_file: {relative_path} → {indexed} chunks");

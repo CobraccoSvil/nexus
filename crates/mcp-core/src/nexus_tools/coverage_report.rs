@@ -75,21 +75,8 @@ impl NexusToolHandler for CoverageReportTool {
                     "error": "package.json has no 'coverage' script defined",
                 }));
             }
-            let out = run_cmd(
-                "npm",
-                &["run", "coverage"],
-                &ctx.project_root,
-                ctx.timeout_secs,
-            )
-            .await?;
-            return Ok(json!({
-                "ok": out.success(),
-                "stack": "node",
-                "exit_code": out.exit_code,
-                "duration_ms": out.duration_ms,
-                "stdout": out.stdout,
-                "stderr": out.stderr,
-            }));
+            // Punto unico in nexus_tools::run_npm_script_node_stack (regola L, S65).
+            return super::run_npm_script_node_stack(ctx, "coverage").await;
         }
 
         Ok(json!({

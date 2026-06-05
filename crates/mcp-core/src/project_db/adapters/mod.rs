@@ -133,6 +133,35 @@ pub(crate) fn list_pending_files(
     Ok(result)
 }
 
+/// Sanitizza un nome migration mantenendo solo alfanumerici e underscore.
+/// Punto unico (regola L, S68) per il pattern duplicato negli adapter SQL.
+pub(crate) fn sanitize_migration_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// Scrive un file migration SQL con nome `<timestamp>_<safe_name>.sql` dentro
+/// `ctx.migration_path`. Il body e' generato da `body_fmt(name, timestamp, sql)`
+/// per consentire header diversi (es. "-- Migration:" vs "-- Liquibase changeset:").
+/// Punto unico (regola L, S68): prima il pattern era duplicato in
+/// `generic_sql.rs::create_migration` e `liquibase.rs::create_migration`.
+pub(crate) fn write_timestamped_sql_migration(
+    ctx: &ProjectDbContext,
+    name: &str,
+    sql: &str,
+    body_fmt: impl FnOnce(&str, &str, &str) -> String,
+) -> Result<PathBuf, ProjectDbError> {
+    let dir = ctx.project_root.join(&ctx.migration_path);
+    std::fs::create_dir_all(&dir)?;
+    let ts = migration_timestamp();
+    let safe_name = sanitize_migration_name(name);
+    let filename = format!("{}_{}.sql", ts, safe_name);
+    let file_path = dir.join(&filename);
+    std::fs::write(&file_path, body_fmt(name, &ts, sql))?;
+    Ok(file_path)
+}
+
 /// Genera un timestamp per il nome del file migration: `YYYYMMDD_HHMMSS`.
 pub(crate) fn migration_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};

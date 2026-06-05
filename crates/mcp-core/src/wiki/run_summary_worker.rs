@@ -327,11 +327,13 @@ async fn ingest_run(
     let body_hash = crate::wiki::vault::sha256_hex(&body_md);
 
     // Embed (best-effort).
-    let snippet = if body_md.len() > 2000 {
-        &body_md[..2000]
-    } else {
-        body_md.as_str()
-    };
+    // Troncamento per CARATTERE, non per byte: `body_md` contiene testo utente
+    // (titolo, nomi tool, output dell'agente) che puo' avere caratteri
+    // multi-byte UTF-8. Uno slice `&body_md[..2000]` panica se il byte 2000
+    // cade in mezzo a un carattere multi-byte ("byte index N is not a char
+    // boundary"). `chars().take(2000)` e' sempre sicuro (coerente con il cap a
+    // 4000 char di `final_section` poco sopra).
+    let snippet: String = body_md.chars().take(2000).collect();
     let combined = format!("{title}\n\n{snippet}");
     // L'id del documento viene fissato qui (non lasciato al DEFAULT della
     // tabella) per poterlo usare come id del punto Qdrant. Mantenere
@@ -443,5 +445,29 @@ async fn mark_processed(db: &PgPool, run_id: Uuid) {
             error = %e,
             "wiki.run_summary: mark_processed fallito"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Regressione: il riepilogo run troncava lo snippet per embedding con uno
+    /// slice per byte (`&body_md[..2000]`), che panica quando il byte 2000 cade
+    /// in mezzo a un carattere multi-byte UTF-8 (es. testo utente con accenti).
+    /// Il troncamento per carattere deve essere sempre sicuro e non panicare.
+    #[test]
+    fn snippet_truncation_e_char_boundary_safe() {
+        // Costruiamo un body in cui il byte 2000 cade dentro un carattere
+        // multi-byte: 1999 ASCII + una sequenza di 'à' (2 byte ciascuno).
+        let mut body = "a".repeat(1999);
+        body.push_str(&"à".repeat(50));
+
+        // Lo slice per byte panicherebbe qui: byte 2000 non e' un char boundary.
+        assert!(!body.is_char_boundary(2000));
+
+        // Il troncamento per carattere usato nel worker e' sicuro.
+        let snippet: String = body.chars().take(2000).collect();
+        assert_eq!(snippet.chars().count(), 2000);
+        // E produce sempre UTF-8 valido (nessun carattere spezzato).
+        assert!(snippet.ends_with('à'));
     }
 }

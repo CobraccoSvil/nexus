@@ -429,6 +429,23 @@ pub async fn list_cached_tools_with_schema(db: &PgPool, server_id: Uuid) -> Vec<
     .collect()
 }
 
+/// Trasforma una `Vec<McpTool>` (output di `list_tools`) nel formato atteso
+/// da `upsert_discovered_tools`: `Vec<(name, description, input_schema_json)>`.
+/// Punto unico (regola L, S67): prima il `.iter().map(|t| (t.name.clone(), ...))`
+/// era duplicato fra mcp-core e plugin-service in `test_mcp_server`.
+pub fn build_tool_upsert_args(tools: &[crate::McpTool]) -> Vec<(String, Option<String>, Value)> {
+    tools
+        .iter()
+        .map(|t| {
+            (
+                t.name.clone(),
+                t.description.clone(),
+                serde_json::to_value(&t.input_schema).unwrap_or(json!({})),
+            )
+        })
+        .collect()
+}
+
 /// UPSERT in `mcp_server_tools` per i tool scoperti dal test (best-effort: gli
 /// errori per-tool vengono ignorati). Usata dopo `list_tools()` di un server reale.
 pub async fn upsert_discovered_tools(

@@ -25,6 +25,27 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _build_history_messages(conversation_history: list[dict] | None) -> list:
+    """Costruisce la lista di AIMessage/HumanMessage di LangChain a partire da
+    `body.conversation_history`. Punto unico (regola L / ADR 0026, S72) per il
+    pattern duplicato negli endpoint `/agent/run` e `/agent/run-stream`.
+    """
+    from langchain_core.messages import AIMessage as _AIMessage
+    from langchain_core.messages import HumanMessage as _HumanMessage
+
+    history_msgs: list = []
+    for msg in (conversation_history or []):
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if not content:
+            continue
+        if role == "assistant":
+            history_msgs.append(_AIMessage(content=content))
+        else:
+            history_msgs.append(_HumanMessage(content=content))
+    return history_msgs
+
+
 # ── PR-3 sub-agents: endpoint per dispatch_subagent (chiamato da mcp-core) ──
 
 class SubagentRunRequest(BaseModel):
@@ -435,22 +456,13 @@ async def agent_run(body: AgentRunRequest) -> dict[str, object]:
 
     Nel response completato include le metriche estese: token, costo, latency.
     """
-    from langchain_core.messages import AIMessage as _AIMessage
     from langchain_core.messages import HumanMessage as _HumanMessage
 
     graph = runtime._get_agent_graph()
     config: dict[str, object] = {"configurable": {"thread_id": body.thread_id}}
 
-    history_msgs: list = []
-    for msg in (body.conversation_history or []):
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if not content:
-            continue
-        if role == "assistant":
-            history_msgs.append(_AIMessage(content=content))
-        else:
-            history_msgs.append(_HumanMessage(content=content))
+    # Punto unico history builder (regola L, S72).
+    history_msgs = _build_history_messages(body.conversation_history)
 
     initial_state = {
         "messages": history_msgs + [_HumanMessage(content=body.prompt)],
@@ -663,22 +675,13 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
     """
     import json as _json
 
-    from langchain_core.messages import AIMessage as _AIMessage
     from langchain_core.messages import HumanMessage as _HumanMessage
 
     graph = runtime._get_agent_graph()
     config: dict[str, object] = {"configurable": {"thread_id": body.thread_id}}
 
-    history_msgs: list = []
-    for msg in (body.conversation_history or []):
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if not content:
-            continue
-        if role == "assistant":
-            history_msgs.append(_AIMessage(content=content))
-        else:
-            history_msgs.append(_HumanMessage(content=content))
+    # Punto unico history builder (regola L, S72).
+    history_msgs = _build_history_messages(body.conversation_history)
 
     initial_state = {
         "messages": history_msgs + [_HumanMessage(content=body.prompt)],

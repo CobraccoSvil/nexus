@@ -118,6 +118,82 @@ pub struct PurposeResolveResponse {
     pub no_capable_provider: bool,
 }
 
+/// Esito della risoluzione di un purpose model. PUNTO UNICO (regola L): sia
+/// l'handler HTTP `resolve_purpose` sia i worker in-process (es.
+/// `wiki::code_docs_enricher`) devono passare da qui invece di re-implementare
+/// la logica tier→statico→cooldown. Estratto da `resolve_purpose` per evitare
+/// duplicazione tra il codepath HTTP e quelli in-process.
+#[derive(Debug, Clone)]
+pub enum PurposeResolution {
+    /// (provider, model) risolto e utilizzabile. `rationale` descrive la fonte
+    /// della decisione (tier dinamico vs statico).
+    Resolved {
+        provider: String,
+        model: String,
+        rationale: String,
+    },
+    /// Il (provider, model) statico configurato e' in cooldown e non esiste
+    /// alternativa tier-based fuori cooldown (ADR 0020).
+    InCooldown { provider: String, model: String },
+    /// Purpose non presente in `nexus_purpose_model`.
+    NotFound,
+    /// La routing matrix non e' disponibile (DB down): nessun fallback hardcoded.
+    MatrixUnavailable(String),
+}
+
+/// Risolve (provider, model) per un purpose applicando, nell'ordine: regola tier
+/// dinamica (mig 0203) con scelta del miglior modello capable fuori cooldown;
+/// fallback al (provider, model_id) statico; enforcement cooldown sul statico.
+/// Nessun nome modello hardcoded: tutto deriva dal DB (regola G).
+pub async fn resolve_purpose_model(state: &AppState, purpose: &str) -> PurposeResolution {
+    let purpose = purpose.trim();
+    let matrix = match state.orchestrator.routing_matrix.current() {
+        Ok(m) => m,
+        Err(e) => return PurposeResolution::MatrixUnavailable(e.to_string()),
+    };
+
+    // Risoluzione tier-based (mig 0203): se il purpose ha un tier configurato,
+    // scegliamo dinamicamente il miglior modello del catalog per quel tier +
+    // capability. Se il catalog non ha candidati (es. tutti in cooldown), si
+    // cade sul (provider, model_id) statico come ultimo fallback.
+    if let Some(rule) = matrix.purpose_tier(purpose) {
+        if let Some((provider, model)) = crate::orchestrator::best_model_for_tier(
+            &state.db,
+            &rule.tier,
+            rule.capability.as_deref(),
+            rule.requires_tool_use,
+        )
+        .await
+        {
+            return PurposeResolution::Resolved {
+                provider,
+                model,
+                rationale: format!("purpose_model:tier={}:auto", rule.tier),
+            };
+        }
+        tracing::warn!(
+            purpose = %purpose,
+            tier = %rule.tier,
+            "resolve_purpose: nessun modello catalog per il tier (tutti in cooldown?) — fallback statico"
+        );
+    }
+
+    match matrix.purpose_model(purpose) {
+        Some((provider, model)) => {
+            if crate::provider_cooldown::is_provider_in_cooldown(&provider) {
+                PurposeResolution::InCooldown { provider, model }
+            } else {
+                PurposeResolution::Resolved {
+                    provider,
+                    model,
+                    rationale: "purpose_model".to_string(),
+                }
+            }
+        }
+        None => PurposeResolution::NotFound,
+    }
+}
+
 /// Handler `GET /api/internal/routing/purpose?purpose=...`
 /// Risolve (provider, model) da `nexus_purpose_model` tramite RoutingMatrixCache.
 ///
@@ -136,92 +212,53 @@ pub async fn resolve_purpose(
     if purpose.is_empty() {
         return (StatusCode::BAD_REQUEST, "missing `purpose`".to_string()).into_response();
     }
-    // Usa la cache DB-driven: nessun fallback hardcoded.
-    let matrix = match state.orchestrator.routing_matrix.current() {
-        Ok(m) => m,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("routing_matrix non disponibile: {e}"),
-            )
-                .into_response();
-        }
-    };
 
-    // Risoluzione tier-based (mig 0203): se il purpose ha un tier configurato,
-    // scegliamo dinamicamente il miglior modello del catalog per quel tier +
-    // capability. Se il catalog non ha candidati (es. tutti in cooldown), si
-    // cade sul (provider, model_id) statico come ultimo fallback. Nessun nome
-    // modello hardcoded: tutto deriva da DB.
-    if let Some(rule) = matrix.purpose_tier(purpose) {
-        if let Some((provider, model)) = crate::orchestrator::best_model_for_tier(
-            &state.db,
-            &rule.tier,
-            rule.capability.as_deref(),
-            rule.requires_tool_use,
+    // Delega al PUNTO UNICO (regola L): la logica tier→statico→cooldown vive in
+    // `resolve_purpose_model`. Qui resta solo la mappatura esito → HTTP status.
+    match resolve_purpose_model(&state, purpose).await {
+        PurposeResolution::Resolved {
+            provider,
+            model,
+            rationale,
+        } => (
+            StatusCode::OK,
+            Json(PurposeResolveResponse {
+                purpose: purpose.to_string(),
+                provider,
+                model,
+                rationale,
+                no_capable_provider: false,
+            }),
         )
-        .await
-        {
-            return (
-                StatusCode::OK,
-                Json(PurposeResolveResponse {
-                    purpose: purpose.to_string(),
-                    provider,
-                    model,
-                    rationale: format!("purpose_model:tier={}:auto", rule.tier),
-                    no_capable_provider: false,
-                }),
-            )
-                .into_response();
-        }
-        tracing::warn!(
-            purpose = %purpose,
-            tier = %rule.tier,
-            "resolve_purpose: nessun modello catalog per il tier (tutti in cooldown?) — fallback statico"
-        );
-        // prosegue al fallback statico sotto.
-    }
-
-    match matrix.purpose_model(purpose) {
-        Some((provider, model)) => {
-            // Cooldown enforcement (ADR 0020): il purpose statico NON filtrava il
-            // cooldown (codepath parallelo al gate). Se il provider configurato e'
-            // in cooldown billing/quota lo segnaliamo come no_capable invece di
-            // restituirlo: il brain lo ritenterebbe a vuoto (incidente reale:
-            // loop_fallback_default -> anthropic in credit_balance_too_low).
-            if crate::provider_cooldown::is_provider_in_cooldown(&provider) {
-                tracing::warn!(
-                    purpose = %purpose,
-                    provider = %provider,
-                    "resolve_purpose: provider in cooldown e nessuna alternativa tier-based -> no_capable (503)"
-                );
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(PurposeResolveResponse {
-                        purpose: purpose.to_string(),
-                        provider,
-                        model,
-                        rationale: "purpose_model:in_cooldown".to_string(),
-                        no_capable_provider: true,
-                    }),
-                )
-                    .into_response();
-            }
+            .into_response(),
+        PurposeResolution::InCooldown { provider, model } => {
+            // Cooldown enforcement (ADR 0020): segnaliamo no_capable invece di
+            // restituire un provider morto che il brain ritenterebbe a vuoto.
+            tracing::warn!(
+                purpose = %purpose,
+                provider = %provider,
+                "resolve_purpose: provider in cooldown e nessuna alternativa tier-based -> no_capable (503)"
+            );
             (
-                StatusCode::OK,
+                StatusCode::SERVICE_UNAVAILABLE,
                 Json(PurposeResolveResponse {
                     purpose: purpose.to_string(),
                     provider,
                     model,
-                    rationale: "purpose_model".to_string(),
-                    no_capable_provider: false,
+                    rationale: "purpose_model:in_cooldown".to_string(),
+                    no_capable_provider: true,
                 }),
             )
                 .into_response()
         }
-        None => (
+        PurposeResolution::NotFound => (
             StatusCode::NOT_FOUND,
             format!("purpose model non trovato: {purpose}"),
+        )
+            .into_response(),
+        PurposeResolution::MatrixUnavailable(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("routing_matrix non disponibile: {e}"),
         )
             .into_response(),
     }

@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::Claims,
-    chat_learning::{api_error, parse_user_id, ApiResult},
+    chat_learning::{api_error, parse_user_id, ApiError, ApiResult},
     AppState,
 };
 
@@ -79,8 +79,62 @@ struct ProfileUpdateBinds<'a> {
     default_automation: Option<&'a str>,
 }
 
+/// Valori trimmati di un INSERT profilo (sia user che system): name + 6 campi.
+/// Punto unico (regola L / S64) per il pattern di binding duplicato fra
+/// `create_profile` e `admin_create_profile`.
+struct ProfileInsertBinds<'a> {
+    description: Option<&'a str>,
+    avatar_emoji: &'a str,
+    system_prompt: &'a str,
+    default_provider: Option<&'a str>,
+    default_model: Option<&'a str>,
+    default_automation: Option<&'a str>,
+}
+
+impl<'a> ProfileInsertBinds<'a> {
+    /// Costruisce i bind a partire dai 6 campi opzionali grezzi dell'INSERT
+    /// (usato sia da CreateProfileRequest che da admin CreateProfileRequest:
+    /// hanno gli stessi nomi/tipi sui 6 campi `Option<String>`).
+    fn from_fields(
+        description: Option<&'a String>,
+        avatar_emoji: Option<&'a String>,
+        system_prompt: Option<&'a String>,
+        default_provider: Option<&'a String>,
+        default_model: Option<&'a String>,
+        default_automation: Option<&'a String>,
+    ) -> Self {
+        let non_empty = |s: &'a str| -> Option<&'a str> {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        };
+        Self {
+            description: description.map(|s| s.as_str().trim()),
+            avatar_emoji: avatar_emoji.map(|s| s.as_str()).unwrap_or("\u{1F916}").trim(),
+            system_prompt: system_prompt.map(|s| s.as_str()).unwrap_or("").trim(),
+            default_provider: default_provider.and_then(|s| non_empty(s.as_str())),
+            default_model: default_model.and_then(|s| non_empty(s.as_str())),
+            default_automation: default_automation.and_then(|s| non_empty(s.as_str())),
+        }
+    }
+}
+
+/// Mappa errore sqlx unique-violation -> 409 CONFLICT con messaggio
+/// personalizzato; altri errori -> 500. Punto unico per i blocchi
+/// `if e.to_string().contains("unique") ...` ripetuti nei create profile.
+fn map_profile_insert_error(e: sqlx::Error, conflict_msg: &'static str) -> ApiError {
+    if e.to_string().contains("unique") || e.to_string().contains("duplicate") {
+        api_error(StatusCode::CONFLICT, conflict_msg)
+    } else {
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    }
+}
+
 impl<'a> ProfileUpdateBinds<'a> {
-    fn from(body: &'a UpdateProfileRequest) -> Self {
+    fn from_body(body: &'a UpdateProfileRequest) -> Self {
         let non_empty = |s: &'a str| -> Option<&'a str> {
             let t = s.trim();
             if t.is_empty() {
@@ -158,6 +212,14 @@ pub async fn create_profile(
             "Il nome del profilo e' obbligatorio",
         ));
     }
+    let binds = ProfileInsertBinds::from_fields(
+        body.description.as_ref(),
+        body.avatar_emoji.as_ref(),
+        body.system_prompt.as_ref(),
+        body.default_provider.as_ref(),
+        body.default_model.as_ref(),
+        body.default_automation.as_ref(),
+    );
     let row = sqlx::query(
         r#"
         INSERT INTO user_profiles
@@ -169,39 +231,15 @@ pub async fn create_profile(
     )
     .bind(user_id)
     .bind(&name)
-    .bind(body.description.as_deref().map(str::trim))
-    .bind(body.avatar_emoji.as_deref().unwrap_or("\u{1F916}").trim())
-    .bind(body.system_prompt.as_deref().unwrap_or("").trim())
-    .bind(
-        body.default_provider
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::trim),
-    )
-    .bind(
-        body.default_model
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::trim),
-    )
-    .bind(
-        body.default_automation
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::trim),
-    )
+    .bind(binds.description)
+    .bind(binds.avatar_emoji)
+    .bind(binds.system_prompt)
+    .bind(binds.default_provider)
+    .bind(binds.default_model)
+    .bind(binds.default_automation)
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        if e.to_string().contains("unique") || e.to_string().contains("duplicate") {
-            api_error(
-                StatusCode::CONFLICT,
-                "Un profilo con questo nome esiste gia'",
-            )
-        } else {
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        }
-    })?;
+    .map_err(|e| map_profile_insert_error(e, "Un profilo con questo nome esiste gia'"))?;
 
     Ok(Json(row_to_json(&row)))
 }
@@ -217,7 +255,7 @@ pub async fn update_profile(
     let profile_uuid = Uuid::parse_str(&profile_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Profile id non valido"))?;
 
-    let binds = ProfileUpdateBinds::from(&body);
+    let binds = ProfileUpdateBinds::from_body(&body);
     let row = sqlx::query(
         r#"
         UPDATE user_profiles SET
@@ -583,6 +621,14 @@ pub async fn admin_create_profile(
             "Il nome del profilo e' obbligatorio",
         ));
     }
+    let binds = ProfileInsertBinds::from_fields(
+        body.description.as_ref(),
+        body.avatar_emoji.as_ref(),
+        body.system_prompt.as_ref(),
+        body.default_provider.as_ref(),
+        body.default_model.as_ref(),
+        body.default_automation.as_ref(),
+    );
     let row = sqlx::query(
         r#"
         INSERT INTO user_profiles
@@ -593,39 +639,15 @@ pub async fn admin_create_profile(
         "#,
     )
     .bind(&name)
-    .bind(body.description.as_deref().map(str::trim))
-    .bind(body.avatar_emoji.as_deref().unwrap_or("\u{1F916}").trim())
-    .bind(body.system_prompt.as_deref().unwrap_or("").trim())
-    .bind(
-        body.default_provider
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::trim),
-    )
-    .bind(
-        body.default_model
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::trim),
-    )
-    .bind(
-        body.default_automation
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .map(str::trim),
-    )
+    .bind(binds.description)
+    .bind(binds.avatar_emoji)
+    .bind(binds.system_prompt)
+    .bind(binds.default_provider)
+    .bind(binds.default_model)
+    .bind(binds.default_automation)
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        if e.to_string().contains("unique") || e.to_string().contains("duplicate") {
-            api_error(
-                StatusCode::CONFLICT,
-                "Un profilo di sistema con questo nome esiste gia'",
-            )
-        } else {
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        }
-    })?;
+    .map_err(|e| map_profile_insert_error(e, "Un profilo di sistema con questo nome esiste gia'"))?;
 
     Ok(Json(row_to_json(&row)))
 }
@@ -640,7 +662,7 @@ pub async fn admin_update_profile(
     let profile_uuid = Uuid::parse_str(&profile_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Profile id non valido"))?;
 
-    let binds = ProfileUpdateBinds::from(&body);
+    let binds = ProfileUpdateBinds::from_body(&body);
     let row = sqlx::query(
         r#"
         UPDATE user_profiles SET

@@ -30,6 +30,9 @@ export interface PurposeModelEntry {
   provider: string;
   model_id: string;
   notes?: string | null;
+  tier?: string | null;
+  required_capability?: string | null;
+  requires_tool_use?: boolean;
   updated_at: string;
 }
 
@@ -39,7 +42,14 @@ export async function listAdminPurposeModels(): Promise<{ items: PurposeModelEnt
 
 export async function updateAdminPurposeModel(
   purpose: string,
-  body: { provider: string; model_id: string; notes?: string | null },
+  body: {
+    provider: string;
+    model_id: string;
+    notes?: string | null;
+    tier?: string | null;
+    required_capability?: string | null;
+    requires_tool_use?: boolean;
+  },
 ): Promise<{ status: string; purpose: string }> {
   return fetchJson(`${API_BASE}/api/admin/routing/purpose-model/${encodeURIComponent(purpose)}`, {
     method: "PUT",

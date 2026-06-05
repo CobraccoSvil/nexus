@@ -75,7 +75,13 @@ def _is_o_series(model: str) -> bool:
     model_lower = model.lower()
     return any(model_lower == m or model_lower.startswith(m + "-") for m in _O_SERIES_MODELS)
 
-from .base import ApiKeyClientMixin, BaseProvider, ProviderCatalogEntry, ProviderResult
+from .base import (
+    ApiKeyClientMixin,
+    BaseProvider,
+    ProviderCatalogEntry,
+    ProviderResult,
+    build_openai_compatible_client,
+)
 from .error_handler import format_error_result
 
 logger = logging.getLogger(__name__)
@@ -94,23 +100,13 @@ class OpenAIProvider(BaseProvider, ApiKeyClientMixin):
         self._init_api_key_cache()
 
     def _create_client(self, api_key: str) -> Any:
-        from openai import AsyncOpenAI
-        from .dns_transport import get_global_dns_transport
-        import httpx
-
-        transport = get_global_dns_transport()
-        http_client = httpx.AsyncClient(transport=transport) if transport is not None else None
+        # Punto unico build_openai_compatible_client (regola L, S70).
         # max_retries=0: i retry sono governati a livello applicativo (cascade
         # M60 nel registry), non dall'SDK. Su errori non-retriabili come
         # 402/insufficient_quota (credit_balance_too_low) il client OpenAI
         # ritenterebbe comunque, sprecando latenza durante il cascade mentre
         # openai e' gia' in cooldown billing. Vedi FIX cooldown openai.
-        return AsyncOpenAI(
-            api_key=api_key,
-            http_client=http_client,
-            max_retries=0,
-        )
-        return self._client
+        return build_openai_compatible_client(api_key, max_retries=0)
 
     def list_models(self) -> list[ProviderCatalogEntry]:
         # Lista modelli letta da DB (ai_price_catalog) con cache 60s.
@@ -266,31 +262,11 @@ class OpenAIProvider(BaseProvider, ApiKeyClientMixin):
             tool_use_blocks: list[dict] = []
             assistant_content: list[dict] = []
 
-            if choice.finish_reason == "tool_calls" and msg.tool_calls:
-                stop_reason = "tool_use"
-                for tc in msg.tool_calls:
-                    import json as _json
-                    try:
-                        args = _json.loads(tc.function.arguments)
-                    except Exception:
-                        args = {}
-                    block = {"id": tc.id, "name": tc.function.name, "input": args}
-                    tool_use_blocks.append(block)
-                    assistant_content.append({"type": "tool_use", **block})
-            else:
-                tool_names = {t.get("name", "") for t in tools if t.get("name")}
-                from ._schema_utils import parse_inline_tool_invocations
-                xml_blocks, cleaned_text = parse_inline_tool_invocations(text_content, tool_names)
-                if xml_blocks:
-                    stop_reason = "tool_use"
-                    for blk in xml_blocks:
-                        tool_use_blocks.append(blk)
-                        assistant_content.append({"type": "tool_use", **blk})
-                    if cleaned_text.strip():
-                        assistant_content.insert(0, {"type": "text", "text": cleaned_text})
-                    text_content = cleaned_text
-                elif text_content:
-                    assistant_content.append({"type": "text", "text": text_content})
+            # Punto unico in _response_parsers (regola L, S61).
+            from ._response_parsers import parse_openai_compatible_choice
+            stop_reason, text_content, tool_use_blocks, assistant_content = (
+                parse_openai_compatible_choice(msg, choice.finish_reason, tools, text_content)
+            )
 
             usage_data = {}
             if response.usage:

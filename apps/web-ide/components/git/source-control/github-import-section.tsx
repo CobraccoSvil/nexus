@@ -7,6 +7,7 @@ import type {
 } from "../../../lib/api-client";
 import { useThemeColors } from "../../../lib/theme";
 import { cardStyle, inputStyle, sectionTitleStyle, smallButtonStyle } from "./styles";
+import { CreateGithubRepoForm } from "./create-github-repo-form";
 
 interface GitHubImportSectionProps {
   project: UserProjectDetails;
@@ -96,48 +97,20 @@ export function GitHubImportSection({
               Pubblica su GitHub
             </button>
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              <input
-                value={createRepoName}
-                onChange={(e) => setCreateRepoName(e.target.value)}
-                placeholder="Nome repository (alfanumerico, '-', '_', '.')"
-                style={inputStyle(tc)}
-              />
-              <input
-                value={createRepoDesc}
-                onChange={(e) => setCreateRepoDesc(e.target.value)}
-                placeholder="Descrizione (opzionale)"
-                style={inputStyle(tc)}
-              />
-              <label style={{ display: "flex", alignItems: "center", gap: 8, color: tc.text }}>
-                <input
-                  type="checkbox"
-                  checked={createRepoPrivate}
-                  onChange={(e) => setCreateRepoPrivate(e.target.checked)}
-                />
-                Repository privato
-              </label>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                <button
-                  disabled={createRepoBusy || !createRepoName.trim()}
-                  onClick={() => void onCreateGithubRepo()}
-                  style={smallButtonStyle(tc, createRepoBusy || !createRepoName.trim())}
-                >
-                  {createRepoBusy ? "Pubblicazione in corso..." : "Conferma e pubblica"}
-                </button>
-                <button
-                  disabled={createRepoBusy}
-                  onClick={() => setCreateRepoOpen(false)}
-                  style={smallButtonStyle(tc, createRepoBusy)}
-                >
-                  Annulla
-                </button>
-              </div>
-              <div style={{ fontSize: 10, color: tc.textMuted }}>
-                L'operazione esegue: git init -b main → .gitignore (se manca) →
-                git add -A → git commit → crea repo GitHub → git push -u origin main.
-              </div>
-            </div>
+            <CreateGithubRepoForm
+              tc={tc}
+              createRepoName={createRepoName}
+              setCreateRepoName={setCreateRepoName}
+              createRepoDesc={createRepoDesc}
+              setCreateRepoDesc={setCreateRepoDesc}
+              createRepoPrivate={createRepoPrivate}
+              setCreateRepoPrivate={setCreateRepoPrivate}
+              createRepoBusy={createRepoBusy}
+              confirmLabels={{ idle: "Conferma e pubblica", busy: "Pubblicazione in corso..." }}
+              hint={"L'operazione esegue: git init -b main → .gitignore (se manca) → git add -A → git commit → crea repo GitHub → git push -u origin main."}
+              onConfirm={onCreateGithubRepo}
+              onCancel={() => setCreateRepoOpen(false)}
+            />
           )}
           {githubMessage ? <div style={{ color: tc.success, fontSize: 12 }}>{githubMessage}</div> : null}
           {githubError ? <div style={{ color: tc.error, fontSize: 12 }}>{githubError}</div> : null}

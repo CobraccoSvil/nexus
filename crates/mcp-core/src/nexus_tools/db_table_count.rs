@@ -7,10 +7,6 @@ use sqlx::Row;
 
 pub struct DbTableCountTool;
 
-fn ident_ok(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 #[async_trait]
 impl NexusToolHandler for DbTableCountTool {
     async fn execute(
@@ -18,17 +14,8 @@ impl NexusToolHandler for DbTableCountTool {
         _ctx: &NexusToolContext,
         args: &Value,
     ) -> Result<Value, NexusToolError> {
-        let table = args
-            .get("table")
-            .and_then(Value::as_str)
-            .ok_or_else(|| NexusToolError::BadInput("table required".into()))?;
-        let schema = args
-            .get("schema")
-            .and_then(Value::as_str)
-            .unwrap_or("public");
-        if !ident_ok(table) || !ident_ok(schema) {
-            return Err(NexusToolError::BadInput("invalid identifier".into()));
-        }
+        // Punto unico extract_schema_table (regola L, S76).
+        let (schema, table) = db_helper::extract_schema_table(args)?;
         let pool = match db_helper::get_pool().await {
             Ok(p) => p,
             Err(e) => return Ok(json!({"ok": false, "error": e})),

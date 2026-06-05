@@ -119,3 +119,36 @@ class ApiKeyClientMixin:
         raise NotImplementedError(
             f"{type(self).__name__} deve implementare _create_client(api_key)"
         )
+
+
+def build_openai_compatible_client(
+    api_key: str,
+    *,
+    base_url: str | None = None,
+    max_retries: int | None = None,
+) -> Any:
+    """Costruisce un ``openai.AsyncOpenAI`` con il transport DNS condiviso
+    Nexus (httpx). Punto unico (regola L / ADR 0026, S70) per il pattern
+    `import + transport + AsyncOpenAI(...)` prima duplicato in
+    `deepseek_provider`, `mistral_provider`, `openai_provider`.
+
+    - ``base_url=None`` per il provider OpenAI ufficiale, stringa per i
+      compatibili (deepseek, mistral, groq, ecc.).
+    - ``max_retries=Some(0)`` per gli adapter che vogliono cascade applicativa
+      (es. openai cooldown billing); ``None`` per il default SDK.
+    """
+    from openai import AsyncOpenAI  # type: ignore[import]
+    import httpx  # type: ignore[import]
+
+    from .dns_transport import get_global_dns_transport
+
+    transport = get_global_dns_transport()
+    http_client = (
+        httpx.AsyncClient(transport=transport) if transport is not None else None
+    )
+    kwargs: dict[str, Any] = {"api_key": api_key, "http_client": http_client}
+    if base_url is not None:
+        kwargs["base_url"] = base_url
+    if max_retries is not None:
+        kwargs["max_retries"] = max_retries
+    return AsyncOpenAI(**kwargs)

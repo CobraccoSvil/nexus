@@ -89,7 +89,14 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
         for (const it of (res.items ?? []) as PurposeModelEntry[]) {
           const prov = it.provider as ProviderName;
           if (!PROVIDERS.includes(prov)) continue;
-          pm[it.purpose] = { provider: prov, model_id: it.model_id, notes: it.notes ?? null };
+          pm[it.purpose] = {
+            provider: prov,
+            model_id: it.model_id,
+            notes: it.notes ?? null,
+            tier: it.tier ?? null,
+            required_capability: it.required_capability ?? null,
+            requires_tool_use: it.requires_tool_use ?? false,
+          };
         }
         setConfig((prev) => ({ ...prev, purposeModels: pm }));
       })
@@ -228,6 +235,9 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
         provider: pm.provider,
         model_id: pm.model_id,
         notes: pm.notes ?? null,
+        tier: pm.tier ?? null,
+        required_capability: pm.required_capability ?? null,
+        requires_tool_use: pm.requires_tool_use ?? false,
       });
       setPurposeSaved(true);
       setTimeout(() => setPurposeSaved(false), 2000);

@@ -7,11 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
-use mcp_proto::neural::{
-    neural_core_service_client::NeuralCoreServiceClient, ClassifyIntentRequest, EmbedTextRequest,
-    GenerateAgentTurnRequest, GenerateCompletionRequest, RouteModelRequest,
-};
-
+// Tipi mcp_proto::neural ri-esportati da super::* (regola L, S73).
 use crate::{
     billing::{self, UsageNumbers},
     domain::OrchestratorAudit,

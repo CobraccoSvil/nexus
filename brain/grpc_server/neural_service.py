@@ -91,6 +91,38 @@ def _humanize_provider_error(exc: Exception) -> str:
     return human
 
 
+def _normalize_provider_result(result, provider: str, model: str) -> tuple[str, object, str]:
+    """Normalizza il `content` di un ProviderResult (gestendo list/dict/non-str)
+    e classifica eventuali errori "[Error: ...]" sanitizzandoli per l'UI.
+
+    Ritorna ``(content, error_meta, error_class)``. Punto unico (regola L /
+    ADR 0026, S66): prima il blocco era duplicato fra
+    ``GenerateCompletion`` (riga 148+) e ``GenerateAgentTurn`` (riga 234+).
+    """
+    content = result.content or ""
+    if not isinstance(content, str):
+        # Alcuni provider/percorsi ritornano content come lista di blocchi
+        # (structured/multimodal) o tipo non-stringa: normalizziamo per
+        # evitare AttributeError su .startswith ("'list' object has no
+        # attribute 'startswith'", osservato su finish_reason malformati).
+        if isinstance(content, list):
+            content = " ".join(
+                str(b.get("text", "")) if isinstance(b, dict) else str(b)
+                for b in content
+            )
+        else:
+            content = str(content)
+    error_meta = result.metadata.get("error")
+    error_class = ""
+    if content.startswith("[Error:") or error_meta:
+        raw = error_meta or content[len("[Error:"):].rstrip("]").strip()
+        logger.error("Provider %s/%s error: %s", provider, model, raw)
+        error_class, human = _classify_provider_error(Exception(raw))
+        content = human
+        error_meta = human
+    return content, error_meta, error_class
+
+
 class NeuralCoreServicer(pb2_grpc.NeuralCoreServiceServicer):
     def EmbedText(self, request, context):
         vector = embeddings.embed_text(request.model, request.text)
@@ -145,27 +177,10 @@ class NeuralCoreServicer(pb2_grpc.NeuralCoreServiceServicer):
     def GenerateCompletion(self, request, context):
         try:
             result = providers.generate_completion(request.provider, request.model, request.prompt)
-            content = result.content or ""
-            if not isinstance(content, str):
-                # Alcuni provider/percorsi ritornano content come lista di blocchi
-                # (structured/multimodal) o tipo non-stringa: normalizziamo per
-                # evitare AttributeError su .startswith ("'list' object has no
-                # attribute 'startswith'", osservato su finish_reason malformati).
-                if isinstance(content, list):
-                    content = " ".join(
-                        str(b.get("text", "")) if isinstance(b, dict) else str(b)
-                        for b in content
-                    )
-                else:
-                    content = str(content)
-            error_meta = result.metadata.get("error")
-            error_class = ""
-            if content.startswith("[Error:") or error_meta:
-                raw = error_meta or content[len("[Error:"):].rstrip("]").strip()
-                logger.error("Provider %s/%s error: %s", request.provider, request.model, raw)
-                error_class, human = _classify_provider_error(Exception(raw))
-                content = human
-                error_meta = human
+            # Punto unico in _normalize_provider_result (regola L, S66).
+            content, error_meta, error_class = _normalize_provider_result(
+                result, request.provider, request.model
+            )
             return pb2.JsonResponse(json=json.dumps({
                 "provider": result.provider,
                 "model": result.model,
@@ -229,29 +244,11 @@ class NeuralCoreServicer(pb2_grpc.NeuralCoreServiceServicer):
                 request.provider, request.model, messages, tools, max_tokens,
                 system_text=system_text,
             )
-            # Sanitizza errori grezzi: i provider scrivono "[Error: <raw>]" dentro content;
-            # convertiamoli in messaggio italiano umano. Niente JSON/grpc status nell'UI.
-            content = result.content or ""
-            if not isinstance(content, str):
-                # Alcuni provider/percorsi ritornano content come lista di blocchi
-                # (structured/multimodal) o tipo non-stringa: normalizziamo per
-                # evitare AttributeError su .startswith ("'list' object has no
-                # attribute 'startswith'", osservato su finish_reason malformati).
-                if isinstance(content, list):
-                    content = " ".join(
-                        str(b.get("text", "")) if isinstance(b, dict) else str(b)
-                        for b in content
-                    )
-                else:
-                    content = str(content)
-            error_meta = result.metadata.get("error")
-            error_class = ""
-            if content.startswith("[Error:") or error_meta:
-                raw = error_meta or content[len("[Error:"):].rstrip("]").strip()
-                logger.error("Provider %s/%s error: %s", request.provider, request.model, raw)
-                error_class, human = _classify_provider_error(Exception(raw))
-                content = human
-                error_meta = human
+            # Sanitizza errori grezzi e normalizza il content list/non-str.
+            # Punto unico in _normalize_provider_result (regola L, S66).
+            content, error_meta, error_class = _normalize_provider_result(
+                result, request.provider, request.model
+            )
             return pb2.JsonResponse(json=json.dumps({
                 "provider": result.provider,
                 "model": result.model,
