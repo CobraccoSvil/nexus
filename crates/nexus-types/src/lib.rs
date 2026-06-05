@@ -70,6 +70,35 @@ pub async fn ensure_project_access(
     }
 }
 
+/// Imposta `projects_base_root` alla cartella `projects/` sotto la working
+/// directory del processo, ma solo se la setting e' ancora vuota. Punto unico
+/// (regola L / ADR 0026): prima questa logica era duplicata in
+/// `mcp-core` e `admin-service`. I default statici delle altre settings stanno
+/// nella migrazione `0325_seed_default_settings.sql` (regola G/H).
+pub async fn ensure_projects_base_root(db: &PgPool) {
+    let default_root = std::env::current_dir()
+        .map(|cwd| cwd.join("projects"))
+        .ok()
+        .and_then(|path| {
+            if std::fs::create_dir_all(&path).is_ok() {
+                path.canonicalize().ok()
+            } else {
+                None
+            }
+        })
+        .map(|path| path.to_string_lossy().to_string());
+
+    if let Some(root_value) = default_root {
+        let _ = sqlx::query(
+            "UPDATE settings SET value = $1, updated_at = NOW() \
+             WHERE key = 'projects_base_root' AND (value IS NULL OR btrim(value) = '')",
+        )
+        .bind(root_value)
+        .execute(db)
+        .await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse_user_id, Claims};

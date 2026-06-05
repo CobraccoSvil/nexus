@@ -60,6 +60,9 @@ assert_single "get_setting" 'fn get_setting[^_a-zA-Z]' 'crates/nexus-auth/src/li
 assert_single "classify_capabilities" 'fn classify_capabilities' 'crates/mcp-core/src/model_catalog_sync.rs' crates
 assert_single "infer_capabilities_from_name" 'fn infer_capabilities_from_name' 'crates/mcp-core/src/model_catalog_sync.rs' crates
 
+# Wave 5 (registry default: statici nella migrazione 0325; parte dinamica unica):
+assert_single "ensure_projects_base_root" 'fn ensure_projects_base_root' 'crates/nexus-types/src/lib.rs' crates
+
 # Wave 6a:
 # assert_single "psycopg2.connect" 'psycopg2\.connect\(' 'brain/utils/db_pool.py' brain
 

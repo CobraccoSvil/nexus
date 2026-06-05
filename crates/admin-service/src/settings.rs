@@ -107,32 +107,10 @@ fn validate_directory_name(name: &str) -> Result<&str, ApiError> {
 }
 
 async fn ensure_required_settings(state: &AppState) {
-    let _ = sqlx::query(
-        r#"INSERT INTO settings (key, value, category, description, is_secret, updated_at)
-        VALUES ('projects_base_root', '', 'infrastructure', 'Root assoluta progetti', FALSE, NOW())
-        ON CONFLICT (key) DO NOTHING"#,
-    ).execute(&state.db).await;
-
-    let _ = sqlx::query(
-        r#"INSERT INTO settings (key, value, category, description, is_secret, updated_at)
-        VALUES ('agent_parallel_enabled', 'false', 'agent', 'Abilita esecuzione parallela agenti', FALSE, NOW()),
-               ('agent_parallel_max', '3', 'agent', 'Max agenti paralleli per sessione', FALSE, NOW())
-        ON CONFLICT (key) DO NOTHING"#,
-    ).execute(&state.db).await;
-
-    let default_root = std::env::current_dir()
-        .map(|cwd| cwd.join("projects"))
-        .ok()
-        .and_then(|path| {
-            if std::fs::create_dir_all(&path).is_ok() { path.canonicalize().ok() } else { None }
-        })
-        .map(|path| path.to_string_lossy().to_string());
-
-    if let Some(root_value) = default_root {
-        let _ = sqlx::query(
-            "UPDATE settings SET value = $1, updated_at = NOW() WHERE key = 'projects_base_root' AND (value IS NULL OR btrim(value) = '')",
-        ).bind(root_value).execute(&state.db).await;
-    }
+    // Default statici: migrazione 0325 (regola G/H). Parte dinamica
+    // (projects_base_root): punto unico in nexus-types (prima duplicata qui e
+    // in mcp-core).
+    nexus_types::ensure_projects_base_root(&state.db).await;
 }
 
 pub async fn browse_directories(Query(query): Query<FsBrowseQuery>) -> ApiResult {
