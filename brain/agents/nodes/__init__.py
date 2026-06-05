@@ -805,6 +805,23 @@ async def router_node(state: AgentState) -> dict[str, Any]:
             intent, token_budget, behavior_mode,
         )
 
+    # ── Chat diretta: per gli intent CONVERSAZIONALI azzeriamo i tool ───────
+    # Una richiesta "chat" non e' agentica: non deve passare per l'executor con
+    # tool (iterazioni, cascade soft-failure, loop di ricerca-tool). Il subset
+    # intent riduce i tool ma gli _ALWAYS_ON_TOOLS (write_file, run_command,
+    # nexus_mcp_tool_search, ...) li bypassano, lasciando tools_json non vuoto ->
+    # l'executor sceglie il ramo agentico. Azzerando tools_json per gli intent
+    # conversazionali l'executor sceglie invece la completion single-shot (gate
+    # `elif tools_json`): risposta diretta e veloce, niente tool ne' escalation.
+    # Se una richiesta servisse davvero un tool verrebbe classificata con un
+    # altro intent (code_read/fix/...), non "chat".
+    if intent in ("chat", "general_chat"):
+        updates["tools_json"] = []
+        logger.info(
+            "router_node: intent=%s conversazionale -> chat diretta (tools_json azzerato)",
+            intent,
+        )
+
     # ── Meta-step `routing` per pubblicazione in chat ───────────────────────
     # Emesso solo se la classificazione e' significativa (no chat banale a 0
     # confidence senza profilo) e se il flag `meta_steps.routing_enabled`

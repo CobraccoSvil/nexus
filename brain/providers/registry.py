@@ -1008,6 +1008,7 @@ class ProviderRegistry:
                 if is_soft_failure(
                     res.metadata, res.content, _cap,
                     first_turn=is_first_agent_turn(messages),
+                    intent=usage_intent,
                 ):
                     logger.warning(
                         "Soft-failure %s/%s: chiusura naturale senza tool e contenuto "

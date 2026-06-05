@@ -116,6 +116,7 @@ def is_soft_failure(
     cap: ProviderCapability,
     iteration: int | None = None,
     first_turn: bool = True,
+    intent: str | None = None,
 ) -> bool:
     """True se il turno e un fallimento soft: chiusura naturale (end_turn/stop)
     SENZA tool-call e con contenuto sotto soglia, MENTRE il modello non ha ancora
@@ -131,6 +132,13 @@ def is_soft_failure(
     (cap.soft_failure_iter_threshold).
     """
     meta = metadata or {}
+    # Intent CONVERSAZIONALE: una chiusura naturale con sola risposta testuale e'
+    # la risposta corretta, non un "modello che molla senza usare i tool". Non e'
+    # soft-failure -> niente cascade/escalation (ne' "narrazione a vuoto"). Rete
+    # di sicurezza per gli intent conversazionali che dovessero comunque arrivare
+    # qui (per la chat pura i tool sono gia' azzerati a monte nel router_node).
+    if (intent or "").strip().lower() in ("chat", "general_chat"):
+        return False
     stop = meta.get("stop_reason")
     if stop not in _NATURAL_STOPS:
         return False
