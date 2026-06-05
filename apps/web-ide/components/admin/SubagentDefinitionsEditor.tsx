@@ -8,6 +8,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { useGlobalDialog } from "../global-dialog-provider";
 import {
   listSubagentDefinitions,
   upsertSubagentDefinition,
@@ -45,6 +46,7 @@ function emptyEdit(): EditState {
 
 export function SubagentDefinitionsEditor() {
   const tc = useThemeColors();
+  const { confirmDialog } = useGlobalDialog();
   const [defs, setDefs] = useState<SubagentDefinition[]>([]);
   const [editing, setEditing] = useState<EditState | null>(null);
   const [recentRuns, setRecentRuns] = useState<Record<string, OrchestratorSubagentRun[]>>({});
@@ -122,7 +124,14 @@ export function SubagentDefinitionsEditor() {
   };
 
   const handleDelete = async (kind: string) => {
-    if (!confirm(`Disabilitare il sub-agent kind '${kind}'?`)) return;
+    const ok = await confirmDialog({
+      title: "Disabilita sub-agent",
+      message: `Disabilitare il sub-agent kind '${kind}'?`,
+      danger: true,
+      confirmLabel: "Disabilita",
+      cancelLabel: "Annulla",
+    });
+    if (!ok) return;
     try {
       await deleteSubagentDefinition(kind);
       await reload();

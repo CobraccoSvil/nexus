@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useThemeColors } from "../../../lib/theme";
+import { useGlobalDialog } from "../../../components/global-dialog-provider";
 import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
 import {
   adminListProfiles,
@@ -189,6 +190,7 @@ function ProfileCard({
 }) {
   const tc = useThemeColors();
   const { input, btn } = useStyles(tc);
+  const { confirmDialog } = useGlobalDialog();
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -222,7 +224,14 @@ function ProfileCard({
   };
 
   const handleDelete = async () => {
-    if (!confirm(`Eliminare il profilo "${profile.name}"? Le copie utente rimarranno.`)) return;
+    const ok = await confirmDialog({
+      title: "Elimina profilo",
+      message: `Eliminare il profilo "${profile.name}"?\n\nLe copie utente rimarranno.`,
+      danger: true,
+      confirmLabel: "Elimina",
+      cancelLabel: "Annulla",
+    });
+    if (!ok) return;
     setDeleting(true);
     try { await onDelete(profile.id); } finally { setDeleting(false); }
   };

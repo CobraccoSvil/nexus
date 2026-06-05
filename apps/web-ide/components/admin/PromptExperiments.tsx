@@ -11,6 +11,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { useGlobalDialog } from "../global-dialog-provider";
 import {
   listPromptExperiments,
   getPromptExperiment,
@@ -54,6 +55,8 @@ function DeltaBadge({ baseline, variant }: { baseline?: number; variant?: number
 
 export default function PromptExperiments() {
   const tc = useThemeColors();
+  // Dialog di Nexus (no window.confirm/alert nativi).
+  const { confirmDialog, alertDialog } = useGlobalDialog();
   const [experiments, setExperiments] = useState<PromptExperiment[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -102,7 +105,14 @@ export default function PromptExperiments() {
 
   const handleAction = async (id: string, action: "promote" | "discard") => {
     const label = action === "promote" ? "promuovere" : "scartare";
-    if (!confirm(`Confermi di voler ${label} questo esperimento?`)) return;
+    const ok = await confirmDialog({
+      title: action === "promote" ? "Promuovi esperimento" : "Scarta esperimento",
+      message: `Confermi di voler ${label} questo esperimento?`,
+      danger: action === "discard",
+      confirmLabel: action === "promote" ? "Promuovi" : "Scarta",
+      cancelLabel: "Annulla",
+    });
+    if (!ok) return;
     setActionLoading(id + action);
     try {
       if (action === "promote") {
@@ -116,7 +126,10 @@ export default function PromptExperiments() {
         setExpandedData(null);
       }
     } catch (e) {
-      alert(`Errore: ${e instanceof Error ? e.message : String(e)}`);
+      await alertDialog(
+        e instanceof Error ? e.message : String(e),
+        action === "promote" ? "Promozione fallita" : "Scarto fallito",
+      );
     } finally {
       setActionLoading(null);
     }

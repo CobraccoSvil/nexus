@@ -1,6 +1,7 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { useGlobalDialog } from "../global-dialog-provider";
 import type { UserProjectDetails } from "../../lib/api-client";
 import { isBinaryDocPath } from "../../lib/file-kind";
 
@@ -118,6 +119,9 @@ const GENERATE_PROMPTS: Record<string, string> = Object.fromEntries(
 
 export function DocumentsSidebar({ project, onSendToChat, onOpenInEditor }: DocumentsSidebarProps) {
   const tc = useThemeColors();
+  // Dialog di Nexus (no window.confirm/alert nativi del browser: rompono
+  // il look&feel e in alcuni embed/webview vengono soppressi).
+  const { confirmDialog, alertDialog } = useGlobalDialog();
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -184,18 +188,25 @@ export function DocumentsSidebar({ project, onSendToChat, onOpenInEditor }: Docu
       a.click();
       URL.revokeObjectURL(url);
     } catch {
-      alert("Errore durante il download");
+      await alertDialog("Errore durante il download", "Download fallito");
     }
   };
 
   const handleDelete = async (doc: DocumentItem) => {
     if (!project?.id) return;
-    if (!confirm(`Eliminare "${doc.title}" v${doc.version}?`)) return;
+    const ok = await confirmDialog({
+      title: "Elimina documento",
+      message: `Eliminare "${doc.title}" v${doc.version}?\n\nL'operazione non e' reversibile.`,
+      danger: true,
+      confirmLabel: "Elimina",
+      cancelLabel: "Annulla",
+    });
+    if (!ok) return;
     try {
       await fetch(`/api/projects/${project.id}/documents/${doc.id}`, { method: "DELETE" });
       fetchDocuments();
     } catch {
-      alert("Errore durante l'eliminazione");
+      await alertDialog("Errore durante l'eliminazione", "Eliminazione fallita");
     }
   };
 

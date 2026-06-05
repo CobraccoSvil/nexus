@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { CreateProfilePayload, UpdateProfilePayload, UserProfile } from "../../lib/api-client";
 import { generateSystemPrompt } from "../../lib/api-client";
 import { useThemeColors } from "../../lib/theme";
+import { useGlobalDialog } from "../global-dialog-provider";
 import { PROVIDER_MODELS } from "../../lib/model-catalog";
 
 interface ProfileEditorProps {
@@ -45,6 +46,7 @@ export function ProfileEditor({
   onClose,
 }: ProfileEditorProps) {
   const tc = useThemeColors();
+  const { confirmDialog } = useGlobalDialog();
   const isEdit = Boolean(profile);
 
   const [name, setName] = useState(profile?.name ?? "");
@@ -107,7 +109,15 @@ export function ProfileEditor({
   };
 
   const handleDelete = async () => {
-    if (!onDelete || !confirm("Eliminare il profilo?")) return;
+    if (!onDelete) return;
+    const ok = await confirmDialog({
+      title: "Elimina profilo",
+      message: "Eliminare il profilo?",
+      danger: true,
+      confirmLabel: "Elimina",
+      cancelLabel: "Annulla",
+    });
+    if (!ok) return;
     setIsDeleting(true);
     try {
       await onDelete();
