@@ -2358,6 +2358,33 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     if _executor_thinking and _thinking_on:
         _thinking_payload["nexus_thinking"] = list(_executor_thinking)
 
+    # ── Scelte di proseguimento (meta_step next_actions) ──────────────────────
+    # SOLO a turno realmente concluso (end_turn senza tool pendenti): la risposta
+    # assistant e' completa e visibile all'utente. Approccio ibrido (punto unico
+    # in brain/agents/next_actions.py): (1) blocco <suggested_actions> emesso
+    # dall'agente -> parse + rimozione dal testo visibile; (2) fallback LLM
+    # leggero (purpose 'choices_extractor') se la risposta sembra proporre scelte.
+    # Best-effort: qualunque errore non deve rompere il turno ne' lo streaming.
+    _next_actions_payload: dict[str, Any] = {}
+    if stop_reason == "end_turn" and not pending_tool_uses and result_text:
+        try:
+            from .. import next_actions as _next_actions
+            _cleaned_text, _na_step = await _next_actions.derive(result_text, _providers)
+            # Allinea testo visibile (result + AIMessage) al testo ripulito dal
+            # blocco grezzo: il generator SSE emette `result` come assistant_delta,
+            # quindi qui e' l'unico punto in cui togliere il blocco prima dell'UI.
+            if _cleaned_text != result_text:
+                result_text = _cleaned_text
+                assistant_msg = AIMessage(
+                    content=_cleaned_text,
+                    additional_kwargs=getattr(assistant_msg, "additional_kwargs", {}) or {},
+                )
+            if _na_step is not None:
+                _next_actions_payload["meta_steps"] = [_na_step]
+                meta_steps.persist_async(state.get("thread_id"), _na_step)
+        except Exception as _na_exc:
+            logger.debug("executor_node: next_actions derive fallita: %s", _na_exc)
+
     return {
         "messages": [assistant_msg],
         "result": result_text,
@@ -2408,6 +2435,7 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         "g1_reroute_count": _g1_reroute_count,
         **sticky_out,
         **_thinking_payload,
+        **_next_actions_payload,
     }
 
 

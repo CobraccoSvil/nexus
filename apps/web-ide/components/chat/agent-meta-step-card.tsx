@@ -16,7 +16,7 @@ import { ProviderBadge } from "./provider-badge";
  * Tutti collassati di default tranne `clarify` (richiede risposta utente).
  */
 
-type MetaStepKind = "plan" | "routing" | "clarify" | "fallback" | "reflection" | string;
+type MetaStepKind = "plan" | "routing" | "clarify" | "fallback" | "reflection" | "next_actions" | string;
 
 export interface AgentMetaStepData {
   kind: MetaStepKind;
@@ -69,6 +69,16 @@ const KIND_MAP: Record<string, KindDescriptor> = {
     tone: "text-purple-700 dark:text-purple-300",
     bg: "bg-purple-50 dark:bg-purple-950/40 border-purple-200 dark:border-purple-800",
     defaultOpen: false,
+  },
+  // Scelte proposte dall'agente per proseguire: ogni voce diventa un pulsante
+  // a tutta larghezza che, al click, invia subito in chat il prompt gia' pronto
+  // (auto-send). defaultOpen true: deve essere visibile subito per invogliare il click.
+  next_actions: {
+    icon: "→",
+    label: "Prossimi passi",
+    tone: "text-blue-700 dark:text-blue-300",
+    bg: "bg-blue-50 dark:bg-blue-950/40 border-blue-200 dark:border-blue-800",
+    defaultOpen: true,
   },
   // Live UX: ogni tool eseguito dall'executor emette questo meta_step
   // (vedi brain/agents/nodes.py tool_dispatch_node). Card compatta, collassata:
@@ -126,7 +136,38 @@ function PlanChecklist({ todos }: { todos: PlanTodo[] }) {
   );
 }
 
-function renderPayload(kind: string, payload: Record<string, unknown>) {
+// Scelta proposta dall'agente: testo breve del pulsante + prompt completo da inviare.
+type NextActionChoice = { label?: string; prompt?: string };
+
+function renderPayload(
+  kind: string,
+  payload: Record<string, unknown>,
+  onChoice: (prompt: string) => void,
+) {
+  if (kind === "next_actions") {
+    const choices = (payload.choices ?? []) as NextActionChoice[];
+    if (!choices.length) return <em className="text-xs opacity-70">Nessuna scelta</em>;
+    return (
+      <div className="flex flex-col gap-1.5">
+        {choices.map((c, i) => {
+          const label = c.label ?? "—";
+          const prompt = c.prompt ?? "";
+          return (
+            <button
+              key={i}
+              type="button"
+              title={prompt}
+              disabled={!prompt}
+              onClick={() => prompt && onChoice(prompt)}
+              className="w-full text-left text-xs px-2 py-1.5 rounded border border-blue-300 dark:border-blue-700 bg-white/70 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200 hover:bg-blue-100 dark:hover:bg-blue-800/50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              {label}
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
   if (kind === "plan") {
     const todos = (payload.todos ?? []) as PlanTodo[];
     return <PlanChecklist todos={todos} />;
@@ -188,9 +229,29 @@ function renderPayload(kind: string, payload: Record<string, unknown>) {
   );
 }
 
-export function AgentMetaStepCard({ data }: { data: AgentMetaStepData }) {
+export function AgentMetaStepCard({
+  data,
+  onChoice,
+}: {
+  data: AgentMetaStepData;
+  /** Chiamata al click su una scelta `next_actions`. Se assente, fallback al
+   *  bridge globale `nexus:chat:send` (stesso meccanismo di "Risolvi con Nexus"). */
+  onChoice?: (prompt: string) => void;
+}) {
   const desc = KIND_MAP[data.kind] ?? DEFAULT_DESC;
   const [open, setOpen] = useState(desc.defaultOpen);
+
+  // Invio della scelta: prop esplicita se fornita, altrimenti CustomEvent globale
+  // ascoltato da ide-shell (imposta pendingChatMessage + pendingAutoSend).
+  const handleChoice = (prompt: string) => {
+    if (onChoice) {
+      onChoice(prompt);
+      return;
+    }
+    window.dispatchEvent(
+      new CustomEvent("nexus:chat:send", { detail: { content: prompt, autoSend: true } }),
+    );
+  };
 
   // I meta_step tool arrivano col title gia' prefissato "tool <nome>": col label
   // "Tool" del descrittore diventerebbe "Tool tool <nome>" ("Tooltool"). Rimuovo
@@ -240,7 +301,7 @@ export function AgentMetaStepCard({ data }: { data: AgentMetaStepData }) {
       </button>
       {open && (
         <div className="px-3 pb-2">
-          {renderPayload(data.kind, data.payload)}
+          {renderPayload(data.kind, data.payload, handleChoice)}
         </div>
       )}
     </div>
