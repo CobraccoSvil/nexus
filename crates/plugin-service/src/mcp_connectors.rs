@@ -32,7 +32,10 @@ use nexus_types::{api_error, parse_user_id, ApiResult};
 pub use nexus_mcp_client::server_storage::{
     CreateMcpServerRequest, ToggleRequest, UpdateMcpServerRequest,
 };
-use nexus_mcp_client::server_storage::{can_manage_server, row_to_json};
+use nexus_mcp_client::server_storage::{
+    apply_update_and_fetch, build_config, can_manage_server, delete_mcp_server as ss_delete,
+    fetch_owner_scope, insert_mcp_server, row_to_json, set_enabled,
+};
 
 use crate::mcp_client::{self, McpServerConfig, McpTransport};
 use crate::AppState;
@@ -62,68 +65,8 @@ pub struct ExecuteMcpToolRequest {
     pub arguments: Value,
 }
 
-fn build_config(
-    id: &Uuid,
-    name: &str,
-    transport: &str,
-    row: &sqlx::postgres::PgRow,
-) -> McpServerConfig {
-    if transport == "builtin" {
-        return McpServerConfig {
-            id: id.to_string(),
-            name: name.to_string(),
-            transport: McpTransport::Builtin,
-            enabled: true,
-        };
-    }
-
-    let url: Option<String> = row.try_get("url").unwrap_or(None);
-    let command: Option<String> = row.try_get("command").unwrap_or(None);
-    let args: Value = row.try_get::<Value, _>("args").unwrap_or(json!([]));
-    let env_vars: Value = row.try_get::<Value, _>("env_vars").unwrap_or(json!({}));
-    let headers: Value = row.try_get::<Value, _>("headers").unwrap_or(json!({}));
-
-    let mcp_transport = if transport == "stdio" {
-        McpTransport::Stdio {
-            command: command.unwrap_or_default(),
-            args: args
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            env_vars: env_vars
-                .as_object()
-                .map(|o| {
-                    o.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        }
-    } else {
-        McpTransport::Http {
-            url: url.unwrap_or_default(),
-            headers: headers
-                .as_object()
-                .map(|o| {
-                    o.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        }
-    };
-
-    McpServerConfig {
-        id: id.to_string(),
-        name: name.to_string(),
-        transport: mcp_transport,
-        enabled: true,
-    }
-}
+// build_config: punto unico in nexus_mcp_client::server_storage (regola L /
+// ADR 0026). Prima duplicato qui e in mcp-core.
 
 fn parse_json_string_set(raw: &Value) -> HashSet<String> {
     raw.as_array()
@@ -264,39 +207,10 @@ pub async fn create_mcp_server(
         ));
     }
 
-    let scope = body.scope.as_deref().unwrap_or("user");
-    let project_id: Option<Uuid> = body
-        .project_id
-        .as_deref()
-        .and_then(|s| Uuid::parse_str(s).ok());
-
-    let args_json = json!(body.args.unwrap_or_default());
-    let env_json = json!(body.env_vars.unwrap_or_default());
-    let headers_json = json!(body.headers.unwrap_or_default());
-
-    let row = sqlx::query(
-        "INSERT INTO mcp_servers
-            (user_id, project_id, name, description, icon_url, transport, url, command,
-             args, env_vars, headers, enabled, scope)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true,$12)
-         RETURNING id, plugin_instance_id, name, description, icon_url, transport, url, command, args,
-                   env_vars, headers, enabled, scope, created_at",
-    )
-    .bind(user_id)
-    .bind(project_id)
-    .bind(&body.name)
-    .bind(&body.description)
-    .bind(&body.icon_url)
-    .bind(&body.transport)
-    .bind(&body.url)
-    .bind(&body.command)
-    .bind(&args_json)
-    .bind(&env_json)
-    .bind(&headers_json)
-    .bind(scope)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Punto unico SQL in nexus_mcp_client::server_storage (regola L).
+    let row = insert_mcp_server(&state.db, user_id, &body)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(row_to_json(&row, true)))
 }
@@ -312,12 +226,10 @@ pub async fn update_mcp_server(
     let server_id = Uuid::parse_str(&server_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Server id non valido"))?;
 
-    let existing = sqlx::query("SELECT id, user_id, scope FROM mcp_servers WHERE id=$1")
-        .bind(server_id)
-        .fetch_optional(&state.db)
+    // Punto unico SQL in nexus_mcp_client::server_storage (regola L).
+    let existing = fetch_owner_scope(&state.db, server_id)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
     let Some(existing) = existing else {
         return Err(api_error(StatusCode::NOT_FOUND, "Server non trovato"));
     };
@@ -325,83 +237,9 @@ pub async fn update_mcp_server(
         return Err(api_error(StatusCode::NOT_FOUND, "Server non modificabile"));
     }
 
-    if let Some(name) = &body.name {
-        sqlx::query("UPDATE mcp_servers SET name=$2, updated_at=NOW() WHERE id=$1")
-            .bind(server_id)
-            .bind(name)
-            .execute(&state.db)
-            .await
-            .ok();
-    }
-    if let Some(desc) = &body.description {
-        sqlx::query("UPDATE mcp_servers SET description=$2, updated_at=NOW() WHERE id=$1")
-            .bind(server_id)
-            .bind(desc)
-            .execute(&state.db)
-            .await
-            .ok();
-    }
-    if let Some(url) = &body.url {
-        sqlx::query("UPDATE mcp_servers SET url=$2, updated_at=NOW() WHERE id=$1")
-            .bind(server_id)
-            .bind(url)
-            .execute(&state.db)
-            .await
-            .ok();
-    }
-    if let Some(cmd) = &body.command {
-        sqlx::query("UPDATE mcp_servers SET command=$2, updated_at=NOW() WHERE id=$1")
-            .bind(server_id)
-            .bind(cmd)
-            .execute(&state.db)
-            .await
-            .ok();
-    }
-    if let Some(args) = &body.args {
-        let v = json!(args);
-        sqlx::query("UPDATE mcp_servers SET args=$2, updated_at=NOW() WHERE id=$1")
-            .bind(server_id)
-            .bind(v)
-            .execute(&state.db)
-            .await
-            .ok();
-    }
-    if let Some(env) = &body.env_vars {
-        let v = json!(env);
-        sqlx::query("UPDATE mcp_servers SET env_vars=$2, updated_at=NOW() WHERE id=$1")
-            .bind(server_id)
-            .bind(v)
-            .execute(&state.db)
-            .await
-            .ok();
-    }
-    if let Some(headers) = &body.headers {
-        let v = json!(headers);
-        sqlx::query("UPDATE mcp_servers SET headers=$2, updated_at=NOW() WHERE id=$1")
-            .bind(server_id)
-            .bind(v)
-            .execute(&state.db)
-            .await
-            .ok();
-    }
-    if let Some(enabled) = body.enabled {
-        sqlx::query("UPDATE mcp_servers SET enabled=$2, updated_at=NOW() WHERE id=$1")
-            .bind(server_id)
-            .bind(enabled)
-            .execute(&state.db)
-            .await
-            .ok();
-    }
-
-    let row = sqlx::query(
-        "SELECT id, plugin_instance_id, name, description, icon_url, transport, url, command, args,
-                env_vars, headers, enabled, scope, user_id, created_at
-         FROM mcp_servers WHERE id=$1",
-    )
-    .bind(server_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let row = apply_update_and_fetch(&state.db, server_id, &body)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(row_to_json(&row, true)))
 }
@@ -416,12 +254,9 @@ pub async fn delete_mcp_server(
     let server_id = Uuid::parse_str(&server_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Server id non valido"))?;
 
-    let existing = sqlx::query("SELECT id, user_id, scope FROM mcp_servers WHERE id=$1")
-        .bind(server_id)
-        .fetch_optional(&state.db)
+    let existing = fetch_owner_scope(&state.db, server_id)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
     let Some(existing) = existing else {
         return Err(api_error(StatusCode::NOT_FOUND, "Server non trovato"));
     };
@@ -429,9 +264,7 @@ pub async fn delete_mcp_server(
         return Err(api_error(StatusCode::NOT_FOUND, "Server non modificabile"));
     }
 
-    sqlx::query("DELETE FROM mcp_servers WHERE id=$1")
-        .bind(server_id)
-        .execute(&state.db)
+    ss_delete(&state.db, server_id)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -452,12 +285,10 @@ pub async fn toggle_mcp_server(
     let server_id = Uuid::parse_str(&server_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Server id non valido"))?;
 
-    let existing = sqlx::query("SELECT id, user_id, scope FROM mcp_servers WHERE id=$1")
-        .bind(server_id)
-        .fetch_optional(&state.db)
+    // Punto unico SQL in nexus_mcp_client::server_storage (regola L).
+    let existing = fetch_owner_scope(&state.db, server_id)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
     let Some(existing) = existing else {
         return Err(api_error(StatusCode::NOT_FOUND, "Server non trovato"));
     };
@@ -465,21 +296,9 @@ pub async fn toggle_mcp_server(
         return Err(api_error(StatusCode::NOT_FOUND, "Server non modificabile"));
     }
 
-    let result = sqlx::query(
-        "UPDATE mcp_servers SET enabled = $2, updated_at = NOW() WHERE id = $1",
-    )
-    .bind(server_id)
-    .bind(body.enabled)
-    .execute(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if result.rows_affected() == 0 {
-        return Err(api_error(
-            StatusCode::NOT_FOUND,
-            "Server non trovato o non modificabile",
-        ));
-    }
+    set_enabled(&state.db, server_id, body.enabled)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Il set di tool disponibili per i prompt cambia (server abilitato/disabilitato).
     trigger_prompt_template_tool_reassignment().await;

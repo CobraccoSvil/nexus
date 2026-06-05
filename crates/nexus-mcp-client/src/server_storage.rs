@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::Row;
+use sqlx::{postgres::PgRow, PgPool, Row};
 use uuid::Uuid;
 
 use crate::{McpServerConfig, McpTransport};
@@ -101,6 +101,11 @@ pub fn can_manage_server(row: &sqlx::postgres::PgRow, user_id: Uuid, role: &str)
 
 /// Costruisce un `McpServerConfig` da una row Postgres. Riconosce il transport
 /// speciale "builtin" (in-process), oltre a "http" e "stdio".
+///
+/// Parsing tollerante per args/env_vars/headers: i valori non-stringa nel JSON
+/// vengono silently skippati invece di far fallire l'intero campo (sopravvive
+/// a row malformate). `enabled` e' hardcoded a `true` perche' i row che arrivano
+/// qui sono gia' filtrati a livello SQL (es. `WHERE enabled = TRUE`).
 pub fn build_config(
     id: &Uuid,
     name: &str,
@@ -126,13 +131,34 @@ pub fn build_config(
     let mcp_transport = if transport == "stdio" {
         McpTransport::Stdio {
             command: command.unwrap_or_default(),
-            args: serde_json::from_value(args_val).unwrap_or_default(),
-            env_vars: serde_json::from_value(env_vars_val).unwrap_or_default(),
+            args: args_val
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            env_vars: env_vars_val
+                .as_object()
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     } else {
         McpTransport::Http {
             url: url.unwrap_or_default(),
-            headers: serde_json::from_value(headers_val).unwrap_or_default(),
+            headers: headers_val
+                .as_object()
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     };
 
@@ -140,6 +166,172 @@ pub fn build_config(
         id: id.to_string(),
         name: name.to_string(),
         transport: mcp_transport,
-        enabled: row.try_get("enabled").unwrap_or(true),
+        enabled: true,
     }
+}
+
+// -- Query SQL CRUD (punto unico, regola L / ADR 0026, Wave C5) --
+// Prima questi blocchi INSERT/UPDATE/SELECT/DELETE erano duplicati identici
+// in crates/mcp-core/src/mcp_connectors.rs e crates/plugin-service/src/mcp_connectors.rs
+// (cluster top del jscpd report: 111L + 96L). Gli handler axum nei due crate
+// restano locali ma delegano tutta la parte SQL qui.
+
+/// SELECT id, user_id, scope FROM mcp_servers WHERE id=$1
+/// Usato dagli handler update/delete/toggle per verificare proprieta'.
+pub async fn fetch_owner_scope(
+    db: &PgPool,
+    server_id: Uuid,
+) -> Result<Option<PgRow>, sqlx::Error> {
+    sqlx::query("SELECT id, user_id, scope FROM mcp_servers WHERE id=$1")
+        .bind(server_id)
+        .fetch_optional(db)
+        .await
+}
+
+/// INSERT INTO mcp_servers (...) VALUES (...) RETURNING * (subset)
+/// Crea un nuovo server e ritorna la row appena inserita.
+pub async fn insert_mcp_server(
+    db: &PgPool,
+    user_id: Uuid,
+    body: &CreateMcpServerRequest,
+) -> Result<PgRow, sqlx::Error> {
+    let scope = body.scope.as_deref().unwrap_or("user");
+    let project_id: Option<Uuid> = body
+        .project_id
+        .as_deref()
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let args_json = json!(body.args.clone().unwrap_or_default());
+    let env_json = json!(body.env_vars.clone().unwrap_or_default());
+    let headers_json = json!(body.headers.clone().unwrap_or_default());
+
+    sqlx::query(
+        "INSERT INTO mcp_servers
+            (user_id, project_id, name, description, icon_url, transport, url, command,
+             args, env_vars, headers, enabled, scope)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true,$12)
+         RETURNING id, plugin_instance_id, name, description, icon_url, transport, url, command, args,
+                   env_vars, headers, enabled, scope, created_at",
+    )
+    .bind(user_id)
+    .bind(project_id)
+    .bind(&body.name)
+    .bind(&body.description)
+    .bind(&body.icon_url)
+    .bind(&body.transport)
+    .bind(&body.url)
+    .bind(&body.command)
+    .bind(&args_json)
+    .bind(&env_json)
+    .bind(&headers_json)
+    .bind(scope)
+    .fetch_one(db)
+    .await
+}
+
+/// Applica gli UPDATE incrementali per ogni campo opzionale di
+/// `UpdateMcpServerRequest`, poi ricarica e ritorna la row aggiornata.
+pub async fn apply_update_and_fetch(
+    db: &PgPool,
+    server_id: Uuid,
+    body: &UpdateMcpServerRequest,
+) -> Result<PgRow, sqlx::Error> {
+    if let Some(name) = &body.name {
+        sqlx::query("UPDATE mcp_servers SET name=$2, updated_at=NOW() WHERE id=$1")
+            .bind(server_id)
+            .bind(name)
+            .execute(db)
+            .await
+            .ok();
+    }
+    if let Some(desc) = &body.description {
+        sqlx::query("UPDATE mcp_servers SET description=$2, updated_at=NOW() WHERE id=$1")
+            .bind(server_id)
+            .bind(desc)
+            .execute(db)
+            .await
+            .ok();
+    }
+    if let Some(url) = &body.url {
+        sqlx::query("UPDATE mcp_servers SET url=$2, updated_at=NOW() WHERE id=$1")
+            .bind(server_id)
+            .bind(url)
+            .execute(db)
+            .await
+            .ok();
+    }
+    if let Some(cmd) = &body.command {
+        sqlx::query("UPDATE mcp_servers SET command=$2, updated_at=NOW() WHERE id=$1")
+            .bind(server_id)
+            .bind(cmd)
+            .execute(db)
+            .await
+            .ok();
+    }
+    if let Some(args) = &body.args {
+        let v = json!(args);
+        sqlx::query("UPDATE mcp_servers SET args=$2, updated_at=NOW() WHERE id=$1")
+            .bind(server_id)
+            .bind(v)
+            .execute(db)
+            .await
+            .ok();
+    }
+    if let Some(env) = &body.env_vars {
+        let v = json!(env);
+        sqlx::query("UPDATE mcp_servers SET env_vars=$2, updated_at=NOW() WHERE id=$1")
+            .bind(server_id)
+            .bind(v)
+            .execute(db)
+            .await
+            .ok();
+    }
+    if let Some(headers) = &body.headers {
+        let v = json!(headers);
+        sqlx::query("UPDATE mcp_servers SET headers=$2, updated_at=NOW() WHERE id=$1")
+            .bind(server_id)
+            .bind(v)
+            .execute(db)
+            .await
+            .ok();
+    }
+    if let Some(enabled) = body.enabled {
+        sqlx::query("UPDATE mcp_servers SET enabled=$2, updated_at=NOW() WHERE id=$1")
+            .bind(server_id)
+            .bind(enabled)
+            .execute(db)
+            .await
+            .ok();
+    }
+
+    sqlx::query(
+        "SELECT id, plugin_instance_id, name, description, icon_url, transport, url, command, args,
+                env_vars, headers, enabled, scope, user_id, created_at
+         FROM mcp_servers WHERE id=$1",
+    )
+    .bind(server_id)
+    .fetch_one(db)
+    .await
+}
+
+/// DELETE FROM mcp_servers WHERE id=$1
+pub async fn delete_mcp_server(db: &PgPool, server_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM mcp_servers WHERE id=$1")
+        .bind(server_id)
+        .execute(db)
+        .await
+        .map(|_| ())
+}
+
+/// UPDATE mcp_servers SET enabled=$2 WHERE id=$1
+pub async fn set_enabled(
+    db: &PgPool,
+    server_id: Uuid,
+    enabled: bool,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE mcp_servers SET enabled=$2, updated_at=NOW() WHERE id=$1")
+        .bind(server_id)
+        .bind(enabled)
+        .execute(db)
+        .await
+        .map(|_| ())
 }
