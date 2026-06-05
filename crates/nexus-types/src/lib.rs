@@ -8,6 +8,11 @@ pub use nexus_auth::Claims;
 mod templates;
 pub use templates::{get_template_or_default, TemplateCache};
 
+pub mod fs_browse;
+pub use fs_browse::{
+    list_directories, list_root_candidates, validate_directory_name, BrowseDirectoryNode,
+};
+
 // --- Shared API types ---
 
 pub type ApiError = (StatusCode, Json<Value>);

@@ -46,13 +46,12 @@ pub struct CreateDirectoryRequest {
     pub name: String,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowseDirectoryNode {
-    name: String,
-    path: String,
-    has_children: bool,
-}
+// FS browse: punto unico in nexus_types::fs_browse (regola L / ADR 0026).
+// Prima `BrowseDirectoryNode`, `list_root_candidates`, `list_directories` e
+// `validate_directory_name` erano duplicati con crates/admin-service/src/settings.rs.
+use nexus_types::fs_browse::{
+    list_directories, list_root_candidates, validate_directory_name as validate_dir_name,
+};
 
 type ApiError = (StatusCode, Json<Value>);
 type ApiResult = Result<Json<Value>, ApiError>;
@@ -61,78 +60,8 @@ fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
     (status, Json(json!({ "error": message.into() })))
 }
 
-fn list_root_candidates() -> Vec<PathBuf> {
-    if cfg!(windows) {
-        let mut roots = Vec::new();
-        for letter in 'A'..='Z' {
-            let candidate = PathBuf::from(format!("{letter}:\\"));
-            if candidate.exists() {
-                roots.push(candidate);
-            }
-        }
-        if roots.is_empty() {
-            roots.push(PathBuf::from("C:\\"));
-        }
-        roots
-    } else {
-        vec![PathBuf::from("/")]
-    }
-}
-
-fn list_directories(target: &std::path::Path) -> Vec<BrowseDirectoryNode> {
-    let mut directories = std::fs::read_dir(target)
-        .ok()
-        .into_iter()
-        .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
-        .filter_map(|entry| {
-            let path = entry.path();
-            let metadata = entry.metadata().ok()?;
-            if !metadata.is_dir() {
-                return None;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            let has_children = std::fs::read_dir(&path)
-                .ok()
-                .map(|children| {
-                    children
-                        .filter_map(|child| child.ok())
-                        .any(|child| child.metadata().map(|m| m.is_dir()).unwrap_or(false))
-                })
-                .unwrap_or(false);
-
-            Some(BrowseDirectoryNode {
-                name,
-                path: path.to_string_lossy().to_string(),
-                has_children,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    directories.sort_by(|left, right| left.name.cmp(&right.name));
-    directories
-}
-
 fn validate_directory_name(name: &str) -> Result<&str, ApiError> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Il nome della directory e' obbligatorio",
-        ));
-    }
-    if trimmed == "." || trimmed == ".." {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Il nome della directory non e' valido",
-        ));
-    }
-    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains('\0') {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Il nome della directory non puo' contenere separatori di percorso",
-        ));
-    }
-    Ok(trimmed)
+    validate_dir_name(name).map_err(|msg| api_error(StatusCode::BAD_REQUEST, msg))
 }
 
 fn map_create_dir_error(error: std::io::Error) -> ApiError {
