@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/kucherenko/jscpd/master/packages/jscpd/schema.json",
+  "minLines": 5,
+  "minTokens": 50,
+  "reporters": ["console", "json"],
+  "output": "./.dup-report",
+  "absolute": true,
+  "gitignore": true,
+  "format": ["typescript", "tsx", "javascript", "jsx", "rust", "python"],
+  "path": ["apps", "packages", "crates", "brain"],
+  "ignore": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/.next/**",
+    "**/.turbo/**",
+    "**/target/**",
+    "**/__pycache__/**",
+    "**/*.d.ts",
+    "**/*.backup*",
+    "**/*.gen.*",
+    "**/generated/**",
+    "**/proto/**",
+    "db/migrations/**"
+  ]
+}

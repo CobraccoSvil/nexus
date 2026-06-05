@@ -31,6 +31,18 @@ pre-commit:
       run: bash -lc "cargo check --workspace"
       fail_text: "pre-commit cargo fallito: correggi cargo check."
 
+    # Guard dei punti unici (regola L / ADR 0026): grep istantaneo, blocca nuove
+    # definizioni di un punto unico fuori dal suo modulo. Il gate jscpd "ratchet"
+    # completo gira in CI (verify.yml), non a ogni commit per non rallentarlo.
+    single_source_guard:
+      glob:
+        - "*.rs"
+        - "*.py"
+        - "*.ts"
+        - "*.tsx"
+      run: bash -lc "bash scripts/check-single-source.sh"
+      fail_text: "pre-commit: regressione su un punto unico (regola L / ADR 0026)."
+
 commit-msg:
   commands:
     no-emoji:

@@ -1,0 +1,11 @@
+# clippy.toml — punto di configurazione lint Rust centralizzato (regola L / ADR 0026).
+#
+# La duplicate-detection cross-linguaggio vera e' delegata a jscpd
+# (vedi jscpd.json + scripts/dup-report.sh), perche' clippy non ha un lint di
+# copy-paste in stable. Questo file e' il punto unico dove configurare eventuali
+# soglie/lint Rust in futuro.
+#
+# DELIBERATAMENTE VUOTO di chiavi: non si abbassa alcuna soglia rispetto al
+# default, per non rompere il gate `cargo clippy --workspace --all-targets -- -D
+# warnings` gia' presente in scripts/verify.sh (regola B). Aggiungere chiavi qui
+# solo con una modifica mirata e verificata.

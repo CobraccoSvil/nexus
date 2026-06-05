@@ -59,3 +59,7 @@ tests/nexus-maturity/202[5-9]-*/
 
 # Modelli ML scaricati via scripts/fetch-models.sh (troppo grandi per git)
 models/minilm/
+
+# Report di dettaglio jscpd (artefatto rigenerabile). La baseline
+# .dup-baseline.json INVECE va tracciata: serve al gate ratchet (regola L / ADR 0026).
+.dup-report/

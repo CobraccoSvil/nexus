@@ -249,6 +249,54 @@ significa che il punto unico non esiste ancora. Crearlo (o consolidare l'esisten
 e applicare il requisito una sola volta. Un PR che introduce logica dispersa
 duplicata e' rifiutato come una toppa (regola H).
 
+### Meccanismo di centralizzazione (criterio per-caso)
+
+Il punto unico e' agnostico rispetto al meccanismo, ma la scelta NON e' libera:
+si applica "composition over inheritance". L'ereditarieta' di classi si usa SOLO
+per relazioni "is-a" reali e poco profonde, mai per riusare codice (Rust non ha
+ereditarieta' di classi; in React ereditare componenti e' anti-pattern).
+
+| Natura della logica | Meccanismo corretto | Esempio |
+|---|---|---|
+| Stateless (calcolo puro, IO singolo) | funzione in un modulo | `get_setting`, `parse_user_id`, `extract_json_block` |
+| Stato + comportamento | classe/struct incapsulata + generics | `TtlCache<K,V>` (Rust), `db_pool` (Python) |
+| Varianti polimorfiche su contratto comune | `trait` (Rust) / ABC-Protocol (Python) + composizione | provider su `brain/providers/base.py` |
+| UI | composizione (componenti + custom hooks) | `AdminPageHeader`, `useListData` |
+
+Anti-pattern vietati: incapsulare una funzione stateless in una classe con
+sottoclassi ("regno dei sostantivi"); gerarchie di ereditarieta' profonde per
+condividere codice (fragile base class).
+
+### Punti unici noti (catalogo sintetico, dettaglio in ADR 0026)
+
+| Concern | Modulo/funzione autoritativa |
+|---|---|
+| Gate disponibilita' provider | ADR 0020 |
+| SQL-injection detector | ADR 0021 |
+| Capability modello (vision/tool/thinking) | vista `0318` + `mcp-core/src/capability.rs` (ADR 0024) |
+| Routing/default/purpose model | `routing_matrix.rs` + tabelle mig 0101/0102 (regola G) |
+| Identita' utente/progetto | `crates/nexus-types/src/lib.rs` (`parse_user_id`, ...) |
+| Lettura settings | `nexus-auth::settings` (`get_setting`) |
+| Cache TTL | crate `nexus-cache` (`TtlCache<K,V>`) |
+| Fetch HTTP frontend | `apps/web-ide/lib/api/_shared.ts` (`fetchJson`) |
+
+### Enforcement automatico (la regola e' duratura, non una-tantum)
+
+- `jscpd.json` + `scripts/dup-report.sh`: misura cross-linguaggio (TS/JS/Rust/Python)
+  con gate "ratchet" — il numero di cloni puo' solo SCENDERE rispetto a
+  `.dup-baseline.json`. Si riallinea la baseline al ribasso dopo ogni consolidamento.
+- `scripts/check-single-source.sh`: guard testuale che blocca nuove definizioni di
+  un punto unico fuori dal suo modulo. I check si attivano per wave.
+- `docs/tech-debt-dup.md`: metrica del debito e baseline.
+- Innesto: `lefthook.yml` (pre-commit veloce) + `.github/workflows/verify.yml` (gate completo).
+
+### Trigger imperativo
+
+Se stai per scrivere la 2a query/funzione/componente che risponde alla stessa
+domanda, FERMATI: cerca il punto unico nel catalogo (ADR 0026); se esiste, delega;
+se e' un concern nuovo, crea PRIMA il punto unico col meccanismo corretto, poi
+aggiungilo al catalogo. Mai copiare-e-adattare.
+
 ## Esecuzione locale canonica
 
 - Ambiente di sviluppo: **solo WSL**, percorso `/home/administrator/ideai`. Non modificare mai `D:\Sviluppo\IDEAI` dall'host Windows.
@@ -267,4 +315,6 @@ duplicata e' rifiutato come una toppa (regola H).
 - `docs/contributing.md` — workflow study -> confirm -> automatic
 - `docs/tech-debt-rust.md` — backlog `unwrap`/clippy
 - `docs/tech-debt-ts.md` — backlog `any`/strict
+- `docs/tech-debt-dup.md` — metrica duplicazione e baseline ratchet (regola L)
+- `docs/.nexus-vault/adr/0026-punto-unico-de-duplicazione.md` — catalogo punti unici + meccanismo
 - `config/policies/` — profili cloud/onprem/hybrid (contratto gateway LLM)
