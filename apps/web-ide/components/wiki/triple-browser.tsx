@@ -472,16 +472,27 @@ function Th({
         <span
           aria-hidden
           onMouseDown={onResizeStart}
-          title="Trascina per ridimensionare"
+          // Doppio-click resetta a "auto-fit" approssimato (200px), utile come
+          // scorciatoia. Spiegato nel title.
+          title="Trascina per ridimensionare la colonna"
           style={{
             position: "absolute",
             top: 0,
-            right: 0,
-            width: 6,
+            // Posiziona il handle a cavallo del bordo destro cosi' e' piu'
+            // facile da agganciare col mouse. width 12 = area click ampia.
+            right: -6,
+            width: 12,
             height: "100%",
             cursor: "col-resize",
-            // hover visivo discreto: barra verticale sul bordo destro
-            borderRight: `2px solid ${tc?.border ?? "transparent"}`,
+            zIndex: 1,
+            // Indicatore visivo del handle: barretta verticale centrata,
+            // visibile in hover (background del parent th + accent al passaggio).
+            background:
+              "linear-gradient(90deg, transparent 0%, transparent 4px, " +
+              (tc?.border ?? "rgba(0,0,0,0.15)") +
+              " 4px, " +
+              (tc?.border ?? "rgba(0,0,0,0.15)") +
+              " 8px, transparent 8px)",
           }}
         />
       )}

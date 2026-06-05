@@ -120,6 +120,14 @@ pub struct ListTriplesQuery {
     pub q: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    /// `meta` | `project` (assente = qualunque scope visibile dall'utente,
+    /// limitato comunque dall'ACL). Filtra le triple per scope del documento
+    /// soggetto via JOIN su wiki_docs.scope.
+    pub scope: Option<String>,
+    /// Restringe a un singolo progetto via JOIN su wiki_docs.project_id.
+    /// Il frontend lo passa sempre quando l'utente lavora dentro un progetto
+    /// (altrimenti si mischiavano triple di progetti diversi).
+    pub project_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1386,6 +1394,8 @@ pub async fn list_triples(
     let mut bind_subj: Option<Uuid> = None;
     let mut bind_obj: Option<Uuid> = None;
     let mut bind_q: Option<String> = None;
+    let mut bind_scope: Option<String> = None;
+    let mut bind_project: Option<Uuid> = None;
 
     if let Some(p) = q.predicate.as_ref().filter(|s| !s.is_empty()) {
         where_parts.push(format!("t.predicate = ${next_idx}"));
@@ -1416,6 +1426,20 @@ pub async fn list_triples(
     if let Some(qs) = q.q.as_ref().filter(|s| !s.is_empty()) {
         where_parts.push(format!("t.obj_text ILIKE ${next_idx}"));
         bind_q = Some(format!("%{qs}%"));
+        next_idx += 1;
+    }
+    // Filtri scope/project_id: erano accettati dal frontend ma IGNORATI dal
+    // backend (i campi mancavano dalla struct), causando cross-contaminazione
+    // tra progetti — le triple di Beauty-Book apparivano anche in Marco perche'
+    // l'ACL utente vedeva entrambi. JOIN su wiki_docs gia' esistente.
+    if let Some(sc) = q.scope.as_ref().filter(|s| !s.is_empty()) {
+        where_parts.push(format!("wiki_docs.scope = ${next_idx}"));
+        bind_scope = Some(sc.clone());
+        next_idx += 1;
+    }
+    if let Some(pid) = q.project_id {
+        where_parts.push(format!("wiki_docs.project_id = ${next_idx}"));
+        bind_project = Some(pid);
         next_idx += 1;
     }
 
@@ -1459,6 +1483,12 @@ pub async fn list_triples(
     if let Some(v) = bind_q {
         query = query.bind(v);
     }
+    if let Some(v) = bind_scope {
+        query = query.bind(v);
+    }
+    if let Some(v) = bind_project {
+        query = query.bind(v);
+    }
     query = query.bind(limit).bind(offset);
 
     let rows = query.fetch_all(&state.db).await.map_err(err500)?;
@@ -1488,11 +1518,16 @@ pub async fn list_triples(
         })
         .collect();
 
+    // NB: ritorniamo sia `total` (atteso dal frontend per la paginazione) sia
+    // `count` (alias storico). Per ora `total = items.len()` (non e' una vera
+    // COUNT(*) con i filtri applicati — il client comunque paginando ne ottiene
+    // solo gli items del lotto corrente). Una COUNT separata e' debito noto.
     Ok(Json(json!({
         "items": items,
         "limit": limit,
         "offset": offset,
         "count": items.len(),
+        "total": items.len(),
     })))
 }
 
