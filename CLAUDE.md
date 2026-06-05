@@ -209,6 +209,46 @@ Quando l'utente carica un allegato (PDF, DOCX, Figma, ZIP, immagine, ecc.) l'age
 - **Budget letture per sessione** (FIX 4): max 500 KB cumulativi (default DB) per nexus_read_attachment + nexus_read_archive_entry. Oltre la soglia il brain ritorna un tool_result sintetico che invita a usare gli estrattori strutturati.
 - **Tuning DB-driven**: i 4 setting in `agent.attachment.*` (preextract_enabled, preextract_max_chars, session_read_budget_bytes, read_cache_ttl_seconds) governano l'intera pipeline. Niente fallback hardcoded nel codice (regola G).
 
+## L. Punti unici di controllo (un solo punto di verita' per logica)
+
+Regola autoritativa, valida per qualunque concern trasversale: **ogni decisione o
+logica deve avere UN solo punto di controllo (una funzione/modulo autoritativo); i
+call site delegano a quello, non re-implementano la stessa logica.** Generalizza G
+(unica fonte dati nel DB) e H (un punto di enforcement) a tutta l'architettura.
+
+### Cosa e' vietato
+
+- **Logica duplicata/dispersa**: la stessa decisione implementata in piu' punti
+  (es. piu' query SQL diverse che selezionano "il modello giusto" con filtri
+  copiati a mano in `best_model_for_tier`, re-route context-aware, cascade
+  fallback, gate, ecc.). Se due punti devono rispondere alla stessa domanda,
+  devono chiamare la **stessa** funzione.
+- **Aggiungere un filtro/condizione in N posti** quando arriva un nuovo requisito
+  (es. spargere `agentic_thinking_policy <> 'exclude'` in ogni query): e' il
+  sintomo che manca il punto unico. Prima si crea/usa la funzione autoritativa,
+  poi si aggiunge il requisito UNA volta li' dentro.
+- **Copiare e adattare** una funzione esistente invece di estrarne una versione
+  parametrica riusabile.
+
+### Cosa e' richiesto
+
+1. Prima di scrivere una nuova funzione/query che decide qualcosa, cercare se
+   esiste gia' il punto autoritativo per quel concern e **delegare** ad esso.
+2. Se la logica e' gia' duplicata, **consolidarla** in un unico punto e far
+   convergere i call site (vedi WikiAcl, gate di routing ADR 0020, fonte unica
+   capability ADR 0024 come esempi del pattern corretto).
+3. Il punto unico e' parametrico (input espliciti) e testato una volta sola;
+   estenderlo li' copre automaticamente tutti i chiamanti.
+4. Vale per tutti i layer: selezione provider/modello, capability, cooldown,
+   classificazione, validazione, accesso DB ripetuto, costruzione prompt.
+
+### Conseguenza pratica
+
+Se un fix richiede di toccare "lo stesso `if` in piu' file", **fermarsi**:
+significa che il punto unico non esiste ancora. Crearlo (o consolidare l'esistente)
+e applicare il requisito una sola volta. Un PR che introduce logica dispersa
+duplicata e' rifiutato come una toppa (regola H).
+
 ## Esecuzione locale canonica
 
 - Ambiente di sviluppo: **solo WSL**, percorso `/home/administrator/ideai`. Non modificare mai `D:\Sviluppo\IDEAI` dall'host Windows.

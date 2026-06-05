@@ -423,7 +423,22 @@ class AnthropicProvider(BaseProvider):
                 logger.warning("thinking capability lookup fallito (%s): disabilito thinking", _tm_err)
                 thinking_models = frozenset()
             thinking_budget = _thinking_config.budget_tokens()
-            use_thinking = _thinking_config.enabled() and model in thinking_models and max_tokens > thinking_budget
+            # ADR 0025: nei loop agentici (tool presenti) i dual-mode
+            # 'disable_for_tools' girano in NON-THINKING. L'extended thinking con
+            # tool richiederebbe di ri-passare i blocchi `thinking` con signature
+            # nei turni successivi (non implementato) e tool_choice non forzabile:
+            # piu' robusto disabilitarlo nel tool-loop, mantenendolo per la chat.
+            _disable_thinking_tools = (
+                bool(tools)
+                and cap is not None
+                and getattr(cap, "agentic_thinking_policy", "none") == "disable_for_tools"
+            )
+            use_thinking = (
+                _thinking_config.enabled()
+                and model in thinking_models
+                and max_tokens > thinking_budget
+                and not _disable_thinking_tools
+            )
 
             kwargs: dict[str, Any] = {
                 "model": model,

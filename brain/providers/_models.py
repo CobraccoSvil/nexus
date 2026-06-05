@@ -67,6 +67,10 @@ class ProviderCapability:
     tool_result_max_chars: int
     tool_result_max_bytes: int
     tool_result_max_lines: int
+    # ADR 0025: policy d'uso nei run agentici (dal catalog via v_model_capabilities).
+    #   none | disable_for_tools | native | exclude
+    # 'disable_for_tools' -> l'adapter forza il NON-THINKING quando ci sono tool.
+    agentic_thinking_policy: str = "none"
 
     def clamp_max_output_tokens(self, requested: int) -> int:
         """Limita i max_tokens richiesti entro il tetto hard del modello."""

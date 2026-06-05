@@ -167,6 +167,15 @@ class DeepSeekProvider(BaseProvider):
                         model, oai_messages, force_override=force_tool_choice,
                     )
 
+                # ADR 0025: DeepSeek V4 e' dual-mode e di DEFAULT gira in thinking
+                # mode; nel loop agentico (tool) il thinking mode richiede il
+                # passback di reasoning_content (400 altrimenti). Per i modelli
+                # 'disable_for_tools' forziamo la modalita' NON-THINKING via il
+                # parametro ufficiale extra_body.thinking=disabled (DeepSeek thinking
+                # mode guide): function calling normale, nessuno stato reasoning.
+                if cap is not None and cap.agentic_thinking_policy == "disable_for_tools":
+                    kwargs_call["extra_body"] = {"thinking": {"type": "disabled"}}
+
             response = await client.chat.completions.create(**kwargs_call)
             choice = response.choices[0]
             msg = choice.message

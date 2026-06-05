@@ -41,7 +41,7 @@ _COLUMNS = (
     "soft_failure_content_threshold, history_keep_recent_messages, "
     "history_max_old_tool_result_chars, request_timeout_seconds, "
     "connect_timeout_seconds, tool_result_max_chars, tool_result_max_bytes, "
-    "tool_result_max_lines"
+    "tool_result_max_lines, agentic_thinking_policy"
 )
 
 # TTL del TTL: evita una query a ogni lookup mantenendo la configurabilita.
@@ -87,6 +87,7 @@ def _row_to_capability(row: tuple) -> ProviderCapability:
         request_timeout_seconds=row[22], connect_timeout_seconds=row[23],
         tool_result_max_chars=row[24], tool_result_max_bytes=row[25],
         tool_result_max_lines=row[26],
+        agentic_thinking_policy=row[27] if len(row) > 27 else "none",
     )
 
 

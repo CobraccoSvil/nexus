@@ -298,10 +298,12 @@ pub async fn best_model_for_tier(
     } else {
         String::new()
     };
-    // Quando si richiede il tool-use, escludi anche i modelli thinking: col
-    // tool_choice forzato producono MALFORMED_FUNCTION_CALL (mig 0275).
+    // Quando si richiede il tool-use, il modello deve essere agentic-eligibile:
+    // tool-capable e NON 'exclude' (reasoning-only senza function calling, es.
+    // deepseek-reasoner). I dual-mode (deepseek-v4, claude, gemini-2.5) sono
+    // ammessi: l'adapter forza il non-thinking nei loop tool (ADR 0025).
     let tool_use_predicate = if requires_tool_use {
-        "AND supports_tool_use = TRUE AND is_thinking = FALSE"
+        "AND supports_tool_use = TRUE AND agentic_thinking_policy <> 'exclude'"
     } else {
         ""
     };
@@ -756,16 +758,16 @@ pub(crate) enum ToolCapabilityGate {
 ///   dal catalog) il gate e' CONSERVATIVO: NON sostituisce (KeepOriginal), per
 ///   non degradare un modello potenzialmente valido solo perche' manca dal
 ///   catalog. La mancanza nel catalog e' un problema di sync separato.
-/// - modello THINKING (`model_is_thinking = Some(true)`) su run agentico ->
-///   `NeedsFallback`: sul tool_choice forzato i modelli thinking producono
-///   MALFORMED_FUNCTION_CALL (gemini-2.5-pro) o richiedono il passback di
-///   reasoning_content non implementato (deepseek-v4) -> il loop agentico
-///   fallisce. Coerente con mig 0275/0274/0317. `None` resta conservativo.
+/// - `agentic_thinking_policy == "exclude"` (reasoning-only SENZA function
+///   calling, es. deepseek-reasoner) su run agentico -> `NeedsFallback`.
+///   I dual-mode (`disable_for_tools`) e i reasoning con tool nativi (`native`)
+///   restano ammessi: l'adapter del brain gestisce la modalita' (ADR 0025).
+///   `None` resta conservativo (KeepOriginal).
 pub(crate) fn decide_tool_capability_gate(
     intent: &str,
     gate_enabled: bool,
     model_supports_tool_use: Option<bool>,
-    model_is_thinking: Option<bool>,
+    agentic_thinking_policy: Option<&str>,
 ) -> ToolCapabilityGate {
     // Il gate si applica SOLO ai run agentici. Convenzione del progetto:
     // intent == "chat" e' l'unico intent non-agentico (vedi agent_run.rs:1206
@@ -776,11 +778,9 @@ pub(crate) fn decide_tool_capability_gate(
     if !gate_enabled {
         return ToolCapabilityGate::KeepOriginal;
     }
-    // Modello thinking su run agentico: incompatibile col tool-forcing /
-    // loop multi-turno (vedi doc sopra). Ha priorita' sul check tool_use:
-    // un modello puo' avere supports_tool_use=true ed essere comunque thinking
-    // (es. deepseek-v4-pro), e in quel caso va comunque scartato.
-    if model_is_thinking == Some(true) {
+    // Policy 'exclude': reasoning-only senza function calling -> non puo' reggere
+    // un loop agentico, serve fallback. Ha priorita' sul check tool_use.
+    if agentic_thinking_policy == Some("exclude") {
         return ToolCapabilityGate::NeedsFallback;
     }
     match model_supports_tool_use {
@@ -797,64 +797,66 @@ mod tool_capability_gate_tests {
 
     #[test]
     fn gate_scarta_modello_non_tool_capable_su_intent_agentico() {
-        // Caso reale ADR 0018: mistral-code-latest (supports_tool_use=false)
-        // risolto per un intent agentico (file_ops) -> deve richiedere fallback.
-        let d = decide_tool_capability_gate("file_ops", true, Some(false), Some(false));
+        // mistral-code-latest (supports_tool_use=false) su intent agentico -> fallback.
+        let d = decide_tool_capability_gate("file_ops", true, Some(false), Some("none"));
         assert_eq!(d, ToolCapabilityGate::NeedsFallback);
     }
 
     #[test]
     fn gate_lascia_passare_modello_tool_capable() {
-        let d = decide_tool_capability_gate("refactor", true, Some(true), Some(false));
+        let d = decide_tool_capability_gate("refactor", true, Some(true), Some("none"));
         assert_eq!(d, ToolCapabilityGate::KeepOriginal);
     }
 
     #[test]
     fn gate_disattivato_lascia_passare_anche_modello_non_capable() {
         // Flag agent.require_tool_use_capability = false -> passthrough.
-        let d = decide_tool_capability_gate("file_ops", false, Some(false), Some(true));
+        let d = decide_tool_capability_gate("file_ops", false, Some(false), Some("exclude"));
         assert_eq!(d, ToolCapabilityGate::KeepOriginal);
     }
 
     #[test]
     fn gate_non_si_applica_a_intent_chat() {
-        // Run non agentico: il gate non interviene neppure su modelli
-        // non-tool-capable o thinking (leciti per chat/title/vision/embedding).
-        let d = decide_tool_capability_gate("chat", true, Some(false), Some(true));
+        // Run non agentico: il gate non interviene neppure su policy 'exclude'.
+        let d = decide_tool_capability_gate("chat", true, Some(false), Some("exclude"));
         assert_eq!(d, ToolCapabilityGate::KeepOriginal);
     }
 
     #[test]
     fn gate_conservativo_su_capability_ignota() {
-        // Modello assente dal catalog (None): non degradare. La mancanza nel
-        // catalog e' un problema di sync, non un motivo per cambiare modello.
+        // Modello assente dal catalog (None): non degradare.
         let d = decide_tool_capability_gate("debug", true, None, None);
         assert_eq!(d, ToolCapabilityGate::KeepOriginal);
     }
 
-    // ── mig 0317: i thinking model non reggono il tool-forcing agentico ──
+    // ── ADR 0025: eleggibilita' agentica via agentic_thinking_policy ──
 
     #[test]
-    fn gate_scarta_thinking_model_su_intent_agentico_anche_se_tool_capable() {
-        // Caso reale (run eec9bffe): deepseek-v4-pro ha supports_tool_use=true
-        // ma e' thinking -> sul loop agentico fallisce (reasoning_content 400).
-        // Il flag thinking ha priorita': deve richiedere fallback.
-        let d = decide_tool_capability_gate("fix", true, Some(true), Some(true));
+    fn gate_scarta_policy_exclude_su_intent_agentico() {
+        // deepseek-reasoner: reasoning-only SENZA function calling (exclude) -> fallback.
+        let d = decide_tool_capability_gate("fix", true, Some(true), Some("exclude"));
         assert_eq!(d, ToolCapabilityGate::NeedsFallback);
     }
 
     #[test]
-    fn gate_thinking_model_lecito_su_chat() {
-        // Su intent non agentico il thinking model va benissimo (nessun tool-forcing).
-        let d = decide_tool_capability_gate("chat", true, Some(true), Some(true));
+    fn gate_dual_mode_passa_su_agentico() {
+        // deepseek-v4 (disable_for_tools): tool-capable, NON escluso -> KeepOriginal
+        // (l'adapter del brain forza il non-thinking nel loop tool).
+        let d = decide_tool_capability_gate("fix", true, Some(true), Some("disable_for_tools"));
         assert_eq!(d, ToolCapabilityGate::KeepOriginal);
     }
 
     #[test]
-    fn gate_non_thinking_tool_capable_passa_su_agentico() {
-        // Modello non-thinking e tool-capable: il candidato ideale per i run
-        // agentici. Nessuna sostituzione.
-        let d = decide_tool_capability_gate("file_ops", true, Some(true), Some(false));
+    fn gate_native_reasoning_passa_su_agentico() {
+        // o3 (native): reasoning con tool nativi -> KeepOriginal.
+        let d = decide_tool_capability_gate("debug", true, Some(true), Some("native"));
+        assert_eq!(d, ToolCapabilityGate::KeepOriginal);
+    }
+
+    #[test]
+    fn gate_exclude_lecito_su_chat() {
+        // Su intent non agentico anche 'exclude' e' lecito (nessun tool-forcing).
+        let d = decide_tool_capability_gate("chat", true, Some(true), Some("exclude"));
         assert_eq!(d, ToolCapabilityGate::KeepOriginal);
     }
 

@@ -1027,7 +1027,7 @@ pub(crate) async fn spawn_agent_run(
                    FROM ai_price_catalog
                   WHERE is_enabled = true
                     AND supports_tool_use = true
-                    AND is_thinking = false
+                    AND agentic_thinking_policy <> 'exclude'
                     AND consecutive_failures = 0",
                 )
                 .fetch_one(&db_clone)
@@ -1118,7 +1118,7 @@ pub(crate) async fn spawn_agent_run(
                 let alt: Option<(String, String)> = sqlx::query_as::<_, (String, String)>(
                     "SELECT provider, model FROM ai_price_catalog
                   WHERE is_enabled=true AND supports_tool_use=true
-                    AND is_thinking=false
+                    AND agentic_thinking_policy <> 'exclude'
                     AND consecutive_failures=0
                     AND context_window >= $1
                   ORDER BY input_cost_per_million_tokens ASC NULLS LAST
@@ -1473,7 +1473,7 @@ pub(crate) async fn spawn_agent_run(
                        FROM ai_price_catalog
                       WHERE is_enabled = true
                         AND supports_tool_use = true
-                        AND is_thinking = false
+                        AND agentic_thinking_policy <> 'exclude'
                         AND consecutive_failures = 0
                         AND NOT (provider = ANY($1))
                         AND context_window >= $2
