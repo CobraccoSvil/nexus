@@ -291,7 +291,15 @@ impl Orchestrator {
         let matrix = &*matrix_arc;
         // Risolve il behavior_mode effettivo: sessione > DB globale.
         // Caricato prima di resolve_agent_provider per passarlo coerentemente.
-        let routing_for_mode = Self::load_routing_config(db).await.unwrap_or_default();
+        // Fix latente: prima `.unwrap_or_default()` su DB error -> behavior_mode
+        // silenziosamente vuoto. Ora almeno il fallimento e' visibile nei log.
+        let routing_for_mode = match Self::load_routing_config(db).await {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!("load_routing_config fallito (resolve): {e}; uso default");
+                RoutingConfig::default()
+            }
+        };
         let configured_behavior_mode = behavior_mode_session
             .filter(|v| !v.trim().is_empty())
             .map(str::to_string)
@@ -634,7 +642,13 @@ impl Orchestrator {
                 return (p.to_string(), m.to_string());
             }
             (Some(p), None) => {
-                let routing = Self::load_routing_config(db).await.unwrap_or_default();
+                let routing = match Self::load_routing_config(db).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("load_routing_config (provider_ov): {e}");
+                        RoutingConfig::default()
+                    }
+                };
                 let model = routing.resolve_model(matrix, p, Some(p), model_override);
                 return (p.to_string(), model);
             }
@@ -673,7 +687,13 @@ impl Orchestrator {
         let (intent, _confidence) = self.classify_intent_with_db_thresholds(message).await;
         // La RoutingConfig admin può sovrascrivere il modello per provider.
         // Il behavior_mode effettivo: override sessione > DB globale.
-        let routing = Self::load_routing_config(db).await.unwrap_or_default();
+        let routing = match Self::load_routing_config(db).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("load_routing_config (intent routing): {e}");
+                RoutingConfig::default()
+            }
+        };
         let effective_behavior_mode: String = behavior_mode_override
             .filter(|v| !v.trim().is_empty())
             .map(str::to_string)

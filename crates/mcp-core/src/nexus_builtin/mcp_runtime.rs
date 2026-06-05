@@ -599,7 +599,13 @@ async fn handle_mcp_tool_search_inner(
         qb.push(") ORDER BY match_score DESC, s.scope DESC, s.name, t.tool_name LIMIT ");
         qb.push_bind(limit);
 
-        qb.build().fetch_all(db).await.unwrap_or_default()
+        match qb.build().fetch_all(db).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("mcp_runtime: search external tools fallita: {e}");
+                Vec::new()
+            }
+        }
     };
 
     let external_results: Vec<Value> = rows
@@ -804,7 +810,13 @@ pub async fn handle_mcp_tool_reindex(
          ORDER BY s.name, t.tool_name"
     };
 
-    let rows = sqlx::query(query).fetch_all(db).await.unwrap_or_default();
+    let rows = match sqlx::query(query).fetch_all(db).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("mcp_runtime: list tools-to-index fallita: {e}");
+            Vec::new()
+        }
+    };
     let total = rows.len();
     let mut indexed = 0usize;
     let mut errors = 0usize;

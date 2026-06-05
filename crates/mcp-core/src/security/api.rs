@@ -74,7 +74,12 @@ pub async fn get_project_audit(
         query = query.bind(action);
     }
 
-    let rows = query.fetch_all(&state.db).await.unwrap_or_default();
+    // Fix bug latente (regola H): prima `.unwrap_or_default()` su DB error
+    // mostrava "audit vuoto" invece di errore — diagnosi sbagliata garantita.
+    let rows = query
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let items: Vec<Value> = rows
         .iter()
@@ -100,7 +105,7 @@ pub async fn get_project_audit(
             .bind(project_id)
             .fetch_one(&state.db)
             .await
-            .unwrap_or(0);
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({
         "items": items,

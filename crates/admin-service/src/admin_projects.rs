@@ -65,7 +65,7 @@ pub async fn add_project_member(
     }
 
     let project_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)")
-        .bind(project_uuid).fetch_one(&state.db).await.unwrap_or(false);
+        .bind(project_uuid).fetch_one(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if !project_exists { return Err(StatusCode::NOT_FOUND); }
 
     let user: (String, String, String, Option<String>, Option<String>) = sqlx::query_as(
@@ -76,7 +76,7 @@ pub async fn add_project_member(
     .ok_or(StatusCode::NOT_FOUND)?;
 
     let already: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project_members WHERE project_id = $1 AND user_id = $2)")
-        .bind(project_uuid).bind(user_uuid).fetch_one(&state.db).await.unwrap_or(false);
+        .bind(project_uuid).bind(user_uuid).fetch_one(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if already { return Err(StatusCode::CONFLICT); }
 
     sqlx::query("INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, $3)")
@@ -130,7 +130,7 @@ pub async fn remove_project_member(
     let user_uuid = Uuid::parse_str(&user_id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project_members WHERE project_id = $1 AND user_id = $2)")
-        .bind(project_uuid).bind(user_uuid).fetch_one(&state.db).await.unwrap_or(false);
+        .bind(project_uuid).bind(user_uuid).fetch_one(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if !exists { return Err(StatusCode::NOT_FOUND); }
 
     sqlx::query("DELETE FROM project_members WHERE project_id = $1 AND user_id = $2")

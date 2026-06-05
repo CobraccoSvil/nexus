@@ -282,7 +282,7 @@ pub async fn delete_user(
     .bind(user_uuid)
     .fetch_one(&state.db)
     .await
-    .unwrap_or(false);
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if !exists {
         return Err(StatusCode::NOT_FOUND);

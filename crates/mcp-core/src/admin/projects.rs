@@ -40,7 +40,7 @@ pub async fn list_project_members(
             .bind(project_uuid)
             .fetch_one(&state.db)
             .await
-            .unwrap_or(false);
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if !project_exists {
         return Err(StatusCode::NOT_FOUND);
@@ -77,7 +77,7 @@ pub async fn add_project_member(
             .bind(project_uuid)
             .fetch_one(&state.db)
             .await
-            .unwrap_or(false);
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if !project_exists {
         return Err(StatusCode::NOT_FOUND);
@@ -101,7 +101,7 @@ pub async fn add_project_member(
     .bind(user_uuid)
     .fetch_one(&state.db)
     .await
-    .unwrap_or(false);
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if already_member {
         return Err(StatusCode::CONFLICT);
@@ -200,7 +200,7 @@ pub async fn remove_project_member(
     .bind(user_uuid)
     .fetch_one(&state.db)
     .await
-    .unwrap_or(false);
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if !exists {
         return Err(StatusCode::NOT_FOUND);
