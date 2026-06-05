@@ -575,6 +575,46 @@ pub async fn wizard_detect_services(
         }
     }
 
+    // ── 6. Sito HTML statico (index.html o primo .html) senza framework ────
+    // Punto unico (regola L): stessa rilevazione del server integrato
+    // (static_preview::detect_static_entry). Proposto SOLO se nessun framework
+    // serve gia' il sito (package.json/Cargo.toml/launchSettings/python entry).
+    // Il server e' un python http.server su una PORTA ALLOCATA DA NEXUS
+    // (kind="static" -> wants_port nell'install): mai porte riservate (la 8080
+    // e' in NEXUS_RESERVED_PORTS) ne' hardcoded. La porta concreta e' iniettata
+    // dall'install al posto del placeholder __PORT__.
+    {
+        let mut has_framework =
+            tokio::fs::metadata(format!("{}/package.json", root)).await.is_ok()
+                || tokio::fs::metadata(format!("{}/Cargo.toml", root)).await.is_ok()
+                || tokio::fs::metadata(format!("{}/launchSettings.json", root))
+                    .await
+                    .is_ok();
+        if !has_framework {
+            for f in &["main.py", "app.py", "server.py", "run.py", "manage.py"] {
+                if tokio::fs::metadata(format!("{}/{}", root, f)).await.is_ok() {
+                    has_framework = true;
+                    break;
+                }
+            }
+        }
+        if !has_framework {
+            if let Some(entry) = crate::static_preview::detect_static_entry(&root).await {
+                suggestions.push(json!({
+                    "short":         "static",
+                    "unit":          format!("{}-static.service", slug),
+                    "label":         format!("Server statico HTML ({entry})"),
+                    "kind":          "static",
+                    "command":       "python3",
+                    "args":          ["-m", "http.server", "__PORT__", "--bind", "127.0.0.1"],
+                    "cwd":           root,
+                    "existing":      false,
+                    "needs_install": false,
+                }));
+            }
+        }
+    }
+
     // Marca quelli già installati come .service files
     if let Ok(svc_out) = systemctl_user()
         .args([
@@ -885,8 +925,8 @@ pub async fn wizard_install_service(
     }
 
     let kind = body["kind"].as_str().unwrap_or("");
-    let wants_port =
-        matches!(kind, "npm" | "pnpm" | "dotnet") || looks_like_web_server_command(&exec_start);
+    let wants_port = matches!(kind, "npm" | "pnpm" | "dotnet" | "static")
+        || looks_like_web_server_command(&exec_start);
     let existing_port = env_map.get("PORT").and_then(|v| parse_port_token(v));
     let final_port = if wants_port {
         // Se il client non passa PORT, assegnalo in modo deterministico nel bucket progetto.
@@ -977,6 +1017,16 @@ pub async fn wizard_install_service(
         }
     } else {
         exec_start
+    };
+
+    // Inietta la porta allocata da Nexus al posto del placeholder dei servizi
+    // statici (kind="static": `python -m http.server __PORT__`). La porta e'
+    // scritta NUMERICA nell'unit e nel fallback detached: robusta, niente
+    // espansione shell (un `${PORT}` finirebbe dentro gli apici singoli del
+    // fallback `bash -lc 'exec ...'` e non verrebbe espanso).
+    let exec_start = match final_port {
+        Some(p) => exec_start.replace("__PORT__", &p.to_string()),
+        None => exec_start,
     };
 
     // ── Variabili cross-servizio ──────────────────────────────────────────────
