@@ -8,7 +8,7 @@ import {
   type FormEvent,
 } from "react";
 import { useChat } from "../lib/use-chat";
-import { listProjectMemories, getProjectDbConfig, listAdminSettings, getModels, findSimilarKnowledge, indexAttachmentsToKb, type AITraceEvent, type ChatAttachment, type ModelCatalogEntry, type PrecheckResult, type ProjectDbConfig, type SimilarHit } from "../lib/api-client";
+import { listProjectMemories, getProjectDbConfig, listAdminSettings, getModels, indexAttachmentsToKb, type AITraceEvent, type ChatAttachment, type ModelCatalogEntry, type PrecheckResult, type ProjectDbConfig, type SimilarHit } from "../lib/api-client";
 import { SimilarRequestBanner } from "./knowledge/similar-request-banner";
 import { fallbackContextWindow } from "../lib/context-window";
 import { useThemeColors } from "../lib/theme";
@@ -581,28 +581,13 @@ export function ChatPanel({
       if (fileInputRef.current) fileInputRef.current.value = "";
     };
 
-    // Knowledge: ricerca note simili. Se la richiesta risulta GIA' COMPLETATA
-    // (hit.implemented), mostra il banner e NON spawna l'agente: l'invio resta
-    // in sospeso finche' l'utente non clicca "Rifai comunque" (onProceed). Hit
-    // solo "simili" (non completate) o errore della ricerca: banner informativo,
-    // ma si procede normalmente.
-    if (hasProject) {
-      try {
-        const r = await findSimilarKnowledge(projectId, text);
-        if (r.hits.length > 0) {
-          // Qualsiasi richiesta simile (gia' completata O solo correlata): mostra
-          // il banner e ATTENDE la conferma esplicita dell'utente ("Rifai
-          // comunque" / "Invia comunque"). L'agente NON parte da solo.
-          setSimilarHits(r.hits);
-          pendingProceedSendRef.current = fireSend;
-          clearComposer();
-          return;
-        }
-      } catch {
-        /* ricerca note non bloccante: in caso di errore si procede con l'invio */
-      }
-    }
-
+    // Knowledge "richieste simili" RIMOSSO: l'endpoint /api/projects/:id/
+    // knowledge/similar e' stato dismesso SENZA sostituto (ADR 0017 v2 F6 ->
+    // 410 Gone). La chiamata frontend falliva ad OGNI invio finendo sempre nel
+    // catch (feature inerte) ma il dispatcher la registrava come "Operazione
+    // progetto (POST) fallita: endpoint deprecated", con un toast fuorviante.
+    // Si procede direttamente con l'invio; il dedup/anti-ripetizione semantico,
+    // se serve, vive lato brain (RAG inline su /api/internal/knowledge/search).
     fireSend();
     clearComposer();
   };
