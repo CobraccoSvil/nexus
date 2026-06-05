@@ -69,9 +69,15 @@ pub async fn get_project_file(
     }
 
     let content = fs::read_to_string(&file_path).await.map_err(|_| {
+        // File binario (es. .docx/.xlsx/.pdf, immagini, archivi): non e'
+        // decodificabile come testo UTF-8 e non puo' essere aperto nell'editor
+        // di codice. Il frontend instrada i documenti binari noti al pannello
+        // DOCUMENTI prima di arrivare qui (openFileInGroup -> isBinaryDocPath);
+        // questo resta come difesa per i binari non classificati. Messaggio
+        // esplicito invece del criptico "Impossibile leggere come UTF-8".
         api_error(
             StatusCode::BAD_REQUEST,
-            "Impossibile leggere il file come testo UTF-8",
+            "File binario: non puo' essere aperto come testo nell'editor. Scaricalo o usa il pannello DOCUMENTI.",
         )
     })?;
 

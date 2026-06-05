@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
 import type { UserProjectDetails } from "../../lib/api-client";
+import { isBinaryDocPath } from "../../lib/file-kind";
 
 interface DocumentItem {
   id: string;
@@ -143,6 +144,16 @@ export function DocumentsSidebar({ project, onSendToChat, onOpenInEditor }: Docu
     fetchDocuments();
   }, [fetchDocuments]);
 
+  // Refresh su richiesta esterna: ide-shell dispatcha `nexus:documents:refresh`
+  // a fine turno chat (un turno puo' aver generato un documento) e quando si
+  // apre il pannello cliccando il link a un .docx nella chat. Senza questo,
+  // il pannello gia' montato e visibile non rifa' la fetch e resta vuoto.
+  useEffect(() => {
+    const handler = () => { void fetchDocuments(); };
+    window.addEventListener("nexus:documents:refresh", handler);
+    return () => window.removeEventListener("nexus:documents:refresh", handler);
+  }, [fetchDocuments]);
+
   const handleGenerate = (docType: string) => {
     if (!onSendToChat || !project) return;
     setGenerating(docType);
@@ -195,10 +206,10 @@ export function DocumentsSidebar({ project, onSendToChat, onOpenInEditor }: Docu
    *  registrato nel DB (es. /home/.../projects/<slug>/docs/x.md -> docs/x.md). */
   const handleOpen = (doc: DocumentItem) => {
     const fp = doc.file_path;
-    const ext = fp.split(".").pop()?.toLowerCase() ?? "";
 
     // File binari (.docx, .xlsx, .pdf): scarica invece di aprire nell'editor.
-    if (["docx", "xlsx", "pdf", "odt", "pptx"].includes(ext)) {
+    // Stessa classificazione usata da openFileInGroup (regola L: punto unico).
+    if (isBinaryDocPath(fp)) {
       handleDownload(doc);
       return;
     }

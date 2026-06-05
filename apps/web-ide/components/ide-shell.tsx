@@ -66,6 +66,7 @@ import {
   selectProblemsBadge,
   selectRunConfigsChangedAt,
 } from "../lib/project-dispatcher";
+import { isBinaryDocPath } from "../lib/file-kind";
 import { ToastStack } from "./dispatcher-status";
 import {
   EMPTY_GROUPS,
@@ -393,6 +394,13 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     void new Promise<void>((resolve) => setTimeout(resolve, delay))
       .then(() => void refreshProviderStatusRef.current());
     setAgentRunEndSignal((n) => n + 1);
+    // Un turno appena concluso puo' aver generato/aggiornato un documento via
+    // nexus_doc_generate. Notifichiamo il pannello DOCUMENTI (se montato) di
+    // rifare la fetch: senza questo segnale resta vuoto finche' non lo si
+    // riapre. Disaccoppiato via window event (DocumentsSidebar lo ascolta).
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("nexus:documents:refresh"));
+    }
     const proj = activeProjectRef.current;
     if (proj) {
       void getPlaywrightRuns(proj.id)
@@ -1096,6 +1104,23 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   const openFileInGroup = useCallback(
     async (path: string, line?: number, preferredGroupId?: string) => {
       if (!activeProject) return;
+
+      // Punto unico (regola L): i documenti binari (.docx/.xlsx/.pdf...) non
+      // sono leggibili come testo UTF-8. Aprirli qui chiamerebbe getProjectFile
+      // -> /api/projects/:id/files -> read_to_string, che fallisce con HTTP 400
+      // "Impossibile leggere il file come testo UTF-8". Sono i documenti
+      // generati da nexus_doc_generate (link .docx nella chat) o file Office
+      // aperti dall'albero. Non vanno nell'editor di codice: instradiamo al
+      // pannello DOCUMENTI (Apri/Download/Rigenera/Elimina) e ne forziamo il
+      // refresh, cosi' il documento appena generato compare subito.
+      if (isBinaryDocPath(path)) {
+        setActiveSidebarView("docs");
+        setPrimarySidebarVisible(true);
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(new CustomEvent("nexus:documents:refresh"));
+        }
+        return;
+      }
 
       const existingGroup = editorGroups.find((group) =>
         group.tabs.some((tab) => tab.path === path),
