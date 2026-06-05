@@ -504,7 +504,10 @@ async fn auto_select_profile(
     .bind(user_id)
     .fetch_all(db)
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|e| {
+        tracing::warn!("auto_select_profile: SELECT user_profiles fallita: {e}");
+        Vec::new()
+    });
 
     if rows.is_empty() {
         return (String::new(), None, None, None);

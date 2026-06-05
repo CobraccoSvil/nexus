@@ -1215,7 +1215,10 @@ pub async fn extract_triples_handler(
                 sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects")
                     .fetch_all(&state_cloned.db)
                     .await
-                    .unwrap_or_default()
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(run_id=%run_id, "SELECT projects fallita: {e}");
+                        Vec::new()
+                    })
             };
             for pid in pids {
                 if let Err(e) = triple_extractor::extract_triples_for_scope(

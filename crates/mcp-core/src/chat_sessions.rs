@@ -746,7 +746,10 @@ pub async fn toggle_project_memory(
             .bind(memory_id)
             .fetch_one(&state.db)
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                tracing::warn!("toggle prompt correction: SELECT qdrant_point_id fallita: {e}");
+                String::new()
+            });
 
     if !qdrant_point_id.is_empty() {
         // Best-effort Qdrant payload update — ignore errors (DB is source of truth)
