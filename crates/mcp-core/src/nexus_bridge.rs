@@ -877,23 +877,33 @@ impl NexusBridge {
     /// Ritorna `None` se non c'e' pool o la query fallisce (best-effort).
     pub async fn q_learning_persisted_totals(&self) -> Option<serde_json::Value> {
         let pool = self.pool.as_ref()?;
-        let row = sqlx::query_as::<_, (i64, Option<i64>, Option<i64>, Option<i64>, Option<f32>)>(
+        // NB: in Postgres `sum(bigint)` ritorna `numeric`, non `bigint` — un
+        // cast esplicito a ::bigint e' necessario o sqlx fallisce il decode in
+        // i64 (la query_as ritornerebbe Err e l'intero metodo None, lasciando
+        // il pannello senza i totali). count(*) e' gia' bigint.
+        let row = match sqlx::query_as::<_, (i64, i64, i64, i64, Option<f32>)>(
             r#"SELECT
-                 count(*)                       AS pairs,
-                 COALESCE(sum(visit_count), 0)   AS visits,
-                 COALESCE(sum(success_count), 0) AS successes,
-                 COALESCE(sum(failure_count), 0) AS failures,
-                 AVG(q_value)::real              AS avg_q
+                 count(*)                                AS pairs,
+                 COALESCE(sum(visit_count), 0)::bigint    AS visits,
+                 COALESCE(sum(success_count), 0)::bigint  AS successes,
+                 COALESCE(sum(failure_count), 0)::bigint  AS failures,
+                 AVG(q_value)::real                       AS avg_q
                FROM nexus_q_values"#,
         )
         .fetch_one(pool.as_ref())
         .await
-        .ok()?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("q_learning_persisted_totals: query fallita: {e}");
+                return None;
+            }
+        };
         Some(serde_json::json!({
             "pairs": row.0,
-            "visits": row.1.unwrap_or(0),
-            "successes": row.2.unwrap_or(0),
-            "failures": row.3.unwrap_or(0),
+            "visits": row.1,
+            "successes": row.2,
+            "failures": row.3,
             "avg_q_value": row.4.unwrap_or(0.0),
         }))
     }
