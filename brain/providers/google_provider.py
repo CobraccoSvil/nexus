@@ -440,18 +440,24 @@ class GoogleProvider(BaseProvider):
             # 'disable_for_tools' girano in NON-THINKING: su Gemini 2.5 il thinking
             # col function calling forzato produce MALFORMED_FUNCTION_CALL (mig 0274).
             # Disabilitiamo il thinking (nessun ThinkingConfig, budget off).
-            _policy_tools = "none"
-            if google_tools:
-                try:
-                    from .capability_loader import load_capability
-                    _policy_tools = load_capability(self.name, model).agentic_thinking_policy
-                except Exception:
-                    _policy_tools = "none"
+            # Fonte UNICA del comportamento thinking: agentic_thinking_policy dal DB
+            # (ADR 0024/0025), MAI il nome del modello. Bug storico: derivare
+            # _is_thinking da substring "gemini-2.5-flash" marcava come thinking
+            # anche gemini-2.5-flash-lite (policy='none', NON-thinking) -> gli si
+            # inviava ThinkingConfig(thinking_budget) fuori range (512-24576) ->
+            # 400 INVALID_ARGUMENT ad ogni chiamata.
+            try:
+                from .capability_loader import load_capability
+                _policy_tools = load_capability(self.name, model).agentic_thinking_policy
+            except Exception:
+                _policy_tools = "none"
             _force_non_thinking_tools = bool(google_tools) and _policy_tools == "disable_for_tools"
-            _is_thinking = (not _force_non_thinking_tools) and (
-                "thinking" in model.lower()
-                or "gemini-2.5-pro" in model.lower()
-                or "gemini-2.5-flash" in model.lower()
+            # Thinking attivo SOLO se la policy lo prevede (native sempre; dual-mode
+            # 'disable_for_tools' solo SENZA tool, cioe' in chat) e non stiamo
+            # forzando il non-thinking per i tool. policy 'none'/'exclude' => mai.
+            _is_thinking = (not _force_non_thinking_tools) and _policy_tools in (
+                "native",
+                "disable_for_tools",
             )
             config_temperature = None if _is_thinking else temperature
             thinking_config = None
