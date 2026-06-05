@@ -287,46 +287,11 @@ def _render_analyzer_prompt(template: str, req: "ProjectAnalyzeRequest") -> str:
 
 
 def _extract_json_block(text: str) -> dict | None:
-    """Estrae il primo blocco JSON valido dal testo.
-    Tollera fence markdown ``` o testo prima/dopo.
-    """
-    # Strip markdown fences se presenti
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        # rimuovi prima e ultima riga (```json ... ```)
-        lines = cleaned.split("\n")
-        if len(lines) >= 3:
-            cleaned = "\n".join(lines[1:-1] if lines[-1].strip().startswith("```") else lines[1:])
-    # Trova primo { e bilancia
-    start = cleaned.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_str = False
-    escape = False
-    for i in range(start, len(cleaned)):
-        ch = cleaned[i]
-        if escape:
-            escape = False
-            continue
-        if ch == "\\" and in_str:
-            escape = True
-            continue
-        if ch == '"':
-            in_str = not in_str
-            continue
-        if in_str:
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json_mod.loads(cleaned[start:i+1])
-                except Exception:
-                    return None
-    return None
+    """Estrae il primo blocco JSON dal testo. Punto unico (regola L / ADR 0026):
+    brain/utils/json_extract.extract_json_block."""
+    from brain.utils.json_extract import extract_json_block
+
+    return extract_json_block(text)
 
 
 @router.post("/agent/project-analyze")

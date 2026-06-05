@@ -653,64 +653,11 @@ class AgenticIntentClassifier:
 
     @staticmethod
     def _extract_json(content: str) -> Optional[dict]:
-        """Estrae il primo oggetto JSON dal contenuto LLM (anche se circondato
-        da markdown fences, testo, o annidato N livelli).
+        """Estrae il primo oggetto JSON dal contenuto LLM. Punto unico
+        (regola L / ADR 0026): brain/utils/json_extract.extract_json_block."""
+        from brain.utils.json_extract import extract_json_block
 
-        Robustezza:
-        1. Strip code fences ``` ```json
-        2. Tentativo parse diretto del contenuto pulito
-        3. Brace-matching counter: trova il primo `{` e cerca la `}` bilanciata
-           a qualsiasi profondita' di annidamento (slots e' nested level 2)
-        4. Se ancora fallisce, fallback al regex single-level (legacy)
-        """
-        if not content:
-            return None
-        # Strip markdown code fences
-        content = re.sub(r"^```(?:json)?\s*", "", content.strip())
-        content = re.sub(r"\s*```\s*$", "", content)
-        # 1. Parse diretto
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            pass
-        # 2. Brace-matching counter (gestisce N livelli annidati)
-        start = content.find("{")
-        if start >= 0:
-            depth = 0
-            in_string = False
-            escape = False
-            for i in range(start, len(content)):
-                ch = content[i]
-                if escape:
-                    escape = False
-                    continue
-                if ch == "\\":
-                    escape = True
-                    continue
-                if ch == '"':
-                    in_string = not in_string
-                    continue
-                if in_string:
-                    continue
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        # Trovata graffa di chiusura bilanciata
-                        candidate = content[start : i + 1]
-                        try:
-                            return json.loads(candidate)
-                        except json.JSONDecodeError:
-                            break  # cade nel fallback regex
-        # 3. Fallback legacy regex (single-level nesting)
-        match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", content, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError:
-                return None
-        return None
+        return extract_json_block(content)
 
     def _fallback_result(self, message: str, reason: str) -> AgenticIntent:
         """Costruisce un risultato di fallback usando il classifier keyword (se

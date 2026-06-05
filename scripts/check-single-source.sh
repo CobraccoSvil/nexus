@@ -63,8 +63,12 @@ assert_single "infer_capabilities_from_name" 'fn infer_capabilities_from_name' '
 # Wave 5 (registry default: statici nella migrazione 0325; parte dinamica unica):
 assert_single "ensure_projects_base_root" 'fn ensure_projects_base_root' 'crates/nexus-types/src/lib.rs' crates
 
-# Wave 6a:
+# Wave 6a (db_pool: ~30 file con psycopg2.connect, da convertire con verifica
+# runtime dedicata; attivare quando la conversione e' completa):
 # assert_single "psycopg2.connect" 'psycopg2\.connect\(' 'brain/utils/db_pool.py' brain
+
+# Wave 6c (estrazione JSON da output LLM):
+assert_single "extract_json_block" 'def extract_json_block' 'brain/utils/json_extract.py' brain
 
 # Wave 8a:
 # assert_single "python chunker" 'def _?chunk_text' 'brain/utils/text_chunk.py' brain

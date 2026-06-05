@@ -34,6 +34,7 @@ Aggiornare questa tabella a ogni wave che riduce il debito.
 | Wave 3 | 3 | 5.26% | 1233 | get_setting: 4 implementazioni divergenti consolidate in una query unica (read_setting_raw) + viste in nexus-auth; i 3 def-site di mcp-core ora re-export. -1 clone. |
 | Wave 4 | 4 | 5.26% | 1233 | Capability gia' fonte unica via ADR 0024 (vista v_model_capabilities): nessun churn. Aggiunto solo guard sul classificatore (classify_capabilities/infer_capabilities_from_name). Cloni invariati. |
 | Wave 5 | 5 | 5.25% | 1229 | ensure_required_settings: default statici -> migrazione 0325 (no env var, regola G/H); parte dinamica projects_base_root -> punto unico nexus_types::ensure_projects_base_root (prima duplicata in mcp-core + admin-service). -4 cloni. |
+| Wave 6 (parz.) | 6 | 5.24% | 1231 | json_extract: punto unico estrazione JSON da output LLM (agentic_classifier + routes/agent delegano). json_extract.py verificato 0 cloni; il +2 e' fluttuazione jscpd su cloni preesistenti (nexus_tools), non regressione. db_pool (~30 file), ttl_cache, intents, fix settings_db rinviati. |
 
 ## Hotspot noti (da consolidare)
 
