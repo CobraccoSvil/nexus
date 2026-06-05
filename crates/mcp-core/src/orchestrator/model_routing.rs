@@ -208,65 +208,23 @@ pub(crate) async fn route_model_from_catalog(
         _           => "is_featured DESC, input_cost_per_million_tokens ASC",
     };
 
-    // Provider in cooldown sono esclusi dalla selezione: chiamarli produrrebbe
-    // un errore (billing/rate limit) e farebbe fallire l'intera richiesta utente.
-    // Lista da memoria condivisa popolata da provider_cooldown::put_provider_in_cooldown.
-    let cooldown_providers: Vec<String> = crate::provider_cooldown::cooldown_snapshot()
-        .into_iter()
-        .map(|(name, _, _)| name)
-        .collect();
-
-    let capability_json = format!("[\"{capability}\"]");
-
-    // Esclusione modelli thinking (is_thinking) dal routing AGENTICO: l'agente
-    // passa sempre per il planner che forza tool_choice; un modello thinking
-    // produce MALFORMED_FUNCTION_CALL (mig 0275). Tutti i modelli heavy enabled
-    // sono thinking, quindi serve una degradazione di tier controllata verso il
-    // miglior modello tool-robust non-thinking (es. heavy -> medium = deepseek-v4-pro).
+    // Selezione tramite il PUNTO UNICO (regola L): l'eleggibilita' agentica
+    // (tool_use, agentic_thinking_policy<>'exclude', consecutive_failures, cooldown)
+    // e' definita una sola volta in select_agentic_model. Degradazione di tier
+    // controllata: heavy->medium, medium->light, ecc.
     let tier_chain: Vec<&str> = match required_tier {
         "heavy" => vec!["heavy", "medium"],
         "medium" => vec!["medium", "light"],
         "light" => vec!["light", "medium"],
         other => vec![other],
     };
-
-    for try_tier in tier_chain {
-        let query = format!(
-            r#"SELECT provider, model FROM ai_price_catalog
-               WHERE is_enabled = TRUE
-                 AND performance_tier = $1
-                 AND capabilities @> $2::jsonb
-                 AND supports_tool_use = TRUE
-                 AND is_thinking = FALSE
-                 AND provider <> ALL($3)
-               ORDER BY {order_clause}
-               LIMIT 1"#
-        );
-
-        let row: Option<(String, String)> = sqlx::query_as(&query)
-            .bind(try_tier)
-            .bind(&capability_json)
-            .bind(&cooldown_providers)
-            .fetch_optional(db)
-            .await
-            .ok()
-            .flatten();
-
-        if let Some((provider, model)) = row {
-            let rationale = if try_tier == required_tier {
-                "catalog dynamic routing (tool-safe)"
-            } else {
-                "catalog dynamic routing (tool-safe, tier-degraded)"
-            };
-            return Some(DynamicRoutingDecision {
-                provider,
-                model,
-                rationale,
-            });
-        }
-    }
-
-    None
+    select_agentic_model(db, &tier_chain, Some(capability), 0, &[], order_clause)
+        .await
+        .map(|(provider, model)| DynamicRoutingDecision {
+            provider,
+            model,
+            rationale: "catalog dynamic routing (selettore agentico unico)",
+        })
 }
 
 /// Seleziona il miglior modello del catalog per un dato `tier`, opzionalmente
@@ -282,14 +240,26 @@ pub async fn best_model_for_tier(
     capability: Option<&str>,
     requires_tool_use: bool,
 ) -> Option<(String, String)> {
+    // Run AGENTICO (tool): delega al PUNTO UNICO di selezione (regola L), che
+    // applica l'eleggibilita' agentica + cooldown in un solo posto.
+    if requires_tool_use {
+        return select_agentic_model(
+            db,
+            &[tier],
+            capability,
+            0,
+            &[],
+            "is_featured DESC, input_cost_per_million_tokens ASC",
+        )
+        .await;
+    }
+
+    // Caso NON-agentico (es. purpose vision/chat/embedding): nessun filtro
+    // tool_use/policy; esclude comunque i provider in cooldown.
     let cooldown_providers: Vec<String> = crate::provider_cooldown::cooldown_snapshot()
         .into_iter()
         .map(|(name, _, _)| name)
         .collect();
-
-    // Costruzione dinamica dei placeholder: $1 = tier sempre presente.
-    // capability (se Some) e cooldown ottengono i numeri successivi in ordine,
-    // cosi' la posizione resta sempre coerente coi bind effettivi.
     let mut idx = 1; // $1 = tier
     let capability_json = capability.map(|c| format!("[\"{c}\"]"));
     let capability_predicate = if capability_json.is_some() {
@@ -297,15 +267,6 @@ pub async fn best_model_for_tier(
         format!("AND capabilities @> ${idx}::jsonb")
     } else {
         String::new()
-    };
-    // Quando si richiede il tool-use, il modello deve essere agentic-eligibile:
-    // tool-capable e NON 'exclude' (reasoning-only senza function calling, es.
-    // deepseek-reasoner). I dual-mode (deepseek-v4, claude, gemini-2.5) sono
-    // ammessi: l'adapter forza il non-thinking nei loop tool (ADR 0025).
-    let tool_use_predicate = if requires_tool_use {
-        "AND supports_tool_use = TRUE AND agentic_thinking_policy <> 'exclude'"
-    } else {
-        ""
     };
     idx += 1;
     let cooldown_idx = idx; // ultimo placeholder
@@ -315,7 +276,6 @@ pub async fn best_model_for_tier(
            WHERE is_enabled = TRUE
              AND performance_tier = $1
              {capability_predicate}
-             {tool_use_predicate}
              AND provider <> ALL(${cooldown_idx})
            ORDER BY is_featured DESC, input_cost_per_million_tokens ASC
            LIMIT 1"#
@@ -328,6 +288,98 @@ pub async fn best_model_for_tier(
     q = q.bind(&cooldown_providers);
 
     q.fetch_optional(db).await.ok().flatten()
+}
+
+/// PUNTO UNICO di selezione di un modello AGENTICO dal catalog (CLAUDE.md, regola L).
+///
+/// Tutte le selezioni/fallback di un modello per un run a tool DEVONO passare di
+/// qui: niente query SQL duplicate sparse (best_model_for_tier, cooldown-fallback,
+/// re-route context-aware, cascade, dynamic catalog) con filtri copiati a mano.
+///
+/// Eleggibilita' SEMPRE applicata (definita una volta sola):
+///   - `is_enabled = TRUE`
+///   - `supports_tool_use = TRUE`
+///   - `agentic_thinking_policy <> 'exclude'` (i dual-mode sono ammessi; l'adapter
+///     forza il non-thinking nei tool-loop, ADR 0025)
+///   - `consecutive_failures = 0` (modelli sani)
+///   - provider NON in cooldown (snapshot in-memory) e NON in `exclude_providers`
+///
+/// Filtri opzionali:
+///   - `tier_chain`: tier provati in ordine (degradazione); il primo tier con un
+///     match vince. `&[]` = qualunque tier (singola query, ordinata da `order_by`).
+///   - `capability`: `capabilities @> ["cap"]`.
+///   - `min_context_window`: `context_window >= N` (0 = nessun filtro).
+///   - `order_by`: clausola ORDER BY SQL (UNICA variazione per call site; valori
+///     costanti dal codice, mai input utente).
+pub(crate) async fn select_agentic_model(
+    db: &PgPool,
+    tier_chain: &[&str],
+    capability: Option<&str>,
+    min_context_window: i64,
+    exclude_providers: &[String],
+    order_by: &str,
+) -> Option<(String, String)> {
+    // Provider esclusi = cooldown (snapshot) + extra del chiamante, lowercase.
+    let mut excluded: Vec<String> = crate::provider_cooldown::cooldown_snapshot()
+        .into_iter()
+        .map(|(name, _, _)| name.to_lowercase())
+        .collect();
+    for p in exclude_providers {
+        let pl = p.to_lowercase();
+        if !excluded.contains(&pl) {
+            excluded.push(pl);
+        }
+    }
+
+    // Tier da provare: nessuno (None) oppure la chain in ordine.
+    let tiers: Vec<Option<&str>> = if tier_chain.is_empty() {
+        vec![None]
+    } else {
+        tier_chain.iter().map(|t| Some(*t)).collect()
+    };
+    let capability_json = capability.map(|c| format!("[\"{c}\"]"));
+
+    for tier in tiers {
+        // $1 = array provider esclusi (sempre). Placeholder successivi assegnati
+        // in ordine per tenere bind e SQL coerenti.
+        let mut idx = 1;
+        let mut sql = String::from(
+            "SELECT provider, model FROM ai_price_catalog \
+             WHERE is_enabled = TRUE \
+               AND supports_tool_use = TRUE \
+               AND agentic_thinking_policy <> 'exclude' \
+               AND consecutive_failures = 0 \
+               AND LOWER(provider) <> ALL($1)",
+        );
+        if tier.is_some() {
+            idx += 1;
+            sql.push_str(&format!(" AND performance_tier = ${idx}"));
+        }
+        if capability_json.is_some() {
+            idx += 1;
+            sql.push_str(&format!(" AND capabilities @> ${idx}::jsonb"));
+        }
+        if min_context_window > 0 {
+            idx += 1;
+            sql.push_str(&format!(" AND context_window >= ${idx}"));
+        }
+        sql.push_str(&format!(" ORDER BY {order_by} LIMIT 1"));
+
+        let mut q = sqlx::query_as::<_, (String, String)>(&sql).bind(&excluded);
+        if let Some(t) = tier {
+            q = q.bind(t);
+        }
+        if let Some(c) = capability_json.as_ref() {
+            q = q.bind(c);
+        }
+        if min_context_window > 0 {
+            q = q.bind(min_context_window);
+        }
+        if let Some(found) = q.fetch_optional(db).await.ok().flatten() {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// Route (intent, behavior_mode) -> (provider, model) consultando la matrice DB

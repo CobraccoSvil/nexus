@@ -808,45 +808,29 @@ impl Orchestrator {
                     None => ("light".to_string(), "chat".to_string()),
                 };
 
-                // Strategia: cerca nel catalogo un modello dello stesso tier (o un
-                // livello sotto) da un provider NON in cooldown. Mantiene la qualita'
-                // richiesta per il task — non degrada a default generico.
+                // Strategia: PUNTO UNICO di selezione agentica (regola L). Cerca
+                // un modello dello stesso tier (o degradato) da un provider NON in
+                // cooldown, mantenendo tier/capability del task. Eleggibilita' e
+                // cooldown sono definiti una sola volta in select_agentic_model.
                 let tiers_to_try: Vec<&str> = match tier.as_str() {
                     "heavy" => vec!["heavy", "medium"],
                     "medium" => vec!["medium"],
                     _ => vec!["light"],
                 };
-
-                let mut found = None;
-                for try_tier in &tiers_to_try {
-                    let rows: Vec<(String, String)> = sqlx::query_as(
-                        r#"SELECT provider, model FROM ai_price_catalog
-                       WHERE is_enabled = TRUE
-                         AND performance_tier = $1
-                         AND capabilities @> $2::jsonb
-                         AND supports_tool_use = TRUE
-                       ORDER BY input_cost_per_million_tokens ASC
-                       LIMIT 10"#,
-                    )
-                    .bind(try_tier)
-                    .bind(format!("[\"{cap}\"]"))
-                    .fetch_all(db)
-                    .await
-                    .unwrap_or_default();
-
-                    for (alt_provider, alt_model) in &rows {
-                        if !is_provider_in_cooldown(alt_provider) {
-                            tracing::info!(
-                            "Agent routing (cooldown-fallback tier-aware): {} → {}/{} (tier={})",
-                            provider, alt_provider, alt_model, try_tier
-                        );
-                            found = Some((alt_provider.clone(), alt_model.clone()));
-                            break;
-                        }
-                    }
-                    if found.is_some() {
-                        break;
-                    }
+                let found = select_agentic_model(
+                    db,
+                    &tiers_to_try,
+                    Some(&cap),
+                    0,
+                    &[],
+                    "input_cost_per_million_tokens ASC",
+                )
+                .await;
+                if let Some((ref alt_provider, ref alt_model)) = found {
+                    tracing::info!(
+                        "Agent routing (cooldown-fallback, selettore unico): {} → {}/{}",
+                        provider, alt_provider, alt_model
+                    );
                 }
 
                 // Ultimo resort: hierarchy classica (se il catalogo non ha nulla)
@@ -961,44 +945,29 @@ impl Orchestrator {
                             d.provider, d.model
                         );
                     }
-                    // Cerca nel catalogo un modello dello stesso tier (o inferiore)
-                    // da un provider NON in cooldown
+                    // PUNTO UNICO di selezione agentica (regola L): tier degradato,
+                    // provider non in cooldown, eleggibilita' definita una volta sola.
                     let tiers_to_try: Vec<&str> = match base_tier.as_str() {
                         "heavy" => vec!["heavy", "medium"],
                         "medium" => vec!["medium", "light"],
                         _ => vec!["light"],
                     };
-                    let mut catalog_alt = None;
-                    for try_tier in &tiers_to_try {
-                        let rows: Vec<(String, String)> = sqlx::query_as(
-                            r#"SELECT provider, model FROM ai_price_catalog
-                               WHERE is_enabled = TRUE
-                                 AND performance_tier = $1
-                                 AND capabilities @> $2::jsonb
-                                 AND supports_tool_use = TRUE
-                               ORDER BY input_cost_per_million_tokens ASC
-                               LIMIT 10"#,
-                        )
-                        .bind(try_tier)
-                        .bind(format!("[\"{capability}\"]"))
-                        .fetch_all(db)
-                        .await
-                        .unwrap_or_default();
-
-                        for (alt_p, alt_m) in &rows {
-                            if !is_provider_in_cooldown(alt_p) {
-                                tracing::info!(
-                                    "Dynamic catalog routing (cooldown-fallback tier-aware): → {}/{} (tier={})",
-                                    alt_p, alt_m, try_tier
-                                );
-                                catalog_alt = Some((Some(alt_p.clone()), Some(alt_m.clone())));
-                                break;
-                            }
-                        }
-                        if catalog_alt.is_some() {
-                            break;
-                        }
-                    }
+                    let catalog_alt = select_agentic_model(
+                        db,
+                        &tiers_to_try,
+                        Some(&capability),
+                        0,
+                        &[],
+                        "input_cost_per_million_tokens ASC",
+                    )
+                    .await
+                    .map(|(p, m)| {
+                        tracing::info!(
+                            "Dynamic catalog routing (cooldown-fallback, selettore unico): → {}/{}",
+                            p, m
+                        );
+                        (Some(p), Some(m))
+                    });
 
                     catalog_alt.unwrap_or_else(|| {
                         let (pref, thr) =

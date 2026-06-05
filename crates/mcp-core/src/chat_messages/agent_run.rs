@@ -1109,26 +1109,19 @@ pub(crate) async fn spawn_agent_run(
                 "agent_run {}: ctx insufficiente per primario {}/{} ({} < {}), cerco modello con ctx >= {}",
                 run_id, current_provider, current_model, primary_ctx, ctx_needed, ctx_needed
             );
-                // Il re-routing context-aware e' un path AGENTICO (loop a tool
-                // forzati): deve escludere i thinking model (is_thinking=true),
-                // altrimenti sceglie il piu' economico a grande contesto — spesso
-                // un reasoner come deepseek-v4-pro (128k) — che fallisce il loop
-                // (reasoning_content 400) e vanifica il capability gate (mig 0317/
-                // 0318, ADR 0024). Stesso filtro di best_model_for_tier.
-                let alt: Option<(String, String)> = sqlx::query_as::<_, (String, String)>(
-                    "SELECT provider, model FROM ai_price_catalog
-                  WHERE is_enabled=true AND supports_tool_use=true
-                    AND agentic_thinking_policy <> 'exclude'
-                    AND consecutive_failures=0
-                    AND context_window >= $1
-                  ORDER BY input_cost_per_million_tokens ASC NULLS LAST
-                  LIMIT 1",
+                // Re-routing context-aware: path AGENTICO. PUNTO UNICO di selezione
+                // (regola L): l'eleggibilita' agentica (tool_use, policy<>'exclude',
+                // consecutive_failures, cooldown) e' definita una sola volta in
+                // select_agentic_model. Vincolo extra: context_window >= ctx_needed.
+                let alt = crate::orchestrator::select_agentic_model(
+                    &db_clone,
+                    &[],
+                    None,
+                    ctx_needed,
+                    &[],
+                    "input_cost_per_million_tokens ASC NULLS LAST",
                 )
-                .bind(ctx_needed)
-                .fetch_optional(&db_clone)
-                .await
-                .ok()
-                .flatten();
+                .await;
                 if let Some((p, m)) = alt {
                     tracing::info!(
                         "agent_run {}: routing context-aware: {} -> {}/{}",
@@ -1458,48 +1451,29 @@ pub(crate) async fn spawn_agent_run(
                 let escalate_on_hollow = hollow_retry && fallback_attempt >= 1;
                 let next_pair: Option<(String, String)> = if escalate_on_hollow {
                     let tried_models: Vec<String> = tried.iter().cloned().collect();
-                    // Ordina i candidati in base alla "potenza" desumibile dal catalog:
-                    //   1. tier_rank: heavy(2) > medium(1) > light(0)
-                    //   2. input_cost_per_million_tokens desc (proxy di capacita')
-                    // Filtri:
-                    //   - is_enabled
-                    //   - supports_tool_use (l'intent richiede tool)
-                    //   - consecutive_failures = 0 (non ha gia' dato hollow di recente)
-                    //   - provider non gia' tried in questo run
-                    //   - provider non in cooldown billing/quota
-                    let candidates: Vec<(String, String, String)> =
-                        sqlx::query_as::<_, (String, String, String)>(
-                            "SELECT provider, model, performance_tier
-                       FROM ai_price_catalog
-                      WHERE is_enabled = true
-                        AND supports_tool_use = true
-                        AND agentic_thinking_policy <> 'exclude'
-                        AND consecutive_failures = 0
-                        AND NOT (provider = ANY($1))
-                        AND context_window >= $2
-                      ORDER BY CASE performance_tier
-                                 WHEN 'heavy' THEN 2
-                                 WHEN 'medium' THEN 1
-                                 ELSE 0
-                               END DESC,
-                               input_cost_per_million_tokens DESC NULLS LAST,
-                               output_cost_per_million_tokens DESC NULLS LAST",
-                        )
-                        .bind(&tried_models)
-                        .bind(ctx_needed)
-                        .fetch_all(&db_clone)
-                        .await
-                        .unwrap_or_default();
-                    // Primo candidato il cui provider non e' in cooldown
-                    candidates.into_iter().find(|(p, _, _)| {
-                    !crate::provider_cooldown::is_provider_in_cooldown(p)
-                }).map(|(p, m, tier)| {
-                    tracing::warn!(
-                        "agent_run {}: ESCALATION hollow ricorrente — salto a tier={} {}/{} (provider-agnostic)",
-                        run_id, tier, p, m
-                    );
-                    (p, m)
-                })
+                    // Escalation su hollow ricorrente: PUNTO UNICO di selezione
+                    // (regola L). Eleggibilita' agentica + cooldown definiti una
+                    // sola volta in select_agentic_model. Esclude i provider gia'
+                    // provati; preferisce i piu' "potenti" (tier desc, costo desc) e
+                    // con context_window sufficiente.
+                    crate::orchestrator::select_agentic_model(
+                        &db_clone,
+                        &[],
+                        None,
+                        ctx_needed,
+                        &tried_models,
+                        "CASE performance_tier WHEN 'heavy' THEN 2 WHEN 'medium' THEN 1 ELSE 0 END DESC, \
+                         input_cost_per_million_tokens DESC NULLS LAST, \
+                         output_cost_per_million_tokens DESC NULLS LAST",
+                    )
+                    .await
+                    .map(|(p, m)| {
+                        tracing::warn!(
+                            "agent_run {}: ESCALATION hollow ricorrente — salto a {}/{} (selettore unico)",
+                            run_id, p, m
+                        );
+                        (p, m)
+                    })
                 } else {
                     None
                 };
