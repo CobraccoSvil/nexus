@@ -144,7 +144,10 @@ pub async fn list_mcp_servers(
         let server_name = r.try_get::<String, _>("name").unwrap_or_default();
         let linked_templates = linked_by_server.get(&server_name).copied().unwrap_or(0);
         let srv_id: Uuid = r.try_get("id").unwrap_or(Uuid::nil());
-        s["tools"] = json!(list_cached_tools(&state.db, srv_id).await);
+        // Fix S82: propaga errore SQL invece di mascherarlo come "0 tool".
+        s["tools"] = json!(list_cached_tools(&state.db, srv_id)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?);
         s["linkedTemplatesCount"] = json!(linked_templates);
         servers.push(s);
     }
@@ -263,7 +266,10 @@ pub async fn test_mcp_server(
 
     // Builtin: return cached tools from DB
     if transport == "builtin" {
-        let tool_list = list_cached_tools_with_schema(&state.db, server_id).await;
+        // Fix S82: propaga errore SQL.
+        let tool_list = list_cached_tools_with_schema(&state.db, server_id)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         return Ok(Json(json!({
             "success": true,
             "toolCount": tool_list.len(),
@@ -278,7 +284,10 @@ pub async fn test_mcp_server(
         Ok(tools) => {
             // Save tool cache in DB (punto unico build_tool_upsert_args, S67).
             let tools_for_upsert = build_tool_upsert_args(&tools);
-            upsert_discovered_tools(&state.db, server_id, &tools_for_upsert).await;
+            // Fix S84: propaga errore SQL invece di mascherare.
+            upsert_discovered_tools(&state.db, server_id, &tools_for_upsert)
+                .await
+                .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
             // I tool del server potrebbero essere cambiati: riallinea le assegnazioni.
             trigger_prompt_template_tool_reassignment().await;

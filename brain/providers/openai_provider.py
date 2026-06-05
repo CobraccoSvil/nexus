@@ -507,74 +507,11 @@ class OpenAIProvider(BaseProvider, ApiKeyClientMixin):
             return {"provider": self.name, "status": "error", "reason": info["message"], "error_class": info["stop_reason"]}
 
 
-def _anthropic_tool_to_openai(tool: dict) -> dict:
-    """Converte un tool definition Anthropic nel formato OpenAI function.
-
-    Applica anche la compressione dello schema (BP6 piano riduzione token):
-    rimuove additionalProperties/$schema/examples, tronca description e enum.
-    """
-    from ._schema_utils import compress_schema, _truncate_text, DEFAULT_TOOL_DESCR_MAX
-
-    raw_schema = tool.get("input_schema", {"type": "object", "properties": {}})
-    return {
-        "type": "function",
-        "function": {
-            "name": tool["name"],
-            "description": _truncate_text(tool.get("description", ""), DEFAULT_TOOL_DESCR_MAX),
-            "parameters": compress_schema(raw_schema),
-        },
-    }
-
-
-def _convert_messages_to_openai(messages: list[dict]) -> list[dict]:
-    """Converte messaggi in formato Anthropic (con tool_use/tool_result) in formato OpenAI."""
-    import json as _json
-    result = []
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-
-        if isinstance(content, str):
-            result.append({"role": role, "content": content})
-        elif isinstance(content, list):
-            # Blocchi misti testo/tool_use/tool_result
-            text_parts: list[str] = []
-            tool_calls: list[dict] = []
-            tool_results: list[dict] = []
-
-            for block in content:
-                btype = block.get("type")
-                if btype == "text":
-                    text_parts.append(block.get("text", ""))
-                elif btype == "tool_use":
-                    tool_calls.append({
-                        "id": block["id"],
-                        "type": "function",
-                        "function": {
-                            "name": block["name"],
-                            "arguments": _json.dumps(block.get("input", {})),
-                        },
-                    })
-                elif btype == "tool_result":
-                    tool_results.append({
-                        "role": "tool",
-                        "tool_call_id": block["tool_use_id"],
-                        "content": block.get("content", ""),
-                    })
-
-            if tool_results:
-                result.extend(tool_results)
-            elif tool_calls:
-                oai_msg: dict[str, Any] = {"role": "assistant"}
-                if text_parts:
-                    oai_msg["content"] = " ".join(text_parts)
-                else:
-                    oai_msg["content"] = None
-                oai_msg["tool_calls"] = tool_calls
-                result.append(oai_msg)
-            else:
-                result.append({"role": role, "content": " ".join(text_parts)})
-        else:
-            result.append({"role": role, "content": str(content)})
-
-    return result
+# _anthropic_tool_to_openai e _convert_messages_to_openai vivono in adapter_base
+# (regola L / ADR 0026, S80: prima la dipendenza era invertita - adapter_base
+# layer-basso che importava da openai_provider layer-alto). Re-export per
+# retrocompatibilita' dei call site esistenti (deepseek_provider, mistral_provider).
+from .adapter_base import (  # noqa: E402,F401
+    anthropic_tool_to_openai as _anthropic_tool_to_openai,
+    convert_messages_to_openai as _convert_messages_to_openai,
+)

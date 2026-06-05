@@ -278,32 +278,28 @@ pub async fn apply_update_and_fetch(
             .bind(server_id)
             .bind(name)
             .execute(db)
-            .await
-            .ok();
+            .await?;
     }
     if let Some(desc) = &body.description {
         sqlx::query("UPDATE mcp_servers SET description=$2, updated_at=NOW() WHERE id=$1")
             .bind(server_id)
             .bind(desc)
             .execute(db)
-            .await
-            .ok();
+            .await?;
     }
     if let Some(url) = &body.url {
         sqlx::query("UPDATE mcp_servers SET url=$2, updated_at=NOW() WHERE id=$1")
             .bind(server_id)
             .bind(url)
             .execute(db)
-            .await
-            .ok();
+            .await?;
     }
     if let Some(cmd) = &body.command {
         sqlx::query("UPDATE mcp_servers SET command=$2, updated_at=NOW() WHERE id=$1")
             .bind(server_id)
             .bind(cmd)
             .execute(db)
-            .await
-            .ok();
+            .await?;
     }
     if let Some(args) = &body.args {
         let v = json!(args);
@@ -311,8 +307,7 @@ pub async fn apply_update_and_fetch(
             .bind(server_id)
             .bind(v)
             .execute(db)
-            .await
-            .ok();
+            .await?;
     }
     if let Some(env) = &body.env_vars {
         let v = json!(env);
@@ -320,8 +315,7 @@ pub async fn apply_update_and_fetch(
             .bind(server_id)
             .bind(v)
             .execute(db)
-            .await
-            .ok();
+            .await?;
     }
     if let Some(headers) = &body.headers {
         let v = json!(headers);
@@ -329,16 +323,14 @@ pub async fn apply_update_and_fetch(
             .bind(server_id)
             .bind(v)
             .execute(db)
-            .await
-            .ok();
+            .await?;
     }
     if let Some(enabled) = body.enabled {
         sqlx::query("UPDATE mcp_servers SET enabled=$2, updated_at=NOW() WHERE id=$1")
             .bind(server_id)
             .bind(enabled)
             .execute(db)
-            .await
-            .ok();
+            .await?;
     }
 
     sqlx::query(
@@ -410,23 +402,29 @@ pub async fn fetch_server_for_test(
 }
 
 /// Lista i tool cached completi (con `input_schema`) per il path `builtin` di
-/// `test_mcp_server`. Ritorna shape JSON pronta per la response.
-pub async fn list_cached_tools_with_schema(db: &PgPool, server_id: Uuid) -> Vec<Value> {
-    sqlx::query(
+/// `test_mcp_server`. Propaga l'errore SQL al chiamante (fix S82, regola H):
+/// l'originale aveva `unwrap_or_default()` che mascherava errori DB facendo
+/// vedere "0 tool" anche quando il problema era il DB irraggiungibile o uno
+/// schema rotto - bug latente cementato dal consolidamento.
+pub async fn list_cached_tools_with_schema(
+    db: &PgPool,
+    server_id: Uuid,
+) -> Result<Vec<Value>, sqlx::Error> {
+    let rows = sqlx::query(
         "SELECT tool_name, description, input_schema FROM mcp_server_tools WHERE server_id=$1 ORDER BY tool_name",
     )
     .bind(server_id)
     .fetch_all(db)
-    .await
-    .unwrap_or_default()
-    .iter()
-    .map(|r| {
-        let tool_name: String = r.try_get("tool_name").unwrap_or_default();
-        let description: Option<String> = r.try_get("description").unwrap_or(None);
-        let input_schema: Value = r.try_get::<Value, _>("input_schema").unwrap_or(json!({}));
-        json!({ "name": tool_name, "description": description, "inputSchema": input_schema })
-    })
-    .collect()
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let tool_name: String = r.try_get("tool_name").unwrap_or_default();
+            let description: Option<String> = r.try_get("description").unwrap_or(None);
+            let input_schema: Value = r.try_get::<Value, _>("input_schema").unwrap_or(json!({}));
+            json!({ "name": tool_name, "description": description, "inputSchema": input_schema })
+        })
+        .collect())
 }
 
 /// Trasforma una `Vec<McpTool>` (output di `list_tools`) nel formato atteso
@@ -446,15 +444,18 @@ pub fn build_tool_upsert_args(tools: &[crate::McpTool]) -> Vec<(String, Option<S
         .collect()
 }
 
-/// UPSERT in `mcp_server_tools` per i tool scoperti dal test (best-effort: gli
-/// errori per-tool vengono ignorati). Usata dopo `list_tools()` di un server reale.
+/// UPSERT in `mcp_server_tools` per i tool scoperti dal test. Propaga il
+/// primo errore SQL (fix S84, regola H): prima `let _ = ... .await;` ingoiava
+/// ogni errore tool-per-tool, il chiamante credeva di aver aggiornato la cache
+/// mentre in realta' la lista era stale. Ora se UPSERT fallisce, l'admin lo
+/// vede subito invece di scoprirlo a runtime.
 pub async fn upsert_discovered_tools(
     db: &PgPool,
     server_id: Uuid,
     tools: &[(String, Option<String>, Value)],
-) {
+) -> Result<(), sqlx::Error> {
     for (name, description, schema) in tools {
-        let _ = sqlx::query(
+        sqlx::query(
             "INSERT INTO mcp_server_tools (server_id, tool_name, description, input_schema, discovered_at)
              VALUES ($1,$2,$3,$4,NOW())
              ON CONFLICT (server_id, tool_name) DO UPDATE
@@ -465,29 +466,31 @@ pub async fn upsert_discovered_tools(
         .bind(description)
         .bind(schema)
         .execute(db)
-        .await;
+        .await?;
     }
+    Ok(())
 }
 
 /// SELECT tool_name, description FROM mcp_server_tools WHERE server_id=$1 ORDER BY tool_name.
 /// Ritorna i tool cached con shape JSON `{name, description}` pronto per la response.
+/// Propaga l'errore SQL (fix S82, stessa motivazione di `list_cached_tools_with_schema`).
 pub async fn list_cached_tools(
     db: &PgPool,
     server_id: Uuid,
-) -> Vec<Value> {
-    sqlx::query(
+) -> Result<Vec<Value>, sqlx::Error> {
+    let rows = sqlx::query(
         "SELECT tool_name, description FROM mcp_server_tools WHERE server_id = $1 ORDER BY tool_name",
     )
     .bind(server_id)
     .fetch_all(db)
-    .await
-    .unwrap_or_default()
-    .iter()
-    .map(|t| {
-        json!({
-            "name": t.try_get::<String, _>("tool_name").unwrap_or_default(),
-            "description": t.try_get::<Option<String>, _>("description").unwrap_or(None),
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.try_get::<String, _>("tool_name").unwrap_or_default(),
+                "description": t.try_get::<Option<String>, _>("description").unwrap_or(None),
+            })
         })
-    })
-    .collect()
+        .collect())
 }

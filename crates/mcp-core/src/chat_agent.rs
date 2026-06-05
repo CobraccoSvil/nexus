@@ -24,15 +24,18 @@ use crate::{
 /// Fetch dei step di un agent_run come array JSON pronto per la response.
 /// Punto unico (regola L, S36) per il blocco SELECT + mapping duplicato fra
 /// `get_active_run` e `get_agent_run`.
-async fn fetch_agent_steps_json(db: &sqlx::PgPool, run_id: Uuid) -> Vec<Value> {
-    sqlx::query(
+async fn fetch_agent_steps_json(
+    db: &sqlx::PgPool,
+    run_id: Uuid,
+) -> Result<Vec<Value>, sqlx::Error> {
+    let rows = sqlx::query(
         "SELECT id, run_id, step_index, tool_name, tool_input, tool_result, status, created_at
          FROM agent_steps WHERE run_id = $1 ORDER BY step_index ASC",
     )
     .bind(run_id)
     .fetch_all(db)
-    .await
-    .unwrap_or_default()
+    .await?;
+    Ok(rows
     .iter()
     .map(|r| {
         json!({
@@ -45,7 +48,7 @@ async fn fetch_agent_steps_json(db: &sqlx::PgPool, run_id: Uuid) -> Vec<Value> {
             "createdAt": r.try_get::<DateTime<Utc>, _>("created_at").ok().map(|v| v.to_rfc3339()),
         })
     })
-    .collect()
+    .collect())
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,7 +236,10 @@ pub async fn get_active_run_for_session(
 
     let run_id: Uuid = run.try_get("id").unwrap_or(Uuid::nil());
 
-    let steps = fetch_agent_steps_json(&state.db, run_id).await;
+    // Fix S85: propaga errore SQL invece di mascherarlo come "0 steps".
+    let steps = fetch_agent_steps_json(&state.db, run_id)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let pending: Value = run
         .try_get::<Option<Value>, _>("pending_actions_json")
@@ -287,7 +293,10 @@ pub async fn get_agent_run(
         return Err(api_error(StatusCode::FORBIDDEN, "Run non accessibile"));
     }
 
-    let steps = fetch_agent_steps_json(&state.db, run_id).await;
+    // Fix S85: propaga errore SQL invece di mascherarlo come "0 steps".
+    let steps = fetch_agent_steps_json(&state.db, run_id)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let pending: Value = run
         .try_get::<Option<Value>, _>("pending_actions_json")

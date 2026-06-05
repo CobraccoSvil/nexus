@@ -46,7 +46,10 @@ pub async fn list_project_members(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let members = nexus_types::admin_dto::fetch_project_members(&state.db, project_uuid).await;
+    // Fix bug latente S81: propagare errore SQL invece di mascherarlo (regola H).
+    let members = nexus_types::admin_dto::fetch_project_members(&state.db, project_uuid)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(ListProjectMembersResponse {
         project_id,

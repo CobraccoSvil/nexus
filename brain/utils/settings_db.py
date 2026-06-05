@@ -19,11 +19,48 @@ regola L / ADR 0026). Niente connection string copiata qui.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from brain.utils.db_pool import DbUrlUnavailable, connect, get_db_url  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+
+def parse_typed_settings(
+    rows: dict[str, str],
+    defaults: dict[str, Any],
+    log_prefix: str = "settings",
+) -> dict[str, Any]:
+    """Per ogni key in `defaults`, prende il raw da `rows` e lo coerce al tipo
+    del default (bool/float/int/str). Se la conversione fallisce o il raw e'
+    vuoto, ritorna il default. Punto unico (regola L / ADR 0026, S77): prima
+    duplicato in `agents/reflection_config.py` e `agents/thinking_config.py`.
+
+    Bool: 'true'/'1'/'yes' (case-insensitive). Float: float(raw). Int: int(raw).
+    Altro: str(raw).strip().
+    """
+    result: dict[str, Any] = {}
+    for key, safe_val in defaults.items():
+        raw = rows.get(key, "")
+        if not raw:
+            result[key] = safe_val
+            continue
+        try:
+            if isinstance(safe_val, bool):
+                result[key] = raw.strip().lower() in ("true", "1", "yes")
+            elif isinstance(safe_val, float):
+                result[key] = float(raw.strip())
+            elif isinstance(safe_val, int):
+                result[key] = int(raw.strip())
+            else:
+                result[key] = raw.strip()
+        except (ValueError, TypeError):
+            logger.warning(
+                "%s: valore non valido per '%s': '%s', uso default",
+                log_prefix, key, raw,
+            )
+            result[key] = safe_val
+    return result
 
 
 def _read_setting_raw(key: str) -> Optional[str]:

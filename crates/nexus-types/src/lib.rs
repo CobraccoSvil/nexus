@@ -99,13 +99,24 @@ pub async fn ensure_projects_base_root(db: &PgPool) {
         .map(|path| path.to_string_lossy().to_string());
 
     if let Some(root_value) = default_root {
-        let _ = sqlx::query(
+        // Fix S86: l'errore SQL prima veniva ingoiato con `let _ = ...await;`.
+        // Ora viene loggato (regola H): se l'UPDATE fallisce, `projects_base_root`
+        // resta vuoto e tutti i nuovi progetti finiscono in un default hardcoded
+        // di nascosto. Almeno con tracing::warn l'admin lo vede subito.
+        if let Err(e) = sqlx::query(
             "UPDATE settings SET value = $1, updated_at = NOW() \
              WHERE key = 'projects_base_root' AND (value IS NULL OR btrim(value) = '')",
         )
         .bind(root_value)
         .execute(db)
-        .await;
+        .await
+        {
+            tracing::warn!(
+                "ensure_projects_base_root: UPDATE settings fallito ({}). \
+                 projects_base_root potrebbe restare vuoto.",
+                e
+            );
+        }
     }
 }
 

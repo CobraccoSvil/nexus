@@ -30,6 +30,119 @@ logger = logging.getLogger(__name__)
 _NATURAL_STOPS = {"end_turn", "stop", "", None}
 
 
+def anthropic_tool_to_openai(tool: dict) -> dict:
+    """Converte un tool definition Anthropic nel formato OpenAI function.
+    Applica anche la compressione dello schema (BP6 piano riduzione token).
+
+    Punto unico (regola L / ADR 0026, S80): prima viveva in
+    `openai_provider._anthropic_tool_to_openai`, ma quel collocamento creava
+    una dipendenza inversa (adapter_base layer-basso ↔ openai_provider
+    layer-alto). Ora vive qui dove appartiene.
+    """
+    from ._schema_utils import compress_schema, _truncate_text, DEFAULT_TOOL_DESCR_MAX
+
+    raw_schema = tool.get("input_schema", {"type": "object", "properties": {}})
+    return {
+        "type": "function",
+        "function": {
+            "name": tool["name"],
+            "description": _truncate_text(tool.get("description", ""), DEFAULT_TOOL_DESCR_MAX),
+            "parameters": compress_schema(raw_schema),
+        },
+    }
+
+
+def convert_messages_to_openai(messages: list[dict]) -> list[dict]:
+    """Converte messaggi in formato Anthropic (con tool_use/tool_result) in
+    formato OpenAI. Punto unico (regola L / ADR 0026, S80) usato da tutti gli
+    adapter OpenAI-compatible (openai, deepseek, mistral)."""
+    import json as _json
+
+    result: list[dict] = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+
+        if isinstance(content, str):
+            result.append({"role": role, "content": content})
+        elif isinstance(content, list):
+            text_parts: list[str] = []
+            tool_calls: list[dict] = []
+            tool_results: list[dict] = []
+
+            for block in content:
+                btype = block.get("type")
+                if btype == "text":
+                    text_parts.append(block.get("text", ""))
+                elif btype == "tool_use":
+                    tool_calls.append({
+                        "id": block["id"],
+                        "type": "function",
+                        "function": {
+                            "name": block["name"],
+                            "arguments": _json.dumps(block.get("input", {})),
+                        },
+                    })
+                elif btype == "tool_result":
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": block["tool_use_id"],
+                        "content": block.get("content", ""),
+                    })
+
+            if tool_results:
+                result.extend(tool_results)
+            elif tool_calls:
+                oai_msg: dict[str, Any] = {"role": "assistant"}
+                if text_parts:
+                    oai_msg["content"] = " ".join(text_parts)
+                else:
+                    oai_msg["content"] = None
+                oai_msg["tool_calls"] = tool_calls
+                result.append(oai_msg)
+            else:
+                result.append({"role": role, "content": " ".join(text_parts)})
+        else:
+            result.append({"role": role, "content": str(content)})
+
+    return result
+
+
+def prepare_openai_compat_request(
+    provider_name: str,
+    model: str,
+    max_tokens: int,
+    messages: list[dict],
+    system_text: str | None,
+) -> tuple[ProviderCapability | None, list[dict], int]:
+    """Pre-processing condiviso dei `generate_agent_turn` OpenAI-compatible:
+    carica la capability del modello, risolve `max_tokens`, converte i messages
+    nel formato OpenAI e inserisce il `system_text` in testa. Punto unico
+    (regola L / ADR 0026, S78): prima duplicato in `deepseek_provider` e
+    `mistral_provider`.
+
+    Ritorna ``(cap, oai_messages, max_tokens_risolto)``. Capability=None se la
+    lookup fallisce (loggato come WARNING, i parametri richiesti vengono usati
+    cosi' come sono).
+    """
+    from .capability_loader import load_capability
+
+    cap: ProviderCapability | None = None
+    try:
+        cap = load_capability(provider_name, model)
+        max_tokens = resolve_max_tokens(cap, max_tokens)
+    except Exception as cap_err:  # noqa: BLE001
+        logger.warning(
+            "capability %s/%s non disponibile (%s): uso parametri richiesti",
+            provider_name, model, cap_err,
+        )
+        cap = None
+    oai_messages = convert_messages_to_openai(messages)
+    if system_text:
+        oai_messages.insert(0, {"role": "system", "content": system_text})
+    return cap, oai_messages, max_tokens
+
+
 def resolve_max_tokens(cap: ProviderCapability, requested: int = 0) -> int:
     """max_tokens effettivi: il richiesto limitato al tetto hard del modello,
     oppure il default del modello se non richiesto. Niente costanti hardcoded."""

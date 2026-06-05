@@ -10,6 +10,9 @@ use serde_json::{json, Value};
 
 pub struct DockerLogsTool;
 
+// Helper: punto unico in docker_helpers (regola L, S79).
+use super::docker_helpers::{extract_container_and_slug, fetch_container_compose_project};
+
 const PROTECTED_PREFIX: &str = "ideai-";
 
 fn validate_not_protected(name: &str) -> Result<(), NexusToolError> {
@@ -22,26 +25,14 @@ fn validate_not_protected(name: &str) -> Result<(), NexusToolError> {
     Ok(())
 }
 
-/// Verifica che il container abbia la label del progetto corrente.
+/// Verifica che il container abbia la label del progetto corrente (msg verbose
+/// con label='...' atteso='...' per il debug dei log).
 async fn verify_container_label(
     name: &str,
     slug: &str,
     project_root: &std::path::Path,
 ) -> Result<(), NexusToolError> {
-    let out = exec::run_cmd(
-        "docker",
-        &[
-            "inspect",
-            "--format",
-            "{{index .Config.Labels \"com.docker.compose.project\"}}",
-            name,
-        ],
-        project_root,
-        10,
-    )
-    .await?;
-
-    let container_slug = out.stdout.trim();
+    let container_slug = fetch_container_compose_project(name, project_root).await?;
     if container_slug != slug {
         return Err(NexusToolError::BadInput(format!(
             "Container '{}' non appartiene al progetto corrente (label='{}', atteso='{}')",
@@ -54,25 +45,9 @@ async fn verify_container_label(
 #[async_trait]
 impl NexusToolHandler for DockerLogsTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let container = args
-            .get("container")
-            .and_then(Value::as_str)
-            .ok_or_else(|| NexusToolError::BadInput("Parametro 'container' obbligatorio".into()))?
-            .trim()
-            .to_string();
-
-        if container.is_empty() {
-            return Err(NexusToolError::BadInput("Nome container vuoto".into()));
-        }
-
+        // Punto unico extract_container_and_slug (regola L, S79).
+        let (container, slug) = extract_container_and_slug(ctx, args)?;
         validate_not_protected(&container)?;
-
-        let slug = ctx
-            .project_root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| ctx.project_id.to_string());
-
         verify_container_label(&container, &slug, &ctx.project_root).await?;
 
         let tail = args.get("tail").and_then(Value::as_u64).unwrap_or(100);

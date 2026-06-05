@@ -187,46 +187,47 @@ pub async fn fetch_all_projects_summary(
         .collect())
 }
 
-/// SELECT membri di un progetto (join con users), best-effort: ritorna vec vuoto
-/// su errore SQL. Punto unico per `list_project_members` admin.
-pub async fn fetch_project_members(db: &PgPool, project_uuid: Uuid) -> Vec<ProjectMemberResponse> {
-    sqlx::query_as::<
-        _,
-        (
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-            String,
-        ),
-    >(
-        r#"
-        SELECT u.id, u.email, u.display_name, u.github_username, u.avatar_url, pm.role, pm.created_at::text
-        FROM project_members pm
-        JOIN users u ON pm.user_id = u.id
-        WHERE pm.project_id = $1 AND u.deleted_at IS NULL
-        ORDER BY pm.created_at DESC
-        "#,
-    )
-    .bind(project_uuid)
-    .fetch_all(db)
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .map(
-        |(user_id, email, display_name, github_username, avatar_url, role, created_at)| {
-            ProjectMemberResponse {
-                user_id,
-                email,
-                display_name,
-                github_username,
-                avatar_url,
-                role,
-                created_at,
-            }
-        },
-    )
-    .collect()
+/// SELECT membri di un progetto (join con users). Propaga l'errore SQL al
+/// chiamante (regola H: fail-loud invece di ingoiare). Punto unico per
+/// `list_project_members` admin.
+///
+/// NOTA: l'originale (sia in mcp-core sia in admin-service) usava
+/// `.unwrap_or_default()` mascherando errori DB. Spostato qui nel punto unico,
+/// quella semantica era un bug latente: l'admin vedeva "nessun membro" sia
+/// per progetti realmente vuoti sia quando il DB era irraggiungibile o la
+/// query falliva. Ora il chiamante DEVE propagare l'errore (es. HTTP 500).
+pub async fn fetch_project_members(
+    db: &PgPool,
+    project_uuid: Uuid,
+) -> Result<Vec<ProjectMemberResponse>, sqlx::Error> {
+    let rows: Vec<(String, String, String, Option<String>, Option<String>, String, String)> =
+        sqlx::query_as(
+            r#"
+            SELECT u.id, u.email, u.display_name, u.github_username, u.avatar_url, pm.role, pm.created_at::text
+            FROM project_members pm
+            JOIN users u ON pm.user_id = u.id
+            WHERE pm.project_id = $1 AND u.deleted_at IS NULL
+            ORDER BY pm.created_at DESC
+            "#,
+        )
+        .bind(project_uuid)
+        .fetch_all(db)
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(user_id, email, display_name, github_username, avatar_url, role, created_at)| {
+                ProjectMemberResponse {
+                    user_id,
+                    email,
+                    display_name,
+                    github_username,
+                    avatar_url,
+                    role,
+                    created_at,
+                }
+            },
+        )
+        .collect())
 }

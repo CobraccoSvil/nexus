@@ -95,7 +95,10 @@ pub async fn list_mcp_servers(
     for r in &rows {
         let mut s = row_to_json(r, can_manage_server(r, user_id, &claims.role));
         let srv_id: Uuid = r.try_get("id").unwrap_or(Uuid::nil());
-        s["tools"] = json!(list_cached_tools(&state.db, srv_id).await);
+        // Fix S82: propaga errore SQL invece di mascherarlo come "0 tool".
+        s["tools"] = json!(list_cached_tools(&state.db, srv_id)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?);
         servers.push(s);
     }
 
@@ -210,7 +213,10 @@ pub async fn test_mcp_server(
 
     // Per il server builtin: restituisce i tool già cached nel DB senza chiamate esterne
     if transport == "builtin" {
-        let tool_list = list_cached_tools_with_schema(&state.db, server_id).await;
+        // Fix S82: propaga errore SQL.
+        let tool_list = list_cached_tools_with_schema(&state.db, server_id)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         return Ok(Json(json!({
             "success": true,
             "toolCount": tool_list.len(),
@@ -225,7 +231,10 @@ pub async fn test_mcp_server(
         Ok(tools) => {
             // Salva/aggiorna tool cache nel DB (punto unico build_tool_upsert_args, S67).
             let tools_for_upsert = build_tool_upsert_args(&tools);
-            upsert_discovered_tools(&state.db, server_id, &tools_for_upsert).await;
+            // Fix S84: propaga errore SQL invece di mascherare.
+            upsert_discovered_tools(&state.db, server_id, &tools_for_upsert)
+                .await
+                .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
             // Indicizzazione semantica Qdrant (fire-and-forget)
             {

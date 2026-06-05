@@ -111,21 +111,11 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
             )
         try:
             client = self._get_client()
-            cap = None
-            try:
-                from .capability_loader import load_capability
-                from .adapter_base import resolve_max_tokens
-                cap = load_capability(self.name, model)
-                max_tokens = resolve_max_tokens(cap, max_tokens)
-            except Exception as _cap_err:
-                logger.warning(
-                    "capability %s/%s non disponibile (%s): uso parametri richiesti",
-                    self.name, model, _cap_err,
-                )
-                cap = None
-            oai_messages = _convert_messages_to_openai(messages)
-            if system_text:
-                oai_messages.insert(0, {"role": "system", "content": system_text})
+            # Punto unico prepare_openai_compat_request (regola L, S78).
+            from .adapter_base import prepare_openai_compat_request
+            cap, oai_messages, max_tokens = prepare_openai_compat_request(
+                self.name, model, max_tokens, messages, system_text,
+            )
 
             # I modelli reasoning (deepseek-reasoner / R1) non supportano tool calling
             # e non accettano temperature.

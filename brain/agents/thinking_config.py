@@ -74,29 +74,9 @@ def _load_from_db() -> dict[str, Any]:
         logger.error("thinking_config: errore lettura DB: %s", exc)
         return dict(_cache)  # mantiene valori precedenti in caso di errore transitorio
 
-    result: dict[str, Any] = {}
-    for key, safe_val in _SAFE_DEFAULTS.items():
-        raw = rows.get(key, "")
-        if not raw:
-            result[key] = safe_val
-            continue
-        try:
-            if isinstance(safe_val, bool):
-                result[key] = raw.strip().lower() in ("true", "1", "yes")
-            elif isinstance(safe_val, float):
-                result[key] = float(raw.strip())
-            elif isinstance(safe_val, int):
-                result[key] = int(raw.strip())
-            else:
-                result[key] = raw.strip()
-        except (ValueError, TypeError):
-            logger.warning(
-                "thinking_config: valore non valido per '%s': '%s', uso default",
-                key, raw,
-            )
-            result[key] = safe_val
-
-    return result
+    # Punto unico parse_typed_settings (regola L, S77).
+    from brain.utils.settings_db import parse_typed_settings
+    return parse_typed_settings(rows, _SAFE_DEFAULTS, "thinking_config")
 
 
 def _refresh_if_stale() -> None:

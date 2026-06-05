@@ -10,8 +10,11 @@ use serde_json::{json, Value};
 
 pub struct DockerStopTool;
 
-// Helper container: punto unico in nexus_tools::docker_helpers (regola L, S43).
-use super::docker_helpers::{validate_not_protected_with_verb, verify_container_label_with_action};
+// Helper container: punto unico in nexus_tools::docker_helpers (regola L, S43/S79).
+use super::docker_helpers::{
+    extract_container_and_slug, validate_not_protected_with_verb,
+    verify_container_label_with_action,
+};
 
 fn validate_not_protected(name: &str) -> Result<(), NexusToolError> {
     validate_not_protected_with_verb(name, "fermarlo da agenti progetto")
@@ -28,25 +31,9 @@ async fn verify_container_label(
 #[async_trait]
 impl NexusToolHandler for DockerStopTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let container = args
-            .get("container")
-            .and_then(Value::as_str)
-            .ok_or_else(|| NexusToolError::BadInput("Parametro 'container' obbligatorio".into()))?
-            .trim()
-            .to_string();
-
-        if container.is_empty() {
-            return Err(NexusToolError::BadInput("Nome container vuoto".into()));
-        }
-
+        // Punto unico extract_container_and_slug (regola L, S79).
+        let (container, slug) = extract_container_and_slug(ctx, args)?;
         validate_not_protected(&container)?;
-
-        let slug = ctx
-            .project_root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| ctx.project_id.to_string());
-
         verify_container_label(&container, &slug, &ctx.project_root).await?;
 
         let timeout_str = args
