@@ -229,7 +229,12 @@ export function AgentMetaStepCard({ data }: { data: AgentMetaStepData }) {
       >
         <span aria-hidden className="font-mono">{open ? "▾" : "▸"}</span>
         <span aria-hidden className="font-mono">{desc.icon}</span>
-        <span className="font-medium">{desc.label}</span>
+        {/* Per i tool il label "Tool" e' ridondante: il nome del tool (read_file,
+            write_file, ...) e' gia' autoesplicativo. Per gli altri kind (Piano,
+            Routing, Fallback, ...) il label resta utile a distinguerli. */}
+        {data.kind !== "tool_executed" && (
+          <span className="font-medium">{desc.label}</span>
+        )}
         <span className="opacity-70 truncate text-left flex-1">{displayTitle}</span>
         {showBadge && <ProviderBadge provider={provider} model={model} />}
       </button>
