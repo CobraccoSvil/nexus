@@ -15,7 +15,7 @@ def _is_deepseek_reasoning(model: str) -> bool:
     model_lower = model.lower()
     return model_lower in _DEEPSEEK_REASONING_MODELS or "deepseek-r" in model_lower
 
-from .base import BaseProvider, ProviderCatalogEntry, ProviderResult
+from .base import ApiKeyClientMixin, BaseProvider, ProviderCatalogEntry, ProviderResult
 from .error_handler import format_error_result
 from .openai_provider import _anthropic_tool_to_openai, _convert_messages_to_openai
 from ._schema_utils import compress_tool_list
@@ -25,40 +25,26 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://api.deepseek.com/v1"
 
 
-class DeepSeekProvider(BaseProvider):
+class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
+    """Provider DeepSeek (OpenAI-compatible endpoint).
+
+    La gestione API key + client cacheato vive nel mixin
+    ``ApiKeyClientMixin`` (punto unico, regola L / ADR 0026, Wave C3).
+    """
+
     name = "deepseek"
 
     def __init__(self) -> None:
-        # API key letta dal DB con cache 60s. Vedi api_key_loader.py.
-        from .api_key_loader import load_api_key
-        self._api_key_provider = lambda: load_api_key(self.name)
-        self._client: Any | None = None
-        self._cached_key: str = ""
+        self._init_api_key_cache()
 
-    @property
-    def _api_key(self) -> str:
-        new_key = self._api_key_provider()
-        if new_key != self._cached_key:
-            self._cached_key = new_key
-            self._client = None
-        return new_key
+    def _create_client(self, api_key: str) -> Any:
+        from openai import AsyncOpenAI
+        from .dns_transport import get_global_dns_transport
+        import httpx
 
-    @_api_key.setter
-    def _api_key(self, value: str) -> None:
-        from .api_key_loader import invalidate_cache
-        invalidate_cache(self.name)
-        self._cached_key = value or ""
-        self._client = None
-
-    def _get_client(self) -> Any:
-        if self._client is None:
-            from openai import AsyncOpenAI
-            from .dns_transport import get_global_dns_transport
-            import httpx
-            transport = get_global_dns_transport()
-            http_client = httpx.AsyncClient(transport=transport) if transport is not None else None
-            self._client = AsyncOpenAI(api_key=self._api_key, base_url=BASE_URL, http_client=http_client)
-        return self._client
+        transport = get_global_dns_transport()
+        http_client = httpx.AsyncClient(transport=transport) if transport is not None else None
+        return AsyncOpenAI(api_key=api_key, base_url=BASE_URL, http_client=http_client)
 
     def list_models(self) -> list[ProviderCatalogEntry]:
         # Lista modelli letta da DB (ai_price_catalog) con cache 60s.

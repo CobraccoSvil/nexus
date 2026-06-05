@@ -12,15 +12,13 @@
 //!   `load_mcp_tools_for_agent()` → carica tool definitions dai server abilitati
 //!   `execute_mcp_tool()`         → esegue un tool su un server esterno
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use axum::{
     extract::{Extension, Path as AxumPath, State},
     http::StatusCode,
     Json,
 };
-use chrono::{DateTime, Utc};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
@@ -32,78 +30,12 @@ use crate::{
     AppState,
 };
 
-// ── Request/Response types ─────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateMcpServerRequest {
-    pub name: String,
-    pub description: Option<String>,
-    pub icon_url: Option<String>,
-    pub transport: String,       // "http" | "stdio"
-    pub url: Option<String>,     // per HTTP
-    pub command: Option<String>, // per stdio
-    pub args: Option<Vec<String>>,
-    pub env_vars: Option<HashMap<String, String>>,
-    pub headers: Option<HashMap<String, String>>,
-    pub scope: Option<String>, // "user" | "project"
-    pub project_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateMcpServerRequest {
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub url: Option<String>,
-    pub command: Option<String>,
-    pub args: Option<Vec<String>>,
-    pub env_vars: Option<HashMap<String, String>>,
-    pub headers: Option<HashMap<String, String>>,
-    pub enabled: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToggleRequest {
-    pub enabled: bool,
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-fn row_to_json(r: &sqlx::postgres::PgRow, can_manage: bool) -> Value {
-    let args: Value = r.try_get::<Value, _>("args").unwrap_or(json!([]));
-    let env_vars: Value = r.try_get::<Value, _>("env_vars").unwrap_or(json!({}));
-    let headers: Value = r.try_get::<Value, _>("headers").unwrap_or(json!({}));
-
-    json!({
-        "id": r.try_get::<Uuid, _>("id").ok().map(|v| v.to_string()),
-        "pluginInstanceId": r
-            .try_get::<Option<Uuid>, _>("plugin_instance_id")
-            .unwrap_or(None)
-            .map(|v| v.to_string()),
-        "name": r.try_get::<String, _>("name").unwrap_or_default(),
-        "description": r.try_get::<Option<String>, _>("description").unwrap_or(None),
-        "iconUrl": r.try_get::<Option<String>, _>("icon_url").unwrap_or(None),
-        "transport": r.try_get::<String, _>("transport").unwrap_or_default(),
-        "url": r.try_get::<Option<String>, _>("url").unwrap_or(None),
-        "command": r.try_get::<Option<String>, _>("command").unwrap_or(None),
-        "args": args,
-        "envVars": env_vars,
-        "headers": headers,
-        "enabled": r.try_get::<bool, _>("enabled").unwrap_or(true),
-        "scope": r.try_get::<String, _>("scope").unwrap_or_else(|_| "user".to_string()),
-        "canManage": can_manage,
-        "createdAt": r.try_get::<DateTime<Utc>, _>("created_at").ok().map(|v| v.to_rfc3339()),
-    })
-}
-
-fn can_manage_server(row: &sqlx::postgres::PgRow, user_id: Uuid, role: &str) -> bool {
-    let owner_user_id: Option<Uuid> = row.try_get("user_id").unwrap_or(None);
-    let scope: String = row.try_get("scope").unwrap_or_else(|_| "user".to_string());
-
-    owner_user_id == Some(user_id) || (scope == "global" && role == "admin")
-}
+// Request types e helper SQL: punto unico in nexus_mcp_client::server_storage
+// (regola L / ADR 0026, Wave C1). Prima erano duplicati con plugin-service.
+pub use nexus_mcp_client::server_storage::{
+    CreateMcpServerRequest, ToggleRequest, UpdateMcpServerRequest,
+};
+use nexus_mcp_client::server_storage::{can_manage_server, row_to_json};
 
 fn build_config(
     id: &Uuid,

@@ -3,56 +3,17 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::AppState;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ProjectMemberResponse {
-    pub user_id: String,
-    pub email: String,
-    pub display_name: String,
-    pub github_username: Option<String>,
-    pub avatar_url: Option<String>,
-    pub role: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AddProjectMemberRequest {
-    pub user_id: String,
-    pub role: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateProjectMemberRequest {
-    pub role: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ListProjectMembersResponse {
-    pub project_id: String,
-    pub members: Vec<ProjectMemberResponse>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct AdminProjectSummary {
-    pub id: String,
-    pub name: String,
-    pub slug: String,
-    pub owner_user_id: String,
-    pub owner_email: Option<String>,
-    pub member_count: i64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ListAllProjectsResponse {
-    pub projects: Vec<AdminProjectSummary>,
-}
+// Tipi DTO: punto unico in nexus_types::admin_dto (regola L / ADR 0026, Wave C2).
+pub use nexus_types::admin_dto::{
+    AddProjectMemberRequest, AdminProjectSummary, ListAllProjectsResponse,
+    ListProjectMembersResponse, ProjectMemberResponse, UpdateProjectMemberRequest,
+};
 
 /// GET /api/admin/projects — list ALL projects (admin only)
 pub async fn list_all_projects(
@@ -307,36 +268,9 @@ pub async fn remove_project_member(
 // Permette di aggiornare in blocco i path dei progetti quando la directory
 // di deploy viene spostata su un altro disco o percorso.
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PortProjectsRequest {
-    /// Vecchio prefisso path (es. "/opt/ai-orchestrator/projects")
-    pub old_base: String,
-    /// Nuovo prefisso path (es. "/var/lib/postgresql/wal/nexus/projects")
-    pub new_base: String,
-    /// Se true, esegue le modifiche. Se false, mostra solo preview.
-    #[serde(default)]
-    pub dry_run: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PortProjectsResponse {
-    pub dry_run: bool,
-    pub projects_base_root_updated: bool,
-    pub workspaces_updated: i64,
-    pub repositories_updated: i64,
-    pub details: Vec<PortDetail>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PortDetail {
-    pub table: String,
-    pub id: String,
-    pub old_path: String,
-    pub new_path: String,
-}
+// PortProjectsRequest/Response/Detail: punto unico in nexus_types::admin_dto
+// (regola L / ADR 0026, Wave C2). Vecchio prefisso path -> nuovo (deploy move).
+pub use nexus_types::admin_dto::{PortDetail, PortProjectsRequest, PortProjectsResponse};
 
 /// POST /api/admin/projects/port — aggiorna i path di tutti i progetti
 pub async fn port_projects(

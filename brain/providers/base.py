@@ -55,3 +55,67 @@ class BaseProvider(abc.ABC):
     @abc.abstractmethod
     def list_models(self) -> list[ProviderCatalogEntry]:
         ...
+
+
+class ApiKeyClientMixin:
+    """Mixin: gestione comune della API key (lettura DB + cache 60s) e del client
+    cacheato (invalidato se la key cambia). Punto unico (regola L / ADR 0026,
+    Wave C3): prima questo blocco era duplicato pari-pari in
+    deepseek_provider.py, mistral_provider.py, openai_provider.py (cluster top
+    del jscpd report: 43L cross-provider).
+
+    Le sottoclassi devono:
+      - settare ``self.name`` (gia' previsto da ``BaseProvider``);
+      - implementare ``_create_client(self, api_key: str) -> Any`` che
+        costruisce il client SDK reale (es. ``AsyncOpenAI(api_key=...,
+        base_url=...)``). Il mixin si occupa di invalidare/ricreare quando
+        la key cambia.
+
+    Uso::
+
+        class FooProvider(BaseProvider, ApiKeyClientMixin):
+            name = "foo"
+            def __init__(self) -> None:
+                self._init_api_key_cache()
+            def _create_client(self, api_key: str) -> Any:
+                return FooClient(api_key=api_key)
+    """
+
+    name: str  # fornito da BaseProvider
+
+    def _init_api_key_cache(self) -> None:
+        """Inizializza i campi del mixin. Chiamare dal ``__init__`` della sottoclasse."""
+        from .api_key_loader import load_api_key  # import locale per evitare cicli
+
+        self._api_key_provider = lambda: load_api_key(self.name)
+        self._client: Any | None = None
+        self._cached_key: str = ""
+
+    @property
+    def _api_key(self) -> str:
+        new_key = self._api_key_provider()
+        if new_key != self._cached_key:
+            self._cached_key = new_key
+            self._client = None
+        return new_key
+
+    @_api_key.setter
+    def _api_key(self, value: str) -> None:
+        from .api_key_loader import invalidate_cache
+
+        invalidate_cache(self.name)
+        self._cached_key = value or ""
+        self._client = None
+
+    def _get_client(self) -> Any:
+        """Restituisce il client cacheato (lo crea on-demand alla prima chiamata
+        o quando la API key cambia). Chiama ``_create_client`` della sottoclasse."""
+        if self._client is None:
+            self._client = self._create_client(self._api_key)  # type: ignore[attr-defined]
+        return self._client
+
+    def _create_client(self, api_key: str) -> Any:
+        """Hook da implementare nella sottoclasse: costruisce il client SDK."""
+        raise NotImplementedError(
+            f"{type(self).__name__} deve implementare _create_client(api_key)"
+        )

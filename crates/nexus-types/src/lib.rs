@@ -13,6 +13,8 @@ pub use fs_browse::{
     list_directories, list_root_candidates, validate_directory_name, BrowseDirectoryNode,
 };
 
+pub mod admin_dto;
+
 // --- Shared API types ---
 
 pub type ApiError = (StatusCode, Json<Value>);

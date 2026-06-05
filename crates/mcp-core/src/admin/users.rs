@@ -3,72 +3,24 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::AppState;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct UserResponse {
-    pub id: String,
-    pub email: String,
-    pub display_name: String,
-    pub github_username: Option<String>,
-    pub avatar_url: Option<String>,
-    pub role: String,
-    pub created_at: String,
-}
+// Tipi DTO: punto unico in nexus_types::admin_dto (regola L / ADR 0026, Wave C2).
+pub use nexus_types::admin_dto::{
+    ListUsersQuery, ListUsersResponse, SearchUsersQuery, UpdateUserRequest, UpdateUserRoleRequest,
+    UserProjectRole, UserResponse, UserWithProjectsResponse,
+};
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct UserWithProjectsResponse {
-    #[serde(flatten)]
-    pub user: UserResponse,
-    pub project_count: i32,
-    pub projects: Vec<UserProjectRole>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct UserProjectRole {
-    pub project_id: String,
-    pub project_name: String,
-    pub role: String,
-}
-
+/// CreateUserRequest e' specifico di mcp-core (admin-service non lo usa); resta
+/// locale.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct CreateUserRequest {
     pub email: String,
     pub display_name: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateUserRequest {
-    pub email: Option<String>,
-    pub display_name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateUserRoleRequest {
-    pub role: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ListUsersQuery {
-    pub page: Option<i32>,
-    pub limit: Option<i32>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SearchUsersQuery {
-    pub q: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ListUsersResponse {
-    pub users: Vec<UserResponse>,
-    pub total: i32,
-    pub page: i32,
-    pub limit: i32,
 }
 
 // List users with pagination

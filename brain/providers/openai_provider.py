@@ -75,60 +75,41 @@ def _is_o_series(model: str) -> bool:
     model_lower = model.lower()
     return any(model_lower == m or model_lower.startswith(m + "-") for m in _O_SERIES_MODELS)
 
-from .base import BaseProvider, ProviderCatalogEntry, ProviderResult
+from .base import ApiKeyClientMixin, BaseProvider, ProviderCatalogEntry, ProviderResult
 from .error_handler import format_error_result
 
 logger = logging.getLogger(__name__)
 
 
-class OpenAIProvider(BaseProvider):
+class OpenAIProvider(BaseProvider, ApiKeyClientMixin):
+    """Provider OpenAI ufficiale.
+
+    La gestione API key + client cacheato vive nel mixin ``ApiKeyClientMixin``
+    (punto unico, regola L / ADR 0026, Wave C3).
+    """
+
     name = "openai"
 
     def __init__(self) -> None:
-        # API key letta dal DB (settings.openai_api_key) con cache 60s
-        # invece che da env var. Vedi brain/providers/api_key_loader.py.
-        from .api_key_loader import load_api_key
-        self._api_key_provider = lambda: load_api_key(self.name)
-        self._client: Any | None = None
-        self._cached_key: str = ""
+        self._init_api_key_cache()
 
-    @property
-    def _api_key(self) -> str:
-        # Re-leggi a ogni accesso (cache 60s interna a load_api_key).
-        # Se la key cambia (admin update), il client viene reset.
-        new_key = self._api_key_provider()
-        if new_key != self._cached_key:
-            self._cached_key = new_key
-            self._client = None  # forza re-init del client AsyncOpenAI con la nuova key
-        return new_key
+    def _create_client(self, api_key: str) -> Any:
+        from openai import AsyncOpenAI
+        from .dns_transport import get_global_dns_transport
+        import httpx
 
-    @_api_key.setter
-    def _api_key(self, value: str) -> None:
-        # Setter per backward-compat con _load_keys_from_db legacy che fa
-        # p._api_key = value. Invalida la cache cosi' la prossima get
-        # rilegge la key aggiornata dal DB.
-        from .api_key_loader import invalidate_cache
-        invalidate_cache(self.name)
-        self._cached_key = value or ""
-        self._client = None
-
-    def _get_client(self) -> Any:
-        if self._client is None:
-            from openai import AsyncOpenAI
-            from .dns_transport import get_global_dns_transport
-            import httpx
-            transport = get_global_dns_transport()
-            http_client = httpx.AsyncClient(transport=transport) if transport is not None else None
-            # max_retries=0: i retry sono governati a livello applicativo (cascade
-            # M60 nel registry), non dall'SDK. Su errori non-retriabili come
-            # 402/insufficient_quota (credit_balance_too_low) il client OpenAI
-            # ritenterebbe comunque, sprecando latenza durante il cascade mentre
-            # openai e' gia' in cooldown billing. Vedi FIX cooldown openai.
-            self._client = AsyncOpenAI(
-                api_key=self._api_key,
-                http_client=http_client,
-                max_retries=0,
-            )
+        transport = get_global_dns_transport()
+        http_client = httpx.AsyncClient(transport=transport) if transport is not None else None
+        # max_retries=0: i retry sono governati a livello applicativo (cascade
+        # M60 nel registry), non dall'SDK. Su errori non-retriabili come
+        # 402/insufficient_quota (credit_balance_too_low) il client OpenAI
+        # ritenterebbe comunque, sprecando latenza durante il cascade mentre
+        # openai e' gia' in cooldown billing. Vedi FIX cooldown openai.
+        return AsyncOpenAI(
+            api_key=api_key,
+            http_client=http_client,
+            max_retries=0,
+        )
         return self._client
 
     def list_models(self) -> list[ProviderCatalogEntry]:

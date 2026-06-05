@@ -14,6 +14,7 @@ chrono.workspace = true
 dotenvy.workspace = true
 jsonwebtoken.workspace = true
 nexus-auth = { path = "../nexus-auth" }
+nexus-mcp-client = { path = "../nexus-mcp-client" }
 nexus-types = { path = "../nexus-types" }
 reqwest.workspace = true
 nexus-http.workspace = true
