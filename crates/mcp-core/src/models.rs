@@ -266,8 +266,8 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
             r#"INSERT INTO ai_price_catalog (
                 provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens,
                 currency, context_window, supports_tool_use, supports_vision,
-                is_thinking, uses_thinking_mode, capability_source, is_enabled, display_name
-              ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, $9, 'auto', FALSE, $2)
+                is_thinking, uses_thinking_mode, agentic_thinking_policy, capability_source, is_enabled, display_name
+              ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, $9, $10, 'auto', FALSE, $2)
               ON CONFLICT (provider, model) DO UPDATE SET
                 input_cost_per_million_tokens = EXCLUDED.input_cost_per_million_tokens,
                 output_cost_per_million_tokens = EXCLUDED.output_cost_per_million_tokens,
@@ -284,6 +284,9 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
                 uses_thinking_mode = CASE WHEN ai_price_catalog.capability_source = 'auto'
                                           THEN EXCLUDED.uses_thinking_mode
                                           ELSE ai_price_catalog.uses_thinking_mode END,
+                agentic_thinking_policy = CASE WHEN ai_price_catalog.capability_source = 'auto'
+                                          THEN EXCLUDED.agentic_thinking_policy
+                                          ELSE ai_price_catalog.agentic_thinking_policy END,
                 updated_at = NOW()
               RETURNING (xmax = 0) AS inserted"#,
         )
@@ -296,6 +299,7 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
         .bind(caps.supports_vision)
         .bind(caps.is_thinking)
         .bind(caps.uses_thinking_mode)
+        .bind(caps.agentic_thinking_policy)
         .fetch_one(db)
         .await;
 
@@ -551,8 +555,13 @@ pub async fn auto_upgrade_models_and_routing(db: &sqlx::PgPool) -> Result<(), St
         let top = sorted[0].clone();
         promotions.push((provider.to_string(), family_label.to_string(), top.clone()));
 
-        // Abilita TUTTI i modelli della famiglia (utente vuole scelta)
+        // Abilita i modelli della famiglia AMMESSI dalla policy (ADR 0025): un
+        // family-label legacy non deve ri-abilitare i suoi modelli (pruned dalla
+        // 0320). La regola di ammissione e' il punto unico model_passes_selection_policy.
         for m in &candidates {
+            if !crate::model_catalog_sync::model_passes_selection_policy(db, provider, m).await {
+                continue;
+            }
             let res = sqlx::query(
                 "UPDATE ai_price_catalog SET is_enabled = true \
                  WHERE provider = $1 AND model = $2 AND is_enabled = false",

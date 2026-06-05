@@ -210,6 +210,9 @@ pub(crate) struct ClassifiedCaps {
     /// di `is_thinking` (ogni reasoning-only e' anche thinking-mode, ma anche
     /// gli ibridi come Claude opus/sonnet lo sono).
     pub uses_thinking_mode: bool,
+    /// Policy d'uso nei run agentici (ADR 0025), driver canonico dell'eleggibilita'
+    /// e del toggle modalita': none | disable_for_tools | native | exclude.
+    pub agentic_thinking_policy: &'static str,
 }
 
 /// Classificatore UNICO delle capability di un modello (ADR 0024).
@@ -287,11 +290,28 @@ pub(crate) fn classify_capabilities(
     // extended thinking (Claude opus/sonnet).
     let uses_thinking_mode = is_reasoning_signal || is_hybrid_agentic(&p, &m);
 
+    // Policy agentica canonica (ADR 0025):
+    //   - exclude: reasoning-only SENZA function calling (deepseek-reasoner).
+    //   - native:  reasoning con tool nativi (OpenAI o-series).
+    //   - disable_for_tools: dual-mode (deepseek-v4, magistral, gemini-pro, claude
+    //     opus/sonnet, qualunque thinking tool-capable) -> non-thinking nei tool-loop.
+    //   - none: modello non-thinking standard.
+    let agentic_thinking_policy: &'static str = if p == "deepseek" && m.contains("reasoner") {
+        "exclude"
+    } else if p == "openai" && reasoning_only_family {
+        "native"
+    } else if is_reasoning_signal || is_hybrid_agentic(&p, &m) {
+        "disable_for_tools"
+    } else {
+        "none"
+    };
+
     ClassifiedCaps {
         supports_tool_use,
         supports_vision,
         is_thinking,
         uses_thinking_mode,
+        agentic_thinking_policy,
     }
 }
 
@@ -302,6 +322,30 @@ fn is_hybrid_agentic(provider: &str, model_lc: &str) -> bool {
         "anthropic" => model_lc.contains("opus") || model_lc.contains("sonnet"),
         _ => false,
     }
+}
+
+/// PUNTO UNICO della regola di ammissione di un modello al catalog ABILITATO
+/// (ADR 0025, regola L). True se (provider, model) e' ammesso dalla policy
+/// `nexus_model_selection_policy`: matcha un `allowed_pattern` (o la lista e'
+/// vuota) e NESSUN `denied_pattern`. Se non esiste una riga policy per il
+/// provider, ammette (true) per non bloccare provider non ancora configurati.
+/// La discovery la consulta prima di abilitare un modello, cosi' i modelli
+/// legacy (pruned dalla mig 0320) non rientrano via probe-on-insert.
+pub(crate) async fn model_passes_selection_policy(db: &PgPool, provider: &str, model: &str) -> bool {
+    let row: Option<(bool,)> = sqlx::query_as::<_, (bool,)>(
+        "SELECT (
+             ( $2 ~ ANY(allowed_patterns) OR cardinality(allowed_patterns) = 0 )
+             AND NOT ( $2 ~ ANY(denied_patterns) )
+         ) AS ok
+         FROM nexus_model_selection_policy WHERE provider = $1",
+    )
+    .bind(provider)
+    .bind(model)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    row.map(|(ok,)| ok).unwrap_or(true)
 }
 
 /// Loop principale: chiamato da `main.rs` startup via `tokio::spawn(...)`.
@@ -568,10 +612,19 @@ async fn sync_provider(
                                         let cc = classify_capabilities(
                                             provider, api_model, None, None, None,
                                         );
+                                        // Gate allowlist (ADR 0025): abilita SOLO se il
+                                        // modello e' ammesso dalla model_selection_policy.
+                                        // Cosi' i modelli legacy (pruned dalla 0320) non
+                                        // rientrano via probe-on-insert.
+                                        let allowed =
+                                            model_passes_selection_policy(db, provider, api_model)
+                                                .await;
                                         let _ = sqlx::query(
                                             "UPDATE ai_price_catalog \
-                                             SET is_enabled = true, auto_disabled_at = NULL, \
-                                                 auto_disabled_reason = NULL, updated_at = NOW(), \
+                                             SET is_enabled = $8, \
+                                                 auto_disabled_at = CASE WHEN $8 THEN NULL ELSE NOW() END, \
+                                                 auto_disabled_reason = CASE WHEN $8 THEN NULL ELSE 'fuori model_selection_policy (mig 0320)' END, \
+                                                 updated_at = NOW(), \
                                                  capabilities = CASE \
                                                      WHEN capabilities IS NULL OR capabilities = '[]'::jsonb \
                                                          THEN $3::jsonb \
@@ -580,7 +633,8 @@ async fn sync_provider(
                                                  supports_tool_use = CASE WHEN capability_source='auto' THEN $4 ELSE supports_tool_use END, \
                                                  supports_vision = CASE WHEN capability_source='auto' THEN $5 ELSE supports_vision END, \
                                                  is_thinking = CASE WHEN capability_source='auto' THEN $6 ELSE is_thinking END, \
-                                                 uses_thinking_mode = CASE WHEN capability_source='auto' THEN $7 ELSE uses_thinking_mode END \
+                                                 uses_thinking_mode = CASE WHEN capability_source='auto' THEN $7 ELSE uses_thinking_mode END, \
+                                                 agentic_thinking_policy = CASE WHEN capability_source='auto' THEN $9 ELSE agentic_thinking_policy END \
                                              WHERE provider = $1 AND model = $2 AND is_enabled = false",
                                         )
                                         .bind(provider)
@@ -590,16 +644,19 @@ async fn sync_provider(
                                         .bind(cc.supports_vision)
                                         .bind(cc.is_thinking)
                                         .bind(cc.uses_thinking_mode)
+                                        .bind(allowed)
+                                        .bind(cc.agentic_thinking_policy)
                                         .execute(db)
                                         .await;
                                         audit_log(
-                                            db, provider, api_model, "probe_ok_on_insert",
-                                            json!({"action":"auto_enabled", "inferred_capabilities": inferred_caps}),
+                                            db, provider, api_model,
+                                            if allowed { "probe_ok_on_insert" } else { "probe_ok_but_outside_policy" },
+                                            json!({"action": if allowed {"auto_enabled"} else {"kept_disabled_outside_allowlist"}, "inferred_capabilities": inferred_caps}),
                                         )
                                         .await;
                                         tracing::info!(
-                                            "catalog_sync[{}]: probe OK su nuovo modello '{}' -> abilitato (caps inferred: {:?})",
-                                            provider, api_model, inferred_caps
+                                            "catalog_sync[{}]: probe OK su '{}' -> {} (policy allowlist)",
+                                            provider, api_model, if allowed {"abilitato"} else {"lasciato disabilitato (fuori allowlist)"}
                                         );
                                     }
                                     ProbeOnInsertResult::ModelBroken(kind) => {
@@ -662,7 +719,10 @@ async fn sync_provider(
                 }
             }
             Some(&(is_enabled, manual_locked)) => {
-                if !is_enabled && !manual_locked {
+                // Re-enable SOLO se il modello e' ammesso dalla policy (ADR 0025):
+                // un legacy ricomparso nell'API non deve rientrare.
+                let policy_ok = model_passes_selection_policy(db, provider, api_model).await;
+                if !is_enabled && !manual_locked && policy_ok {
                     // Modello disabilitato dal worker (missing_from_api) ma ricomparso: re-enable.
                     let res = sqlx::query(
                         "UPDATE ai_price_catalog SET is_enabled = true, effective_from = NOW(), \
@@ -704,31 +764,45 @@ async fn sync_provider(
     // per sempre. `manual_locked` viene rispettato: se l'admin ha deciso di
     // tenerlo abilitato a mano, non lo tocchiamo.
     for (catalog_model, (is_enabled, manual_locked)) in &catalog_models {
-        if *is_enabled && !manual_locked && !is_chat_compatible_model(catalog_model) {
-            let res = sqlx::query(
-                "UPDATE ai_price_catalog SET is_enabled = false, \
-                 auto_disabled_at = NOW(), auto_disabled_reason = 'not_chat_compatible' \
-                 WHERE provider = $1 AND model = $2",
-            )
-            .bind(provider)
-            .bind(catalog_model)
-            .execute(db)
-            .await;
-            if let Ok(r) = res {
-                if r.rows_affected() > 0 {
-                    disabled += 1;
-                    audit_log(
-                        db,
-                        provider,
-                        catalog_model,
-                        "disabled",
-                        json!({"reason":"not_chat_compatible"}),
-                    )
-                    .await;
-                    tracing::warn!(
-                        "catalog_sync[{}]: disabled '{}' (non chat-compatible per blacklist aggiornata)",
-                        provider, catalog_model,
-                    );
+        if *is_enabled && !manual_locked {
+            // Prune self-healing (ADR 0025): un modello enabled va disabilitato se
+            // non e' chat-compatibile (blacklist) OPPURE non passa la
+            // model_selection_policy (famiglia legacy). Cosi' i modelli vecchi non
+            // restano enabled neanche se entrati prima dell'aggiornamento policy.
+            let chat_ok = is_chat_compatible_model(catalog_model);
+            let policy_ok = model_passes_selection_policy(db, provider, catalog_model).await;
+            if !chat_ok || !policy_ok {
+                let reason = if !chat_ok {
+                    "not_chat_compatible"
+                } else {
+                    "fuori model_selection_policy (legacy)"
+                };
+                let res = sqlx::query(
+                    "UPDATE ai_price_catalog SET is_enabled = false, \
+                     auto_disabled_at = NOW(), auto_disabled_reason = $3 \
+                     WHERE provider = $1 AND model = $2",
+                )
+                .bind(provider)
+                .bind(catalog_model)
+                .bind(reason)
+                .execute(db)
+                .await;
+                if let Ok(r) = res {
+                    if r.rows_affected() > 0 {
+                        disabled += 1;
+                        audit_log(
+                            db,
+                            provider,
+                            catalog_model,
+                            "disabled",
+                            json!({ "reason": reason }),
+                        )
+                        .await;
+                        tracing::warn!(
+                            "catalog_sync[{}]: disabled '{}' ({})",
+                            provider, catalog_model, reason,
+                        );
+                    }
                 }
             }
         }
@@ -1098,5 +1172,25 @@ mod tests {
         assert!(!c.is_thinking);
         let pro = classify_capabilities("google", "gemini-2.5-pro", None, None, None);
         assert!(pro.is_thinking, "gemini-2.5-pro e' thinking -> escluso da agentico");
+    }
+
+    // ── ADR 0025: agentic_thinking_policy per famiglia ──
+
+    #[test]
+    fn classify_agentic_thinking_policy_per_famiglia() {
+        let p = |prov, model| classify_capabilities(prov, model, None, None, None).agentic_thinking_policy;
+        // Reasoning-only senza function calling -> exclude.
+        assert_eq!(p("deepseek", "deepseek-reasoner"), "exclude");
+        // OpenAI o-series: tool nativi -> native.
+        assert_eq!(p("openai", "o3-mini"), "native");
+        // Dual-mode (thinking + tool-capable) -> disable_for_tools.
+        assert_eq!(p("deepseek", "deepseek-v4-pro"), "disable_for_tools");
+        assert_eq!(p("anthropic", "claude-sonnet-4-6"), "disable_for_tools");
+        assert_eq!(p("google", "gemini-2.5-pro"), "disable_for_tools");
+        assert_eq!(p("mistral", "magistral-medium-latest"), "disable_for_tools");
+        // Modelli non-thinking standard -> none.
+        assert_eq!(p("openai", "gpt-4o"), "none");
+        assert_eq!(p("mistral", "mistral-large-2411"), "none");
+        assert_eq!(p("google", "gemini-2.5-flash"), "none");
     }
 }
