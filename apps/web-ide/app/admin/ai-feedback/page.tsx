@@ -8,6 +8,7 @@ import {
 } from "../../../lib/api-client";
 import { useThemeColors } from "../../../lib/theme";
 import { useGlobalDialog } from "../../../components/global-dialog-provider";
+import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
 
 export default function AdminAiFeedbackPage() {
   const tc = useThemeColors();
@@ -58,12 +59,11 @@ export default function AdminAiFeedbackPage() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      <div>
-        <h1 style={{ fontSize: 20, fontWeight: 600, marginBottom: 6 }}>AI Feedback</h1>
-        <p style={{ color: tc.textMuted, fontSize: 13, margin: 0 }}>
-          Review dei feedback errore inviati dalla chat e controllo qualità auto-learning.
-        </p>
-      </div>
+      <AdminPageHeader
+        title="AI Feedback"
+        description="Review dei feedback errore inviati dalla chat e controllo qualità auto-learning."
+      />
+
 
       {error && (
         <div

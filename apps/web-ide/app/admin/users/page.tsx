@@ -3,8 +3,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../../lib/theme";
 import { useI18n } from "../../../lib/i18n";
+import { formatDate } from "../../../lib/format";
 import * as api from "../../../lib/api-client";
 import { useGlobalDialog } from "../../../components/global-dialog-provider";
+import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
 
 interface User {
   id: string;
@@ -84,10 +86,7 @@ export default function UsersPage() {
 
   return (
     <div>
-      <h1 style={{ fontSize: 20, fontWeight: 600, marginBottom: 6 }}>{t("admin.users")}</h1>
-      <p style={{ color: tc.textMuted, fontSize: 13, marginBottom: 28 }}>
-        {t("admin.users.desc")}
-      </p>
+      <AdminPageHeader title={t("admin.users")} description={t("admin.users.desc")} />
 
       {error && (
         <div
@@ -226,7 +225,7 @@ export default function UsersPage() {
                       </span>
                     </td>
                     <td style={{ padding: "12px 16px", fontSize: 13, color: tc.textMuted }}>
-                      {new Date(user.createdAt).toLocaleDateString("it-IT")}
+                      {formatDate(user.createdAt)}
                     </td>
                     <td style={{ padding: "12px 16px", textAlign: "right" }}>
                       <button

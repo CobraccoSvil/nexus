@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { useThemeColors } from "../../../lib/theme";
+import { formatBytes, formatDateTime } from "../../../lib/format";
+import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
 
 interface TableStats {
   name: string;
@@ -21,22 +23,13 @@ interface DatabaseStats {
   };
 }
 
-function formatDate(iso: string | null): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  return d.toLocaleString("it-IT", { dateStyle: "short", timeStyle: "short" });
-}
-
-function formatMB(mb: number): string {
-  if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
-  return `${mb.toFixed(1)} MB`;
-}
-
-function formatKB(kb: number | null): string {
-  if (kb === null) return "—";
-  if (kb >= 1024) return `${(kb / 1024).toFixed(1)} MB`;
-  return `${kb} KB`;
-}
+// Formatter centralizzati in lib/format.ts (regola L / ADR 0026).
+// Wrapper locali per preservare le firme attese dai call site di questa pagina:
+// formatMB riceve MB, formatKB riceve KB, formatDate accetta null.
+const formatDate = (iso: string | null) => formatDateTime(iso);
+const formatMB = (mb: number) => formatBytes(mb * 1024 * 1024);
+const formatKB = (kb: number | null) =>
+  kb === null ? "—" : formatBytes(kb * 1024);
 
 type SortKey = "name" | "row_count" | "size_kb";
 type SortDir = "asc" | "desc";
@@ -84,31 +77,29 @@ export default function NexusDatabasePage() {
 
   return (
     <div style={{ color: tc.text, fontFamily: "'JetBrains Mono', monospace" }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
-        <div>
-          <h1 style={{ fontSize: 22, fontWeight: 700, margin: 0 }}>Database Nexus</h1>
-          <p style={{ color: tc.textSecondary, fontSize: 13, marginTop: 4 }}>
-            Statistiche e stato del database PostgreSQL interno
-          </p>
-        </div>
-        <button
-          onClick={fetchData}
-          disabled={loading}
-          style={{
-            padding: "8px 18px",
-            borderRadius: 8,
-            background: tc.accent,
-            color: "#fff",
-            border: "none",
-            cursor: loading ? "not-allowed" : "pointer",
-            fontSize: 13,
-            fontWeight: 600,
-            opacity: loading ? 0.6 : 1,
-          }}
-        >
-          {loading ? "Aggiornamento..." : "Aggiorna"}
-        </button>
-      </div>
+      <AdminPageHeader
+        title="Database Nexus"
+        description="Statistiche e stato del database PostgreSQL interno"
+        action={
+          <button
+            onClick={fetchData}
+            disabled={loading}
+            style={{
+              padding: "8px 18px",
+              borderRadius: 8,
+              background: tc.accent,
+              color: "#fff",
+              border: "none",
+              cursor: loading ? "not-allowed" : "pointer",
+              fontSize: 13,
+              fontWeight: 600,
+              opacity: loading ? 0.6 : 1,
+            }}
+          >
+            {loading ? "Aggiornamento..." : "Aggiorna"}
+          </button>
+        }
+      />
 
       {lastRefresh && (
         <p style={{ color: tc.textMuted, fontSize: 11, marginBottom: 20 }}>

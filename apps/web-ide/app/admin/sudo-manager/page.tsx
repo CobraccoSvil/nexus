@@ -23,6 +23,7 @@ import {
 } from "../../../lib/api-client";
 import { useThemeColors } from "../../../lib/theme";
 import { useGlobalDialog } from "../../../components/global-dialog-provider";
+import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
 
 export default function SudoManagerAdminPage() {
   const tc = useThemeColors();
@@ -117,16 +118,10 @@ export default function SudoManagerAdminPage() {
 
   return (
     <div style={{ padding: 16, color: tc.text }}>
-      <header style={{ marginBottom: 14 }}>
-        <h1 style={{ fontSize: 22, fontWeight: 700, margin: "0 0 4px" }}>
-          Sudo Manager
-        </h1>
-        <p style={{ fontSize: 12, color: tc.textMuted, margin: 0 }}>
-          Whitelist di comandi privilegiati eseguibili da Nexus. Niente password
-          sudo salvate: la sicurezza viene da <code>/etc/sudoers.d/nexus-runner</code>.
-          Setup one-time: <code>bash deploy/install-sudo-manager.sh</code>.
-        </p>
-      </header>
+      <AdminPageHeader
+        title="Sudo Manager"
+        description="Whitelist di comandi privilegiati eseguibili da Nexus. Niente password sudo salvate: la sicurezza viene da /etc/sudoers.d/nexus-runner. Setup one-time: bash deploy/install-sudo-manager.sh."
+      />
 
       {/* Status banner */}
       <section
