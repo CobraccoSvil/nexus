@@ -55,11 +55,21 @@ _BLOCK_RE = re.compile(
 )
 
 # Euristica leggera per il fallback: la risposta "sembra" proporre scelte se
-# contiene piu' domande dirette o formule italiane di proposta in lista.
+# contiene piu' domande dirette o formule italiane di proposta/scelta.
 _CHOICE_HINT_RE = re.compile(
-    r"\b(vuoi|vorresti|preferisci|preferiresti|ti interessa|posso|procediamo con)\b",
+    r"\b(vuoi|vorresti|preferisci|preferiresti|ti interessa|posso|procediamo con|"
+    r"scegli|scegliere|sceglier\w*|scelta|opzion\w*|alternativ\w*|tra cui|"
+    r"quale preferisci|come preferisci|fammi sapere)\b",
     re.IGNORECASE,
 )
+
+# Elenco (numerato "1." / "1)" o puntato "-", "*", "•") con almeno 2 voci:
+# segnale forte di "lista di opzioni" quando accompagnato da un termine di scelta.
+_LIST_ITEM_RE = re.compile(r"(?m)^\s*(?:\d+[.)]|[-*•])\s+\S")
+
+
+def _list_item_count(text: str) -> int:
+    return len(_LIST_ITEM_RE.findall(text or ""))
 
 
 def _redact(text: str) -> str:
@@ -149,7 +159,14 @@ def looks_like_choices(text: str) -> bool:
     if text.count("?") >= 2:
         return True
     hints = len(_CHOICE_HINT_RE.findall(text))
-    return hints >= 2
+    if hints >= 2:
+        return True
+    # Un termine di scelta + un elenco di almeno 2 voci (es. "Ecco 3 opzioni:
+    # 1. ... 2. ... 3. ... Scegli quella che..."): pattern tipico di proposta
+    # di alternative anche senza punti interrogativi.
+    if hints >= 1 and _list_item_count(text) >= 2:
+        return True
+    return False
 
 
 def _build_extractor_prompt(assistant_text: str) -> str:
