@@ -18,7 +18,7 @@ import { FeedbackErrorDialog } from "./feedback-error-dialog";
 import { IconButton } from "./icon-button";
 import { MessageList } from "./chat/message-list";
 import { AgentStepsPanel } from "./chat/agent-steps-panel";
-import { AgentMetaStepCard as AgentMetaStepCardLazy } from "./chat/agent-meta-step-card";
+import { AgentMetaStepCard as AgentMetaStepCardLazy, dedupeNextActions } from "./chat/agent-meta-step-card";
 import { InlineTracePanel } from "./chat/inline-trace-panel";
 import { Composer } from "./chat/composer";
 import { MemoryPanel } from "./chat/memory-panel";
@@ -1166,7 +1166,7 @@ export function ChatPanel({
                 <div style={{ fontSize: 11, fontWeight: 600, color: tc.textMuted, marginBottom: 4 }}>
                   Decisioni del turno
                 </div>
-                {targetMetaSteps.map((m, idx) => (
+                {dedupeNextActions(targetMetaSteps).map((m, idx) => (
                   <AgentMetaStepCardLazy key={`hist-${m.kind}-${m.createdAt}-${idx}`} data={m} />
                 ))}
               </div>

@@ -26,6 +26,22 @@ export interface AgentMetaStepData {
   createdAt: string;
 }
 
+/**
+ * Tiene solo l'ULTIMA card `next_actions` di una timeline di meta_step. Con i
+ * fallback/escalation di provider lo stesso turno puo' emettere piu' meta_step
+ * di scelte (uno per tentativo): all'utente ne mostriamo una sola, la piu'
+ * recente (quella del provider che ha effettivamente concluso). Gli altri kind
+ * non sono toccati.
+ */
+export function dedupeNextActions(steps: AgentMetaStepData[]): AgentMetaStepData[] {
+  let lastIdx = -1;
+  steps.forEach((m, i) => {
+    if (m.kind === "next_actions") lastIdx = i;
+  });
+  if (lastIdx < 0) return steps;
+  return steps.filter((m, i) => m.kind !== "next_actions" || i === lastIdx);
+}
+
 interface KindDescriptor {
   icon: string;
   label: string;
@@ -296,7 +312,14 @@ export function AgentMetaStepCard({
         {data.kind !== "tool_executed" && (
           <span className="font-medium">{desc.label}</span>
         )}
-        <span className="opacity-70 truncate text-left flex-1">{displayTitle}</span>
+        {/* Evita il titolo ridondante quando coincide col label (es.
+            next_actions: label "Prossimi passi" + title "Prossimi passi" =>
+            "Prossimi passiProssimi passi"). Lo span resta per lo spacer flex. */}
+        <span className="opacity-70 truncate text-left flex-1">
+          {displayTitle && displayTitle.trim().toLowerCase() !== desc.label.toLowerCase()
+            ? displayTitle
+            : ""}
+        </span>
         {showBadge && <ProviderBadge provider={provider} model={model} />}
       </button>
       {open && (

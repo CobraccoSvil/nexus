@@ -3,7 +3,7 @@
 import React, { useState } from "react";
 import type { AgentRunInfo, AgentStep } from "../../lib/api-client";
 import type { useThemeColors } from "../../lib/theme";
-import { AgentMetaStepCard, type AgentMetaStepData } from "./agent-meta-step-card";
+import { AgentMetaStepCard, dedupeNextActions, type AgentMetaStepData } from "./agent-meta-step-card";
 import { MarkdownBlock } from "./markdown-renderer";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
@@ -842,7 +842,7 @@ export function AgentStepsPanel({
       {/* Meta-step semantici (plan/routing/clarify/fallback/reflection) */}
       {metaSteps && metaSteps.length > 0 && (
         <div style={{ marginBottom: 8 }} data-testid="agent-meta-steps">
-          {metaSteps.map((m, idx) => (
+          {dedupeNextActions(metaSteps).map((m, idx) => (
             <AgentMetaStepCard key={`${m.kind}-${m.createdAt}-${idx}`} data={m} />
           ))}
         </div>
