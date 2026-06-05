@@ -110,6 +110,21 @@ export async function getAgentRun(runId: string): Promise<AgentRunInfo> {
   return fetchJson(`${API_BASE}/api/chat/agent-runs/${runId}`);
 }
 
+export interface RunNextActionChoice {
+  label?: string;
+  prompt?: string;
+}
+
+/** Scelte di proseguimento (next_actions) persistite per un run. Usato per
+ *  RIPRISTINARE i pulsanti delle scelte dopo un reload o sui turni passati: i
+ *  meta_step live arrivano via SSE e si perdono al refresh, qui li rileggiamo dal
+ *  DB. Ritorna sempre {choices: [...]}, eventualmente vuoto. */
+export async function getAgentRunNextActions(
+  runId: string,
+): Promise<{ choices: RunNextActionChoice[] }> {
+  return fetchJson(`${API_BASE}/api/chat/agent-runs/${runId}/next-actions`);
+}
+
 export async function getActiveRunForSession(
   sessionId: string,
 ): Promise<{ activeRun: AgentRunInfo | null }> {

@@ -26,20 +26,74 @@ export interface AgentMetaStepData {
   createdAt: string;
 }
 
+// Scelta proposta dall'agente: testo breve del pulsante + prompt completo da inviare.
+export type NextActionChoice = { label?: string; prompt?: string };
+
 /**
- * Tiene solo l'ULTIMA card `next_actions` di una timeline di meta_step. Con i
- * fallback/escalation di provider lo stesso turno puo' emettere piu' meta_step
- * di scelte (uno per tentativo): all'utente ne mostriamo una sola, la piu'
- * recente (quella del provider che ha effettivamente concluso). Gli altri kind
- * non sono toccati.
+ * Estrae le scelte dell'ULTIMO meta_step `next_actions` di una timeline (gli
+ * eventuali precedenti sono tentativi superati dai fallback). Ritorna [] se non
+ * ci sono scelte. Punto unico per leggere le scelte (usato da chat-panel per
+ * renderle a fine risposta).
  */
-export function dedupeNextActions(steps: AgentMetaStepData[]): AgentMetaStepData[] {
-  let lastIdx = -1;
-  steps.forEach((m, i) => {
-    if (m.kind === "next_actions") lastIdx = i;
-  });
-  if (lastIdx < 0) return steps;
-  return steps.filter((m, i) => m.kind !== "next_actions" || i === lastIdx);
+export function extractLatestNextActions(steps: AgentMetaStepData[]): NextActionChoice[] {
+  let latest: NextActionChoice[] = [];
+  for (const m of steps) {
+    if (m.kind === "next_actions") {
+      latest = (m.payload?.choices ?? []) as NextActionChoice[];
+    }
+  }
+  return latest.filter((c) => c && (c.prompt ?? "").trim().length > 0);
+}
+
+/**
+ * Invia la scelta selezionata: prop esplicita se fornita, altrimenti CustomEvent
+ * globale `nexus:chat:send` (stesso bridge di "Risolvi con Nexus", ascoltato da
+ * ide-shell). Punto unico per il comportamento di click-su-scelta.
+ */
+function dispatchChoice(prompt: string, onChoice?: (prompt: string) => void) {
+  if (onChoice) {
+    onChoice(prompt);
+    return;
+  }
+  window.dispatchEvent(
+    new CustomEvent("nexus:chat:send", { detail: { content: prompt, autoSend: true } }),
+  );
+}
+
+/**
+ * Pulsanti delle scelte di proseguimento. Punto unico di rendering (regola L):
+ * usato sia a fine risposta in chat (posizione primaria voluta dall'utente) sia,
+ * storicamente, dentro la card meta_step. Ogni voce, al click, invia subito in
+ * chat il prompt gia' pronto (auto-send).
+ */
+export function NextActionsButtons({
+  choices,
+  onChoice,
+}: {
+  choices: NextActionChoice[];
+  onChoice?: (prompt: string) => void;
+}) {
+  if (!choices.length) return null;
+  return (
+    <div className="flex flex-col gap-1.5">
+      {choices.map((c, i) => {
+        const label = c.label ?? "—";
+        const prompt = c.prompt ?? "";
+        return (
+          <button
+            key={i}
+            type="button"
+            title={prompt}
+            disabled={!prompt}
+            onClick={() => prompt && dispatchChoice(prompt, onChoice)}
+            className="w-full text-left text-xs px-2 py-1.5 rounded border border-blue-300 dark:border-blue-700 bg-white/70 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200 hover:bg-blue-100 dark:hover:bg-blue-800/50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            {label}
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
 interface KindDescriptor {
@@ -152,9 +206,6 @@ function PlanChecklist({ todos }: { todos: PlanTodo[] }) {
   );
 }
 
-// Scelta proposta dall'agente: testo breve del pulsante + prompt completo da inviare.
-type NextActionChoice = { label?: string; prompt?: string };
-
 function renderPayload(
   kind: string,
   payload: Record<string, unknown>,
@@ -163,26 +214,7 @@ function renderPayload(
   if (kind === "next_actions") {
     const choices = (payload.choices ?? []) as NextActionChoice[];
     if (!choices.length) return <em className="text-xs opacity-70">Nessuna scelta</em>;
-    return (
-      <div className="flex flex-col gap-1.5">
-        {choices.map((c, i) => {
-          const label = c.label ?? "—";
-          const prompt = c.prompt ?? "";
-          return (
-            <button
-              key={i}
-              type="button"
-              title={prompt}
-              disabled={!prompt}
-              onClick={() => prompt && onChoice(prompt)}
-              className="w-full text-left text-xs px-2 py-1.5 rounded border border-blue-300 dark:border-blue-700 bg-white/70 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200 hover:bg-blue-100 dark:hover:bg-blue-800/50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              {label}
-            </button>
-          );
-        })}
-      </div>
-    );
+    return <NextActionsButtons choices={choices} onChoice={onChoice} />;
   }
   if (kind === "plan") {
     const todos = (payload.todos ?? []) as PlanTodo[];

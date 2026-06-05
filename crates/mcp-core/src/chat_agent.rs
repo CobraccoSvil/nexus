@@ -360,6 +360,44 @@ pub async fn get_agent_run(
     })))
 }
 
+/// GET /api/chat/agent-runs/:run_id/next-actions -- scelte di proseguimento
+/// (meta_step `next_actions`) persistite per il run. Serve a RIPRISTINARE i
+/// pulsanti delle scelte dopo un reload o sui turni passati: i meta_step live
+/// arrivano via SSE e si perdono al refresh, mentre qui li rileggiamo dal DB
+/// (nexus_agent_meta_steps). Ritorna l'ULTIMA card del run (le precedenti sono
+/// tentativi superati dai fallback). Sempre {choices: [...]}, eventualmente vuoto.
+pub async fn get_agent_run_next_actions(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(run_id): AxumPath<String>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let run_id = Uuid::parse_str(&run_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Run id non valido"))?;
+
+    // Ownership verificata via join su agent_runs.user_id: nessun leak cross-utente.
+    let row = sqlx::query(
+        "SELECT m.payload
+         FROM nexus_agent_meta_steps m
+         JOIN agent_runs r ON r.id = m.run_id
+         WHERE m.run_id = $1 AND m.kind = 'next_actions' AND r.user_id = $2
+         ORDER BY m.created_at DESC
+         LIMIT 1",
+    )
+    .bind(run_id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let choices: Value = row
+        .and_then(|r| r.try_get::<Option<Value>, _>("payload").ok().flatten())
+        .and_then(|p| p.get("choices").cloned())
+        .unwrap_or_else(|| json!([]));
+
+    Ok(Json(json!({ "choices": choices })))
+}
+
 /// POST /api/chat/agent-runs/:run_id/confirm -- approva o annulla le pending actions.
 pub async fn confirm_agent_run(
     State(state): State<AppState>,

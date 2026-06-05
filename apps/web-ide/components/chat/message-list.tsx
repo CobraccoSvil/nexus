@@ -3,9 +3,10 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { RefObject } from "react";
 import type { ChatMessage, AgentRunInfo, AgentStep, SavedChatAttachment } from "../../lib/api-client";
-import { getAgentRun, getAttachmentRawUrl } from "../../lib/api-client";
+import { getAgentRun, getAgentRunNextActions, getAttachmentRawUrl } from "../../lib/api-client";
 import type { useThemeColors } from "../../lib/theme";
 import { MarkdownBlock } from "./markdown-renderer";
+import { NextActionsButtons, type NextActionChoice } from "./agent-meta-step-card";
 
 type ThemeColors = ReturnType<typeof useThemeColors>;
 
@@ -349,6 +350,61 @@ function formatStepInput(input: Record<string, unknown>): string {
     }
   }
   return lines.join("\n");
+}
+
+/**
+ * Pulsanti delle scelte di proseguimento (next_actions) per un singolo messaggio
+ * assistant. Sorgente robusta a due livelli:
+ *   1. `liveChoices` (fast-path): scelte arrivate via SSE nel run corrente,
+ *      mostrate subito senza attendere il fetch.
+ *   2. fallback DB: rilegge le scelte persistite (nexus_agent_meta_steps) tramite
+ *      l'endpoint dedicato, cosi' i pulsanti RESTANO anche dopo un reload o sui
+ *      turni passati (i dati SSE si perdono al refresh). Una sola fetch per runId.
+ * Best-effort: in caso di errore/nessuna scelta non rende nulla.
+ */
+function MessageNextActions({
+  runId,
+  liveChoices,
+  tc,
+}: {
+  runId: string;
+  liveChoices?: NextActionChoice[];
+  tc: ThemeColors;
+}) {
+  const [choices, setChoices] = useState<NextActionChoice[]>(liveChoices ?? []);
+
+  // Fast-path live: se arrivano scelte via SSE le adottiamo subito.
+  useEffect(() => {
+    if (liveChoices && liveChoices.length) setChoices(liveChoices);
+  }, [liveChoices]);
+
+  // Fallback DB: una sola fetch per runId; non sovrascrive scelte gia' presenti.
+  useEffect(() => {
+    let alive = true;
+    getAgentRunNextActions(runId)
+      .then((r) => {
+        const fromDb = (r.choices ?? []) as NextActionChoice[];
+        if (alive && fromDb.length) {
+          setChoices((prev) => (prev.length ? prev : fromDb));
+        }
+      })
+      .catch(() => {
+        /* best-effort: senza scelte non mostriamo pulsanti */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [runId]);
+
+  if (!choices.length) return null;
+  return (
+    <div style={{ marginTop: 8 }} data-testid="chat-next-actions">
+      <div style={{ fontSize: 11, fontWeight: 600, color: tc.textMuted, marginBottom: 4 }}>
+        Scegli come proseguire
+      </div>
+      <NextActionsButtons choices={choices} />
+    </div>
+  );
 }
 
 function AgentRunStepsInline({ runId, tc }: { runId: string; tc: ThemeColors }) {
@@ -710,6 +766,11 @@ export interface MessageListProps {
   lastUserRef: RefObject<HTMLDivElement | null>;
   /** ID progetto corrente: abilita esecuzione comandi dai blocchi codice shell. */
   projectId?: string;
+  /** Scelte di proseguimento (next_actions) da mostrare come pulsanti DENTRO la
+   *  bolla del messaggio assistant a cui appartengono (a fine proposta, non in un
+   *  blocco separato). `runId` identifica il run; i pulsanti vengono attaccati
+   *  all'ultimo messaggio assistant di quel run. */
+  nextActions?: { runId?: string; choices: NextActionChoice[] };
 }
 
 type CopyFeedbackState = { messageId: string; status: "success" | "error" } | null;
@@ -763,6 +824,7 @@ export function MessageList({
   positiveFeedback,
   lastUserRef,
   projectId,
+  nextActions,
 }: MessageListProps) {
   const [copyFeedback, setCopyFeedback] = useState<CopyFeedbackState>(null);
   const copyFeedbackTimeoutRef = useRef<number | null>(null);
@@ -994,6 +1056,21 @@ export function MessageList({
                 );
               })()}
             </div>
+
+            {/* Scelte di proseguimento: pulsanti attaccati a fine proposta DENTRO
+                la bolla del messaggio assistant che le ha generate (vicino al
+                testo). Sorgente: scelte live (SSE) se disponibili per questo run,
+                altrimenti rilette dal DB -> i pulsanti restano dopo un reload e
+                sui turni passati. */}
+            {!isUser && message.runId && (
+              <MessageNextActions
+                runId={message.runId}
+                liveChoices={
+                  nextActions?.runId === message.runId ? nextActions.choices : undefined
+                }
+                tc={tc}
+              />
+            )}
 
             {/* Chip allegati salvati: cliccabili (immagini -> tab raw, testo/binario -> editor). */}
             {isUser && message.attachments && message.attachments.length > 0 && (

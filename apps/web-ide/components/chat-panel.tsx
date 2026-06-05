@@ -18,7 +18,10 @@ import { FeedbackErrorDialog } from "./feedback-error-dialog";
 import { IconButton } from "./icon-button";
 import { MessageList } from "./chat/message-list";
 import { AgentStepsPanel } from "./chat/agent-steps-panel";
-import { AgentMetaStepCard as AgentMetaStepCardLazy, dedupeNextActions } from "./chat/agent-meta-step-card";
+import {
+  AgentMetaStepCard as AgentMetaStepCardLazy,
+  extractLatestNextActions,
+} from "./chat/agent-meta-step-card";
 import { InlineTracePanel } from "./chat/inline-trace-panel";
 import { Composer } from "./chat/composer";
 import { MemoryPanel } from "./chat/memory-panel";
@@ -1056,6 +1059,20 @@ export function ChatPanel({
             positiveFeedback={positiveFeedback}
             lastUserRef={lastUserRef}
             projectId={projectId}
+            nextActions={(!agentRun && metaStepsMap.size > 0) ? (() => {
+              // Scelte di proseguimento (next_actions) dell'ultimo run concluso:
+              // passate a MessageList per essere rese DENTRO la bolla del
+              // messaggio assistant, a fine proposta (vicino al testo). Durante il
+              // run attivo restano gestite da AgentStepsPanel (qui undefined).
+              const lastAssistantWithRun = [...messages]
+                .reverse()
+                .find((m) => m.role === "assistant" && m.runId);
+              const targetRunId = lastAssistantWithRun?.runId
+                ?? Array.from(metaStepsMap.keys()).pop();
+              const targetMetaSteps = targetRunId ? metaStepsMap.get(targetRunId) : undefined;
+              const choices = targetMetaSteps ? extractLatestNextActions(targetMetaSteps) : [];
+              return choices.length ? { runId: targetRunId, choices } : undefined;
+            })() : undefined}
           />
 
           {resendPreview && (
@@ -1137,6 +1154,11 @@ export function ChatPanel({
               ?? Array.from(metaStepsMap.keys()).pop();
             const targetMetaSteps = targetRunId ? metaStepsMap.get(targetRunId) : undefined;
             if (!targetMetaSteps || !targetMetaSteps.length) return null;
+            // I next_actions sono ora resi come pulsanti a fine risposta (sopra):
+            // qui restano solo le decisioni di processo (plan/routing/clarify/
+            // fallback/reflection/tool_executed).
+            const decisionSteps = targetMetaSteps.filter((m) => m.kind !== "next_actions");
+            if (!decisionSteps.length) return null;
             return (
               <div
                 style={{
@@ -1151,7 +1173,7 @@ export function ChatPanel({
                 <div style={{ fontSize: 11, fontWeight: 600, color: tc.textMuted, marginBottom: 4 }}>
                   Decisioni del turno
                 </div>
-                {dedupeNextActions(targetMetaSteps).map((m, idx) => (
+                {decisionSteps.map((m, idx) => (
                   <AgentMetaStepCardLazy key={`hist-${m.kind}-${m.createdAt}-${idx}`} data={m} />
                 ))}
               </div>

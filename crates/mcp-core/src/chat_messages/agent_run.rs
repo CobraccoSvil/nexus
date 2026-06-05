@@ -1470,8 +1470,18 @@ pub(crate) async fn spawn_agent_run(
                 // tool e' sempre un fallimento.
                 let is_action_request =
                     crate::agent_types::detect_action_request(&initial_msg_clone);
+                // Intent AUTORITATIVO: quello del router del brain propagato in
+                // nexus_task_type, NON la pre-classificazione locale di mcp-core
+                // (che diverge: mcp-core passa i tool, il brain li azzera per le
+                // chat dirette -> had_tools=true marcava hollow a torto). Evita il
+                // retry/cascade hollow spurio quando il brain ha instradato come
+                // 'chat'. Fallback al locale se il task_type non e' propagato.
+                let brain_intent = result
+                    .nexus_task_type
+                    .as_deref()
+                    .unwrap_or(classified_intent_for_loop);
                 let hollow_retry = result.hollow_completion
-                    && (classified_intent_for_loop != "chat" || is_action_request);
+                    && (brain_intent != "chat" || is_action_request);
                 let should_retry = failed_retry || hollow_retry;
 
                 if !should_retry || fallback_attempt + 1 >= max_provider_fallbacks {
@@ -1673,9 +1683,18 @@ pub(crate) async fn spawn_agent_run(
             }
 
             // ── Hollow completion: il modello ha dichiarato di aver completato
-            // senza invocare alcun tool. Per intent `chat` questo e' atteso —
-            // non aggiungiamo avvisi spuri.
-            let conversational_intent = classified_intent_for_loop == "chat";
+            // senza invocare alcun tool. Per intent `chat` questo e' atteso (il
+            // brain azzera i tool: chat diretta) e NON va segnalato come avviso.
+            // Intent AUTORITATIVO dal router del brain (nexus_task_type), non la
+            // pre-classificazione locale di mcp-core: quest'ultima divergeva e,
+            // combinata con had_tools=true (mcp-core passa i tool, il brain li
+            // azzera), produceva l'avviso "0 tool / risposta generica" fuorviante
+            // sulle chat dirette. Fallback al locale se il task_type non c'e'.
+            let effective_intent = result
+                .nexus_task_type
+                .as_deref()
+                .unwrap_or(classified_intent_for_loop);
+            let conversational_intent = effective_intent == "chat";
             let report_hollow = result.hollow_completion && !conversational_intent;
             if report_hollow {
                 tracing::warn!(

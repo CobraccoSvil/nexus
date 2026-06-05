@@ -564,6 +564,22 @@ async def clarify_or_expand_node(state: AgentState) -> dict[str, Any]:
         logger.info("clarify_or_expand: disabilitato via settings, skip")
         return {}
 
+    # Intent CONVERSAZIONALE: una richiesta di chiacchierata/discussione NON e'
+    # una richiesta operativa ambigua da chiarire. Per chat/general_chat si
+    # risponde direttamente (coerente col router_node che azzera i tool): niente
+    # clarify, niente intake gate, niente decision lookup. Senza questa guardia
+    # il nodo chiamava un LLM extra con tool clarify_or_expand che, su risposta
+    # malformata, emetteva un "Serve un chiarimento" fuorviante e innescava la
+    # cascade di fallback provider (giro a vuoto). Punto unico della decisione
+    # "questa richiesta non va chiarita perche' e' conversazionale".
+    intent = str(state.get("user_intent") or "").strip().lower()
+    if intent in ("chat", "general_chat"):
+        logger.info(
+            "clarify_or_expand: intent=%s conversazionale -> skip (nessun chiarimento)",
+            intent,
+        )
+        return {}
+
     user_msg_preview = _last_user_message(state).strip()
 
     # ── Comp.1: Intake Gate multi-asse (gated). Assorbe il decision-lookup. ───
