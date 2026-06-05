@@ -21,10 +21,105 @@ fn user_manager_unavailable(output: &std::process::Output) -> bool {
 
 /// Suggerimento operativo mostrato in UI quando il manager utente e' giu'.
 /// Niente uid hardcoded: `$(id -u)` viene risolto dalla shell dell'utente.
-const USER_MANAGER_HINT: &str = "Il manager systemd utente non e' attivo: \
-impossibile elencare i servizi. Avvialo con `sudo systemctl start user@$(id -u)` \
-oppure riavvia WSL con `wsl --shutdown`. I servizi installati ricompariranno \
-automaticamente (il file .service esiste gia' in ~/.config/systemd/user/).";
+const USER_MANAGER_HINT: &str = "Il manager systemd utente non e' attivo \
+(tipico in WSL). Nexus gestisce comunque i servizi in modalita' detached: \
+sono elencati e avviabili qui sotto. Per usare systemd: `sudo systemctl start \
+user@$(id -u)` oppure `wsl --shutdown`. I file .service restano in \
+~/.config/systemd/user/.";
+
+/// Estrae la riga `ExecStart=` da un contenuto di unit file systemd.
+pub(super) fn unit_exec_start(content: &str) -> String {
+    content
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("ExecStart="))
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// Estrae `WorkingDirectory=` da un unit file.
+pub(super) fn unit_working_dir(content: &str) -> String {
+    content
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("WorkingDirectory="))
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// Estrae le coppie `Environment=KEY=VAL` da un unit file (una per riga, forma
+/// usata dal wizard install).
+pub(super) fn unit_env_map(content: &str) -> std::collections::HashMap<String, String> {
+    let mut m = std::collections::HashMap::new();
+    for l in content.lines() {
+        if let Some(rest) = l.trim().strip_prefix("Environment=") {
+            let rest = rest.trim().trim_matches('"');
+            if let Some((k, v)) = rest.split_once('=') {
+                m.insert(
+                    k.trim().to_string(),
+                    v.trim().trim_matches('"').to_string(),
+                );
+            }
+        }
+    }
+    m
+}
+
+/// Vero se esiste un processo che esegue `exec_start` (avviato dal fallback
+/// detached, vedi `spawn_detached_service`). Usa lo stesso criterio di match
+/// (pgrep -f sull'ExecStart) di pkill usato per fermarlo.
+pub(super) async fn detached_process_running(exec_start: &str) -> bool {
+    if exec_start.trim().is_empty() {
+        return false;
+    }
+    tokio::process::Command::new("pgrep")
+        .args(["-f", exec_start])
+        .output()
+        .await
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+/// Elenca i servizi del progetto SENZA systemd --user (manager `user@<uid>`
+/// dead, tipico in WSL). Legge i file unit in `~/.config/systemd/user/{slug}-*.
+/// service` e ne deduce lo stato dal processo detached (pgrep sull'ExecStart).
+/// Cosi' il pannello funziona anche quando il bus systemd utente e' giu', senza
+/// richiedere sudo (fix definitivo, regola H: niente dipendenza dal manager
+/// fragile di WSL).
+pub(super) async fn list_services_fallback(slug: &str) -> Vec<serde_json::Value> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/administrator".to_string());
+    let dir = format!("{home}/.config/systemd/user");
+    let prefix = format!("{slug}-");
+    let mut services: Vec<serde_json::Value> = Vec::new();
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(r) => r,
+        Err(_) => return services,
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let fname = entry.file_name().to_string_lossy().to_string();
+        if !fname.starts_with(&prefix) || !fname.ends_with(".service") {
+            continue;
+        }
+        let short = fname
+            .strip_prefix(&prefix)
+            .unwrap_or(&fname)
+            .strip_suffix(".service")
+            .unwrap_or(&fname)
+            .to_string();
+        let content = tokio::fs::read_to_string(entry.path()).await.unwrap_or_default();
+        let exec_start = unit_exec_start(&content);
+        let running = detached_process_running(&exec_start).await;
+        services.push(json!({
+            "unit":       fname,
+            "short":      short,
+            "state":      if running { "active" } else { "inactive" },
+            "sub":        if running { "running" } else { "dead" },
+            "managed_by": "detached",
+        }));
+    }
+    services.sort_by(|a, b| a["short"].as_str().cmp(&b["short"].as_str()));
+    services
+}
 
 // ── POST /api/projects/:id/services/:service/:action ─────────────────────────
 // service: "backend" | "brain" | "frontend"
@@ -62,10 +157,15 @@ pub async fn get_project_services_status(
     // servizi. Senza questo check il frontend mostrerebbe "Nessun servizio trovato"
     // anche quando il manager `user@<uid>` e' semplicemente inactive (tipico WSL).
     if user_manager_unavailable(&out) {
+        // Fix definitivo (regola H): invece di mostrare solo il warning, elenca
+        // i servizi dai file unit + stato dei processi detached. Il pannello
+        // resta funzionale senza systemd --user e senza sudo.
+        let services = list_services_fallback(&slug).await;
         return Ok(Json(json!({
-            "services": [],
+            "services": services,
             "slug": slug,
             "manager_unavailable": true,
+            "manager_mode": "detached",
             "manager_hint": USER_MANAGER_HINT,
         })));
     }
@@ -208,6 +308,75 @@ pub async fn control_project_service(
         .output()
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Fix definitivo (regola H): se il manager systemd utente e' giu' (WSL),
+    // gestisci start/stop/restart in modalita' detached leggendo l'unit file,
+    // senza richiedere sudo. Coerente con l'avvio del wizard install.
+    if user_manager_unavailable(&out) {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/administrator".to_string());
+        let unit_path = format!("{home}/.config/systemd/user/{svc_name}");
+        let content = tokio::fs::read_to_string(&unit_path).await.unwrap_or_default();
+        let exec_start = unit_exec_start(&content);
+        if exec_start.is_empty() {
+            return Ok(Json(json!({
+                "ok": false,
+                "unit": svc_name,
+                "action": systemctl_action,
+                "stderr": format!("unit file assente o senza ExecStart: {unit_path}"),
+                "manager_mode": "detached",
+            })));
+        }
+        let cwd = {
+            let w = unit_working_dir(&content);
+            if w.is_empty() {
+                context.root_path.to_string_lossy().to_string()
+            } else {
+                w
+            }
+        };
+        let env_map = unit_env_map(&content);
+        let (ok, msg) = match systemctl_action {
+            "stop" => {
+                let _ = tokio::process::Command::new("pkill")
+                    .args(["-f", &exec_start])
+                    .output()
+                    .await;
+                (true, "fermato (detached)".to_string())
+            }
+            // start e restart: spawn_detached_service e' idempotente (fa pkill
+            // del precedente prima di riavviare), quindi copre entrambi.
+            _ => match super::wizard::spawn_detached_service(&svc_name, &cwd, &env_map, &exec_start)
+                .await
+            {
+                Ok(log) => (true, format!("avviato (detached), log={log}")),
+                Err(e) => (false, e),
+            },
+        };
+        if ok {
+            let evt = match systemctl_action {
+                "start" => nexus_events::event::ProjectEvent::ServiceStarted {
+                    name: svc_name.clone(),
+                    port: None,
+                    pid: None,
+                },
+                "stop" => nexus_events::event::ProjectEvent::ServiceStopped {
+                    name: svc_name.clone(),
+                },
+                _ => nexus_events::event::ProjectEvent::ServiceRestarted {
+                    name: svc_name.clone(),
+                },
+            };
+            nexus_events::dispatcher::emit(&state.project_channels, project_id, evt);
+        }
+        return Ok(Json(json!({
+            "ok": ok,
+            "unit": svc_name,
+            "action": systemctl_action,
+            "stdout": msg,
+            "manager_mode": "detached",
+            "freed_ports": freed_ports,
+        })));
+    }
 
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();

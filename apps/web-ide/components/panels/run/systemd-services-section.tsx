@@ -177,7 +177,17 @@ export function SystemdServicesSection({
                 : "Caricamento…"}
             </div>
           )
-        ) : services.map(svc => {
+        ) : (
+          <>
+            {managerUnavailable && (
+              <div style={{ fontSize:11, padding:"2px 0 8px", display:"flex", alignItems:"center", gap:6 }}>
+                <span style={{ color:"#f59e0b", fontWeight:700 }}>•</span>
+                <span style={{ color:tc.textSecondary, lineHeight:1.4 }}>
+                  Gestiti in modalita' detached (systemd utente non attivo): avvio, arresto e stato funzionano comunque, senza systemd.
+                </span>
+              </div>
+            )}
+            {services.map(svc => {
           const hasDiag = !!svc.last_error;
           const col = hasDiag ? "#ef4444" : stateColor(svc.state);
           // Match porta↔servizio: prima per campo `service` esatto (popolato dal backend),
@@ -367,6 +377,8 @@ export function SystemdServicesSection({
             </div>
           );
         })}
+          </>
+        )}
         {svcMsg && <div style={{ fontSize:11,color:(svcMsg.toLowerCase().includes("errore")||svcMsg.toLowerCase().includes("error"))?"#ef4444":"#22c55e",marginTop:4 }}>{svcMsg}</div>}
       </div>
     </>

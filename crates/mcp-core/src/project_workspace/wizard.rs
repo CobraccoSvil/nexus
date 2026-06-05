@@ -295,7 +295,7 @@ async fn systemd_user_available() -> bool {
 ///
 /// Ritorna `Ok(logfile)` in caso di spawn riuscito, `Err(msg)` se lo spawn
 /// stesso fallisce (in tal caso il chiamante deve ritornare ok:false).
-async fn spawn_detached_service(
+pub(super) async fn spawn_detached_service(
     unit_name: &str,
     cwd: &str,
     env_map: &std::collections::HashMap<String, String>,
