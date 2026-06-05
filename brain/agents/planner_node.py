@@ -74,21 +74,43 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
         return {"plan_phase_active": False}
 
     # Se siamo gia' passati dal planner per questo run e i todos esistono,
-    # non rifare il piano (PR-2 gestira' le revisioni esplicite).
+    # riusa il piano — MA solo se l'intent (e la behavior_mode) NON sono
+    # cambiati. Root cause del bug "plan-reuse cieco": lo stesso thread_id puo'
+    # ricevere un turno con intent diverso (es. dopo "crea sito web" arriva
+    # "genera documentazione"); riusare il piano coding faceva ignorare la nuova
+    # richiesta. Confrontiamo l'intent corrente con quello salvato col piano
+    # (mig 0328). Se divergono, NON riusiamo: il flusso prosegue alla creazione
+    # di un nuovo piano (UPSERT su run_id che sovrascrive quello stantio).
     run_id = state.get("thread_id")
-    if run_id and todo_store.fetch_plan(run_id) is not None:
-        todos = todo_store.list_todos(run_id)
-        active = todo_store.active_todo(run_id)
-        logger.info(
-            "planner_node: plan gia' esistente per run_id=%s (%d todos), riuso",
-            run_id, len(todos),
-        )
-        return {
-            "plan_phase_active": True,
-            "current_plan_id": run_id,
-            "current_todos": todos,
-            "active_todo_id": active.get("id") if active else None,
-        }
+    if run_id:
+        existing_plan = todo_store.fetch_plan(run_id)
+        if existing_plan is not None:
+            plan_intent = existing_plan.get("user_intent")
+            plan_mode = existing_plan.get("behavior_mode")
+            # Invalida SOLO con informazione tracciata e divergente: i piani
+            # legacy (pre-0328, intent non salvato -> None) mantengono il riuso
+            # storico per non rigenerare a vuoto.
+            intent_diverged = plan_intent is not None and plan_intent != intent
+            mode_diverged = plan_mode is not None and plan_mode != behavior_mode
+            if intent_diverged or mode_diverged:
+                logger.info(
+                    "planner_node: piano obsoleto run_id=%s (intent %s->%s, mode %s->%s) — rigenero",
+                    run_id, plan_intent, intent, plan_mode, behavior_mode,
+                )
+                # Nessun return: prosegue al flusso di creazione di un nuovo piano.
+            else:
+                todos = todo_store.list_todos(run_id)
+                active = todo_store.active_todo(run_id)
+                logger.info(
+                    "planner_node: plan valido per run_id=%s (%d todos), riuso (intent=%s mode=%s)",
+                    run_id, len(todos), intent, behavior_mode,
+                )
+                return {
+                    "plan_phase_active": True,
+                    "current_plan_id": run_id,
+                    "current_todos": todos,
+                    "active_todo_id": active.get("id") if active else None,
+                }
 
     # ── Pre-requisiti: providers + tool_runner + routing_client ──────────────
     if _providers is None or _tool_runner is None or _routing_client is None:
@@ -420,6 +442,12 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
     tool_input = dict(todo_block.get("input") or {})
     tool_input["run_id"] = run_id  # forza valorizzazione corretta
     tool_input.setdefault("planner_model", f"{used_provider}/{used_model}")
+    # Persisti intent + behavior_mode con cui il piano viene creato (mig 0328):
+    # consentono l'invalidazione intent-aware del riuso nei turni successivi.
+    if intent is not None:
+        tool_input["user_intent"] = intent
+    if behavior_mode is not None:
+        tool_input["behavior_mode"] = behavior_mode
     tool_use_id = todo_block.get("id") or str(uuid.uuid4())
     try:
         result = await _tool_runner.execute_tool(

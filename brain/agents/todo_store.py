@@ -43,7 +43,8 @@ def fetch_plan(run_id: str) -> dict[str, Any] | None:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT run_id::text, project_id::text, thread_id, acceptance_criteria,
-                          planner_model, approved_at, score, plan_revisions, created_at
+                          planner_model, approved_at, score, plan_revisions, created_at,
+                          user_intent, behavior_mode
                    FROM nexus_agent_plans WHERE run_id = %s""",
                 (run_id,),
             )
