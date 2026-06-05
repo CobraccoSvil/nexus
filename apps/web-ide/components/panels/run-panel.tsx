@@ -266,10 +266,23 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
   const [batchBusy, setBatchBusy] = useState(false);
 
   const handleRestartAll = async () => {
-    // Fix M47: se non ci sono servizi systemd installati, il pulsante prima
-    // era solo disabilitato senza spiegare perche. Ora il click avvisa
-    // l'utente con un messaggio attivabile (Configura wizard) invece di
-    // restare silenzioso.
+    // Caso 1: manager systemd --user non attivo (es. WSL senza login persistent
+    // o ambiente detached). Spiegare ESPLICITAMENTE invece di chiamare
+    // systemctl che ritorna 0 unit senza errore (esito muto = "non succede
+    // nulla" lato utente, come segnalato).
+    if (managerUnavailable) {
+      await confirmDialog(
+        "Il manager systemd --user non è attivo: impossibile riavviare i servizi via systemctl.\n\n" +
+        (managerHint ? `Suggerimento: ${managerHint}\n\n` : "") +
+        "Alternativa: usa il terminale e lancia `./deploy/deploy-local.sh` " +
+        "(o il comando di restart specifico del tuo progetto) per riavviare i processi detached. " +
+        "Una volta riavviati, premi la X per azzerare il contatore.",
+      );
+      // Non chiamiamo bumpLastRestart automaticamente: l'utente deve fare il
+      // restart manuale e poi decidere se segnalarlo (X) o riavviare ancora.
+      return;
+    }
+    // Caso 2: nessun servizio systemd installato (M47).
     if (services.length === 0) {
       await confirmDialog(
         "Nessun servizio systemd installato per questo progetto. " +
@@ -285,11 +298,21 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
       const r = await restartAllProjectServices(projectId);
       const ok = (r.restarted ?? []).filter(x=>x.ok).length;
       const tot = (r.restarted ?? []).length;
-      setSvcMsg(`Riavviati ${ok}/${tot} servizi`);
-      if (ok > 0) bumpLastRestart();
+      // Edge case: systemctl ritorna 0 unit (slug non matcha, manager appena
+      // morto) — segnalare invece di lasciare "Riavviati 0/0 servizi" criptico.
+      if (tot === 0) {
+        setSvcMsg("Nessun servizio del progetto trovato in systemctl (slug non corrisponde alle unit).");
+      } else {
+        setSvcMsg(`Riavviati ${ok}/${tot} servizi`);
+        if (ok > 0) bumpLastRestart();
+      }
       setTimeout(()=>{ fetchServices(); fetchPorts(); }, 1500);
-    } catch { setSvcMsg("Errore riavvio batch"); }
-    finally { setBatchBusy(false); setTimeout(()=>setSvcMsg(""),6000); }
+    } catch (e) {
+      // Mostra l'errore reale invece del generico "Errore riavvio batch".
+      const msg = e instanceof Error ? e.message : String(e);
+      setSvcMsg(`Errore riavvio batch: ${msg.slice(0, 120)}`);
+    }
+    finally { setBatchBusy(false); setTimeout(()=>setSvcMsg(""),10000); }
   };
 
   const handleCleanupPorts = async () => {
