@@ -186,24 +186,33 @@ pub async fn validate_token(
 
     // Verify session exists and not expired
     let token_hash = hash_token(&token);
-    let session_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash = $1 AND expires_at > NOW())",
-    )
-    .bind(&token_hash)
-    .fetch_one(db)
-    .await
-    .map_err(|e| {
-        // Fix regola H: prima `.unwrap_or(false)` -> tutti gli utenti
-        // ricevevano 401 quando il DB cadeva, diagnosi sbagliata garantita.
-        tracing::error!("verify_session_token: SELECT sessions fallita: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    if !session_exists {
+    if !check_session_exists(db, &token_hash).await? {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
     Ok(token_data.claims)
+}
+
+/// Verifica nel DB se esiste una sessione non scaduta col dato hash.
+///
+/// Estratta da `validate_token` per consentire test di regressione sul
+/// comportamento "DB down -> 500, NON 401" (fix S90, regola H).
+pub async fn check_session_exists(
+    db: &PgPool,
+    token_hash: &str,
+) -> Result<bool, StatusCode> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash = $1 AND expires_at > NOW())",
+    )
+    .bind(token_hash)
+    .fetch_one(db)
+    .await
+    .map_err(|e| {
+        // Fix regola H (S90): prima `.unwrap_or(false)` -> tutti gli utenti
+        // ricevevano 401 quando il DB cadeva, diagnosi sbagliata garantita.
+        tracing::error!("check_session_exists: SELECT sessions fallita: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 // --- Middleware ---
@@ -242,6 +251,39 @@ pub async fn require_admin<S: Clone + Send + Sync + 'static>(
         Err(e) => {
             tracing::warn!("require_admin: token validation failed: {:?}, path={}", e, req.uri());
             Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use sqlx::postgres::PgPoolOptions;
+    use std::time::Duration;
+
+    /// Regressione S90: con DB irraggiungibile, check_session_exists deve
+    /// ritornare INTERNAL_SERVER_ERROR, NON false (che -> 401 Unauthorized).
+    /// Prima del fix  mascherava ogni DB outage come
+    /// "tutti gli utenti non sono loggati" - diagnosi catastroficamente
+    /// sbagliata.
+    #[tokio::test]
+    async fn s90_db_down_returns_500_not_401() {
+        // Pool puntato a una porta senza listener: la prima query fallira.
+        let pool = match PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(2))
+            .connect_lazy("postgres://nobody:nopass@127.0.0.1:1/nonexistent")
+        {
+            Ok(p) => p,
+            Err(_) => return, // ambiente senza supporto: skip
+        };
+
+        let res = check_session_exists(&pool, "deadbeef").await;
+        match res {
+            Err(StatusCode::INTERNAL_SERVER_ERROR) => {}
+            Err(other) => panic!("S90: atteso 500, ricevuto {other}"),
+            Ok(v) => panic!("S90: atteso Err(500), ricevuto Ok({v}) - regressione!"),
         }
     }
 }
