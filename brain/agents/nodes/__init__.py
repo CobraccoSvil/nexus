@@ -1504,11 +1504,11 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             _exploration_count, _exploration_threshold,
         )
         _expl_text = (
-            f"[LOOP RILEVATO] Il modello ha eseguito {_exploration_count} esplorazioni "
-            f"consecutive dell'allegato/file senza scrivere nulla, ignorando il "
-            f"sollecito a procedere. Esecuzione interrotta per evitare stallo. "
-            f"La specifica e' gia' disponibile nel contesto: riformula la richiesta "
-            f"o usa un modello piu' capace per lo scaffolding."
+            f"[LOOP RILEVATO] Il modello ha eseguito {_exploration_count} "
+            f"esplorazioni/ricerche-tool consecutive senza produrre un risultato "
+            f"(ne' scrittura ne' risposta), ignorando il sollecito a procedere. "
+            f"Esecuzione interrotta per evitare stallo. Riformula la richiesta in "
+            f"modo piu' specifico o usa un modello piu' capace."
         )
         return {
             "messages": [AIMessage(content=_expl_text)],
@@ -1522,11 +1522,13 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     if _exploration_count >= _exploration_threshold and not _exploration_nudge_sent:
         _expl_nudge = HumanMessage(
             content=(
-                f"Hai gia' raccolto sufficiente contesto dall'allegato "
-                f"({_exploration_count} esplorazioni). La specifica e' gia' "
-                f"disponibile nel contesto. NON esplorare ulteriormente "
-                f"l'archivio/i file: procedi ORA a creare i file dell'applicazione "
-                f"con write_file e richiedi le porte con request_port."
+                f"Hai gia' raccolto sufficiente contesto / cercato abbastanza "
+                f"strumenti ({_exploration_count} esplorazioni). NON esplorare "
+                f"oltre e NON cercare altri tool. Procedi ORA in base alla "
+                f"richiesta: se devi MODIFICARE il progetto, scrivi i file con "
+                f"write_file (e usa request_port per le porte); se invece era una "
+                f"DOMANDA o una richiesta di proposte/opzioni, RISPONDI subito a "
+                f"parole con il risultato, senza altre tool call."
             )
         )
         messages = list(messages) + [_expl_nudge]

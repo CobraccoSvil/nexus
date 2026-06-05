@@ -308,6 +308,12 @@ _EXPLORATION_ONLY_TOOLS: frozenset[str] = frozenset({
     "nexus_extract_docx_text", "nexus_extract_xlsx_data",
     "nexus_extract_pdf_text", "nexus_describe_image_attachment",
     "read_file",
+    # Discovery meta NON produttiva: cerca altri tool MCP ma non scrive ne'
+    # risponde. Senza questa voce un loop di sole ricerche-tool azzererebbe
+    # ad ogni iterazione il contatore anti-loop (visto come "produttivo"),
+    # rendendo il loop infinito (es. gemini-flash-lite che cerca ossessivamente
+    # tool per una domanda conversazionale invece di rispondere).
+    "nexus_mcp_tool_search",
 })
 
 # ── Cache soglia loop esplorativo (TTL 60s) ─────────────────────────────────
