@@ -30,6 +30,7 @@ Aggiornare questa tabella a ogni wave che riduce il debito.
 | Data | Wave | % righe duplicate | Cloni | Note |
 |---|---|---|---|---|
 | Wave 0 | 0 | 5.27% (16899 righe) | 1234 | Baseline iniziale, pre-consolidamento (2648 file, 20 formati) |
+| Wave 2 | 2 | 5.26% | 1234 | Consolidate TemplateCache/TtlCache + get_template_or_default in nexus-cache/nexus-types. Conteggio jscpd invariato: le due copie differivano nel formato, quindi non erano exact-clone; la duplicazione era strutturale, ora coperta dal guard check-single-source. |
 
 ## Hotspot noti (da consolidare)
 

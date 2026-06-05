@@ -5,6 +5,9 @@ use uuid::Uuid;
 
 pub use nexus_auth::Claims;
 
+mod templates;
+pub use templates::{get_template_or_default, TemplateCache};
+
 // --- Shared API types ---
 
 pub type ApiError = (StatusCode, Json<Value>);

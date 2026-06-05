@@ -9,42 +9,14 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-#[derive(Clone, Debug)]
-pub struct TemplateCache {
-    inner: Arc<DashMap<String, (String, Instant)>>,
-    ttl: Duration,
-}
-
-impl TemplateCache {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(DashMap::new()),
-            ttl: Duration::from_secs(60),
-        }
-    }
-    pub fn get(&self, key: &str) -> Option<String> {
-        self.inner.get(key).and_then(|e| {
-            if e.1.elapsed() < self.ttl {
-                Some(e.0.clone())
-            } else {
-                None
-            }
-        })
-    }
-    pub fn set(&self, key: String, value: String) {
-        self.inner.insert(key, (value, Instant::now()));
-    }
-    pub fn invalidate(&self, key: &str) {
-        self.inner.remove(key);
-    }
-}
+// TemplateCache e get_template_or_default: punto unico in nexus-types
+// (regola L / ADR 0026). Qui solo re-export per i call site interni
+// `crate::prompt_templates::{TemplateCache, get_template_or_default}`.
+pub use nexus_types::{get_template_or_default, TemplateCache};
 
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow, Clone)]
 pub struct PromptTemplate {
@@ -105,45 +77,6 @@ pub struct FalsePositiveReq {
 pub struct FalsePositiveStat {
     pub rule_key: Option<String>,
     pub count: Option<i64>,
-}
-
-/// Carica un prompt template dal DB (singola fonte di verità).
-///
-/// Priorità:
-/// 1. Cache in-memory (TTL 60s)
-/// 2. DB PostgreSQL (`nexus_prompt_templates` WHERE is_active=TRUE)
-/// 3. Stringa vuota con log errore critico
-///
-/// Tutti i template di sistema devono essere presenti nel DB via migration.
-/// Se manca un template, il log errore indica esattamente quale chiave aggiungere.
-pub async fn get_template_or_default(db: &PgPool, cache: &TemplateCache, key: &str) -> String {
-    if let Some(cached) = cache.get(key) {
-        return cached;
-    }
-    let result = sqlx::query_scalar::<_, String>(
-        "SELECT content FROM nexus_prompt_templates WHERE key = $1 AND is_active = TRUE",
-    )
-    .bind(key)
-    .fetch_optional(db)
-    .await;
-    match result {
-        Ok(Some(content)) => {
-            cache.set(key.to_string(), content.clone());
-            content
-        }
-        Ok(None) => {
-            tracing::error!(
-                "PROMPT TEMPLATE MANCANTE: key='{}' non trovata in nexus_prompt_templates \
-                 o disabilitata. Aggiungila tramite /admin/prompts o migration.",
-                key
-            );
-            String::new()
-        }
-        Err(e) => {
-            tracing::error!("Errore lettura prompt template '{}': {}", key, e);
-            String::new()
-        }
-    }
 }
 
 /// Suffix sempre accodato a `system.nexus_base` per i run agente (**non** in Study mode).

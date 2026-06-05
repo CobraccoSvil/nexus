@@ -7,52 +7,17 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use crate::AppState;
 
-#[derive(Clone, Debug)]
-pub struct TemplateCache {
-    inner: Arc<DashMap<String, (String, Instant)>>,
-    ttl: Duration,
-}
-
-impl TemplateCache {
-    /// Crea una nuova cache con TTL di 60 secondi.
-    ///
-    /// # Esempi
-    ///
-    /// ```
-    /// use admin_service::prompt_templates::TemplateCache;
-    ///
-    /// let cache = TemplateCache::new();
-    /// // Chiave assente restituisce None
-    /// assert!(cache.get("missing").is_none());
-    /// ```
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(DashMap::new()),
-            ttl: Duration::from_secs(60),
-        }
-    }
-    pub fn get(&self, key: &str) -> Option<String> {
-        self.inner
-            .get(key)
-            .and_then(|e| if e.1.elapsed() < self.ttl { Some(e.0.clone()) } else { None })
-    }
-    pub fn set(&self, key: String, value: String) {
-        self.inner.insert(key, (value, Instant::now()));
-    }
-    pub fn invalidate(&self, key: &str) {
-        self.inner.remove(key);
-    }
-}
+// TemplateCache e get_template_or_default: punto unico in nexus-types
+// (regola L / ADR 0026). Qui solo re-export, usato da main.rs come
+// `admin_service::prompt_templates::TemplateCache`.
+pub use nexus_types::{get_template_or_default, TemplateCache};
 
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow, Clone)]
 pub struct PromptTemplate {
@@ -122,34 +87,6 @@ pub struct FalsePositiveReq {
 pub struct FalsePositiveStat {
     pub rule_key: Option<String>,
     pub count: Option<i64>,
-}
-
-#[allow(dead_code)]
-pub async fn get_template_or_default(db: &PgPool, cache: &TemplateCache, key: &str) -> String {
-    if let Some(cached) = cache.get(key) {
-        return cached;
-    }
-    let result = sqlx::query_scalar::<_, String>(
-        "SELECT content FROM nexus_prompt_templates WHERE key = $1 AND is_active = TRUE",
-    )
-    .bind(key)
-    .fetch_optional(db)
-    .await;
-
-    match result {
-        Ok(Some(content)) => {
-            cache.set(key.to_string(), content.clone());
-            content
-        }
-        Ok(None) => {
-            tracing::error!("PROMPT TEMPLATE MANCANTE: key='{}'", key);
-            String::new()
-        }
-        Err(e) => {
-            tracing::error!("Errore lettura prompt template '{}': {}", key, e);
-            String::new()
-        }
-    }
 }
 
 pub async fn list_templates_handler(

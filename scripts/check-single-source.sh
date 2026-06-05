@@ -49,7 +49,8 @@ assert_single() {
 assert_single "parse_user_id" 'fn parse_user_id' 'crates/nexus-types/src/lib.rs' crates
 
 # Wave 2:
-# assert_single "TemplateCache" 'struct TemplateCache' 'crates/nexus-cache/src/*.rs' crates
+assert_single "TtlCache" 'struct TtlCache' 'crates/nexus-cache/src/lib.rs' crates
+assert_single "TemplateCache" 'struct TemplateCache' 'crates/nexus-types/src/templates.rs' crates
 
 # Wave 3:
 # assert_single "get_setting" 'fn get_setting[^_a-zA-Z]' 'crates/nexus-auth/src/*.rs' crates
