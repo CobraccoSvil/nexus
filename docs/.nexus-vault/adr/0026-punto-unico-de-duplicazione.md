@@ -84,8 +84,8 @@ condividere codice (fragile base class, accoppiamento al genitore).
 | Intent canonici (Python) | `brain/router/intents.py` | Wave 6 |
 | Fetch HTTP frontend | `apps/web-ide/lib/api/_shared.ts` (`fetchJson`) | esistente |
 | Formatter frontend | `apps/web-ide/lib/format.ts` | Wave 7 |
-| Chunking testo | `crates/mcp-core/src/rag/chunker.rs` (riferimento) + `brain/utils/text_chunk.py` | Wave 8 |
-| Classificazione errore provider (testo) | `crates/mcp-core/src/provider_error_classifier.rs` | Wave 8 |
+| Chunking testo | `crates/mcp-core/src/rag/chunker.rs` (riferimento) + `brain/utils/text_chunk.py` (paritetico, golden test) | esistente |
+| Classificazione errore provider (testo) | `crates/mcp-core/src/provider_error_classifier.rs` (paritetico a `brain/providers/error_handler.py`, golden test) | esistente |
 
 ### Enforcement
 

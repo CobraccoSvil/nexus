@@ -58,6 +58,7 @@ mod project_workspace;
 mod projects;
 mod prompt_templates;
 mod provider_cooldown;
+mod provider_error_classifier;
 mod provider_health_probe;
 mod quality_guard;
 mod rag;

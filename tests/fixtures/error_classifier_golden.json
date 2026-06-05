@@ -1,0 +1,75 @@
+{
+  "_comment": "Golden fixture cross-language (regola L / ADR 0026 Wave 8b): la classificazione testuale dell'errore provider deve produrre lo stesso stop_reason fra brain/providers/error_handler.py::classify_error e crates/mcp-core/src/provider_error_classifier.rs::classify_text. La parte SDK-specifica (retry-after da headers) resta solo lato Python e non e' coperta qui. Drift = bug.",
+  "cases": [
+    {
+      "name": "billing_pattern",
+      "input": "Your credit balance is too low to make this request",
+      "expected_stop_reason": "billing_error"
+    },
+    {
+      "name": "billing_quota",
+      "input": "you exceeded your current quota, please check your plan",
+      "expected_stop_reason": "billing_error"
+    },
+    {
+      "name": "context_length",
+      "input": "This model's maximum context length is 8192 tokens",
+      "expected_stop_reason": "context_too_long"
+    },
+    {
+      "name": "context_window",
+      "input": "context window exceeded for this request",
+      "expected_stop_reason": "context_too_long"
+    },
+    {
+      "name": "auth_invalid",
+      "input": "Invalid API key provided",
+      "expected_stop_reason": "auth_error"
+    },
+    {
+      "name": "auth_unauthorized",
+      "input": "401 unauthorized: token expired",
+      "expected_stop_reason": "auth_error"
+    },
+    {
+      "name": "http_429_rate_limit",
+      "input": "Error code: 429 - rate limit hit",
+      "expected_stop_reason": "rate_limit"
+    },
+    {
+      "name": "http_500_provider",
+      "input": "Error code: 500 - internal server error",
+      "expected_stop_reason": "provider_error"
+    },
+    {
+      "name": "http_503_unavailable",
+      "input": "Error code: 503 - service unavailable",
+      "expected_stop_reason": "service_unavailable"
+    },
+    {
+      "name": "http_403_forbidden",
+      "input": "Error code: 403 - forbidden",
+      "expected_stop_reason": "forbidden"
+    },
+    {
+      "name": "timeout",
+      "input": "Request timed out after 60s",
+      "expected_stop_reason": "timeout"
+    },
+    {
+      "name": "connection_refused",
+      "input": "connection refused by upstream",
+      "expected_stop_reason": "connection_error"
+    },
+    {
+      "name": "network",
+      "input": "network unreachable",
+      "expected_stop_reason": "connection_error"
+    },
+    {
+      "name": "unclassified",
+      "input": "Something completely unexpected happened",
+      "expected_stop_reason": "error"
+    }
+  ]
+}

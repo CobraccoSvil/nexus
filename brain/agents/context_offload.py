@@ -129,17 +129,17 @@ def _point_id(content_hash: str, chunk_index: int) -> str:
 
 
 def _chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
-    """Spezza il testo in chunk con overlap. Semplice e robusto (char-based)."""
-    if chunk_size <= 0:
-        return [text]
-    step = max(1, chunk_size - overlap)
-    chunks: list[str] = []
-    pos = 0
-    n = len(text)
-    while pos < n:
-        chunks.append(text[pos : pos + chunk_size])
-        pos += step
-    return chunks
+    """Spezza il testo in chunk con overlap. Punto unico (regola L / ADR 0026):
+    delega a ``brain.utils.text_chunk.chunk_text``, paritetico al Rust
+    ``crates/mcp-core/src/rag/chunker.rs`` (golden test cross-language).
+
+    Cambio di comportamento rispetto alla versione precedente: ora applica lo
+    smart trimming su whitespace per non spezzare parole a meta'. Sicuro qui
+    perche' context_offload e' una utility on-demand sul contesto agente,
+    non scrive su un index permanente."""
+    from brain.utils.text_chunk import chunk_text
+
+    return chunk_text(text, chunk_size, overlap)
 
 
 def offload_to_rag(

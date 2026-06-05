@@ -79,6 +79,12 @@ assert_single "extract_json_block" 'def extract_json_block' 'brain/utils/json_ex
 # Wave 6e (intent canonici di routing):
 assert_single "ALLOWED_INTENTS" '^ALLOWED_INTENTS' 'brain/router/intents.py' brain
 
+# Wave 8a (chunker testo, punto unico Python paritetico a rag/chunker.rs Rust):
+assert_single "python chunk_text" '^def chunk_text' 'brain/utils/text_chunk.py' brain
+
+# Wave 8b (error classifier testuale Rust, paritetico a brain error_handler):
+assert_single "rust classify_text" 'pub fn classify_text' 'crates/mcp-core/src/provider_error_classifier.rs' crates
+
 # Wave 8a:
 # assert_single "python chunker" 'def _?chunk_text' 'brain/utils/text_chunk.py' brain
 

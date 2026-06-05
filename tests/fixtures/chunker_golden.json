@@ -1,0 +1,74 @@
+{
+  "_comment": "Golden fixture cross-language (regola L / ADR 0026): l'algoritmo di chunking deve produrre output BIT-PER-BIT identici tra brain/utils/text_chunk.py e crates/mcp-core/src/rag/chunker.rs. Letta sia da pytest sia da cargo test (vedi brain/tests/test_text_chunk.py e crates/mcp-core/tests/chunker_parity.rs). Drift = bug.",
+  "cases": [
+    {
+      "name": "empty",
+      "input": "",
+      "chunk_size": 100,
+      "overlap": 10,
+      "expected": []
+    },
+    {
+      "name": "small_text_single_chunk",
+      "input": "hello world",
+      "chunk_size": 100,
+      "overlap": 10,
+      "expected": [
+        "hello world"
+      ]
+    },
+    {
+      "name": "size_zero_returns_empty",
+      "input": "anything",
+      "chunk_size": 0,
+      "overlap": 0,
+      "expected": []
+    },
+    {
+      "name": "exact_fit_single_chunk",
+      "input": "12345",
+      "chunk_size": 5,
+      "overlap": 1,
+      "expected": [
+        "12345"
+      ]
+    },
+    {
+      "name": "no_whitespace_overlap_advance",
+      "input": "aaaaaaaaaaaaaaaaaaaa",
+      "chunk_size": 5,
+      "overlap": 2,
+      "expected": [
+        "aaaaa",
+        "aaaaa",
+        "aaaaa",
+        "aaaaa",
+        "aaaaa",
+        "aaaaa"
+      ]
+    },
+    {
+      "name": "whitespace_boundary_close",
+      "input": "alpha beta gamma delta epsilon zeta",
+      "chunk_size": 12,
+      "overlap": 3,
+      "expected": [
+        "alpha beta",
+        "a gamma",
+        "elta",
+        "lon zeta"
+      ]
+    },
+    {
+      "name": "unicode_codepoints",
+      "input": "àèìòù-àèìòù-àèìòù-àèìòù-",
+      "chunk_size": 10,
+      "overlap": 3,
+      "expected": [
+        "àèìòù-àèìò",
+        "èìòù-àèìòù",
+        "ìòù-àèìòù-"
+      ]
+    }
+  ]
+}

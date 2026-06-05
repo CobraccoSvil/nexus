@@ -93,4 +93,39 @@ mod tests {
             assert!(c.chars().count() <= 1000);
         }
     }
+
+    /// Parita' cross-language con ``brain/utils/text_chunk.py``.
+    ///
+    /// La fixture e' la stessa letta da ``brain/tests/test_text_chunk.py``: se
+    /// questo test e quello pytest passano entrambi, l'algoritmo e' identico
+    /// bit-per-bit fra Rust e Python (regola L / ADR 0026, Wave 8a).
+    #[test]
+    fn parita_cross_language_da_fixture_golden() {
+        const FIXTURE: &str = include_str!(
+            "../../../../tests/fixtures/chunker_golden.json"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(FIXTURE)
+            .expect("fixture golden non e' JSON valido");
+        let cases = parsed["cases"]
+            .as_array()
+            .expect("fixture senza array 'cases'");
+        for case in cases {
+            let name = case["name"].as_str().unwrap_or("<senza nome>");
+            let input = case["input"].as_str().expect("input string");
+            let chunk_size = case["chunk_size"].as_u64().expect("chunk_size") as usize;
+            let overlap = case["overlap"].as_u64().expect("overlap") as usize;
+            let expected: Vec<String> = case["expected"]
+                .as_array()
+                .expect("expected array")
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            let actual = chunk_text(input, chunk_size, overlap);
+            assert_eq!(
+                actual, expected,
+                "caso golden '{name}' divergente fra Rust e Python: \
+                 size={chunk_size} overlap={overlap}",
+            );
+        }
+    }
 }

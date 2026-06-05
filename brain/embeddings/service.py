@@ -197,6 +197,12 @@ class EmbeddingService:
 
     @staticmethod
     def _chunk_text(text: str, chunk_size: int) -> list[str]:
+        # TODO Wave 8a (regola L / ADR 0026): convergere su
+        # ``brain.utils.text_chunk.chunk_text`` (paritetico al Rust). Cambio
+        # algoritmo (split-per-linea greedy -> sliding window char con
+        # boundary smart) richiede re-index controllato della collection
+        # Qdrant dietro feature flag, per evitare regressione di recall RAG.
+        # Per ora resta l'implementazione storica.
         lines = text.split("\n")
         chunks: list[str] = []
         current: list[str] = []
