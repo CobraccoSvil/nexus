@@ -196,10 +196,22 @@ async def verifier_node(state: AgentState) -> dict[str, Any]:
     if all_passed and bool(cfg.get("exploratory_verify_enabled")):
         expl_cap = int(cfg.get("exploratory_verify_max_cycles", 1) or 1)
         expl_cycle = int(state.get("exploratory_verify_cycle", 0) or 0)
-        if expl_cycle < expl_cap:
+        # Cap GLOBALE per run: `exploratory_verify_cycle` e' per-todo e viene
+        # azzerato a ogni avanzamento (_advance_or_end). Con N todo la verifica
+        # esplorativa ripartirebbe per ciascuno, tenendo il run in loop
+        # (osservato: 5+ re-iterazioni, run >7 min senza terminare). Il contatore
+        # cumulativo `exploratory_verify_total` NON viene mai resettato: oltre il
+        # cap globale la verifica esplorativa si disattiva e i criteri
+        # deterministici (gia' passati) bastano a completare il todo.
+        expl_total = int(state.get("exploratory_verify_total", 0) or 0)
+        expl_global_cap = int(cfg.get("exploratory_verify_max_total", 3) or 3)
+        if expl_cycle < expl_cap and expl_total < expl_global_cap:
             expl_ok, expl_finding = await _run_exploratory_check(state, todo, results, ctx, cfg)
             if not expl_ok and expl_finding:
-                logger.info("verifier_node: verifica esplorativa ha trovato un'anomalia non coperta")
+                logger.info(
+                    "verifier_node: verifica esplorativa ha trovato un'anomalia non coperta "
+                    "(totale run %d/%d)", expl_total + 1, expl_global_cap,
+                )
                 hint = (
                     f"<verifica_esplorativa cycle=\"{expl_cycle + 1}/{expl_cap}\">\n"
                     f"I criteri deterministici passano, ma un controllo aggiuntivo ha "
@@ -211,6 +223,7 @@ async def verifier_node(state: AgentState) -> dict[str, Any]:
                     "messages": [HumanMessage(content=hint)],
                     "verify_cycle": cycle,
                     "exploratory_verify_cycle": expl_cycle + 1,
+                    "exploratory_verify_total": expl_total + 1,
                     "stop_reason": "tool_use",
                     "pending_tool_uses": [],
                 }
