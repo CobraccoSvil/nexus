@@ -628,6 +628,39 @@ pub async fn cleanup_duplicate_dev_servers(db: &PgPool) -> u64 {
         procs.sort_by(|a, b| b.1.cmp(&a.1));
         let keep = procs[0].0;
         for (pid, _) in procs.iter().skip(1) {
+            // Anti-race: verifica che tra lo scan e la kill il PID non sia stato
+            // riciclato (processo morto, kernel assegna lo stesso numero a un
+            // nuovo processo non-dev-server, eventualmente mcp-core stesso).
+            // Ri-leggiamo cmdline+cwd: se non matchano piu', skip.
+            let cmdline_now = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            if cmdline_now.is_empty() {
+                // Processo gia' morto: niente da fare.
+                continue;
+            }
+            let cmdline_now_s: String = cmdline_now
+                .split(|b| *b == 0)
+                .map(|seg| String::from_utf8_lossy(seg))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !is_dev_server_cmdline(&cmdline_now_s) {
+                warn!(
+                    "cleanup_duplicate_dev_servers: pid={} non e' piu' un dev-server (riciclato?) — skip",
+                    pid
+                );
+                continue;
+            }
+            let cwd_now = match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+                Ok(p) => p.to_string_lossy().to_string(),
+                Err(_) => continue,
+            };
+            if cwd_now != cwd {
+                warn!(
+                    "cleanup_duplicate_dev_servers: pid={} cwd cambiato ({} -> {}) — skip",
+                    pid, cwd, cwd_now
+                );
+                continue;
+            }
+
             info!(
                 "cleanup_duplicate_dev_servers: terminato dev-server duplicato pid={} cwd={} (tengo pid piu' recente {})",
                 pid, cwd, keep

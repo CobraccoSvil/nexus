@@ -49,13 +49,84 @@ async fn read_pgid(pid: u32) -> Option<u32> {
     fields.next()?.parse::<u32>().ok()
 }
 
+/// Legge il comm (nome processo) di `pid` da /proc/{pid}/comm. None se non
+/// leggibile o pid morto.
+async fn read_comm(pid: u32) -> Option<String> {
+    let raw = tokio::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .await
+        .ok()?;
+    Some(raw.trim().to_string())
+}
+
 /// Termina l'intero PROCESS GROUP di `pid` (SIGTERM, poi SIGKILL dopo 500ms se
 /// ancora vivo). Cosi' una catena `pnpm dev -> node -> vite` viene fermata per
 /// intero e il processo padre non rilancia il figlio che reggeva il listener
 /// (causa per cui un kill del solo PID lasciava la porta occupata). Fallback al
 /// solo `pid` se il PGID non e' leggibile.
+///
+/// SAFETY NET STRUTTURALI (incidente 2026-06-05 22:51): un PID di dev-server
+/// puo' essere stato riciclato dal kernel dopo la morte del processo originale.
+/// Se nel frattempo il kernel ha riassegnato quel PID a un thread di mcp-core
+/// (LWP), `read_pgid(pid)` ritorna il PGID di mcp-core e `kill -TERM -<PGID>`
+/// uccide mcp-core stesso (suicidio osservato in produzione). Tre check
+/// difensivi prima di inviare segnali:
+///   1. pid != own_pid: mai uccidere se stessi (banale ma necessario).
+///   2. pgid != own_pgid: se il process group coincide con quello di mcp-core
+///      siamo certi che il PID e' stato riciclato per un thread del padre,
+///      o che il chiamante e' stato chiamato per errore (es. cleanup_duplicate
+///      che ha trovato un proprio thread). Abort.
+///   3. comm != mcp-core: ultima difesa di identita' — se il nome del processo
+///      e' "mcp-core" il PID e' stato riciclato per il binario stesso, abort.
 pub(crate) async fn kill_process_tree(pid: u32) {
-    let target = match read_pgid(pid).await {
+    let own_pid = std::process::id();
+
+    // Check 1: mai uccidere il proprio PID. Banale ma essenziale.
+    if pid == own_pid {
+        tracing::error!(
+            target = "port_recovery",
+            pid,
+            "kill_process_tree: RIFIUTO di uccidere il proprio PID (mcp-core)"
+        );
+        return;
+    }
+
+    // Check 3: verifica identita' tramite /proc/<pid>/comm. Se il PID e' stato
+    // riciclato per un thread di mcp-core, comm conterra' "mcp-core" e abort.
+    // Se il processo e' morto (comm illeggibile), procedi: nessun gruppo da
+    // colpire, il fallback `kill <pid>` sara' un no-op.
+    if let Some(comm) = read_comm(pid).await {
+        if comm == "mcp-core" {
+            tracing::error!(
+                target = "port_recovery",
+                pid,
+                comm = %comm,
+                "kill_process_tree: RIFIUTO — il PID e' stato riciclato per mcp-core stesso"
+            );
+            return;
+        }
+    }
+
+    let pgid_opt = read_pgid(pid).await;
+
+    // Check 2: se il PGID del target coincide col PGID di mcp-core, il PID
+    // appartiene allo stesso gruppo del padre (caso patologico: PID riciclato
+    // o spawn senza process_group(0)). Abort prima di toccare il gruppo.
+    if let Some(target_pgid) = pgid_opt {
+        let own_pgid = read_pgid(own_pid).await;
+        if Some(target_pgid) == own_pgid {
+            tracing::error!(
+                target = "port_recovery",
+                pid,
+                target_pgid,
+                own_pid,
+                own_pgid = ?own_pgid,
+                "kill_process_tree: RIFIUTO — il PGID del target coincide col gruppo di mcp-core (PID riciclato o spawn senza setsid)"
+            );
+            return;
+        }
+    }
+
+    let target = match pgid_opt {
         // Il `-` davanti al PGID dice a kill(1) di colpire l'intero gruppo.
         Some(pgid) if pgid > 1 => format!("-{pgid}"),
         _ => pid.to_string(),
