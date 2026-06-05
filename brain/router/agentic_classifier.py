@@ -111,7 +111,7 @@ async def _load_classifier_config() -> dict[str, str]:
             return {k: _CONFIG_CACHE[k][1] for k in _CONFIG_KEYS}
 
         # Miss: query DB
-        db_url = os.environ.get("DATABASE_URL", "")
+        db_url = os.environ.get("DATABASE_URL")
         if not db_url:
             raise ClassifierConfigUnavailable(
                 "DATABASE_URL non impostata: impossibile leggere "
@@ -199,7 +199,7 @@ async def _load_classifier_chain() -> list[ClassifierChainEntry]:
     now = time.monotonic()
     if _CHAIN_CACHE and now < _CHAIN_CACHE_EXPIRY:
         return list(_CHAIN_CACHE)  # snapshot immutabile
-    db_url = os.environ.get("DATABASE_URL", "")
+    db_url = os.environ.get("DATABASE_URL")
     if not db_url:
         logger.warning("classifier_chain: DATABASE_URL non set, chain vuota")
         return []

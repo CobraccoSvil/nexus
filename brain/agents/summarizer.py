@@ -260,7 +260,7 @@ def _resolve_summary_model(provider: str) -> str:
     sceglie provider+model insieme tramite `nexus_purpose_model`).
     """
     import os
-    database_url = os.environ.get("DATABASE_URL", "")
+    database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         raise SummaryModelUnavailable(
             "DATABASE_URL non impostata: impossibile leggere "

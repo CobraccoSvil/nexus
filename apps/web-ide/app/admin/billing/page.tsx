@@ -18,6 +18,7 @@ import {
   listModelCatalog,
 } from "../../../lib/api-client";
 import { useThemeColors } from "../../../lib/theme";
+import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
 
 function toIsoDateStart(value: string): string | undefined {
   if (!value) return undefined;
@@ -266,12 +267,10 @@ export default function AdminBillingPage() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18, padding: 4 }}>
-      <div>
-        <h1 style={{ fontSize: 22, fontWeight: 600, marginBottom: 6, color: tc.text }}>Billing AI</h1>
-        <p style={{ color: tc.textMuted, fontSize: 13, margin: 0 }}>
-          Catalogo modelli, prezzi attivi, quote per utente/progetto e report consumi.
-        </p>
-      </div>
+      <AdminPageHeader
+        title="Billing AI"
+        description="Catalogo modelli, prezzi attivi, quote per utente/progetto e report consumi."
+      />
 
       {error && (
         <div

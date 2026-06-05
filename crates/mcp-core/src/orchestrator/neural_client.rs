@@ -325,32 +325,27 @@ impl NeuralCoreClient {
         self.provider_health("system").await.is_ok()
     }
 
-    /// Classificazione errori provider via il PUNTO UNICO (brain
-    /// error_handler.classify_error, RPC ClassifyError). mcp-core NON classifica
-    /// in proprio: passa il testo dell'errore e riceve l'error_class canonico
-    /// (billing_error, auth_error, rate_limit, context_too_long, not_found, ...).
-    /// Fallback "error" solo se il brain e' irraggiungibile (nessuna logica di
-    /// pattern duplicata lato Rust).
-    pub async fn classify_error(&self, error_text: &str, provider: &str) -> String {
-        let mut client = self.client.clone();
-        let req = mcp_proto::neural::ClassifyErrorRequest {
-            error_text: error_text.to_string(),
-            provider: provider.to_string(),
-        };
-        match client.classify_error(req).await {
-            Ok(resp) => serde_json::from_str::<Value>(&resp.into_inner().json)
-                .ok()
-                .and_then(|j| {
-                    j.get("error_class")
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                })
-                .unwrap_or_else(|| "error".to_string()),
-            Err(e) => {
-                tracing::debug!("classify_error gRPC fallito: {e}");
-                "error".to_string()
-            }
-        }
+    /// Classificazione errori provider via il PUNTO UNICO Rust
+    /// (``crate::provider_error_classifier::classify_text``, paritetico a
+    /// ``brain/providers/error_handler.py`` con golden test cross-language —
+    /// regola L / ADR 0026, Wave 8b).
+    ///
+    /// Prima questa funzione faceva una RPC gRPC ``ClassifyError`` al brain
+    /// per ogni errore provider — overhead inutile su un path d'errore caldo,
+    /// e fragile (se il brain e' down, non riesci nemmeno a classificare).
+    /// Ora il classificatore vive in Rust: zero round-trip di rete, zero
+    /// dipendenza da brain healthy per gestire un errore provider.
+    ///
+    /// La parte SDK-specifica (estrazione `retry-after` da
+    /// `exc.response.headers`) resta lato Python perche' richiede l'oggetto
+    /// eccezione vero, e viaggia gia' nel ``metadata`` del ``ProviderResult``
+    /// (vedi ``retry_after_seconds`` letto a riga 263-266 di questo file).
+    ///
+    /// L'``&self`` e ``async`` sono mantenuti per compatibilita' di firma con
+    /// i call site esistenti, ma la funzione e' di fatto sincrona e priva di
+    /// I/O di rete.
+    pub async fn classify_error(&self, error_text: &str, _provider: &str) -> String {
+        crate::provider_error_classifier::classify_text(error_text).stop_reason
     }
 
     pub async fn generate_document(

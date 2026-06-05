@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useThemeColors } from "../../../lib/theme";
+import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
 import {
   adminListProfiles,
   adminCreateProfile,
@@ -696,12 +697,10 @@ export default function AdminProfilesPage() {
           marginBottom: 20,
         }}
       >
-        <div>
-          <h1 style={{ fontSize: 22, fontWeight: 700, color: tc.text, margin: 0 }}>Profili</h1>
-          <p style={{ fontSize: 13, color: tc.textMuted, margin: "4px 0 0" }}>
-            Profili AI di sistema (condivisi) e profili personalizzati degli utenti.
-          </p>
-        </div>
+        <AdminPageHeader
+        title="Profili"
+        description="Profili AI di sistema (condivisi) e profili personalizzati degli utenti."
+      />
         {tab === "system" && (
           <button
             style={{

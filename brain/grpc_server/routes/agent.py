@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from brain.grpc_server import runtime
+from brain.utils.db_pool import get_db_url
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +120,7 @@ async def subagent_resume_endpoint(body: SubagentResumeRequest) -> dict[str, obj
 async def clarifications_get(run_id: str) -> dict[str, object]:
     """Ritorna le clarifying questions emesse per un run + eventuali risposte."""
     import os
-    url = os.environ.get("DATABASE_URL", "")
+    url = os.environ.get("DATABASE_URL")
     if not url:
         return {"error": "db_unavailable"}
     try:
@@ -153,7 +154,7 @@ async def clarifications_answer(run_id: str, body: ClarificationsAnswerRequest) 
     iniettate come default applicati.
     """
     import os, json as _json
-    url = os.environ.get("DATABASE_URL", "")
+    url = os.environ.get("DATABASE_URL")
     if not url:
         return {"error": "db_unavailable"}
     try:
@@ -215,10 +216,7 @@ def _load_analyzer_provider_chain() -> list[dict]:
         return _ANALYZER_CHAIN_CACHE
     try:
         import psycopg2
-        db_url = os.environ.get(
-            "DATABASE_URL",
-            "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
-        )
+        db_url = get_db_url()
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
                 # Ordine preferenziale per analyzer: economici/veloci prima,
@@ -252,7 +250,7 @@ def _load_project_analyzer_prompt() -> str | None:
     """
     try:
         import psycopg2
-        db_url = os.environ.get("DATABASE_URL", "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable")
+        db_url = get_db_url()
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(

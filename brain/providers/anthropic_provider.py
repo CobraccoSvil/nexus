@@ -9,6 +9,7 @@ from .base import BaseProvider, ProviderCatalogEntry, ProviderResult
 from .error_handler import format_error_result
 from ._schema_utils import compress_tool_list, measure_tools_bytes
 from brain.agents import thinking_config as _thinking_config
+from brain.utils.db_pool import get_db_url
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +77,7 @@ def _load_thinking_models() -> frozenset[str]:
             return cached
         try:
             import psycopg2  # type: ignore[import-untyped]
-            db_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL", "")
+            db_url = get_db_url()
             if not db_url:
                 raise ThinkingModelsUnavailable("DATABASE_URL/POSTGRES_URL non configurato")
             conn = psycopg2.connect(db_url)

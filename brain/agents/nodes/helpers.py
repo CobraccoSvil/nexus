@@ -21,6 +21,7 @@ import uuid
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from brain.utils.db_pool import get_db_url
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,7 @@ def _load_adaptive_budget_config() -> dict[str, Any]:
     try:
         import os as _os
         import psycopg2
-        db_url = _os.environ.get("DATABASE_URL") or "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable"
+        db_url = get_db_url()  # regola G: niente fallback hardcoded
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -661,7 +662,7 @@ def _nexus_thinking_enabled() -> bool:
     try:
         import os as _os
         import psycopg2  # type: ignore[import-untyped]
-        dburl = _os.environ.get("DATABASE_URL", "")
+        dburl = _os.environ.get("DATABASE_URL")
         if dburl:
             conn = psycopg2.connect(dburl)
             try:
@@ -1008,10 +1009,7 @@ def _pick_escalation_model(
         try:
             import psycopg2  # type: ignore[import]
             import os as _os
-            _db_url = _os.environ.get(
-                "DATABASE_URL",
-                "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
-            )
+            _db_url = _get_db_url()
             with psycopg2.connect(_db_url) as _conn:
                 with _conn.cursor() as _cur:
                     _cur.execute(
@@ -1248,10 +1246,7 @@ def _lookup_price(provider: str, model: str) -> tuple[float, float]:
         return _PRICE_CACHE[key]
     try:
         import psycopg2
-        db_url = os.environ.get(
-            "DATABASE_URL",
-            "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
-        )
+        db_url = get_db_url()
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1608,7 +1603,7 @@ def _provider_from_model(model: str) -> str | None:
     try:
         import os as _os
         import psycopg2  # type: ignore[import-untyped]
-        db_url = _os.environ.get("DATABASE_URL") or "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable"
+        db_url = get_db_url()  # regola G: niente fallback hardcoded
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1645,7 +1640,7 @@ def _smart_upscale_model(
     try:
         import os as _os
         import psycopg2  # type: ignore[import-untyped]
-        db_url = _os.environ.get("DATABASE_URL") or "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable"
+        db_url = get_db_url()  # regola G: niente fallback hardcoded
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
                 # Costruisce l'ordering dei target via array_position per rispettare la preferenza CSV
@@ -1871,7 +1866,7 @@ def _load_ctx_mgmt_config() -> dict[str, Any]:
     try:
         import os as _os
         import psycopg2  # type: ignore[import-untyped]
-        db_url = _os.environ.get("DATABASE_URL") or "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable"
+        db_url = get_db_url()  # regola G: niente fallback hardcoded
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2207,7 +2202,7 @@ def _model_context_window(model: str) -> int:
     try:
         import os as _os
         import psycopg2  # type: ignore[import-untyped]
-        db_url = _os.environ.get("DATABASE_URL") or "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable"
+        db_url = get_db_url()  # regola G: niente fallback hardcoded
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2356,7 +2351,7 @@ def _attachment_budget_bytes() -> int:
     value = 500_000
     try:
         import psycopg2  # type: ignore[import-untyped]
-        dburl = _os.environ.get("DATABASE_URL", "")
+        dburl = _os.environ.get("DATABASE_URL")
         if dburl:
             conn = psycopg2.connect(dburl)
             try:

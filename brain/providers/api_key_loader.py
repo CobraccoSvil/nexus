@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from brain.utils.db_pool import get_db_url
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +35,7 @@ def _load_from_db(provider: str) -> str | None:
     irraggiungibile o key vuota/assente."""
     try:
         import psycopg2  # type: ignore[import]
-        db_url = os.environ.get(
-            "DATABASE_URL",
-            "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
-        )
+        db_url = get_db_url()
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../../lib/theme";
+import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
 import {
   portProjects,
   listAdminSettings,
@@ -119,13 +120,11 @@ export default function ProjectPortingPage() {
         fontFamily: '"Inter", sans-serif',
       }}
     >
-      <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 4 }}>
-        Porting Progetti
-      </h2>
-      <p style={{ fontSize: 13, color: tc.textMuted, marginBottom: 20 }}>
-        Aggiorna i path dei progetti nel database quando la directory di deploy
-        viene spostata su un altro disco o percorso.
-      </p>
+      <AdminPageHeader
+        title="Porting Progetti"
+        description="Aggiorna i path dei progetti nel database quando la directory di deploy
+        viene spostata su un altro disco o percorso."
+      />
 
       {/* Current base root */}
       <div

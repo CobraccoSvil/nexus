@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+from brain.utils.db_pool import get_db_url
 from .. import (
     meta_steps,
     profile_loader,
@@ -219,7 +220,7 @@ def _get_learning_config() -> dict[str, Any]:
         if _learning_cfg_cache is not None and now - _learning_cfg_ts < _LEARNING_CFG_TTL:
             return _learning_cfg_cache
 
-    database_url = os.environ.get("DATABASE_URL", "")
+    database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         logger.warning("learning_config: DATABASE_URL non impostato, uso safe_defaults")
         with _learning_cfg_lock:
@@ -2034,7 +2035,7 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 try:
                     import os, psycopg2  # type: ignore[import-untyped]
                     _run_id = str(state.get("thread_id") or "")
-                    _dburl = os.environ.get("DATABASE_URL", "")
+                    _dburl = os.environ.get("DATABASE_URL")
                     if _run_id and _dburl:
                         _conn = psycopg2.connect(_dburl)
                         with _conn.cursor() as _cur:
@@ -2195,10 +2196,7 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 try:
                     import psycopg2  # type: ignore[import]
                     import os as _os
-                    _db_url = _os.environ.get(
-                        "DATABASE_URL",
-                        "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
-                    )
+                    _db_url = _get_db_url()
                     with psycopg2.connect(_db_url) as _conn:
                         with _conn.cursor() as _cur:
                             _cur.execute(
@@ -2660,7 +2658,7 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
         import os, psycopg2  # type: ignore[import-untyped]
         from psycopg2.extras import Json as _Json  # type: ignore[import-untyped]
         _run_id = state.get("thread_id") or ""
-        _dburl = os.environ.get("DATABASE_URL", "")
+        _dburl = os.environ.get("DATABASE_URL")
         if _run_id and _dburl:
             _step_base = int(state.get("iterations") or 0) * 1000
             _conn = psycopg2.connect(_dburl)
@@ -3265,7 +3263,7 @@ def _build_pr3_system_blocks(state: AgentState) -> str:
         import os as _os
         cfg = orchestrator_config.get()
         if cfg.get("plan_phase_enabled", False) and project_id:
-            url = _os.environ.get("DATABASE_URL", "")
+            url = _os.environ.get("DATABASE_URL")
             if url:
                 import psycopg2  # type: ignore[import-untyped]
                 with psycopg2.connect(url) as conn:

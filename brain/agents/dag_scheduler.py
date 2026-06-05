@@ -76,7 +76,7 @@ def _mark(todo_id: str, status: str) -> None:
         return
     try:
         import psycopg2  # type: ignore[import-untyped]
-        url = os.environ.get("DATABASE_URL", "")
+        url = os.environ.get("DATABASE_URL")
         if not url:
             return
         conn = psycopg2.connect(url)

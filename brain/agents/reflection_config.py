@@ -61,7 +61,7 @@ def _load_from_db() -> dict[str, Any]:
     fallisce, restituisce i valori gia' in cache (o i safe_defaults al primo avvio).
     """
     import os
-    database_url = os.environ.get("DATABASE_URL", "")
+    database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         logger.warning("reflection_config: DATABASE_URL non impostato, uso safe_defaults")
         return dict(_SAFE_DEFAULTS)

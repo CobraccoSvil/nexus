@@ -427,7 +427,7 @@ def _mark_todo_status(todo_id: str, new_status: str) -> None:
         return
     try:
         import psycopg2  # type: ignore[import-untyped]
-        url = os.environ.get("DATABASE_URL", "")
+        url = os.environ.get("DATABASE_URL")
         if not url:
             return
         conn = psycopg2.connect(url)
@@ -455,7 +455,7 @@ def _persist_verifier_run(
     try:
         import psycopg2  # type: ignore[import-untyped]
         from psycopg2.extras import Json  # type: ignore[import-untyped]
-        url = os.environ.get("DATABASE_URL", "")
+        url = os.environ.get("DATABASE_URL")
         if not url:
             return
         conn = psycopg2.connect(url)

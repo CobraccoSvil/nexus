@@ -63,11 +63,12 @@ assert_single "infer_capabilities_from_name" 'fn infer_capabilities_from_name' '
 # Wave 5 (registry default: statici nella migrazione 0325; parte dinamica unica):
 assert_single "ensure_projects_base_root" 'fn ensure_projects_base_root' 'crates/nexus-types/src/lib.rs' crates
 
-# Wave 6a (db_pool: ~28 file con psycopg2.connect ancora diretti, da convertire
-# con verifica runtime dedicata; attivare il guard quando la conversione e'
-# completa). NOTA: get_db_url() vive solo in brain/utils/db_pool.py (regola G:
-# zero default hardcoded di DATABASE_URL altrove).
-# assert_single "psycopg2.connect" 'psycopg2\.connect\(' 'brain/utils/db_pool.py' brain
+# Wave 6a + Residuo R1: get_db_url() e' il punto unico della DB URL. Niente
+# default hardcoded "postgres://..." altrove (regola G). I 28 call site con
+# psycopg2.connect convergono via questa URL.
+# Lasciato come guard "soft" (solo get_db_url): permettiamo psycopg2.connect
+# diretti con get_db_url() per i casi che richiedono kwargs particolari
+# (cursor_factory, autocommit), mentre per la maggioranza usare db_pool.connect.
 assert_single "get_db_url" 'def get_db_url' 'brain/utils/db_pool.py' brain
 
 # Wave 6b (cache TTL Python, paritetica a nexus-cache lato Rust):

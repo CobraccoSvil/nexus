@@ -73,7 +73,7 @@ def load_from_db(database_url: Optional[str] = None) -> int:
     Se `database_url` e' None usa env `DATABASE_URL`. Se assente, ritorna 0.
     Errori di connessione sono solo loggati (non rilanciati).
     """
-    url = database_url or os.environ.get("DATABASE_URL", "")
+    url = database_url or os.environ.get("DATABASE_URL")
     if not url:
         logger.warning("prompt_registry: DATABASE_URL non impostato, skip load")
         return 0

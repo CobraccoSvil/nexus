@@ -16,6 +16,7 @@ from .deepseek_provider import DeepSeekProvider
 from .mistral_provider import MistralProvider
 from .ollama_provider import OllamaProvider
 from .vllm_provider import VllmProvider
+from brain.utils.db_pool import get_db_url
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +39,7 @@ _DB_COOLDOWN_CACHE_TTL_S = 30.0
 
 
 def _cooldown_db_url() -> str:
-    return os.environ.get(
-        "DATABASE_URL",
-        "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
-    )
+    return get_db_url()
 
 
 def _billing_cooldown_ttl_s() -> int:
@@ -248,9 +246,7 @@ def _record_intent_health(provider: str, model: str, intent: str, outcome: str) 
     last_ts_col = "last_success_at" if outcome == "success" else "last_failure_at"
     import psycopg2  # type: ignore[import]
     try:
-        db_url = os.environ.get(
-            "DATABASE_URL", "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable"
-        )
+        db_url = get_db_url()
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -294,9 +290,7 @@ def _intent_in_cooldown(provider: str, intent: str) -> bool:
     intent = (intent or "chat").strip() or "chat"
     import psycopg2  # type: ignore[import]
     try:
-        db_url = os.environ.get(
-            "DATABASE_URL", "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable"
-        )
+        db_url = get_db_url()
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -339,10 +333,7 @@ def _billing_context() -> tuple[str, str]:
     if _BILLING_CTX_CACHE and (now - _BILLING_CTX_TS) < 30.0:
         return _BILLING_CTX_CACHE
     import psycopg2  # type: ignore[import]
-    db_url = os.environ.get(
-        "DATABASE_URL",
-        "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
-    )
+    db_url = get_db_url()
     with psycopg2.connect(db_url) as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT id::text FROM users ORDER BY created_at DESC LIMIT 1")
@@ -362,10 +353,7 @@ def _lookup_price_any_currency(provider: str, model: str) -> tuple[float, float,
     Legge anche i prezzi cache (0130_price_cache_columns). Fallback 0 se non trovato.
     """
     import psycopg2  # type: ignore[import]
-    db_url = os.environ.get(
-        "DATABASE_URL",
-        "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
-    )
+    db_url = get_db_url()
     try:
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
@@ -462,10 +450,7 @@ def _record_usage(provider: str, model: str, usage: dict[str, Any] | None, detai
 
     import psycopg2  # type: ignore[import]
     try:
-        db_url = os.environ.get(
-            "DATABASE_URL",
-            "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
-        )
+        db_url = get_db_url()
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -533,10 +518,7 @@ def _enforce_quota_estimate(provider: str, model: str, estimated_prompt_tokens: 
     )
 
     import psycopg2  # type: ignore[import]
-    db_url = os.environ.get(
-        "DATABASE_URL",
-        "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
-    )
+    db_url = get_db_url()
     try:
         with psycopg2.connect(db_url) as conn:
             with conn.cursor() as cur:
@@ -721,10 +703,7 @@ class ProviderRegistry:
         try:
             import psycopg2  # type: ignore[import]
             import os
-            db_url = os.environ.get(
-                "DATABASE_URL",
-                "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
-            )
+            db_url = get_db_url()
             with psycopg2.connect(db_url) as conn:
                 with conn.cursor() as cur:
                     cur.execute(

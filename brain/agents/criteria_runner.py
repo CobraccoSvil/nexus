@@ -541,7 +541,7 @@ async def _check_db_query(
     # connection_string: opzionale, default usa DATABASE_URL.
     # Per le app di progetto l'agente passa il connection string del DB applicativo
     # (es. postgres://nexus:nexus@localhost:5433/<slug>).
-    conn_str = spec.get("connection_string") or os.environ.get("DATABASE_URL", "")
+    conn_str = spec.get("connection_string") or os.environ.get("DATABASE_URL")
     if not conn_str:
         return False, {"error": "connection_string o DATABASE_URL obbligatori"}
 

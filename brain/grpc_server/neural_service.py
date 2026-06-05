@@ -11,6 +11,7 @@ import grpc
 
 from brain.grpc_server.generated import neural_core_pb2 as pb2
 from brain.grpc_server.generated import neural_core_pb2_grpc as pb2_grpc
+from brain.utils.db_pool import get_db_url
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +40,7 @@ def _default_model_for_provider(provider: str) -> str:
     if (now - _DEFAULT_MODEL_CACHE_TS) >= 60.0 or not _DEFAULT_MODEL_CACHE:
         try:
             import psycopg2  # type: ignore[import]
-            db_url = os.environ.get(
-                "DATABASE_URL",
-                "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
-            )
+            db_url = get_db_url()
             with psycopg2.connect(db_url) as conn:
                 with conn.cursor() as cur:
                     cur.execute(

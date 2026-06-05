@@ -98,7 +98,7 @@ def _load_config() -> dict[str, Any]:
         "intake_match_min_score": 0.7,
         "intake_topk": 5,
     }
-    url = os.environ.get("DATABASE_URL", "")
+    url = os.environ.get("DATABASE_URL")
     if not url:
         return defaults
     try:
@@ -329,7 +329,7 @@ def _note_implementation_status(note_id: str | None) -> dict[str, Any]:
     """
     if not note_id:
         return {}
-    url = os.environ.get("DATABASE_URL", "")
+    url = os.environ.get("DATABASE_URL")
     if not url:
         return {}
     try:

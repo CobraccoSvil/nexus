@@ -50,7 +50,7 @@ def _load_flags() -> dict[str, bool]:
         "reflection_enabled": False,
         "global_enabled": True,
     }
-    url = os.environ.get("DATABASE_URL", "")
+    url = os.environ.get("DATABASE_URL")
     if not url:
         _FLAG_CACHE = defaults
         _FLAG_CACHE_AT = now
@@ -113,7 +113,7 @@ def persist_async(run_id: str | None, step: dict[str, Any]) -> None:
     """
     if not run_id:
         return
-    url = os.environ.get("DATABASE_URL", "")
+    url = os.environ.get("DATABASE_URL")
     if not url:
         return
     try:

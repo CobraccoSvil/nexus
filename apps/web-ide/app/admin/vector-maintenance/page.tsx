@@ -9,6 +9,7 @@ import {
   type VectorCompactionRun,
 } from "../../../lib/api-client";
 import { useThemeColors } from "../../../lib/theme";
+import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
 
 export default function AdminVectorMaintenancePage() {
   const tc = useThemeColors();
@@ -59,12 +60,10 @@ export default function AdminVectorMaintenancePage() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      <div>
-        <h1 style={{ fontSize: 20, fontWeight: 600, marginBottom: 6 }}>Vector Maintenance</h1>
-        <p style={{ color: tc.textMuted, fontSize: 13, margin: 0 }}>
-          Compattazione vettoriale, metriche before/after e storico run.
-        </p>
-      </div>
+      <AdminPageHeader
+        title="Vector Maintenance"
+        description="Compattazione vettoriale, metriche before/after e storico run."
+      />
 
       {error && (
         <div

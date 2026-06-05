@@ -12,6 +12,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
+from brain.utils.db_pool import get_db_url
 
 logger = logging.getLogger(__name__)
 

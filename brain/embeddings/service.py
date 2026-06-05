@@ -197,12 +197,35 @@ class EmbeddingService:
 
     @staticmethod
     def _chunk_text(text: str, chunk_size: int) -> list[str]:
-        # TODO Wave 8a (regola L / ADR 0026): convergere su
-        # ``brain.utils.text_chunk.chunk_text`` (paritetico al Rust). Cambio
-        # algoritmo (split-per-linea greedy -> sliding window char con
-        # boundary smart) richiede re-index controllato della collection
-        # Qdrant dietro feature flag, per evitare regressione di recall RAG.
-        # Per ora resta l'implementazione storica.
+        """Chunker testuale del servizio embeddings con feature flag DB-driven
+        (mig 0326). Setting ``rag.chunker.algorithm``:
+
+          - ``legacy`` (default): split per linee greedy, NO overlap. I chunk
+            corrispondono a quelli gia' indicizzati in Qdrant. Valore safe.
+          - ``unified``: delega a ``brain.utils.text_chunk.chunk_text``
+            (paritetico al Rust ``rag/chunker.rs``, sliding window char con
+            overlap e smart trimming su whitespace). ATTIVABILE SOLO DOPO
+            re-index della collection Qdrant — vedi migrazione 0326.
+
+        Lettura del flag best-effort: se il DB e' down si comporta come
+        ``legacy`` (no regressione su path caldi).
+        """
+        try:
+            from brain.utils.settings_db import get_setting
+            algo = get_setting("rag.chunker.algorithm", "legacy").strip().lower()
+        except Exception:
+            algo = "legacy"
+
+        if algo == "unified":
+            # Punto unico paritetico col Rust (regola L / ADR 0026, Wave 8a).
+            # Overlap 0 per restare semantica-friendly al posto della split-per-
+            # linea storica: l'admin che attiva il flag lo fa appositamente con
+            # re-index, eventuali parametri size/overlap si tunano dal DB
+            # (settings agent.rag.chunk_size / chunk_overlap, vedi context_offload).
+            from brain.utils.text_chunk import chunk_text
+            return chunk_text(text, chunk_size, 0)
+
+        # ── legacy: algoritmo storico (split-per-linea, NO overlap) ──
         lines = text.split("\n")
         chunks: list[str] = []
         current: list[str] = []

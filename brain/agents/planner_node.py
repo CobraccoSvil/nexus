@@ -780,7 +780,7 @@ def _persist_clarifications(
 ) -> None:
     """Persisti la riga in nexus_agent_clarifications (best-effort)."""
     import os
-    url = os.environ.get("DATABASE_URL", "")
+    url = os.environ.get("DATABASE_URL")
     if not url:
         return
     try:

@@ -11,6 +11,7 @@ import {
 } from "../../../lib/api-client";
 import { useThemeColors } from "../../../lib/theme";
 import { useGlobalDialog } from "../../../components/global-dialog-provider";
+import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
 
 const defaultConfig: ProjectLearningConfig = {
   enabled: true,
@@ -104,12 +105,10 @@ export default function AdminProjectLearningPage() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      <div>
-        <h1 style={{ fontSize: 20, fontWeight: 600, marginBottom: 6 }}>Project Learning</h1>
-        <p style={{ color: tc.textMuted, fontSize: 13, margin: 0 }}>
-          Configurazione auto-apprendimento per progetto e retrain manuale del routing.
-        </p>
-      </div>
+      <AdminPageHeader
+        title="Project Learning"
+        description="Configurazione auto-apprendimento per progetto e retrain manuale del routing."
+      />
 
       {error && (
         <div

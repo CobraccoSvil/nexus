@@ -66,7 +66,7 @@ def _modified_files_from_steps(run_id: str) -> list[str]:
     write_tools = ("write_file", "create_file", "edit_file", "apply_patch", "str_replace")
     paths: list[str] = []
     seen: set[str] = set()
-    database_url = os.environ.get("DATABASE_URL", "")
+    database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         logger.debug("regression_gate: DATABASE_URL assente, impossibile leggere agent_steps")
         return paths

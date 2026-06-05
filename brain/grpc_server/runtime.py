@@ -99,7 +99,7 @@ def _registered_project_roots() -> set[str]:
     if _PROJECT_ROOTS_CACHE and now - _PROJECT_ROOTS_CACHE[0] <= _PROJECT_ROOTS_TTL_SECONDS:
         return _PROJECT_ROOTS_CACHE[1]
 
-    db_url = os.environ.get("DATABASE_URL", "")
+    db_url = os.environ.get("DATABASE_URL")
     if not db_url:
         return _PROJECT_ROOTS_CACHE[1] if _PROJECT_ROOTS_CACHE else set()
 
@@ -533,7 +533,7 @@ def _load_keys_from_db() -> dict[str, object]:
     updated = []
     errors = []
 
-    database_url = os.environ.get("DATABASE_URL", "")
+    database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         return {"status": "error", "updated": [], "errors": ["DATABASE_URL not set"]}
 

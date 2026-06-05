@@ -405,7 +405,7 @@ def _model_has_vision_capability(provider: str, model: str) -> bool | None:
     try:
         import os
         import psycopg2
-        database_url = os.environ.get("DATABASE_URL", "")
+        database_url = os.environ.get("DATABASE_URL")
         if not database_url:
             return None
         conn = psycopg2.connect(database_url, connect_timeout=2)
@@ -433,7 +433,7 @@ def _select_cheapest_vision_model() -> tuple[str, str] | None:
     try:
         import os
         import psycopg2
-        database_url = os.environ.get("DATABASE_URL", "")
+        database_url = os.environ.get("DATABASE_URL")
         if not database_url:
             return None
         conn = psycopg2.connect(database_url, connect_timeout=2)

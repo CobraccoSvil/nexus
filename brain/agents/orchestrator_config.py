@@ -217,7 +217,7 @@ def _coerce(value: str, default: Any) -> Any:
 def _load_from_db() -> dict[str, Any]:
     """Legge i settings orchestrator dalla tabella `settings` via psycopg2."""
     import os
-    database_url = os.environ.get("DATABASE_URL", "")
+    database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         logger.warning("orchestrator_config: DATABASE_URL non impostato, uso safe_defaults")
         return dict(_SAFE_DEFAULTS)

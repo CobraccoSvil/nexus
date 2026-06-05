@@ -22,7 +22,7 @@ def _get_conn():
 
     Ritorna None se DB non disponibile (caller gestisce graceful degrade).
     """
-    database_url = os.environ.get("DATABASE_URL", "")
+    database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         return None
     try:

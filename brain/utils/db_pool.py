@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import os
-from typing import Iterator
+from typing import Any, Iterator
 
 
 class DbUrlUnavailable(RuntimeError):
@@ -43,21 +43,26 @@ def get_db_url() -> str:
 
 
 @contextlib.contextmanager
-def connect() -> Iterator["psycopg2.extensions.connection"]:  # type: ignore[name-defined]
+def connect(**kwargs: Any) -> Iterator["psycopg2.extensions.connection"]:  # type: ignore[name-defined]
     """Context manager che apre/chiude una connessione psycopg2 sul DB Nexus.
 
     Uso::
 
         from brain.utils.db_pool import connect
+        from psycopg2.extras import RealDictCursor
 
         with connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT 1")
+
+        # Kwargs psycopg2 supportati (es. cursor_factory)
+        with connect(cursor_factory=RealDictCursor) as conn, conn.cursor() as cur:
+            ...
 
     Solleva ``DbUrlUnavailable`` se la URL non e' configurata.
     """
     import psycopg2  # type: ignore[import]
 
-    conn = psycopg2.connect(get_db_url())
+    conn = psycopg2.connect(get_db_url(), **kwargs)
     try:
         yield conn
     finally:

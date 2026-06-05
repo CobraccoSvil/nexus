@@ -10,6 +10,7 @@ import { useState } from "react";
 import { useThemeColors } from "../../../../lib/theme";
 import PromptDashboard from "../../../../components/admin/PromptDashboard";
 import PromptExperiments from "../../../../components/admin/PromptExperiments";
+import { AdminPageHeader } from "../../../../components/admin/AdminPageHeader";
 
 type Tab = "dashboard" | "esperimenti";
 
@@ -39,12 +40,10 @@ export default function PromptDashboardPage() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
-      <div>
-        <h1 style={{ fontSize: 20, fontWeight: 700, color: tc.text, margin: 0 }}>Dashboard Prompt</h1>
-        <p style={{ marginTop: 4, fontSize: 13, color: tc.textSecondary }}>
-          Metriche di qualita&apos; e esperimenti A/B canary gestiti dal PromptOptimizerWorker.
-        </p>
-      </div>
+      <AdminPageHeader
+        title="Dashboard Prompt"
+        description="Metriche di qualita&apos; e esperimenti A/B canary gestiti dal PromptOptimizerWorker."
+      />
 
       {/* Tab */}
       <div style={{ borderBottom: `1px solid ${tc.border}` }}>

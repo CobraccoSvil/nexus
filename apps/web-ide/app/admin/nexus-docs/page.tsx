@@ -19,6 +19,7 @@ import { useThemeColors } from "../../../lib/theme";
 import { WikiShell } from "../../../components/wiki/wiki-shell";
 import { makeMetaScope } from "../../../components/wiki/wiki-scope";
 import { KnowledgeGraph } from "../../../components/knowledge/knowledge-graph";
+import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
 
 const META_VAULT_NAME_KEY = "nexus.meta_docs.obsidian_vault_name";
 
@@ -285,13 +286,11 @@ export default function NexusDocsAdminPage() {
         </a>
       </div>
       <header style={{ marginBottom: 12 }}>
-        <h1 style={{ fontSize: 22, fontWeight: 700, margin: "0 0 4px" }}>
-          Documentazione Nexus
-        </h1>
-        <p style={{ fontSize: 12, color: tc.textMuted, margin: 0 }}>
-          Wiki del meta-progetto: architettura, ADR, runbook, schema, changelog auto,
-          decisioni. Editing live, cronologia revisioni e protezione dalla rigenerazione.
-        </p>
+        <AdminPageHeader
+        title="Documentazione Nexus"
+        description="Wiki del meta-progetto: architettura, ADR, runbook, schema, changelog auto,
+          decisioni. Editing live, cronologia revisioni e protezione dalla rigenerazione."
+      />
       </header>
       <WikiShell scope={scope} title="Doc Nexus" toolbar={toolbar} />
       {graphOpen && (

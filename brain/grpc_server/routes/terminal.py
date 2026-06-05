@@ -73,7 +73,7 @@ async def terminal_ws(websocket: WebSocket, session_id: str):
         _output_buf_len = 0
         _max_buf = 16384  # 16KB ring buffer
         _project_id = payload.get("pid", "")
-        _db_url = os.environ.get("DATABASE_URL", "")
+        _db_url = os.environ.get("DATABASE_URL")
 
         def _strip_ansi(s: str) -> str:
             s = _re.sub(r"\x1B\[[0-9;]*[A-Za-z]", "", s)

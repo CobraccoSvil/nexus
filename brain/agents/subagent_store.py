@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 def _conn():
-    url = os.environ.get("DATABASE_URL", "")
+    url = os.environ.get("DATABASE_URL")
     if not url:
         return None
     try:

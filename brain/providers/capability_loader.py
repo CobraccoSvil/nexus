@@ -17,6 +17,7 @@ import os
 import time
 
 from ._models import ProviderCapability
+from brain.utils.db_pool import get_db_url
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +52,7 @@ _TTL_REFRESH_S = 60.0
 
 
 def _db_url() -> str:
-    return os.environ.get(
-        "DATABASE_URL",
-        "postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable",
-    )
+    return get_db_url()
 
 
 def _get_ttl() -> float:

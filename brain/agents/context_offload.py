@@ -27,6 +27,7 @@ import hashlib
 import logging
 import time
 from typing import Any
+from brain.utils.db_pool import get_db_url
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ def _load_offload_config() -> dict[str, Any]:
         import os
         import psycopg2  # type: ignore[import-untyped]
 
-        db_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL", "")
+        db_url = get_db_url()
         if not db_url:
             raise RuntimeError("DATABASE_URL assente")
         with psycopg2.connect(db_url) as conn:
