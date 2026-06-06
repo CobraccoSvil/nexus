@@ -576,21 +576,29 @@ pub(crate) async fn spawn_agent_run(
         });
     }
 
-    // ── AUTO-COMPACT a soglia (regola H: fix strutturale all'overflow del
-    // contesto) ─────────────────────────────────────────────────────────────
-    // Prima di costruire la history e avviare il turno, valuta il rapporto
-    // token sessione / context window del modello risolto. Se supera la soglia
-    // configurabile (DB-driven, regola G), compatta automaticamente la sessione
-    // riusando la stessa logica del compact manuale (compact_session_core).
-    // Best-effort: ogni fallimento e' loggato WARN e il turno prosegue.
-    maybe_auto_compact(
-        state,
-        params.session_id,
-        params.project_id,
-        &provider,
-        &model_str,
-    )
-    .await;
+    // ── AUTO-COMPACT a soglia, in BACKGROUND (regola H: fix strutturale) ─────
+    // Valuta il rapporto token sessione / context window e, se supera la soglia
+    // (DB-driven, regola G), compatta la sessione riusando compact_session_core.
+    //
+    // ESEGUITO IN BACKGROUND (fire-and-forget): la compattazione chiama un LLM e
+    // su sessioni grandi puo' durare oltre 20s. Eseguirla sincrona qui bloccava
+    // la risposta "running" della POST /chat/.../messages oltre il timeout del
+    // proxy Next.js: la chat riceveva HTTP 500 (socket hang up) ad OGNI invio su
+    // una sessione vicina alla soglia, perche' il compact riscattava ogni volta.
+    // Il turno corrente NON dipende dalla compattazione: la history dell'agente
+    // usa una finestra limitata (ultimi 4 raw + top-6 semantici), non l'intera
+    // sessione. Quindi snellire la sessione puo' avvenire async, a beneficio dei
+    // turni futuri. Best-effort: ogni fallimento e' loggato WARN dentro il task.
+    {
+        let state_bg = state.clone();
+        let session_id = params.session_id;
+        let project_id = params.project_id;
+        let provider_bg = provider.clone();
+        let model_bg = model_str.clone();
+        tokio::spawn(async move {
+            maybe_auto_compact(&state_bg, session_id, project_id, &provider_bg, &model_bg).await;
+        });
+    }
 
     // Persist initial run in DB
     let _ = sqlx::query(
