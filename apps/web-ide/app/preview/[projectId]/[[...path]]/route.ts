@@ -30,11 +30,35 @@ async function proxyPreview(
       return new Response(null, { status: upstream.status, headers });
     }
 
+    const contentType = upstream.headers.get("content-type") || "";
+
+    // Per le pagine HTML iniettiamo <base href="/preview/<id>/"> nel <head>.
+    // Senza, se l'URL della pagina perde lo slash finale o il nome file
+    // (es. /preview/<id> invece di /preview/<id>/index.html), i link relativi
+    // del sito (es. ./flotta.html) risolvono a /preview/flotta.html PERDENDO il
+    // projectId -> la route ritorna "project id non valido" e il menu sembra non
+    // funzionare. Il <base> ancora OGNI link relativo alla radice del preview del
+    // progetto, indipendentemente dall'URL corrente o da eventuali redirect
+    // upstream. Si applica solo all'HTML; i binari (immagini, css, font) passano
+    // invariati. Se la pagina ha gia' un <base>, non lo tocchiamo.
+    if (contentType.includes("text/html")) {
+      let html = new TextDecoder("utf-8").decode(await upstream.arrayBuffer());
+      if (!/<base\b/i.test(html)) {
+        const baseTag = `<base href="/preview/${encodeURIComponent(projectId)}/">`;
+        html = /<head[^>]*>/i.test(html)
+          ? html.replace(/<head[^>]*>/i, (m) => `${m}${baseTag}`)
+          : `${baseTag}${html}`;
+      }
+      const headers = new Headers();
+      headers.set("Content-Type", contentType);
+      headers.set("Cache-Control", "no-store");
+      return new Response(html, { status: upstream.status, headers });
+    }
+
     // Gestione contenuti binari (immagini, font, ecc.): si legge l'arrayBuffer
     // e si ritorna con lo stesso Content-Type/Content-Length.
     const body = await upstream.arrayBuffer();
     const headers = new Headers();
-    const contentType = upstream.headers.get("content-type");
     if (contentType) headers.set("Content-Type", contentType);
     const contentLength = upstream.headers.get("content-length");
     if (contentLength) headers.set("Content-Length", contentLength);
