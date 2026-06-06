@@ -97,6 +97,10 @@ def _load_config() -> dict[str, Any]:
         "intake_gate_enabled": False,
         "intake_match_min_score": 0.7,
         "intake_topk": 5,
+        # Sotto (<=) questo agentic_score un intent chat e' small-talk puro
+        # (saluti/ringraziamenti) e bypassa l'intake gate. Sopra, anche una
+        # "chat" e' una richiesta sostanziale e consulta la KB del progetto.
+        "smalltalk_agentic_score_max": 0.3,
     }
     url = os.environ.get("DATABASE_URL")
     if not url:
@@ -151,6 +155,11 @@ def _load_config() -> dict[str, Any]:
                     elif short == "intake_topk":
                         try:
                             defaults["intake_topk"] = int(value)
+                        except (TypeError, ValueError):
+                            pass
+                    elif short == "smalltalk_agentic_score_max":
+                        try:
+                            defaults["smalltalk_agentic_score_max"] = float(value)
                         except (TypeError, ValueError):
                             pass
     except Exception as exc:
@@ -574,11 +583,25 @@ async def clarify_or_expand_node(state: AgentState) -> dict[str, Any]:
     # "questa richiesta non va chiarita perche' e' conversazionale".
     intent = str(state.get("user_intent") or "").strip().lower()
     if intent in ("chat", "general_chat"):
+        # Bypass SOLO per lo small-talk puro (saluti/ringraziamenti): basso
+        # agentic_score dal classifier LLM. Una domanda sostanziale finita in
+        # "chat" NON viene bypassata: deve passare per l'intake gate esistente,
+        # che consulta la KB del progetto (richiesta nuova/duplicata + coerenza
+        # off_topic). Niente keyword: la distinzione e' semantica (agentic_score).
+        # Gli intent agentic_default (LLM in timeout) non sono "chat", quindi non
+        # arrivano qui: proseguono gia' all'intake gate.
+        agentic_score = float(state.get("agentic_score") or 0.0)
+        smalltalk_max = float(cfg.get("smalltalk_agentic_score_max", 0.3))
+        if agentic_score <= smalltalk_max:
+            logger.info(
+                "clarify_or_expand: intent=%s small-talk (agentic_score=%.2f<=%.2f) -> skip",
+                intent, agentic_score, smalltalk_max,
+            )
+            return {}
         logger.info(
-            "clarify_or_expand: intent=%s conversazionale -> skip (nessun chiarimento)",
-            intent,
+            "clarify_or_expand: intent=%s ma richiesta sostanziale (agentic_score=%.2f) -> intake gate/KB",
+            intent, agentic_score,
         )
-        return {}
 
     user_msg_preview = _last_user_message(state).strip()
 
