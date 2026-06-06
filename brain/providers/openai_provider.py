@@ -143,6 +143,9 @@ class OpenAIProvider(BaseProvider, ApiKeyClientMixin):
             else:
                 create_kwargs["max_tokens"] = max_tok
                 create_kwargs["temperature"] = kwargs.get("temperature", 0.7)
+            # JSON mode: output JSON sintatticamente valido (Chat Completions).
+            if kwargs.get("json_mode"):
+                create_kwargs["response_format"] = {"type": "json_object"}
             response = await client.chat.completions.create(**create_kwargs)
             choice = response.choices[0]
             return ProviderResult(

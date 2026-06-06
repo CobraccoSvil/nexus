@@ -256,33 +256,54 @@ pub async fn handle_doc_generate(
                 Ok(c) => c,
                 Err(e) => return format!("[Errore] Costruzione client HTTP fallita: {e}"),
             };
-            // Modello purpose-specific letto da DB (purpose: docs_generator)
-            // invece che hardcoded. Vedi migrazione 0102.
-            // Nota: handle_doc_generate non ha accesso a Orchestrator/AppState,
-            // quindi facciamo una query diretta one-shot al DB.
-            let (gen_provider, gen_model): (String, String) = match sqlx::query_as::<_, (String, String)>(
-                "SELECT provider, model_id FROM nexus_purpose_model WHERE purpose = 'docs_generator' LIMIT 1"
-            )
-            .fetch_optional(db)
-            .await
-            {
-                Ok(Some(row)) => row,
-                Ok(None) => {
-                    tracing::error!(
-                        "purpose 'docs_generator' non configurato in nexus_purpose_model. \
-                         Esegui INSERT con il modello desiderato (mig 0102)."
-                    );
-                    return "[Errore] purpose 'docs_generator' non configurato in nexus_purpose_model".to_string();
-                }
-                Err(e) => {
-                    tracing::error!("query nexus_purpose_model fallita: {e}");
-                    return format!("[Errore] query nexus_purpose_model fallita: {e}");
-                }
-            };
+            // Modello risolto tramite il ROUTING CANONICO per tier (punto unico
+            // regola L): resolve_purpose_model_db applica tier-rule (mig 0203) ->
+            // miglior modello del catalog fuori cooldown -> fallback statico ->
+            // enforcement cooldown. NIENTE piu' query statica che ignorava il
+            // tier e il routing. handle_doc_generate non ha AppState, quindi usa
+            // l'adapter `_db` (stessa logica, fonte DB invece della matrix cache).
+            let (gen_provider, gen_model): (String, String) =
+                match crate::internal_routing::resolve_purpose_model_db(db, "docs_generator").await {
+                    crate::internal_routing::PurposeResolution::Resolved {
+                        provider, model, rationale,
+                    } => {
+                        tracing::info!(
+                            "nexus_doc_generate: modello risolto {provider}/{model} ({rationale})"
+                        );
+                        (provider, model)
+                    }
+                    crate::internal_routing::PurposeResolution::InCooldown { provider, model } => {
+                        tracing::warn!(
+                            "nexus_doc_generate: {provider}/{model} in cooldown e nessuna \
+                             alternativa tier-based"
+                        );
+                        return format!(
+                            "[Errore] Generazione documento non disponibile: il provider '{provider}' \
+                             del purpose docs_generator e' in cooldown e non esiste un'alternativa \
+                             capable per il tier configurato. Riprova piu' tardi."
+                        );
+                    }
+                    crate::internal_routing::PurposeResolution::NotFound => {
+                        tracing::error!(
+                            "purpose 'docs_generator' non configurato in nexus_purpose_model."
+                        );
+                        return "[Errore] purpose 'docs_generator' non configurato in nexus_purpose_model".to_string();
+                    }
+                    crate::internal_routing::PurposeResolution::MatrixUnavailable(e) => {
+                        tracing::error!("nexus_doc_generate: routing non disponibile: {e}");
+                        return format!("[Errore] routing docs_generator non disponibile: {e}");
+                    }
+                };
+            // json_mode: forza output JSON sintatticamente valido sui provider
+            // che lo supportano (Google/OpenAI). max_tokens alto: un documento
+            // strutturato lungo (~13k char) col default 4096 veniva TRONCATO, da
+            // cui il "JSON parse error" osservato. 16000 token coprono i casi reali.
             let body = serde_json::json!({
                 "provider": gen_provider,
                 "model": gen_model,
-                "prompt": gen_prompt
+                "prompt": gen_prompt,
+                "json_mode": true,
+                "max_tokens": 16000
             });
             let resp = match http
                 .post(format!("{}/complete", brain_rest))

@@ -340,13 +340,18 @@ class GoogleProvider(BaseProvider):
         try:
             from google.genai import types  # type: ignore[import]
             client = self._get_client()
+            config_kwargs: dict[str, Any] = {
+                "max_output_tokens": kwargs.get("max_tokens", 4096),
+                "temperature": kwargs.get("temperature", 0.7),
+            }
+            # JSON mode: Gemini garantisce output JSON sintatticamente valido
+            # (niente prosa/fence) quando si imposta response_mime_type.
+            if kwargs.get("json_mode"):
+                config_kwargs["response_mime_type"] = "application/json"
             response = await client.aio.models.generate_content(
                 model=model,
                 contents=prompt,
-                config=types.GenerateContentConfig(
-                    max_output_tokens=kwargs.get("max_tokens", 4096),
-                    temperature=kwargs.get("temperature", 0.7),
-                ),
+                config=types.GenerateContentConfig(**config_kwargs),
             )
             prompt_tokens = 0
             completion_tokens = 0

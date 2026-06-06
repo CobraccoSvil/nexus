@@ -37,6 +37,13 @@ class CompletionRequest(BaseModel):
     provider: str
     model: str
     prompt: str
+    # Parametri opzionali di generazione. max_tokens evita il troncamento di
+    # output lunghi (es. documenti strutturati ~13k char: col default 4096 il
+    # JSON usciva troncato e non parsabile). json_mode forza l'output JSON dove
+    # il provider lo supporta (Google response_mime_type, OpenAI response_format).
+    max_tokens: int | None = None
+    json_mode: bool = False
+    temperature: float | None = None
 
 
 class EmbedRequest(BaseModel):
@@ -202,7 +209,16 @@ async def provider_health(provider: str) -> dict[str, object]:
 
 @router.post("/complete")
 async def complete(body: CompletionRequest) -> dict[str, object]:
-    result = await runtime.providers.generate_completion_async(body.provider, body.model, body.prompt)
+    # Inoltra solo i kwargs valorizzati: i provider applicano i propri default
+    # per quelli assenti (regola: nessun magic default duplicato qui).
+    extra: dict[str, object] = {"json_mode": body.json_mode}
+    if body.max_tokens is not None:
+        extra["max_tokens"] = body.max_tokens
+    if body.temperature is not None:
+        extra["temperature"] = body.temperature
+    result = await runtime.providers.generate_completion_async(
+        body.provider, body.model, body.prompt, **extra
+    )
     return {
         "provider": result.provider,
         "model": result.model,

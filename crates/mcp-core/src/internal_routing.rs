@@ -17,6 +17,7 @@
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
+use sqlx::PgPool;
 
 use crate::AppState;
 
@@ -141,24 +142,29 @@ pub enum PurposeResolution {
     MatrixUnavailable(String),
 }
 
-/// Risolve (provider, model) per un purpose applicando, nell'ordine: regola tier
-/// dinamica (mig 0203) con scelta del miglior modello capable fuori cooldown;
-/// fallback al (provider, model_id) statico; enforcement cooldown sul statico.
-/// Nessun nome modello hardcoded: tutto deriva dal DB (regola G).
-pub async fn resolve_purpose_model(state: &AppState, purpose: &str) -> PurposeResolution {
-    let purpose = purpose.trim();
-    let matrix = match state.orchestrator.routing_matrix.current() {
-        Ok(m) => m,
-        Err(e) => return PurposeResolution::MatrixUnavailable(e.to_string()),
-    };
-
+/// CORE decisionale (PUNTO UNICO, regola L) della risoluzione purpose→modello.
+/// Applica, nell'ordine: regola tier dinamica (mig 0203) con scelta del miglior
+/// modello capable fuori cooldown; fallback al (provider, model_id) statico;
+/// enforcement cooldown sullo statico. Nessun nome modello hardcoded (regola G).
+///
+/// Riceve gia' risolti `tier_rule` e `static_model` cosi' da essere indipendente
+/// dalla FONTE (matrix cache o query DB diretta). I due adapter pubblici
+/// (`resolve_purpose_model` da `AppState`, `resolve_purpose_model_db` da
+/// `&PgPool`) leggono questi due input dalla rispettiva fonte e delegano qui:
+/// la logica decisionale vive in un solo posto.
+async fn resolve_purpose_core(
+    db: &PgPool,
+    purpose: &str,
+    tier_rule: Option<crate::routing_matrix::PurposeTierRule>,
+    static_model: Option<(String, String)>,
+) -> PurposeResolution {
     // Risoluzione tier-based (mig 0203): se il purpose ha un tier configurato,
     // scegliamo dinamicamente il miglior modello del catalog per quel tier +
     // capability. Se il catalog non ha candidati (es. tutti in cooldown), si
     // cade sul (provider, model_id) statico come ultimo fallback.
-    if let Some(rule) = matrix.purpose_tier(purpose) {
+    if let Some(rule) = tier_rule {
         if let Some((provider, model)) = crate::orchestrator::best_model_for_tier(
-            &state.db,
+            db,
             &rule.tier,
             rule.capability.as_deref(),
             rule.requires_tool_use,
@@ -178,7 +184,7 @@ pub async fn resolve_purpose_model(state: &AppState, purpose: &str) -> PurposeRe
         );
     }
 
-    match matrix.purpose_model(purpose) {
+    match static_model {
         Some((provider, model)) => {
             if crate::provider_cooldown::is_provider_in_cooldown(&provider) {
                 PurposeResolution::InCooldown { provider, model }
@@ -192,6 +198,56 @@ pub async fn resolve_purpose_model(state: &AppState, purpose: &str) -> PurposeRe
         }
         None => PurposeResolution::NotFound,
     }
+}
+
+/// Adapter da `AppState`: legge tier-rule e statico dalla RoutingMatrix cache
+/// (TTL 60s) e delega al core. Usare quando si dispone di `AppState`.
+pub async fn resolve_purpose_model(state: &AppState, purpose: &str) -> PurposeResolution {
+    let purpose = purpose.trim();
+    let matrix = match state.orchestrator.routing_matrix.current() {
+        Ok(m) => m,
+        Err(e) => return PurposeResolution::MatrixUnavailable(e.to_string()),
+    };
+    resolve_purpose_core(
+        &state.db,
+        purpose,
+        matrix.purpose_tier(purpose),
+        matrix.purpose_model(purpose),
+    )
+    .await
+}
+
+/// Adapter da `&PgPool`: legge tier-rule e statico direttamente da
+/// `nexus_purpose_model` e delega al core. Per i call site che NON dispongono di
+/// `AppState` (es. i tool del Nexus Builtin server come `nexus_doc_generate`,
+/// che ricevono solo `&PgPool`). Stessa decisione di `resolve_purpose_model`,
+/// senza re-implementarla (regola L): la fonte e' il DB invece della matrix
+/// cache, i dati sono gli stessi (`nexus_purpose_model`).
+pub async fn resolve_purpose_model_db(db: &PgPool, purpose: &str) -> PurposeResolution {
+    let purpose = purpose.trim();
+    let row = match sqlx::query_as::<_, (String, String, Option<String>, Option<String>, bool)>(
+        "SELECT provider, model_id, tier, required_capability, requires_tool_use \
+         FROM nexus_purpose_model WHERE purpose = $1 LIMIT 1",
+    )
+    .bind(purpose)
+    .fetch_optional(db)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return PurposeResolution::MatrixUnavailable(e.to_string()),
+    };
+
+    let Some((provider, model_id, tier, capability, requires_tool_use)) = row else {
+        return PurposeResolution::NotFound;
+    };
+
+    let tier_rule = tier.map(|t| crate::routing_matrix::PurposeTierRule {
+        tier: t,
+        capability,
+        requires_tool_use,
+    });
+
+    resolve_purpose_core(db, purpose, tier_rule, Some((provider, model_id))).await
 }
 
 /// Handler `GET /api/internal/routing/purpose?purpose=...`
