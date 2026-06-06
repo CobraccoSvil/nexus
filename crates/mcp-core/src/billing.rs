@@ -902,16 +902,22 @@ pub async fn get_session_usage(
         }
     }
 
-    // Aggregate tokens from assistant messages metadata in this session
+    // Aggregate da assistant messages. Distinzione semantica:
+    // - total_tokens: solo messaggi VIVI (deleted_at IS NULL) -> usato per il
+    //   context window % della TokenUsageBar, che dopo un compact deve scendere.
+    // - total_cost: TUTTI i messaggi, inclusi i soft-deleted dalla compattazione
+    //   -> il costo e' CUMULATIVO (gia' speso/pagato) e non deve mai azzerarsi
+    //   compattando la chat. Bug storico: il filtro deleted_at azzerava anche il
+    //   costo dopo un compact.
     let summary_row = sqlx::query(
         r#"
         SELECT
-            COALESCE(SUM((metadata->>'totalTokens')::bigint), 0)::bigint AS total_tokens,
+            COALESCE(SUM((metadata->>'totalTokens')::bigint)
+                     FILTER (WHERE deleted_at IS NULL), 0)::bigint AS total_tokens,
             COALESCE(SUM((metadata->>'totalCost')::float8), 0.0)::float8 AS total_cost
         FROM chat_messages
         WHERE session_id = $1
           AND role = 'assistant'
-          AND deleted_at IS NULL
           AND metadata->>'totalTokens' IS NOT NULL
         "#,
     )

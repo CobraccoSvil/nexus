@@ -611,12 +611,25 @@ pub(crate) async fn compact_session_core(
         .await
         .map_err(|e| CompactError::internal(e.to_string()))?;
 
-    // Dopo il soft-delete, il totale token mostrato dalla TokenUsageBar e'
-    // solo quello del summary nuovo (i precedenti sono deleted_at NOT NULL e
-    // la query frontend li filtra). Inviamo direttamente la stima per il reset
-    // immediato della barra.
+    // Dopo il soft-delete, il totale TOKEN mostrato dalla TokenUsageBar e' solo
+    // quello del summary nuovo (i precedenti sono deleted_at NOT NULL e la query
+    // frontend li filtra) — corretto per il calcolo del context window %.
     let total_tokens: i64 = summary_tokens_est;
-    let total_cost_usd: f64 = 0.0;
+    // Il COSTO totale della chat e' invece CUMULATIVO: i turni appena
+    // soft-deletati dalla compattazione sono stati comunque PAGATI, quindi il
+    // costo non va mai azzerato. Sommiamo il costo di TUTTI i messaggi assistant
+    // della sessione (inclusi i soft-deleted). Bug storico: qui era hardcodato a
+    // 0.0, percio' compattando una chat si perdeva il costo totale speso.
+    let total_cost_usd: f64 = sqlx::query_scalar::<_, f64>(
+        "SELECT COALESCE(SUM((metadata->>'totalCost')::float8), 0.0)::float8 \
+         FROM chat_messages \
+         WHERE session_id = $1 AND role = 'assistant' \
+           AND metadata->>'totalCost' IS NOT NULL",
+    )
+    .bind(session_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0.0);
 
     // Emette eventi dispatcher: il frontend ascolta via SSE e ricalcola UI.
     // - ChatSessionCompacted → use-chat aggiorna tokenUsage
