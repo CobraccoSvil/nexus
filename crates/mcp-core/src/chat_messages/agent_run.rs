@@ -1157,22 +1157,34 @@ pub(crate) async fn spawn_agent_run(
             );
             // Se il modello primario non ha context_window sufficiente (con margine
             // 30% per output), cerca subito un modello idoneo per ctx.
-            let primary_ctx: i64 = sqlx::query_scalar(
-            "SELECT context_window FROM ai_price_catalog WHERE provider=$1 AND model=$2 LIMIT 1"
-        )
-        .bind(&current_provider)
-        .bind(&current_model)
-        .fetch_optional(&db_clone)
-        .await
-        .ok().flatten().unwrap_or(8192);
             let ctx_needed: i64 = (estimated_input_tokens as f64 * 1.3) as i64;
-            if primary_ctx < ctx_needed {
+            // Idoneita' del primario: context_window sufficiente E eleggibilita'
+            // agentica (supports_tool_use AND policy<>'exclude'), lette in un'unica
+            // query. Il routing a monte (routing matrix) puo' aver scelto un modello
+            // NON tool-capable (es. mistral-small-latest, supports_tool_use=false):
+            // in un run agentico fallirebbe sistematicamente (422/MALFORMED/hollow).
+            // Va sostituito SUBITO con un modello eleggibile, non solo quando il
+            // context e' insufficiente. Cosi' il gate di capability vale anche per
+            // il PRIMARIO, non solo per i fallback (prima era bypassato).
+            let (primary_ctx, primary_tool_ok): (i64, bool) = sqlx::query_as(
+                "SELECT context_window,
+                        (supports_tool_use AND agentic_thinking_policy <> 'exclude')
+                   FROM ai_price_catalog WHERE provider=$1 AND model=$2 LIMIT 1",
+            )
+            .bind(&current_provider)
+            .bind(&current_model)
+            .fetch_optional(&db_clone)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or((8192, false));
+            if primary_ctx < ctx_needed || !primary_tool_ok {
                 tracing::warn!(
-                "agent_run {}: ctx insufficiente per primario {}/{} ({} < {}), cerco modello con ctx >= {}",
-                run_id, current_provider, current_model, primary_ctx, ctx_needed, ctx_needed
-            );
-                // Re-routing context-aware: path AGENTICO. PUNTO UNICO di selezione
-                // (regola L): l'eleggibilita' agentica (tool_use, policy<>'exclude',
+                    "agent_run {}: primario {}/{} non idoneo (ctx {} < {} oppure non tool-capable: {}), re-route agentico",
+                    run_id, current_provider, current_model, primary_ctx, ctx_needed, !primary_tool_ok
+                );
+                // Re-routing AGENTICO. PUNTO UNICO di selezione (regola L):
+                // l'eleggibilita' agentica (tool_use, policy<>'exclude',
                 // consecutive_failures, cooldown) e' definita una sola volta in
                 // select_agentic_model. Vincolo extra: context_window >= ctx_needed.
                 let alt = crate::orchestrator::select_agentic_model(
@@ -1186,11 +1198,8 @@ pub(crate) async fn spawn_agent_run(
                 .await;
                 if let Some((p, m)) = alt {
                     tracing::info!(
-                        "agent_run {}: routing context-aware: {} -> {}/{}",
-                        run_id,
-                        current_model,
-                        p,
-                        m
+                        "agent_run {}: re-route agentico: {} -> {}/{}",
+                        run_id, current_model, p, m
                     );
                     current_provider = p;
                     current_model = m;
