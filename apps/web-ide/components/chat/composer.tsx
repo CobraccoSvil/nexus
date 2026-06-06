@@ -35,6 +35,8 @@ export interface ComposerProps {
   onToggleMicrophone: () => void;
   isLoading: boolean;
   isAgentRunning?: boolean;
+  /** Numero di messaggi in coda (inviati durante un run, verranno processati a fine run). */
+  pendingCount?: number;
   onStopAgent?: () => void;
   hasRunningServices?: boolean;
   hasProject: boolean;
@@ -76,6 +78,7 @@ export function Composer({
   onToggleMicrophone,
   isLoading,
   isAgentRunning = false,
+  pendingCount = 0,
   onStopAgent,
   hasRunningServices = false,
   hasProject,
@@ -452,43 +455,64 @@ export function Composer({
           >
             {isListening ? "■" : "\uD83C\uDFA4"}
           </IconButton>
-          {isAgentRunning && onStopAgent ? (
-            <button
-              type="button"
-              onClick={onStopAgent}
-              title="Interrompi agente"
-              style={{
-                marginLeft: "auto",
-                border: `1px solid ${tc.error}88`,
-                background: `${tc.error}1a`,
-                color: tc.error,
-                borderRadius: 7,
-                padding: "5px 12px",
-                cursor: "pointer",
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: 5,
-                fontSize: 12,
-                fontWeight: 600,
-              }}
-            >
-              <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
-                <rect x="1" y="1" width="10" height="10" rx="2"/>
-              </svg>
-              Stop
-            </button>
-          ) : (
-            <IconButton
-              type="submit"
-              label={hasRunningServices ? "Servizio in background attivo — fermalo prima di inviare" : t("chat.send")}
-              disabled={isLoading || (!input.trim() && attachments.length === 0) || !hasProject || hasRunningServices}
-              variant="primary"
-              style={{ borderRadius: 7, fontSize: 13, marginLeft: "auto" }}
-            >
-              {isLoading ? "…" : "➤"}
-            </IconButton>
-          )}
+          <div style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 8 }}>
+            {pendingCount > 0 && (
+              <span
+                title={`${pendingCount} messaggi in coda: verranno inviati automaticamente al termine del run in corso`}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 4,
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color: tc.accent,
+                  background: `${tc.accent}14`,
+                  border: `1px solid ${tc.accent}40`,
+                  borderRadius: 7,
+                  padding: "3px 8px",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {pendingCount} in coda
+              </span>
+            )}
+            {isAgentRunning && onStopAgent ? (
+              <button
+                type="button"
+                onClick={onStopAgent}
+                title="Interrompi agente"
+                style={{
+                  border: `1px solid ${tc.error}88`,
+                  background: `${tc.error}1a`,
+                  color: tc.error,
+                  borderRadius: 7,
+                  padding: "5px 12px",
+                  cursor: "pointer",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 5,
+                  fontSize: 12,
+                  fontWeight: 600,
+                }}
+              >
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
+                  <rect x="1" y="1" width="10" height="10" rx="2"/>
+                </svg>
+                Stop
+              </button>
+            ) : (
+              <IconButton
+                type="submit"
+                label={hasRunningServices ? "Servizio in background attivo — fermalo prima di inviare" : t("chat.send")}
+                disabled={isLoading || (!input.trim() && attachments.length === 0) || !hasProject || hasRunningServices}
+                variant="primary"
+                style={{ borderRadius: 7, fontSize: 13 }}
+              >
+                {isLoading ? "…" : "➤"}
+              </IconButton>
+            )}
+          </div>
         </div>
       </div>
       {attachmentError && (

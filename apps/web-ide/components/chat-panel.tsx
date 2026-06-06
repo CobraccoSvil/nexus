@@ -192,6 +192,7 @@ export function ChatPanel({
     agentRun, agentSteps, agentRuns, agentStepsMap, metaStepsMap,
     tokenUsage, traces, streamingToken, thinkingText,
     attachmentIndexProposal, clearAttachmentIndexProposal, applyAttachmentsIndexed,
+    pendingCount,
     send, resend, remove, feedbackError, feedbackPositive, positiveFeedback,
     confirmAgent, cancelRun,
   } = useChat(projectId, profileId, { sessionId });
@@ -1391,6 +1392,7 @@ export function ChatPanel({
         onToggleMicrophone={toggleMicrophone}
         isLoading={isLoading || precheckPending}
         isAgentRunning={isAgentRunning}
+        pendingCount={pendingCount}
         onStopAgent={() => { if (agentRun?.runId) void cancelRun(agentRun.runId); }}
         hasRunningServices={hasRunningServices}
         hasProject={hasProject}
