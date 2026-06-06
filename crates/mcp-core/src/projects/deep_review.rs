@@ -99,7 +99,6 @@ pub async fn submit_deep_review(
     .parse::<usize>()
     .unwrap_or(5);
 
-    const CODE_EXTENSIONS: &[&str] = &["tsx", "jsx", "ts", "js", "rs", "py", "cs", "go", "vue"];
     const MAX_FILE_BYTES: u64 = 50 * 1024;
 
     let source_files = collect_source_files(&root_path, CODE_EXTENSIONS);

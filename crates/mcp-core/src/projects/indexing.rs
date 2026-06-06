@@ -351,7 +351,6 @@ pub async fn index_project_code_files(state: &AppState, project_id: Uuid, root: 
         "__pycache__",
         ".deploy",
     ];
-    const CODE_EXTENSIONS: &[&str] = &["tsx", "jsx", "ts", "js", "rs", "py", "cs", "go", "vue"];
     const MAX_FILE_BYTES: u64 = 200 * 1024;
     const MAX_FILES: usize = 500;
     const MAX_CHUNKS_PER_FILE: usize = 10;
@@ -598,7 +597,6 @@ pub async fn reindex_single_file_inner(
     file_path: &Path,
     force: bool,
 ) -> anyhow::Result<usize> {
-    const CODE_EXTENSIONS: &[&str] = &["tsx", "jsx", "ts", "js", "rs", "py", "cs", "go", "vue"];
     const MAX_FILE_BYTES: u64 = 200 * 1024;
     const MAX_CHUNKS_PER_FILE: usize = 10;
     const CHUNK_SIZE: usize = 2000;
@@ -828,7 +826,6 @@ pub async fn get_index_status(
         ));
     }
 
-    const CODE_EXTENSIONS: &[&str] = &["tsx", "jsx", "ts", "js", "rs", "py", "cs", "go", "vue"];
     const MAX_FILE_BYTES: u64 = 200 * 1024;
 
     let stored: Vec<(String, String)> = sqlx::query_as(
@@ -937,7 +934,6 @@ pub async fn reindex_stale_files(
         ));
     }
 
-    const CODE_EXTENSIONS: &[&str] = &["tsx", "jsx", "ts", "js", "rs", "py", "cs", "go", "vue"];
     const MAX_FILE_BYTES: u64 = 200 * 1024;
 
     let stored: Vec<(String, String)> = sqlx::query_as(

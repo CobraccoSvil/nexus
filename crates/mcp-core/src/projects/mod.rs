@@ -48,6 +48,18 @@ pub(crate) const EXCLUDED_NAMES: &[&str] = &[
     "__pycache__",
 ];
 
+/// Estensioni dei file indicizzati nella knowledge base (chunk + embedding nel
+/// vector store, reindex real-time del file watcher, deep review).
+///
+/// Punto unico (regola L / ADR 0026): prima questa lista era DUPLICATA in
+/// `indexing.rs` (x4), `file_watcher.rs` e `deep_review.rs`; aggiungere
+/// un'estensione richiedeva di toccarle tutte. Include i linguaggi di
+/// programmazione E il markup `html`/`htm` (le pagine sono contenuto
+/// indicizzabile e ricercabile semanticamente nella KB del progetto).
+pub(crate) const CODE_EXTENSIONS: &[&str] = &[
+    "tsx", "jsx", "ts", "js", "rs", "py", "cs", "go", "vue", "html", "htm",
+];
+
 // ── Struct request/response pubbliche ────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]

@@ -18,10 +18,9 @@ use uuid::Uuid;
 
 use crate::AppState;
 
-/// Estensioni monitorate per la RE-INDICIZZAZIONE semantica (stessa lista di
-/// `reindex_single_file`): solo file di codice "pesante" che vale la pena
-/// rievaluare nell'indice vettoriale.
-const CODE_EXTENSIONS: &[&str] = &["tsx", "jsx", "ts", "js", "rs", "py", "cs", "go", "vue"];
+// Estensioni indicizzate nella KB: punto unico in `crate::projects`
+// (regola L), include i linguaggi di programmazione + html/htm.
+use crate::projects::CODE_EXTENSIONS;
 
 /// Estensioni che, oltre al codice, vanno NOTIFICATE al frontend tramite
 /// `FileChanged` per far refreshare il pannello explorer. Lista piu' larga
