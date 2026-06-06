@@ -90,11 +90,6 @@ from .helpers import (
     _TOOL_ERROR_HINTS,
     _detect_repeated_failed_command,
     _detect_recent_tool_error,
-    _SCAFFOLD_VERBS,
-    _SCAFFOLD_OBJECTS,
-    _SCAFFOLD_VERB_RE,
-    _SCAFFOLD_OBJ_RE,
-    _detect_scaffolding_intent,
     _PRICE_CACHE,
     _PRICE_CACHE_TS,
     _PRICE_TTL_S,
@@ -544,101 +539,45 @@ async def router_node(state: AgentState) -> dict[str, Any]:
     # Stima token budget (approssimazione: 1 token ~ 4 caratteri)
     token_budget = max(400, len(text) // 4)
 
-    if _router is not None:
-        classification = _router.classify_intent(str(text))
-        intent = classification.get("intent", "chat")
-        # Confidence ritornata come stringa "0.xx" dal semantic router.
-        # Defaults a 1.0 quando il classifier non popola il campo (es. fallback
-        # keyword puro) cosi' clarify_or_expand_node non si attiva spuriamente.
-        try:
-            intent_confidence = float(classification.get("confidence", "1.0"))
-        except (TypeError, ValueError):
-            intent_confidence = 1.0
-    else:
-        intent = "chat"
-        intent_confidence = 1.0
-
-    # ── Fast-path conversazionale ────────────────────────────────────────
-    # Euristica: messaggi corti puramente conversazionali (saluti, ringraziamenti,
-    # affermazioni brevi) vengono spesso classificati erroneamente come "file_ops"
-    # o "implement" se la conversazione precedente conteneva quel contesto. Il
-    # classifier vede l'intera storia e si lascia influenzare. Forziamo "chat"
-    # quando il messaggio matcha pattern conversazionali puri: cosi' il flow
-    # bypassa tool/RAG/planner e l'executor risponde direttamente.
-    _text_stripped = str(text).strip().lower().rstrip("!?.,;:")
-    _CHAT_TOKENS = {
-        "ciao", "salve", "buongiorno", "buonasera", "buonanotte", "hey",
-        "hi", "hello", "ehi", "ehila", "yo",
-        "grazie", "grazie mille", "thanks", "thank you", "ok", "okay",
-        "perfetto", "fantastico", "ottimo", "bene", "capito",
-        "addio", "arrivederci", "a presto", "ci sentiamo", "bye",
-    }
-    is_conversational = (
-        len(_text_stripped) < 60
-        and (
-            _text_stripped in _CHAT_TOKENS
-            or any(_text_stripped.startswith(tok + " ") for tok in _CHAT_TOKENS)
-            or _text_stripped in {
-                "come stai", "come va", "tutto bene", "tutto ok",
-                "come ti chiami", "chi sei",
-            }
-        )
-    )
-    if is_conversational and intent not in ("chat", "general_chat"):
-        logger.info(
-            "router_node: fast-path conversazionale (msg=%r len=%d): override intent %s -> chat",
-            _text_stripped[:40], len(_text_stripped), intent,
-        )
-        intent = "chat"
-        intent_confidence = 1.0
-
-    # ── Override deterministico: scaffolding applicativo ─────────────────────
-    # Se il messaggio chiede di CREARE un'applicazione/progetto (famiglia
-    # verbo+oggetto), forziamo intent="architecture" anche quando l'embedding
-    # classifier l'ha mandato su code_read/docs. Questo evita che il profilo di
-    # sola lettura blocchi lo scaffolding (il modello esplora invece di
-    # scrivere). Non sovrascriviamo gli intent gia' "attivi" (architecture,
-    # system_admin, file_ops): se siamo gia' su uno di quelli il routing e'
-    # corretto. Speculare alla regola dell'agentic classifier, ma deterministico.
-    if intent not in ("architecture", "system_admin", "file_ops") and _detect_scaffolding_intent(str(text)):
-        logger.info(
-            "router_node: override scaffolding deterministico, intent %s -> architecture (msg=%r)",
-            intent, str(text)[:60],
-        )
-        intent = "architecture"
-        intent_confidence = 0.9
-
-    # ── PR-D: classifier agentico per il gating adattivo del planner forte ────
-    # Solo se adaptive_classifier_enabled. Produce complexity/agentic_score/
-    # is_ambiguous che route_after_router usa per decidere se attivare il
-    # planner forte. Su fallback/timeout/non-conversazionale resta il path
-    # keyword (zero regressioni). Cache TTL 24h + timeout interni al classifier.
+    # ── Classificazione intent: SOLO semantica via LLM ───────────────────────
+    # Niente piu' keyword/embedding ne' fast-path/override basati sul confronto
+    # di stringhe. L'AgenticIntentClassifier (LLM, cache TTL 24h) e' l'UNICO
+    # interprete; su LLM down ritorna l'intent neutro `agentic_default` (che
+    # attiva il _LAZY_MINIMAL_TOOLKIT cosi' l'agente interpreta e agisce da se').
+    # I metadati complexity/agentic_score/is_ambiguous alimentano il gating del
+    # planner (route_after_router).
+    intent = "agentic_default"
+    intent_confidence = 0.5
     task_complexity: str | None = None
     agentic_score_val: float | None = None
     is_ambiguous_val: bool | None = None
-    if not is_conversational and _agentic_classifier is not None:
+    if _agentic_classifier is not None:
         try:
-            from .. import orchestrator_config
-            if orchestrator_config.adaptive_classifier_enabled():
-                ag = await _agentic_classifier.classify(str(text))
-                if ag is not None and not getattr(ag, "fallback_used", False):
-                    task_complexity = getattr(ag, "complexity", None)
-                    agentic_score_val = getattr(ag, "agentic_score", None)
-                    is_ambiguous_val = getattr(ag, "is_ambiguous", None)
-                    # L'intent LLM rimpiazza il keyword solo se valido.
-                    _ag_intent = getattr(ag, "intent", None)
-                    if _ag_intent:
-                        intent = _ag_intent
-                    _ag_conf = getattr(ag, "confidence", None)
-                    if _ag_conf is not None:
-                        intent_confidence = float(_ag_conf)
-                    logger.info(
-                        "router_node: adaptive classifier -> intent=%s complexity=%s "
-                        "agentic=%.2f ambiguous=%s",
-                        intent, task_complexity, agentic_score_val or 0.0, is_ambiguous_val,
-                    )
-        except Exception as _ag_exc:
-            logger.debug("router_node: adaptive classifier skip (%s)", _ag_exc)
+            ag = await _agentic_classifier.classify(str(text))
+            if ag is not None:
+                intent = getattr(ag, "intent", None) or "agentic_default"
+                _ag_conf = getattr(ag, "confidence", None)
+                if _ag_conf is not None:
+                    intent_confidence = float(_ag_conf)
+                task_complexity = getattr(ag, "complexity", None)
+                agentic_score_val = getattr(ag, "agentic_score", None)
+                is_ambiguous_val = getattr(ag, "is_ambiguous", None)
+                logger.info(
+                    "router_node: classifier LLM -> intent=%s conf=%.2f complexity=%s "
+                    "agentic=%.2f ambiguous=%s",
+                    intent, intent_confidence, task_complexity,
+                    agentic_score_val or 0.0, is_ambiguous_val,
+                )
+        except Exception as _ag_exc:  # noqa: BLE001
+            logger.warning(
+                "router_node: classifier LLM fallito (%s) -> agentic_default", _ag_exc
+            )
+            intent = "agentic_default"
+            intent_confidence = 0.5
+    else:
+        logger.warning(
+            "router_node: _agentic_classifier non configurato -> agentic_default"
+        )
 
     behavior_mode = state.get("behavior_mode", "bilanciata")
 
@@ -651,11 +590,9 @@ async def router_node(state: AgentState) -> dict[str, Any]:
         "doc_generate", "analyze", "fix", "refactor", "implement",
         "file_ops", "architecture", "system_admin",
     }
-    text_lower = str(text).lower()
-    is_complex = intent in COMPLEX_INTENTS or any(
-        kw in text_lower for kw in ("genera", "document", "analisi tecnica", "implementa")
-    )
-    if is_complex:
+    # Boost basato solo sull'intent semantico (niente piu' keyword sul testo).
+    # agentic_default (fallback LLM-down) e' agentico: merita il budget pieno.
+    if intent in COMPLEX_INTENTS or intent == "agentic_default":
         token_budget = max(token_budget, 4096)
 
     # ── Profile selection ────────────────────────────────────────────────

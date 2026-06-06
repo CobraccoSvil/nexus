@@ -70,82 +70,19 @@ impl Orchestrator {
     /// ambiguita'. Usata da `spawn_agent_run` per decidere se chiedere
     /// disambiguazione all'utente (best practice NLU).
     pub async fn classify_intent_full(&self, message: &str) -> ClassifiedIntent {
-        let (min_conf, timeout_s, det_high, det_min) =
-            match self.routing_thresholds.current_async().await {
-                Ok(t) => (
-                    t.llm_classifier_min_confidence,
-                    t.llm_classifier_timeout_seconds,
-                    t.intent_deterministic_high,
-                    t.intent_deterministic_min,
-                ),
-                Err(_) => (
-                    LLM_CLASSIFIER_MIN_CONFIDENCE_DEFAULT,
-                    5.0,
-                    INTENT_DETERMINISTIC_HIGH_DEFAULT,
-                    INTENT_DETERMINISTIC_MIN_DEFAULT,
-                ),
-            };
+        let (min_conf, timeout_s) = match self.routing_thresholds.current_async().await {
+            Ok(t) => (
+                t.llm_classifier_min_confidence,
+                t.llm_classifier_timeout_seconds,
+            ),
+            Err(_) => (LLM_CLASSIFIER_MIN_CONFIDENCE_DEFAULT, 5.0),
+        };
 
-        // Classificatore deterministico (keyword/pattern). Calcolato una volta
-        // e riusato sia come pre-check sia come fallback se l'LLM fallisce.
-        let deterministic = deterministic_intent_fallback(message);
-
-        // (a) PRE-CHECK: se il deterministico e' confidente >= soglia alta,
-        // saltiamo del tutto l'LLM. E' piu' veloce e, soprattutto, robusto:
-        // un task agentico evidente ("Crea l'applicazione descritta nel file")
-        // viene instradato al path agent anche se il classifier LLM e' down.
-        if let Some((det_intent, det_conf)) = deterministic {
-            if det_conf >= det_high {
-                tracing::info!(
-                    "classify_intent: deterministic match intent={} conf={:.2} (pre-check, LLM saltato)",
-                    det_intent, det_conf
-                );
-                return ClassifiedIntent {
-                    intent: det_intent,
-                    confidence: det_conf,
-                    candidates: vec![IntentCandidate {
-                        intent: det_intent.to_string(),
-                        confidence: det_conf,
-                    }],
-                    is_ambiguous: false,
-                    slots: crate::routing_slots::ActionSlots::default(),
-                };
-            }
-        }
-
-        // (b) Path normale: prova l'LLM. Se ritorna un risultato valido lo usa.
-        let llm_result =
-            classify_intent_async_full_with_threshold(message, min_conf, timeout_s).await;
-
-        // L'LLM e' considerato "non utile" quando ricade su `chat` con
-        // confidence sotto la soglia minima del deterministico: in quel caso
-        // un eventuale match deterministico (anche a confidence media) e' piu'
-        // affidabile per non perdere il path agent. Questo copre sia il caso
-        // di vero fallimento HTTP (gia' degradato a keyword internamente) sia
-        // il caso di LLM che risponde "chat" su un task chiaramente agentico.
-        let llm_degraded_to_chat = llm_result.intent == "chat";
-        if llm_degraded_to_chat {
-            if let Some((det_intent, det_conf)) = deterministic {
-                if det_intent != "chat" && det_conf >= det_min {
-                    tracing::warn!(
-                        "classify_intent: LLM ha prodotto chat (conf={:.2}), uso fallback deterministico intent={} conf={:.2}",
-                        llm_result.confidence, det_intent, det_conf
-                    );
-                    return ClassifiedIntent {
-                        intent: det_intent,
-                        confidence: det_conf,
-                        candidates: vec![IntentCandidate {
-                            intent: det_intent.to_string(),
-                            confidence: det_conf,
-                        }],
-                        is_ambiguous: false,
-                        slots: crate::routing_slots::ActionSlots::default(),
-                    };
-                }
-            }
-        }
-
-        llm_result
+        // Solo interpretazione semantica LLM: niente piu' pre-check ne' fallback
+        // keyword/deterministico. Quando l'LLM non e' disponibile, la funzione
+        // ritorna l'intent di sistema neutro `agentic_default`, che attiva lato
+        // agente il _LAZY_MINIMAL_TOOLKIT (l'LLM dell'agente interpreta da se').
+        classify_intent_async_full_with_threshold(message, min_conf, timeout_s).await
     }
 
     /// Routing slot-first (Livello 4 NLU): se il classifier ha estratto slot
@@ -335,10 +272,11 @@ impl Orchestrator {
                 .await;
         }
 
-        let risky = is_risky_task(message);
-        let effective_mode = if risky && configured_behavior_mode != "approfondita" {
-            "approfondita".to_string()
-        } else if configured_behavior_mode == "dinamico" {
+        // is_risky_task rimosso: il rischio non viene piu' dedotto via keyword.
+        // Il behavior_mode resta quello configurato (solo dinamico->bilanciata).
+        // La safety reale e' indipendente (study mode, isolamento progetto, tag
+        // <safety_progetto>) e resta intatta.
+        let effective_mode = if configured_behavior_mode == "dinamico" {
             "bilanciata".to_string()
         } else {
             configured_behavior_mode.clone()
@@ -357,8 +295,8 @@ impl Orchestrator {
         let has_model_override = model_override.filter(|v| !v.trim().is_empty()).is_some();
         let source: &'static str = if has_provider_override || has_model_override {
             "override"
-        } else if configured_behavior_mode == "dinamico" && !risky {
-            // In modalita' dinamica non rischiosa il catalogo prezzi e' autoritativo.
+        } else if configured_behavior_mode == "dinamico" {
+            // In modalita' dinamica il catalogo prezzi e' autoritativo.
             // Verifichiamo: se il modello scelto NON e' quello della matrix per
             // (intent, "bilanciata"), allora il catalogo lo ha sovrascritto.
             let (pref, thr) = self.routing_helpers_for(intent).await;
@@ -410,11 +348,10 @@ impl Orchestrator {
         };
 
         let rationale = format!(
-            "intent={} confidence={:.2} mode={}{} source={} → {}/{}{}{}",
+            "intent={} confidence={:.2} mode={} source={} → {}/{}{}{}",
             intent,
             confidence,
             effective_mode,
-            if risky { " [risky→approfondita]" } else { "" },
             source,
             provider,
             model,
@@ -453,7 +390,9 @@ impl Orchestrator {
             model,
             intent: intent.to_string(),
             mode: effective_mode,
-            risky,
+            // is_risky_task rimosso: il flag resta nello schema per compatibilita'
+            // ma non viene piu' valutato (nessuna interpretazione keyword).
+            risky: false,
             rationale,
             source: source.to_string(),
             configured_behavior_mode,
@@ -698,21 +637,15 @@ impl Orchestrator {
             .filter(|v| !v.trim().is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| routing.behavior_mode.clone());
-        // Task rischioso ha PRIORITA' assoluta: salta il ramo dinamico (catalogo
-        // prezzi sceglie modelli "light" per costo, ma per task distruttivi
-        // serve un modello capable). L'override mode -> approfondita applicato
-        // PRIMA del ramo dinamico forza la matrix statica.
-        let risky_pre = is_risky_task(message);
-        // Se behavior_mode == "dinamico" E il task NON e' rischioso, consulta il
-        // catalogo prezzi (come fa Orchestrator::run).
-        // Altrimenti usa la matrix statica route_model_with_mode.
+        // Se behavior_mode == "dinamico" consulta il catalogo prezzi (come fa
+        // Orchestrator::run). Altrimenti usa la matrix statica route_model_with_mode.
         // Estratte come String per uniformare i due rami (catalogo restituisce String,
         // matrix restituisce &'static str).
         // Caso speciale "dinamico": il catalogo prezzi è autoritativo.
         // Saltiamo candidates() e provider_models perché altrimenti riordinano sempre
         // sui provider configurati nell'admin (anthropic/openai prima) e applicano
         // il provider_model_<x> override → risultato: il dinamico non sceglie mai nulla.
-        if effective_behavior_mode == "dinamico" && !risky_pre {
+        if effective_behavior_mode == "dinamico" {
             // Risolvi tier/capability dalla cache intent_capability (mig 0110)
             // invece dal match Rust statico (rimosso). Se intent non mappato,
             // default light/chat (caso tipico di intent legacy non in seed).
@@ -758,20 +691,9 @@ impl Orchestrator {
             // Catalogo vuoto → cade nel ramo statico bilanciata sotto
         }
 
-        // Override "task rischioso": se il messaggio contiene verbi distruttivi
-        // (rm -rf, drop table, docker prune, force push, ecc.), promuoviamo
-        // automaticamente il behavior_mode a "approfondita". Motivazione:
-        // i modelli leggeri (mistral-small, gpt-4.1-nano) tendono a interpretare
-        // liberamente le richieste distruttive (es. "elimina file Docker" ->
-        // ricrea i file). Per task ad alto impatto serve un modello capable.
-        let effective_mode = if is_risky_task(message) && effective_behavior_mode != "approfondita"
-        {
-            tracing::info!(
-                "Agent routing: task rischioso rilevato (mode {} -> approfondita)",
-                effective_behavior_mode
-            );
-            "approfondita"
-        } else if effective_behavior_mode == "dinamico" {
+        // is_risky_task rimosso: niente piu' elevazione automatica a "approfondita"
+        // dedotta da verbi distruttivi via keyword. Resta solo dinamico->bilanciata.
+        let effective_mode = if effective_behavior_mode == "dinamico" {
             "bilanciata"
         } else {
             effective_behavior_mode.as_str()

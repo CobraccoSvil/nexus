@@ -427,6 +427,7 @@ CRITICAL:
 - "leggi file.py" → intent=code_read, action_verb=read.
 - "fai/crea/costruisci/realizza una app|applicazione|sistema|sito|servizio|piattaforma per X" → intent=architecture, action_verb=write, scope=system_wide, complexity=high. E' scaffolding completo (PRD + schema DB + backend + frontend + test). NON e' docs.
 - "scaffold/genera progetto" / "boilerplate" / "starter kit" → intent=architecture, scope=system_wide.
+- "imposta/configura/abilita un utente admin|il backend|un servizio|CORS|HTTPS", "setup X", "deploya/avvia X" → intent=system_admin, requires_tools=true. E' un task agentico multi-step, NON chat anche se la frase e' breve.
 
 Use confidence<0.7 honestly when ambiguous (downstream asks user). NEVER inflate.
 
@@ -455,11 +456,12 @@ class AgenticIntentClassifier:
     salta il lookup DB (utile per testing).
     """
 
-    def __init__(self, provider_registry, fallback_classifier=None,
+    def __init__(self, provider_registry,
                  provider: Optional[str] = None,
                  model: Optional[str] = None):
         self._providers = provider_registry
-        self._fallback = fallback_classifier  # SemanticRouter o None
+        # Nessun fallback keyword: quando l'LLM non risponde si usa l'intent
+        # di sistema neutro `agentic_default` (vedi _fallback_result).
         # Se passati esplicitamente, hanno precedenza assoluta (no DB lookup).
         # Altrimenti lazy-load dal DB al primo classify() / _ensure_config().
         self._explicit_provider = provider
@@ -655,39 +657,31 @@ class AgenticIntentClassifier:
         return extract_json_block(content)
 
     def _fallback_result(self, message: str, reason: str) -> AgenticIntent:
-        """Costruisce un risultato di fallback usando il classifier keyword (se
-        disponibile) e marcando `fallback_used=True`."""
-        intent = "chat"
-        confidence = 0.30
-        if self._fallback is not None:
-            try:
-                kw_result = self._fallback.classify_intent(message)
-                intent = str(kw_result.get("intent", "chat"))
-                confidence = float(kw_result.get("confidence", 0.30))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("classifier: fallback keyword failed: %s", exc)
-        # Heuristic minima per agentic_score: se intent != chat, alza un po'
-        agentic_score = 0.6 if intent != "chat" else 0.2
-        adjusted_conf = confidence * 0.5  # ridotta perche' fallback
-        # Fallback path: nessuna lista di candidati alternativi disponibile.
-        # is_ambiguous=True spinge il caller a chiedere disambiguazione,
-        # coerente con il fatto che la confidence ridotta indica incertezza.
-        # Soglia DB-driven (mig 0132) — _ensure_config() la popola su istanza.
-        min_conf = getattr(
-            self, "_ambiguity_min_confidence", DEFAULT_AMBIGUITY_MIN_CONFIDENCE
-        )
-        candidates = [IntentCandidate(intent=intent, confidence=adjusted_conf)]
+        """Risultato di fallback NEUTRO quando l'interpretazione semantica LLM
+        non e' disponibile (LLM down/timeout/JSON invalido/config DB assente).
+
+        Niente piu' classifier keyword: si ritorna l'intent di sistema
+        `agentic_default`, che attiva lato agente il _LAZY_MINIMAL_TOOLKIT
+        (nexus_mcp_tool_search/call + lettura). Cosi' e' l'LLM dell'agente a
+        interpretare il testo e agire, invece di dedurre l'intento da una lista
+        di parole. `message` non viene piu' ispezionato.
+        """
+        intent = "agentic_default"
+        confidence = 0.5
+        candidates = [IntentCandidate(intent=intent, confidence=confidence)]
         return AgenticIntent(
             intent=intent,
-            agentic_score=agentic_score,
-            requires_tools=intent != "chat",
+            agentic_score=0.6,
+            requires_tools=True,
             complexity="medium",
-            confidence=adjusted_conf,
+            confidence=confidence,
             model_used=f"fallback:{reason}",
             cached=False,
             fallback_used=True,
             candidates=candidates,
-            is_ambiguous=adjusted_conf < min_conf,
+            # Scelta di sistema deliberata, non una classificazione incerta:
+            # niente disambiguazione, l'agente procede col toolkit.
+            is_ambiguous=False,
         )
 
     async def classify(self, message: str) -> AgenticIntent:

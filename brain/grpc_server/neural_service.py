@@ -141,8 +141,14 @@ class NeuralCoreServicer(pb2_grpc.NeuralCoreServiceServicer):
         }))
 
     def ClassifyIntent(self, request, context):
-        result = router.classify_intent(request.message)
-        return pb2.JsonResponse(json=json.dumps(result))
+        # Interpretazione semantica via LLM (niente piu' keyword). Lazy import
+        # per evitare cicli; asyncio.run perche' il servicer gRPC e' sincrono.
+        import asyncio
+        from brain.grpc_server.runtime import agentic_classifier
+        result = asyncio.run(agentic_classifier.classify(request.message))
+        return pb2.JsonResponse(json=json.dumps(
+            {"intent": result.intent, "confidence": f"{result.confidence:.2f}"}
+        ))
 
     def RouteModel(self, request, context):
         decision = router.route_model(request.intent, token_budget=request.token_budget)

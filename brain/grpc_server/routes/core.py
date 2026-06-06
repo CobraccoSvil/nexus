@@ -75,8 +75,11 @@ def billing_cooldown() -> dict[str, dict[str, int]]:
 
 
 @router.post("/classify-intent")
-def classify_intent(body: IntentRequest) -> dict[str, str]:
-    return runtime.router.classify_intent(body.message)
+async def classify_intent(body: IntentRequest) -> dict[str, str]:
+    # Interpretazione semantica via LLM (niente piu' keyword). Manteniamo la
+    # forma di output {intent, confidence} per retrocompatibilita' dei client.
+    result = await runtime.agentic_classifier.classify(body.message)
+    return {"intent": result.intent, "confidence": f"{result.confidence:.2f}"}
 
 
 @router.post("/classify-intent-agentic")
@@ -91,7 +94,7 @@ async def classify_intent_agentic(body: AgenticIntentRequest) -> dict[str, objec
       - confidence: 0..1, fiducia LLM
       - model_used: modello che ha classificato
       - cached: true se il risultato viene dalla cache TTL 24h
-      - fallback_used: true se LLM fallito ed e' stato usato il classifier keyword
+      - fallback_used: true se LLM fallito ed e' stato usato l'intent neutro `agentic_default`
 
     Cache: in-memory TTL 24h, key=sha256(message[:1000]).
     """
@@ -106,10 +109,11 @@ async def classify_intent_agentic_stats() -> dict[str, object]:
 
 
 @router.post("/route-model")
-def route_model(body: IntentRequest) -> dict[str, str]:
-    intent = runtime.router.classify_intent(body.message)["intent"]
-    # Passa anche il message originale: abilita detection task rischiosi
-    # (override behavior_mode -> approfondita per verbi distruttivi).
+async def route_model(body: IntentRequest) -> dict[str, str]:
+    classification = await runtime.agentic_classifier.classify(body.message)
+    intent = classification.intent
+    # route_model e' un thin-client: passa il message al routing Rust, che
+    # decide provider/model (e ri-usa il classifier LLM via cache).
     decision = runtime.router.route_model(intent, token_budget=4096, message=body.message)
     return {
         "intent": intent,

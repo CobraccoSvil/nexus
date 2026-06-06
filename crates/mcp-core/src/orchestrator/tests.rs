@@ -3,222 +3,6 @@
 use super::*;
 
 #[test]
-fn test_is_risky_imperativo_e_infinito() {
-    // Bug reale visto in produzione: il prompt "Rimuovere le credenziali"
-    // (infinito) non era riconosciuto come rischioso perche' la keyword era
-    // "rimuovi " (imperativo). Le keyword sono ora prefissi laschi che
-    // matchano tutte le forme verbali.
-    assert!(is_risky_task("Rimuovere le credenziali in chiaro"));
-    assert!(is_risky_task("Rimuovi i file Docker"));
-    assert!(is_risky_task("Eliminare la cartella build"));
-    assert!(is_risky_task("Elimina i file Dockerfile"));
-    assert!(is_risky_task("Cancellare la configurazione obsoleta"));
-    assert!(is_risky_task("Lancia rm -rf node_modules"));
-    assert!(is_risky_task("DROP TABLE users"));
-    assert!(is_risky_task("git reset --hard HEAD~3"));
-    assert!(is_risky_task("docker prune -a"));
-}
-
-#[test]
-fn test_is_risky_negativi() {
-    assert!(!is_risky_task("ciao come stai"));
-    assert!(!is_risky_task("scrivi una funzione che somma due numeri"));
-    assert!(!is_risky_task("come si configura il backend?"));
-}
-
-#[test]
-fn test_is_agentic_request_positivi() {
-    // Caso paradigmatico del bug originale
-    assert!(is_agentic_request(
-        "imposta un utente admin per l'applicazione e dammi user e password"
-    ));
-    // Setup / configurazione
-    assert!(is_agentic_request(
-        "Configura il backend per usare PostgreSQL"
-    ));
-    assert!(is_agentic_request("Setup HTTPS sul dev server"));
-    assert!(is_agentic_request("Abilita CORS per /api/*"));
-    // Creazione
-    assert!(is_agentic_request("Crea un endpoint /healthz"));
-    assert!(is_agentic_request(
-        "Aggiungi una migrazione per la tabella users"
-    ));
-    // Deploy / esecuzione
-    assert!(is_agentic_request("Deploya il microservizio doc-service"));
-    assert!(is_agentic_request("Lancia i test di integrazione"));
-    assert!(is_agentic_request("Avvia il servizio backend"));
-    // Domande "come fare X"
-    assert!(is_agentic_request(
-        "Come faccio a creare un nuovo utente admin?"
-    ));
-}
-
-#[test]
-fn test_is_agentic_request_negativi() {
-    // Domande puramente informative non sono agentic
-    assert!(!is_agentic_request("Cos'e' un middleware in Express?"));
-    assert!(!is_agentic_request("Che cosa fa il pattern repository?"));
-    assert!(!is_agentic_request("Spiegami come funziona OAuth"));
-    // Saluti / chat casuale
-    assert!(!is_agentic_request("ciao come stai"));
-    assert!(!is_agentic_request("grazie del supporto"));
-}
-
-#[test]
-fn test_classify_intent_with_agentic_promotion() {
-    // Caso paradigmatico: prompt agentic breve viene promosso da chat a system_admin
-    let (intent, _) =
-        classify_intent_with_agentic_promotion("imposta un utente admin per l'applicazione");
-    assert_eq!(
-        intent, "system_admin",
-        "prompt agentic breve deve essere promosso a system_admin"
-    );
-
-    // Promozione anche per "configura"
-    let (intent, _) = classify_intent_with_agentic_promotion("Configura il backend");
-    assert_eq!(intent, "system_admin");
-
-    // Domanda informativa pura resta su chat
-    let (intent, _) = classify_intent_with_agentic_promotion("Cos'e' Docker?");
-    assert_eq!(intent, "chat");
-
-    // Intent gia' specifici NON vengono toccati dalla promozione
-    let (intent, _) = classify_intent_with_agentic_promotion("Elimina i file Dockerfile");
-    assert_eq!(intent, "file_ops", "intent specifico non viene riscritto");
-}
-
-// ─────────────────────────────────────────────────────────────────
-// Test promozione test → fix_complesso (test failure resolution)
-// ─────────────────────────────────────────────────────────────────
-
-#[test]
-fn test_is_test_failure_resolution_positivi() {
-    // Casi paradigmatici osservati in produzione (Redemptor / Playwright)
-    assert!(is_test_failure_resolution(
-        "esegui i test playwright e risolvi i fail"
-    ));
-    assert!(is_test_failure_resolution(
-        "lancia i test e correggi gli errori"
-    ));
-    assert!(is_test_failure_resolution(
-        "fai funzionare i test Playwright"
-    ));
-    assert!(is_test_failure_resolution("fix i test che falliscono"));
-    assert!(is_test_failure_resolution(
-        "Run Playwright tests and make them pass"
-    ));
-    assert!(is_test_failure_resolution(
-        "i test playwright stanno fallendo, ripara"
-    ));
-    assert!(is_test_failure_resolution("applica fix ai test pytest"));
-    assert!(is_test_failure_resolution(
-        "i test cargo non passano, risolvi"
-    ));
-    assert!(is_test_failure_resolution(
-        "verifica perche' i test failure"
-    ));
-    assert!(is_test_failure_resolution(
-        "playwright test failure: indaga e correggi"
-    ));
-}
-
-#[test]
-fn test_is_test_failure_resolution_negativi() {
-    // "scrivi un test" non e' una risoluzione di fallimento
-    assert!(!is_test_failure_resolution(
-        "scrivi un test unitario per la funzione X"
-    ));
-    // "esegui test" senza richiesta di fix non promuove
-    assert!(!is_test_failure_resolution("esegui i test playwright"));
-    // Senza menzione test
-    assert!(!is_test_failure_resolution(
-        "risolvi questo errore di compilazione"
-    ));
-    // Chat informativa
-    assert!(!is_test_failure_resolution("come si configura playwright?"));
-    // Verb correttivo senza test
-    assert!(!is_test_failure_resolution("fix questo bug nel server"));
-}
-
-#[test]
-fn test_promotion_test_a_fix_complesso() {
-    // Caso paradigmatico Redemptor: gpt-4.1-mini diagnosticava invece di
-    // applicare fix perche' intent=test mappava a modelli light.
-    let (intent, _) = classify_intent_with_agentic_promotion(
-        "Esegui i test Playwright e risolvi i fallimenti rilevati",
-    );
-    assert_eq!(
-        intent, "fix_complesso",
-        "test + verbo correttivo deve essere promosso a fix_complesso"
-    );
-
-    let (intent, _) = classify_intent_with_agentic_promotion("fai funzionare i test Playwright");
-    assert_eq!(intent, "fix_complesso");
-
-    // Negativo: solo "scrivi test" resta test (no failure resolution)
-    let (intent, _) =
-        classify_intent_with_agentic_promotion("scrivi i test unitari per il modulo auth");
-    // Nota: classify_intent_local potrebbe ritornare un altro intent qui;
-    // l'importante e' che NON sia fix_complesso senza failure resolution.
-    assert_ne!(
-        intent, "fix_complesso",
-        "creazione test senza failure resolution non deve essere promossa"
-    );
-}
-
-#[test]
-fn test_classify_intent_local_file_ops() {
-    // Verifiche dei nuovi intent introdotti
-    let (intent, _) =
-        classify_intent_local("Per favore elimina i file Dockerfile rimasti nel progetto");
-    assert_eq!(intent, "file_ops");
-}
-
-#[test]
-fn test_classify_intent_local_system_admin() {
-    let (intent, _) = classify_intent_local("Esegui docker compose down per fermare i container");
-    assert_eq!(intent, "system_admin");
-}
-
-#[test]
-fn test_classify_intent_local_debug_via_stack_trace() {
-    let msg = "Got NullReferenceException with stack trace at line 42 in ProcessRequest, can you fixare il bug?";
-    let (intent, _) = classify_intent_local(msg);
-    assert_eq!(intent, "debug");
-}
-
-#[test]
-fn test_classify_intent_local_migra_dotnet_va_a_refactor() {
-    // Bug residuo del refactor 0101: "migra il backend .NET 9 da SQL Server a PostgreSQL"
-    // veniva classificato come "chat" e routato a mistral-small (inadatto per code migration).
-    // Con i prefissi laschi "migra "/"migrare " in refactor, ora va correttamente in refactor.
-    let (intent, _) = classify_intent_local("Migra il backend .NET 9 da SQL Server a PostgreSQL");
-    assert_eq!(intent, "refactor");
-}
-
-#[test]
-fn test_classify_intent_local_converti_typescript_va_a_refactor() {
-    let (intent, _) = classify_intent_local("Converti questi file da JavaScript a TypeScript");
-    assert_eq!(intent, "refactor");
-}
-
-#[test]
-fn test_classify_intent_local_sostituisci_libreria_va_a_refactor() {
-    let (intent, _) =
-        classify_intent_local("Sostituisci la libreria axios con fetch nativa in tutti i moduli");
-    assert_eq!(intent, "refactor");
-}
-
-#[test]
-fn test_classify_intent_local_piano_migrazione_va_a_architecture() {
-    // Distinzione: PLANNING di migrazione (no codice) → architecture
-    let (intent, _) = classify_intent_local(
-        "Definisci un piano di migrazione del database da MySQL a PostgreSQL",
-    );
-    assert_eq!(intent, "architecture");
-}
-
-#[test]
 fn test_route_model_with_mode_file_ops_approfondita() {
     // Test usa la fallback safe matrix (anthropic claude-sonnet per tutti gli intent rischiosi)
     let m = crate::routing_matrix::RoutingMatrix::fallback_safe();
@@ -343,58 +127,6 @@ fn classified(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Test: deterministic_intent_fallback (classificatore robusto)
-// ─────────────────────────────────────────────────────────────────
-
-#[test]
-fn deterministic_fallback_task_agentico_creazione_app() {
-    // Caso reale dell'incidente: questo messaggio NON deve degradare a
-    // chat. Deve ritornare un intent agentico ad alta confidenza cosi'
-    // il pre-check salta l'LLM e il path agent parte anche se l'LLM e' down.
-    let (intent, conf) = deterministic_intent_fallback(
-        "Crea l'applicazione completa descritta nel file allegato. Implementala e avviala.",
-    )
-    .expect("atteso match agentico");
-    assert_ne!(intent, "chat");
-    assert_eq!(intent, "system_admin");
-    assert!(conf >= 0.85, "confidence attesa alta, got {conf}");
-}
-
-#[test]
-fn deterministic_fallback_chat_pura_e_none() {
-    // Conversazione pura: nessun verbo+contesto software -> None,
-    // lascia decidere all'LLM o al default chat.
-    assert!(deterministic_intent_fallback("ciao come stai").is_none());
-    assert!(deterministic_intent_fallback("grazie mille, ottimo lavoro").is_none());
-}
-
-#[test]
-fn deterministic_fallback_lettura_codice() {
-    // "leggi src/app.js" -> intent di lettura/analisi (debug), non chat.
-    let (intent, conf) = deterministic_intent_fallback("leggi src/app.js e dimmi cosa fa")
-        .expect("atteso match lettura");
-    assert_eq!(intent, "debug");
-    assert!(
-        conf > 0.0 && conf < 0.85,
-        "confidence media attesa, got {conf}"
-    );
-}
-
-#[test]
-fn deterministic_fallback_docs() {
-    let (intent, _) = deterministic_intent_fallback("scrivi readme per questo progetto")
-        .expect("atteso match docs");
-    assert_eq!(intent, "docs");
-}
-
-#[test]
-fn deterministic_fallback_richiesta_informativa_non_agentica() {
-    // "cos'e' un endpoint?" contiene "endpoint" ma e' una domanda
-    // informativa: non deve essere classificata come agentica.
-    assert!(deterministic_intent_fallback("cos'e' un endpoint REST?").is_none());
-}
-
 #[test]
 fn classified_intent_struct_e_costruibile_e_serializzabile() {
     // Smoke test: la struct ClassifiedIntent e i suoi campi sono pubblici
@@ -404,6 +136,17 @@ fn classified_intent_struct_e_costruibile_e_serializzabile() {
     assert_eq!(c.candidates.len(), 2);
     assert_eq!(c.candidates[0].intent, "debug");
     assert!(!c.is_ambiguous);
+}
+
+#[test]
+fn intent_str_to_static_mappa_code_read_e_agentic_default() {
+    // Regressione: prima `code_read` non era mappato -> un code_read dall'LLM
+    // cadeva nel fallback. E il fallback neutro `agentic_default` deve essere
+    // riconosciuto. Un intent sconosciuto resta None.
+    assert_eq!(intent_str_to_static("code_read"), Some("code_read"));
+    assert_eq!(intent_str_to_static("agentic_default"), Some("agentic_default"));
+    assert_eq!(intent_str_to_static("chat"), Some("chat"));
+    assert_eq!(intent_str_to_static("intent_inventato_xyz"), None);
 }
 
 #[test]

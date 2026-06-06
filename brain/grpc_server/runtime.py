@@ -329,15 +329,17 @@ builtin cd -- "$NEXUS_TERMINAL_CWD"
     return guarded, rc_path
 
 
-# --- Shared services (embedding-aware router) ---
+# --- Shared services ---
 embeddings = EmbeddingService()
-router = SemanticRouter(embedding_service=embeddings)
+# SemanticRouter ora e' solo un thin-client verso il routing Rust (route_model).
+# La classificazione dell'intent NON e' piu' keyword/embedding-based.
+router = SemanticRouter()
 providers = ProviderRegistry()
-# LLM-based agentic intent classifier (Fase 2). Usa gemini-flash con cache TTL 24h.
-# Fallback al classifier keyword (`router`) in caso di timeout/JSON malformato.
+# Classificatore intent: SOLO interpretazione semantica via LLM (gemini-flash,
+# cache TTL 24h). Niente fallback keyword: su LLM down/timeout ritorna l'intent
+# di sistema neutro `agentic_default` che attiva il _LAZY_MINIMAL_TOOLKIT.
 agentic_classifier = AgenticIntentClassifier(
     provider_registry=providers,
-    fallback_classifier=router,
 )
 
 # --- Grafo LangGraph (inizializzazione lazy al primo uso) ---

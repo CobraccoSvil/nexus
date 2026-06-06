@@ -428,6 +428,11 @@ pub(crate) fn intent_key_for(
         // risponde in astratto. Niente soglia token: la lettura non scala con
         // l'output ma col numero di tool call (gestite dall'iter budget).
         "code_read" => "code_read",
+        // agentic_default: fallback neutro quando il classifier LLM non risponde.
+        // Intent_key dedicato (mig 0336) con modelli tool-robust, cosi' l'agente
+        // parte col _LAZY_MINIMAL_TOOLKIT e interpreta da se' invece di finire su
+        // un modello "lite" conversazionale.
+        "agentic_default" => "agentic_default",
         _ => {
             if estimated_tokens <= token_thresholds.chat_breve {
                 "chat_breve"
@@ -994,6 +999,15 @@ mod intent_key_tests {
         assert_eq!(intent_key_for("code_read", 50, &t), "code_read");
         // Anche con budget ampio resta code_read (niente soglia token).
         assert_eq!(intent_key_for("code_read", 100_000, &t), "code_read");
+    }
+
+    #[test]
+    fn agentic_default_ha_intent_key_dedicato_non_chat() {
+        // mig 0336: il fallback neutro `agentic_default` (LLM down) deve avere
+        // un intent_key dedicato -> modelli tool-robust, non chat_* lite.
+        let t = thresholds();
+        assert_eq!(intent_key_for("agentic_default", 50, &t), "agentic_default");
+        assert_eq!(intent_key_for("agentic_default", 100_000, &t), "agentic_default");
     }
 
     #[test]

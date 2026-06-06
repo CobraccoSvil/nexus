@@ -1,5 +1,7 @@
-//! Classificazione intent: keyword matching locale, promozione
-//! agentica, fallback deterministico e classificazione LLM async.
+//! Classificazione intent: SOLO interpretazione semantica via classifier LLM
+//! (endpoint brain `/classify-intent-agentic`). Niente piu' keyword matching /
+//! promozione / fallback deterministico: quando l'LLM non risponde si usa
+//! l'intent di sistema neutro `agentic_default`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,673 +25,13 @@ use crate::{
 
 use super::*;
 
-/// Classifica l'intent dal testo del messaggio tramite keyword matching.
-/// Rispecchia esattamente la logica Python in brain/router/service.py.
-pub(crate) fn classify_intent_local(message: &str) -> (&'static str, f32) {
-    let lower = message.to_lowercase();
-
-    // ── Intent "debug" prioritario ────────────────────────────────────────
-    // Riconosce pattern di stack trace o richieste agentiche multi-step su errori
-    // reali (.NET / Java / Python / Rust / Node). Questo intent va a tier "heavy"
-    // perché richiede sequence di tool call (read_file → str_replace → restart),
-    // che modelli "code-light" come codestral non sanno orchestrare.
-    let stack_trace_signals = [
-        "\n   at ",
-        "\n    at ",
-        "traceback (most recent call last)",
-        ".exception",
-        ".error:",
-        "stack trace",
-        "stacktrace",
-        "panicked at",
-        "fatal:",
-        "rejectedexecutionexception",
-    ];
-    let agentic_signals = [
-        "analizza la gerarchia",
-        "causa radice",
-        "root cause",
-        "stack trace",
-        "tool call",
-        "fixare",
-        "esegui restart",
-        "leggi il file",
-        "appsettings",
-        "log degli ultimi",
-    ];
-    let stack_hits: usize = stack_trace_signals
-        .iter()
-        .filter(|s| lower.contains(*s))
-        .count();
-    let agent_hits: usize = agentic_signals
-        .iter()
-        .filter(|s| lower.contains(*s))
-        .count();
-    // Se trovo sia un segno di stack trace sia un segno di richiesta agentica,
-    // o se trovo molti segni di stack trace (≥2), instrado verso "debug".
-    if stack_hits >= 2 || (stack_hits >= 1 && agent_hits >= 1) || agent_hits >= 2 {
-        let confidence = (0.85 + (stack_hits + agent_hits) as f32 * 0.02).min(0.97);
-        return ("debug", confidence);
-    }
-
-    // Order matters: file_ops e system_admin valutati PRIMA di fix/refactor
-    // perche' "elimina i file Dockerfile" matcha sia "elimina" sia "file" sia
-    // "Dockerfile" e finirebbe in fix; ma e' un task di file management,
-    // non di bug fixing. Stesso ragionamento per system_admin (docker,
-    // systemctl, container) che richiede modelli con tool use solido.
-    let rules: &[(&str, &[&str])] = &[
-        (
-            "file_ops",
-            &[
-                "elimina file",
-                "rimuovi file",
-                "cancella file",
-                "remove file",
-                "delete file",
-                "elimina i file",
-                "remove the file",
-                "elimina la cartella",
-                "rimuovi la cartella",
-                "delete folder",
-                "elimina dockerfile",
-                "rimuovi dockerfile",
-                "elimina docker-compose",
-                "rimuovi docker-compose",
-                "elimina configurazione docker",
-                "remove docker configuration",
-                "elimina file di configurazione",
-                "rimuovi file di configurazione",
-                "ripulisci la directory",
-                "cleanup directory",
-            ],
-        ),
-        (
-            "system_admin",
-            &[
-                "docker stop",
-                "docker rm",
-                "docker prune",
-                "system prune",
-                "ferma il container",
-                "stop container",
-                "kill container",
-                "elimina container",
-                "remove container",
-                "delete container",
-                "ferma il servizio",
-                "stop service",
-                "systemctl stop",
-                "systemctl restart",
-                "restart service",
-                "compose down",
-                "compose up",
-                "docker compose",
-                "elimina docker",
-                "rimuovi docker locale",
-                "elimina docker locale",
-                // Anche i pattern dell'analyzer: "rimuovere il container",
-                // "container ridondante", ecc.
-                "rimuovere il container",
-                "rimuovere container",
-                "container ridondante",
-                "container superfluo",
-            ],
-        ),
-        (
-            "fix",
-            &[
-                "/fix", "bug", "error", "crash", "broken", "debug", "issue", "patch", "errore",
-                "correggi", "risolvi", "problema",
-            ],
-        ),
-        // Refactor include task di migrazione codice (es. "migra il backend da SQL Server a PostgreSQL",
-        // "converti TypeScript a JavaScript", "sostituisci EFCore con Npgsql"). Senza questi prefissi
-        // laschi, "migra .NET 9 ..." finiva nel default "chat" → mistral-small inadatto.
-        // I prefissi (no parola intera) catturano forme verbali italiane multiple:
-        // "migra/migrare/migrate", "porta/portare", "converti/convertire", "trasforma/trasformare",
-        // "sposta/spostare", "sostituisci/sostituire", "rimpiazza/rimpiazzare".
-        (
-            "refactor",
-            &[
-                "/refactor",
-                "refactor",
-                "clean",
-                "simplify",
-                "extract",
-                "improve",
-                "migliora",
-                "pulisci",
-                "semplifica",
-                "ristruttura",
-                "migra ",
-                "migrare ",
-                "porta da ",
-                "porta a ",
-                "portare da ",
-                "converti ",
-                "convertire ",
-                "trasform",
-                "sposta da ",
-                "spostare da ",
-                "sostituisci ",
-                "sostituire ",
-                "rimpiazza ",
-                "rimpiazzare ",
-                "migrate from",
-                "migrate to",
-                "convert to",
-                "rename ",
-            ],
-        ),
-        (
-            "test",
-            &[
-                "/test",
-                "test",
-                "coverage",
-                "assert",
-                "spec",
-                "unit test",
-                "integration test",
-            ],
-        ),
-        (
-            "docs",
-            &[
-                "/docs",
-                "document",
-                "readme",
-                "jsdoc",
-                "comment",
-                "explain",
-                "documenta",
-                "commenta",
-                "spiega",
-            ],
-        ),
-        // Architecture e' per task di PLANNING (piano di migrazione, design system) senza
-        // toccare ancora codice. I verbi imperativi di migrazione codice vanno a "refactor".
-        (
-            "architecture",
-            &[
-                "/arch",
-                "architecture",
-                "design",
-                "system",
-                "plan",
-                "architettura",
-                "progetta",
-                "piano di migrazione",
-                "migration plan",
-                "strategia di migrazione",
-                "migration strategy",
-            ],
-        ),
-    ];
-
-    for (intent, keywords) in rules {
-        let matches: u32 = keywords.iter().filter(|kw| lower.contains(*kw)).count() as u32;
-        if matches >= 1 {
-            let confidence = (0.75 + matches as f32 * 0.05).min(0.95);
-            return (intent, confidence);
-        }
-    }
-
-    ("chat", 0.82)
-}
-
-/// Detecta se il messaggio contiene keyword distruttivi (rm -rf, drop table,
-/// docker prune, force push). In tal caso il routing promuove il
-/// behavior_mode a "approfondita" cosi' viene scelto un modello capable
-/// (Claude Sonnet/Opus, GPT-4.1) invece dei modelli "lite" che tendono
-/// a interpretare liberamente le richieste distruttive.
-///
-/// Le keyword sono **prefissi/sottostringhe** intenzionalmente lasche:
-/// `"elimin"` matcha "elimina/eliminare/elimini/eliminate", `"rimuov"`
-/// matcha "rimuovi/rimuovere/rimuove/rimosso", ecc. Cosi' evitiamo bug
-/// di mancato match dovuti a forme verbali diverse (e.g. infinito vs
-/// imperativo) — la trade-off di qualche falso positivo e' accettabile
-/// (al peggio scegliamo un modello piu' capace di quanto serva).
-pub(crate) fn is_risky_task(message: &str) -> bool {
-    let lc = message.to_lowercase();
-    const RISKY: &[&str] = &[
-        // Filesystem distruttive
-        "rm -rf",
-        " rm ",
-        "rmdir",
-        "unlink",
-        // Verbi distruttivi (prefissi: matchano forme infinitive/imperative/coniugate)
-        "elimin",
-        "rimuov",
-        "cancell",
-        "delete",
-        "remove",
-        // Docker / container
-        "docker prune",
-        "system prune",
-        "docker rm ",
-        "docker rmi",
-        "compose down",
-        "ferma il container",
-        "stop container",
-        // Database
-        "drop table",
-        "drop database",
-        "drop schema",
-        "truncate",
-        // Git distruttive
-        "git reset --hard",
-        "force push",
-        "--force",
-        "git clean",
-        // Sistema
-        "shutdown",
-        "reboot",
-        "systemctl stop",
-        "systemctl disable",
-        "kill -9",
-        "pkill",
-    ];
-    RISKY.iter().any(|kw| lc.contains(*kw))
-}
-
-/// Detecta se il messaggio descrive un **task agentico multi-step** che
-/// richiede esplorazione codebase, lettura file, modifica config, esecuzione
-/// comandi — anche quando il fraseggio breve farebbe pensare a una semplice
-/// chat (`intent=chat`). Esempi:
-///   - "imposta un utente admin per l'applicazione"
-///   - "configura il backend"
-///   - "crea un endpoint per /healthz"
-///   - "abilita HTTPS sul dev server"
-///   - "deploya il microservizio doc-service"
-///
-/// Senza questo detector tali richieste con `intent=chat` cadrebbero su
-/// modelli leggeri (gemini-flash, gpt-4.1-nano, mistral-small) inadeguati
-/// per orchestrare tool call. Il chiamante riclassifica l'intent a
-/// `system_admin` (già mappato a modelli capable in `nexus_routing_matrix`).
-///
-/// Le keyword sono **prefissi laschi** che matchano forme verbali multiple
-/// (imposta/imposti/impostare/impostazione, ecc.) — falsi positivi sono
-/// accettabili (al peggio scegliamo un modello più capace di quanto serva).
-/// `is_risky_task` ha priorità: i verbi distruttivi vanno comunque a
-/// `approfondita`, non riclassificati a `system_admin`.
-pub(crate) fn is_agentic_request(message: &str) -> bool {
-    let lc = message.to_lowercase();
-    const AGENTIC_VERBS: &[&str] = &[
-        // Setup / configurazione
-        "imposta",
-        "impost",
-        "configur",
-        "setup",
-        "set up",
-        "set-up",
-        "abilit",
-        "disabilit",
-        "enable",
-        "disable",
-        // Creazione / modifica
-        "crea ",
-        "create ",
-        "creare ",
-        "aggiung",
-        "add ",
-        "cambi",
-        "modific",
-        "aggiorn",
-        "update ",
-        "modify ",
-        // Deploy / esecuzione
-        "deploy",
-        "lancia ",
-        "launch",
-        "avvia",
-        "start service",
-        "installa",
-        "install ",
-        // Investigazione + azione
-        "trova ",
-        "find ",
-        "individua",
-        "identifica",
-        "verifica ",
-        "verify ",
-        "controlla ",
-        // Implementazione / integrazione
-        "implementa",
-        "integra",
-        "integrate ",
-        "implement",
-        // Riparazione (oltre fix che è già intent dedicato)
-        "ripar",
-        "ripara",
-        // Domande "come/dove" + azione (heuristic for "how to do X")
-        "come faccio a",
-        "come si imposta",
-        "come configurare",
-        "how do i ",
-        "how to set",
-    ];
-    // Matching: almeno una keyword + il messaggio non è puramente informativo.
-    // Heuristic per escludere domande puramente "cos'e'": se inizia con
-    // "cos'e'", "che cosa", "what is", il task è informativo, non agentico.
-    let purely_informational = lc.starts_with("cos'e")
-        || lc.starts_with("cosa e")
-        || lc.starts_with("che cosa")
-        || lc.starts_with("what is")
-        || lc.starts_with("spiegami");
-    if purely_informational {
-        return false;
-    }
-    AGENTIC_VERBS.iter().any(|kw| lc.contains(*kw))
-}
-
-/// Detecta se il messaggio descrive **risoluzione di test falliti** (non
-/// semplice creazione/esecuzione di test): "esegui i test e risolvi i fail",
-/// "lancia Playwright e correggi gli errori", "fai funzionare i test che
-/// falliscono", ecc.
-///
-/// Senza questo detector tali richieste con `intent=test` cadrebbero sulla
-/// routing matrix `test|bilanciata` che usa modelli LEGGERI (deepseek-chat,
-/// gpt-4.1-mini) — questi non sono in grado di orchestrare multi-file edit,
-/// debug AuthJS, refactor config. Il chiamante riclassifica l'intent a
-/// `fix_complesso` (mappato a claude-haiku/claude-sonnet/mistral-large in
-/// `nexus_routing_matrix`).
-///
-/// Le keyword sono **prefissi laschi** che matchano forme verbali multiple:
-/// (risolv/risolvere/risolto, fix/fixa/fixato, correg/correggere/corretto).
-/// Falsi positivi accettabili (al peggio modello piu' capace di quanto serva).
-pub(crate) fn is_test_failure_resolution(message: &str) -> bool {
-    let lc = message.to_lowercase();
-    // Deve menzionare i test E richiedere un'azione correttiva
-    let mentions_tests = [
-        "test",
-        "playwright",
-        "vitest",
-        "jest",
-        "pytest",
-        "cargo test",
-    ]
-    .iter()
-    .any(|kw| lc.contains(*kw));
-    if !mentions_tests {
-        return false;
-    }
-    // Verbi/pattern correttivi (prefissi che coprono coniugazioni it/en).
-    // Sono inclusi anche pattern di fallimento osservati in produzione
-    // (problemi di catch playwright_test): "falliti", "fallit*", "fix m"
-    // ("fix M44" è un format ricorrente nei prompt di Nexus M-tickets).
-    const CORRECTIVE_VERBS: &[&str] = &[
-        "risolv",
-        "fix",
-        "correg",
-        "ripar",
-        "ripara",
-        "fai funzionare",
-        "fai passare",
-        "make pass",
-        "make work",
-        "fai partire e",
-        "esegui e",
-        "lancia e",
-        "applica fix",
-        "applica patch",
-        "applica corre",
-        "make them pass",
-        "pass all tests",
-        "tutti i test passino",
-        "fai in modo che",
-        "fai sì che",
-        "fa sì che",
-        "non funziona",
-        "non funzionano",
-        "non passano",
-        "stanno fallendo",
-        "are failing",
-        "is failing",
-        "failing",
-        "failure",
-        "failures",
-        "failed",
-        // Italiano: fallit* matcha fallito/falliti/fallita/fallite
-        "fallit",
-        "falliscono",
-        "fallimento",
-        "fallimenti",
-        // Format M-ticket Nexus: "Fix M44: ..." viene generato per ogni problema
-        "fix m",
-        "errore — problema",
-        // Errori da error-fix workflow
-        "errore rilevato",
-        "severita: error",
-        "severità: error",
-    ];
-    CORRECTIVE_VERBS.iter().any(|kw| lc.contains(*kw))
-}
-
-/// Variante di `classify_intent_local` che applica la promozione agentic:
-/// se l'intent classificato e' `chat` ma `is_agentic_request` rileva una
-/// richiesta multi-step (es. "imposta un utente admin"), riclassifica come
-/// `system_admin` per dirottare a modelli capable in routing matrix.
-///
-/// Inoltre: se l'intent e' `test` ma `is_test_failure_resolution` rileva
-/// una richiesta di risoluzione fail, riclassifica come `fix_complesso`
-/// per evitare il routing a modelli leggeri (gpt-4.1-mini).
-///
-/// Usata come **fallback** quando il classifier LLM non e' disponibile.
-/// Path async preferito: `classify_intent_async`.
-pub(crate) fn classify_intent_with_agentic_promotion(message: &str) -> (&'static str, f32) {
-    let (intent, confidence) = classify_intent_local(message);
-    if intent == "chat" && is_agentic_request(message) {
-        // Confidence ridotta perche' e' una promozione euristica, non una
-        // classificazione diretta.
-        return ("system_admin", 0.70);
-    }
-    // Promozione → fix_complesso quando il messaggio chiede di RISOLVERE
-    // fail di test (es. "esegui i test e correggi gli errori"). Senza
-    // questa promozione il task finisce su modelli light incapaci di
-    // orchestrare multi-file edit + debug.
-    // Sia `intent="test"` (creazione test interpretata male) sia
-    // `intent="fix"` (intent generico senza tier) vengono promossi:
-    // `fix_complesso` mappa esplicitamente a modelli capable in DB.
-    if (intent == "test" || intent == "fix") && is_test_failure_resolution(message) {
-        return ("fix_complesso", 0.70);
-    }
-    (intent, confidence)
-}
-
-/// Classificatore DETERMINISTICO di fallback (keyword/pattern based, IT+EN).
-///
-/// Esiste per rendere la classificazione intent **indipendente da un LLM che
-/// puo' fallire** (overload, quota, timeout). Viene usato in due punti di
-/// `classify_intent_full`:
-///   (a) come **pre-check** prima di chiamare l'LLM: se un pattern agentico ad
-///       altissima confidenza matcha, si salta del tutto la chiamata HTTP
-///       (piu' veloce e robusto);
-///   (b) come **fallback** quando l'LLM fallisce: invece di degradare a
-///       `chat` (che NON attiva il path agent + tool), si usa il risultato
-///       deterministico se disponibile.
-///
-/// Ritorna `Some((intent_static, confidence))` con un intent **ammesso dalla
-/// routing matrix** (vedi `intent_str_to_static` + le promozioni
-/// `system_admin` / `fix_complesso`). Ritorna `None` quando nessun pattern
-/// matcha, lasciando decidere all'LLM o al default `chat`.
-///
-/// I pattern sono prefissi/sottostringhe lasche per coprire le forme verbali
-/// italiane (crea/creare/crei, implementa/implementare, ecc.) e gli
-/// equivalenti inglesi. Falsi positivi sono accettabili: al peggio si attiva
-/// il path agent quando non strettamente necessario, che e' molto meno grave
-/// del falso negativo opposto (task agentico trattato come chat).
-pub(crate) fn deterministic_intent_fallback(message: &str) -> Option<(&'static str, f32)> {
-    let lc = message.to_lowercase();
-    if lc.trim().is_empty() {
-        return None;
-    }
-
-    // Escludi le richieste puramente informative ("cos'e'", "che cosa", ...):
-    // non sono task agentici anche se contengono verbi che altrimenti
-    // matcherebbero. Coerente con `is_agentic_request`.
-    let purely_informational = lc.starts_with("cos'e")
-        || lc.starts_with("cosa e")
-        || lc.starts_with("che cosa")
-        || lc.starts_with("what is")
-        || lc.starts_with("spiegami");
-
-    // ── 0. Pattern DOCS: valutati PRIMA dell'agentico generico perche'
-    // "scrivi readme per il progetto" matcherebbe altrimenti il blocco
-    // agentico (verbo "scrivi" + contesto "progetto"). DOCS e' piu' specifico.
-    const DOCS_PATTERNS: &[&str] = &[
-        "documenta",
-        "genera doc",
-        "genera la doc",
-        "genera documentazione",
-        "crea documentazione",
-        "crea la documentazione",
-        "scrivi readme",
-        "scrivi il readme",
-        "genera readme",
-        "write docs",
-        "generate docs",
-        "write readme",
-    ];
-    if DOCS_PATTERNS.iter().any(|p| lc.contains(*p)) {
-        return Some(("docs", 0.70));
-    }
-
-    // ── 1. Pattern AGENTICI forti: creazione/modifica codice e infra. ──────
-    // Verbi imperativi/infinitivi di azione su artefatti software. Match ad
-    // ALTA confidenza (0.85): attiva il path agent (intent != "chat").
-    // L'intent scelto e' `system_admin`, gia' mappato a modelli capable con
-    // tool use solido in `nexus_routing_matrix` (stesso target della
-    // promozione agentic esistente).
-    const AGENTIC_VERBS: &[&str] = &[
-        "crea ",
-        "creare",
-        "crei ",
-        "implementa",
-        "implementare",
-        "sviluppa",
-        "sviluppare",
-        "costruisci",
-        "costruire",
-        "genera ",
-        "generare",
-        "scrivi ",
-        "scrivere",
-        "aggiung",
-        "add ",
-        "modific",
-        "modify ",
-        "corregg",
-        "fixa",
-        "fix ",
-        "refactor",
-        "installa",
-        "install ",
-        "configur",
-        "avvia",
-        "esegui ",
-        "lancia ",
-        "build",
-        "deploy",
-        "scaffold",
-    ];
-    // Contesto che qualifica il verbo come task software (evita falsi positivi
-    // tipo "crea un account sul sito X" che non e' un task di codice).
-    const SOFTWARE_CONTEXT: &[&str] = &[
-        "app",
-        "applicazione",
-        "progetto",
-        "project",
-        "file",
-        "funzione",
-        "function",
-        "componente",
-        "component",
-        "servizio",
-        "service",
-        "endpoint",
-        "server",
-        "api",
-        "script",
-        "test",
-        "codice",
-        "code",
-        "feature",
-        "modulo",
-        "module",
-        "classe",
-        "class",
-        "container",
-        "docker",
-        "database",
-        "schema",
-        "migrazione",
-        "migration",
-        "pagina",
-        "page",
-        "form",
-        "route",
-    ];
-    if !purely_informational {
-        let has_verb = AGENTIC_VERBS.iter().any(|v| lc.contains(*v));
-        let has_ctx = SOFTWARE_CONTEXT.iter().any(|c| lc.contains(*c));
-        if has_verb && has_ctx {
-            return Some(("system_admin", 0.85));
-        }
-    }
-
-    // ── 2. Pattern di LETTURA / ANALISI: confidence media. ─────────────────
-    // Richieste di ispezione del codice/stato che attivano comunque tool di
-    // lettura (intent != "chat"). Mappa a `debug` (intent ammesso con tool
-    // use) — non esiste `code_read`/`analyze` nella matrix: `debug` e'
-    // l'intent piu' vicino che instrada a modelli capaci di leggere file.
-    const READ_VERBS: &[&str] = &[
-        "leggi ",
-        "mostra",
-        "analizza",
-        "analizzare",
-        "cosa fa",
-        "che cosa fa",
-        "quanti ",
-        "quante ",
-        "elenca",
-        "lista ",
-        "trova ",
-        "cerca ",
-        "individua",
-        "ispeziona",
-        "esamina",
-    ];
-    const READ_CONTEXT: &[&str] = &[
-        "file",
-        "src/",
-        "codice",
-        "code",
-        "funzione",
-        "function",
-        "classe",
-        "class",
-        "modulo",
-        "module",
-        "errore",
-        "error",
-        "log",
-        "endpoint",
-        "test",
-        "progetto",
-        "repository",
-        "repo",
-    ];
-    if !purely_informational {
-        let has_read_verb = READ_VERBS.iter().any(|v| lc.contains(*v));
-        let has_read_ctx = READ_CONTEXT.iter().any(|c| lc.contains(*c));
-        if has_read_verb && has_read_ctx {
-            return Some(("debug", 0.65));
-        }
-    }
-
-    None
-}
+// Le funzioni di interpretazione keyword-based dell'intent sono state RIMOSSE
+// (classify_intent_local, is_risky_task, is_agentic_request,
+// is_test_failure_resolution, classify_intent_with_agentic_promotion,
+// deterministic_intent_fallback): l'interpretazione del testo e' ora SOLO
+// semantica (classifier LLM). Quando l'LLM non risponde si usa l'intent
+// neutro `agentic_default` (vedi classify_intent_async_with_threshold), che
+// attiva lato agente il _LAZY_MINIMAL_TOOLKIT.
 
 /// Risultato del classifier LLM (Fase 2). Specchia il JSON dell'endpoint
 /// `POST /classify-intent-agentic` esposto da `brain/grpc_server/main.py`.
@@ -752,17 +94,6 @@ pub struct ClassifiedIntent {
 /// caricato in `RoutingThresholds`. Questa costante e' usata solo dal path che
 /// non passa per `Orchestrator` (es. test isolati).
 pub(crate) const LLM_CLASSIFIER_MIN_CONFIDENCE_DEFAULT: f32 = 0.60;
-
-/// Soglia (default) sopra la quale il classificatore deterministico keyword
-/// viene usato come pre-check saltando l'LLM. Override DB:
-/// `settings.routing.intent_deterministic_high`. Usata solo quando la cache
-/// `RoutingThresholds` non e' disponibile.
-pub(crate) const INTENT_DETERMINISTIC_HIGH_DEFAULT: f32 = 0.85;
-
-/// Soglia (default) minima sotto la quale il deterministico NON viene usato
-/// nemmeno come fallback quando l'LLM ricade su `chat`. Override DB:
-/// `settings.routing.intent_deterministic_min`.
-pub(crate) const INTENT_DETERMINISTIC_MIN_DEFAULT: f32 = 0.60;
 
 // ── Telemetria routing (mig 0112) ───────────────────────────────────────────
 
@@ -854,6 +185,11 @@ pub(crate) fn intent_str_to_static(intent: &str) -> Option<&'static str> {
         "architecture" => Some("architecture"),
         "file_ops" => Some("file_ops"),
         "system_admin" => Some("system_admin"),
+        "code_read" => Some("code_read"),
+        // Intent di sistema: non emesso dal classifier LLM, ma assegnato come
+        // fallback neutro quando l'LLM non risponde (vedi classify_intent_async_*).
+        // Mappato qui per coerenza se mai dovesse transitare per questa funzione.
+        "agentic_default" => Some("agentic_default"),
         _ => None,
     }
 }
@@ -889,8 +225,14 @@ pub(crate) async fn classify_intent_async_with_threshold(
         Err(_) => LLM_CLASSIFIER_ENABLED.load(Ordering::Relaxed),
     };
 
+    // Niente interpretazione keyword: se non otteniamo una classificazione
+    // semantica dall'LLM, ritorniamo l'intent di sistema neutro `agentic_default`.
+    // Attiva lato agente il _LAZY_MINIMAL_TOOLKIT (discovery + lettura) + modelli
+    // tool-robust, cosi' e' l'LLM dell'agente a interpretare e agire da se'.
+    const NEUTRAL: (&str, f32) = ("agentic_default", 0.5);
+
     if !llm_enabled || message.trim().is_empty() {
-        return classify_intent_with_agentic_promotion(message);
+        return NEUTRAL;
     }
 
     let brain_url =
@@ -905,48 +247,48 @@ pub(crate) async fn classify_intent_async_with_threshold(
     let timeout_dur = std::time::Duration::from_millis((timeout_seconds * 1000.0) as u64);
     let http = match reqwest::Client::builder().timeout(timeout_dur).build() {
         Ok(c) => c,
-        Err(_) => return classify_intent_with_agentic_promotion(message),
+        Err(_) => return NEUTRAL,
     };
 
     let body = serde_json::json!({ "message": message });
     let resp = match http.post(&url).json(&body).send().await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
-            tracing::debug!("classifier LLM: HTTP {} — fallback keyword", r.status());
-            return classify_intent_with_agentic_promotion(message);
+            tracing::debug!("classifier LLM: HTTP {} — fallback agentic_default", r.status());
+            return NEUTRAL;
         }
         Err(e) => {
-            tracing::debug!("classifier LLM: rete fallita ({e}) — fallback keyword");
-            return classify_intent_with_agentic_promotion(message);
+            tracing::debug!("classifier LLM: rete fallita ({e}) — fallback agentic_default");
+            return NEUTRAL;
         }
     };
 
     let parsed: AgenticIntentResponse = match resp.json().await {
         Ok(p) => p,
         Err(e) => {
-            tracing::debug!("classifier LLM: JSON malformato ({e}) — fallback keyword");
-            return classify_intent_with_agentic_promotion(message);
+            tracing::debug!("classifier LLM: JSON malformato ({e}) — fallback agentic_default");
+            return NEUTRAL;
         }
     };
 
     if parsed.fallback_used || parsed.confidence < min_confidence {
         tracing::debug!(
-            "classifier LLM: scarso (fallback={}, conf={}, threshold={}) — uso keyword",
+            "classifier LLM: scarso (fallback={}, conf={}, threshold={}) — agentic_default",
             parsed.fallback_used,
             parsed.confidence,
             min_confidence
         );
-        return classify_intent_with_agentic_promotion(message);
+        return NEUTRAL;
     }
 
     let intent_static = match intent_str_to_static(&parsed.intent) {
         Some(s) => s,
         None => {
             tracing::warn!(
-                "classifier LLM: intent sconosciuto '{}' — fallback",
+                "classifier LLM: intent sconosciuto '{}' — agentic_default",
                 parsed.intent
             );
-            return classify_intent_with_agentic_promotion(message);
+            return NEUTRAL;
         }
     };
 
@@ -957,25 +299,6 @@ pub(crate) async fn classify_intent_async_with_threshold(
         parsed.confidence,
         parsed.cached
     );
-
-    // Up-tier extra basato su agentic_score: se il messaggio e' classificato
-    // come "chat" ma l'agentic_score e' alto (>0.7), promuoviamo a system_admin.
-    if intent_static == "chat" && parsed.agentic_score > 0.70 && parsed.requires_tools {
-        return ("system_admin", parsed.confidence);
-    }
-
-    // Promozione → fix_complesso quando il messaggio chiede di risolvere
-    // fail di test. La routing matrix `test|*` ha modelli light
-    // (deepseek-chat, gpt-4.1-mini) inadeguati per orchestrare multi-file
-    // edit + debug. `fix_complesso` mappa a modelli capable.
-    // Sia `test` sia `fix` vengono promossi (entrambi sono target sub-tier).
-    if (intent_static == "test" || intent_static == "fix") && is_test_failure_resolution(message) {
-        tracing::info!(
-            "intent: promozione {} → fix_complesso (test failure resolution detected)",
-            intent_static
-        );
-        return ("fix_complesso", parsed.confidence);
-    }
 
     (intent_static, parsed.confidence)
 }
@@ -1001,28 +324,25 @@ pub(crate) async fn classify_intent_async_full_with_threshold(
         Err(_) => LLM_CLASSIFIER_ENABLED.load(Ordering::Relaxed),
     };
 
-    // Helper: wrap di un (intent, confidence) keyword-based in ClassifiedIntent.
-    // Il path keyword non ha candidati alternativi: ne sintetizziamo uno solo.
-    // is_ambiguous = (confidence < min_confidence) — best effort: il classifier
-    // keyword non ha visione semantica del task, quindi sotto soglia trattiamo
-    // la decisione come incerta e l'agente chiedera' chiarimenti.
-    let keyword_to_full = |intent: &'static str, conf: f32| -> ClassifiedIntent {
+    // Helper: ClassifiedIntent "secco" per l'intent di sistema neutro
+    // `agentic_default` (un solo candidato, niente ambiguita'). Usato quando NON
+    // otteniamo una classificazione semantica dall'LLM (down/timeout/JSON/brain
+    // in fallback). L'agente parte col _LAZY_MINIMAL_TOOLKIT e interpreta da se'.
+    let neutral_full = || -> ClassifiedIntent {
         ClassifiedIntent {
-            intent,
-            confidence: conf,
+            intent: "agentic_default",
+            confidence: 0.5,
             candidates: vec![IntentCandidate {
-                intent: intent.to_string(),
-                confidence: conf,
+                intent: "agentic_default".to_string(),
+                confidence: 0.5,
             }],
-            is_ambiguous: conf < min_confidence,
-            // Keyword classifier: nessuno slot semantico estraibile.
+            is_ambiguous: false,
             slots: crate::routing_slots::ActionSlots::default(),
         }
     };
 
     if !llm_enabled || message.trim().is_empty() {
-        let (i, c) = classify_intent_with_agentic_promotion(message);
-        return keyword_to_full(i, c);
+        return neutral_full();
     }
 
     let brain_url =
@@ -1035,79 +355,57 @@ pub(crate) async fn classify_intent_async_full_with_threshold(
     let timeout_dur = std::time::Duration::from_millis((timeout_seconds * 1000.0) as u64);
     let http = match reqwest::Client::builder().timeout(timeout_dur).build() {
         Ok(c) => c,
-        Err(_) => {
-            let (i, c) = classify_intent_with_agentic_promotion(message);
-            return keyword_to_full(i, c);
-        }
+        Err(_) => return neutral_full(),
     };
 
     let body = serde_json::json!({ "message": message });
     let resp = match http.post(&url).json(&body).send().await {
         Ok(r) if r.status().is_success() => r,
-        _ => {
-            let (i, c) = classify_intent_with_agentic_promotion(message);
-            return keyword_to_full(i, c);
-        }
+        _ => return neutral_full(),
     };
 
     let parsed: AgenticIntentResponse = match resp.json().await {
         Ok(p) => p,
-        Err(_) => {
-            let (i, c) = classify_intent_with_agentic_promotion(message);
-            return keyword_to_full(i, c);
-        }
+        Err(_) => return neutral_full(),
     };
 
-    if parsed.fallback_used || parsed.confidence < min_confidence {
-        let (i, c) = classify_intent_with_agentic_promotion(message);
-        // Conserviamo i candidati LLM se disponibili (utili per audit anche
-        // quando il top intent non passa la soglia di confidence).
+    // Il brain stesso non e' riuscito a classificare con l'LLM: niente keyword,
+    // si va sul neutro di sistema.
+    if parsed.fallback_used {
+        return neutral_full();
+    }
+
+    let intent_static = match intent_str_to_static(&parsed.intent) {
+        Some(s) => s,
+        None => return neutral_full(),
+    };
+
+    // Confidence sotto soglia: l'LLM HA interpretato ma e' incerto. Conserviamo
+    // intent + candidati e segnaliamo is_ambiguous=true cosi' l'agente chiede
+    // disambiguazione (ADR ambiguity), invece di degradare a keyword.
+    if parsed.confidence < min_confidence {
         let candidates = if parsed.candidates.is_empty() {
             vec![IntentCandidate {
-                intent: i.to_string(),
-                confidence: c,
+                intent: intent_static.to_string(),
+                confidence: parsed.confidence,
             }]
         } else {
             parsed.candidates
         };
         return ClassifiedIntent {
-            intent: i,
-            confidence: c,
+            intent: intent_static,
+            confidence: parsed.confidence,
             candidates,
-            is_ambiguous: parsed.is_ambiguous || c < min_confidence,
-            // Anche sotto-soglia conserviamo gli slot per audit/UI: il
-            // routing classico ha priorita' ma il debug rimane visibile.
+            is_ambiguous: true,
             slots: parsed.slots,
         };
     }
 
-    let intent_static = match intent_str_to_static(&parsed.intent) {
-        Some(s) => s,
-        None => {
-            let (i, c) = classify_intent_with_agentic_promotion(message);
-            return keyword_to_full(i, c);
-        }
-    };
-
-    // Promozioni euristiche (chat→system_admin, test/fix→fix_complesso).
-    // Una volta promosso, il flag is_ambiguous viene RESETTATO perche' la
-    // promozione e' deterministica (regola hardcoded, non probabilistica).
-    let (final_intent, ambiguous) =
-        if intent_static == "chat" && parsed.agentic_score > 0.70 && parsed.requires_tools {
-            ("system_admin", false)
-        } else if (intent_static == "test" || intent_static == "fix")
-            && is_test_failure_resolution(message)
-        {
-            ("fix_complesso", false)
-        } else {
-            (intent_static, parsed.is_ambiguous)
-        };
-
     ClassifiedIntent {
-        intent: final_intent,
+        intent: intent_static,
         confidence: parsed.confidence,
         candidates: parsed.candidates,
-        is_ambiguous: ambiguous,
+        is_ambiguous: parsed.is_ambiguous,
         slots: parsed.slots,
     }
 }

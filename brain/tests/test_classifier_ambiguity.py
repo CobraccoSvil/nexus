@@ -338,3 +338,16 @@ def test_agentic_intent_to_dict_include_candidates_e_is_ambiguous() -> None:
     assert isinstance(d["candidates"], list)
     assert d["candidates"][0]["intent"] == "debug"
     assert d["candidates"][0]["confidence"] == 0.85
+
+
+def test_fallback_result_ritorna_agentic_default() -> None:
+    """Su LLM down/timeout/JSON invalido NON si usa piu' il classifier keyword:
+    il fallback e' l'intent di sistema neutro `agentic_default`, agentico
+    (requires_tools=True) e non ambiguo (scelta deliberata, non incertezza)."""
+    clf = AgenticIntentClassifier(provider_registry=None)
+    res = clf._fallback_result("qualsiasi messaggio", "llm_down")
+    assert res.intent == "agentic_default"
+    assert res.fallback_used is True
+    assert res.requires_tools is True
+    assert res.is_ambiguous is False
+    assert res.candidates and res.candidates[0].intent == "agentic_default"

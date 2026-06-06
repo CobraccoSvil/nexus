@@ -11,71 +11,12 @@ Mock puri: nessuna connessione DB o provider LLM reale.
 """
 import unittest
 
-from brain.agents.nodes import (
-    _EXPLORATION_ONLY_TOOLS,
-    _detect_scaffolding_intent,
-)
+from brain.agents.nodes import _EXPLORATION_ONLY_TOOLS
 
-
-class TestDetectScaffoldingIntent(unittest.TestCase):
-    """FIX 1(b): _detect_scaffolding_intent su casi positivi e negativi."""
-
-    def test_positivi(self):
-        casi = [
-            "crea un'applicazione per prenotazioni",
-            "Crea l'app descritta nel file allegato",
-            "fai una app per autonoleggio",
-            "implementa il sistema gestionale",
-            "Crea l'applicazione descritta nel file allegato",
-            "costruisci un sistema gestionale per la palestra",
-            "sviluppa un sito web vetrina",
-            "realizza una piattaforma di booking",
-            "genera un progetto fullstack",
-            "scaffold a fullstack application",
-            "build a web app for restaurants",
-            "create an application for invoicing",
-            "develop a booking system",
-            "crea un e-commerce",
-            "crea una dashboard di monitoraggio",
-            # apostrofo tipografico
-            "crea un’applicazione mobile",
-        ]
-        for testo in casi:
-            with self.subTest(testo=testo):
-                self.assertTrue(
-                    _detect_scaffolding_intent(testo),
-                    f"atteso True per: {testo!r}",
-                )
-
-    def test_negativi(self):
-        casi = [
-            "leggi il file main.py",
-            "ciao",
-            "elenca i file",
-            "quante righe ha il file",
-            "mostrami il contenuto del file di configurazione",
-            "",
-            "   ",
-            # verbo di creazione senza oggetto applicativo
-            "crea una colonna nella tabella utenti",
-            # oggetto applicativo senza verbo di creazione
-            "apri l'applicazione e mostrami il log",
-        ]
-        for testo in casi:
-            with self.subTest(testo=testo):
-                self.assertFalse(
-                    _detect_scaffolding_intent(testo),
-                    f"atteso False per: {testo!r}",
-                )
-
-    def test_file_non_declassa(self):
-        # La presenza di "nel file allegato" NON deve impedire il match:
-        # vince il verbo di creazione.
-        self.assertTrue(
-            _detect_scaffolding_intent(
-                "Crea l'applicazione descritta nel file allegato"
-            )
-        )
+# NOTA: i test su _detect_scaffolding_intent sono stati RIMOSSI insieme alla
+# funzione. Lo scaffolding ("crea un'app per X" -> architecture) e' ora
+# interpretato semanticamente dal classifier LLM (prompt in
+# brain/router/agentic_classifier.py), non piu' da regex su verbi+oggetti.
 
 
 class TestExplorationToolSet(unittest.TestCase):

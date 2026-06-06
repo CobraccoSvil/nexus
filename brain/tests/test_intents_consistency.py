@@ -22,26 +22,12 @@ def test_agentic_classifier_riusa_il_punto_unico():
     assert ac.ALLOWED_COMPLEXITY is ALLOWED_COMPLEXITY
 
 
-def test_intent_exemplars_chiavi_documentate():
-    """Le chiavi degli exemplars hanno scopo diverso (training set degli
-    embedding), ma quando entrambe le liste cambiano va aggiornata anche questa
-    documentazione: e' il modo in cui la regola L si autodifende dal drift.
+def test_agentic_default_e_intent_di_sistema():
+    # L'intent neutro di fallback (LLM down) deve essere ammesso, cosi' il
+    # classifier/routing non lo scarta come sconosciuto.
+    assert "agentic_default" in ALLOWED_INTENTS
 
-    Drift noto e accettato al momento del consolidamento:
-      - 'database_schema_change' compare negli exemplars ma non in
-        ALLOWED_INTENTS (intent non ancora promosso al classifier agentico);
-      - 'debug' compare in ALLOWED_INTENTS ma non negli exemplars (cade su
-        'fix' nel router semantico, intenzionale).
-    """
-    from brain.router.service import _INTENT_EXEMPLARS
 
-    diff_solo_exemplars = set(_INTENT_EXEMPLARS) - set(ALLOWED_INTENTS)
-    diff_solo_allowed = set(ALLOWED_INTENTS) - set(_INTENT_EXEMPLARS)
-    assert diff_solo_exemplars == {"database_schema_change"}, (
-        f"Drift exemplars vs allowed cambiato: {diff_solo_exemplars}. "
-        "Aggiornare ALLOWED_INTENTS in intents.py o questo test."
-    )
-    assert diff_solo_allowed == {"debug"}, (
-        f"Drift allowed vs exemplars cambiato: {diff_solo_allowed}. "
-        "Aggiornare _INTENT_EXEMPLARS in service.py o questo test."
-    )
+# NOTA: il vecchio test su _INTENT_EXEMPLARS e' stato RIMOSSO con il classifier
+# keyword/embedding. La fonte di verita' degli intent e' ora ALLOWED_INTENTS +
+# la routing matrix DB (nexus_routing_matrix); l'interpretazione e' solo LLM.

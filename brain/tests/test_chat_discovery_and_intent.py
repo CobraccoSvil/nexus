@@ -1,24 +1,18 @@
-"""Regressione: domande sul progetto devono ispezionare i file reali, non
-ricevere risposte generiche su progetti ipotetici.
+"""Regressione: per gli intent conversazionali NON si azzerano del tutto i tool.
 
-Copre due fix collegati (audit chat progetto Marco, 06/06/2026):
+`filter_chat_discovery_tools` mantiene i meta-tool di gestione/discovery Nexus
+(nexus_mcp_tool_search/call + lettura), cosi' il modello puo' scoprire e usare
+gli strumenti di lettura se la domanda riguarda il progetto, restando rapido
+sullo small-talk. Restano esclusi i tool con side-effect.
 
-A) `filter_chat_discovery_tools` — per gli intent conversazionali NON si azzerano
-   piu' del tutto i tool: restano i meta-tool di gestione/discovery Nexus, cosi'
-   il modello puo' scoprire e usare gli strumenti di lettura se la domanda
-   riguarda il progetto. Restano esclusi i tool con side-effect.
-
-B) `_classify_by_keywords` — le domande conoscitive sull'esistenza/scopo di
-   entita' del progetto vanno su `code_read`; le osservazioni di malfunzionamento
-   su `fix`. Prima cadevano sul default `chat` -> modello lite senza contesto.
+NOTA: la parte sulla classificazione keyword (_classify_by_keywords) e' stata
+RIMOSSA: l'interpretazione dell'intent e' ora solo semantica (classifier LLM),
+quindi non e' piu' testabile con asserzioni deterministiche su stringhe.
 """
 from __future__ import annotations
 
 from brain.agents.nodes import _CHAT_DISCOVERY_KEEP, filter_chat_discovery_tools
-from brain.router.service import SemanticRouter
 
-
-# ── A) toolkit chat: meta-tool mantenuti, side-effect esclusi ────────────────
 
 def test_chat_mantiene_meta_tool_non_azzera() -> None:
     tools = [
@@ -55,44 +49,3 @@ def test_chat_discovery_keep_e_solo_read_e_meta() -> None:
     assert "write_file" not in _CHAT_DISCOVERY_KEEP
     assert "run_command" not in _CHAT_DISCOVERY_KEEP
     assert "nexus_mcp_tool_search" in _CHAT_DISCOVERY_KEEP
-
-
-# ── B) classificazione domande/osservazioni sul progetto ─────────────────────
-
-def test_domanda_due_index_html_e_code_read() -> None:
-    # Caso reale: senza accento su "perche", come digitato dall'utente.
-    r = SemanticRouter()
-    out = r._classify_by_keywords("perche ci sono due file index.html?")
-    assert out["intent"] == "code_read", out
-
-
-def test_form_mal_disposte_e_fix() -> None:
-    r = SemanticRouter()
-    out = r._classify_by_keywords(
-        "le form del sito sono mal disposte, i campi sono piccoli"
-    )
-    assert out["intent"] == "fix", out
-
-
-def test_menu_non_funziona_e_fix() -> None:
-    r = SemanticRouter()
-    out = r._classify_by_keywords(
-        "il menu della home non funziona, i link sono sbagliati"
-    )
-    assert out["intent"] == "fix", out
-
-
-def test_smalltalk_resta_chat() -> None:
-    # Lo small-talk vero non deve essere promosso a intent operativo.
-    r = SemanticRouter()
-    out = r._classify_by_keywords("ciao, come stai oggi?")
-    assert out["intent"] == "chat", out
-
-
-def test_regressione_casi_esistenti_intatti() -> None:
-    # I casi gia' coperti da altri test non devono cambiare classificazione.
-    r = SemanticRouter()
-    assert r._classify_by_keywords("cancella il file variables.txt")["intent"] == "file_ops"
-    assert r._classify_by_keywords("quante variabili ci sono")["intent"] == "code_read"
-    assert r._classify_by_keywords("genera l'analisi tecnica")["intent"] == "docs"
-    assert r._classify_by_keywords("Esegui docker compose down per fermare i container")["intent"] == "system_admin"

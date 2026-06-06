@@ -218,6 +218,10 @@ _INTENT_TOOL_SUBSET: dict[str, list[str]] = {
     "file_ops": _LAZY_MINIMAL_TOOLKIT,
     "scaffold_app": _LAZY_MINIMAL_TOOLKIT,
     "architecture": _LAZY_MINIMAL_TOOLKIT,
+    # agentic_default: fallback neutro quando il classifier LLM non e'
+    # disponibile. Diamo il lazy toolkit (discovery + lettura) cosi' l'agente
+    # interpreta da se' e scopre i tool necessari, invece di limitarlo a priori.
+    "agentic_default": _LAZY_MINIMAL_TOOLKIT,
     # Doc generation: SOLO nexus_doc_generate (single shot).
     # NON includere write_file/edit_file: bypassano il catalogo DB nexus_docs.
     # NON includere read_file/list_files: il backend handle_doc_generate

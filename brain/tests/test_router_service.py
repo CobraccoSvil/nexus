@@ -22,18 +22,6 @@ from unittest.mock import patch
 from brain.router.service import RoutingDecision, SemanticRouter
 
 
-def test_classify_file_ops_via_keywords() -> None:
-    router = SemanticRouter()
-    out = router._classify_by_keywords("Per favore elimina i file Dockerfile rimasti nel progetto")
-    assert out["intent"] == "file_ops", out
-
-
-def test_classify_system_admin_via_keywords() -> None:
-    router = SemanticRouter()
-    out = router._classify_by_keywords("Esegui docker compose down per fermare i container")
-    assert out["intent"] == "system_admin", out
-
-
 def test_route_model_delegates_to_rust_endpoint() -> None:
     """Verifica che route_model chiami il thin client e ritorni la decisione Rust."""
     router = SemanticRouter()
