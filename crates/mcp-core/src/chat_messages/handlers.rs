@@ -733,38 +733,15 @@ pub async fn send_chat_message(
     let (assistant_message, orchestrator) = match run_turn_result {
         Ok(result) => result,
         Err(error) => {
-            let fallback_metadata = json!({
-                "provider": "none",
-                "model": "none",
-                "intent": "chat",
-                "runId": "",
-                "error": error.1["error"].as_str().unwrap_or("generation_error"),
-                "promptTokens": 0,
-                "completionTokens": 0,
-                "totalTokens": 0,
-                "totalCost": 0.0,
-                "currency": "EUR",
-                "automationMode": automation_mode.as_str(),
-            });
-            let assistant_id = insert_message(
-                &state.db,
+            let assistant = fallback_assistant_after_run_turn_error(
+                &state,
                 context.session_id,
                 context.project_id,
-                "assistant",
-                &format!(
-                    "Operazione non completata: {}",
-                    humanize_ai_error(
-                        error.1["error"]
-                            .as_str()
-                            .unwrap_or("Richiesta non completata")
-                    )
-                ),
-                fallback_metadata,
-                Some(user_message_id),
+                user_message_id,
+                &automation_mode,
+                &error,
             )
             .await?;
-            let row = load_message_by_id(&state.db, assistant_id).await?;
-            let assistant = to_message_view(&row)?;
             return Ok(Json(json!({
                 "sessionId": context.session_id.to_string(),
                 "userMessage": user_message,
@@ -1097,7 +1074,7 @@ pub async fn resend_chat_message(
     }
 
     // Fallback: orchestrator singolo turno (Study mode o progetto non trovato)
-    let (assistant_message, orchestrator) = run_turn(
+    let run_turn_result = run_turn(
         &state,
         user_id,
         session_id,
@@ -1109,10 +1086,35 @@ pub async fn resend_chat_message(
         None,
         provider_override,
         model_override,
-        automation_mode,
+        automation_mode.clone(),
         attachments,
     )
-    .await?;
+    .await;
+
+    // Stessa gestione di send_chat_message (regola L): se la cascata provider e'
+    // esaurita run_turn fallisce; invece di propagare l'errore grezzo (che lato
+    // chat diventava 500 / socket hang up sul resend) ritorniamo un messaggio
+    // assistant gestito con HTTP 200.
+    let (assistant_message, orchestrator) = match run_turn_result {
+        Ok(result) => result,
+        Err(error) => {
+            let assistant = fallback_assistant_after_run_turn_error(
+                &state,
+                session_id,
+                project_id,
+                resent_user_message_id,
+                &automation_mode,
+                &error,
+            )
+            .await?;
+            update_user_active_project(&state, user_id, project_id).await;
+            return Ok(Json(json!({
+                "sessionId": session_id.to_string(),
+                "userMessage": resent_user_message,
+                "assistantMessage": assistant,
+            })));
+        }
+    };
 
     update_user_active_project(&state, user_id, project_id).await;
 
@@ -1127,6 +1129,51 @@ pub async fn resend_chat_message(
         }
     })))
 }
+/// Punto unico (regola L) per la risposta di fallback quando `run_turn` fallisce
+/// (es. cascata provider esaurita: tutti in cooldown/billing KO). Invece di
+/// propagare l'errore grezzo con `?` — che lato frontend si manifesta come
+/// 500 / "socket hang up" — inserisce un messaggio assistant "Operazione non
+/// completata: ..." e ne ritorna la view serializzata. Usato sia da
+/// `send_chat_message` sia da `resend_chat_message`, che prima divergevano: il
+/// primo gestiva l'errore, il secondo lo lasciava propagare (bug del 500 chat).
+async fn fallback_assistant_after_run_turn_error(
+    state: &AppState,
+    session_id: Uuid,
+    project_id: Uuid,
+    user_message_id: Uuid,
+    automation_mode: &AutomationMode,
+    error: &(StatusCode, Json<Value>),
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    let err_text = error.1["error"].as_str().unwrap_or("generation_error");
+    let fallback_metadata = json!({
+        "provider": "none",
+        "model": "none",
+        "intent": "chat",
+        "runId": "",
+        "error": err_text,
+        "promptTokens": 0,
+        "completionTokens": 0,
+        "totalTokens": 0,
+        "totalCost": 0.0,
+        "currency": "EUR",
+        "automationMode": automation_mode.as_str(),
+    });
+    let assistant_id = insert_message(
+        &state.db,
+        session_id,
+        project_id,
+        "assistant",
+        &format!("Operazione non completata: {}", humanize_ai_error(err_text)),
+        fallback_metadata,
+        Some(user_message_id),
+    )
+    .await?;
+    let row = load_message_by_id(&state.db, assistant_id).await?;
+    let assistant = to_message_view(&row)?;
+    serde_json::to_value(assistant)
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 pub async fn delete_chat_message(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
