@@ -93,9 +93,13 @@ export function Composer({
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      // Non inviare se il componente è in stato di caricamento (es. precheck in corso)
-      // per evitare race condition con chiamate multiple al server
-      if (!isLoading) {
+      // Invia con Enter. Durante un AGENT RUN (isAgentRunning) consentiamo
+      // comunque l'invio: send() accoda il messaggio nella coda e lo processera'
+      // a fine run (senza questo, durante un run il bottone e' "Stop" e Enter era
+      // bloccato da isLoading -> impossibile accodare). Blocchiamo solo quando
+      // isLoading senza run attivo (es. precheck/POST in volo) per evitare il
+      // doppio invio al server.
+      if (!isLoading || isAgentRunning) {
         onSubmit(e as unknown as FormEvent);
       }
     }
