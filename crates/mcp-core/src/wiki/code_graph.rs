@@ -135,7 +135,7 @@ fn extract_imports(file_path: &str, content: &str) -> Vec<String> {
 /// Garantisce l'esistenza di un wiki_doc placeholder (scope=project, kind='code')
 /// per il file specificato. Idempotente via UNIQUE su (scope, project_id, slug).
 /// Ritorna l'id del doc esistente o appena creato.
-async fn ensure_code_doc(
+pub(crate) async fn ensure_code_doc(
     db: &PgPool,
     project_id: Uuid,
     relative_path: &str,
@@ -194,15 +194,23 @@ pub async fn persist_code_graph_for_file(
     relative_path: &str,
     content: &str,
 ) -> usize {
-    if detect_lang(relative_path).is_none() {
+    // Punto unico (regola L): la presenza di un file nella knowledge base come
+    // wiki_doc kind='code' segue CODE_EXTENSIONS — lo stesso filtro usato dal RAG
+    // (`projects::CODE_EXTENSIONS`) — NON il sottoinsieme `detect_lang`. Cosi' i
+    // file HTML/markup e quelli senza import compaiono comunque come scheda nella
+    // KB, non solo i linguaggi per cui esiste un parser di import.
+    let ext = relative_path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !crate::projects::CODE_EXTENSIONS.contains(&ext.as_str()) {
         return 0;
     }
 
-    let specifiers = extract_imports(relative_path, content);
-    if specifiers.is_empty() {
-        return 0;
-    }
-
+    // Garantisce SEMPRE il doc placeholder per il file indicizzato. L'enricher
+    // (mig 0331) lo trasforma poi in scheda descrittiva via LLM. L'assenza di
+    // import non nasconde piu' il file dalla knowledge base.
     let subj_doc_id = match ensure_code_doc(db, project_id, relative_path).await {
         Ok(id) => id,
         Err(e) => {
@@ -215,6 +223,14 @@ pub async fn persist_code_graph_for_file(
             return 0;
         }
     };
+
+    // Triple `imports`: solo per i linguaggi con parser. `extract_imports` usa
+    // `detect_lang` internamente e ritorna vuoto per HTML/markup; il doc esiste
+    // comunque gia'.
+    let specifiers = extract_imports(relative_path, content);
+    if specifiers.is_empty() {
+        return 0;
+    }
 
     // Strategia idempotente: cancella le triple `imports` precedenti generate
     // da static_analysis per questo soggetto, poi reinserisce il set corrente.

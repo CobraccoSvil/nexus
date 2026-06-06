@@ -549,6 +549,19 @@ pub async fn index_project_code_files(state: &AppState, project_id: Uuid, root: 
             }
         }
 
+        // Garantisce la scheda KB (wiki_doc kind='code') + le triple del
+        // code-graph per ogni file indicizzato anche nell'indicizzazione INIZIALE,
+        // non solo nei reindex successivi. Best-effort, idempotente (ON CONFLICT):
+        // senza questo i file (specie HTML/JS) comparivano nella KB solo dopo una
+        // modifica che innescava reindex_single_file. Punto unico in code_graph.
+        let _ = crate::wiki::code_graph::persist_code_graph_for_file(
+            &state.db,
+            project_id,
+            &relative_path,
+            &content,
+        )
+        .await;
+
         files_processed += 1;
     }
 
