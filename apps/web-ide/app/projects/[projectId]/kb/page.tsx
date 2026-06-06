@@ -9,6 +9,7 @@ import { useParams, useSearchParams } from "next/navigation";
 import { KnowledgeWorkspace } from "../../../../components/wiki/knowledge-workspace";
 import { useThemeColors } from "../../../../lib/theme";
 import { useI18n } from "../../../../lib/i18n";
+import { CobraccoMark } from "../../../../components/landing/CobraccoMark";
 
 export default function ProjectKbPage() {
   const params = useParams<{ projectId: string }>();
@@ -66,6 +67,34 @@ export default function ProjectKbPage() {
       <div style={{ flex: 1, minHeight: 0, display: "flex", overflow: "hidden", padding: 8 }}>
         <KnowledgeWorkspace scope="project" projectId={projectId} initialDocId={initialDocId} />
       </div>
+      {/* Footer Nexus: coerente con landing/pricing (copyright + CobraccoMark). */}
+      <footer
+        style={{
+          flexShrink: 0,
+          padding: "8px 16px",
+          borderTop: `1px solid ${tc.border}`,
+          background: tc.bgCard,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 6,
+          fontSize: 11,
+          color: tc.textSecondary,
+        }}
+      >
+        <span>
+          &copy; 2026 {t("landing.v2.footer.copyright")}{" "}
+          <a
+            href="https://cobracco.it"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Cobracco"
+            style={{ color: "inherit", textDecoration: "underline" }}
+          >
+            <CobraccoMark />
+          </a>
+        </span>
+      </footer>
     </div>
   );
 }
