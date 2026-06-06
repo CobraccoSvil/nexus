@@ -423,12 +423,12 @@ pub(crate) async fn compact_session_core(
             PurposeResolution::Resolved {
                 provider, model, ..
             } => (provider, model),
-            PurposeResolution::InCooldown { provider, .. } => {
+            PurposeResolution::NoCapableModel { tier } => {
                 return Err(CompactError::new(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     format!(
-                        "Compattazione non disponibile: il provider '{provider}' e' in \
-                         cooldown (credito/quota esaurito) e non ci sono alternative. \
+                        "Compattazione non disponibile: nessun modello del tier '{tier}' e' \
+                         disponibile (capability mancante o provider in cooldown). \
                          Riprova piu' tardi o ricarica il credito del provider."
                     ),
                 ));
@@ -437,8 +437,8 @@ pub(crate) async fn compact_session_core(
                 return Err(CompactError::new(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     "Compattazione non disponibile: purpose 'conversation_summary' \
-                     non configurato in nexus_purpose_model. Aggiungi la configurazione \
-                     dall'admin panel.",
+                     non configurato (o privo di tier) in nexus_purpose_model. Aggiungi la \
+                     configurazione dall'admin panel.",
                 ));
             }
             PurposeResolution::MatrixUnavailable(e) => {

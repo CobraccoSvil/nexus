@@ -334,17 +334,17 @@ async fn enrich_code_doc(
         return Ok(false);
     }
 
-    // Risolve provider+model dal PUNTO UNICO (regola L): tier dinamico -> statico.
+    // Risolve provider+model dal PUNTO UNICO (regola L): routing tier-only.
     let (provider, model) = match resolve_purpose_model(state, PURPOSE).await {
         PurposeResolution::Resolved {
             provider, model, ..
         } => (provider, model),
-        PurposeResolution::InCooldown { .. } => {
-            anyhow::bail!("provider in cooldown per purpose {PURPOSE}");
+        PurposeResolution::NoCapableModel { tier } => {
+            anyhow::bail!("nessun modello del tier '{tier}' disponibile per purpose {PURPOSE}");
         }
         PurposeResolution::NotFound => {
             anyhow::bail!(
-                "purpose non configurato: {PURPOSE} (applicare migrazione 0331)"
+                "purpose non configurato o privo di tier: {PURPOSE} (applicare migrazione 0331/0344)"
             );
         }
         PurposeResolution::MatrixUnavailable(e) => {

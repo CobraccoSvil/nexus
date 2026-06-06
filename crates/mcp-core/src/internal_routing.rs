@@ -133,100 +133,81 @@ pub enum PurposeResolution {
         model: String,
         rationale: String,
     },
-    /// Il (provider, model) statico configurato e' in cooldown e non esiste
-    /// alternativa tier-based fuori cooldown (ADR 0020).
-    InCooldown { provider: String, model: String },
-    /// Purpose non presente in `nexus_purpose_model`.
+    /// Il purpose ha un tier configurato ma il catalog non offre alcun modello
+    /// disponibile per quel tier (capability mancante o tutti i provider in
+    /// cooldown). Tier-only: niente fallback su un modello statico (regola H).
+    NoCapableModel { tier: String },
+    /// Purpose non presente in `nexus_purpose_model` o privo di tier (tier-only:
+    /// un purpose senza tier non e' risolvibile).
     NotFound,
     /// La routing matrix non e' disponibile (DB down): nessun fallback hardcoded.
     MatrixUnavailable(String),
 }
 
 /// CORE decisionale (PUNTO UNICO, regola L) della risoluzione purpose→modello.
-/// Applica, nell'ordine: regola tier dinamica (mig 0203) con scelta del miglior
-/// modello capable fuori cooldown; fallback al (provider, model_id) statico;
-/// enforcement cooldown sullo statico. Nessun nome modello hardcoded (regola G).
+/// TIER-ONLY: il modello e' scelto ESCLUSIVAMENTE dal routing per tier
+/// (`best_model_for_tier`: miglior modello del catalog per tier+capability,
+/// provider in cooldown esclusi). NIENTE fallback su un (provider, model_id)
+/// statico (regola H: fail-loud). Nessun nome modello hardcoded (regola G).
 ///
-/// Riceve gia' risolti `tier_rule` e `static_model` cosi' da essere indipendente
-/// dalla FONTE (matrix cache o query DB diretta). I due adapter pubblici
-/// (`resolve_purpose_model` da `AppState`, `resolve_purpose_model_db` da
-/// `&PgPool`) leggono questi due input dalla rispettiva fonte e delegano qui:
-/// la logica decisionale vive in un solo posto.
+/// Riceve gia' risolta `tier_rule` cosi' da essere indipendente dalla FONTE
+/// (matrix cache o query DB diretta): i due adapter pubblici la leggono dalla
+/// rispettiva fonte e delegano qui. La logica decisionale vive in un solo posto.
+///
+/// - tier_rule assente  -> NotFound (purpose senza tier: non risolvibile)
+/// - tier senza modello -> NoCapableModel (catalog/cooldown)
 async fn resolve_purpose_core(
     db: &PgPool,
     purpose: &str,
     tier_rule: Option<crate::routing_matrix::PurposeTierRule>,
-    static_model: Option<(String, String)>,
 ) -> PurposeResolution {
-    // Risoluzione tier-based (mig 0203): se il purpose ha un tier configurato,
-    // scegliamo dinamicamente il miglior modello del catalog per quel tier +
-    // capability. Se il catalog non ha candidati (es. tutti in cooldown), si
-    // cade sul (provider, model_id) statico come ultimo fallback.
-    if let Some(rule) = tier_rule {
-        if let Some((provider, model)) = crate::orchestrator::best_model_for_tier(
-            db,
-            &rule.tier,
-            rule.capability.as_deref(),
-            rule.requires_tool_use,
-        )
-        .await
-        {
-            return PurposeResolution::Resolved {
-                provider,
-                model,
-                rationale: format!("purpose_model:tier={}:auto", rule.tier),
-            };
+    let Some(rule) = tier_rule else {
+        tracing::warn!(purpose = %purpose, "resolve_purpose: purpose privo di tier (tier-only)");
+        return PurposeResolution::NotFound;
+    };
+    match crate::orchestrator::best_model_for_tier(
+        db,
+        &rule.tier,
+        rule.capability.as_deref(),
+        rule.requires_tool_use,
+    )
+    .await
+    {
+        Some((provider, model)) => PurposeResolution::Resolved {
+            provider,
+            model,
+            rationale: format!("tier={}:auto", rule.tier),
+        },
+        None => {
+            tracing::warn!(
+                purpose = %purpose, tier = %rule.tier,
+                "resolve_purpose: nessun modello catalog per il tier (capability mancante o cooldown)"
+            );
+            PurposeResolution::NoCapableModel { tier: rule.tier }
         }
-        tracing::warn!(
-            purpose = %purpose,
-            tier = %rule.tier,
-            "resolve_purpose: nessun modello catalog per il tier (tutti in cooldown?) — fallback statico"
-        );
-    }
-
-    match static_model {
-        Some((provider, model)) => {
-            if crate::provider_cooldown::is_provider_in_cooldown(&provider) {
-                PurposeResolution::InCooldown { provider, model }
-            } else {
-                PurposeResolution::Resolved {
-                    provider,
-                    model,
-                    rationale: "purpose_model".to_string(),
-                }
-            }
-        }
-        None => PurposeResolution::NotFound,
     }
 }
 
-/// Adapter da `AppState`: legge tier-rule e statico dalla RoutingMatrix cache
-/// (TTL 60s) e delega al core. Usare quando si dispone di `AppState`.
+/// Adapter da `AppState`: legge la tier-rule dalla RoutingMatrix cache (TTL 60s)
+/// e delega al core. Usare quando si dispone di `AppState`.
 pub async fn resolve_purpose_model(state: &AppState, purpose: &str) -> PurposeResolution {
     let purpose = purpose.trim();
     let matrix = match state.orchestrator.routing_matrix.current() {
         Ok(m) => m,
         Err(e) => return PurposeResolution::MatrixUnavailable(e.to_string()),
     };
-    resolve_purpose_core(
-        &state.db,
-        purpose,
-        matrix.purpose_tier(purpose),
-        matrix.purpose_model(purpose),
-    )
-    .await
+    resolve_purpose_core(&state.db, purpose, matrix.purpose_tier(purpose)).await
 }
 
-/// Adapter da `&PgPool`: legge tier-rule e statico direttamente da
-/// `nexus_purpose_model` e delega al core. Per i call site che NON dispongono di
-/// `AppState` (es. i tool del Nexus Builtin server come `nexus_doc_generate`,
-/// che ricevono solo `&PgPool`). Stessa decisione di `resolve_purpose_model`,
-/// senza re-implementarla (regola L): la fonte e' il DB invece della matrix
-/// cache, i dati sono gli stessi (`nexus_purpose_model`).
+/// Adapter da `&PgPool`: legge la tier-rule direttamente da `nexus_purpose_model`
+/// e delega al core. Per i call site che NON dispongono di `AppState` (es. i tool
+/// del Nexus Builtin server come `nexus_doc_generate`, che ricevono solo
+/// `&PgPool`). Stessa decisione di `resolve_purpose_model`, senza re-implementarla
+/// (regola L): la fonte e' il DB invece della matrix cache.
 pub async fn resolve_purpose_model_db(db: &PgPool, purpose: &str) -> PurposeResolution {
     let purpose = purpose.trim();
-    let row = match sqlx::query_as::<_, (String, String, Option<String>, Option<String>, bool)>(
-        "SELECT provider, model_id, tier, required_capability, requires_tool_use \
+    let row = match sqlx::query_as::<_, (Option<String>, Option<String>, bool)>(
+        "SELECT tier, required_capability, requires_tool_use \
          FROM nexus_purpose_model WHERE purpose = $1 LIMIT 1",
     )
     .bind(purpose)
@@ -237,7 +218,7 @@ pub async fn resolve_purpose_model_db(db: &PgPool, purpose: &str) -> PurposeReso
         Err(e) => return PurposeResolution::MatrixUnavailable(e.to_string()),
     };
 
-    let Some((provider, model_id, tier, capability, requires_tool_use)) = row else {
+    let Some((tier, capability, requires_tool_use)) = row else {
         return PurposeResolution::NotFound;
     };
 
@@ -247,7 +228,7 @@ pub async fn resolve_purpose_model_db(db: &PgPool, purpose: &str) -> PurposeReso
         requires_tool_use,
     });
 
-    resolve_purpose_core(db, purpose, tier_rule, Some((provider, model_id))).await
+    resolve_purpose_core(db, purpose, tier_rule).await
 }
 
 /// Handler `GET /api/internal/routing/purpose?purpose=...`
@@ -287,21 +268,21 @@ pub async fn resolve_purpose(
             }),
         )
             .into_response(),
-        PurposeResolution::InCooldown { provider, model } => {
-            // Cooldown enforcement (ADR 0020): segnaliamo no_capable invece di
-            // restituire un provider morto che il brain ritenterebbe a vuoto.
+        PurposeResolution::NoCapableModel { tier } => {
+            // Tier-only: nessun modello disponibile per il tier (capability
+            // mancante o tutti in cooldown). Niente fallback (regola H):
+            // segnaliamo no_capable cosi' il brain salta invece di ritentare.
             tracing::warn!(
-                purpose = %purpose,
-                provider = %provider,
-                "resolve_purpose: provider in cooldown e nessuna alternativa tier-based -> no_capable (503)"
+                purpose = %purpose, tier = %tier,
+                "resolve_purpose: nessun modello capable per il tier -> no_capable (503)"
             );
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(PurposeResolveResponse {
                     purpose: purpose.to_string(),
-                    provider,
-                    model,
-                    rationale: "purpose_model:in_cooldown".to_string(),
+                    provider: String::new(),
+                    model: String::new(),
+                    rationale: format!("tier={tier}:no_capable"),
                     no_capable_provider: true,
                 }),
             )
@@ -309,7 +290,7 @@ pub async fn resolve_purpose(
         }
         PurposeResolution::NotFound => (
             StatusCode::NOT_FOUND,
-            format!("purpose model non trovato: {purpose}"),
+            format!("purpose model non trovato o privo di tier: {purpose}"),
         )
             .into_response(),
         PurposeResolution::MatrixUnavailable(e) => (

@@ -256,14 +256,23 @@ pub async fn best_model_for_tier(
         .into_iter()
         .map(|(name, _, _)| name)
         .collect();
+    // La capability "vision" NON e' nel jsonb `capabilities` ma nella colonna
+    // booleana `supports_vision` (fonte unica capability, ADR 0024): va filtrata
+    // a parte. Le altre capability restano sul match jsonb `capabilities @> [..]`.
+    let is_vision = capability == Some("vision");
+    let capability_json = capability
+        .filter(|_| !is_vision)
+        .map(|c| format!("[\"{c}\"]"));
+
     let mut idx = 1; // $1 = tier
-    let capability_json = capability.map(|c| format!("[\"{c}\"]"));
-    let capability_predicate = if capability_json.is_some() {
+    let mut capability_predicate = String::new();
+    if is_vision {
+        capability_predicate.push_str("AND supports_vision = TRUE ");
+    }
+    if capability_json.is_some() {
         idx += 1;
-        format!("AND capabilities @> ${idx}::jsonb")
-    } else {
-        String::new()
-    };
+        capability_predicate.push_str(&format!("AND capabilities @> ${idx}::jsonb "));
+    }
     idx += 1;
     let cooldown_idx = idx; // ultimo placeholder
 

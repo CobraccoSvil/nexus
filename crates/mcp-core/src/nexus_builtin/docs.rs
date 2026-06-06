@@ -272,22 +272,21 @@ pub async fn handle_doc_generate(
                         );
                         (provider, model)
                     }
-                    crate::internal_routing::PurposeResolution::InCooldown { provider, model } => {
+                    crate::internal_routing::PurposeResolution::NoCapableModel { tier } => {
                         tracing::warn!(
-                            "nexus_doc_generate: {provider}/{model} in cooldown e nessuna \
-                             alternativa tier-based"
+                            "nexus_doc_generate: nessun modello del tier '{tier}' disponibile"
                         );
                         return format!(
-                            "[Errore] Generazione documento non disponibile: il provider '{provider}' \
-                             del purpose docs_generator e' in cooldown e non esiste un'alternativa \
-                             capable per il tier configurato. Riprova piu' tardi."
+                            "[Errore] Generazione documento non disponibile: nessun modello del \
+                             tier '{tier}' (purpose docs_generator) e' disponibile (capability \
+                             mancante o provider in cooldown). Riprova piu' tardi."
                         );
                     }
                     crate::internal_routing::PurposeResolution::NotFound => {
                         tracing::error!(
-                            "purpose 'docs_generator' non configurato in nexus_purpose_model."
+                            "purpose 'docs_generator' non configurato o privo di tier."
                         );
-                        return "[Errore] purpose 'docs_generator' non configurato in nexus_purpose_model".to_string();
+                        return "[Errore] purpose 'docs_generator' non configurato (o privo di tier) in nexus_purpose_model".to_string();
                     }
                     crate::internal_routing::PurposeResolution::MatrixUnavailable(e) => {
                         tracing::error!("nexus_doc_generate: routing non disponibile: {e}");
