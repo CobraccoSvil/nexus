@@ -1,7 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type CSSProperties } from "react";
 import { useEventOfKind } from "../../lib/project-dispatcher/hooks";
+import { useThemeColors } from "../../lib/theme";
 import { ProviderBadge } from "./provider-badge";
 
 /**
@@ -14,6 +15,13 @@ import { ProviderBadge } from "./provider-badge";
  *  - reflection → riassunto post-hoc del turno
  *
  * Tutti collassati di default tranne `clarify` (richiede risposta utente).
+ *
+ * NB stile: il web-ide NON usa Tailwind (nessuna dipendenza tailwindcss, nessun
+ * file con @tailwind/@apply). Le classi utility erano percio' CSS morto: flex,
+ * gap, colori e spaziature non venivano applicati e tutti i testi finivano
+ * attaccati ("FallbackFallback", "delete_file/...errore"). Questo componente usa
+ * quindi stili inline + `useThemeColors`, coerente col resto dell'IDE
+ * (ProviderBadge, chat-panel, nexus-metrics-panel).
  */
 
 type MetaStepKind = "plan" | "routing" | "clarify" | "fallback" | "reflection" | "next_actions" | string;
@@ -28,6 +36,20 @@ export interface AgentMetaStepData {
 
 // Scelta proposta dall'agente: testo breve del pulsante + prompt completo da inviare.
 export type NextActionChoice = { label?: string; prompt?: string };
+
+const NEXT_ACTION_ACCENT = "#3b82f6";
+
+/** Converte un colore hex (#RRGGBB) in rgba con l'alpha dato. Usato per derivare
+ *  sfondi/bordi tenui dal colore-accento del kind senza dipendere da Tailwind. */
+function withAlpha(hex: string, alpha: number): string {
+  const m = /^#?([0-9a-fA-F]{6})$/.exec(hex);
+  if (!m) return hex;
+  const v = m[1];
+  const r = parseInt(v.slice(0, 2), 16);
+  const g = parseInt(v.slice(2, 4), 16);
+  const b = parseInt(v.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
 
 /**
  * Estrae le scelte dell'ULTIMO meta_step `next_actions` di una timeline (gli
@@ -65,6 +87,9 @@ function dispatchChoice(prompt: string, onChoice?: (prompt: string) => void) {
  * usato sia a fine risposta in chat (posizione primaria voluta dall'utente) sia,
  * storicamente, dentro la card meta_step. Ogni voce, al click, invia subito in
  * chat il prompt gia' pronto (auto-send).
+ *
+ * Tastini pieni colorati affiancati (wrap su piu' righe se servono): riempimento
+ * accent + testo bianco + ombra, chiaramente cliccabili a fine messaggio.
  */
 export function NextActionsButtons({
   choices,
@@ -75,7 +100,7 @@ export function NextActionsButtons({
 }) {
   if (!choices.length) return null;
   return (
-    <div className="flex flex-col gap-1.5">
+    <div style={{ display: "flex", flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
       {choices.map((c, i) => {
         const label = c.label ?? "—";
         const prompt = c.prompt ?? "";
@@ -86,7 +111,21 @@ export function NextActionsButtons({
             title={prompt}
             disabled={!prompt}
             onClick={() => prompt && dispatchChoice(prompt, onChoice)}
-            className="w-full text-left text-xs px-2 py-1.5 rounded border border-blue-300 dark:border-blue-700 bg-white/70 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200 hover:bg-blue-100 dark:hover:bg-blue-800/50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              textAlign: "left",
+              fontSize: 12,
+              fontWeight: 600,
+              padding: "6px 12px",
+              borderRadius: 6,
+              background: "#2563eb",
+              color: "#fff",
+              border: "none",
+              boxShadow: "0 1px 2px rgba(0,0,0,0.15)",
+              cursor: prompt ? "pointer" : "not-allowed",
+              opacity: prompt ? 1 : 0.5,
+            }}
           >
             {label}
           </button>
@@ -99,76 +138,27 @@ export function NextActionsButtons({
 interface KindDescriptor {
   icon: string;
   label: string;
-  tone: string; // tailwind text color
-  bg: string;   // tailwind bg color
+  accent: string; // colore-accento (hex) per icona, label, bordo e sfondo tenue
   defaultOpen: boolean;
 }
 
 const KIND_MAP: Record<string, KindDescriptor> = {
-  plan: {
-    icon: "□",
-    label: "Piano",
-    tone: "text-indigo-700 dark:text-indigo-300",
-    bg: "bg-indigo-50 dark:bg-indigo-950/40 border-indigo-200 dark:border-indigo-800",
-    defaultOpen: false,
-  },
-  routing: {
-    icon: "→",
-    label: "Routing",
-    tone: "text-slate-600 dark:text-slate-300",
-    bg: "bg-slate-50 dark:bg-slate-900/40 border-slate-200 dark:border-slate-800",
-    defaultOpen: false,
-  },
-  clarify: {
-    icon: "?",
-    label: "Chiarimento",
-    tone: "text-amber-700 dark:text-amber-300",
-    bg: "bg-amber-50 dark:bg-amber-950/40 border-amber-300 dark:border-amber-800",
-    defaultOpen: true,
-  },
-  fallback: {
-    icon: "↻",
-    label: "Fallback",
-    tone: "text-orange-700 dark:text-orange-300",
-    bg: "bg-orange-50 dark:bg-orange-950/40 border-orange-200 dark:border-orange-800",
-    defaultOpen: false,
-  },
-  reflection: {
-    icon: "◐",
-    label: "Riflessione",
-    tone: "text-purple-700 dark:text-purple-300",
-    bg: "bg-purple-50 dark:bg-purple-950/40 border-purple-200 dark:border-purple-800",
-    defaultOpen: false,
-  },
-  // Scelte proposte dall'agente per proseguire: ogni voce diventa un pulsante
-  // a tutta larghezza che, al click, invia subito in chat il prompt gia' pronto
-  // (auto-send). defaultOpen true: deve essere visibile subito per invogliare il click.
-  next_actions: {
-    icon: "→",
-    label: "Prossimi passi",
-    tone: "text-blue-700 dark:text-blue-300",
-    bg: "bg-blue-50 dark:bg-blue-950/40 border-blue-200 dark:border-blue-800",
-    defaultOpen: true,
-  },
-  // Live UX: ogni tool eseguito dall'executor emette questo meta_step
-  // (vedi brain/agents/nodes.py tool_dispatch_node). Card compatta, collassata:
-  // l'utente vede il flusso dei tool in tempo reale durante run lunghi.
-  tool_executed: {
-    // Icona distinta dal chevron di espansione (anch'esso "▸"): altrimenti la
-    // card tool mostrava due frecce identiche "▸▸".
-    icon: "◆",
-    label: "Tool",
-    tone: "text-emerald-700 dark:text-emerald-300",
-    bg: "bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800",
-    defaultOpen: false,
-  },
+  plan: { icon: "□", label: "Piano", accent: "#6366f1", defaultOpen: false },
+  routing: { icon: "→", label: "Routing", accent: "#64748b", defaultOpen: false },
+  clarify: { icon: "?", label: "Chiarimento", accent: "#f59e0b", defaultOpen: true },
+  fallback: { icon: "↻", label: "Fallback", accent: "#f97316", defaultOpen: false },
+  reflection: { icon: "◐", label: "Riflessione", accent: "#a855f7", defaultOpen: false },
+  // Scelte proposte dall'agente: ogni voce diventa un pulsante a tutta larghezza.
+  next_actions: { icon: "→", label: "Prossimi passi", accent: NEXT_ACTION_ACCENT, defaultOpen: true },
+  // Ogni tool eseguito dall'executor emette questo meta_step (vedi
+  // brain/agents/nodes tool_dispatch). Icona "◆" distinta dal chevron "▸".
+  tool_executed: { icon: "◆", label: "Tool", accent: "#10b981", defaultOpen: false },
 };
 
 const DEFAULT_DESC: KindDescriptor = {
   icon: "•",
   label: "Step",
-  tone: "text-slate-600 dark:text-slate-300",
-  bg: "bg-slate-50 dark:bg-slate-900/40 border-slate-200 dark:border-slate-800",
+  accent: "#64748b",
   defaultOpen: false,
 };
 
@@ -187,18 +177,21 @@ function PlanChecklist({ todos }: { todos: PlanTodo[] }) {
     },
     [],
   );
-  if (!todos.length) return <em className="text-xs opacity-70">Nessun todo</em>;
+  if (!todos.length) return <em style={{ fontSize: 11, opacity: 0.7 }}>Nessun todo</em>;
   const MARK: Record<string, string> = {
     completed: "[x]", in_progress: "[~]", blocked: "[!]", skipped: "[-]", pending: "[ ]",
   };
   return (
-    <ol className="list-none pl-0 space-y-0.5 text-xs">
+    <ol style={{ listStyle: "none", paddingLeft: 0, margin: 0, display: "flex", flexDirection: "column", gap: 2, fontSize: 12 }}>
       {todos.map((t, i) => {
         const status = (t.id ? overrides[t.id] : undefined) ?? t.status ?? "pending";
         return (
-          <li key={t.id ?? i} className="leading-snug flex items-start gap-1.5">
-            <span className="font-mono opacity-70">{MARK[status] ?? MARK.pending}</span>
-            <span>{t.content ?? "—"}{t.priority && t.priority !== "normal" ? <span className="opacity-60"> ({t.priority})</span> : null}</span>
+          <li key={t.id ?? i} style={{ lineHeight: 1.4, display: "flex", alignItems: "flex-start", gap: 6 }}>
+            <span style={{ fontFamily: "monospace", opacity: 0.7 }}>{MARK[status] ?? MARK.pending}</span>
+            <span>
+              {t.content ?? "—"}
+              {t.priority && t.priority !== "normal" ? <span style={{ opacity: 0.6 }}> ({t.priority})</span> : null}
+            </span>
           </li>
         );
       })}
@@ -206,72 +199,90 @@ function PlanChecklist({ todos }: { todos: PlanTodo[] }) {
   );
 }
 
+/** Riga chiave/valore per i payload tabellari (routing, fallback). */
+function DefRow({ k, v, tc }: { k: string; v: string; tc: ReturnType<typeof useThemeColors> }) {
+  return (
+    <>
+      <span style={{ opacity: 0.7, color: tc.textMuted }}>{k}</span>
+      <span style={{ wordBreak: "break-word" }}>{v}</span>
+    </>
+  );
+}
+
 function renderPayload(
   kind: string,
   payload: Record<string, unknown>,
   onChoice: (prompt: string) => void,
+  tc: ReturnType<typeof useThemeColors>,
 ) {
   if (kind === "next_actions") {
     const choices = (payload.choices ?? []) as NextActionChoice[];
-    if (!choices.length) return <em className="text-xs opacity-70">Nessuna scelta</em>;
+    if (!choices.length) return <em style={{ fontSize: 11, opacity: 0.7 }}>Nessuna scelta</em>;
     return <NextActionsButtons choices={choices} onChoice={onChoice} />;
   }
   if (kind === "plan") {
     const todos = (payload.todos ?? []) as PlanTodo[];
     return <PlanChecklist todos={todos} />;
   }
+  const grid: CSSProperties = {
+    display: "grid",
+    gridTemplateColumns: "auto 1fr",
+    columnGap: 8,
+    rowGap: 2,
+    fontSize: 12,
+  };
   if (kind === "routing") {
     const intent = String(payload.intent ?? "—");
     const profile = payload.profile_name as string | undefined;
     const mode = payload.behavior_mode as string | undefined;
     const budget = payload.token_budget as number | undefined;
     return (
-      <dl className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 text-xs">
-        <dt className="opacity-70">Intent</dt><dd>{intent}</dd>
-        {profile && (<><dt className="opacity-70">Profilo</dt><dd>{profile}</dd></>)}
-        {mode && (<><dt className="opacity-70">Modalità</dt><dd>{mode}</dd></>)}
-        {typeof budget === "number" && (<><dt className="opacity-70">Token budget</dt><dd>{budget}</dd></>)}
-      </dl>
+      <div style={grid}>
+        <DefRow k="Intent" v={intent} tc={tc} />
+        {profile && <DefRow k="Profilo" v={profile} tc={tc} />}
+        {mode && <DefRow k="Modalità" v={mode} tc={tc} />}
+        {typeof budget === "number" && <DefRow k="Token budget" v={String(budget)} tc={tc} />}
+      </div>
     );
   }
   if (kind === "fallback") {
     return (
-      <dl className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 text-xs">
-        <dt className="opacity-70">A</dt><dd>{String(payload.to_provider ?? "?")}/{String(payload.to_model ?? "?")}</dd>
-        <dt className="opacity-70">Motivo</dt><dd>{String(payload.reason ?? "—")}</dd>
-        <dt className="opacity-70">Tentativo</dt><dd>#{String(payload.attempt ?? "?")}</dd>
-      </dl>
+      <div style={grid}>
+        <DefRow k="A" v={`${String(payload.to_provider ?? "?")} / ${String(payload.to_model ?? "?")}`} tc={tc} />
+        <DefRow k="Motivo" v={String(payload.reason ?? "—")} tc={tc} />
+        <DefRow k="Tentativo" v={`#${String(payload.attempt ?? "?")}`} tc={tc} />
+      </div>
     );
   }
   if (kind === "clarify") {
     const question = String(payload.question ?? "");
     const rationale = payload.rationale as string | undefined;
     return (
-      <div className="space-y-1 text-xs">
-        <p className="font-medium">{question}</p>
-        {rationale && <p className="opacity-70 italic">{rationale}</p>}
+      <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
+        <p style={{ margin: 0, fontWeight: 500 }}>{question}</p>
+        {rationale && <p style={{ margin: 0, opacity: 0.7, fontStyle: "italic" }}>{rationale}</p>}
       </div>
     );
   }
   if (kind === "reflection") {
     const summary = String(payload.summary ?? "");
-    return <p className="text-xs leading-snug">{summary}</p>;
+    return <p style={{ margin: 0, fontSize: 12, lineHeight: 1.4 }}>{summary}</p>;
   }
   if (kind === "tool_executed") {
     const tool = String(payload.tool ?? "");
     const target = String(payload.target ?? "");
     const isErr = Boolean(payload.is_error);
     return (
-      <div className="text-xs flex items-center gap-2 leading-snug">
-        <code className={isErr ? "text-red-700 dark:text-red-300" : ""}>{tool}</code>
-        {target && <span className="opacity-70 truncate">{target}</span>}
-        {isErr && <span className="text-red-600 dark:text-red-300">errore</span>}
+      <div style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 8, lineHeight: 1.4, flexWrap: "wrap" }}>
+        <code style={{ fontFamily: "monospace", color: isErr ? tc.error : tc.text }}>{tool}</code>
+        {target && <span style={{ opacity: 0.7, wordBreak: "break-all" }}>{target}</span>}
+        {isErr && <span style={{ color: tc.error, fontWeight: 600 }}>errore</span>}
       </div>
     );
   }
-  // fallback: JSON
+  // fallback: JSON grezzo.
   return (
-    <pre className="text-[10px] overflow-x-auto opacity-80">
+    <pre style={{ fontSize: 10, overflowX: "auto", opacity: 0.8, margin: 0 }}>
       {JSON.stringify(payload, null, 2)}
     </pre>
   );
@@ -286,6 +297,7 @@ export function AgentMetaStepCard({
    *  bridge globale `nexus:chat:send` (stesso meccanismo di "Risolvi con Nexus"). */
   onChoice?: (prompt: string) => void;
 }) {
+  const tc = useThemeColors();
   const desc = KIND_MAP[data.kind] ?? DEFAULT_DESC;
   const [open, setOpen] = useState(desc.defaultOpen);
 
@@ -302,61 +314,79 @@ export function AgentMetaStepCard({
   };
 
   // I meta_step tool arrivano col title gia' prefissato "tool <nome>": col label
-  // "Tool" del descrittore diventerebbe "Tool tool <nome>" ("Tooltool"). Rimuovo
-  // il prefisso ridondante per i soli tool_executed.
+  // "Tool" del descrittore diventerebbe "Tool tool <nome>". Rimuovo il prefisso
+  // ridondante per i soli tool_executed.
   const displayTitle =
     data.kind === "tool_executed" ? data.title.replace(/^tool\s+/i, "") : data.title;
 
-  // Provider/model per il turno (per il badge colorato per provider+costo).
-  // - routing      -> popolato direttamente nel payload (provider/model)
-  // - tool_executed -> idem
-  // - fallback     -> usa to_provider/to_model (destinazione del fallback)
-  // Per gli altri kind (plan, clarify, reflection) il badge non e' mostrato:
-  // non hanno semantica di "scelta del modello per il turno".
-  const provider = (data.payload?.provider
-    ?? data.payload?.to_provider
-    ?? null) as string | null;
-  const model = (data.payload?.model
-    ?? data.payload?.to_model
-    ?? null) as string | null;
+  // Dedup label/title: se il title comincia gia' col label (es. label "Fallback"
+  // + title "Fallback su google/...") mostrare entrambi dava "Fallback Fallback su
+  // ..." (e senza Tailwind diventava "FallbackFallback"). In quel caso nascondo il
+  // label e tengo solo il title, piu' descrittivo. Per i tool il label "Tool" e'
+  // sempre ridondante col nome del tool, quindi mai mostrato.
+  const titleLc = (displayTitle ?? "").trim().toLowerCase();
+  const labelLc = desc.label.toLowerCase();
+  const titleStartsWithLabel = titleLc.startsWith(labelLc);
+  const showLabel = data.kind !== "tool_executed" && !titleStartsWithLabel;
+  const titleToShow = titleLc && titleLc !== labelLc ? displayTitle : "";
+
+  // Provider/model per il turno (badge colorato per provider+costo).
+  const provider = (data.payload?.provider ?? data.payload?.to_provider ?? null) as string | null;
+  const model = (data.payload?.model ?? data.payload?.to_model ?? null) as string | null;
   const showBadge =
     (provider || model) &&
-    (data.kind === "routing" ||
-      data.kind === "tool_executed" ||
-      data.kind === "fallback");
+    (data.kind === "routing" || data.kind === "tool_executed" || data.kind === "fallback");
 
   return (
     <div
       data-meta-step-kind={data.kind}
-      className={`my-1 rounded border ${desc.bg} text-sm`}
+      style={{
+        margin: "4px 0",
+        borderRadius: 6,
+        border: `1px solid ${withAlpha(desc.accent, 0.3)}`,
+        background: withAlpha(desc.accent, 0.08),
+        fontSize: 13,
+      }}
     >
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className={`w-full flex items-center gap-2 px-2 py-1 ${desc.tone} hover:opacity-90`}
         aria-expanded={open}
+        style={{
+          width: "100%",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "5px 8px",
+          background: "transparent",
+          border: "none",
+          color: desc.accent,
+          cursor: "pointer",
+          textAlign: "left",
+        }}
       >
-        <span aria-hidden className="font-mono">{open ? "▾" : "▸"}</span>
-        <span aria-hidden className="font-mono">{desc.icon}</span>
-        {/* Per i tool il label "Tool" e' ridondante: il nome del tool (read_file,
-            write_file, ...) e' gia' autoesplicativo. Per gli altri kind (Piano,
-            Routing, Fallback, ...) il label resta utile a distinguerli. */}
-        {data.kind !== "tool_executed" && (
-          <span className="font-medium">{desc.label}</span>
-        )}
-        {/* Evita il titolo ridondante quando coincide col label (es.
-            next_actions: label "Prossimi passi" + title "Prossimi passi" =>
-            "Prossimi passiProssimi passi"). Lo span resta per lo spacer flex. */}
-        <span className="opacity-70 truncate text-left flex-1">
-          {displayTitle && displayTitle.trim().toLowerCase() !== desc.label.toLowerCase()
-            ? displayTitle
-            : ""}
+        <span aria-hidden style={{ fontFamily: "monospace" }}>{open ? "▾" : "▸"}</span>
+        <span aria-hidden style={{ fontFamily: "monospace" }}>{desc.icon}</span>
+        {showLabel && <span style={{ fontWeight: 600 }}>{desc.label}</span>}
+        {/* Title del turno: colore testo neutro (leggibile), troncato con ellipsis
+            nell'header collassato; il dettaglio completo e' nel corpo espanso. */}
+        <span
+          style={{
+            flex: 1,
+            color: tc.text,
+            opacity: 0.85,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {titleToShow}
         </span>
         {showBadge && <ProviderBadge provider={provider} model={model} />}
       </button>
       {open && (
-        <div className="px-3 pb-2">
-          {renderPayload(data.kind, data.payload, handleChoice)}
+        <div style={{ padding: "0 12px 8px" }}>
+          {renderPayload(data.kind, data.payload, handleChoice, tc)}
         </div>
       )}
     </div>

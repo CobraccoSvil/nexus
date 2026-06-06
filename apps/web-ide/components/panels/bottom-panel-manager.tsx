@@ -1,6 +1,7 @@
 "use client";
 
 import { useThemeColors } from "../../lib/theme";
+import { stripAnsi } from "../../lib/ansi";
 import { TerminalPanel } from "../terminal-panel";
 import { DebugPanel } from "./debug-panel";
 import { OutputPanel } from "./output-panel";
@@ -494,14 +495,28 @@ export function BottomPanelManager({
                       padding: "1px 6px", borderRadius: 3, textTransform: "uppercase",
                       letterSpacing: 0.5,
                     }}>{category}</span>
-                    <span className="font-semibold" style={{ color: tc.text }}>{run.label}</span>
+                    <span style={{ color: tc.text, fontWeight: 600 }}>{stripAnsi(run.label)}</span>
                   </div>
                   <span style={{
                     color: run.status === "passed" ? "#10b981" : run.status === "failed" ? tc.error : tc.textMuted,
                     fontSize: 11, fontWeight: 600,
                   }}>{run.status}</span>
                 </div>
-                {run.summary && <div style={{ color: tc.textSecondary, fontSize: 12, marginTop: 6 }}>{run.summary}</div>}
+                {run.summary && (
+                  <div
+                    style={{
+                      color: tc.textSecondary,
+                      fontSize: 12,
+                      marginTop: 6,
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                      fontFamily: '"JetBrains Mono", "Consolas", monospace',
+                      lineHeight: 1.45,
+                    }}
+                  >
+                    {stripAnsi(run.summary)}
+                  </div>
+                )}
                 {project && category === "test" && (
                   <PlaywrightLiveProgress run={run} projectId={project.id} tc={tc} />
                 )}
