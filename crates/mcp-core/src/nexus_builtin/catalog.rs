@@ -182,6 +182,23 @@ pub(super) static NEXUS_TOOLS: &[ToolDef] = &[
         description: "Cambia lo stato di un documento (draft, review, approved, outdated).",
         schema: r#"{"type":"object","required":["project_id","document_id","status"],"properties":{"project_id":{"type":"string","description":"UUID del progetto"},"document_id":{"type":"string","description":"UUID del documento"},"status":{"type":"string","enum":["draft","review","approved","outdated"],"description":"Nuovo stato"}}}"#,
     },
+    // ── file mutations / rollback ─────────────────────────────────────────
+    ToolDef {
+        name: "nexus_file_mutations_list",
+        description: "Elenca le modifiche file recenti fatte dall'agente in questo progetto, ognuna con id, path, op (created/modified/deleted/reverted), dimensione before/after, timestamp e flag 'revertible'. Usalo quando l'utente chiede di vedere lo storico delle modifiche o vuole annullare un cambiamento.",
+        schema: r#"{"type":"object","required":["project_id"],"properties":{"project_id":{"type":"string","description":"UUID del progetto"},"limit":{"type":"integer","description":"Numero massimo voci (default 50, max 500)"}}}"#,
+    },
+    ToolDef {
+        name: "nexus_file_mutation_diff",
+        description: "Carica i contenuti completi prima e dopo di una specifica mutazione file, per mostrare il diff all'utente prima di un eventuale ripristino. Usalo dopo nexus_file_mutations_list quando devi presentare il dettaglio di un cambiamento.",
+        schema: r#"{"type":"object","required":["project_id","mutation_id"],"properties":{"project_id":{"type":"string","description":"UUID del progetto"},"mutation_id":{"type":"integer","description":"ID della mutazione (dalla list)"}}}"#,
+    },
+    ToolDef {
+        name: "nexus_file_revert",
+        description: "Ripristina un file allo stato precedente a una mutazione specifica, oppure annulla l'ultima mutazione del progetto. Usalo quando l'utente dice 'annulla', 'torna indietro', 'ripristina', 'rimedia agli errori', dopo aver chiarito quale modifica annullare. Per sicurezza il revert fallisce se il file e' stato modificato dopo la mutazione (l'utente deve confermare con force=true).",
+        schema: r#"{"type":"object","required":["project_id"],"properties":{"project_id":{"type":"string","description":"UUID del progetto"},"mutation_id":{"type":"integer","description":"ID specifico della mutazione da annullare. Se assente, annulla l'ULTIMA mutazione annullabile del progetto."},"force":{"type":"boolean","description":"Se true sovrascrive anche in caso di conflict (il file e' stato modificato dopo). Default false."}}}"#,
+    },
+
     // ── editor UI ─────────────────────────────────────────────────────────
     ToolDef {
         name: "nexus_open_file_in_editor",

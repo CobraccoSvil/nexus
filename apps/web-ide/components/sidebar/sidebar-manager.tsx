@@ -2,6 +2,7 @@
 import { useThemeColors } from "../../lib/theme";
 import { shortenAbsolutePath } from "../../lib/format";
 import { DocumentsSidebar } from "./documents-sidebar";
+import { MutationsSidebar } from "./mutations-sidebar";
 import { ProjectExplorer } from "../project-explorer";
 import { SourceControlPanel } from "../git/source-control-panel";
 import { ServerMonitorPanel } from "./server-monitor-panel";
@@ -24,6 +25,7 @@ export type SidebarView =
   | "source-control"
   | "run"
   | "docs"
+  | "mutations"
   | "server-monitor"
   | "project-db"
   | "knowledge";
@@ -306,6 +308,15 @@ export function SidebarManager({
   if (activeSidebarView === "docs") {
     return (
       <DocumentsSidebar
+        project={project}
+        onOpenInEditor={(relativePath) => onOpenFile(relativePath)}
+      />
+    );
+  }
+
+  if (activeSidebarView === "mutations") {
+    return (
+      <MutationsSidebar
         project={project}
         onOpenInEditor={(relativePath) => onOpenFile(relativePath)}
       />

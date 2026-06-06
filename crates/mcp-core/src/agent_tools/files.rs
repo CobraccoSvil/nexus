@@ -332,6 +332,34 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
         }
     }
     let existed_before = target.exists();
+    // Tracking ripristinabile (mig 0349): legge lo stato corrente PRIMA della
+    // scrittura e registra (project_id, session_id, file_path, before, after)
+    // in `file_mutations`. Cosi' un revert successivo riporta il file allo
+    // stato attuale. Best-effort: se la registrazione fallisce loggiamo ma non
+    // blocchiamo la scrittura (l'agente non puo' restare bloccato per un bug
+    // della tabella di audit).
+    let before_for_track: Option<String> = if existed_before {
+        tokio::fs::read_to_string(&target).await.ok()
+    } else {
+        None
+    };
+    if let Err(e) = crate::file_mutations::record_mutation(
+        &ctx.db,
+        ctx.project_id,
+        ctx.session_id,
+        Some(ctx.user_id),
+        path_str,
+        "write_file",
+        before_for_track.as_deref(),
+        Some(content),
+    )
+    .await
+    {
+        tracing::warn!(
+            project_id = %ctx.project_id, path = %path_str,
+            "file_mutations::record_mutation fallita (write_file): {e}"
+        );
+    }
     match tokio::fs::write(&target, content).await {
         Ok(()) => {
             // Dispatcher: notifica Explorer/Editor in tempo reale
@@ -822,6 +850,26 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
             } else {
                 new_content_lf
             };
+            // Tracking ripristinabile (mig 0349): registra before/after PRIMA
+            // della scrittura. raw_content e' il contenuto preesistente
+            // (gia' letto sopra). best-effort: warn ma non blocca.
+            if let Err(e) = crate::file_mutations::record_mutation(
+                &ctx.db,
+                ctx.project_id,
+                ctx.session_id,
+                Some(ctx.user_id),
+                path_str,
+                "edit_file",
+                Some(&raw_content),
+                Some(&new_content),
+            )
+            .await
+            {
+                tracing::warn!(
+                    project_id = %ctx.project_id, path = %path_str,
+                    "file_mutations::record_mutation fallita (edit_file): {e}"
+                );
+            }
             match tokio::fs::write(&target, &new_content).await {
                 Ok(()) => {
                     nexus_events::dispatcher::emit(

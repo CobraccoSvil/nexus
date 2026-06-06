@@ -27,6 +27,7 @@ export const sidebarItems: Array<{ key: SidebarView; label: string; icon: string
   { key: "source-control", label: "Git", icon: "⑂" },
   { key: "run", label: "Run", icon: "▶" },
   { key: "docs", label: "Documenti", icon: "📄" },
+  { key: "mutations", label: "Modifiche", icon: "↶" },
   { key: "server-monitor", label: "Monitor", icon: "▣" },
 ];
 

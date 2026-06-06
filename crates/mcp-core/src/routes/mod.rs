@@ -15,6 +15,7 @@ mod dispatcher;
 mod documents;
 mod knowledge;
 mod meta_docs;
+mod mutations;
 mod project_db;
 mod prompt_templates;
 mod protected;
@@ -58,6 +59,7 @@ pub fn build_app_router(state: AppState, cors: CorsLayer) -> Router {
     let router = crate::wiki::routes::merge(router, &state);
     let router = change_drafts::merge(router, &state);
     let router = documents::merge(router, &state);
+    let router = mutations::merge(router, &state);
     let router = chat_commands::merge(router, &state);
     let router = security_quota::merge(router, &state);
     let router = dispatcher::merge(router, &state);
