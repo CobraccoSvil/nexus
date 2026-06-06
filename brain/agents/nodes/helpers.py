@@ -114,6 +114,94 @@ def _load_adaptive_budget_config() -> dict[str, Any]:
     return config
 
 
+# ── Floor selettivo del tier per i task agentici (cache 60s) ─────────────────
+# Un task che entra nel loop tool-use ed e' "pesante" (agentic_score alto o
+# budget iterazioni alto) merita un modello tool-robust anche quando l'utente ha
+# scelto behavior_mode "veloce"/"economica": sotto un modello lite il loop
+# agentico (tool forcing multi-step) tende a fallire. Il floor scatta su segnali
+# SEMANTICI (agentic_score dal classifier LLM) o sul budget gia' calcolato, NON
+# su keyword (a differenza del vecchio is_risky_task, rimosso). Settings DB (reg. G).
+_TIER_FLOOR_CACHE: dict[str, Any] = {"loaded_at": 0.0, "config": None}
+_TIER_FLOOR_TTL_SEC = 60.0
+_TIER_FLOOR_DEFAULTS = {
+    "enabled": True,
+    "agentic_score_min": 0.6,
+    "iteration_budget_min": 160,
+    "mode": "bilanciata",
+}
+# Modalita' "economiche" su cui si applica il floor; le altre restano invariate.
+_TIER_FLOOR_LOW_MODES = {"veloce", "economica"}
+
+
+def _load_tier_floor_config() -> dict[str, Any]:
+    """Carica agent.tier_floor.* dal DB con cache 60s. Mai solleva (degraded mode)."""
+    now = time.time()
+    if _TIER_FLOOR_CACHE["config"] is not None and (now - _TIER_FLOOR_CACHE["loaded_at"]) < _TIER_FLOOR_TTL_SEC:
+        return _TIER_FLOOR_CACHE["config"]
+    config = dict(_TIER_FLOOR_DEFAULTS)
+    try:
+        import psycopg2
+        db_url = get_db_url()  # regola G: niente fallback hardcoded sull'URL
+        with psycopg2.connect(db_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT key, value FROM settings WHERE key LIKE 'agent.tier_floor.%%'")
+                for key, value in cur.fetchall():
+                    if key == "agent.tier_floor.enabled":
+                        config["enabled"] = str(value).strip().lower() not in ("false", "0", "off", "no")
+                    elif key == "agent.tier_floor.agentic_score_min":
+                        try:
+                            config["agentic_score_min"] = float(value)
+                        except (TypeError, ValueError):
+                            pass
+                    elif key == "agent.tier_floor.iteration_budget_min":
+                        try:
+                            config["iteration_budget_min"] = int(value)
+                        except (TypeError, ValueError):
+                            pass
+                    elif key == "agent.tier_floor.mode":
+                        if str(value).strip():
+                            config["mode"] = str(value).strip()
+    except Exception as exc:
+        logger.warning("tier_floor: load DB fallito, uso defaults (%s)", exc)
+    _TIER_FLOOR_CACHE["config"] = config
+    _TIER_FLOOR_CACHE["loaded_at"] = now
+    return config
+
+
+def apply_agentic_tier_floor(behavior_mode: str, state: dict, cfg: dict | None = None) -> str:
+    """Ritorna il behavior_mode effettivo applicando il floor selettivo.
+
+    Se il task e' agentico "pesante" (agentic_score >= soglia OPPURE
+    iteration_budget >= soglia) e la modalita' richiesta e' "veloce"/"economica",
+    eleva al `mode` del floor (default "bilanciata"), cosi' il routing sceglie un
+    modello tool-robust invece di un lite. Altrimenti lascia behavior_mode
+    invariato (small-talk e task semplici rispettano la modalita' scelta).
+    Mai solleva.
+    """
+    bm = (behavior_mode or "").strip().lower()
+    if bm not in _TIER_FLOOR_LOW_MODES:
+        return behavior_mode
+    cfg = cfg or _load_tier_floor_config()
+    if not cfg.get("enabled", True):
+        return behavior_mode
+    try:
+        score = float(state.get("agentic_score") or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    try:
+        budget = int(state.get("iteration_budget") or 0)
+    except (TypeError, ValueError):
+        budget = 0
+    if score >= float(cfg.get("agentic_score_min", 0.6)) or budget >= int(cfg.get("iteration_budget_min", 160)):
+        floor_mode = str(cfg.get("mode") or "bilanciata")
+        logger.info(
+            "tier_floor: task agentico (agentic_score=%.2f budget=%d) mode=%s -> %s",
+            score, budget, bm, floor_mode,
+        )
+        return floor_mode
+    return behavior_mode
+
+
 # ── Cache G1 nudge cap (TTL 60s) ────────────────────────────────────────────
 # Numero massimo di re-execution G1 ("risposta descrittiva su action request")
 # per singolo run prima di forzare chiusura con messaggio assistant esplicito.

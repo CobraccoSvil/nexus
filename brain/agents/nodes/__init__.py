@@ -73,6 +73,7 @@ from .helpers import (
     _inject_language_reminder,
     estimate_prompt_complexity,
     compute_iteration_budget,
+    apply_agentic_tier_floor,
     _NEXUS_THINKING_CACHE,
     _NEXUS_THINKING_TTL_SEC,
     _nexus_thinking_enabled,
@@ -1600,7 +1601,11 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             # task rischiosi (override automatico a behavior_mode "approfondita"
             # se rileva verbi distruttivi: rm -rf, drop table, docker prune, ecc.)
             _last_msg_text = messages[-1].content if messages else ""
-            decision = _router.route_model(intent, token_budget, behavior_mode, message=str(_last_msg_text))
+            # Floor selettivo: un task agentico "pesante" (agentic_score/budget alto)
+            # in modalita' veloce/economica viene elevato a un tier tool-robust, cosi'
+            # il loop tool-use non cade su un modello lite. Non tocca sticky/override.
+            effective_mode = apply_agentic_tier_floor(behavior_mode, state)
+            decision = _router.route_model(intent, token_budget, effective_mode, message=str(_last_msg_text))
             provider = provider or decision.provider
             model = model or decision.model
             logger.info("executor_node routing: %s", decision.rationale)

@@ -159,6 +159,13 @@ _LAZY_MINIMAL_TOOLKIT = [
     # menzionato nella risposta. Il tool ritorna { _ui_action: "open_file" }
     # che il frontend intercetta per dispatchare l'evento.
     "nexus_open_file_in_editor",
+    # Delega a sub-agent (gia' abilitata via orchestrator.subagents_enabled):
+    # esposta direttamente nel toolkit agentico cosi' il modello puo' delegare
+    # task multi-file/multi-dominio a sub-agent specializzati senza doverla
+    # scoprire prima via nexus_mcp_tool_search (riduce i giri M16). I guard-rail
+    # (whitelist kind, max_depth, cost_cap) restano lato server.
+    "dispatch_subagent",
+    "dispatch_subagents",
 ]
 
 
