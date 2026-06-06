@@ -19,7 +19,6 @@ import {
 import { BehaviorModeSection } from "./behavior-mode-section";
 import { PurposeModelsSection } from "./purpose-models-section";
 import { ManualConfigSection } from "./manual-config-section";
-import { ParallelAgentsSection } from "./parallel-agents-section";
 import { NexusActiveRoutingSection } from "./nexus-active-routing-section";
 
 export type { SettingEntry, BehaviorMode, ProviderName, RoutingConfigState };
@@ -45,20 +44,6 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
   const [error, setError] = useState<string | null>(null);
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [behaviorSaved, setBehaviorSaved] = useState(false);
-  // Allineato al pannello admin Orchestrator (PUNTO UNICO): stesse chiavi
-  // orchestrator.subagents_enabled / orchestrator.max_parallel_subagents.
-  // Le vecchie chiavi agent_parallel_* (tool dispatch_subtask, rimosso) sono
-  // deprecate e non piu' usate.
-  const [parallelEnabled, setParallelEnabled] = useState<boolean>(
-    () => settings.find((s) => s.key === "orchestrator.subagents_enabled")?.value === "true"
-  );
-  const [parallelMax, setParallelMax] = useState<number>(
-    () => parseInt(settings.find((s) => s.key === "orchestrator.max_parallel_subagents")?.value ?? "3", 10) || 3
-  );
-  const [parallelSaving, setParallelSaving] = useState(false);
-  const [parallelSaved, setParallelSaved] = useState(false);
-  const [parallelError, setParallelError] = useState<string | null>(null);
-
   // Nexus Active Routing Percentage (Q-Learning A/B)
   const [nexusRoutingPct, setNexusRoutingPct] = useState<number>(
     () => Math.max(0, Math.min(100,
@@ -71,12 +56,6 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
 
   useEffect(() => {
     setConfig(buildRoutingState(settings));
-    const parallelEnabledValue =
-      settings.find((s) => s.key === "orchestrator.subagents_enabled")?.value ?? "false";
-    const parsedParallelMax =
-      parseInt(settings.find((s) => s.key === "orchestrator.max_parallel_subagents")?.value ?? "3", 10) || 3;
-    setParallelEnabled(parallelEnabledValue.trim().toLowerCase() === "true");
-    setParallelMax(Math.max(1, Math.min(8, parsedParallelMax)));
     const parsedNexusPct =
       parseInt(settings.find((s) => s.key === "nexus_active_routing_pct")?.value ?? "0", 10) || 0;
     setNexusRoutingPct(Math.max(0, Math.min(100, parsedNexusPct)));
@@ -114,40 +93,6 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
       });
     return () => { active = false; };
   }, []);
-
-  const saveParallelSettings = async () => {
-    setParallelSaving(true);
-    setParallelSaved(false);
-    setParallelError(null);
-    try {
-      const res = await fetch(`${API_BASE}/api/admin/settings`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({
-          settings: [
-            { key: "orchestrator.subagents_enabled", value: parallelEnabled ? "true" : "false" },
-            { key: "orchestrator.max_parallel_subagents", value: String(Math.max(1, Math.min(8, parallelMax))) },
-          ],
-        }),
-      });
-      const payload = await res.json().catch(() => null);
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
-      }
-      if (payload && payload.status && payload.status !== "ok") {
-        const errors = Array.isArray(payload.errors) ? payload.errors.join(" | ") : "Errore salvataggio";
-        throw new Error(errors);
-      }
-      setParallelSaved(true);
-      setTimeout(() => setParallelSaved(false), 2000);
-      await onSaveComplete();
-    } catch (saveError) {
-      setParallelError(saveError instanceof Error ? saveError.message : "Salvataggio non riuscito");
-    } finally {
-      setParallelSaving(false);
-    }
-  };
 
   const saveNexusPct = async () => {
     setNexusPctSaving(true);
@@ -338,17 +283,9 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
         </div>
       </div>
 
-      {/* Sezione Agenti Paralleli */}
-      <ParallelAgentsSection
-        parallelEnabled={parallelEnabled}
-        setParallelEnabled={setParallelEnabled}
-        parallelMax={parallelMax}
-        setParallelMax={setParallelMax}
-        parallelSaving={parallelSaving}
-        parallelSaved={parallelSaved}
-        parallelError={parallelError}
-        saveParallelSettings={saveParallelSettings}
-      />
+      {/* I controlli sub-agent/parallelismo vivono ora in un unico pannello:
+          AI & Prompt -> Orchestrator (/admin/orchestrator). Qui rimossi per
+          evitare doppia configurazione delle stesse chiavi orchestrator.*. */}
 
       {/* Sezione Nexus Active Routing (Q-Learning A/B) */}
       <NexusActiveRoutingSection

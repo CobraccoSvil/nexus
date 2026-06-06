@@ -297,8 +297,6 @@ export function SettingsPanel({ category }: SettingsPanelProps) {
     ? settings.filter(
         (setting) =>
           setting.category === "routing" ||
-          setting.key === "orchestrator.subagents_enabled" ||
-          setting.key === "orchestrator.max_parallel_subagents" ||
           setting.key === "nexus_active_routing_pct",
       )
     : items;

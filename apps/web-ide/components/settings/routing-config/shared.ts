@@ -140,8 +140,6 @@ export const MANAGED_ROUTING_KEYS = new Set([
   "routing_test_providers",
   "routing_docs_providers",
   "routing_architecture_providers",
-  "orchestrator.subagents_enabled",
-  "orchestrator.max_parallel_subagents",
 ]);
 
 function normalizeProviderChain(values: string[]): ProviderName[] {
