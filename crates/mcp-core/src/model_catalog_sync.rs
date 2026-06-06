@@ -267,11 +267,23 @@ pub(crate) fn classify_capabilities(
         "deepseek" => m.contains("reasoner") || m.contains("v4"),
         // Mistral magistral: linea reasoning.
         "mistral" => m.contains("magistral"),
-        // Google: i *-pro 2.x sono thinking e danno MALFORMED sul tool-forcing
-        // (mig 0274). I flash NON lo sono.
-        "google" => m.contains("pro") && !m.contains("flash"),
+        // Google: i Gemini 2.5 NON sono reasoning-only da escludere. Sono
+        // dual-mode tool-capable e si gestiscono via agentic_thinking_policy
+        // ='disable_for_tools' (gestito sotto da `gemini_25_thinking`): girano
+        // non-thinking nei tool-loop, evitando il MALFORMED_FUNCTION_CALL.
+        "google" => false,
         _ => false,
     };
+    // Gemini 2.5 (pro E flash, ESCLUSO flash-lite) ha il thinking attivo di
+    // default: col function calling in modalita' thinking produce
+    // MALFORMED_FUNCTION_CALL (mig 0274). Va trattato come dual-mode -> tool-capable
+    // + policy 'disable_for_tools' (non-thinking nei tool-loop), NON escluso
+    // dall'agentico. Bug storico: l'euristica precedente assumeva che solo i
+    // *-pro fossero thinking ("flash NON lo sono"), lasciando gemini-2.5-flash
+    // con policy 'none' -> thinking attivo coi tool -> MALFORMED ad ogni run.
+    // flash-lite NON ha thinking di default: resta policy 'none'.
+    let gemini_25_thinking =
+        p == "google" && m.contains("gemini-2.5") && !m.contains("flash-lite");
     // Marker generici nel nome, cross-provider.
     let name_reasoning = m.contains("reasoner")
         || m.contains("reasoning")
@@ -287,8 +299,9 @@ pub(crate) fn classify_capabilities(
         || (meta_reasoning.unwrap_or(false) && !is_hybrid_agentic(&p, &m));
 
     // Concetto B (non forzare tool_choice): tutti i reasoning + gli ibridi con
-    // extended thinking (Claude opus/sonnet).
-    let uses_thinking_mode = is_reasoning_signal || is_hybrid_agentic(&p, &m);
+    // extended thinking (Claude opus/sonnet) + i Gemini 2.5 thinking.
+    let uses_thinking_mode =
+        is_reasoning_signal || is_hybrid_agentic(&p, &m) || gemini_25_thinking;
 
     // Policy agentica canonica (ADR 0025):
     //   - exclude: reasoning-only SENZA function calling (deepseek-reasoner).
@@ -300,7 +313,7 @@ pub(crate) fn classify_capabilities(
         "exclude"
     } else if p == "openai" && reasoning_only_family {
         "native"
-    } else if is_reasoning_signal || is_hybrid_agentic(&p, &m) {
+    } else if is_reasoning_signal || is_hybrid_agentic(&p, &m) || gemini_25_thinking {
         "disable_for_tools"
     } else {
         "none"
@@ -1166,12 +1179,21 @@ mod tests {
     }
 
     #[test]
-    fn classify_gemini_flash_non_e_reasoning() {
-        // gemini flash NON e' reasoning (solo i *-pro lo sono).
-        let c = classify_capabilities("google", "gemini-2.5-flash", None, None, None);
-        assert!(!c.is_thinking);
+    fn classify_gemini_25_thinking_dual_mode() {
+        // Gemini 2.5 (pro E flash) ha il thinking attivo di default: e' dual-mode,
+        // NON reasoning-only. Quindi is_thinking=false (eleggibile all'agentico),
+        // uses_thinking_mode=true e policy='disable_for_tools' (non-thinking nei
+        // tool-loop -> niente MALFORMED_FUNCTION_CALL). flash-lite NON ha thinking.
+        let flash = classify_capabilities("google", "gemini-2.5-flash", None, None, None);
+        assert!(!flash.is_thinking, "gemini-2.5-flash NON va escluso dall'agentico");
+        assert!(flash.uses_thinking_mode, "gemini-2.5-flash e' thinking");
+        assert_eq!(flash.agentic_thinking_policy, "disable_for_tools");
         let pro = classify_capabilities("google", "gemini-2.5-pro", None, None, None);
-        assert!(pro.is_thinking, "gemini-2.5-pro e' thinking -> escluso da agentico");
+        assert!(!pro.is_thinking, "gemini-2.5-pro e' dual-mode, non reasoning-only");
+        assert_eq!(pro.agentic_thinking_policy, "disable_for_tools");
+        let lite = classify_capabilities("google", "gemini-2.5-flash-lite", None, None, None);
+        assert!(!lite.uses_thinking_mode, "gemini-2.5-flash-lite NON e' thinking");
+        assert_eq!(lite.agentic_thinking_policy, "none");
     }
 
     // ── ADR 0025: agentic_thinking_policy per famiglia ──
@@ -1191,6 +1213,9 @@ mod tests {
         // Modelli non-thinking standard -> none.
         assert_eq!(p("openai", "gpt-4o"), "none");
         assert_eq!(p("mistral", "mistral-large-2411"), "none");
-        assert_eq!(p("google", "gemini-2.5-flash"), "none");
+        // Gemini 2.5 flash/pro: thinking di default -> disable_for_tools.
+        // flash-lite NON e' thinking -> none.
+        assert_eq!(p("google", "gemini-2.5-flash"), "disable_for_tools");
+        assert_eq!(p("google", "gemini-2.5-flash-lite"), "none");
     }
 }
