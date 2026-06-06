@@ -493,18 +493,12 @@ pub async fn ai_suggest_handler(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?
     .ok_or((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "template non trovato"}))))?;
 
-    // Default provider/model letti da DB (purpose: admin_fallback_default)
-    // Errore esplicito 503 se la matrice non e' caricata o il purpose non e' configurato.
-    let matrix_arc = state.orchestrator.routing_matrix.current_async().await
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": format!("routing_matrix non disponibile: {e}. Verifica DB e migrazioni 0101/0102.")
-        }))))?;
-    let (purpose_provider, purpose_model) = matrix_arc
-        .purpose_model("admin_fallback_default")
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "purpose 'admin_fallback_default' non configurato in nexus_purpose_model. \
-                      Esegui INSERT su nexus_purpose_model con il modello desiderato."
-        }))))?;
+    // Default provider/model dal PUNTO UNICO tier-only (regola L/G).
+    let (purpose_provider, purpose_model) =
+        crate::internal_routing::resolve_purpose_model(&state, "admin_fallback_default")
+            .await
+            .into_model("admin_fallback_default")
+            .map_err(|m| (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": m}))))?;
     let provider: String = req
         .provider
         .as_deref()

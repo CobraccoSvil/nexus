@@ -355,19 +355,11 @@ pub async fn generate_title_for_doc(state: &AppState, doc_id: Uuid) -> Result<Ti
         return Ok(report);
     }
 
-    // Risolvi modello via purpose -> routing_matrix (regola G).
-    let matrix = state
-        .orchestrator
-        .routing_matrix
-        .current_async()
+    // Risolvi modello dal PUNTO UNICO tier-only (regola L/G).
+    let (provider, model) = crate::internal_routing::resolve_purpose_model(state, "wiki_title_gen")
         .await
-        .map_err(|e| anyhow!("routing_matrix non disponibile: {e}"))?;
-    let (provider, model) = matrix.purpose_model("wiki_title_gen").ok_or_else(|| {
-        anyhow!(
-            "purpose 'wiki_title_gen' non configurato in nexus_purpose_model \
-             (applicare migrazione 0306)"
-        )
-    })?;
+        .into_model("wiki_title_gen")
+        .map_err(|m| anyhow!(m))?;
 
     let prompt = render_prompt(state, &doc, settings.max_words).await?;
 

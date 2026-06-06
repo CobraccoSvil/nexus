@@ -67,17 +67,23 @@ pub static NEXUS_AB_FORCED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// - **Haiku** per task brevi/ripetitivi dove latenza e costo contano
 ///   piu' della profondita' (Tester, TechWriter, monitoring, ETL, i18n, ecc.).
 ///
-/// I nomi modello concreti vengono da `nexus_purpose_model` (mig 0104):
-///   `agent_tier_opus`, `agent_tier_sonnet`, `agent_tier_haiku`.
+/// I tier-alias `agent_tier_opus|sonnet|haiku` sono purpose in
+/// `nexus_purpose_model` con `tier` valorizzato: la risoluzione passa dal PUNTO
+/// UNICO tier-only `resolve_purpose_model_db` (regola L/G), che sceglie il
+/// modello dal catalog per quel tier escludendo i provider in cooldown. Niente
+/// piu' lettura del (provider, model_id) statico.
 ///
-/// Se un variant non e' in questa tabella o il tier non e' nel DB, il sito
-/// di chiamata incrementa `NEXUS_AB_FALLBACK_TOTAL` e mantiene la config originale.
-pub fn agent_type_to_model(
+/// Se un variant non e' mappato a un tier, o il tier non risolve, ritorna None
+/// e il sito di chiamata incrementa `NEXUS_AB_FALLBACK_TOTAL`.
+pub async fn agent_type_to_model(
+    db: &sqlx::PgPool,
     agent_type: &AgentType,
-    matrix: &RoutingMatrix,
 ) -> Option<(String, String)> {
     let tier_key = agent_type_to_tier(agent_type)?;
-    matrix.purpose_model(tier_key)
+    crate::internal_routing::resolve_purpose_model_db(db, tier_key)
+        .await
+        .into_model(tier_key)
+        .ok()
 }
 
 const TIER_OPUS: &str = "agent_tier_opus";
@@ -441,37 +447,25 @@ mod tests {
         }
     }
 
+    // NB: la risoluzione tier->modello (agent_type_to_model) e' ora async e passa
+    // dal punto unico tier-only (testato in internal_routing). Qui testiamo la
+    // mappatura PURA agent_type->tier, che e' la logica propria di questo modulo.
     #[test]
-    fn test_agent_type_to_model_core_agents() {
-        let m = test_matrix();
-        let sonnet = Some((
-            "test_provider_sonnet".to_string(),
-            "test_model_sonnet".to_string(),
-        ));
-        let haiku = Some((
-            "test_provider_haiku".to_string(),
-            "test_model_haiku".to_string(),
-        ));
-        let opus = Some((
-            "test_provider_opus".to_string(),
-            "test_model_opus".to_string(),
-        ));
-
-        assert_eq!(agent_type_to_model(&AgentType::Coder, &m), sonnet);
-        assert_eq!(agent_type_to_model(&AgentType::Tester, &m), haiku);
-        assert_eq!(agent_type_to_model(&AgentType::Reviewer, &m), sonnet);
-        assert_eq!(agent_type_to_model(&AgentType::Architect, &m), opus);
+    fn test_agent_type_to_tier_core_agents() {
+        assert_eq!(agent_type_to_tier(&AgentType::Coder), Some(TIER_SONNET));
+        assert_eq!(agent_type_to_tier(&AgentType::Tester), Some(TIER_HAIKU));
+        assert_eq!(agent_type_to_tier(&AgentType::Reviewer), Some(TIER_SONNET));
+        assert_eq!(agent_type_to_tier(&AgentType::Architect), Some(TIER_OPUS));
     }
 
     #[test]
-    fn test_agent_type_to_model_all_60_variants_mapped() {
-        let m = test_matrix();
+    fn test_agent_type_to_tier_all_60_variants_mapped() {
         let registered = all_registered_agent_types();
         assert_eq!(registered.len(), 60, "expected 60 registered variants");
         for variant in &registered {
             assert!(
-                agent_type_to_model(variant, &m).is_some(),
-                "missing model mapping for {:?}",
+                agent_type_to_tier(variant).is_some(),
+                "missing tier mapping for {:?}",
                 variant
             );
         }
@@ -518,22 +512,8 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_type_to_model_custom_is_none() {
-        let m = test_matrix();
-        assert!(agent_type_to_model(&AgentType::Custom("anything".to_string()), &m).is_none());
-    }
-
-    #[test]
-    fn test_agent_type_to_model_returns_none_when_tier_missing_from_db() {
-        let empty_matrix = RoutingMatrix {
-            by_intent_mode: HashMap::new(),
-            default_models: HashMap::new(),
-            purpose_models: HashMap::new(),
-            purpose_tiers: HashMap::new(),
-            escalations: HashMap::new(),
-            loaded_at: Instant::now(),
-        };
-        assert!(agent_type_to_model(&AgentType::Coder, &empty_matrix).is_none());
+    fn test_agent_type_to_tier_custom_is_none() {
+        assert!(agent_type_to_tier(&AgentType::Custom("anything".to_string())).is_none());
     }
 
     #[test]

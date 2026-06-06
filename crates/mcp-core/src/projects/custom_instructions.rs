@@ -342,27 +342,13 @@ pub async fn generate_system_prompt(
     Extension(_claims): Extension<Claims>,
     Json(body): Json<GeneratePromptRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Default purpose-specific letto da DB (purpose: custom_instructions).
-    // Errore esplicito 503 se la matrice non e' caricata o il purpose non e' configurato.
-    let matrix_arc = state
-        .orchestrator
-        .routing_matrix
-        .current_async()
-        .await
-        .map_err(|e| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("routing_matrix non disponibile: {e}. Verifica DB e migrazioni 0101/0102."),
-            )
-        })?;
-    let (default_prov, default_model) = matrix_arc
-        .purpose_model("custom_instructions")
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "purpose 'custom_instructions' non configurato in nexus_purpose_model.".to_string(),
-            )
-        })?;
+    // Default purpose-specific risolto dal PUNTO UNICO tier-only (regola L/G).
+    // Errore esplicito 503 se il routing non risolve (niente fallback statico).
+    let (default_prov, default_model) =
+        crate::internal_routing::resolve_purpose_model(&state, "custom_instructions")
+            .await
+            .into_model("custom_instructions")
+            .map_err(|m| api_error(StatusCode::SERVICE_UNAVAILABLE, m))?;
     let provider = body
         .provider
         .as_deref()

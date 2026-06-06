@@ -507,21 +507,12 @@ pub async fn extract_triples_for_doc(
         anyhow::bail!("documento {doc_id} non trovato");
     };
 
-    // Risolvi modello via purpose -> routing_matrix.
-    let matrix = state
-        .orchestrator
-        .routing_matrix
-        .current_async()
-        .await
-        .map_err(|e| anyhow!("routing_matrix non disponibile: {e}"))?;
-    let (provider, model) = matrix
-        .purpose_model("wiki_triple_extract")
-        .ok_or_else(|| {
-            anyhow!(
-                "purpose 'wiki_triple_extract' non configurato in nexus_purpose_model \
-                 (applicare migrazione 0297)"
-            )
-        })?;
+    // Risolvi modello dal PUNTO UNICO tier-only (regola L/G).
+    let (provider, model) =
+        crate::internal_routing::resolve_purpose_model(state, "wiki_triple_extract")
+            .await
+            .into_model("wiki_triple_extract")
+            .map_err(|m| anyhow!(m))?;
 
     let prompt = render_prompt(state, &doc, settings.max_triples_per_doc).await?;
 

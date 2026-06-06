@@ -1883,29 +1883,12 @@ pub async fn precheck_chat_message(
     ]))
     .unwrap_or_default();
 
-    // Modello purpose-specific letto da DB (purpose: chat_feedback_generator).
-    // Errore esplicito 503 se la matrice non e' caricata o il purpose non e' configurato.
-    let matrix_arc = state
-        .orchestrator
-        .routing_matrix
-        .current_async()
-        .await
-        .map_err(|e| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("routing_matrix non disponibile: {e}. Verifica DB e migrazioni 0101/0102."),
-            )
-        })?;
-    let (provider_pf, model_pf) = matrix_arc
-        .purpose_model("chat_feedback_generator")
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "purpose 'chat_feedback_generator' non configurato in nexus_purpose_model. \
-             Esegui INSERT su nexus_purpose_model con il modello desiderato."
-                    .to_string(),
-            )
-        })?;
+    // Modello purpose-specific risolto dal PUNTO UNICO tier-only (regola L/G).
+    let (provider_pf, model_pf) =
+        crate::internal_routing::resolve_purpose_model(&state, "chat_feedback_generator")
+            .await
+            .into_model("chat_feedback_generator")
+            .map_err(|m| api_error(StatusCode::SERVICE_UNAVAILABLE, m))?;
     let raw = match state
         .orchestrator
         .neural
@@ -2041,28 +2024,12 @@ pub async fn feedback_assist_handler(
     ]))
     .unwrap_or_default();
 
-    // Modello purpose-specific letto da DB (purpose: chat_title_generator).
-    // Errore esplicito 503 se la matrice non e' caricata o il purpose non e' configurato.
-    let matrix_arc = state
-        .orchestrator
-        .routing_matrix
-        .current_async()
-        .await
-        .map_err(|e| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("routing_matrix non disponibile: {e}. Verifica DB e migrazioni 0101/0102."),
-            )
-        })?;
-    let (provider_pt, model_pt) = matrix_arc
-        .purpose_model("chat_title_generator")
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "purpose 'chat_title_generator' non configurato in nexus_purpose_model."
-                    .to_string(),
-            )
-        })?;
+    // Modello purpose-specific risolto dal PUNTO UNICO tier-only (regola L/G).
+    let (provider_pt, model_pt) =
+        crate::internal_routing::resolve_purpose_model(&state, "chat_title_generator")
+            .await
+            .into_model("chat_title_generator")
+            .map_err(|m| api_error(StatusCode::SERVICE_UNAVAILABLE, m))?;
     let raw = match state
         .orchestrator
         .neural

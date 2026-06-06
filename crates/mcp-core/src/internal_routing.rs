@@ -144,6 +144,28 @@ pub enum PurposeResolution {
     MatrixUnavailable(String),
 }
 
+impl PurposeResolution {
+    /// Riduce l'esito a `(provider, model)` oppure a un messaggio d'errore
+    /// leggibile (tier-only: nessun fallback). Helper per i call site che vogliono
+    /// solo il modello risolto e mappano l'errore nel proprio tipo. Evita di
+    /// duplicare il match a 4 rami in ogni chiamante (regola L).
+    pub fn into_model(self, purpose: &str) -> Result<(String, String), String> {
+        match self {
+            PurposeResolution::Resolved { provider, model, .. } => Ok((provider, model)),
+            PurposeResolution::NoCapableModel { tier } => Err(format!(
+                "nessun modello del tier '{tier}' disponibile per purpose '{purpose}' \
+                 (capability mancante o provider in cooldown)"
+            )),
+            PurposeResolution::NotFound => Err(format!(
+                "purpose '{purpose}' non configurato o privo di tier in nexus_purpose_model"
+            )),
+            PurposeResolution::MatrixUnavailable(e) => {
+                Err(format!("routing non disponibile per '{purpose}': {e}"))
+            }
+        }
+    }
+}
+
 /// CORE decisionale (PUNTO UNICO, regola L) della risoluzione purpose→modello.
 /// TIER-ONLY: il modello e' scelto ESCLUSIVAMENTE dal routing per tier
 /// (`best_model_for_tier`: miglior modello del catalog per tier+capability,

@@ -73,19 +73,14 @@ pub async fn submit_deep_review(
     let batch_model: String = match model_setting {
         Some(m) => m,
         None => {
-            // Letto dal registry DB (purpose: google_batch). Errore esplicito se mancante.
-            let matrix_arc = state.orchestrator.routing_matrix.current_async().await
-                .map_err(|e| api_error(StatusCode::SERVICE_UNAVAILABLE,
-                    format!("routing_matrix non disponibile: {e}. Verifica DB e migrazioni 0101/0102.")))?;
-            matrix_arc
-                .purpose_model("google_batch")
-                .map(|(_, m)| m)
-                .or_else(|| matrix_arc.default_model("google"))
-                .ok_or_else(|| {
-                    api_error(StatusCode::SERVICE_UNAVAILABLE,
-                    "Modello google_batch non configurato. Imposta settings.google_batch_model \
-                     o popola nexus_purpose_model con purpose='google_batch'.".to_string())
-                })?
+            // Risolto dal PUNTO UNICO tier-only (regola L/G): niente fallback su
+            // default_model. Errore esplicito se il tier non risolve.
+            let (_prov, model) =
+                crate::internal_routing::resolve_purpose_model(&state, "google_batch")
+                    .await
+                    .into_model("google_batch")
+                    .map_err(|m| api_error(StatusCode::SERVICE_UNAVAILABLE, m))?;
+            model
         }
     };
 

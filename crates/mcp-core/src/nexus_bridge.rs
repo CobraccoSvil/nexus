@@ -1345,14 +1345,10 @@ pub async fn nexus_test_routing(
     let agent_type_str = format!("{:?}", decision.agent_type);
     let strategy_str = format!("{:?}", decision.strategy);
 
-    let (mapped_provider, mapped_model) = match state.routing_matrix.current_async().await {
-        Ok(matrix) => crate::nexus_routing::agent_type_to_model(&decision.agent_type, &matrix)
-            .unwrap_or_else(|| ("(unmapped)".to_string(), "(unmapped)".to_string())),
-        Err(_) => (
-            "(matrix_unavailable)".to_string(),
-            "(matrix_unavailable)".to_string(),
-        ),
-    };
+    let (mapped_provider, mapped_model) =
+        crate::nexus_routing::agent_type_to_model(&state.db, &decision.agent_type)
+            .await
+            .unwrap_or_else(|| ("(unmapped)".to_string(), "(unmapped)".to_string()));
 
     let prompt_key = crate::nexus_routing::agent_type_to_prompt_key(&decision.agent_type);
     let system_prompt = crate::nexus_routing::get_agent_system_prompt(&decision.agent_type);
