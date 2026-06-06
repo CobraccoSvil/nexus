@@ -18,6 +18,11 @@ _INTENT_EXEMPLARS: dict[str, list[str]] = {
         "fix questo problema nel file", "fix this problem in the file",
         "risolvi questo problema nel file", "correggi questo problema nel file",
         "fix the issue in the file", "fix the problem in the file",
+        # Osservazioni di malfunzionamento su elementi gia' presenti nel progetto
+        # (segnalazione di un problema concreto, non conversazione generica).
+        "il menu non funziona", "i link del menu sono sbagliati",
+        "le form sono mal disposte", "i campi del form sono troppo piccoli",
+        "il layout della pagina non e' rispettato", "la pagina e' rotta",
     ],
     "refactor": [
         "refactor this code", "clean up the implementation", "improve code quality",
@@ -57,6 +62,12 @@ _INTENT_EXEMPLARS: dict[str, list[str]] = {
         "mostra il codice di", "leggi il codice", "apri il file",
         "conta le righe", "quante funzioni", "cosa fa questa classe",
         "elenco dei file", "struttura del progetto", "tree della cartella",
+        # Domande conoscitive sull'esistenza/scopo di entita' del progetto
+        # attivo: richiedono ispezione dei file reali, non risposta in astratto.
+        "perche ci sono due file index.html", "perche esiste questo file",
+        "a cosa serve questo file nel progetto",
+        "come mai ci sono due cartelle uguali",
+        "che cosa rappresenta questa funzione",
     ],
     # ── architecture: design di sistema E scaffolding applicativo ────────────
     # Oltre al design "puro" (architettura, migrazione, valutazione approcci),
@@ -558,6 +569,20 @@ class SemanticRouter:
                 "fix questo problema", "fix this problem", "risolvi questo problema",
                 "risolvi il problema", "correggi questo", "correggi il",
                 "fix the issue", "fix the bug",
+                # Osservazioni di malfunzionamento/UI su qualcosa che esiste GIA'
+                # nel progetto: l'utente segnala un problema concreto, non fa
+                # small-talk. Senza questi pattern "il menu non funziona" o "le
+                # form sono mal disposte" cadevano su chat -> risposta generica
+                # su progetti ipotetici (audit chat progetto Marco, 06/06/2026).
+                "non funziona", "non funzionano", "non va", "non vanno",
+                "e' rotto", "è rotto", "sono rotti", "sono rotte", "si rompe",
+                "mal disposto", "mal disposti", "mal disposta", "mal disposte",
+                "non rispetta il layout", "non rispettano il layout",
+                "non rispetta lo stile", "fuori posto", "sballato", "sballati",
+                "è sbagliato", "e' sbagliato", "sono sbagliati", "sono sbagliate",
+                "link sbagliati", "link errati", "percorsi sbagliati",
+                "campi piccoli", "campi sono piccoli", "troppo piccoli",
+                "non si vede", "non si vedono", "visualizzazione sbagliata",
             ],
             "refactor": [
                 "/refactor", "refactor", "clean", "simplify", "extract", "improve",
@@ -596,6 +621,17 @@ class SemanticRouter:
                 # Domande generali sul progetto/codebase, intent informativo.
                 "ci sono nel progetto", "esistono nel progetto",
                 "dove si trova", "dove sta", "in quale file",
+                # Domande conoscitive sull'ESISTENZA o lo SCOPO di entita' del
+                # progetto attivo: vanno ispezionate sui file reali, non risposte
+                # in astratto. Includiamo le varianti senza accento ("perche")
+                # perche' gli utenti spesso le digitano cosi' (caso reale:
+                # "perche ci sono due file index.html?" -> prima cadeva su chat).
+                "perché c'è", "perché ci sono", "perche c'è", "perche ci sono",
+                "perché esiste", "perché esistono", "perche esiste", "perche esistono",
+                "perché ho due", "perché ci sono due", "perche ci sono due",
+                "perché abbiamo due", "come mai c'è", "come mai ci sono",
+                "come mai esiste", "a cosa serve", "a che serve",
+                "cosa rappresenta", "che cos'è questo file", "che file è",
             ],
             # Pattern test piu' specifici: il bare "test" matchava anche
             # nomi file come "test.js" o "test.spec.ts" facendo cadere

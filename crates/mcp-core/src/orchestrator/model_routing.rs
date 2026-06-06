@@ -394,6 +394,52 @@ pub(crate) async fn select_agentic_model(
     None
 }
 
+/// Mapping intent classificato -> intent_key per il lookup nella routing matrix.
+///
+/// Punto unico (regola L): un solo posto traduce l'intent + il budget token
+/// nella chiave usata da `route_model_with_mode`. Gli intent agentici hanno una
+/// chiave dedicata; `code_read` (mig 0335) ha la propria per NON cadere nel ramo
+/// conversazionale `chat_*` -> modello "lite" incapace di ispezionare i file;
+/// ogni altro intent (incluso `chat`) degrada su chat_breve/media/lunga in base
+/// alla lunghezza stimata.
+pub(crate) fn intent_key_for(
+    intent: &str,
+    estimated_tokens: u32,
+    token_thresholds: &TokenThresholds,
+) -> &'static str {
+    match intent {
+        "debug" => "debug",
+        "architecture" => "architecture",
+        "refactor" => "refactor",
+        "fix" => {
+            if estimated_tokens > token_thresholds.complex_fix {
+                "fix_complesso"
+            } else {
+                "fix_semplice"
+            }
+        }
+        "test" => "test",
+        "docs" => "docs",
+        "file_ops" => "file_ops",
+        "system_admin" => "system_admin",
+        // code_read: ispezione/lettura read-only del progetto. Intent_key
+        // dedicato (mig 0335) con modelli tool-robust, invece di cadere nel
+        // default chat_* -> modello "lite" che non sa ispezionare i file e
+        // risponde in astratto. Niente soglia token: la lettura non scala con
+        // l'output ma col numero di tool call (gestite dall'iter budget).
+        "code_read" => "code_read",
+        _ => {
+            if estimated_tokens <= token_thresholds.chat_breve {
+                "chat_breve"
+            } else if estimated_tokens <= token_thresholds.chat_media {
+                "chat_media"
+            } else {
+                "chat_lunga"
+            }
+        }
+    }
+}
+
 /// Route (intent, behavior_mode) -> (provider, model) consultando la matrice DB
 /// (cache 60s in-memory). Sostituisce la matrice hardcoded che era qui prima
 /// del refactor 0101 (vedi `crates/mcp-core/src/routing_matrix.rs`).
@@ -411,32 +457,8 @@ pub(crate) fn route_model_with_mode(
     token_thresholds: &TokenThresholds,
 ) -> RoutingDecision {
     // Determina intent_key composta usando le soglie da settings.routing.*
-    // (mig 0111). I valori default sono replicati in `TokenThresholds::defaults()`.
-    let intent_key = match intent {
-        "debug" => "debug",
-        "architecture" => "architecture",
-        "refactor" => "refactor",
-        "fix" => {
-            if estimated_tokens > token_thresholds.complex_fix {
-                "fix_complesso"
-            } else {
-                "fix_semplice"
-            }
-        }
-        "test" => "test",
-        "docs" => "docs",
-        "file_ops" => "file_ops",
-        "system_admin" => "system_admin",
-        _ => {
-            if estimated_tokens <= token_thresholds.chat_breve {
-                "chat_breve"
-            } else if estimated_tokens <= token_thresholds.chat_media {
-                "chat_media"
-            } else {
-                "chat_lunga"
-            }
-        }
-    };
+    // (mig 0111). Punto unico del mapping: vedi `intent_key_for`.
+    let intent_key = intent_key_for(intent, estimated_tokens, token_thresholds);
 
     // Routing matrix: (intent_key, mode) → (provider, model)
     // Budget-aware lookup: usa `lookup_with_budget` che applica le regole
@@ -952,5 +974,44 @@ mod tool_capability_gate_tests {
         assert!(!compute_no_capable_provider(true, true, true));
         assert!(!compute_no_capable_provider(true, true, false));
         assert!(!compute_no_capable_provider(true, false, true));
+    }
+}
+
+#[cfg(test)]
+mod intent_key_tests {
+    use super::{intent_key_for, TokenThresholds};
+
+    fn thresholds() -> TokenThresholds {
+        TokenThresholds::defaults()
+    }
+
+    #[test]
+    fn code_read_ha_intent_key_dedicato_non_chat() {
+        // Regressione mig 0335: `code_read` NON deve piu' cadere nel ramo
+        // conversazionale chat_*. Con un budget piccolo (sotto chat_breve) il
+        // vecchio default avrebbe dato "chat_breve" -> modello lite.
+        let t = thresholds();
+        assert_eq!(intent_key_for("code_read", 50, &t), "code_read");
+        // Anche con budget ampio resta code_read (niente soglia token).
+        assert_eq!(intent_key_for("code_read", 100_000, &t), "code_read");
+    }
+
+    #[test]
+    fn intent_sconosciuto_degrada_su_chat_per_token() {
+        // Un intent non mappato (es. "chat") usa le soglie token.
+        let t = thresholds(); // chat_breve=400, chat_media=1500
+        assert_eq!(intent_key_for("chat", 100, &t), "chat_breve");
+        assert_eq!(intent_key_for("chat", 800, &t), "chat_media");
+        assert_eq!(intent_key_for("chat", 5_000, &t), "chat_lunga");
+    }
+
+    #[test]
+    fn intent_agentici_conservano_la_chiave() {
+        let t = thresholds();
+        assert_eq!(intent_key_for("debug", 100, &t), "debug");
+        assert_eq!(intent_key_for("system_admin", 100, &t), "system_admin");
+        // fix si sdoppia su complex_fix (default 3000).
+        assert_eq!(intent_key_for("fix", 100, &t), "fix_semplice");
+        assert_eq!(intent_key_for("fix", 5_000, &t), "fix_complesso");
     }
 }
