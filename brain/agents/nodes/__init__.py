@@ -491,6 +491,32 @@ def _build_kb_rag_context(intent: str, project_id: str, query_text: str) -> str:
 
 # ─── Nodo: router ────────────────────────────────────────────────────────────
 
+# Meta-tool di gestione/discovery Nexus mantenuti per gli intent conversazionali.
+# Punto unico (regola L): un solo posto definisce cosa resta disponibile a una
+# chat. NON include tool con side-effect (write_file/edit_file/run_command/...):
+# una chat puo' ISPEZIONARE il progetto (scoprendo read_file/list_files via
+# nexus_mcp_tool_search e invocandoli via nexus_mcp_tool_call) ma non modificarlo.
+_CHAT_DISCOVERY_KEEP = frozenset({
+    "nexus_mcp_tool_search",
+    "nexus_mcp_tool_call",
+    "nexus_open_file_in_editor",
+    "recall_context",
+})
+
+
+def filter_chat_discovery_tools(tools_json: list[dict]) -> list[dict]:
+    """Per gli intent conversazionali tiene solo i meta-tool di gestione/discovery.
+
+    Prima qui si azzerava tools_json (chat single-shot senza tool): una domanda
+    riferita al progetto ma formulata in modo informativo ("perche' ci sono due
+    index.html?") riceveva una risposta generica su progetti ipotetici, perche'
+    il modello non poteva ispezionare i file reali. Mantenendo i meta-tool il
+    modello puo' scoprire e usare gli strumenti di lettura se la domanda lo
+    richiede, restando comunque rapido sullo small-talk (nessuna tool call).
+    """
+    return [t for t in (tools_json or []) if t.get("name") in _CHAT_DISCOVERY_KEEP]
+
+
 async def router_node(state: AgentState) -> dict[str, Any]:
     """Classifica l'intent utente e prepara il routing del modello.
 
@@ -805,21 +831,34 @@ async def router_node(state: AgentState) -> dict[str, Any]:
             intent, token_budget, behavior_mode,
         )
 
-    # ── Chat diretta: per gli intent CONVERSAZIONALI azzeriamo i tool ───────
-    # Una richiesta "chat" non e' agentica: non deve passare per l'executor con
-    # tool (iterazioni, cascade soft-failure, loop di ricerca-tool). Il subset
-    # intent riduce i tool ma gli _ALWAYS_ON_TOOLS (write_file, run_command,
-    # nexus_mcp_tool_search, ...) li bypassano, lasciando tools_json non vuoto ->
-    # l'executor sceglie il ramo agentico. Azzerando tools_json per gli intent
-    # conversazionali l'executor sceglie invece la completion single-shot (gate
-    # `elif tools_json`): risposta diretta e veloce, niente tool ne' escalation.
-    # Se una richiesta servisse davvero un tool verrebbe classificata con un
-    # altro intent (code_read/fix/...), non "chat".
+    # ── Chat: meta-tool di gestione/discovery, NON azzeramento totale ───────
+    # Prima azzeravamo tools_json per gli intent conversazionali, forzando la
+    # completion single-shot. Effetto collaterale grave: una domanda riferita al
+    # progetto ma formulata in modo informativo ("perche' ci sono due
+    # index.html?", "le form sono mal disposte") che il classifier etichetta
+    # "chat" riceveva una risposta GENERICA su progetti ipotetici, perche' il
+    # modello non aveva alcun tool per ispezionare i file reali.
+    #
+    # Ora manteniamo SOLO i meta-tool di gestione tool di Nexus
+    # (nexus_mcp_tool_search + nexus_mcp_tool_call) piu' open-file e
+    # recall_context. Questo lascia tools_json NON vuoto -> ramo agentico, ma:
+    #   - per small-talk vero ("ciao", "grazie") il modello non chiama alcun
+    #     tool e risponde diretto (nessun overhead di scrittura/esecuzione);
+    #   - per una domanda sul progetto il modello scopre i tool di lettura
+    #     (read_file/list_files/...) via nexus_mcp_tool_search e li invoca via
+    #     nexus_mcp_tool_call, ispezionando il progetto REALE invece di
+    #     rispondere a vuoto.
+    # Restano esclusi i tool con side-effect (write_file/edit_file/run_command/
+    # delete_file/...): una chat non deve modificare il progetto; se serve una
+    # modifica la richiesta viene classificata con un altro intent (fix/code_*).
     if intent in ("chat", "general_chat"):
-        updates["tools_json"] = []
+        _chat_base_tools = updates.get("tools_json", state.get("tools_json") or [])
+        _chat_kept = filter_chat_discovery_tools(_chat_base_tools)
+        updates["tools_json"] = _chat_kept
         logger.info(
-            "router_node: intent=%s conversazionale -> chat diretta (tools_json azzerato)",
-            intent,
+            "router_node: intent=%s -> meta-tool gestione/discovery (%d tool): "
+            "il modello puo' scoprire e ispezionare il progetto se la domanda lo richiede",
+            intent, len(_chat_kept),
         )
 
     # ── Meta-step `routing` per pubblicazione in chat ───────────────────────
