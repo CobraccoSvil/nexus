@@ -123,6 +123,33 @@ pub async fn send_chat_message(
         ));
     }
 
+    // ── Hardening anti-run-concorrente ───────────────────────────────────────
+    // Una sola generazione agentica attiva per sessione. Senza questa guardia,
+    // due POST /messages ravvicinate sulla stessa sessione avviano due agent run
+    // in parallelo: il secondo "ruba" lo stream SSE e un messaggio resta orfano
+    // (sintomo osservato: un messaggio inviato mentre un run e' in corso sparisce
+    // senza risposta). Rifiutiamo con 409: il frontend lo accoda e lo reinvia a
+    // fine run. Solo per modalita' agente (Study e' sincrono nella POST, si
+    // serializza da se'). Niente messaggio orfano: la guardia precede l'INSERT.
+    if parse_automation_mode(body.automation_mode.as_deref()) != AutomationMode::Study {
+        let active_run: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM agent_runs \
+             WHERE session_id = $1 AND status IN ('running', 'awaiting_confirmation') \
+             LIMIT 1",
+        )
+        .bind(context.session_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+        if active_run.is_some() {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "Un'operazione e' gia' in corso su questa sessione: attendi il completamento del run prima di inviare un nuovo messaggio.",
+            ));
+        }
+    }
+
     let user_message_id = insert_message(
         &state.db,
         context.session_id,
