@@ -51,16 +51,27 @@ pub async fn list_documents(
                 let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) else {
                     continue;
                 };
-                let path_str = path.to_string_lossy().to_string();
+                // FIX duplicati: normalizza al path RELATIVO alla project root,
+                // cosi' coincide col formato salvato da nexus_doc_generate
+                // (es. "docs/functional-analysis-v1.0.0.docx"). Prima usavamo
+                // path.to_string_lossy() (assoluto) e la guardia NOT EXISTS non
+                // matchava il record canonico -> doppio INSERT. La UNIQUE
+                // constraint introdotta in mig 0348 fa da rete di sicurezza.
+                let relative_path = path
+                    .strip_prefix(&ctx.root_path)
+                    .ok()
+                    .and_then(|p| p.to_str())
+                    .map(|s| s.replace('\\', "/"))
+                    .unwrap_or_else(|| path.to_string_lossy().to_string());
 
                 // Inferisci doc_type dal nome file.
                 let doc_type = infer_doc_type(file_name);
                 let title = humanize_filename(file_name);
 
-                // INSERT atomico con guardia NOT EXISTS: previene duplicati anche
-                // sotto chiamate concorrenti (React StrictMode invoca l'effect due
-                // volte). Senza UNIQUE constraint sul DB, due SELECT + INSERT
-                // separati creerebbero record duplicati.
+                // INSERT atomico con guardia NOT EXISTS: previene duplicati
+                // sotto chiamate concorrenti (React StrictMode invoca l'effect
+                // due volte). La UNIQUE constraint (mig 0348) e' la rete finale
+                // in caso di drift dei path tra call site.
                 let _ = sqlx::query(
                     "INSERT INTO project_documents
                      (project_id, doc_type, title, version, file_path, status, metadata)
@@ -68,12 +79,13 @@ pub async fn list_documents(
                      WHERE NOT EXISTS (
                          SELECT 1 FROM project_documents
                          WHERE project_id = $1 AND file_path = $4
-                     )",
+                     )
+                     ON CONFLICT (project_id, file_path) DO NOTHING",
                 )
                 .bind(project_id)
                 .bind(&doc_type)
                 .bind(&title)
-                .bind(&path_str)
+                .bind(&relative_path)
                 .bind(json!({ "source": "auto_discovery", "discovered_at": chrono::Utc::now().to_rfc3339() }))
                 .execute(&state.db)
                 .await;
