@@ -449,18 +449,13 @@ pub async fn ai_suggest_handler(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?
     .ok_or((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "template non trovato"}))))?;
 
-    // Provider/model da DB (purpose_model 'admin_fallback_default') se non specificati.
-    // Niente fallback hardcoded: se la tabella non e' configurata, errore esplicito.
+    // Provider/model risolti dal routing tier-only di mcp-core (PUNTO UNICO via
+    // HTTP, regola L/G/H): niente SQL statico, niente fallback. Solo se non
+    // specificati esplicitamente nella richiesta.
     let (db_provider, db_model) = if req.provider.is_none() || req.model.is_none() {
-        sqlx::query_as::<_, (String, String)>(
-            "SELECT provider, model_id FROM nexus_purpose_model WHERE purpose = 'admin_fallback_default' LIMIT 1"
-        )
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("DB error: {e}")}))))?
-        .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "nexus_purpose_model: 'admin_fallback_default' non configurato. Applica migrazione 0102."
-        }))))?
+        nexus_types::resolve_purpose_via_http(&state.db, "admin_fallback_default")
+            .await
+            .map_err(|m| (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": m}))))?
     } else {
         (String::new(), String::new())
     };
@@ -877,15 +872,10 @@ async fn run_batch_assign_tools_job(
     const BASE_MAX: usize = 3;
     const HARD_MAX: usize = 8;
 
-    // Provider/model per la selezione tool: letti da nexus_purpose_model
-    // purpose='admin.tool_selection' (mig 0171). CLAUDE.md §G: niente hardcode.
-    let (admin_provider, admin_model) = sqlx::query_as::<_, (String, String)>(
-        "SELECT provider, model_id FROM nexus_purpose_model WHERE purpose = 'admin.tool_selection' LIMIT 1"
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| format!("DB error caricando admin.tool_selection: {e}"))?
-    .ok_or_else(|| "nexus_purpose_model: 'admin.tool_selection' non configurato. Applica migrazione 0171.".to_string())?;
+    // Provider/model per la selezione tool dal routing tier-only di mcp-core
+    // (PUNTO UNICO via HTTP, regola L/G/H): niente SQL statico, niente fallback.
+    let (admin_provider, admin_model) =
+        nexus_types::resolve_purpose_via_http(&state.db, "admin.tool_selection").await?;
 
     let mut results: Vec<serde_json::Value> = Vec::new();
     let mut assigned = 0usize;

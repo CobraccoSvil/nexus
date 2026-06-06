@@ -181,13 +181,7 @@ impl PromptOptimizerWorker {
         &self,
         metrics: &PromptMetrics,
         weaknesses: &[String],
-        anthropic_key: &str,
     ) -> Option<GeneratedVariant> {
-        if anthropic_key.is_empty() {
-            warn!("prompt_optimizer: anthropic_api_key assente, skip generazione variante");
-            return None;
-        }
-
         let weakness_text = if weaknesses.is_empty() {
             "Nessuna debolezza specifica identificata. Migliorare chiarezza e autonomia.".to_string()
         } else {
@@ -246,47 +240,43 @@ Rispondi con JSON nel formato:
         // meno di costo. Adatto per il prompt_optimizer perche' le varianti
         // non servono in real-time. Manteniamo il flusso sincrono finche'
         // l'admin non attiva esplicitamente il flag.
-        // Modello da DB (nexus_purpose_model, purpose='prompt_optimizer').
-        // Niente fallback hardcoded: se non configurato, errore esplicito.
-        let optimizer_model: Option<(String,)> = sqlx::query_as(
-            "SELECT model_id FROM nexus_purpose_model WHERE purpose = 'prompt_optimizer' LIMIT 1"
-        )
-        .fetch_optional(self.pool.as_ref())
-        .await
-        .ok()
-        .flatten();
-        let model_id = match optimizer_model {
-            Some((m,)) => m,
-            None => {
-                error!("prompt_optimizer: nexus_purpose_model purpose='prompt_optimizer' non configurato");
-                return None;
-            }
-        };
+        // Provider+model dal routing tier-only di mcp-core (PUNTO UNICO via HTTP,
+        // regola L/G): niente piu' SELECT statica del model_id ne' provider fisso.
+        let (provider, model) =
+            match nexus_types::resolve_purpose_via_http(self.pool.as_ref(), "prompt_optimizer")
+                .await
+            {
+                Ok(pm) => pm,
+                Err(e) => {
+                    error!("prompt_optimizer: routing 'prompt_optimizer' non risolto: {e}");
+                    return None;
+                }
+            };
 
+        // Instrada via brain /complete (multi-provider): cosi' la chiamata rispetta
+        // il provider scelto dal routing, non e' piu' inchiodata ad Anthropic.
+        let brain_url = std::env::var("NEURAL_CORE_REST_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
         let client = reqwest::Client::new();
         let body = serde_json::json!({
-            "model": model_id,
+            "provider": provider,
+            "model": model,
+            "prompt": meta_prompt,
             "max_tokens": 4096,
             "temperature": 0.3,
-            "messages": [{
-                "role": "user",
-                "content": meta_prompt
-            }]
+            "json_mode": true,
         });
 
         let response = match client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", anthropic_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
+            .post(format!("{brain_url}/complete"))
             .json(&body)
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(90))
             .send()
             .await
         {
             Ok(r) => r,
             Err(e) => {
-                error!("prompt_optimizer: errore HTTP API Claude: {}", e);
+                error!("prompt_optimizer: errore HTTP brain /complete: {}", e);
                 return None;
             }
         };
@@ -294,19 +284,19 @@ Rispondi con JSON nel formato:
         if !response.status().is_success() {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
-            error!("prompt_optimizer: Claude API error {}: {}", status, &body_text[..body_text.len().min(200)]);
+            error!("prompt_optimizer: brain /complete error {}: {}", status, &body_text[..body_text.len().min(200)]);
             return None;
         }
 
         let resp_json: serde_json::Value = match response.json().await {
             Ok(v) => v,
             Err(e) => {
-                error!("prompt_optimizer: parse risposta Claude: {}", e);
+                error!("prompt_optimizer: parse risposta brain: {}", e);
                 return None;
             }
         };
 
-        let raw_text = resp_json["content"][0]["text"].as_str()?.to_string();
+        let raw_text = resp_json["content"].as_str()?.to_string();
 
         // Estrae il JSON dalla risposta
         let variant: GeneratedVariant = if let Ok(v) = serde_json::from_str(&raw_text) {
@@ -617,7 +607,6 @@ impl LearningWorker for PromptOptimizerWorker {
         let reflection_threshold = self.read_setting_f64("optimizer_reflection_threshold", 0.65).await;
         let max_concurrent = self.read_setting_i64("optimizer_max_concurrent_experiments", 3).await;
         let traffic_pct = self.read_setting_i64("optimizer_canary_traffic_pct", 10).await;
-        let anthropic_key = self.read_setting("anthropic_api_key").await;
 
         info!(
             "prompt_optimizer: avvio (auto_promote={} min_runs={} threshold={:.2})",
@@ -684,7 +673,7 @@ impl LearningWorker for PromptOptimizerWorker {
 
             let weaknesses = self.top_weaknesses(&candidate.prompt_key).await;
 
-            match self.generate_variant(candidate, &weaknesses, &anthropic_key).await {
+            match self.generate_variant(candidate, &weaknesses).await {
                 Some(variant) => {
                     match self.insert_variant_and_experiment(candidate, &variant, traffic_pct).await {
                         Ok(()) => generated += 1,

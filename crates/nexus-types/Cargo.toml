@@ -8,6 +8,7 @@ axum.workspace = true
 chrono.workspace = true
 nexus-auth = { path = "../nexus-auth" }
 nexus-cache = { path = "../nexus-cache" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
