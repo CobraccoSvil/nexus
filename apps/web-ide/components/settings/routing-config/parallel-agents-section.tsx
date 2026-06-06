@@ -46,7 +46,7 @@ export function ParallelAgentsSection({
       </div>
       <div className="text-sm text-muted" style={{ marginBottom: 14 }}>
         Permette all&apos;orchestratore di lanciare più agenti contemporaneamente per accelerare task complessi.
-        L&apos;agente può usare il tool <code style={{ fontFamily: "monospace", fontSize: 11 }}>dispatch_subtask</code> per delegare sotto-task in parallelo.
+        L&apos;agente può usare i tool <code style={{ fontFamily: "monospace", fontSize: 11 }}>dispatch_subagent</code> / <code style={{ fontFamily: "monospace", fontSize: 11 }}>dispatch_subagents</code> per delegare sotto-task a sub-agenti specializzati in parallelo.
       </div>
 
       <div className="flex-row" style={{ gap: 12, marginBottom: 12 }}>
@@ -85,12 +85,12 @@ export function ParallelAgentsSection({
       {parallelEnabled && (
         <div className="flex-row" style={{ gap: 10, marginBottom: 12 }}>
           <label className="text-sm" style={{ color: "var(--color-textSecondary)", minWidth: 160 }}>
-            Max agenti paralleli (1–5):
+            Max agenti paralleli (1–8):
           </label>
           <input
             type="number"
             min={1}
-            max={5}
+            max={8}
             value={parallelMax}
             onChange={(e) => setParallelMax(parseInt(e.target.value, 10) || 1)}
             style={{

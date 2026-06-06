@@ -1,0 +1,21 @@
+-- 0345_remove_orphan_parallel_agent_settings.sql
+--
+-- Rimuove le chiavi settings ORFANE `agent_parallel_enabled` / `agent_parallel_max`.
+--
+-- Causa radice: il pannello admin "Agenti Paralleli" (pagina Routing) scriveva
+-- queste due chiavi e dichiarava di pilotare il tool `dispatch_subtask`. Ma
+-- `dispatch_subtask` e' uno stub disabilitato dal refactor "Fase 4 / M55"
+-- (crates/mcp-core/src/agent_tools/profile_tools.rs) e nessun codice di
+-- esecuzione legge `agent_parallel_*`: il controllo era quindi puramente
+-- decorativo (mostrava "ATTIVO" senza alcun effetto).
+--
+-- Allineamento (regola L, punto unico): il parallelismo dei sub-agenti e'
+-- governato dal sistema VIVO `dispatch_subagent(s)` tramite
+-- `orchestrator.subagents_enabled` + `orchestrator.max_parallel_subagents`.
+-- Il pannello "Agenti Paralleli" e il pannello admin "Orchestrator" ora leggono
+-- e scrivono ENTRAMBI queste stesse chiavi; il tool Rust diretto rispetta
+-- `orchestrator.max_parallel_subagents` come tetto (prima clamp hardcoded 1-4).
+--
+-- Idempotente: DELETE su chiavi che potrebbero non esistere e' no-op.
+
+DELETE FROM settings WHERE key IN ('agent_parallel_enabled', 'agent_parallel_max');

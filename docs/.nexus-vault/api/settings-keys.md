@@ -109,8 +109,8 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent_narration_warn_after_ms` | `30000` | Millisecondi di run senza tool call dopo i quali il badge UI passa in stato warning (possibile loop di narrazione). |
 | `agent.no_orphan.min_ratio` | `0.4` | Frazione minima di moduli staged che l'entry servito deve raggiungere via grafo import per superare il gate. |
 | `agent.orchestrator_cfg_ttl_seconds` | `60` | TTL cache orchestrator_config (H-56) |
-| `agent_parallel_enabled` | `true` | Abilita l'esecuzione parallela di piu' agenti contemporaneamente per accelerare task complessi |
-| `agent_parallel_max` | `5` | Numero massimo di agenti paralleli per sessione (1-5) |
+| ~~`agent_parallel_enabled`~~ | _(rimossa, mig 0345)_ | Orfana: pilotava `dispatch_subtask` (stub rimosso in M55). Sostituita da `orchestrator.subagents_enabled`. |
+| ~~`agent_parallel_max`~~ | _(rimossa, mig 0345)_ | Orfana. Sostituita da `orchestrator.max_parallel_subagents` (tetto reale del parallelismo dei sub-agenti). |
 | `agent.planner.full_max_tokens` | `4096` | max_tokens per planner completo (H-43) |
 | `agent.planner.rationale_snippet_max` | `400` | Max char snippet rationale nel planner (H-42) |
 | `agent.planner.short_max_tokens` | `512` | max_tokens per planner short (H-45) |

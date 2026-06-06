@@ -295,7 +295,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
             "required": ["kind", "task"]
           }
         },
-        "max_parallel": {"type": "integer", "description": "Ampiezza ondata concorrente (default 2, max 4)"}
+        "max_parallel": {"type": "integer", "description": "Ampiezza ondata concorrente (default e tetto dal setting admin orchestrator.max_parallel_subagents)"}
       },
       "required": ["tasks"]
     }

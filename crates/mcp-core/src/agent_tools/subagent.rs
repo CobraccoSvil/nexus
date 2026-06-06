@@ -241,7 +241,8 @@ async fn run_single_subagent(
 ///
 /// Input:
 ///   - `tasks`: array di {kind, task, context?, expected_output_format?} (1-8)
-///   - `max_parallel`: ampiezza dell'ondata concorrente (default 2, max 4)
+///   - `max_parallel`: ampiezza dell'ondata concorrente (default e tetto dal
+///     setting admin `orchestrator.max_parallel_subagents`, hard cap 8)
 ///
 /// Esegue a ondate di `max_parallel` via join_all (I/O-bound verso il brain).
 /// E' la base del DAG scheduler parallelo (Comp.3b); i guard per-sub e il
@@ -254,11 +255,18 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
     if tasks.len() > 8 {
         return err("troppi task in un batch (max 8)");
     }
+    // Tetto effettivo dal setting admin (PUNTO UNICO, regola L): l'LLM puo'
+    // chiedere un'ampiezza d'ondata via `max_parallel`, ma viene clampata al
+    // massimo configurato in `orchestrator.max_parallel_subagents`. Prima qui
+    // c'era un clamp hardcoded (1,4) che ignorava il setting admin: il valore
+    // del pannello "Agenti Paralleli" non aveva quindi alcun effetto sul tool
+    // diretto. `MAX_PARALLEL_HARD_CAP` resta come rete di sicurezza anti-runaway.
+    let configured_max = read_max_parallel_subagents(ctx).await;
     let max_parallel = input
         .get("max_parallel")
         .and_then(|v| v.as_u64())
-        .unwrap_or(2)
-        .clamp(1, 4) as usize;
+        .unwrap_or(configured_max)
+        .clamp(1, configured_max) as usize;
 
     // Valida e normalizza ogni task prima di eseguire.
     let mut parsed: Vec<(String, String, String, String)> = Vec::with_capacity(tasks.len());
@@ -353,6 +361,26 @@ async fn read_subagent_settings(
         }
     }
     Ok((enabled, whitelist, max_depth, cost_cap, default_timeout))
+}
+
+/// Tetto massimo di sicurezza per l'ampiezza dell'ondata concorrente di
+/// sub-agenti. Il valore admin `orchestrator.max_parallel_subagents` puo'
+/// arrivare fino a qui; oltre e' considerato runaway e viene clampato.
+const MAX_PARALLEL_HARD_CAP: u64 = 8;
+
+/// Legge `orchestrator.max_parallel_subagents` (default 3) come tetto effettivo
+/// del parallelismo dei sub-agenti. PUNTO UNICO condiviso col DAG scheduler
+/// Python e col pannello admin "Agenti Paralleli".
+async fn read_max_parallel_subagents(ctx: &AgentToolContext) -> u64 {
+    let v: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'orchestrator.max_parallel_subagents'")
+            .fetch_optional(&*ctx.db)
+            .await
+            .ok()
+            .flatten();
+    v.and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(3)
+        .clamp(1, MAX_PARALLEL_HARD_CAP)
 }
 
 fn err(msg: &str) -> String {

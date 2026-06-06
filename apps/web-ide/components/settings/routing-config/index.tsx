@@ -45,11 +45,15 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
   const [error, setError] = useState<string | null>(null);
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [behaviorSaved, setBehaviorSaved] = useState(false);
+  // Allineato al pannello admin Orchestrator (PUNTO UNICO): stesse chiavi
+  // orchestrator.subagents_enabled / orchestrator.max_parallel_subagents.
+  // Le vecchie chiavi agent_parallel_* (tool dispatch_subtask, rimosso) sono
+  // deprecate e non piu' usate.
   const [parallelEnabled, setParallelEnabled] = useState<boolean>(
-    () => settings.find((s) => s.key === "agent_parallel_enabled")?.value === "true"
+    () => settings.find((s) => s.key === "orchestrator.subagents_enabled")?.value === "true"
   );
   const [parallelMax, setParallelMax] = useState<number>(
-    () => parseInt(settings.find((s) => s.key === "agent_parallel_max")?.value ?? "3", 10) || 3
+    () => parseInt(settings.find((s) => s.key === "orchestrator.max_parallel_subagents")?.value ?? "3", 10) || 3
   );
   const [parallelSaving, setParallelSaving] = useState(false);
   const [parallelSaved, setParallelSaved] = useState(false);
@@ -68,11 +72,11 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
   useEffect(() => {
     setConfig(buildRoutingState(settings));
     const parallelEnabledValue =
-      settings.find((s) => s.key === "agent_parallel_enabled")?.value ?? "false";
+      settings.find((s) => s.key === "orchestrator.subagents_enabled")?.value ?? "false";
     const parsedParallelMax =
-      parseInt(settings.find((s) => s.key === "agent_parallel_max")?.value ?? "3", 10) || 3;
+      parseInt(settings.find((s) => s.key === "orchestrator.max_parallel_subagents")?.value ?? "3", 10) || 3;
     setParallelEnabled(parallelEnabledValue.trim().toLowerCase() === "true");
-    setParallelMax(Math.max(1, Math.min(5, parsedParallelMax)));
+    setParallelMax(Math.max(1, Math.min(8, parsedParallelMax)));
     const parsedNexusPct =
       parseInt(settings.find((s) => s.key === "nexus_active_routing_pct")?.value ?? "0", 10) || 0;
     setNexusRoutingPct(Math.max(0, Math.min(100, parsedNexusPct)));
@@ -122,8 +126,8 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
         credentials: "include",
         body: JSON.stringify({
           settings: [
-            { key: "agent_parallel_enabled", value: parallelEnabled ? "true" : "false" },
-            { key: "agent_parallel_max", value: String(Math.max(1, Math.min(5, parallelMax))) },
+            { key: "orchestrator.subagents_enabled", value: parallelEnabled ? "true" : "false" },
+            { key: "orchestrator.max_parallel_subagents", value: String(Math.max(1, Math.min(8, parallelMax))) },
           ],
         }),
       });
