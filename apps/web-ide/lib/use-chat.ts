@@ -95,6 +95,16 @@ export function useChat(
   const autoContinueCountRef = useRef(0);
   const [autoContinuePending, setAutoContinuePending] = useState(false);
 
+  // ── Coda messaggi ──
+  // Messaggi inviati dall'utente MENTRE un agent run e' in corso. Vengono
+  // accodati qui e inviati automaticamente a fine run dall'effect di drain (sotto
+  // a `send`). Evita run concorrenti sulla stessa sessione — il backend ne
+  // rifiuta uno con 409 — e la perdita silenziosa del messaggio osservata quando
+  // si inviava un secondo messaggio durante un run ancora attivo.
+  const [pendingQueue, setPendingQueue] = useState<
+    Array<{ content: string; options: SendChatMessageOptions }>
+  >([]);
+
   // ── Binding dispatcher: TokenUsageBar e tokenUsage si aggiornano in
   // ── real-time SENZA refresh browser quando il backend emette eventi chat.
   //
@@ -574,7 +584,18 @@ export function useChat(
 
   const send = useCallback(
     async (content: string, options: SendChatMessageOptions = {}) => {
-      if (!hasProject || !isReady || !sessionId || !content.trim() || isLoading) {
+      if (!hasProject || !isReady || !sessionId || !content.trim()) {
+        return;
+      }
+      // Coda: se un agent run e' in corso (agentRun != null) o una POST e' in volo
+      // (isLoading), accoda il messaggio invece di inviarlo subito. L'effect di
+      // drain lo inviera' a fine run. Cosi' non si avviano run concorrenti sulla
+      // stessa sessione e nessun messaggio viene perso. Gli invii sintetici di
+      // auto-continuazione passano da un altro path (non da send), quindi non
+      // interferiscono con la coda.
+      if (agentRun !== null || isLoading) {
+        const trimmed = content.trim();
+        setPendingQueue((q) => [...q, { content: trimmed, options }]);
         return;
       }
       // Reset contatore auto-continuazione: ogni messaggio manuale dell'utente
@@ -663,8 +684,19 @@ export function useChat(
         if (!isAgentMode) setIsLoading(false);
       }
     },
-    [hasProject, isLoading, isReady, profileId, sessionId, subscribeToRun],
+    [hasProject, isLoading, isReady, profileId, sessionId, subscribeToRun, agentRun],
   );
+
+  // Drain della coda messaggi: quando non c'e' piu' un run attivo (agentRun null)
+  // ne una POST in volo (!isLoading), invia il primo messaggio accodato. send()
+  // setta isLoading in modo sincrono prima del primo await, quindi un solo
+  // messaggio per volta viene drenato (niente doppio invio nello stesso tick).
+  useEffect(() => {
+    if (isLoading || agentRun !== null || pendingQueue.length === 0) return;
+    const next = pendingQueue[0];
+    setPendingQueue((q) => q.slice(1));
+    void send(next.content, next.options);
+  }, [isLoading, agentRun, pendingQueue, send]);
 
   const resend = useCallback(
     async (messageId: string, options: SendChatMessageOptions = {}) => {
@@ -949,6 +981,9 @@ export function useChat(
     attachmentIndexProposal,
     clearAttachmentIndexProposal,
     applyAttachmentsIndexed,
+    // Numero di messaggi accodati in attesa che il run corrente finisca (per
+    // mostrare un indicatore "N in coda" nell'input).
+    pendingCount: pendingQueue.length,
     send,
     resend,
     remove,
