@@ -71,7 +71,8 @@ export type ProjectEvent =
   | { kind: "SnapshotRequired"; reason: string; last_known_seq: number }
   | { kind: "KnowledgeNoteCreated"; note_id: string; title: string; intent: string | null }
   | { kind: "KnowledgeNoteUpdated"; note_id: string; status: string }
-  | { kind: "KnowledgeLinkCreated"; link_id: string; from: string; to: string; rel_type: string; created_by: string };
+  | { kind: "KnowledgeLinkCreated"; link_id: string; from: string; to: string; rel_type: string; created_by: string }
+  | { kind: "DocumentGenerated"; document_id: string; doc_type: string; title: string; version: string; file_path: string };
 
 export interface EnvelopedEvent {
   event_id: string;

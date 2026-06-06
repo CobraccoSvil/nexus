@@ -552,6 +552,10 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
         next.knowledge = { lastChangeAt: env.ts };
         break;
       }
+      // DocumentGenerated: il refresh del pannello DOCUMENTI e' gestito in
+      // connection.ts via window event "nexus:documents:refresh" (il pannello
+      // ricarica dalla REST); qui nessuna mutazione di stato dispatcher.
+      case "DocumentGenerated":
       case "Notification":
       case "HighlightPanel":
       case "AgentToolUsed":

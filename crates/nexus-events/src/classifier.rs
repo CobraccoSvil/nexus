@@ -353,6 +353,15 @@ impl Classifier {
             ProjectEvent::KnowledgeNoteUpdated { .. } => None, // silente
             ProjectEvent::KnowledgeLinkCreated { .. } => None,  // silente
 
+            // ── Documenti di progetto ─────────────────────────────────
+            ProjectEvent::DocumentGenerated { title, .. } => Some(UiHint {
+                highlight_panel: Some("documents".to_string()),
+                toast_severity: Some("success".to_string()),
+                toast_msg: Some(format!("Documento generato: {title}")),
+                badge_increment: None,
+                flash_duration_ms: Some(2000),
+            }),
+
             ProjectEvent::EventEnriched { .. } => None,
         }
     }

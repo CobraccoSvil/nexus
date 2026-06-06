@@ -448,6 +448,23 @@ pub async fn handle_doc_generate(
                 );
             }
 
+            // FIX 3 (realtime via chat): emette l'evento SSE DocumentGenerated.
+            // Il tool builtin non ha accesso ad AppState/project_channels, quindi
+            // usa il registry globale inizializzato in main.rs
+            // (dispatcher::init_global). Il pannello DOCUMENTI, ricevendo l'evento
+            // via /event-stream, fa il refresh anche quando la generazione e'
+            // partita dalla chat e non dal pulsante.
+            let _ = nexus_events::dispatcher::emit_global(
+                pid,
+                nexus_events::event::ProjectEvent::DocumentGenerated {
+                    document_id: doc_id,
+                    doc_type: doc_type.clone(),
+                    title: final_title.clone(),
+                    version: version.clone(),
+                    file_path: relative_path.clone(),
+                },
+            );
+
             // Vettorializzazione in background
             let db2 = db.clone();
             let content2 = content.clone();

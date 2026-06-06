@@ -63,6 +63,12 @@ function openStream(projectId: string): void {
         console.info("[dispatcher] SnapshotRequired:", env.payload.reason);
         void fetchSnapshot(projectId);
       }
+
+      // DocumentGenerated (anche via chat): notifica il pannello DOCUMENTI
+      // riusando lo stesso window event gia' ascoltato da DocumentsSidebar.
+      if (env.payload.kind === "DocumentGenerated" && typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("nexus:documents:refresh"));
+      }
     } catch (err) {
       console.warn("[dispatcher] event parse error", err, raw.data);
     }
@@ -104,6 +110,8 @@ function openStream(projectId: string): void {
     "SubagentRunChanged",
     "QualityScanProgress",
     "OutputChannelCreated",
+    // ── Documenti di progetto (refresh pannello DOCUMENTI in realtime) ─────
+    "DocumentGenerated",
   ];
   KINDS.forEach((k) => es.addEventListener(k, handleEvent));
   es.addEventListener("message", handleEvent);

@@ -38,6 +38,7 @@ pub const TOPIC_MUTATION: &str = "mutation";
 /// `EventEnriched` con `event_id` originale + `ui_hint`/`semantic_tags` aggiunti.
 pub const TOPIC_META: &str = "meta";
 pub const TOPIC_KNOWLEDGE: &str = "knowledge";
+pub const TOPIC_DOCUMENTS: &str = "documents";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
@@ -353,6 +354,19 @@ pub enum ProjectEvent {
         created_by: String,
     },
 
+    // ── Documenti di progetto ──────────────────────────────────────────────
+    /// Emesso quando un documento (analisi funzionale/tecnica, ecc.) viene
+    /// generato e registrato in `project_documents`. Permette al pannello
+    /// DOCUMENTI di aggiornarsi in realtime anche quando la generazione avviene
+    /// via chat (il tool builtin non ha accesso ad AppState: usa emit_global).
+    DocumentGenerated {
+        document_id: Uuid,
+        doc_type: String,
+        title: String,
+        version: String,
+        file_path: String,
+    },
+
     // ── Eventi di servizio del dispatcher ──────────────────────────────────
     /// Inviato quando il consumer e' rimasto indietro oltre la capacita'
     /// del ring buffer. Il client deve ricaricare lo snapshot REST.
@@ -402,6 +416,7 @@ impl ProjectEvent {
             Self::KnowledgeNoteCreated { .. }
             | Self::KnowledgeNoteUpdated { .. }
             | Self::KnowledgeLinkCreated { .. } => TOPIC_KNOWLEDGE,
+            Self::DocumentGenerated { .. } => TOPIC_DOCUMENTS,
             Self::SnapshotRequired { .. } => TOPIC_SYSTEM,
         }
     }
@@ -450,6 +465,7 @@ impl ProjectEvent {
             Self::KnowledgeNoteCreated { .. } => "KnowledgeNoteCreated",
             Self::KnowledgeNoteUpdated { .. } => "KnowledgeNoteUpdated",
             Self::KnowledgeLinkCreated { .. } => "KnowledgeLinkCreated",
+            Self::DocumentGenerated { .. } => "DocumentGenerated",
             Self::SnapshotRequired { .. } => "SnapshotRequired",
         }
     }
