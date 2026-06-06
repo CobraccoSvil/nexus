@@ -33,7 +33,7 @@ ALLOWED_INTENTS: FrozenSet[str] = frozenset({
     # Intent di SISTEMA, non emesso dal classifier LLM: usato come fallback
     # neutro quando l'interpretazione semantica non e' disponibile (LLM down).
     # Attiva il _LAZY_MINIMAL_TOOLKIT (discovery + lettura) e modelli tool-robust
-    # cosi' e' l'agente stesso a interpretare e agire. Vedi mig 0336.
+    # cosi' e' l'agente stesso a interpretare e agire. Vedi mig 0337.
     "agentic_default",
 })
 

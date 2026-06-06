@@ -1,4 +1,4 @@
--- 0336_routing_matrix_agentic_default.sql
+-- 0337_routing_matrix_agentic_default.sql
 --
 -- Intent di SISTEMA `agentic_default`: fallback neutro quando il classifier LLM
 -- (`/classify-intent-agentic`) non risponde. Nella nuova architettura (solo
@@ -7,7 +7,7 @@
 -- _LAZY_MINIMAL_TOOLKIT lato agente (discovery + lettura) e deve quindi essere
 -- routato su modelli tool-robust, non su un modello "lite" conversazionale.
 --
--- Come per `code_read` (mig 0335), eredita la config cascade corrente di `debug`
+-- Come per `code_read` (mig 0336), eredita la config cascade corrente di `debug`
 -- (modelli tool-robust non-thinking: mistral-large-2411 + deepseek-v4-pro,
 -- gemini-2.5-pro come ultima riserva), invece di hardcodare nomi modello.
 --
@@ -21,7 +21,7 @@ INSERT INTO nexus_routing_matrix
     (intent, behavior_mode, provider, model_id, priority, is_active, manual_override, notes)
 SELECT
     'agentic_default', behavior_mode, provider, model_id, priority, is_active, manual_override,
-    '0336: agentic_default eredita la config tool-robust di debug (vedi mig 0268/0270)'
+    '0337: agentic_default eredita la config tool-robust di debug (vedi mig 0268/0270)'
 FROM nexus_routing_matrix
 WHERE intent = 'debug'
 ON CONFLICT (intent, behavior_mode, provider) DO UPDATE

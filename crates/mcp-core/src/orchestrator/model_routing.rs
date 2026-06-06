@@ -398,7 +398,7 @@ pub(crate) async fn select_agentic_model(
 ///
 /// Punto unico (regola L): un solo posto traduce l'intent + il budget token
 /// nella chiave usata da `route_model_with_mode`. Gli intent agentici hanno una
-/// chiave dedicata; `code_read` (mig 0335) ha la propria per NON cadere nel ramo
+/// chiave dedicata; `code_read` (mig 0336) ha la propria per NON cadere nel ramo
 /// conversazionale `chat_*` -> modello "lite" incapace di ispezionare i file;
 /// ogni altro intent (incluso `chat`) degrada su chat_breve/media/lunga in base
 /// alla lunghezza stimata.
@@ -423,13 +423,13 @@ pub(crate) fn intent_key_for(
         "file_ops" => "file_ops",
         "system_admin" => "system_admin",
         // code_read: ispezione/lettura read-only del progetto. Intent_key
-        // dedicato (mig 0335) con modelli tool-robust, invece di cadere nel
+        // dedicato (mig 0336) con modelli tool-robust, invece di cadere nel
         // default chat_* -> modello "lite" che non sa ispezionare i file e
         // risponde in astratto. Niente soglia token: la lettura non scala con
         // l'output ma col numero di tool call (gestite dall'iter budget).
         "code_read" => "code_read",
         // agentic_default: fallback neutro quando il classifier LLM non risponde.
-        // Intent_key dedicato (mig 0336) con modelli tool-robust, cosi' l'agente
+        // Intent_key dedicato (mig 0337) con modelli tool-robust, cosi' l'agente
         // parte col _LAZY_MINIMAL_TOOLKIT e interpreta da se' invece di finire su
         // un modello "lite" conversazionale.
         "agentic_default" => "agentic_default",
@@ -992,7 +992,7 @@ mod intent_key_tests {
 
     #[test]
     fn code_read_ha_intent_key_dedicato_non_chat() {
-        // Regressione mig 0335: `code_read` NON deve piu' cadere nel ramo
+        // Regressione mig 0336: `code_read` NON deve piu' cadere nel ramo
         // conversazionale chat_*. Con un budget piccolo (sotto chat_breve) il
         // vecchio default avrebbe dato "chat_breve" -> modello lite.
         let t = thresholds();
@@ -1003,7 +1003,7 @@ mod intent_key_tests {
 
     #[test]
     fn agentic_default_ha_intent_key_dedicato_non_chat() {
-        // mig 0336: il fallback neutro `agentic_default` (LLM down) deve avere
+        // mig 0337: il fallback neutro `agentic_default` (LLM down) deve avere
         // un intent_key dedicato -> modelli tool-robust, non chat_* lite.
         let t = thresholds();
         assert_eq!(intent_key_for("agentic_default", 50, &t), "agentic_default");

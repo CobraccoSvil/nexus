@@ -75,9 +75,10 @@ _CONFIG_LOCK = asyncio.Lock()
 # Chiavi DB lette dalla tabella settings con prefisso 'routing.'
 # Le soglie ambiguity_* (mig 0132) sono parametri operativi: se mancano dal DB
 # si usano i default tecnici da _classifier_operational_defaults().
+# NB: il MODELLO del classifier NON e' piu' qui. E' risolto via purpose+tier
+# dal router (purpose 'intent_classifier', mig 0338): regola G (no modello fisso)
+# + regola L (routing unico). Qui restano solo i parametri operativi.
 _CONFIG_KEYS = [
-    "routing.classifier_provider",
-    "routing.classifier_model",
     "routing.classifier_cache_ttl_seconds",
     "routing.classifier_cache_max_entries",
     "routing.llm_classifier_timeout_seconds",
@@ -135,17 +136,10 @@ async def _load_classifier_config() -> dict[str, str]:
             ) from exc
 
         result = {k: v for (k, v) in rows}
-        # Provider/model: OBBLIGATORI da DB (regola G). Le costanti operative
-        # (TTL, max_entries, timeout) tollerano un fallback tecnico.
-        provider = result.get("routing.classifier_provider")
-        model = result.get("routing.classifier_model")
-        if not provider or not model:
-            raise ClassifierConfigUnavailable(
-                "settings.routing.classifier_provider/model mancanti nel DB. "
-                "Applicare la migrazione 0111 e popolare la tabella `settings`."
-            )
-
-        # Operativi (timeout, cache size): default tecnico se mancanti
+        # Il modello del classifier NON e' piu' una setting fissa: e' risolto via
+        # purpose 'intent_classifier' + tier in _ensure_config (mig 0338).
+        # Qui restano solo i parametri operativi (timeout, cache size, soglie):
+        # default tecnico se mancanti.
         op_defaults = _classifier_operational_defaults()
         expiry = now + _CONFIG_CACHE_TTL_SECONDS
         for k in _CONFIG_KEYS:
@@ -164,66 +158,6 @@ async def _load_classifier_config() -> dict[str, str]:
             _CONFIG_CACHE[k] = (expiry, v)
         return {k: _CONFIG_CACHE[k][1] for k in _CONFIG_KEYS}
 
-
-@dataclass
-class ClassifierChainEntry:
-    """Una entry della chain di provider per il classifier agentico.
-
-    Sorgente autoritativa: tabella `nexus_classifier_provider_chain` (mig 0134).
-    """
-    provider: str
-    model: str
-    priority: int
-
-
-# Cache process-local della chain (TTL 60s, allineato a _CONFIG_CACHE).
-_CHAIN_CACHE: list[ClassifierChainEntry] = []
-_CHAIN_CACHE_EXPIRY: float = 0.0
-
-
-async def _load_classifier_chain() -> list[ClassifierChainEntry]:
-    """Carica la chain di provider/model per il classifier dalla tabella
-    `nexus_classifier_provider_chain` (mig 0134) con cache 60s.
-
-    Comportamento (regola G di CLAUDE.md):
-    - Tabella popolata: ritorna entries ordinate per priority DESC
-    - Tabella vuota O DB irraggiungibile: ritorna lista vuota
-      → il caller usera' la singola entry da `settings.routing.classifier_*`
-        come fallback retrocompatibile.
-
-    Niente hardcoded: nessun model name nel codice.
-    """
-    global _CHAIN_CACHE, _CHAIN_CACHE_EXPIRY
-    import time
-    import os
-    now = time.monotonic()
-    if _CHAIN_CACHE and now < _CHAIN_CACHE_EXPIRY:
-        return list(_CHAIN_CACHE)  # snapshot immutabile
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        logger.warning("classifier_chain: DATABASE_URL non set, chain vuota")
-        return []
-    try:
-        import psycopg2  # type: ignore[import-untyped]
-        with psycopg2.connect(db_url) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT provider, model_id, priority "
-                    "FROM nexus_classifier_provider_chain "
-                    "WHERE is_active = TRUE "
-                    "ORDER BY priority DESC, provider ASC",
-                )
-                rows = cur.fetchall()
-    except Exception as exc:
-        logger.warning("classifier_chain: load fallita (%s), chain vuota", exc)
-        return []
-    chain = [
-        ClassifierChainEntry(provider=p, model=m, priority=int(pr))
-        for (p, m, pr) in rows
-    ]
-    _CHAIN_CACHE = chain
-    _CHAIN_CACHE_EXPIRY = now + 60.0
-    return list(chain)
 
 
 def _classifier_operational_defaults() -> dict[str, str]:
@@ -479,10 +413,27 @@ class AgenticIntentClassifier:
         if self._explicit_provider and self._explicit_model and self._cache is not None:
             return
         cfg = await _load_classifier_config()
-        if not self._explicit_provider:
-            self._provider = cfg["routing.classifier_provider"]
-        if not self._explicit_model:
-            self._model = cfg["routing.classifier_model"]
+        # Modello via purpose+tier (regola G/L): il router sceglie il miglior
+        # modello 'light'+reasoning dal catalog (cooldown-aware) per il purpose
+        # 'intent_classifier' (mig 0338). Nessun modello hardcoded. Il client e'
+        # sincrono (urllib): in executor per non bloccare l'event loop async.
+        if not self._explicit_provider or not self._explicit_model:
+            from brain.router.service import _routing_client_singleton
+            loop = asyncio.get_event_loop()
+            decision = await loop.run_in_executor(
+                None,
+                lambda: _routing_client_singleton().purpose_model(
+                    purpose="intent_classifier"
+                ),
+            )
+            if decision.provider.startswith("__") or decision.model.startswith("__"):
+                raise ClassifierConfigUnavailable(
+                    f"intent_classifier non risolvibile dal router: {decision.rationale}"
+                )
+            if not self._explicit_provider:
+                self._provider = decision.provider
+            if not self._explicit_model:
+                self._model = decision.model
         if self._cache is None:
             try:
                 ttl = int(cfg["routing.classifier_cache_ttl_seconds"])
@@ -715,12 +666,11 @@ class AgenticIntentClassifier:
         # finche' un provider risponde con JSON valido. Se la chain e' vuota
         # cade sul singolo (self._provider, self._model) per retrocompat.
         prompt = _CLASSIFIER_PROMPT.format(message=message[:2000])
-        chain_db = await _load_classifier_chain()
-        if chain_db:
-            chain: list[tuple[str, str]] = [(e.provider, e.model) for e in chain_db]
-        else:
-            # Fallback retrocompat: chain a 1 elemento dalle settings (mig 0132)
-            chain = [(self._provider, self._model)]
+        # Modello risolto via purpose 'intent_classifier' + tier in _ensure_config
+        # (router cooldown-aware, regola G/L). Niente piu' chain hardcoded: la
+        # nexus_classifier_provider_chain e' disattivata (mig 0338) e il fallback
+        # multi-provider e' gestito dal tier system lato router.
+        chain: list[tuple[str, str]] = [(self._provider, self._model)]
 
         ambiguity_args = dict(
             ambiguity_min_confidence=getattr(
