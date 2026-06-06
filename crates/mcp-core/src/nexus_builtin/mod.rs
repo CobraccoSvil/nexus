@@ -31,9 +31,13 @@ pub use catalog::{nexus_builtin_server_id, NEXUS_BUILTIN_SERVER_ID_STR};
 // Import privati usati dai sotto-moduli tramite `use super::*`
 use catalog::NEXUS_TOOLS;
 use docs::{
-    bump_version, get_project_slug, handle_doc_generate, handle_doc_list, handle_doc_search,
-    handle_doc_status, handle_doc_update,
+    bump_version, get_project_slug, handle_doc_list, handle_doc_search, handle_doc_status,
+    handle_doc_update,
 };
+// Re-export pubblico: usata anche dall'endpoint REST dedicato
+// POST /api/projects/:id/documents/generate (FIX 3/4: generazione senza passare
+// per l'agente conversazionale).
+pub use docs::handle_doc_generate;
 use git::{
     handle_git_branches, handle_git_checkout, handle_git_create_branch, handle_git_diff,
     handle_git_log,

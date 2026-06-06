@@ -29,6 +29,7 @@ mod environment;
 mod github;
 mod internal_learning;
 mod internal_routing;
+mod llm_json;
 mod long_running;
 mod mcp_client;
 mod mcp_connectors;

@@ -64,7 +64,7 @@ export function SqlQueryPanel({ project }: SqlQueryPanelProps) {
         // Default: la primary; se non c'e', la prima.
         const primary = conns.find((c) => c.is_primary) ?? conns[0];
         setSelectedConnection(primary?.name ?? "");
-      } catch (e) {
+      } catch {
         if (cancelled) return;
         setConnections([]);
         setSelectedConnection("");

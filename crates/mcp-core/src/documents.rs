@@ -32,8 +32,11 @@ pub async fn list_documents(
     let project_id = Uuid::parse_str(&id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
 
-    // Auto-discovery: scansiona la cartella docs/ e auto-registra i .md
+    // Auto-discovery: scansiona la cartella docs/ e auto-registra i file
     // orfani (presenti sul filesystem ma assenti dal DB).
+    // FIX 2: include i .docx oltre ai .md. Il flusso canonico
+    // (nexus_doc_generate) salva .docx; prima la discovery li ignorava, quindi
+    // un .docx orfano (es. INSERT mai avvenuto) non veniva mai recuperato.
     if let Ok(ctx) = load_project_context(&state.db, project_id, user_id).await {
         let docs_dir = ctx.root_path.join("docs");
         if let Ok(mut entries) = fs::read_dir(&docs_dir).await {
@@ -42,7 +45,7 @@ pub async fn list_documents(
                 let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
                     continue;
                 };
-                if ext != "md" {
+                if !matches!(ext.to_ascii_lowercase().as_str(), "md" | "docx") {
                     continue;
                 }
                 let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -321,4 +324,59 @@ pub async fn delete_document(
     }
 
     Ok(Json(json!({ "deleted": true })))
+}
+
+/// POST /api/projects/:id/documents/generate
+///
+/// FIX 3/4: generazione documento SENZA passare per l'agente conversazionale.
+/// Prima il pulsante "Genera" del pannello DOCUMENTI inviava un messaggio in
+/// chat (`onSendToChat`) che instradava la richiesta sull'agente generico: dopo
+/// la chiamata al tool l'agente non era vincolato a fermarsi e proseguiva con
+/// una "revisione" del progetto non richiesta; inoltre il pannello si
+/// aggiornava solo a fine turno (evento window `nexus:documents:refresh`),
+/// quindi con timing impredicibile.
+///
+/// Questo endpoint chiama direttamente `nexus_builtin::handle_doc_generate`
+/// (stesso punto unico usato dal tool) e ritorna l'esito sincrono: il frontend
+/// puo' fare il refresh subito, deterministico.
+pub async fn generate_document(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    let user_id = parse_user_id(&claims)?;
+    let project_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+
+    let doc_type = body
+        .get("doc_type")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "Parametro 'doc_type' obbligatorio"))?;
+    let title = body
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    // Costruisce gli stessi argomenti del tool nexus_doc_generate. content_json
+    // omesso: il backend auto-genera (con KB injection, FIX 1).
+    let args = json!({
+        "project_id": project_id.to_string(),
+        "doc_type": doc_type,
+        "title": title,
+    });
+
+    let result = crate::nexus_builtin::handle_doc_generate(&state.db, project_id, user_id, &args).await;
+
+    // handle_doc_generate ritorna o un JSON serializzato (successo) o una stringa
+    // che inizia con "[Errore]". Mappiamo coerentemente sullo status HTTP.
+    if let Some(msg) = result.strip_prefix("[Errore]") {
+        return Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, msg.trim()));
+    }
+    match serde_json::from_str::<Value>(&result) {
+        Ok(v) => Ok(Json(v)),
+        Err(_) => Ok(Json(json!({ "ok": true, "message": result }))),
+    }
 }

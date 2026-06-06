@@ -17,6 +17,13 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
             )),
         )
         .route(
+            "/api/projects/:id/documents/generate",
+            post(documents::generate_document).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_auth,
+            )),
+        )
+        .route(
             "/api/projects/:id/documents/:doc_id",
             get(documents::get_document)
                 .delete(documents::delete_document)

@@ -294,17 +294,8 @@ struct ParsedTriple {
     confidence: f32,
 }
 
-/// Estrae il blocco JSON dal contenuto LLM tollerando preamboli e fence Markdown
-/// (anche se il prompt li proibisce, alcuni provider li reinseriscono).
-fn extract_json_object(raw: &str) -> Option<&str> {
-    let start = raw.find('{')?;
-    let end = raw.rfind('}')?;
-    if end > start {
-        Some(&raw[start..=end])
-    } else {
-        None
-    }
-}
+// Estrazione blocco JSON: punto unico in `crate::llm_json` (regola L / ADR 0026).
+use crate::llm_json::extract_json_object;
 
 fn parse_triples_from_llm(content: &str) -> Result<Vec<ParsedTriple>> {
     let json_slice = extract_json_object(content)

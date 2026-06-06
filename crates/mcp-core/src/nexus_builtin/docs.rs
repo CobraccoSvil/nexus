@@ -66,7 +66,7 @@ fn doc_content_is_empty(content: &Value) -> bool {
     }
 }
 
-pub(super) async fn handle_doc_generate(
+pub async fn handle_doc_generate(
     db: &PgPool,
     project_id: Uuid,
     user_id: Uuid,
@@ -168,6 +168,70 @@ pub(super) async fn handle_doc_generate(
                     count += 1;
                 }
             }
+            // FIX 1 (KB nel prompt): arricchisci il contesto con i passaggi piu'
+            // rilevanti del codebase gia' indicizzato in Qdrant (collection
+            // project_context). Senza questo, "analizza il codebase" del template
+            // resta una promessa vuota: il modello vede solo README + albero
+            // cartelle e produce documenti generici. Best-effort (regola H sul
+            // log): se la KB e' vuota (progetto mai indicizzato) o il neural core
+            // non risponde, si prosegue coi soli file statici.
+            let neural_url_kb = crate::auth::get_setting(db, "neural_core_url")
+                .await
+                .unwrap_or_else(|| {
+                    std::env::var("NEURAL_CORE_URL")
+                        .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string())
+                });
+            let kb_query = format!(
+                "Architettura, funzionalita', requisiti e componenti principali del progetto {} \
+                 per documento di tipo {}",
+                project_name, doc_type
+            );
+            match crate::orchestrator::NeuralCoreClient::connect(&neural_url_kb).await {
+                Ok(neural_kb) => match neural_kb.embed_text("", &kb_query).await {
+                    Ok(vector) => {
+                        match crate::vector_memory::search_project_context_points(
+                            db, &vector, pid, 8, 0.3,
+                        )
+                        .await
+                        {
+                            Ok(hits) if !hits.is_empty() => {
+                                project_context.push_str(
+                                    "\n--- Estratti rilevanti dal codebase (knowledge base) ---\n",
+                                );
+                                for h in &hits {
+                                    if let Some(text) = h
+                                        .payload
+                                        .get("text")
+                                        .or_else(|| h.payload.get("text_preview"))
+                                        .and_then(Value::as_str)
+                                    {
+                                        let snippet: String = text.chars().take(800).collect();
+                                        project_context.push_str(&format!("- {}\n", snippet));
+                                    }
+                                }
+                                tracing::info!(
+                                    "nexus_doc_generate: KB context iniettato ({} passaggi)",
+                                    hits.len()
+                                );
+                            }
+                            Ok(_) => tracing::info!(
+                                "nexus_doc_generate: KB project_context vuota per il progetto, \
+                                 uso solo file statici"
+                            ),
+                            Err(e) => tracing::warn!(
+                                "nexus_doc_generate: ricerca KB fallita (best-effort): {e}"
+                            ),
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("nexus_doc_generate: embedding query KB fallito: {e}")
+                    }
+                },
+                Err(e) => tracing::warn!(
+                    "nexus_doc_generate: connessione neural core per KB fallita: {e}"
+                ),
+            }
+
             // Chiedi al brain di generare il content_json strutturato
             let doc_type_label = match doc_type.as_str() {
                 "functional_analysis" => "Analisi Funzionale IEEE 830",
@@ -185,10 +249,13 @@ pub(super) async fn handle_doc_generate(
                  Genera almeno 5 sezioni principali con sottosezioni. Ogni content deve essere almeno 2-3 frasi.\n\n\
                  CONTESTO PROGETTO:\n{}", doc_type_label, project_context
             );
-            let http = reqwest::Client::builder()
+            let http = match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
-                .unwrap();
+            {
+                Ok(c) => c,
+                Err(e) => return format!("[Errore] Costruzione client HTTP fallita: {e}"),
+            };
             // Modello purpose-specific letto da DB (purpose: docs_generator)
             // invece che hardcoded. Vedi migrazione 0102.
             // Nota: handle_doc_generate non ha accesso a Orchestrator/AppState,
@@ -230,33 +297,39 @@ pub(super) async fn handle_doc_generate(
                 Ok(t) => t,
                 Err(e) => return format!("[Errore] Lettura risposta brain fallita: {e}"),
             };
-            // Prova a parsare il JSON dalla risposta
-            let parsed: Result<Value, _> = serde_json::from_str(&resp_text);
-            let content_val: Value = match parsed {
-                Ok(v) => {
-                    // La risposta potrebbe essere wrapper: {"content": "..."} o direttamente il JSON
-                    if let Some(c) = v.get("content").and_then(|x| x.as_str()) {
-                        let cleaned = c.trim().replace("```json", "").replace("```", "");
-                        let parsed_inner: Result<Value, _> = serde_json::from_str(cleaned.trim());
-                        parsed_inner.unwrap_or_else(|_| {
-                            serde_json::json!({"sections": [{"number": "1", "title": doc_type_label, "content": cleaned.trim(), "subsections": []}]})
-                        })
-                    } else if v.get("sections").is_some() {
-                        v
-                    } else if let Some(text) = v.get("text").and_then(|x| x.as_str()) {
-                        let cleaned = text.trim().replace("```json", "").replace("```", "");
-                        let parsed_inner: Result<Value, _> = serde_json::from_str(cleaned.trim());
-                        parsed_inner.unwrap_or_else(|_| {
-                            serde_json::json!({"sections": [{"number": "1", "title": doc_type_label, "content": cleaned.trim(), "subsections": []}]})
-                        })
-                    } else {
-                        v
-                    }
+            // FIX 5 (anti-malformazione): parsing tramite il punto unico
+            // `llm_json::parse_llm_json` (gestisce fence ```json, wrapper
+            // content/text, preamboli). Fail-loud (regola H): se il modello non
+            // produce un oggetto JSON con un array `sections` valido, NON
+            // costruiamo piu' una pseudo-sezione col testo raw (era la causa dei
+            // documenti .docx malformati: prosa o JSON troncato finiva dentro
+            // un'unica sezione). Ritorniamo un errore azionabile.
+            let content_val: Value = match crate::llm_json::parse_llm_json(&resp_text) {
+                Ok(v) if v.get("sections").and_then(Value::as_array).is_some() => v,
+                Ok(_) => {
+                    tracing::warn!(
+                        doc_type = %doc_type,
+                        "nexus_doc_generate: JSON valido ma senza array 'sections'"
+                    );
+                    return format!(
+                        "[Errore] Generazione '{}' fallita: il modello docs_generator ha \
+                         prodotto un JSON privo dell'array 'sections'. Riprova; se persiste, \
+                         verifica provider/modello in nexus_purpose_model (purpose='docs_generator').",
+                        doc_type
+                    );
                 }
-                Err(_) => {
-                    // Non è JSON, usa come testo raw
-                    let raw: String = resp_text.chars().take(5000).collect();
-                    serde_json::json!({"sections": [{"number": "1", "title": doc_type_label, "content": raw, "subsections": []}]})
+                Err(e) => {
+                    tracing::warn!(
+                        doc_type = %doc_type,
+                        "nexus_doc_generate: output docs_generator non parsabile come JSON: {e}"
+                    );
+                    return format!(
+                        "[Errore] Generazione '{}' fallita: l'output del modello docs_generator \
+                         non e' un JSON valido ({}). Il documento non e' stato creato (nessun file \
+                         malformato salvato). Riprova; se persiste, verifica il modello in \
+                         nexus_purpose_model (purpose='docs_generator').",
+                        doc_type, e
+                    );
                 }
             };
             let sec_count = content_val
@@ -343,9 +416,13 @@ pub(super) async fn handle_doc_generate(
         .await
     {
         Ok((_file_path, page_count, section_count)) => {
-            // Salva nel DB
+            // Salva nel DB. FIX 2: prima era `let _ =`, quindi se l'INSERT
+            // falliva il .docx restava sul filesystem ma orfano dal catalogo: non
+            // appariva nel pannello DOCUMENTI (che lista da project_documents) e
+            // l'auto-discovery recuperava solo i .md, mai i .docx. Ora l'errore e'
+            // propagato (regola H): meglio un errore visibile che un file fantasma.
             let doc_id = Uuid::new_v4();
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "INSERT INTO project_documents (id, project_id, doc_type, title, version, file_path, structure_json, status, created_by)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', $8)"
             )
@@ -358,7 +435,18 @@ pub(super) async fn handle_doc_generate(
             .bind(&content)
             .bind(user_id)
             .execute(db)
-            .await;
+            .await
+            {
+                tracing::error!(
+                    doc_type = %doc_type, file = %relative_path,
+                    "nexus_doc_generate: INSERT project_documents fallito: {e}"
+                );
+                return format!(
+                    "[Errore] Documento generato su disco ({}) ma registrazione nel catalogo \
+                     fallita: {e}. Il file non comparirebbe nel pannello. Riprova.",
+                    relative_path
+                );
+            }
 
             // Vettorializzazione in background
             let db2 = db.clone();

@@ -21,6 +21,29 @@ from brain.documents.templates import get_template
 logger = logging.getLogger(__name__)
 
 
+def _as_text(value) -> str:
+    """Coerce un valore `content` arbitrario a stringa renderizzabile.
+
+    FIX 5 (anti-malformazione): il modello docs_generator a volte annida liste
+    o oggetti dentro `content` invece di una stringa. Prima `content.strip()` e
+    `len(content)` sollevavano eccezioni non gestite (AttributeError/TypeError)
+    durante il rendering, facendo fallire l'intera generazione o producendo un
+    .docx corrotto. Qui normalizziamo sempre a testo leggibile.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return "\n".join(_as_text(v) for v in value if v is not None)
+    if isinstance(value, dict):
+        for key in ("content", "text", "value"):
+            if key in value:
+                return _as_text(value[key])
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    return str(value)
+
+
 class DocumentGenerator:
     """Generates professional .docx documents from structured JSON content."""
 
@@ -87,7 +110,7 @@ class DocumentGenerator:
             return {"file_path": "", "page_count": 0, "section_count": 0, "error": f"Errore salvataggio: {e}"}
 
         # Estimate page count (~3000 chars per page)
-        total_chars = sum(len(s.get("content", "")) for s in sections)
+        total_chars = sum(len(_as_text(s.get("content", ""))) for s in sections)
         page_count = max(1, total_chars // 3000 + 1)
 
         logger.info("Documento generato: %s (%d sezioni, ~%d pagine)", output_path, section_count, page_count)
@@ -103,8 +126,10 @@ class DocumentGenerator:
         """Render a section and its subsections recursively. Returns count."""
         number = section.get("number", "")
         title = section.get("title", "")
-        content = section.get("content", "")
+        content = _as_text(section.get("content", ""))
         subsections = section.get("subsections", [])
+        if not isinstance(subsections, list):
+            subsections = []
 
         heading_level = min(level, 3)
         heading_text = f"{number}. {title}" if number else title

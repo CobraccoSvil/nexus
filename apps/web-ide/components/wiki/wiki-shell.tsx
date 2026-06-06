@@ -102,7 +102,6 @@ export function WikiShell({ scope, title, toolbar }: WikiShellProps) {
       cancelled = true;
     };
     // applyDoc usa solo setter stabili
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scope, selectedId]);
 
   const applyDoc = (d: WikiDocDetail) => {

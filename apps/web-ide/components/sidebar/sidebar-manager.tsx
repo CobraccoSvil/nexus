@@ -307,7 +307,6 @@ export function SidebarManager({
     return (
       <DocumentsSidebar
         project={project}
-        onSendToChat={onSendToChat}
         onOpenInEditor={(relativePath) => onOpenFile(relativePath)}
       />
     );
