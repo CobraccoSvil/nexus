@@ -368,15 +368,38 @@ pub async fn generate_document(
         "title": title,
     });
 
-    let result = crate::nexus_builtin::handle_doc_generate(&state.db, project_id, user_id, &args).await;
+    // Generazione ASINCRONA: con un modello heavy/thinking la completion puo'
+    // durare minuti. Se la legassimo alla connessione HTTP, il proxy la
+    // chiuderebbe in timeout (-> 500) e axum cancellerebbe l'handler a meta',
+    // lasciando nessun documento. Avviamo in background e ritorniamo subito 202:
+    // il completamento arriva al pannello via evento SSE DocumentGenerated (su
+    // successo) o Notification (su errore), gia' ascoltati dal frontend.
+    let db = state.db.clone();
+    let doc_type_for_log = doc_type.clone();
+    tokio::spawn(async move {
+        let result =
+            crate::nexus_builtin::handle_doc_generate(&db, project_id, user_id, &args).await;
+        if let Some(msg) = result.strip_prefix("[Errore]") {
+            let msg = msg.trim().to_string();
+            tracing::warn!(doc_type = %doc_type_for_log, "generate_document (async): {msg}");
+            // Notifica il fallimento al pannello (toast), altrimenti l'utente
+            // resterebbe in attesa di un documento che non arrivera' mai.
+            let _ = nexus_events::dispatcher::emit_global(
+                project_id,
+                nexus_events::event::ProjectEvent::Notification {
+                    severity: "error".to_string(),
+                    message: format!("Generazione documento fallita: {msg}"),
+                    panel: Some("documents".to_string()),
+                    ttl_ms: Some(10000),
+                    run_id: None,
+                },
+            );
+        }
+        // Su successo handle_doc_generate ha gia' emesso DocumentGenerated.
+    });
 
-    // handle_doc_generate ritorna o un JSON serializzato (successo) o una stringa
-    // che inizia con "[Errore]". Mappiamo coerentemente sullo status HTTP.
-    if let Some(msg) = result.strip_prefix("[Errore]") {
-        return Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, msg.trim()));
-    }
-    match serde_json::from_str::<Value>(&result) {
-        Ok(v) => Ok(Json(v)),
-        Err(_) => Ok(Json(json!({ "ok": true, "message": result }))),
-    }
+    Ok(Json(json!({
+        "status": "accepted",
+        "message": "Generazione avviata: il documento comparira' nel pannello al termine."
+    })))
 }

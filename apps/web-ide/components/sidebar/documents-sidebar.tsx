@@ -88,12 +88,14 @@ export function DocumentsSidebar({ project, onOpenInEditor }: DocumentsSidebarPr
     return () => window.removeEventListener("nexus:documents:refresh", handler);
   }, [fetchDocuments]);
 
-  // FIX 3/4: la generazione chiama l'endpoint REST dedicato
-  // (POST /api/projects/:id/documents/generate) invece di inviare un prompt in
-  // chat. Cosi' non passa per l'agente conversazionale (che dopo il tool faceva
-  // una "revisione" del progetto non richiesta) e il pannello si aggiorna in
-  // modo deterministico al ritorno della risposta, senza dipendere dall'evento
-  // di fine turno.
+  // La generazione chiama l'endpoint REST dedicato
+  // (POST /api/projects/:id/documents/generate), che NON passa per l'agente
+  // conversazionale (niente "revisione" non richiesta) e avvia la generazione in
+  // BACKGROUND ritornando subito 202: con modelli heavy/thinking puo' durare
+  // minuti, una richiesta sincrona andrebbe in timeout di proxy (-> 500). Il
+  // documento compare quando arriva l'evento SSE DocumentGenerated, che il
+  // dispatcher converte in `nexus:documents:refresh` (gia' ascoltato sopra). In
+  // caso di errore arriva un toast via evento Notification.
   const handleGenerate = async (docType: string) => {
     if (!project?.id) return;
     setGenerating(docType);
@@ -116,8 +118,13 @@ export function DocumentsSidebar({ project, onOpenInEditor }: DocumentsSidebarPr
         }
         throw new Error(detail);
       }
-      await fetchDocuments();
+      // 202 Accepted: generazione avviata. Niente fetch immediata (il documento
+      // non esiste ancora); il refresh arriva via SSE al termine.
       setShowGenerate(false);
+      await alertDialog(
+        "Generazione avviata. Il documento comparira' nel pannello al termine (puo' richiedere fino a qualche minuto).",
+        "Generazione in corso",
+      );
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Errore generazione documento";
       await alertDialog(msg, "Generazione documento fallita");

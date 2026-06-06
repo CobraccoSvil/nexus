@@ -390,6 +390,129 @@ async def project_analyze(body: ProjectAnalyzeRequest) -> dict[str, object]:
     }
 
 
+# ── Prompt revise: punto unico valuta+rivede un prompt vs direttive ─────────
+
+def _prompt_applies_to_filter(prompt_key: str) -> list[str]:
+    """Determina i valori applies_to delle guideline pertinenti al prompt."""
+    if prompt_key.startswith("agent."):
+        return ["all", "agent"]
+    if prompt_key.startswith("system."):
+        return ["all", "system"]
+    if prompt_key.startswith("automation."):
+        return ["all", "automation"]
+    return ["all"]
+
+
+def _load_active_guidelines(applies_to_values: list[str]) -> list[dict]:
+    """Carica le direttive attive (is_active=TRUE) pertinenti dal DB.
+
+    Ritorna lista di dict {practice_key, description, check_hint, severity}.
+    Lista vuota se DB irraggiungibile (loggato; il chiamante decide come gestire).
+    """
+    try:
+        import psycopg2
+        db_url = get_db_url()
+        with psycopg2.connect(db_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT practice_key, description, check_hint, severity "
+                    "FROM nexus_prompt_guideline "
+                    "WHERE is_active = TRUE AND applies_to = ANY(%s) "
+                    "ORDER BY CASE severity WHEN 'must' THEN 1 WHEN 'should' THEN 2 ELSE 3 END, practice_key",
+                    (applies_to_values,),
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        logger.error("Errore caricamento direttive attive: %s", e)
+        return []
+    return [
+        {"practice_key": r[0], "description": r[1], "check_hint": r[2], "severity": r[3]}
+        for r in rows
+    ]
+
+
+class PromptReviseRequest(BaseModel):
+    current_template: str
+    prompt_key: str = ""
+    mode: str = "evaluate"  # "evaluate" | "evaluate_and_revise"
+    # signals: {"kind": "guideline"|"reflection", "weaknesses": [...], "guidelines": [...]}
+    signals: dict = {}
+
+
+@router.post("/agent/prompt-revise")
+async def prompt_revise(body: PromptReviseRequest) -> dict[str, object]:
+    """Punto unico (regola L): valuta ed eventualmente rivede un template prompt
+    rispetto alle direttive attive. Usato da GuidelineAlignmentWorker,
+    PromptOptimizerWorker e dalla UI admin.
+
+    Pipeline:
+      1. Carica le direttive attive pertinenti (da signals.guidelines o dal DB).
+      2. Costruisce il prompt di valutazione/revisione (prompt_conformance_rubric).
+      3. Risolve il modello via purpose tier-only 'prompt_conformance_check'.
+      4. Chiama il provider, parsa il JSON, ritorna il risultato strutturato.
+    """
+    from brain.agents.prompt_conformance_rubric import build_revise_prompt, parse_revise_response
+    from brain.router.service import _routing_client_singleton
+
+    started = time.time()
+    mode = body.mode if body.mode in ("evaluate", "evaluate_and_revise") else "evaluate"
+
+    # 1. Direttive attive: usa quelle fornite o caricale dal DB
+    guidelines = body.signals.get("guidelines") if isinstance(body.signals, dict) else None
+    if not guidelines:
+        guidelines = _load_active_guidelines(_prompt_applies_to_filter(body.prompt_key or ""))
+
+    # 2. Prompt di valutazione/revisione
+    system, user = build_revise_prompt(
+        body.current_template, guidelines, mode=mode, signals=body.signals or None,
+    )
+    full_prompt = f"{system}\n\n{user}"
+
+    # 3. Modello via purpose tier-only (niente fallback hardcoded, regola G)
+    decision = _routing_client_singleton().purpose_model(purpose="prompt_conformance_check")
+    if decision.provider.startswith("__"):
+        return {
+            "status": "failed",
+            "error": f"purpose 'prompt_conformance_check' non risolvibile: {decision.rationale}",
+            "duration_ms": int((time.time() - started) * 1000),
+        }
+
+    # 4. Chiamata provider + parse JSON robusto
+    try:
+        result = await runtime.providers.generate_completion_async(
+            decision.provider, decision.model, full_prompt,
+        )
+    except Exception as e:
+        return {
+            "status": "failed",
+            "error": f"{decision.provider}/{decision.model}: {str(e)[:200]}",
+            "duration_ms": int((time.time() - started) * 1000),
+        }
+
+    content = (result.content or "").strip()
+    parsed = parse_revise_response(content, mode=mode)
+    if parsed is None:
+        return {
+            "status": "failed",
+            "error": "output non parsabile come JSON di conformita'",
+            "model_used": f"{decision.provider}/{decision.model}",
+            "duration_ms": int((time.time() - started) * 1000),
+            "raw_length": len(content),
+        }
+
+    return {
+        "status": "completed",
+        "overall_score": parsed["overall_score"],
+        "dimensions": parsed["dimensions"],
+        "issues": parsed["issues"],
+        "revised_template": parsed.get("revised_template"),
+        "rationale": parsed.get("rationale"),
+        "guideline_count": len(guidelines),
+        "model_used": f"{decision.provider}/{decision.model}",
+        "duration_ms": int((time.time() - started) * 1000),
+    }
+
+
 # ── Batch API (Anthropic Messages Batches) ─────────────────────────────────
 class BatchAnalyzeRequest(BaseModel):
     requests: list[dict]  # [{"custom_id": str, "system": str, "prompt": str}]

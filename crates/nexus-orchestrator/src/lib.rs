@@ -54,8 +54,8 @@ pub use types::{
 };
 pub use workers::{
     AnomalyDetectionWorker, AuditWorker, CleanupWorker, ClusteringWorker,
-    MemoryConsolidationWorker, MetricsAggregationWorker, ProfilingWorker,
-    PromptOptimizerWorker, QLearningReplayWorker, ReplicationBatch,
+    GuidelineAlignmentWorker, MemoryConsolidationWorker, MetricsAggregationWorker,
+    ProfilingWorker, PromptOptimizerWorker, QLearningReplayWorker, ReplicationBatch,
     ReplicationEntry, ReplicationWorker, SessionPersistenceWorker,
     UltralearnWorker, VersioningWorker,
 };

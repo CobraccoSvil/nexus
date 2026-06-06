@@ -23,12 +23,12 @@
 
 use nexus_orchestrator::{
     AgentType, AnomalyDetectionWorker, AuditWorker, CleanupWorker, ClusteringWorker,
-    ConsensusEngine, ConsensusStrategy, Embedder, ExecutionOutcome, HashEmbedder, LearningContext,
-    LearningScheduler, MemoryConsolidationWorker, MemoryNamespace, MetricsAggregationWorker,
-    OnnxMiniLmEmbedder, ProfilingWorker, QLearningConfig, QLearningReplayWorker, QLearningRouter,
-    ReplicationBatch, ReplicationWorker, RoutingDecision, SelectionStrategy,
-    SessionPersistenceWorker, SwarmExecutionResult, SwarmTaskOutcome, TaskBuilder, TaskResult,
-    UltralearnWorker, VersioningWorker,
+    ConsensusEngine, ConsensusStrategy, Embedder, ExecutionOutcome, GuidelineAlignmentWorker,
+    HashEmbedder, LearningContext, LearningScheduler, MemoryConsolidationWorker, MemoryNamespace,
+    MetricsAggregationWorker, OnnxMiniLmEmbedder, ProfilingWorker, PromptOptimizerWorker,
+    QLearningConfig, QLearningReplayWorker, QLearningRouter, ReplicationBatch, ReplicationWorker,
+    RoutingDecision, SelectionStrategy, SessionPersistenceWorker, SwarmExecutionResult,
+    SwarmTaskOutcome, TaskBuilder, TaskResult, UltralearnWorker, VersioningWorker,
 };
 use ruvector::{HnswConfig, RuVectorManager, RuVectorStore};
 use sqlx::PgPool;
@@ -349,6 +349,20 @@ impl NexusBridge {
         scheduler.register(Arc::new(QLearningReplayWorker::new()));
         scheduler.register(Arc::new(ReplicationWorker::new()));
         scheduler.register(Arc::new(ClusteringWorker::new()));
+
+        // Worker che richiedono il pool PostgreSQL (prompt optimizer + allineamento
+        // direttive). Entrambi sono kill-switch-gated nel DB (optimizer_enabled /
+        // alignment_enabled): registrarli e' sicuro, restano no-op finche' non
+        // abilitati. Il PromptOptimizerWorker non era mai stato registrato prima.
+        if let Some(ref pool) = pool {
+            scheduler.register(Arc::new(PromptOptimizerWorker::new(pool.clone())));
+            scheduler.register(Arc::new(GuidelineAlignmentWorker::new(pool.clone())));
+            info!("PromptOptimizerWorker e GuidelineAlignmentWorker registrati (pool disponibile)");
+        } else {
+            info!(
+                "PromptOptimizerWorker/GuidelineAlignmentWorker non registrati: pool DB assente"
+            );
+        }
 
         let observability_ns = Arc::new(MemoryNamespace::new("nexus-bridge-global"));
 

@@ -273,3 +273,64 @@ export async function deleteSharedDirective(key: string): Promise<{ ok: boolean 
     { method: "DELETE" },
   );
 }
+
+// ── Allineamento direttive di prompt engineering (MVP read-only) ─────────────
+
+/** Le 4 dimensioni di valutazione di un template (NUMERIC(4,3): 0..1). */
+export interface AlignmentDimensions {
+  alignment?: number;
+  structure?: number;
+  clarity?: number;
+  safety_preservation?: number;
+}
+
+/** Singola non-conformita' rilevata su un template. */
+export interface AlignmentIssue {
+  practice_key?: string;
+  severity?: string;
+  detail?: string;
+}
+
+/** Riga di conformance piu' recente per un dato prompt_key. */
+export interface AlignmentConformanceRow {
+  prompt_key: string;
+  prompt_version: number;
+  overall_score: number;
+  dimensions: AlignmentDimensions;
+  issues: AlignmentIssue[];
+  checked_at: string;
+}
+
+/** Direttiva versionata della knowledge base. */
+export interface AlignmentGuidelineRow {
+  practice_key: string;
+  source: string;
+  severity: string;
+  applies_to: string;
+  description: string;
+  is_active: boolean;
+  approved_by: string | null;
+}
+
+/** Proposta di revisione pending per un prompt SAFELIST. */
+export interface AlignmentProposalRow {
+  id: string;
+  prompt_key: string;
+  baseline_version: number;
+  rationale: string | null;
+  trigger_source: string;
+  status: string;
+  created_at: string;
+}
+
+export async function listAlignmentConformance(): Promise<AlignmentConformanceRow[]> {
+  return fetchJson(`${adminServiceUrl("/alignment/conformance")}`);
+}
+
+export async function listAlignmentGuidelines(): Promise<AlignmentGuidelineRow[]> {
+  return fetchJson(`${adminServiceUrl("/alignment/guidelines")}`);
+}
+
+export async function listAlignmentProposals(): Promise<AlignmentProposalRow[]> {
+  return fetchJson(`${adminServiceUrl("/alignment/proposals")}`);
+}

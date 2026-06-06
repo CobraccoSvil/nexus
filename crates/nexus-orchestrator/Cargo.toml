@@ -17,11 +17,14 @@ uuid.workspace = true
 reqwest.workspace = true
 futures.workspace = true
 chrono.workspace = true
+sha2.workspace = true
 
 # Local crates
 ruvector = { path = "../ruvector" }
 nexus-types = { path = "../nexus-types" }
 nexus-events = { path = "../nexus-events" }
+nexus-auth = { path = "../nexus-auth" }
+nexus-http.workspace = true
 
 # Orchestrator specific
 parking_lot = "0.12"

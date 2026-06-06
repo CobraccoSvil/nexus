@@ -20,15 +20,23 @@
 //! - `QLearningReplayWorker`  — replay esperienze per Q-Learning
 //! - `ReplicationWorker`      — prepara batch per replica PostgreSQL
 //! - `ClusteringWorker`       — raggruppa pattern per agent_type
+//! - `PromptOptimizerWorker`  — varianti A/B prompt da metriche reflection
+//! - `GuidelineAlignmentWorker` — conformance prompt vs direttive + revisioni
+//!
+//! Modulo condiviso:
+//! - `prompt_variants` — safelist, insert variante+esperimento, client brain
+//!   `/agent/prompt-revise` (riusato da optimizer e alignment, regola L)
 
 pub mod anomaly;
 pub mod audit;
 pub mod cleanup;
 pub mod clustering;
+pub mod guideline_alignment;
 pub mod memory_consolidation;
 pub mod metrics;
 pub mod profiling;
 pub mod prompt_optimizer;
+pub mod prompt_variants;
 pub mod q_learning_replay;
 pub mod replication;
 pub mod session_persistence;
@@ -39,6 +47,7 @@ pub use anomaly::AnomalyDetectionWorker;
 pub use audit::AuditWorker;
 pub use cleanup::CleanupWorker;
 pub use clustering::ClusteringWorker;
+pub use guideline_alignment::GuidelineAlignmentWorker;
 pub use memory_consolidation::MemoryConsolidationWorker;
 pub use metrics::MetricsAggregationWorker;
 pub use profiling::ProfilingWorker;

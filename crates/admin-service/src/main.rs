@@ -14,6 +14,7 @@ use tower_http::trace::TraceLayer;
 
 mod admin_projects;
 mod admin_users;
+mod alignment;
 mod browser_bridge;
 mod environment;
 mod experiments;
@@ -241,6 +242,19 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/orchestrator/subagents/runs",
             get(orchestrator_panel::list_subagent_runs),
+        )
+        // Dashboard allineamento direttive prompt (MVP read-only)
+        .route(
+            "/alignment/conformance",
+            get(alignment::list_conformance),
+        )
+        .route(
+            "/alignment/guidelines",
+            get(alignment::list_guidelines),
+        )
+        .route(
+            "/alignment/proposals",
+            get(alignment::list_proposals),
         )
         .layer(axum_mw::from_fn_with_state(state.clone(), require_admin))
         .with_state(state.clone());

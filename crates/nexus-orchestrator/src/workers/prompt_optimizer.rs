@@ -6,8 +6,10 @@
 //!    `(prompt_key, version)`. Richiede >= `min_runs` run per cohort.
 //! 2. **Identify candidates**: prompt con `avg_reflection_score < threshold`
 //!    o `feedback_rate < success_threshold` sono candidati all'ottimizzazione.
-//! 3. **Generate variants**: chiama Claude API con meta-prompt XML.
-//!    Genera 1-2 varianti per candidato. Valida lo schema XML (tag obbligatori).
+//! 3. **Generate variants**: chiama il brain `POST /agent/prompt-revise`
+//!    (mode `evaluate_and_revise`). Il brain sceglie il modello via routing
+//!    tier-only e valida la conformita' XML lato server. Usa il campo
+//!    `revised_template` della risposta come variante.
 //! 4. **Insert as inactive**: nuove versioni in `nexus_prompt_templates`
 //!    con `is_active=FALSE`, `experimental=TRUE`.
 //! 5. **Register canary**: inserisce in `prompt_ab_experiments` (status=running).
@@ -17,34 +19,18 @@
 //! ## Protezioni
 //! - Kill switch globale: `optimizer_enabled=false` nel DB.
 //! - Auto-promozione separata: `optimizer_auto_promote=false` (default) = dry-run.
-//! - Safelist immutabile: `system.*` e `automation.*` non vengono mai ottimizzati.
+//! - Safelist immutabile (`prompt_variants::is_safelisted`): `system.*` e
+//!   `automation.*` non vengono mai ottimizzati.
 //! - Cap concorrenza: max `optimizer_max_concurrent_experiments` esperimenti running.
 //! - Auto-rollback: monitorato separatamente nella logica di promozione.
 
 use crate::learning_loop::{LearningContext, LearningWorker, WorkerOutcome, WorkerTrigger};
+use crate::workers::prompt_variants;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
-
-/// Prefissi di chiave prompt che non vengono mai ottimizzati automaticamente.
-const SAFELIST_PREFIXES: &[&str] = &[
-    "system.",
-    "automation.",
-    "system.nexus",
-    "automation.mode_",
-];
-
-/// Tag XML obbligatori che ogni variante generata deve contenere.
-const REQUIRED_XML_TAGS: &[&str] = &[
-    "<role>",
-    "<autonomia>",
-    "<protocollo>",
-    "<output_format>",
-    "<reflection>",
-];
 
 /// Metriche aggregate per un singolo (prompt_key, version).
 #[derive(Debug, Clone)]
@@ -55,13 +41,6 @@ struct PromptMetrics {
     avg_reflection_score: f64,
     feedback_positive_rate: f64,
     total_runs: i64,
-}
-
-/// Variante di prompt generata dall'AI.
-#[derive(Debug, Serialize, Deserialize)]
-struct GeneratedVariant {
-    content: String,
-    rationale: String,
 }
 
 pub struct PromptOptimizerWorker {
@@ -99,11 +78,6 @@ impl PromptOptimizerWorker {
     async fn read_setting_i64(&self, key: &str, default: i64) -> i64 {
         let raw = self.read_setting(key).await;
         raw.trim().parse::<i64>().unwrap_or(default)
-    }
-
-    /// Restituisce true se la chiave e' nella safelist (non ottimizzabile).
-    fn is_safelisted(key: &str) -> bool {
-        SAFELIST_PREFIXES.iter().any(|prefix| key.starts_with(prefix))
     }
 
     /// Raccoglie le metriche aggregate per tutti i prompt agente.
@@ -175,152 +149,56 @@ impl PromptOptimizerWorker {
         count.unwrap_or(0) > 0
     }
 
-    /// Genera una variante migliorata del prompt via Claude API.
-    /// Restituisce None se la generazione fallisce o il risultato e' invalido.
+    /// Genera una variante migliorata del prompt via brain `/agent/prompt-revise`.
+    ///
+    /// Il brain valuta e riscrive il template (mode `evaluate_and_revise`),
+    /// scegliendo il modello via routing tier-only e validando la conformita'
+    /// XML lato server (la validazione locale dei tag e' stata rimossa: e' ora
+    /// responsabilita' del conformance check del brain).
+    ///
+    /// Restituisce il contenuto della variante (revised_template) o None se la
+    /// generazione fallisce o non c'e' `revised_template`.
     async fn generate_variant(
         &self,
         metrics: &PromptMetrics,
         weaknesses: &[String],
-    ) -> Option<GeneratedVariant> {
-        let weakness_text = if weaknesses.is_empty() {
-            "Nessuna debolezza specifica identificata. Migliorare chiarezza e autonomia.".to_string()
-        } else {
-            weaknesses.join("\n- ")
-        };
-
-        let meta_prompt = format!(
-            r#"Sei un esperto di prompt engineering per agenti AI specializzati in sviluppo software.
-Il tuo compito e' migliorare il prompt seguente per l'agente Nexus.
-
-PROMPT ATTUALE:
-<prompt_attuale>
-{content}
-</prompt_attuale>
-
-METRICHE DI PERFORMANCE:
-- Score reflection medio: {score:.2} / 1.0 (soglia: 0.65)
-- Feedback positivi: {feedback:.0}%
-- Run analizzati: {runs}
-
-DEBOLEZZE IDENTIFICATE:
-- {weaknesses}
-
-ISTRUZIONI:
-1. Genera UNA variante migliorata che risolva le debolezze identificate.
-2. Mantieni la struttura XML con i tag: <role>, <contesto>, <autonomia>, <protocollo>, <tool_usage>, <anti_loop>, <output_format>, <examples>, <reflection>.
-3. Tutto in italiano. Nessuna emoji.
-4. Aumenta l'autonomia esplicita: l'agente NON deve chiedere conferma per operazioni di sola lettura.
-5. Aggiungi esempi few-shot concreti se mancanti.
-
-Rispondi con JSON nel formato:
-{{"content": "<prompt migliorato completo>", "rationale": "<spiegazione breve delle modifiche>"}}"#,
-            content = &metrics.prompt_content[..metrics.prompt_content.len().min(6000)],
-            score = metrics.avg_reflection_score,
-            feedback = metrics.feedback_positive_rate * 100.0,
-            runs = metrics.total_runs,
-            weaknesses = weakness_text,
-        );
-
-        // ── BP9 follow-up (Batch API) ─────────────────────────────────────
-        // L'infrastruttura DB e' pronta in mig 0121:
-        //   - tabella nexus_anthropic_batches (tracking batch in volo)
-        //   - flag settings.prompt_optimizer_use_batch_api (default false)
-        //
-        // Per attivare la Batch API (50% sconto token):
-        // 1. Leggere il flag prompt_optimizer_use_batch_api dal DB
-        // 2. Se true: accumulare N richieste in un buffer
-        // 3. POST https://api.anthropic.com/v1/messages/batches con custom_id
-        //    per ogni richiesta, persistere anthropic_batch_id in DB
-        // 4. Worker separato (poll ogni 5min) che chiama
-        //    GET /v1/messages/batches/{id}/results per batch ended
-        // 5. Una volta recuperati, marca batch come 'ended' e processa le
-        //    risposte (parsing identico al flusso sincrono attuale)
-        //
-        // Tradeoff: latenza fino a 24h per ottenere le varianti, ma 50% in
-        // meno di costo. Adatto per il prompt_optimizer perche' le varianti
-        // non servono in real-time. Manteniamo il flusso sincrono finche'
-        // l'admin non attiva esplicitamente il flag.
-        // Provider+model dal routing tier-only di mcp-core (PUNTO UNICO via HTTP,
-        // regola L/G): niente piu' SELECT statica del model_id ne' provider fisso.
-        let (provider, model) =
-            match nexus_types::resolve_purpose_via_http(self.pool.as_ref(), "prompt_optimizer")
-                .await
-            {
-                Ok(pm) => pm,
-                Err(e) => {
-                    error!("prompt_optimizer: routing 'prompt_optimizer' non risolto: {e}");
-                    return None;
-                }
-            };
-
-        // Instrada via brain /complete (multi-provider): cosi' la chiamata rispetta
-        // il provider scelto dal routing, non e' piu' inchiodata ad Anthropic.
-        let brain_url = std::env::var("NEURAL_CORE_REST_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
-        let client = reqwest::Client::new();
-        let body = serde_json::json!({
-            "provider": provider,
-            "model": model,
-            "prompt": meta_prompt,
-            "max_tokens": 4096,
-            "temperature": 0.3,
-            "json_mode": true,
+    ) -> Option<String> {
+        // Segnali reflection-driven: metriche aggregate dalle reflection recenti.
+        let signal_metrics = serde_json::json!({
+            "avg_reflection_score": metrics.avg_reflection_score,
+            "feedback_positive_rate": metrics.feedback_positive_rate,
+            "total_runs": metrics.total_runs,
         });
 
-        let response = match client
-            .post(format!("{brain_url}/complete"))
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(90))
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                error!("prompt_optimizer: errore HTTP brain /complete: {}", e);
-                return None;
-            }
-        };
+        let result = prompt_variants::call_prompt_revise(
+            self.pool.as_ref(),
+            &metrics.prompt_key,
+            &metrics.prompt_content,
+            prompt_variants::ReviseMode::EvaluateAndRevise,
+            prompt_variants::SignalKind::Reflection,
+            weaknesses,
+            signal_metrics,
+        )
+        .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body_text = response.text().await.unwrap_or_default();
-            error!("prompt_optimizer: brain /complete error {}: {}", status, &body_text[..body_text.len().min(200)]);
+        if result.status != "completed" {
+            warn!(
+                "prompt_optimizer: prompt-revise status='{}' per '{}', variante scartata",
+                result.status, metrics.prompt_key
+            );
             return None;
         }
 
-        let resp_json: serde_json::Value = match response.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                error!("prompt_optimizer: parse risposta brain: {}", e);
-                return None;
-            }
-        };
-
-        let raw_text = resp_json["content"].as_str()?.to_string();
-
-        // Estrae il JSON dalla risposta
-        let variant: GeneratedVariant = if let Ok(v) = serde_json::from_str(&raw_text) {
-            v
-        } else {
-            // Tenta estrazione con regex-like: cerca il primo { ... }
-            let start = raw_text.find('{')?;
-            let end = raw_text.rfind('}')?;
-            if end <= start { return None; }
-            serde_json::from_str(&raw_text[start..=end]).ok()?
-        };
-
-        // Validazione schema XML
-        for tag in REQUIRED_XML_TAGS {
-            if !variant.content.contains(tag) {
-                warn!(
-                    "prompt_optimizer: variante per '{}' manca tag {}, scartata",
-                    metrics.prompt_key, tag
+        match result.revised_template {
+            Some(content) if !content.trim().is_empty() => Some(content),
+            _ => {
+                debug!(
+                    "prompt_optimizer: prompt-revise senza revised_template per '{}'",
+                    metrics.prompt_key
                 );
-                return None;
+                None
             }
         }
-
-        Some(variant)
     }
 
     /// Recupera le debolezze piu' comuni dalle reflection recenti per un prompt.
@@ -351,57 +229,6 @@ Rispondi con JSON nel formato:
         let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(&a.1));
         sorted.into_iter().take(5).map(|(w, _)| w).collect()
-    }
-
-    /// Inserisce la variante nel DB e registra l'esperimento canary.
-    async fn insert_variant_and_experiment(
-        &self,
-        metrics: &PromptMetrics,
-        variant: &GeneratedVariant,
-        traffic_pct: i64,
-    ) -> Result<(), sqlx::Error> {
-        let new_version = metrics.prompt_version + 1;
-
-        // Inserisce la nuova versione come inattiva e sperimentale
-        sqlx::query(
-            r#"
-            INSERT INTO nexus_prompt_templates
-                (key, version, content, is_active, experimental,
-                 schema_type, placeholder_vars, updated_by)
-            VALUES ($1, $2, $3, FALSE, TRUE, 'xml',
-                    '["lang_hint","type_hint","repo_summary"]'::jsonb,
-                    'prompt_optimizer')
-            ON CONFLICT (key, version) DO NOTHING
-            "#,
-        )
-        .bind(&metrics.prompt_key)
-        .bind(new_version)
-        .bind(&variant.content)
-        .execute(self.pool.as_ref())
-        .await?;
-
-        // Registra l'esperimento canary
-        sqlx::query(
-            r#"
-            INSERT INTO prompt_ab_experiments
-                (prompt_key, baseline_version, variant_version,
-                 traffic_pct, status, auto_promote_enabled)
-            VALUES ($1, $2, $3, $4, 'running', FALSE)
-            ON CONFLICT DO NOTHING
-            "#,
-        )
-        .bind(&metrics.prompt_key)
-        .bind(metrics.prompt_version)
-        .bind(new_version)
-        .bind(traffic_pct as i32)
-        .execute(self.pool.as_ref())
-        .await?;
-
-        info!(
-            "prompt_optimizer: variante v{} inserita per '{}' (traffic={}%)",
-            new_version, metrics.prompt_key, traffic_pct
-        );
-        Ok(())
     }
 
     /// Chiude gli esperimenti maturi (se auto_promote abilitato).
@@ -636,7 +463,7 @@ impl LearningWorker for PromptOptimizerWorker {
         let candidates: Vec<&PromptMetrics> = metrics
             .iter()
             .filter(|m| {
-                !Self::is_safelisted(&m.prompt_key)
+                !prompt_variants::is_safelisted(&m.prompt_key)
                     && m.avg_reflection_score < reflection_threshold
             })
             .collect();
@@ -674,8 +501,16 @@ impl LearningWorker for PromptOptimizerWorker {
             let weaknesses = self.top_weaknesses(&candidate.prompt_key).await;
 
             match self.generate_variant(candidate, &weaknesses).await {
-                Some(variant) => {
-                    match self.insert_variant_and_experiment(candidate, &variant, traffic_pct).await {
+                Some(variant_content) => {
+                    match prompt_variants::insert_variant_and_experiment(
+                        self.pool.as_ref(),
+                        &candidate.prompt_key,
+                        candidate.prompt_version,
+                        &variant_content,
+                        traffic_pct,
+                    )
+                    .await
+                    {
                         Ok(()) => generated += 1,
                         Err(e) => error!(
                             "prompt_optimizer: insert variante '{}': {}",
