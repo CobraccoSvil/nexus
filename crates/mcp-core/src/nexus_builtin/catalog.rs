@@ -194,6 +194,11 @@ pub(super) static NEXUS_TOOLS: &[ToolDef] = &[
         schema: r#"{"type":"object","required":["project_id","mutation_id"],"properties":{"project_id":{"type":"string","description":"UUID del progetto"},"mutation_id":{"type":"integer","description":"ID della mutazione (dalla list)"}}}"#,
     },
     ToolDef {
+        name: "nexus_session_branch_info",
+        description: "Ritorna il branch git di auto-commit della sessione corrente (es. nexus/session/a1b2c3d4) e l'elenco dei comandi pronti all'uso per ispezionare/mergiare/scartare l'intera sessione. Utile quando l'utente chiede 'come vedo tutto cio' che ho fatto in questa chat?' o 'fai diff di tutta la sessione'.",
+        schema: r#"{"type":"object","properties":{"project_id":{"type":"string","description":"UUID del progetto (default: progetto corrente)"}}}"#,
+    },
+    ToolDef {
         name: "nexus_file_revert",
         description: "Ripristina un file allo stato precedente a una mutazione specifica, oppure annulla l'ultima mutazione del progetto. Usalo quando l'utente dice 'annulla', 'torna indietro', 'ripristina', 'rimedia agli errori', dopo aver chiarito quale modifica annullare. Per sicurezza il revert fallisce se il file e' stato modificato dopo la mutazione (l'utente deve confermare con force=true).",
         schema: r#"{"type":"object","required":["project_id"],"properties":{"project_id":{"type":"string","description":"UUID del progetto"},"mutation_id":{"type":"integer","description":"ID specifico della mutazione da annullare. Se assente, annulla l'ULTIMA mutazione annullabile del progetto."},"force":{"type":"boolean","description":"Se true sovrascrive anche in caso di conflict (il file e' stato modificato dopo). Default false."}}}"#,

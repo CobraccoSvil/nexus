@@ -360,6 +360,7 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
             "file_mutations::record_mutation fallita (write_file): {e}"
         );
     }
+    let autocommit_op = if existed_before { "modify" } else { "create" };
     match tokio::fs::write(&target, content).await {
         Ok(()) => {
             // Dispatcher: notifica Explorer/Editor in tempo reale
@@ -375,6 +376,22 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
                     },
                 },
             );
+
+            // Auto-commit per sessione su branch dedicato: rete di sicurezza
+            // sopra file_mutations. Se non e' un git repo / setting disabilitato
+            // / session_id assente, il modulo fa no-op silenzioso (vedi modulo).
+            let ac_db = ctx.db.clone();
+            let ac_root = ctx.root_path.clone();
+            let ac_is_git = ctx.is_git_repo;
+            let ac_sid = ctx.session_id;
+            let ac_path = path_str.to_string();
+            let ac_op = autocommit_op.to_string();
+            tokio::spawn(async move {
+                crate::session_autocommit::snapshot_after_mutation(
+                    &ac_db, &ac_root, ac_is_git, ac_sid, &ac_op, &ac_path,
+                )
+                .await;
+            });
 
             // Re-indicizza il file nel code index + eventuale auto-scan qualità (in background)
             let db_bg = ctx.db.clone();
@@ -880,6 +897,19 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
                             op: "modified".to_string(),
                         },
                     );
+                    // Auto-commit per sessione (vedi tool_write_file).
+                    let ac_db = ctx.db.clone();
+                    let ac_root = ctx.root_path.clone();
+                    let ac_is_git = ctx.is_git_repo;
+                    let ac_sid = ctx.session_id;
+                    let ac_path = path_str.to_string();
+                    tokio::spawn(async move {
+                        crate::session_autocommit::snapshot_after_mutation(
+                            &ac_db, &ac_root, ac_is_git, ac_sid, "modify", &ac_path,
+                        )
+                        .await;
+                    });
+
                     // Re-indicizza il file nel code index + eventuale auto-scan qualità (in background)
                     let db_bg = ctx.db.clone();
                     let neural_bg = ctx.neural.clone();

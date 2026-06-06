@@ -35,7 +35,10 @@ use docs::{
     bump_version, get_project_slug, handle_doc_list, handle_doc_search, handle_doc_status,
     handle_doc_update,
 };
-use mutations::{handle_file_mutation_diff, handle_file_mutations_list, handle_file_revert};
+use mutations::{
+    handle_file_mutation_diff, handle_file_mutations_list, handle_file_revert,
+    handle_session_branch_info,
+};
 // Re-export pubblico: usata anche dall'endpoint REST dedicato
 // POST /api/projects/:id/documents/generate (FIX 3/4: generazione senza passare
 // per l'agente conversazionale).
@@ -197,6 +200,9 @@ pub async fn execute(
         }
         "nexus_file_mutation_diff" => handle_file_mutation_diff(db, project_id, &arguments).await,
         "nexus_file_revert" => handle_file_revert(db, project_id, user_id, &arguments).await,
+        "nexus_session_branch_info" => {
+            handle_session_branch_info(db, project_id, &arguments).await
+        }
         // ── editor UI ────────────────────────────────────────────────
         "nexus_open_file_in_editor" => handle_open_file_in_editor(db, project_id, &arguments).await,
         // ── nexus_tool_catalog (Fase 9A) ──────────────────────────────

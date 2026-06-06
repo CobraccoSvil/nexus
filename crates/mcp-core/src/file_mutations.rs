@@ -409,6 +409,20 @@ pub async fn revert_mutation(
     .execute(db)
     .await;
 
+    // Auto-commit per sessione: il revert e' a sua volta una mutazione
+    // dell'agente, va congelato nel branch nexus/session/<short>. Verifica
+    // is_git_repo on-the-fly (per il revert non passiamo per ctx).
+    let is_git = project_root.join(".git").exists();
+    crate::session_autocommit::snapshot_after_mutation(
+        db,
+        project_root,
+        is_git,
+        session_id,
+        "revert",
+        &file_path,
+    )
+    .await;
+
     RevertOutcome::Reverted {
         new_mutation_id: recorded.id,
     }

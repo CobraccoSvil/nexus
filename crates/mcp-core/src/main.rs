@@ -31,6 +31,7 @@ mod internal_learning;
 mod file_mutations;
 mod internal_routing;
 mod mutations_api;
+mod session_autocommit;
 mod llm_json;
 mod long_running;
 mod mcp_client;

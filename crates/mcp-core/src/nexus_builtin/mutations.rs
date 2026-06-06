@@ -46,6 +46,51 @@ pub(super) async fn handle_file_mutation_diff(
     }
 }
 
+/// Ritorna info sul branch di auto-commit della sessione corrente / progetto:
+/// prefisso configurato, comandi git pronti all'uso per ispezionare/mergiare/
+/// scartare l'intera sessione.
+pub(super) async fn handle_session_branch_info(
+    db: &PgPool,
+    project_id: Uuid,
+    args: &Value,
+) -> String {
+    let pid = match args.get("project_id").and_then(Value::as_str) {
+        Some(s) => Uuid::parse_str(s).unwrap_or(project_id),
+        None => project_id,
+    };
+
+    let cfg = crate::session_autocommit::load_config(db).await;
+    let prefix = cfg.branch_prefix.trim_end_matches('/').to_string();
+
+    // Conta i branch nexus per il progetto leggendo la project root.
+    let root_row = sqlx::query(
+        "SELECT w.absolute_path FROM workspaces w \
+         WHERE w.project_id = $1 AND w.is_primary = TRUE",
+    )
+    .bind(pid)
+    .fetch_optional(db)
+    .await;
+    let root: Option<String> = match root_row {
+        Ok(Some(r)) => r.try_get::<String, _>("absolute_path").ok(),
+        _ => None,
+    };
+
+    format_json(&json!({
+        "enabled": cfg.enabled,
+        "branch_prefix": cfg.branch_prefix,
+        "branch_pattern": format!("{prefix}/*"),
+        "project_root": root,
+        "commands": {
+            "list_session_branches": format!("git branch --list '{prefix}/*'"),
+            "list_session_log_template": format!("git log --oneline {prefix}/<short_id>"),
+            "diff_full_session_template": format!("git diff HEAD..{prefix}/<short_id>"),
+            "merge_session_into_current_template": format!("git merge --no-ff {prefix}/<short_id>"),
+            "discard_session_template": format!("git branch -D {prefix}/<short_id>")
+        },
+        "hint": "Il <short_id> e' visibile nei messaggi di commit (es. 'agent: ... (session a1b2c3d4)'). Usa `git branch --list` per elencarli tutti."
+    }))
+}
+
 pub(super) async fn handle_file_revert(
     db: &PgPool,
     project_id: Uuid,
