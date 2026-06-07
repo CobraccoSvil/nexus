@@ -83,8 +83,8 @@ pub fn spawn_routing_matrix_auto_promoter(db: PgPool, enabled: bool, interval_s:
         loop {
             match run_one_round(&db).await {
                 Ok(stats) => tracing::info!(
-                    "routing_matrix_auto_promoter: round completato — updated={} skipped_manual={} no_candidates={} cleaned_up={}",
-                    stats.updated, stats.skipped_manual, stats.no_candidates, stats.cleaned_up
+                    "routing_matrix_auto_promoter: round completato — healed={} updated={} skipped_manual={} no_candidates={} cleaned_up={}",
+                    stats.healed, stats.updated, stats.skipped_manual, stats.no_candidates, stats.cleaned_up
                 ),
                 Err(e) => tracing::warn!("routing_matrix_auto_promoter: round fallito: {e}"),
             }
@@ -99,12 +99,23 @@ pub struct PromoteStats {
     pub skipped_manual: usize,
     pub no_candidates: usize,
     pub cleaned_up: usize,
+    pub healed: usize,
 }
 
 pub async fn run_one_round(db: &PgPool) -> anyhow::Result<PromoteStats> {
+    let mut stats = PromoteStats::default();
+
+    // ── Heal pass (PRIMA di tutto) ───────────────────────────────────────────
+    // Sana i pin orfani (model_id missing_from_api) sostituendoli con un modello
+    // sano dello stesso provider+tier, ANCHE su righe manual_override. Cosi' il
+    // promote/cleanup successivi e il routing live non vedono mai modelli morti.
+    match heal_orphan_pinned_models(db).await {
+        Ok(healed) => stats.healed = healed as usize,
+        Err(e) => tracing::warn!("routing_matrix_auto_promoter: heal_orphan_pinned_models fallito: {e}"),
+    }
+
     let requirements = load_requirements(db).await?;
     let catalog = load_catalog(db).await?;
-    let mut stats = PromoteStats::default();
 
     for req in &requirements {
         let top_by_provider = select_top_candidates(req, &catalog);
@@ -312,6 +323,206 @@ pub async fn cleanup_stale_rows(db: &PgPool) -> sqlx::Result<u64> {
     }
 
     Ok(deactivated)
+}
+
+// ---------------------------------------------------------------------------
+// Auto-heal dei "pin orfani" (regola H)
+// ---------------------------------------------------------------------------
+//
+// PROBLEMA: il promote e il cleanup rispettano `manual_override=true` e non
+// toccano quelle righe. Migrazioni storiche (0260/0268/0270/0274/0337) hanno
+// messo manual_override=true su TUTTE le righe agentiche per "pinnarle". Quando
+// un modello pinnato viene deprecato dall'API del provider (catalog_sync lo
+// marca `auto_disabled_reason='missing_from_api'`), la riga resta a puntare a un
+// modello inesistente: il routing lo sceglie, fallisce, e degrada su un modello
+// light. Un pin su un modello che il provider non offre PIU' non e' una scelta
+// valida dell'admin: e' orfano. Va sanato anche se manual_override=true.
+//
+// FIX: heal_orphan_pinned_models sostituisce il `model_id` morto con il miglior
+// modello SANO dello stesso (provider, performance_tier), PRESERVANDO il pin
+// (manual_override resta invariato: cambia solo il model_id, non la decisione di
+// provider/tier dell'admin). Se non esiste alcun sostituto sano, lascia la riga
+// al cleanup (che la logghera' come blackout reale).
+
+/// Candidato sostituto del catalog (gia' filtrato sano: is_enabled, cf=0).
+/// Campi separati per testabilita' della logica di selezione.
+#[derive(Debug, Clone, PartialEq)]
+struct HealCandidate {
+    model: String,
+    is_featured: bool,
+    context_window: i64,
+    input_cost: f64,
+}
+
+/// "Family stem" di un nome modello: rimuove l'ultimo segmento se e' una
+/// versione (data/numero/"latest"). Serve a riconoscere il SUCCESSORE di un
+/// modello deprecato nella stessa famiglia.
+///   mistral-large-2411  -> mistral-large
+///   mistral-large-latest -> mistral-large
+///   ministral-8b-2512   -> ministral-8b   (8b non e' una versione pura)
+///   gpt-4o-2024-05-13   -> gpt-4o-2024-05 (rimuove solo l'ultimo; approssimato
+///                                          ma sufficiente per il match di famiglia)
+fn model_stem(model: &str) -> &str {
+    match model.rsplit_once('-') {
+        Some((head, tail)) => {
+            let is_version =
+                tail.eq_ignore_ascii_case("latest") || tail.chars().all(|c| c.is_ascii_digit());
+            if is_version && !head.is_empty() {
+                head
+            } else {
+                model
+            }
+        }
+        None => model,
+    }
+}
+
+/// Sceglie il miglior sostituto tra candidati dello stesso (provider, tier).
+///
+/// CRITICO: il `performance_tier` di un provider puo' mescolare modelli di
+/// capacita' molto diversa (es. Mistral 'medium' contiene sia ministral-3b sia
+/// mistral-large). Per non degradare, si PREFERISCONO i candidati della STESSA
+/// famiglia del modello deprecato (stesso `model_stem`): il successore naturale
+/// di `mistral-large-2411` e' `mistral-large-latest`, non `ministral-8b`.
+/// Solo se nessun candidato condivide la famiglia si ricade su tutti.
+///
+/// Ordine a parita' di famiglia: featured, poi context window, poi costo basso.
+fn pick_best_replacement(dead_model: &str, candidates: &[HealCandidate]) -> Option<String> {
+    let dead_stem = model_stem(dead_model);
+    let same_family: Vec<&HealCandidate> = candidates
+        .iter()
+        .filter(|c| model_stem(&c.model) == dead_stem)
+        .collect();
+    let pool: Vec<&HealCandidate> = if same_family.is_empty() {
+        candidates.iter().collect()
+    } else {
+        same_family
+    };
+    pool.into_iter()
+        .max_by(|a, b| {
+            a.is_featured
+                .cmp(&b.is_featured)
+                .then(a.context_window.cmp(&b.context_window))
+                .then(
+                    b.input_cost
+                        .partial_cmp(&a.input_cost)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+        })
+        .map(|c| c.model.clone())
+}
+
+/// Sana le righe matrix che puntano a modelli `missing_from_api`, sostituendo
+/// il model_id con il miglior sostituto sano dello stesso provider+tier.
+/// RISPETTA `manual_override` (cambia solo il model_id morto, non il pin).
+/// Ritorna il numero di righe sanate.
+pub async fn heal_orphan_pinned_models(db: &PgPool) -> sqlx::Result<u64> {
+    // Flag enforcement (settings, regola G — niente env/hardcode).
+    let enabled = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM settings WHERE key = 'agent.routing_matrix_heal_orphan_enabled'",
+    )
+    .fetch_optional(db)
+    .await?
+    .map(|v| {
+        !matches!(
+            v.trim().to_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+    .unwrap_or(true);
+    if !enabled {
+        tracing::info!("routing_matrix_auto_promoter: heal_orphan_pinned_models DISABILITATO (flag)");
+        return Ok(0);
+    }
+
+    // 1. Trova i (provider, dead_model, tier) distinti referenziati da righe
+    //    matrix ATTIVE il cui modello e' missing_from_api nel catalog.
+    let orphans = sqlx::query(
+        "SELECT DISTINCT m.provider, m.model_id AS dead_model, c.performance_tier AS tier
+           FROM nexus_routing_matrix m
+           JOIN ai_price_catalog c
+             ON LOWER(c.provider) = LOWER(m.provider) AND c.model = m.model_id
+          WHERE m.is_active = true
+            AND c.auto_disabled_reason = 'missing_from_api'",
+    )
+    .fetch_all(db)
+    .await?;
+
+    let mut healed_total: u64 = 0;
+    for o in &orphans {
+        let provider: String = o.try_get("provider").unwrap_or_default();
+        let dead_model: String = o.try_get("dead_model").unwrap_or_default();
+        let tier: String = o.try_get("tier").unwrap_or_default();
+
+        // 2. Carica i candidati sani dello stesso (provider, tier).
+        let cand_rows = sqlx::query(
+            "SELECT model, COALESCE(is_featured, false) AS is_featured,
+                    COALESCE(context_window, 8192) AS context_window,
+                    input_cost_per_million_tokens::float8 AS input_cost
+               FROM ai_price_catalog
+              WHERE LOWER(provider) = LOWER($1)
+                AND performance_tier = $2
+                AND is_enabled = true
+                AND consecutive_failures = 0
+                AND model <> $3",
+        )
+        .bind(&provider)
+        .bind(&tier)
+        .bind(&dead_model)
+        .fetch_all(db)
+        .await?;
+
+        let candidates: Vec<HealCandidate> = cand_rows
+            .iter()
+            .map(|r| HealCandidate {
+                model: r.try_get("model").unwrap_or_default(),
+                is_featured: r.try_get("is_featured").unwrap_or(false),
+                context_window: r.try_get("context_window").unwrap_or(8192),
+                input_cost: r.try_get("input_cost").unwrap_or(0.0),
+            })
+            .collect();
+
+        let Some(replacement) = pick_best_replacement(&dead_model, &candidates) else {
+            tracing::warn!(
+                provider = %provider, dead_model = %dead_model, tier = %tier,
+                "heal_orphan_pinned_models: nessun sostituto sano per il modello deprecato — riga lasciata al cleanup"
+            );
+            continue;
+        };
+
+        // 3. UPDATE tutte le righe (qualsiasi manual_override) che puntano al
+        //    modello morto: cambia SOLO il model_id, preserva il pin.
+        let note = format!(
+            " [auto-heal: {dead_model} deprecato (missing_from_api) -> {replacement}]"
+        );
+        let res = sqlx::query(
+            "UPDATE nexus_routing_matrix
+                SET model_id = $1,
+                    notes = COALESCE(notes, '') ||
+                            CASE WHEN COALESCE(notes,'') LIKE '%' || $2 || '%'
+                                 THEN '' ELSE $2 END,
+                    updated_at = NOW()
+              WHERE LOWER(provider) = LOWER($3)
+                AND model_id = $4
+                AND is_active = true",
+        )
+        .bind(&replacement)
+        .bind(&note)
+        .bind(&provider)
+        .bind(&dead_model)
+        .execute(db)
+        .await?;
+        let n = res.rows_affected();
+        if n > 0 {
+            tracing::info!(
+                provider = %provider, dead_model = %dead_model, replacement = %replacement, rows = n,
+                "heal_orphan_pinned_models: sanate {n} righe (modello deprecato sostituito)"
+            );
+            healed_total += n;
+        }
+    }
+
+    Ok(healed_total)
 }
 
 async fn load_requirements(db: &PgPool) -> sqlx::Result<Vec<IntentRequirement>> {
@@ -830,6 +1041,93 @@ mod tests {
         assert!(
             s_light > s_heavy,
             "economica deve preferire light-cheap ({s_light}) > heavy-expensive ({s_heavy})"
+        );
+    }
+
+    // ── Test heal_orphan_pinned_models::pick_best_replacement ────────────────
+
+    fn heal_cand(model: &str, featured: bool, ctx: i64, cost: f64) -> HealCandidate {
+        HealCandidate {
+            model: model.to_string(),
+            is_featured: featured,
+            context_window: ctx,
+            input_cost: cost,
+        }
+    }
+
+    #[test]
+    fn heal_stem_extraction() {
+        assert_eq!(model_stem("mistral-large-2411"), "mistral-large");
+        assert_eq!(model_stem("mistral-large-latest"), "mistral-large");
+        assert_eq!(model_stem("mistral-large-2512"), "mistral-large");
+        assert_eq!(model_stem("ministral-8b-2512"), "ministral-8b");
+        assert_eq!(model_stem("claude-sonnet"), "claude-sonnet"); // niente versione
+    }
+
+    #[test]
+    fn heal_pick_none_when_empty() {
+        assert_eq!(pick_best_replacement("mistral-large-2411", &[]), None);
+    }
+
+    #[test]
+    fn heal_pick_prefers_featured_same_family() {
+        // featured vince, MA solo tra la stessa famiglia. Qui entrambi family.
+        let cands = vec![
+            heal_cand("x-big", false, 1_000_000, 0.1),
+            heal_cand("x-small", true, 8_192, 9.0),
+        ];
+        assert_eq!(
+            pick_best_replacement("x-2411", &cands).as_deref(),
+            Some("x-small")
+        );
+    }
+
+    #[test]
+    fn heal_pick_context_then_cost_same_family() {
+        let cands = vec![
+            heal_cand("x-small-ctx", false, 8_192, 0.1),
+            heal_cand("x-big-ctx", false, 200_000, 5.0),
+        ];
+        assert_eq!(
+            pick_best_replacement("x-0000", &cands).as_deref(),
+            Some("x-big-ctx")
+        );
+    }
+
+    #[test]
+    fn heal_realcase_mistral_large_prefers_same_family() {
+        // CASO REALE del bug: mistral-large-2411 deprecato. Candidati medium
+        // sani includono ministral (piccolo, economico, context grande) e
+        // mistral-large-latest. La famiglia deve vincere: NON deve scegliere
+        // ministral-8b solo perche' costa meno.
+        let cands = vec![
+            heal_cand("ministral-8b-2512", false, 128_000, 0.10),
+            heal_cand("ministral-3b-latest", false, 128_000, 0.04),
+            heal_cand("mistral-large-latest", false, 128_000, 2.0),
+            heal_cand("mistral-large-2512", false, 128_000, 2.0),
+            heal_cand("mistral-small-2506", false, 32_000, 0.2),
+        ];
+        // dead stem = "mistral-large" -> candidati family: large-latest, large-2512
+        // (entrambi non featured, stesso context, stesso costo) -> il primo per
+        // l'ordine stabile max_by. Verifichiamo che sia UNO dei due large.
+        let pick = pick_best_replacement("mistral-large-2411", &cands).unwrap();
+        assert!(
+            pick.starts_with("mistral-large"),
+            "atteso un mistral-large-*, ottenuto {pick}"
+        );
+    }
+
+    #[test]
+    fn heal_fallback_when_no_same_family() {
+        // Se nessun candidato condivide la famiglia, ricade su tutti
+        // (featured > context > cost).
+        let cands = vec![
+            heal_cand("other-a", false, 8_192, 1.0),
+            heal_cand("other-b", true, 8_192, 5.0),
+        ];
+        assert_eq!(
+            pick_best_replacement("deadfamily-2411", &cands).as_deref(),
+            Some("other-b")
         );
     }
 }
