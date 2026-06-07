@@ -434,6 +434,20 @@ pub(crate) async fn build_composed_system_context(
         services_block, project_header, profile_prompt_block, base
     )
 }
+/// Punto unico (regola L) di conversione del ruolo DB -> ruolo LLM. I ruoli
+/// interni di Nexus non standard per i provider (in particolare 'summary',
+/// iniettato dal compact) vengono mappati a 'user'; 'assistant' resta tale.
+/// Necessario perche' i servizi a valle (gateway/brain) accettano solo
+/// system/user/assistant/tool e rifiutano 'summary' con un errore di
+/// deserializzazione ("unknown variant `summary`"). Va usato OVUNQUE si
+/// costruiscano i `messages` da inviare a un LLM a partire da chat_messages.
+pub(crate) fn db_role_to_llm_role(role: &str) -> &'static str {
+    match role {
+        "assistant" => "assistant",
+        _ => "user",
+    }
+}
+
 /// Carica gli ultimi `limit` messaggi della sessione come turn LLM strutturati.
 /// Restituisce un Vec di { "role": "user"|"assistant", "content": "..." }
 /// pronti da passare come history iniziale all'agent loop.
@@ -472,13 +486,9 @@ pub(crate) async fn build_recent_conversation_history(
             if content.trim().is_empty() {
                 return None;
             }
-            // Normalizza il ruolo per compatibilità con il formato messages LLM.
-            // 'summary' (iniettato dal compact) viene inviato come messaggio user
-            // — il content e' gia' prefissato con "[Riassunto ...]".
-            let llm_role = match role.as_str() {
-                "assistant" => "assistant",
-                _ => "user",
-            };
+            // Normalizza il ruolo per compatibilità con il formato messages LLM
+            // (punto unico, regola L): 'summary' -> 'user'.
+            let llm_role = db_role_to_llm_role(&role);
             Some(serde_json::json!({ "role": llm_role, "content": content }))
         })
         .collect()
@@ -817,11 +827,7 @@ pub(crate) async fn build_vectorized_conversation_history(
                 }
             }
         }
-        let llm_role = if role == "assistant" {
-            "assistant"
-        } else {
-            "user"
-        };
+        let llm_role = db_role_to_llm_role(role);
         semantic_msgs.push((
             created_at.to_string(),
             hit.score,
@@ -853,4 +859,19 @@ pub(crate) async fn build_vectorized_conversation_history(
         semantic_msgs.into_iter().map(|(_, _, m)| m).collect();
     combined.extend(recent);
     combined
+}
+
+#[cfg(test)]
+mod role_map_tests {
+    use super::db_role_to_llm_role;
+
+    #[test]
+    fn summary_role_e_mappato_a_user() {
+        // Regressione: il ruolo interno 'summary' (compact) NON deve mai
+        // arrivare grezzo a un LLM (errore "unknown variant ").
+        assert_eq!(db_role_to_llm_role("summary"), "user");
+        assert_eq!(db_role_to_llm_role("assistant"), "assistant");
+        assert_eq!(db_role_to_llm_role("user"), "user");
+        assert_eq!(db_role_to_llm_role("qualsiasi_altro"), "user");
+    }
 }

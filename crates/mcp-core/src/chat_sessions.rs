@@ -394,13 +394,18 @@ pub(crate) async fn compact_session_core(
         ));
     }
 
-    // Build messages JSON for summarization
+    // Build messages JSON for summarization. Normalizza il ruolo DB -> ruolo LLM
+    // (punto unico, regola L): una RI-compattazione legge anche il messaggio
+    // role='summary' del compact precedente; inviarlo grezzo al brain/gateway
+    // causa "unknown variant `summary`" (i provider accettano solo
+    // system/user/assistant/tool). 'summary' -> 'user'.
     let mut msgs: Vec<serde_json::Value> = rows
         .iter()
         .filter_map(|row| {
             let role: String = row.try_get("role").ok()?;
             let content: String = row.try_get("content").ok()?;
-            Some(json!({ "role": role, "content": content }))
+            let llm_role = crate::chat_messages::db_role_to_llm_role(&role);
+            Some(json!({ "role": llm_role, "content": content }))
         })
         .collect();
 
