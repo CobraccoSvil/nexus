@@ -347,6 +347,42 @@ pub(super) async fn spawn_detached_service(
 /// Analizza il filesystem del progetto e suggerisce definizioni di servizi systemd.
 /// Riconosce: npm/pnpm scripts, Cargo binaries, .csproj / launchSettings.json,
 /// docker-compose.yml, python app entry points.
+/// Comandi no-op che genererebbero un servizio segnaposto (sempre `active
+/// (exited)` ma inutile). PUNTO UNICO (regola L): usato sia da
+/// `wizard_install_service` sia da `service_discovery::validate_and_map_service`.
+pub(super) const FORBIDDEN_NOOP: &[&str] = &[
+    "true", "false", ":", "sleep", "echo", "exit", "noop", "no-op",
+];
+
+/// Marca come `existing=true` i suggerimenti il cui unit e' gia' installato come
+/// file .service in systemd --user. PUNTO UNICO (regola L): usato sia dal ramo
+/// agentico sia dall'euristica in `wizard_detect_services`. Stato volatile: non
+/// va cachato.
+pub(super) async fn mark_existing_services(suggestions: &mut [serde_json::Value]) {
+    if let Ok(svc_out) = systemctl_user()
+        .args([
+            "--user",
+            "list-unit-files",
+            "--type=service",
+            "--no-legend",
+            "--no-pager",
+        ])
+        .output()
+        .await
+    {
+        let installed: std::collections::HashSet<String> = String::from_utf8_lossy(&svc_out.stdout)
+            .lines()
+            .filter_map(|l| l.split_whitespace().next().map(String::from))
+            .collect();
+        for s in suggestions.iter_mut() {
+            let unit = s["unit"].as_str().unwrap_or("").to_string();
+            if installed.contains(&unit) {
+                s["existing"] = json!(true);
+            }
+        }
+    }
+}
+
 pub async fn wizard_detect_services(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -365,6 +401,26 @@ pub async fn wizard_detect_services(
     async fn suggest_port(state: &AppState, project_id: &Uuid, key: &str) -> u16 {
         super::services::deterministic_project_port_for_key(project_id, key, &state.port_registry)
             .await
+    }
+
+    // ── Rilevamento agentico PRIMARIO (agent-first) ────────────────────────
+    // Se l'agent identifica servizi validi, li usa e ritorna subito; altrimenti
+    // prosegue con l'euristica testuale sottostante come fallback (regola: agent
+    // primario, euristica rete di sicurezza). L'agent fa solo la comprensione;
+    // l'allocazione porte resta deterministica dentro service_discovery.
+    if let Some(mut found) = super::service_discovery::discover_services_agentic(
+        &state,
+        &project_id,
+        &root,
+        &context.details.name,
+        &slug,
+    )
+    .await
+    {
+        if !found.is_empty() {
+            mark_existing_services(&mut found).await;
+            return Ok(Json(json!({ "suggestions": found, "slug": slug })));
+        }
     }
 
     // ── 1. package.json / pnpm ─────────────────────────────────────────────
@@ -639,29 +695,8 @@ pub async fn wizard_detect_services(
         }
     }
 
-    // Marca quelli già installati come .service files
-    if let Ok(svc_out) = systemctl_user()
-        .args([
-            "--user",
-            "list-unit-files",
-            "--type=service",
-            "--no-legend",
-            "--no-pager",
-        ])
-        .output()
-        .await
-    {
-        let installed: std::collections::HashSet<String> = String::from_utf8_lossy(&svc_out.stdout)
-            .lines()
-            .filter_map(|l| l.split_whitespace().next().map(String::from))
-            .collect();
-        for s in &mut suggestions {
-            let unit = s["unit"].as_str().unwrap_or("").to_string();
-            if installed.contains(&unit) {
-                s["existing"] = json!(true);
-            }
-        }
-    }
+    // Marca quelli già installati come .service files (punto unico, regola L).
+    mark_existing_services(&mut suggestions).await;
 
     Ok(Json(json!({ "suggestions": suggestions, "slug": slug })))
 }
@@ -713,9 +748,6 @@ pub async fn wizard_install_service(
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(cmd_trim);
-    const FORBIDDEN_NOOP: &[&str] = &[
-        "true", "false", ":", "sleep", "echo", "exit", "noop", "no-op",
-    ];
     if FORBIDDEN_NOOP.contains(&cmd_basename) {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
