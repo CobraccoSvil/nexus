@@ -191,6 +191,68 @@ pub(crate) fn infer_capabilities_from_name(provider: &str, model: &str) -> Vec<&
     caps
 }
 
+/// Inferisce il `performance_tier` (light|medium|heavy) dal nome del modello.
+///
+/// PERCHE': lo schema `ai_price_catalog.performance_tier` ha default 'medium',
+/// e il catalog_sync inserisce i nuovi modelli scoperti via API senza tier.
+/// Risultato: ogni modello nuovo (anche piccolo come ministral-3b/8b) diventava
+/// 'medium' ed entrava nel pool dei candidati per gli intent agentici medium,
+/// degradando la qualita'. Qui classifichiamo dal nome (euristica gemella di
+/// `infer_capabilities_from_name`), applicata SOLO ai nuovi insert (non
+/// sovrascrive le righe esistenti / override admin).
+///
+/// Regole per famiglia (allineate alla migrazione 0354 che riclassifica gli
+/// esistenti): i modelli "piccoli" (mini/nano/lite/haiku/ministral/small/nemo)
+/// sono light; i flagship (opus/o3/o1/*-pro) heavy; il resto medium.
+pub(crate) fn infer_tier_from_name(provider: &str, model: &str) -> &'static str {
+    let m = model.to_ascii_lowercase();
+    match provider {
+        "google" => {
+            if m.contains("pro") {
+                "heavy"
+            } else {
+                // flash, flash-lite
+                "light"
+            }
+        }
+        "anthropic" => {
+            if m.contains("opus") {
+                "heavy"
+            } else if m.contains("haiku") {
+                "light"
+            } else {
+                // sonnet e altri
+                "medium"
+            }
+        }
+        "openai" => {
+            // o3/o1 reasoning + *-pro = flagship. o4-mini/gpt-*-mini/nano = piccoli.
+            if m.contains("o3") || m.contains("o1") || (m.contains("pro") && !m.contains("mini")) {
+                "heavy"
+            } else if m.contains("nano") || m.contains("mini") {
+                "light"
+            } else {
+                "medium"
+            }
+        }
+        "mistral" => {
+            // Mistral non ha un tier "heavy" reale: large e' il loro massimo.
+            // Piccoli (ministral 3b/8b/14b, small, nemo) -> light.
+            if m.contains("ministral")
+                || m.contains("small")
+                || m.contains("nemo")
+            {
+                "light"
+            } else {
+                // large, medium, codestral, devstral, magistral
+                "medium"
+            }
+        }
+        "deepseek" => "medium",
+        _ => "medium",
+    }
+}
+
 /// Flag di capability canonici di un modello (colonne reali di ai_price_catalog).
 /// Vedi ADR 0024 e migrazione 0318: il catalog e' l'UNICA fonte; il brain li
 /// legge derivati via vista `v_model_capabilities`.
@@ -570,16 +632,22 @@ async fn sync_provider(
         match catalog_models.get(api_model) {
             None => {
                 if insert_new_disabled {
+                    // performance_tier inferito dal nome (non il default 'medium'
+                    // dello schema): evita che i modelli piccoli scoperti via API
+                    // entrino come 'medium' nel pool agentico. Vedi
+                    // infer_tier_from_name + migrazione 0354.
+                    let inferred_tier = infer_tier_from_name(provider, api_model);
                     let res = sqlx::query(
                         "INSERT INTO ai_price_catalog \
                          (provider, model, display_name, input_cost_per_million_tokens, \
-                          output_cost_per_million_tokens, currency, capabilities, is_enabled, effective_from) \
-                         VALUES ($1, $2, $3, 0, 0, 'USD', '[]'::jsonb, false, NOW()) \
+                          output_cost_per_million_tokens, currency, capabilities, performance_tier, is_enabled, effective_from) \
+                         VALUES ($1, $2, $3, 0, 0, 'USD', '[]'::jsonb, $4, false, NOW()) \
                          ON CONFLICT (provider, model) DO NOTHING",
                     )
                     .bind(provider)
                     .bind(api_model)
                     .bind(api_model)
+                    .bind(inferred_tier)
                     .execute(db)
                     .await;
                     if let Ok(r) = res {
@@ -1084,6 +1152,39 @@ struct ModelEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_infer_tier_mistral_small_families_are_light() {
+        // Caso del bug: ministral/small/nemo NON devono essere medium.
+        assert_eq!(infer_tier_from_name("mistral", "ministral-8b-2512"), "light");
+        assert_eq!(infer_tier_from_name("mistral", "ministral-3b-latest"), "light");
+        assert_eq!(infer_tier_from_name("mistral", "mistral-small-2506"), "light");
+        assert_eq!(infer_tier_from_name("mistral", "magistral-small-latest"), "light");
+        assert_eq!(infer_tier_from_name("mistral", "open-mistral-nemo-2407"), "light");
+        // I capaci restano medium (Mistral non ha heavy reale).
+        assert_eq!(infer_tier_from_name("mistral", "mistral-large-latest"), "medium");
+        assert_eq!(infer_tier_from_name("mistral", "mistral-medium-3"), "medium");
+        assert_eq!(infer_tier_from_name("mistral", "codestral-latest"), "medium");
+        assert_eq!(infer_tier_from_name("mistral", "devstral-2512"), "medium");
+    }
+
+    #[test]
+    fn test_infer_tier_other_providers() {
+        // Google: pro=heavy, flash*=light.
+        assert_eq!(infer_tier_from_name("google", "gemini-2.5-pro"), "heavy");
+        assert_eq!(infer_tier_from_name("google", "gemini-2.5-flash"), "light");
+        assert_eq!(infer_tier_from_name("google", "gemini-2.5-flash-lite"), "light");
+        // Anthropic: opus=heavy, sonnet=medium, haiku=light.
+        assert_eq!(infer_tier_from_name("anthropic", "claude-opus-4-6"), "heavy");
+        assert_eq!(infer_tier_from_name("anthropic", "claude-sonnet-4-6"), "medium");
+        assert_eq!(infer_tier_from_name("anthropic", "claude-haiku-4-5-20251001"), "light");
+        // OpenAI: o3/o1/pro=heavy, nano/mini=light, resto medium.
+        assert_eq!(infer_tier_from_name("openai", "o3"), "heavy");
+        assert_eq!(infer_tier_from_name("openai", "gpt-5.4-pro-2026-03-05"), "heavy");
+        assert_eq!(infer_tier_from_name("openai", "gpt-4.1-nano"), "light");
+        assert_eq!(infer_tier_from_name("openai", "o4-mini"), "light");
+        assert_eq!(infer_tier_from_name("openai", "gpt-4.1"), "medium");
+    }
 
     #[test]
     fn test_is_chat_compatible_no_per_name_blacklist() {
