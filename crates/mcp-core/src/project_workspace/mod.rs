@@ -301,5 +301,9 @@ lint:\n\
         assert!(services::is_protected_nexus_listener(99999, 50051, own));
         // un dev-server di progetto nel bucket NON e' protetto -> resta killabile
         assert!(!services::is_protected_nexus_listener(99999, 39555, own));
+        // PID 0/1 NON terminabili: `kill -TERM 0` colpirebbe il process group di
+        // mcp-core (suicidio); i container Docker compaiono con pid 0 da `ss`.
+        assert!(services::is_protected_nexus_listener(0, 39555, own));
+        assert!(services::is_protected_nexus_listener(1, 39555, own));
     }
 }
