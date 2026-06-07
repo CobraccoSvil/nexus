@@ -694,13 +694,26 @@ impl Orchestrator {
                         c.tier_for_tokens(estimated_tokens),
                         c.base_capability.clone(),
                     ),
-                    None => ("light".to_string(), "chat".to_string()),
+                    None => {
+                        // Niente magic fallback "light" (regola G): un intent non
+                        // mappato in nexus_intent_capability e' tipicamente un task
+                        // agentico (es. agentic_default), e degradarlo a "light"
+                        // sceglie un modello debole (mistral-small ecc.). Default
+                        // sicuro medium/reasoning + WARN per accorgersene e
+                        // aggiungerlo alla tabella (mig 0110/0358).
+                        tracing::warn!(
+                            "Agent routing: intent '{}' non in nexus_intent_capability, \
+                             uso default medium/reasoning (aggiungerlo alla tabella)",
+                            intent
+                        );
+                        ("medium".to_string(), "reasoning".to_string())
+                    }
                 },
                 None => {
                     tracing::warn!(
-                        "intent_capability cache non disponibile, uso defaults light/chat"
+                        "intent_capability cache non disponibile, uso default medium/reasoning"
                     );
-                    ("light".to_string(), "chat".to_string())
+                    ("medium".to_string(), "reasoning".to_string())
                 }
             };
             if let Some(d) = route_model_from_catalog(db, &base_tier, &capability, "dinamico").await
