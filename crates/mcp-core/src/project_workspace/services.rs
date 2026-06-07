@@ -579,6 +579,17 @@ pub async fn stop_all_project_services(
 /// Termina i processi che occupano porte rilevate per il progetto MA non sono
 /// gestiti da systemd `{slug}-*.service` (porte "orfane" o conflittuali).
 /// Body opzionale: { "ports": [3002, 5215, ...] } per limitare l'azione.
+/// Vero se `(pid, port)` appartiene all'infrastruttura Nexus e NON va mai
+/// terminato dal cleanup porte di un progetto (anti-suicidio, regola E):
+/// - il PID e' mcp-core stesso (`own_pid`);
+/// - la porta e' una riservata Nexus (mcp-core 4000, microservizi 40xx, brain
+///   50051, gateway 4060, ...). In WSL `systemctl --user` non popola
+///   `protected_pids`, quindi questa e' l'unica barriera che impedisce al reset
+///   porte di uccidere il core (e gli altri servizi) dal pannello.
+pub(super) fn is_protected_nexus_listener(pid: u32, port: u16, own_pid: u32) -> bool {
+    pid == own_pid || NEXUS_RESERVED_PORTS.contains(&port)
+}
+
 pub async fn cleanup_project_ports(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -704,6 +715,14 @@ pub async fn cleanup_project_ports(
     for (port, pid, program) in listening {
         // Se è stata data una whitelist di porte, applica il filtro
         if !target_ports.is_empty() && !target_ports.contains(&port) {
+            continue;
+        }
+        // ANTI-SUICIDIO (regola E): mai terminare mcp-core ne' altra
+        // infrastruttura Nexus. Senza questo guard, in WSL (dove protected_pids
+        // resta vuoto perche' `systemctl --user` non e' attivo) un reset porte
+        // uccideva mcp-core stesso sulla 4000 -> "il core muore" dal pannello.
+        if is_protected_nexus_listener(pid, port, std::process::id()) {
+            skipped.push(json!({ "port": port, "pid": pid, "program": program, "reason": "infrastruttura Nexus (protetta)" }));
             continue;
         }
         if protected_pids.contains(&pid) {

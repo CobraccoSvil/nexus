@@ -285,4 +285,21 @@ lint:\n\
             "docker-compose.yml up backend"
         ));
     }
+
+    #[test]
+    fn cleanup_ports_protegge_infrastruttura_nexus() {
+        // Anti-suicidio (regola E): il reset porte non deve mai terminare
+        // mcp-core (own_pid) ne' un listener su una porta riservata Nexus, anche
+        // quando protected_pids (systemctl --user) e' vuoto come in WSL.
+        let own = 4242;
+        // mcp-core stesso (match per PID)
+        assert!(services::is_protected_nexus_listener(own, 39555, own));
+        // porte riservate Nexus: mcp-core 4000, admin 4010, gateway 4060, brain 50051
+        assert!(services::is_protected_nexus_listener(99999, 4000, own));
+        assert!(services::is_protected_nexus_listener(99999, 4010, own));
+        assert!(services::is_protected_nexus_listener(99999, 4060, own));
+        assert!(services::is_protected_nexus_listener(99999, 50051, own));
+        // un dev-server di progetto nel bucket NON e' protetto -> resta killabile
+        assert!(!services::is_protected_nexus_listener(99999, 39555, own));
+    }
 }
