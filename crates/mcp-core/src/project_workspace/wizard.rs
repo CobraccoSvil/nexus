@@ -512,6 +512,29 @@ pub async fn wizard_detect_services(
     ] {
         let dc_path = format!("{}/{}", root, dc_name);
         if tokio::fs::metadata(&dc_path).await.is_ok() {
+            // docker-compose espone tipicamente PIU' porte via variabili
+            // d'ambiente (es. ${PORT_FRONTEND:-20001}, ${PORT_BACKEND:-20002}).
+            // Allochiamo una porta gestita per CIASCUNA variabile e la
+            // proponiamo nell'env, invece di lasciare il dialog vuoto (che
+            // mostra il placeholder fuorviante "PORT=20000") o iniettare una
+            // singola PORT che il compose ignorerebbe. Cosi' il servizio docker
+            // usa le porte del bucket di progetto (regola I / ADR 0010).
+            let mut env_obj = serde_json::Map::new();
+            if let Ok(compose) = tokio::fs::read_to_string(&dc_path).await {
+                if let Ok(re) = regex::Regex::new(r"\$\{(PORT[A-Z0-9_]*)(?::-\d+)?\}") {
+                    let mut seen = std::collections::HashSet::new();
+                    for cap in re.captures_iter(&compose) {
+                        if let Some(m) = cap.get(1) {
+                            let var = m.as_str().to_string();
+                            if seen.insert(var.clone()) {
+                                let key = format!("docker-{}", var.to_lowercase());
+                                let p = suggest_port(&state, &project_id, &key).await;
+                                env_obj.insert(var, serde_json::Value::String(p.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
             suggestions.push(json!({
                 "short":    "docker",
                 "unit":     format!("{}-docker.service", slug),
@@ -521,6 +544,7 @@ pub async fn wizard_detect_services(
                 "args":     ["compose", "-f", dc_name, "up"],
                 "cwd":      root,
                 "existing": false,
+                "env":      serde_json::Value::Object(env_obj),
             }));
             break;
         }
