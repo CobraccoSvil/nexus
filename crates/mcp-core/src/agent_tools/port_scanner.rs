@@ -74,6 +74,15 @@ static PORT_REGEXES: Lazy<Vec<Regex>> = Lazy::new(|| {
 static RANGE_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)\brange\s+(\d{2,5})\s*-\s*(\d{2,5})\b").unwrap());
 
+/// Default di variabile in stile shell/Docker Compose: `${VAR:-NNNN}`. Il valore
+/// dopo `:-` e' una porta EFFETTIVA (usata quando la variabile non e' impostata,
+/// tipico dell'avvio manuale del compose), quindi va trattato come hardcoded
+/// anche se la riga usa una variabile env. Senza questo controllo i default fuori
+/// bucket nei docker-compose (es. `${PORT_FRONTEND:-20001}`) sfuggivano al
+/// guard-rail e facevano partire container su porte non ammissibili (ADR 0010).
+static DEFAULT_PORT_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-(\d{2,5})\}").unwrap());
+
 #[derive(Debug)]
 pub enum PortScanOutcome {
     Allowed,
@@ -171,6 +180,24 @@ fn collect_ports(content: &str, keep: impl Fn(u32) -> bool) -> Vec<PortFinding> 
         }
     };
     for (line_idx, raw_line) in content.lines().enumerate() {
+        // I default `${VAR:-NNNN}` sono porte EFFETTIVE: vengono usate quando la
+        // variabile non e' impostata. Vanno validati SEMPRE, anche se la riga
+        // contiene un hint env (es. `${PORT_BACKEND:-20002}` contiene `${PORT_`):
+        // altrimenti il default fuori-bucket o nel-bucket-non-allocato sfugge al
+        // guard-rail e fa partire container su porte non ammissibili (ADR 0010).
+        for caps in DEFAULT_PORT_REGEX.captures_iter(raw_line) {
+            if let Some(m) = caps.get(1) {
+                if let Ok(port) = m.as_str().parse::<u32>() {
+                    if keep(port) {
+                        findings.push(PortFinding {
+                            line: line_idx + 1,
+                            port,
+                            snippet: snip(raw_line),
+                        });
+                    }
+                }
+            }
+        }
         if ENV_PORT_HINTS.iter().any(|hint| raw_line.contains(hint)) {
             continue;
         }
@@ -508,5 +535,52 @@ mod tests {
             }
             _ => panic!("DB_PORT=5432 deve essere rifiutato"),
         }
+    }
+
+    #[test]
+    fn detect_compose_default_out_of_bucket() {
+        // `${PORT:-3000}` default FUORI bucket: la riga ha l'hint `${PORT` ma il
+        // default 3000 va comunque rifiutato (prima veniva saltato).
+        let res = scan_content(
+            "docker-compose.yml",
+            "    ports:\n      - \"${PORT:-3000}:3000\"\n",
+        );
+        match res {
+            PortScanOutcome::Reject(f) => {
+                assert!(f.iter().any(|x| x.port == 3000), "default 3000 deve essere rilevato");
+            }
+            _ => panic!("default ${{PORT:-3000}} fuori bucket deve essere rifiutato"),
+        }
+    }
+
+    #[test]
+    fn compose_default_in_bucket_collected_for_allocation_check() {
+        // `${PORT_BACKEND:-20002}` default NEL bucket: raccolto per la verifica di
+        // allocazione (reject_unallocated_bucket_ports), nonostante l'hint env
+        // `${PORT_` sulla stessa riga. Questo e' il caso Beauty-Book.
+        let host = collect_ports(
+            "      - \"${PORT_BACKEND:-20002}:${PORT_BACKEND:-20002}\"\n",
+            port_in_bucket,
+        );
+        assert!(
+            host.iter().any(|p| p.port == 20002),
+            "il default 20002 nel bucket deve essere raccolto per il check di allocazione"
+        );
+        // scan_content (solo fuori-bucket) NON deve segnalare 20002 (e' nel bucket).
+        assert!(matches!(
+            scan_content(
+                "docker-compose.yml",
+                "      - \"${PORT_BACKEND:-20002}:3000\"\n"
+            ),
+            PortScanOutcome::Allowed
+        ));
+    }
+
+    #[test]
+    fn allow_default_in_bucket_via_scan() {
+        // Un default nel bucket non e' una violazione "fuori-bucket": scan_content
+        // lo lascia passare (l'allocazione e' verificata altrove).
+        let res = scan_content("docker-compose.yml", "      - \"${PORT:-25000}:3000\"\n");
+        assert!(matches!(res, PortScanOutcome::Allowed));
     }
 }
