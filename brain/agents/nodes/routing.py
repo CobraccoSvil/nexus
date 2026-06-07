@@ -102,6 +102,15 @@ def route_after_executor(state: AgentState) -> str:
             # e chiude. Cap g1_reroute_count previene loop su falsi positivi.
             _is_action_req = _detect_action_request(str(_first_human))
             _is_unfulfilled = _detect_unfulfilled_intent(state.get("result"))
+            # Gating modalita': in confirm l'utente vuole controllo step-by-step,
+            # quindi una mera intenzione/attesa narrata e non eseguita NON innesca
+            # auto-azione (re-entry); l'executor produce un resoconto onesto.
+            # action_req e structural restano attivi in ogni modalita'.
+            _automation_mode = (state.get("automation_mode") or "confirm").strip().lower()
+            _unfulfilled_triggers = _is_unfulfilled and _automation_mode in (
+                "automatic",
+                "continuous",
+            )
             # ── ADR 0018 (c): segnale STRUTTURALE primario ───────────────────
             # Il caso BookingPage (0 tool call su un task d'azione mentre i tool
             # erano disponibili) scatta per via strutturale, indipendentemente
@@ -119,7 +128,7 @@ def route_after_executor(state: AgentState) -> str:
                 iteration=iterations,
                 max_iteration=_tc_max_iter,
             )
-            if _structural_unfulfilled or _is_action_req or _is_unfulfilled:
+            if _structural_unfulfilled or _is_action_req or _unfulfilled_triggers:
                 _nudge_count_log = int(state.get("action_nudge_count") or 0)
                 if _structural_unfulfilled:
                     _trigger = "structural(had_tools+no_tool_call+action)"

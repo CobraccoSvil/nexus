@@ -1013,6 +1013,35 @@ _INTENT_NARRATION_PATTERNS: tuple[str, ...] = (
     "i'll create", "i'll implement", "i'll write", "i'll add",
     "i will create", "i will implement", "i will write", "i will add",
     "the next step is", "the next file",
+    # Italiano — POLLING/ATTESA: l'agente temporeggia ("attendo e ricontrollo")
+    # invece di diagnosticare. Caso Beauty-Book run 2026-06-07: "Attendo qualche
+    # istante e verifico di nuovo" -> end_turn senza azione, container in
+    # crash-loop mai diagnosticato. Senza questi pattern il segnale unfulfilled
+    # non scattava (presente indicativo, non futuro/gerundio).
+    "attendo ", "attendo qualche", "attendo ancora", "attendo che",
+    "attendo il", "attendo un", "aspetto ", "aspetto che", "aspetto qualche",
+    "aspetto ancora", "ricontrollo", "ricontrollare", "verifico di nuovo",
+    "controllo di nuovo", "verifico nuovamente", "controllo nuovamente",
+    "riprovo tra", "riprovo a ", "riprovo subito", "riprovo ora",
+    "provo di nuovo", "provo ancora",
+    # Inglese — polling/attesa
+    "i'll check again", "let me check again", "i'll wait", "let me wait",
+    "waiting for", "i'll retry", "let me retry", "checking again",
+    "i'll verify again", "i'll re-check", "let me re-check", "i'll try again",
+)
+
+# Sottoinsieme POLLING: l'agente vuole solo "ri-controllare/aspettare" lo stato
+# (tipico dei wait-loop su container/servizi che non partono). Usato per il
+# nudge anti wait-loop: invece di ri-attendere, l'agente deve DIAGNOSTICARE.
+_POLLING_WAIT_PATTERNS: tuple[str, ...] = (
+    "attendo ", "attendo qualche", "attendo ancora", "attendo che",
+    "attendo il", "attendo un", "aspetto ", "aspetto che", "aspetto qualche",
+    "aspetto ancora", "ricontrollo", "ricontrollare", "verifico di nuovo",
+    "controllo di nuovo", "verifico nuovamente", "controllo nuovamente",
+    "riprovo tra", "riprovo subito", "riprovo ora", "provo di nuovo",
+    "provo ancora", "i'll check again", "let me check again", "i'll wait",
+    "let me wait", "waiting for", "i'll retry", "checking again",
+    "i'll verify again", "i'll re-check", "i'll try again",
 )
 
 # Rilevamento MORFOLOGICO (regola H: robusto a verbi nuovi, evita la blacklist
@@ -1053,6 +1082,78 @@ def _detect_unfulfilled_intent(text: str | None) -> bool:
     if any(p in tail for p in _INTENT_NARRATION_PATTERNS):
         return True
     return bool(_FUTURE_1P_RE.search(tail) or _START_GERUND_RE.search(tail))
+
+
+def _detect_polling_wait(text: str | None) -> bool:
+    """True se l'OUTPUT e' un'attesa/polling passiva ("attendo e ricontrollo").
+
+    Distingue il wait-loop (l'agente temporeggia su uno stato che non cambia, es.
+    container in crash-loop) dall'intenzione d'azione normale. Usato per il nudge
+    anti wait-loop: invece di ri-attendere, l'agente deve DIAGNOSTICARE. Valutato
+    sulla coda del testo (l'attesa chiude tipicamente il messaggio).
+    """
+    if not text or not text.strip():
+        return False
+    tail = text.strip().lower()[-400:]
+    return any(p in tail for p in _POLLING_WAIT_PATTERNS)
+
+
+def build_unfulfilled_report(result_text: str | None, messages: list | None) -> str:
+    """Resoconto onesto quando il turno chiude con un'intenzione non eseguita e
+    NON si fa auto-restart (modalita' confirm o cap raggiunto).
+
+    Deterministico (nessuna chiamata LLM, niente nuova allucinazione): sintetizza
+    le azioni gia' svolte dalla history (tool usati + file toccati), dichiara lo
+    stato (interrotto, non completato) e propone il prossimo passo. Sostituisce la
+    "promessa monca" come final answer, cosi' l'utente riceve un resoconto invece
+    di "attendo e verifico di nuovo".
+    """
+    tool_counts: dict[str, int] = {}
+    files_touched: list[str] = []
+    for m in messages or []:
+        content = getattr(m, "content", None)
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                name = str(block.get("name") or "tool")
+                tool_counts[name] = tool_counts.get(name, 0) + 1
+                inp = block.get("input")
+                if isinstance(inp, dict):
+                    path = inp.get("path") or inp.get("file_path") or inp.get("filename")
+                    if isinstance(path, str) and path and path not in files_touched:
+                        files_touched.append(path)
+    lines: list[str] = [
+        "Mi sono fermato annunciando un'attesa o un passo successivo senza "
+        "eseguirlo, quindi il compito NON e' completato. Ecco il resoconto onesto:",
+        "",
+    ]
+    if tool_counts:
+        azioni = ", ".join(
+            f"{n}x {name}" for name, n in sorted(tool_counts.items(), key=lambda kv: -kv[1])
+        )
+        lines.append(f"- Cosa ho fatto: {azioni}.")
+    else:
+        lines.append("- Cosa ho fatto: nessuna azione concreta in questo turno.")
+    if files_touched:
+        shown = ", ".join(files_touched[:12])
+        more = "" if len(files_touched) <= 12 else f" (+{len(files_touched) - 12} altri)"
+        lines.append(f"- File toccati: {shown}{more}.")
+    snippet = (result_text or "").strip().replace("\n", " ")
+    if snippet:
+        lines.append(f'- Dove mi sono interrotto: "{snippet[-180:]}"')
+    lines.append(
+        "- Cosa manca: portare a termine il compito; l'ultimo passo annunciato "
+        "non e' stato eseguito."
+    )
+    lines.append(
+        "- Prossimo passo proposto: invece di attendere passivamente, diagnosticare "
+        "lo stato reale (es. leggere i log del servizio/container che non parte) e "
+        "agire sulla causa. Confermi se procedo?"
+    )
+    return "\n".join(lines)
 
 
 def _last_assistant_text(messages: list) -> str:

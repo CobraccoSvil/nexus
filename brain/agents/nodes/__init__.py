@@ -85,6 +85,8 @@ from .helpers import (
     _detect_action_request,
     _INTENT_NARRATION_PATTERNS,
     _detect_unfulfilled_intent,
+    _detect_polling_wait,
+    build_unfulfilled_report,
     _last_assistant_text,
     _pick_escalation_model,
     _has_tool_calls_in_history,
@@ -1706,10 +1708,26 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         # secondo caso copre i debug/diagnosi dove il primo messaggio non e'
         # imperativo ma l'agente narra il piano invece di agire.
         _is_action_req = _detect_action_request(str(_first_human_text))
-        _is_unfulfilled = _detect_unfulfilled_intent(_last_assistant_text(messages))
+        _last_asst_text = _last_assistant_text(messages)
+        _is_unfulfilled = _detect_unfulfilled_intent(_last_asst_text)
+        _is_polling = _detect_polling_wait(_last_asst_text)
         if _is_action_req or _is_unfulfilled:
-            _nudge_msg = HumanMessage(
-                content=(
+            if _is_polling:
+                # Anti wait-loop: l'agente sta aspettando passivamente uno stato
+                # che potrebbe non cambiare (container/servizio in crash-loop).
+                # Invece di ri-attendere, deve DIAGNOSTICARE la causa.
+                _nudge_content = (
+                    "STOP: stai aspettando passivamente uno stato che potrebbe non "
+                    "cambiare (es. container o servizio in crash-loop). NON attendere "
+                    "e ricontrollare di nuovo: DIAGNOSTICA ORA la causa con un tool. "
+                    "Leggi i log del servizio/container che non parte (run_command: "
+                    "`docker logs`, `docker compose logs`, `journalctl -u <unit>`), "
+                    "individua l'errore reale e agisci sulla causa. "
+                    "Esegui subito il comando diagnostico con un tool call."
+                )
+                _nudge_reason = "wait-loop(polling)"
+            else:
+                _nudge_content = (
                     "⚠️ ERRORE: hai annunciato/descritto cosa avresti fatto, "
                     "ma NON hai chiamato nessun tool. Questo non è accettabile. "
                     "AGISCI ADESSO — esegui l'azione che hai appena dichiarato "
@@ -1718,12 +1736,14 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                     "write_file/edit_file per creare o modificare file. "
                     "Nessuna spiegazione: ESEGUI il prossimo step concreto con un tool call."
                 )
-            )
+                _nudge_reason = (
+                    "action-request" if _is_action_req else "intent-non-compiuta"
+                )
+            _nudge_msg = HumanMessage(content=_nudge_content)
             messages = list(messages) + [_nudge_msg]
             logger.warning(
                 "G1 nudge iniettato (iter=%d, nudge_count=%d, intent=%s, motivo=%s)",
-                _current_iter, _nudge_count, intent,
-                "action-request" if _is_action_req else "intent-non-compiuta",
+                _current_iter, _nudge_count, intent, _nudge_reason,
             )
 
     # Heartbeat A: pubblica step "calling_model" cosi' l'utente vede in chat
@@ -2384,6 +2404,43 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 meta_steps.persist_async(state.get("thread_id"), _na_step)
         except Exception as _na_exc:
             logger.debug("executor_node: next_actions derive fallita: %s", _na_exc)
+
+    # ── Resoconto onesto su intenzione non eseguita (confirm / no auto-restart) ─
+    # Se il turno chiude annunciando un passo/attesa senza eseguirlo e NON ci
+    # sara' auto-restart (modalita' confirm: l'utente vuole controllo
+    # step-by-step), sostituiamo la "promessa monca" con un resoconto onesto
+    # (cosa fatto, cosa manca, prossimo passo). In automatic/continuous il
+    # re-entry G1 (route_after_executor) fa invece agire il modello: qui non
+    # interveniamo. Esclude le richieste d'azione esplicite (gestite dal G1).
+    if stop_reason == "end_turn" and not pending_tool_uses and result_text:
+        _auto_mode = (state.get("automation_mode") or "confirm").strip().lower()
+        if _auto_mode not in ("automatic", "continuous") and _detect_unfulfilled_intent(
+            result_text
+        ):
+            _first_human_rep = next(
+                (
+                    getattr(m, "content", "")
+                    for m in messages
+                    if hasattr(m, "type") and m.type == "human"
+                ),
+                "",
+            )
+            if isinstance(_first_human_rep, list):
+                _first_human_rep = " ".join(
+                    b.get("text", "") for b in _first_human_rep if isinstance(b, dict)
+                )
+            if not _detect_action_request(str(_first_human_rep)):
+                _report = build_unfulfilled_report(result_text, messages)
+                result_text = _report
+                assistant_msg = AIMessage(
+                    content=_report,
+                    additional_kwargs=getattr(assistant_msg, "additional_kwargs", {}) or {},
+                )
+                logger.info(
+                    "executor_node: intenzione non eseguita in modalita' %s -> "
+                    "resoconto onesto sostituito alla promessa monca",
+                    _auto_mode,
+                )
 
     return {
         "messages": [assistant_msg],
