@@ -157,66 +157,130 @@ fn port_is_violating(port: u32) -> bool {
     true
 }
 
-pub fn scan_content(path: &str, content: &str) -> PortScanOutcome {
-    if should_skip_path(path) {
-        return PortScanOutcome::Allowed;
-    }
-
+/// Colleziona le porte rilevate nel contenuto che soddisfano `keep`. Punto
+/// unico di parsing (regola L): sia lo scan delle violazioni fuori-bucket sia
+/// quello delle porte host nel bucket (per la verifica di allocazione) usano
+/// gli stessi regex/whitelist, cambiando solo il predicato sulla porta.
+fn collect_ports(content: &str, keep: impl Fn(u32) -> bool) -> Vec<PortFinding> {
     let mut findings: Vec<PortFinding> = Vec::new();
-
+    let snip = |raw_line: &str| {
+        if raw_line.len() > 200 {
+            format!("{}...", &raw_line[..200])
+        } else {
+            raw_line.to_string()
+        }
+    };
     for (line_idx, raw_line) in content.lines().enumerate() {
         if ENV_PORT_HINTS.iter().any(|hint| raw_line.contains(hint)) {
             continue;
         }
-
         for caps in RANGE_REGEX.captures_iter(raw_line) {
             let lo = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok());
             let hi = caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
             for opt in [lo, hi].iter().flatten() {
-                let port = *opt;
-                if port_is_violating(port) {
-                    let snippet = if raw_line.len() > 200 {
-                        format!("{}...", &raw_line[..200])
-                    } else {
-                        raw_line.to_string()
-                    };
-                    findings.push(PortFinding {
-                        line: line_idx + 1,
-                        port,
-                        snippet,
-                    });
+                if keep(*opt) {
+                    findings.push(PortFinding { line: line_idx + 1, port: *opt, snippet: snip(raw_line) });
                 }
             }
         }
-
         for regex in PORT_REGEXES.iter() {
             for caps in regex.captures_iter(raw_line) {
                 if let Some(port_str) = caps.get(1) {
                     if let Ok(port) = port_str.as_str().parse::<u32>() {
-                        if !port_is_violating(port) {
-                            continue;
+                        if keep(port) {
+                            findings.push(PortFinding { line: line_idx + 1, port, snippet: snip(raw_line) });
                         }
-                        let snippet = if raw_line.len() > 200 {
-                            format!("{}...", &raw_line[..200])
-                        } else {
-                            raw_line.to_string()
-                        };
-                        findings.push(PortFinding {
-                            line: line_idx + 1,
-                            port,
-                            snippet,
-                        });
                     }
                 }
             }
         }
     }
+    findings
+}
 
+/// Porta dentro il bucket Nexus (20000-39999). Le porte nel bucket sono lecite
+/// SOLO se allocate per il progetto (vedi `reject_unallocated_bucket_ports`).
+fn port_in_bucket(port: u32) -> bool {
+    (NEXUS_PORT_MIN..NEXUS_PORT_MAX).contains(&port)
+}
+
+pub fn scan_content(path: &str, content: &str) -> PortScanOutcome {
+    if should_skip_path(path) {
+        return PortScanOutcome::Allowed;
+    }
+    let findings = collect_ports(content, port_is_violating);
     if findings.is_empty() {
         PortScanOutcome::Allowed
     } else {
         PortScanOutcome::Reject(findings)
     }
+}
+
+/// Enforcement "allocation-aware" (ADR 0010 + richiesta utente): una porta host
+/// NEL bucket Nexus e' lecita solo se REALMENTE allocata per il progetto in
+/// `nexus_port_allocations` (cioe' ottenuta via `request_port`). Senza questo
+/// controllo l'agente poteva scrivere una porta a caso nel range (es. 20001)
+/// nei docker-compose senza passare dall'allocatore: numericamente valida ma
+/// non tracciata, con rischio di collisione tra progetti. Ritorna `Some(msg)`
+/// se ci sono porte nel bucket non allocate (la write va rifiutata), altrimenti
+/// `None`. NON tocca le porte fuori-bucket (gestite da `scan_content`).
+pub async fn reject_unallocated_bucket_ports(
+    db: &PgPool,
+    project_id: uuid::Uuid,
+    path: &str,
+    content: &str,
+) -> Option<String> {
+    if should_skip_path(path) {
+        return None;
+    }
+    let bucket_ports = collect_ports(content, port_in_bucket);
+    if bucket_ports.is_empty() {
+        return None;
+    }
+    let allocated: std::collections::HashSet<u32> = sqlx::query_scalar::<_, i32>(
+        "SELECT port::int FROM nexus_port_allocations WHERE project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|p| p as u32)
+    .collect();
+    let unallocated: Vec<PortFinding> = bucket_ports
+        .into_iter()
+        .filter(|f| !allocated.contains(&f.port))
+        .collect();
+    if unallocated.is_empty() {
+        None
+    } else {
+        Some(format_unallocated_message(path, &unallocated))
+    }
+}
+
+fn format_unallocated_message(path: &str, findings: &[PortFinding]) -> String {
+    let mut msg = format!(
+        "[Errore: scrittura su '{}' rifiutata. Sono state rilevate {} porta/e host nel range Nexus (20000-39999) ma NON allocate a questo progetto.]\n\nDettaglio:\n",
+        path,
+        findings.len()
+    );
+    for f in findings.iter().take(10) {
+        msg.push_str(&format!("  - riga {}: porta {} | {}\n", f.line, f.port, f.snippet.trim()));
+    }
+    if findings.len() > 10 {
+        msg.push_str(&format!("  ... e altri {} riscontri.\n", findings.len() - 10));
+    }
+    msg.push_str(
+        "\nUna porta nel range Nexus NON va scelta a mano: anche se il numero e' nel bucket, \
+         deve essere ALLOCATA dall'allocatore per evitare collisioni tra progetti.\n\n\
+         Azione richiesta:\n\
+         1. Chiama `request_port(label=\"<nome_servizio>\")` per ciascun servizio (es. 'backend', 'frontend').\n\
+         2. Usa la porta HOST ritornata nel mapping docker (es. ports: <porta_allocata>:<porta_container>) \
+            o in process.env.PORT; la porta CONTAINER resta quella dell'app.\n\
+         3. Riprova la scrittura.\n\
+         \nVedi <port_allocation> nel system prompt e ADR 0010.",
+    );
+    msg
 }
 
 pub fn format_reject_message(path: &str, findings: &[PortFinding]) -> String {
@@ -366,6 +430,23 @@ mod tests {
     fn allow_backend_port_in_bucket() {
         let res = scan_content("config.sh", "BACKEND_PORT=32100\n");
         assert!(matches!(res, PortScanOutcome::Allowed));
+    }
+
+    #[test]
+    fn bucket_ports_host_only_per_verifica_allocazione() {
+        // Enforcement allocation-aware: dai docker-compose si raccoglie SOLO la
+        // porta HOST nel bucket (per verificarne l'allocazione via DB), mai la
+        // porta CONTAINER. Cosi' "20001:3000" -> raccoglie 20001, non 3000.
+        let ports = collect_ports(
+            "services:\n  web:\n    ports:\n      - 20001:3000\n",
+            port_in_bucket,
+        );
+        assert!(ports.iter().any(|p| p.port == 20001), "host 20001 (bucket) raccolta");
+        assert!(!ports.iter().any(|p| p.port == 3000), "container 3000 NON raccolta");
+        // scan_content (violazioni fuori-bucket) NON deve segnalare 20001.
+        assert!(!collect_ports("x PORT=20001", port_is_violating)
+            .iter()
+            .any(|p| p.port == 20001));
     }
 
     #[test]

@@ -308,6 +308,16 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
         {
             return super::port_scanner::format_reject_message(path_str, &findings);
         }
+        // Allocation-aware: anche una porta NEL bucket Nexus va rifiutata se non
+        // e' stata allocata via request_port (evita porte scelte a mano nel range
+        // ma non tracciate, fonte di collisioni tra progetti).
+        if let Some(msg) = super::port_scanner::reject_unallocated_bucket_ports(
+            &ctx.db, ctx.project_id, path_str, content,
+        )
+        .await
+        {
+            return msg;
+        }
     }
 
     // Preflight build graph (ADR 0020): blocca file generati, avvisa OOG.
@@ -765,6 +775,14 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
             super::port_scanner::scan_content(path_str, new_string)
         {
             return super::port_scanner::format_reject_message(path_str, &findings);
+        }
+        // Allocation-aware: porte nel bucket non allocate via request_port -> reject.
+        if let Some(msg) = super::port_scanner::reject_unallocated_bucket_ports(
+            &ctx.db, ctx.project_id, path_str, new_string,
+        )
+        .await
+        {
+            return msg;
         }
     }
 
