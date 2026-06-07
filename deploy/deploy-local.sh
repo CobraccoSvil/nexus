@@ -245,6 +245,15 @@ start_service() {
         unset "$varname"
     done
     echo "  ${name} PID=${pid} log=${logfile}"
+    # Supervisor esterno per mcp-core: il services_watchdog interno (dentro
+    # mcp-core) non puo' rialzare mcp-core stesso. Questo supervisor lo monitora
+    # dall'esterno e lo riavvia se cade. Single-instance (flock), quindi
+    # ri-lanciarlo a ogni start di mcp-core e' idempotente.
+    if [ "$name" = "mcp-core" ] && [ -f "${ROOT}/deploy/mcp-core-supervisor.sh" ]; then
+        setsid nohup bash "${ROOT}/deploy/mcp-core-supervisor.sh" > /dev/null 2>&1 < /dev/null &
+        disown || true
+        echo "  mcp-core-supervisor garantito attivo (single-instance)"
+    fi
 }
 
 # Mappa dei servizi con eventuali env var extra necessarie all'avvio.
