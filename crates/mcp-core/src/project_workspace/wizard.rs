@@ -876,16 +876,36 @@ pub async fn wizard_install_service(
     fn rewrite_port_flags(command: &str, target_port: u16) -> String {
         let p = target_port.to_string();
         let mut out = command.to_string();
-        // Rimpiazza porte note (default tool framework) anche per Vite (5173), Svelte (5173),
-        // Astro (4321), Nuxt (3000), CRA (3000), Angular (4200), Webpack (8080).
+        // RAFFORZAMENTO guard-rail porte (ADR 0010 / regola I): riscrive QUALUNQUE
+        // porta esplicita sui flag --port/-p con la porta ALLOCATA dal registro,
+        // non solo i default noti dei framework. Senza questo, una porta hardcoded
+        // ARBITRARIA nel bucket (es. `vite --port 20001` mai passata da
+        // request_port) sopravvive: il servizio ascolta su una porta diversa da
+        // Environment=PORT / dall'allocazione -> mismatch e kill del port-enforcer
+        // (caso reale Beauty-Book: ExecStart `--port 20001` con PORT=39598).
+        // Cattura: `--port N`, `--port=N`, ` -p N`, ` -p=N`, ` -pN`. Gruppo 1 =
+        // flag+separatore (preservato), gruppo 2 = numero (sostituito).
+        match regex::Regex::new(r"(--port[ =]|(?:^|\s)-p[ =]?)(\d{2,5})") {
+            Ok(re) => {
+                out = re
+                    .replace_all(&out, |c: &regex::Captures| format!("{}{}", &c[1], p))
+                    .into_owned();
+            }
+            Err(_) => {
+                // Ramo difensivo (regex statica valida: mai raggiunto in pratica).
+                for bad in ["3000", "5173", "4321", "3001", "8080", "4200", "5000", "8000"] {
+                    out = out.replace(&format!("--port {}", bad), &format!("--port {}", p));
+                    out = out.replace(&format!("--port={}", bad), &format!("--port={}", p));
+                }
+            }
+        }
+        // URL espliciti verso i default noti -> porta allocata. Qui resta una
+        // blacklist mirata (non una regex generica) per NON riscrivere porte
+        // legittime in URL verso servizi esterni o DB (es. 5432, 6379).
         for bad in [
-            "3000", "3001", "3002", "4000", "4010", "4020", "4030", "4040", "4050", "4060", "4200",
-            "4321", "5173", "5174", "5000", "5001", "8000", "8001", "8080", "9000",
+            "3000", "3001", "3002", "4200", "4321", "5173", "5174", "5000", "5001", "8000",
+            "8080", "9000",
         ] {
-            out = out.replace(&format!("--port={}", bad), &format!("--port={}", p));
-            out = out.replace(&format!("--port {}", bad), &format!("--port {}", p));
-            out = out.replace(&format!("-p {}", bad), &format!("-p {}", p));
-            out = out.replace(&format!("-p{}", bad), &format!("-p{}", p));
             out = out.replace(&format!("localhost:{}", bad), &format!("localhost:{}", p));
             out = out.replace(&format!("127.0.0.1:{}", bad), &format!("127.0.0.1:{}", p));
         }
@@ -992,8 +1012,11 @@ pub async fn wizard_install_service(
                     } else {
                         "npx"
                     };
-                    let needs_host =
-                        resolved_lower.contains("vite") || resolved_lower.contains("svelte");
+                    // Aggiungi --host solo se lo script risolto non lo ha gia',
+                    // altrimenti l'ExecStart finisce con `--host 0.0.0.0` duplicato.
+                    let needs_host = (resolved_lower.contains("vite")
+                        || resolved_lower.contains("svelte"))
+                        && !resolved_lower.contains("--host");
                     let host_flag = if needs_host { " --host 0.0.0.0" } else { "" };
                     // resolved e' qualcosa come "vite" o "vite --some-flag" — manteniamo i suoi flag
                     // ma aggiungiamo --port se manca.
