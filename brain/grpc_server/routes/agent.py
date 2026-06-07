@@ -39,9 +39,21 @@ def _build_history_messages(conversation_history: list[dict] | None) -> list:
         content = msg.get("content", "")
         if not content:
             continue
+        # Difesa in profondita' (regola L): i ruoli interni Nexus non-LLM (es.
+        # 'summary' iniettato dal compact) NON devono arrivare a un provider che
+        # accetta solo user/assistant/system/tool, altrimenti si ha l'errore
+        # "unknown variant `summary`" / "[Error: Unexpected role]". mcp-core li
+        # normalizza gia' (db_role_to_llm_role), ma qui ribadiamo: solo
+        # 'assistant' -> AIMessage, qualunque altro ruolo -> HumanMessage.
         if role == "assistant":
             history_msgs.append(_AIMessage(content=content))
         else:
+            if role not in ("user", "assistant", "system"):
+                logger.warning(
+                    "conversation_history: ruolo non-standard '%s' normalizzato a "
+                    "'user' (path a monte non normalizzato?)",
+                    role,
+                )
             history_msgs.append(_HumanMessage(content=content))
     return history_msgs
 

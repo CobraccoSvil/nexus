@@ -138,9 +138,50 @@ def prepare_openai_compat_request(
         )
         cap = None
     oai_messages = convert_messages_to_openai(messages)
+    oai_messages = _sanitize_tool_message_sequence(oai_messages)
     if system_text:
         oai_messages.insert(0, {"role": "system", "content": system_text})
     return cap, oai_messages, max_tokens
+
+
+def _sanitize_tool_message_sequence(oai_messages: list[dict]) -> list[dict]:
+    """Rimuove `tool` messages ORFANI: quelli il cui `tool_call_id` non
+    corrisponde ad alcun `tool_calls.id` dichiarato da un `assistant` precedente
+    nella stessa sequenza. Punto unico cross-provider (regola L): tutti i
+    provider OpenAI-compatible (mistral/deepseek/openai/gemini-openai) rifiutano
+    con HTTP 400 invalid_request_message_order una sequenza con `role 'tool'`
+    senza l'`assistant(tool_calls=[...id])` che la precede.
+    Casi che generano questo stato (osservati in prod):
+      - `rolling_summary` taglia la history nel mezzo di una coppia
+        AIMessage(tool_calls)+ToolMessage e il primo ToolMessage del cutoff
+        resta orfano.
+      - fallback mid-turn / ricostruzione parziale della history da DB
+        (es. campo messages_json) dove l'AIMessage padre non e' stato
+        persistito ma i suoi ToolMessage si.
+    Il drop e' loggato come WARNING con il tool_call_id, cosi' i casi non
+    triviali sono visibili e si puo' risalire alla causa upstream."""
+    declared: set[str] = set()
+    out: list[dict] = []
+    dropped = 0
+    for msg in oai_messages:
+        role = msg.get("role")
+        if role == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                tid = tc.get("id")
+                if tid:
+                    declared.add(tid)
+        elif role == "tool":
+            tid = msg.get("tool_call_id")
+            if not tid or tid not in declared:
+                dropped += 1
+                continue
+        out.append(msg)
+    if dropped:
+        logger.warning(
+            "adapter sanitize: rimossi %d tool message orfani su %d totali",
+            dropped, len(oai_messages),
+        )
+    return out
 
 
 def resolve_max_tokens(cap: ProviderCapability, requested: int = 0) -> int:

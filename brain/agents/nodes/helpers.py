@@ -1558,6 +1558,20 @@ def _apply_rolling_summary(messages: list[Any], iteration: int, embeddings: Any 
         cutoff = max(first_human + 1, len(messages) - cfg["keep_recent"])
         if cutoff <= 1:
             return messages
+        # Snap del cutoff in avanti: se messages[cutoff] e' un ToolMessage, il
+        # suo AIMessage(tool_calls=...) corrispondente e' finito in to_compress
+        # -> il ToolMessage resterebbe ORFANO nella history mantenuta. Mistral,
+        # DeepSeek, OpenAI rifiutano lo schema con "Unexpected role" / "Messages
+        # with role 'tool' must follow a message with role 'assistant' that has
+        # tool_calls" (causa del bug osservato in prod su rolling_summary). Lo
+        # avanziamo finche' non e' piu' un tool message. Stesso fix anche per
+        # AIMessage con tool_calls i cui tool response cadrebbero in to_compress
+        # (simmetrico: AIMessage(tool_calls) senza ToolMessage che lo segue).
+        max_cutoff = len(messages) - 1  # lascia almeno un messaggio recente
+        while cutoff < max_cutoff and getattr(messages[cutoff], "type", None) == "tool":
+            cutoff += 1
+        if cutoff <= 1:
+            return messages
         to_compress = messages[1:cutoff] if first_human == 0 else messages[:cutoff]
         if not to_compress:
             return messages
@@ -1584,9 +1598,18 @@ def _apply_rolling_summary(messages: list[Any], iteration: int, embeddings: Any 
             len(full_text), offload, what="messaggi precedenti"
         )
         # Sostituisci il blocco con UN messaggio di summary.
+        # IMPORTANTE: usiamo HumanMessage, NON SystemMessage. Causa root del bug
+        # "Unexpected role" / "Messages with role" osservato su mistral/deepseek/
+        # openai: un SystemMessage in posizione NON iniziale (qui veniva inserito
+        # dopo HumanMessage[0]: vedi rami first_human==0 sotto) viola lo schema
+        # OpenAI-compatible che ammette un solo SystemMessage all'inizio. Allinea
+        # con il punto unico Rust db_role_to_llm_role (chat_messages::context):
+        # ogni summary interno -> ruolo 'user' verso i provider. Il prefisso
+        # "[Rolling summary ...]" rende riconoscibile la natura del messaggio nel
+        # _is_summary_message (vedi sotto) e nei prompt downstream.
         try:
-            from langchain_core.messages import SystemMessage
-            summary_msg = SystemMessage(content=(
+            from langchain_core.messages import HumanMessage
+            summary_msg = HumanMessage(content=(
                 f"[Rolling summary turni 1..{cutoff}]\n"
                 f"{len(to_compress)} messaggi precedenti compressi e indicizzati. {pointer}"
             ))
