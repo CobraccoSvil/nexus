@@ -1,5 +1,6 @@
 mod admin;
 mod agent_processes;
+mod process_resume;
 mod agent_router_server;
 mod agent_todos_routes;
 mod agent_tool_result_cache;
@@ -1025,6 +1026,12 @@ async fn main() -> anyhow::Result<()> {
     // watchdog (servizi {slug}-* del progetto). Config DB-driven
     // (agent.observer.*, mig 0355/0356), gating runtime agent.observer.enabled.
     crate::project_workspace::service_observer::spawn_service_observer(state.clone());
+
+    // Worker `process_resume`: cablaggio process-completion -> agent-resume.
+    // Quando un agent_process tracciato con sessione termina, risveglia l'agente
+    // del run per dare l'aggiornamento promesso ("ti aggiorno appena termina").
+    // Config DB-driven (agent.process_resume.*, mig 0360).
+    process_resume::spawn_process_resume_worker(state.clone());
 
     // Worker `catalog_sync`: aggiorna periodicamente ai_price_catalog dal
     // JSON LiteLLM. Cadenza configurabile via settings.model_catalog_sync_interval_s
