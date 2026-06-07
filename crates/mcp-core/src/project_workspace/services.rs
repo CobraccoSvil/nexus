@@ -1209,7 +1209,12 @@ fn stable_hash_u16(input: &str) -> u16 {
 }
 
 /// Trova una porta libera *nel bucket deterministico* del progetto.
-/// Fallback: se il bucket è pieno (o collisioni esterne), ripiega su `find_free_port(PROJECT_PORT_RANGE_START, ...)`.
+/// INVARIANTE (regola H): la porta ritornata resta SEMPRE nel bucket del
+/// progetto. Mai allocare fuori bucket: il `port_enforcer` ammette solo porte nel
+/// bucket del progetto (o allocate esplicitamente) e ucciderebbe il processo che
+/// binda una porta fuori bucket, producendo esattamente il sintomo "porta non
+/// ammissibile". In caso (estremo) di bucket saturo si ritorna la base del bucket
+/// con WARN, mai una porta fuori range.
 pub(super) async fn find_free_project_port(
     project_id: &Uuid,
     registry: &crate::port_registry::PortRegistryCache,
@@ -1238,8 +1243,22 @@ pub(super) async fn find_free_project_port(
         port += 1;
     }
 
-    // Bucket pieno o tutte occupate: fallback su scan globale nel range progetti.
-    find_free_port(PROJECT_PORT_RANGE_START, registry).await
+    // Bucket saturo: NON uscire dal bucket. Una porta fuori bucket verrebbe
+    // rifiutata e uccisa dal port_enforcer (ammette solo porte nel bucket del
+    // progetto o allocate esplicitamente) -> proprio il sintomo "porta non
+    // ammissibile". Inoltre uscire dal bucket innescava un effetto domino:
+    // il fallback partiva da PROJECT_PORT_RANGE_START (20000) e "rubava" porte
+    // ai bucket di altri progetti, facendoli sembrare pieni a loro volta.
+    // Manteniamo l'invariante 1 progetto = 1 bucket: ritorniamo la base del
+    // bucket con WARN. Scenario estremo (50 servizi nello stesso bucket);
+    // l'eventuale bind-fail sara' visibile ma la porta resta autorizzata.
+    tracing::warn!(
+        project_id = %project_id,
+        bucket_start = start,
+        bucket_end = end,
+        "find_free_project_port: bucket progetto saturo, nessuna porta libera nel bucket; ritorno la base del bucket (resta nel range autorizzato)"
+    );
+    start
 }
 
 /// Porta deterministica per un dato servizio/config all'interno del bucket del progetto.
