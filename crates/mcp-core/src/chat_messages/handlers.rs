@@ -123,18 +123,29 @@ pub async fn send_chat_message(
         ));
     }
 
-    // ── Hardening anti-run-concorrente ───────────────────────────────────────
-    // Una sola generazione agentica attiva per sessione. Senza questa guardia,
-    // due POST /messages ravvicinate sulla stessa sessione avviano due agent run
-    // in parallelo: il secondo "ruba" lo stream SSE e un messaggio resta orfano
-    // (sintomo osservato: un messaggio inviato mentre un run e' in corso sparisce
-    // senza risposta). Rifiutiamo con 409: il frontend lo accoda e lo reinvia a
-    // fine run. Solo per modalita' agente (Study e' sincrono nella POST, si
-    // serializza da se'). Niente messaggio orfano: la guardia precede l'INSERT.
+    // ── Hardening anti-run-concorrente (con stale detection) ─────────────────
+    // Una sola generazione agentica VERAMENTE attiva per sessione: senza questa
+    // guardia, due POST /messages ravvicinate avviavano due run in parallelo e
+    // il secondo rubava lo stream SSE (un messaggio orfano).
+    //
+    // Fix originale: rifiutavamo se esisteva un run status IN ('running',
+    // 'awaiting_confirmation'). Difetto strutturale: un crash/restart del
+    // backend lasciava il run in 'running' nel DB per sempre -> la sessione
+    // restava bloccata col 409 fino a cleanup manuale. La causa radice e' che
+    // 'status=running' non implica "vivo": serve verificare la recency.
+    //
+    // Fix definitivo: consideriamo attivo solo un run con created_at recente
+    // (entro la soglia di "vita massima ragionevole"). I run piu' vecchi sono
+    // per definizione stale (un turno reale termina entro pochi minuti) e
+    // verranno marcati 'interrupted' dal cleanup di startup (vedi main.rs).
+    // Soglia: 15 minuti — copre i turni piu' lunghi visti in produzione con
+    // largo margine, ma sblocca la chat se qualcosa e' rimasto sospeso.
     if parse_automation_mode(body.automation_mode.as_deref()) != AutomationMode::Study {
         let active_run: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM agent_runs \
-             WHERE session_id = $1 AND status IN ('running', 'awaiting_confirmation') \
+             WHERE session_id = $1 \
+               AND status IN ('running', 'awaiting_confirmation') \
+               AND created_at > NOW() - INTERVAL '15 minutes' \
              LIMIT 1",
         )
         .bind(context.session_id)
