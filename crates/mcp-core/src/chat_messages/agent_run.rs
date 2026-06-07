@@ -447,7 +447,7 @@ pub(crate) async fn spawn_agent_run(
     {
         state
             .orchestrator
-            .route_by_slots(&effective_slots, 0.60)
+            .route_by_slots(&state.db, &effective_slots, 0.60)
             .await
     } else {
         None

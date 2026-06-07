@@ -649,6 +649,50 @@ fn select_top_candidates(req: &IntentRequirement, catalog: &[CatalogModel]) -> V
     top
 }
 
+/// Punto unico di selezione modello per un requisito tier+capability (regola L).
+///
+/// Carica il catalog SANO (`is_enabled = true`, `consecutive_failures = 0`) e
+/// usa lo STESSO scoring di `select_top_candidates` che governa la
+/// `nexus_routing_matrix` per intent. Ritorna i `(provider, model)` ordinati per
+/// score (uno per provider, max 3): il chiamante puo' scorrere la lista
+/// saltando i provider in cooldown.
+///
+/// Riusato da:
+///   - questo modulo (popolamento matrix per `(intent, behavior_mode)`);
+///   - `Orchestrator::route_by_slots` (routing slot-based, mig 0357): la
+///     `nexus_routing_slots_matrix` esprime solo tier+capability, mentre il
+///     provider+modello concreto viene scelto QUI. Niente piu' modelli pinnati
+///     che marciscono (regola G/H).
+///
+/// I pesi sono i default della tabella `nexus_intent_routing_requirements`
+/// (vedi `load_requirements`): il routing slot-based eredita la stessa
+/// calibrazione del routing per intent, senza duplicarla.
+pub(crate) async fn select_models_for_requirement(
+    db: &PgPool,
+    preferred_tier: &str,
+    required_capabilities: &[String],
+    requires_tool_use: bool,
+    cost_direction: &str,
+) -> sqlx::Result<Vec<(String, String)>> {
+    let catalog = load_catalog(db).await?;
+    let req = IntentRequirement {
+        intent: String::new(),
+        behavior_mode: String::new(),
+        required_capabilities: required_capabilities.to_vec(),
+        requires_tool_use,
+        preferred_tier: preferred_tier.to_string(),
+        weight_tier: 0.35,
+        weight_cost: 0.25,
+        weight_context: 0.20,
+        weight_capabilities: 0.20,
+        cost_direction: cost_direction.to_string(),
+    };
+    Ok(select_top_candidates(&req, &catalog)
+        .into_iter()
+        .map(|s| (s.catalog.provider, s.catalog.model))
+        .collect())
+}
+
 /// Calcola lo score 0..1 per un modello dato un requirement.
 /// Esposto per testabilita'.
 fn score_model(req: &IntentRequirement, m: &CatalogModel, full_catalog: &[CatalogModel]) -> f32 {
