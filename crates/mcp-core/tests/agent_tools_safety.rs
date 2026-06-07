@@ -55,6 +55,7 @@ fn binary_contiene_tutti_i_pattern_safety_attesi() {
         "fs_rm_rf_root",
         "kill_brain_mcp",
         "iptables_route",
+        "systemctl_system",
         "database_url_nexus",
         "cat_env_nexus",
     ];

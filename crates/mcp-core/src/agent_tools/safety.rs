@@ -145,8 +145,12 @@ static FORBIDDEN_PATTERNS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "iptables_route",
-        r"(?i)\b(?:iptables|ip\s+route|systemctl|service\s+\w+\s+(?:stop|restart))\b",
-        "Modifica routing/servizi systemd vietata",
+        // NB: `systemctl` NON e' qui: e' gestito context-aware in check_command
+        // (has_system_systemctl), perche' `systemctl --user <slug>-*.service` e' il
+        // modo legittimo di gestire i servizi del PROGETTO. Qui restano le
+        // operazioni sysadmin reali su routing/servizi SysV.
+        r"(?i)\b(?:iptables|ip\s+route|service\s+\w+\s+(?:stop|restart))\b",
+        "Modifica routing/servizi di sistema vietata",
         "Operazioni sysadmin fuori scope progetto.",
     ),
     // ── 6b. DATABASE_URL puntato al DB nexus (M70) ─────────────────────────
@@ -208,10 +212,48 @@ static FORBIDDEN_SET: Lazy<RegexSet> = Lazy::new(|| {
 
 /// Verifica un comando shell contro la blacklist.
 /// Ritorna `Some(BlockReason)` se va bloccato, `None` se OK.
+/// True se il comando contiene almeno un `systemctl` di SISTEMA (cioe' NON
+/// `systemctl --user`). I servizi del PROGETTO si gestiscono con
+/// `systemctl --user <slug>-*.service` (lo fa Nexus stesso nel pannello
+/// Run&Debug): vanno PERMESSI. `systemctl ...` di sistema e' sysadmin fuori scope:
+/// va bloccato. Il crate `regex` non supporta il negative lookahead, quindi la
+/// distinzione e' fatta qui con scansione manuale dei token (regola L: un solo
+/// punto decide "systemctl progetto vs sistema").
+fn has_system_systemctl(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    let bytes = lower.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("systemctl") {
+        let start = from + rel;
+        // Confine di parola a sinistra (evita match dentro identificatori).
+        let left_ok = start == 0
+            || (!bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_');
+        if left_ok {
+            let after = lower[start + "systemctl".len()..].trim_start();
+            // `systemctl --user ...` -> servizi utente/progetto, permesso.
+            if !after.starts_with("--user") {
+                return true;
+            }
+        }
+        from = start + "systemctl".len();
+    }
+    false
+}
+
 pub fn check_command(cmd: &str) -> Option<BlockReason> {
     let normalized = cmd.trim();
     if normalized.is_empty() {
         return None;
+    }
+    // systemctl context-aware (vedi has_system_systemctl): `systemctl --user`
+    // (servizi del progetto) e' permesso; `systemctl` di sistema e' bloccato.
+    if has_system_systemctl(normalized) {
+        return Some(BlockReason {
+            category: "systemctl_system",
+            pattern_index: usize::MAX,
+            message: "Gestione servizi systemd di SISTEMA vietata",
+            remediation: "Per i servizi del progetto usa `systemctl --user <slug>-<servizio>.service`. `systemctl` di sistema e' sysadmin, fuori scope progetto.",
+        });
     }
     let matches: Vec<usize> = FORBIDDEN_SET.matches(normalized).into_iter().collect();
     if matches.is_empty() {
@@ -249,6 +291,40 @@ fn truncate_for_log(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permette_systemctl_user_servizi_progetto() {
+        // I servizi del progetto si gestiscono con systemctl --user: permesso.
+        assert!(check_command("systemctl --user restart beauty-book-frontend.service").is_none());
+        assert!(check_command(
+            "systemctl --user daemon-reload && systemctl --user restart beauty-book-backend-dev.service"
+        )
+        .is_none());
+        assert!(check_command("systemctl --user status beauty-book-frontend.service").is_none());
+    }
+
+    #[test]
+    fn blocca_systemctl_di_sistema() {
+        assert_eq!(
+            check_command("systemctl restart nginx").unwrap().category,
+            "systemctl_system"
+        );
+        assert!(check_command("sudo systemctl stop docker").is_some());
+        // Misto: un --user e uno di sistema -> bloccato (c'e' un systemctl sistema).
+        assert!(check_command("systemctl --user restart x && systemctl restart nginx").is_some());
+    }
+
+    #[test]
+    fn blocca_ancora_iptables_e_iproute() {
+        assert_eq!(
+            check_command("iptables -A INPUT -j DROP").unwrap().category,
+            "iptables_route"
+        );
+        assert_eq!(
+            check_command("ip route add default via 1.2.3.4").unwrap().category,
+            "iptables_route"
+        );
+    }
 
     #[test]
     fn blocca_psql_db_nexus() {
