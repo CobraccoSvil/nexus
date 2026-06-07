@@ -228,10 +228,21 @@ pub async fn get_project_services_status(
                 .await
             {
                 let log = String::from_utf8_lossy(&journal.stdout).to_string();
-                let diag = diagnose_service_failure(&log, unit, &context.root_path);
-                entry["last_error"] = json!(diag.error);
-                entry["suggestion"] = json!(diag.suggestion);
-                entry["error_kind"] = json!(diag.kind);
+                // Punto unico (regola L): prova prima i pattern configurabili in
+                // nexus_dev_diagnostics (DB, hot-reload); fallback all'euristica
+                // hardcoded come rete di sicurezza se nessun pattern DB matcha.
+                let (err, sugg, kind) =
+                    match crate::agent_tools::dev_diagnostics::diagnose_log_db(&state.db, &log).await
+                    {
+                        Some((desc, fix, cat)) => (desc, fix, cat),
+                        None => {
+                            let d = diagnose_service_failure(&log, unit, &context.root_path);
+                            (d.error, d.suggestion, d.kind.to_string())
+                        }
+                    };
+                entry["last_error"] = json!(err);
+                entry["suggestion"] = json!(sugg);
+                entry["error_kind"] = json!(kind);
                 if is_crash_looping && !is_failing {
                     entry["crash_loop"] = json!(true);
                 }

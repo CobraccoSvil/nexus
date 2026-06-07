@@ -2,6 +2,7 @@
 pub mod allocate_port;
 pub mod auto_bootstrap;
 pub mod browser_check;
+pub mod build_diagnostics;
 pub mod changes;
 pub mod execute_cmd;
 pub mod fs_events;
@@ -12,6 +13,8 @@ pub mod processes;
 pub mod run_configs;
 pub mod runtime_issues;
 pub mod scan_ports;
+pub mod service_observer;
+pub mod service_observer_remediation;
 pub mod services;
 pub mod sync_ports;
 pub mod wizard;

@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, } from "react";
 import { useThemeColors } from "../../lib/theme";
+import { ServiceMetricsStrip } from "./service-metrics-strip";
 import { getOutputChannels, getOutputEvents, stopAgentProcess, clearFinishedProcesses, type OutputChannel, type OutputEvent } from "../../lib/api-client";
 import {
   useProjectStore,
@@ -259,6 +260,8 @@ ${outputBlock}${truncatedNote}
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
+      {/* Osservabilita runtime dei servizi utente (service_observer) */}
+      <ServiceMetricsStrip projectId={projectId} />
       {/* Tab bar */}
       <div
         style={{

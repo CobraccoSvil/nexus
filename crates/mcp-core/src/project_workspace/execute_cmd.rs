@@ -85,6 +85,17 @@ pub async fn execute_command(
             let stderr = String::from_utf8_lossy(&output.stderr);
             let exit_code = output.status.code().unwrap_or(-1);
 
+            // Capacita' 2: parsing strutturato degli errori di build sull'output
+            // COMPLETO (prima del troncamento), solo se il comando e' fallito.
+            // Punto unico: project_workspace::build_diagnostics.
+            let diagnostics = if exit_code != 0 {
+                crate::project_workspace::build_diagnostics::parse_diagnostics(
+                    &command, &stdout, &stderr,
+                )
+            } else {
+                Vec::new()
+            };
+
             let stdout_out = if stdout.len() > max_output {
                 format!(
                     "{}...\n[troncato a {} byte]",
@@ -122,6 +133,7 @@ pub async fn execute_command(
                 "stderr": stderr_out,
                 "blocked": false,
                 "duration_ms": duration_ms,
+                "diagnostics": diagnostics,
             })))
         }
         Ok(Err(e)) => Ok(Json(json!({

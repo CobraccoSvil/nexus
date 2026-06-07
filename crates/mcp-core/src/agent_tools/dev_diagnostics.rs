@@ -100,6 +100,27 @@ async fn get_diagnostics(db: &PgPool) -> Vec<Diagnostic> {
         .unwrap_or_default()
 }
 
+/// Diagnosi DB-driven riusabile (punto unico, regola L): ritorna il primo
+/// pattern di `nexus_dev_diagnostics` che matcha il log, come
+/// `(descrizione, fix_renderizzato, category)`. None se nessun pattern matcha
+/// o la tabella e' vuota — in tal caso il chiamante usa il fallback hardcoded.
+/// Usata sia dal tool sia da `services.rs` per non duplicare la diagnosi crash.
+pub(crate) async fn diagnose_log_db(db: &PgPool, log: &str) -> Option<(String, String, String)> {
+    let diagnostics = get_diagnostics(db).await;
+    for diag in &diagnostics {
+        if let Some(caps) = diag.pattern.captures(log) {
+            let fix = render_fix_template(&diag.fix_template, &caps, None);
+            let desc = if diag.description.is_empty() {
+                "Errore rilevato nei log del servizio".to_string()
+            } else {
+                diag.description.clone()
+            };
+            return Some((desc, fix, diag.category.clone()));
+        }
+    }
+    None
+}
+
 /// Sostituisce i placeholder {1},{2},... con i capture group della regex match.
 /// Riconosce anche placeholder testuali: {file}, {from}, {module}, {log_path}.
 fn render_fix_template(template: &str, caps: &regex::Captures, log_path: Option<&str>) -> String {

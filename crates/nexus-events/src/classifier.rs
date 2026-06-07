@@ -363,6 +363,42 @@ impl Classifier {
             }),
 
             ProjectEvent::EventEnriched { .. } => None,
+
+            // ── Observability servizi app utente ───────────────────────
+            ProjectEvent::ServiceCrashDetected { unit, error_kind, .. } => Some(UiHint {
+                highlight_panel: Some("services".to_string()),
+                toast_severity: Some("error".to_string()),
+                toast_msg: Some(format!("Crash rilevato in {unit} ({error_kind})")),
+                badge_increment: Some(("services".to_string(), 1)),
+                flash_duration_ms: Some(1500),
+            }),
+            ProjectEvent::ServiceAnomaly {
+                unit, metric, severity, ..
+            } => Some(UiHint {
+                highlight_panel: Some("monitor".to_string()),
+                toast_severity: Some(if severity == "critical" {
+                    "error".to_string()
+                } else {
+                    "warning".to_string()
+                }),
+                toast_msg: Some(format!("Anomalia {metric} su {unit}")),
+                flash_duration_ms: Some(1000),
+                ..Default::default()
+            }),
+            ProjectEvent::ServiceDiagnosisStarted { unit, .. } => Some(UiHint {
+                toast_severity: Some("info".to_string()),
+                toast_msg: Some(format!("Diagnosi automatica avviata per {unit}")),
+                ..Default::default()
+            }),
+            ProjectEvent::ServiceBuildErrors { unit, count, .. } => Some(UiHint {
+                highlight_panel: Some("problems".to_string()),
+                toast_severity: Some("error".to_string()),
+                toast_msg: Some(format!("{count} errori di build in {unit}")),
+                badge_increment: Some(("problems".to_string(), 1)),
+                flash_duration_ms: Some(1000),
+            }),
+            // Eventi ad alta frequenza: nessun toast (consumati dai pannelli).
+            ProjectEvent::ServiceMetrics { .. } | ProjectEvent::ServiceLogLine { .. } => None,
         }
     }
 }

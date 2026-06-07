@@ -359,7 +359,7 @@ pub(crate) async fn build_initial_msg_with_attachments(
 /// Ritorna `None` se il progetto non è caricabile (fallback al singolo turn).
 pub(crate) async fn spawn_agent_run(
     state: &AppState,
-    params: SpawnAgentParams,
+    mut params: SpawnAgentParams,
 ) -> Option<SpawnAgentResult> {
     let project_ctx = load_project_context(&state.db, params.project_id, params.user_id).await;
     let proj = match project_ctx {
@@ -370,6 +370,27 @@ pub(crate) async fn spawn_agent_run(
     let run_id = Uuid::new_v4();
     let (tx, _rx) = broadcast::channel::<AgentStepEvent>(256);
     state.agent_channels.insert(run_id, tx.clone());
+
+    // Forcing esplicito dell'AgentType via hint (chiude il campo prima inerte):
+    // se il chiamante specifica `nexus_agent_type_hint` (es. "debugger" da
+    // "Risolvi con Nexus" o dall'auto-debug del service_observer), antepone il
+    // system prompt specializzato di quel ruolo al contesto di sistema, cosi'
+    // l'agente assume davvero quel comportamento. Riusa get_agent_system_prompt.
+    if let Some(hint) = params.nexus_agent_type_hint.as_deref() {
+        if !hint.trim().is_empty() {
+            let pascal = crate::internal_learning::snake_to_pascal(hint);
+            let agent_type = nexus_orchestrator::AgentType::from_name(&pascal);
+            let agent_prompt = crate::nexus_routing::get_agent_system_prompt(&agent_type);
+            if !agent_prompt.is_empty() {
+                params.system_context = if params.system_context.trim().is_empty() {
+                    agent_prompt
+                } else {
+                    format!("{}\n\n{}", agent_prompt, params.system_context)
+                };
+                tracing::info!("spawn_agent_run: AgentType forzato via hint = {}", pascal);
+            }
+        }
+    }
 
     // ─────────────────────────────────────────────────────────────────
     // Disambiguation step (best practice NLU)

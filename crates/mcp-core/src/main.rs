@@ -1020,6 +1020,12 @@ async fn main() -> anyhow::Result<()> {
     // gating runtime via agent.watchdog.enabled. mcp-core escluso (ospita il loop).
     services_watchdog::spawn_services_watchdog(state.db.clone());
 
+    // Worker `service_observer`: osservabilita' runtime delle APP UTENTE
+    // (metriche /proc, anomalie, crash -> auto-debug). Scope disgiunto dal
+    // watchdog (servizi {slug}-* del progetto). Config DB-driven
+    // (agent.observer.*, mig 0355/0356), gating runtime agent.observer.enabled.
+    crate::project_workspace::service_observer::spawn_service_observer(state.clone());
+
     // Worker `catalog_sync`: aggiorna periodicamente ai_price_catalog dal
     // JSON LiteLLM. Cadenza configurabile via settings.model_catalog_sync_interval_s
     // (default 12h, minimo 1h). Disabilitabile via settings.model_catalog_sync_enabled.

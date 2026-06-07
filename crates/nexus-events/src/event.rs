@@ -367,6 +367,50 @@ pub enum ProjectEvent {
         file_path: String,
     },
 
+    // ── Observability servizi app utente (service_observer, mig 0355/0356) ──
+    /// Metriche OS per processo di un servizio utente (capacita' 4). Effimero:
+    /// non persistito su DB, solo event-stream + ring in-memory per snapshot.
+    ServiceMetrics {
+        unit: String,
+        pid: Option<i32>,
+        cpu_pct: f32,
+        rss_bytes: u64,
+        io_read_bytes: u64,
+        io_write_bytes: u64,
+        latency_ms: Option<u64>,
+    },
+    /// Riga di log significativa dal tail continuo di un servizio utente.
+    ServiceLogLine {
+        unit: String,
+        level: String, // "error" | "warn" | "info"
+        line: String,
+    },
+    /// Anomalia rilevata su un servizio utente (capacita' 3).
+    ServiceAnomaly {
+        unit: String,
+        metric: String, // latency | restart | error_rate | cpu | rss
+        value: f64,
+        threshold: f64,
+        severity: String, // "warning" | "critical"
+    },
+    /// Crash/eccezione runtime rilevato nei log di un servizio utente (cap 1).
+    ServiceCrashDetected {
+        unit: String,
+        error_kind: String,
+        last_log: String,
+    },
+    /// Errori di build strutturati associati a un servizio (capacita' 2).
+    ServiceBuildErrors {
+        unit: String,
+        count: i64,
+        findings: serde_json::Value,
+    },
+    /// Avviata una diagnosi automatica (run dell'agente Debugger) per un crash.
+    ServiceDiagnosisStarted {
+        unit: String,
+        run_id: String,
+    },
+
     // ── Eventi di servizio del dispatcher ──────────────────────────────────
     /// Inviato quando il consumer e' rimasto indietro oltre la capacita'
     /// del ring buffer. Il client deve ricaricare lo snapshot REST.
@@ -417,6 +461,11 @@ impl ProjectEvent {
             | Self::KnowledgeNoteUpdated { .. }
             | Self::KnowledgeLinkCreated { .. } => TOPIC_KNOWLEDGE,
             Self::DocumentGenerated { .. } => TOPIC_DOCUMENTS,
+            Self::ServiceMetrics { .. } | Self::ServiceAnomaly { .. } => TOPIC_MONITOR,
+            Self::ServiceBuildErrors { .. } => TOPIC_PROBLEMS,
+            Self::ServiceLogLine { .. }
+            | Self::ServiceCrashDetected { .. }
+            | Self::ServiceDiagnosisStarted { .. } => TOPIC_SERVICES,
             Self::SnapshotRequired { .. } => TOPIC_SYSTEM,
         }
     }
@@ -466,6 +515,12 @@ impl ProjectEvent {
             Self::KnowledgeNoteUpdated { .. } => "KnowledgeNoteUpdated",
             Self::KnowledgeLinkCreated { .. } => "KnowledgeLinkCreated",
             Self::DocumentGenerated { .. } => "DocumentGenerated",
+            Self::ServiceMetrics { .. } => "ServiceMetrics",
+            Self::ServiceLogLine { .. } => "ServiceLogLine",
+            Self::ServiceAnomaly { .. } => "ServiceAnomaly",
+            Self::ServiceCrashDetected { .. } => "ServiceCrashDetected",
+            Self::ServiceBuildErrors { .. } => "ServiceBuildErrors",
+            Self::ServiceDiagnosisStarted { .. } => "ServiceDiagnosisStarted",
             Self::SnapshotRequired { .. } => "SnapshotRequired",
         }
     }

@@ -72,7 +72,13 @@ export type ProjectEvent =
   | { kind: "KnowledgeNoteCreated"; note_id: string; title: string; intent: string | null }
   | { kind: "KnowledgeNoteUpdated"; note_id: string; status: string }
   | { kind: "KnowledgeLinkCreated"; link_id: string; from: string; to: string; rel_type: string; created_by: string }
-  | { kind: "DocumentGenerated"; document_id: string; doc_type: string; title: string; version: string; file_path: string };
+  | { kind: "DocumentGenerated"; document_id: string; doc_type: string; title: string; version: string; file_path: string }
+  | { kind: "ServiceMetrics"; unit: string; pid?: number; cpu_pct: number; rss_bytes: number; io_read_bytes: number; io_write_bytes: number; latency_ms?: number }
+  | { kind: "ServiceLogLine"; unit: string; level: string; line: string }
+  | { kind: "ServiceAnomaly"; unit: string; metric: string; value: number; threshold: number; severity: string }
+  | { kind: "ServiceCrashDetected"; unit: string; error_kind: string; last_log: string }
+  | { kind: "ServiceBuildErrors"; unit: string; count: number; findings: unknown }
+  | { kind: "ServiceDiagnosisStarted"; unit: string; run_id: string };
 
 export interface EnvelopedEvent {
   event_id: string;
