@@ -515,7 +515,7 @@ pub async fn cancel_agent_run(
     let run_id = Uuid::parse_str(&run_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Run id non valido"))?;
 
-    let run_row = sqlx::query("SELECT user_id, status FROM agent_runs WHERE id = $1")
+    let run_row = sqlx::query("SELECT user_id, session_id, status FROM agent_runs WHERE id = $1")
         .bind(run_id)
         .fetch_optional(&state.db)
         .await
@@ -530,39 +530,63 @@ pub async fn cancel_agent_run(
         return Err(api_error(StatusCode::FORBIDDEN, "Run non accessibile"));
     }
 
+    let session_id: Uuid = run.get::<Uuid, _>("session_id");
     let status: String = run.get::<String, _>("status");
     if status != "running" && status != "awaiting_confirmation" {
-        return Ok(Json(
-            json!({ "runId": run_id.to_string(), "status": status, "message": "Run già terminato" }),
-        ));
+        // Anche se il run target e' gia' terminale, sblocchiamo eventuali ALTRI
+        // run rimasti stuck sulla stessa sessione (vedi fix cascade sotto): il
+        // 'Forza Stop' lato utente deve sempre liberare la sessione.
     }
 
-    sqlx::query(
-        "UPDATE agent_runs SET status='cancelled', completed_at=NOW(), \
-         final_answer='Operazione annullata.' WHERE id=$1",
+    // Cancel CASCADING per sessione (fix architetturale): l'invariante "max 1
+    // run attivo per sessione" che assume la guardia 409 (handlers.rs) puo'
+    // venire violata da path "resume", auto-continuation o race condition tra
+    // INSERT e cleanup. Senza cascade, un singolo Forza Stop lascia un secondo
+    // run "running" stuck nel DB per fino a 15 min (sintomo osservato: dopo
+    // Stop, la POST successiva sulla stessa sessione torna 409 ripetuto).
+    // Cancellando TUTTI i run attivi della sessione si ristabilisce
+    // l'invariante e si sblocca subito l'utente, in modo idempotente.
+    let cancelled_ids: Vec<Uuid> = sqlx::query_scalar(
+        "UPDATE agent_runs \
+         SET status='cancelled', completed_at=NOW(), \
+             final_answer='Operazione annullata.' \
+         WHERE session_id = $1 \
+           AND status IN ('running', 'awaiting_confirmation') \
+         RETURNING id",
     )
-    .bind(run_id)
-    .execute(&state.db)
+    .bind(session_id)
+    .fetch_all(&state.db)
     .await
     .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Emetti is_final sul broadcast del run: il frontend chiude l'SSE
-    // immediatamente e poll il DB per leggere lo stato 'cancelled'. Senza
-    // questo evento la UI rimarrebbe "in esecuzione" finche' il tokio::spawn
+    // Emetti is_final sul broadcast di OGNI run cancellato: il frontend chiude
+    // gli SSE immediatamente e poll il DB per leggere 'cancelled'. Senza questo
+    // evento la UI rimarrebbe "in esecuzione" finche' il tokio::spawn
     // sottostante non termina autonomamente (anche minuti).
-    if let Some(ch) = state.agent_channels.get(&run_id) {
-        let _ = ch.send(AgentStepEvent {
-            run_id: run_id.to_string(),
-            step: None,
-            trace: None,
-            is_final: true,
-            token_delta: None,
-            thinking_delta: None,
-            meta_step: None,
-        });
+    for cid in &cancelled_ids {
+        if let Some(ch) = state.agent_channels.get(cid) {
+            let _ = ch.send(AgentStepEvent {
+                run_id: cid.to_string(),
+                step: None,
+                trace: None,
+                is_final: true,
+                token_delta: None,
+                thinking_delta: None,
+                meta_step: None,
+            });
+        }
+    }
+    if cancelled_ids.len() > 1 {
+        tracing::warn!(
+            "cancel_agent_run: cancellati {} run attivi sulla session {} (atteso 1, sintomo di run stuck precedenti)",
+            cancelled_ids.len(),
+            session_id
+        );
     }
 
-    Ok(Json(
-        json!({ "runId": run_id.to_string(), "status": "cancelled" }),
-    ))
+    Ok(Json(json!({
+        "runId": run_id.to_string(),
+        "status": "cancelled",
+        "cancelledIds": cancelled_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+    })))
 }
