@@ -1187,8 +1187,14 @@ pub(crate) async fn spawn_agent_run(
             // Va sostituito SUBITO con un modello eleggibile, non solo quando il
             // context e' insufficiente. Cosi' il gate di capability vale anche per
             // il PRIMARIO, non solo per i fallback (prima era bypassato).
-            let (primary_ctx, primary_tool_ok): (i64, bool) = sqlx::query_as(
-                "SELECT context_window,
+            // context_window e' INT4 in Postgres: il cast ::bigint evita il
+            // type-mismatch i64/INT4 che faceva fallire la decodifica sqlx. Prima
+            // l'errore veniva ingoiato da .ok() -> fallback (8192,false) ->
+            // re-route SEMPRE attivo -> degrado a un modello piccolo anche quando
+            // il routing aveva scelto un modello capace (regola G: niente fallback
+            // magico che nasconde errori). Ora l'errore reale viene loggato.
+            let (primary_ctx, primary_tool_ok): (i64, bool) = match sqlx::query_as(
+                "SELECT context_window::bigint,
                         (supports_tool_use AND agentic_thinking_policy <> 'exclude')
                    FROM ai_price_catalog WHERE provider=$1 AND model=$2 LIMIT 1",
             )
@@ -1196,9 +1202,25 @@ pub(crate) async fn spawn_agent_run(
             .bind(&current_model)
             .fetch_optional(&db_clone)
             .await
-            .ok()
-            .flatten()
-            .unwrap_or((8192, false));
+            {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    tracing::warn!(
+                        "agent_run {}: {}/{} assente dal catalog per il check idoneita', \
+                         fallback conservativo (8192, non-tool)",
+                        run_id, current_provider, current_model
+                    );
+                    (8192, false)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "agent_run {}: query idoneita' context fallita per {}/{}: {e} \
+                         (fallback conservativo)",
+                        run_id, current_provider, current_model
+                    );
+                    (8192, false)
+                }
+            };
             if primary_ctx < ctx_needed || !primary_tool_ok {
                 tracing::warn!(
                     "agent_run {}: primario {}/{} non idoneo (ctx {} < {} oppure non tool-capable: {}), re-route agentico",
