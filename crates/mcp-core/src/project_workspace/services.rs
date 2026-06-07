@@ -252,6 +252,30 @@ pub async fn get_project_services_status(
         services.push(entry);
     }
 
+    // Merge con gli unit FILE su disco: `systemctl --user list-units` puo' NON
+    // elencare servizi installati quando il manager utente era giu' al momento
+    // dell'install (tipico WSL: il file .service esiste in ~/.config/systemd/user/
+    // ma non e' caricato nel manager). Uniamo gli unit file mancanti, cosi' il
+    // pannello mostra SEMPRE tutti i servizi del progetto, non solo quelli noti
+    // a systemctl.
+    {
+        let known: std::collections::HashSet<String> = services
+            .iter()
+            .filter_map(|s| s.get("unit").and_then(|u| u.as_str()).map(String::from))
+            .collect();
+        for fb in list_services_fallback(&slug).await {
+            let unit = fb
+                .get("unit")
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !unit.is_empty() && !known.contains(&unit) {
+                services.push(fb);
+            }
+        }
+        services.sort_by(|a, b| a["short"].as_str().cmp(&b["short"].as_str()));
+    }
+
     Ok(Json(json!({
         "services": services,
         "slug": slug,
