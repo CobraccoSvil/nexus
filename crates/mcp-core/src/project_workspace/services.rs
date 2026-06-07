@@ -749,6 +749,18 @@ pub async fn cleanup_project_ports(
         killed.push(json!({ "port": port, "pid": pid, "program": program }));
     }
 
+    // Rilascia (DB + cache registry) le allocazioni delle porte EFFETTIVAMENTE
+    // liberate, tramite il punto unico PortRegistryCache::release (regola L).
+    // Senza, get_project_ports (che mostra anche nexus_port_allocations) le
+    // continuava a elencare con live=false dopo il kill: dal pannello sembrava
+    // "il reset non aggiorna nulla". NON tocca le porte "skipped" (servizi del
+    // progetto / infrastruttura protetta), che non vengono killate.
+    for entry in &killed {
+        if let Some(p) = entry.get("port").and_then(|v| v.as_u64()) {
+            let _ = state.port_registry.release(p as u16).await;
+        }
+    }
+
     Ok(Json(json!({
         "slug": slug,
         "killed": killed,
