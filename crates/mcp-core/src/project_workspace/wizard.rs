@@ -701,6 +701,50 @@ pub async fn wizard_detect_services(
     Ok(Json(json!({ "suggestions": suggestions, "slug": slug })))
 }
 
+/// Per i servizi docker-compose scrive/aggiorna il file `.env` nella directory
+/// del compose (`cwd`) con le variabili di porta allocate (`PORT*`). Cosi' anche
+/// un `docker compose up` lanciato A MANO (non via unit systemd) usa le porte del
+/// bucket gestito invece dei default hardcoded nel compose (es.
+/// `${PORT_FRONTEND:-20001}`), che facevano ripartire i container su porte fuori
+/// bucket. Merge NON distruttivo: aggiorna le righe PORT* esistenti, aggiunge le
+/// mancanti, preserva tutto il resto. (regola I: porte sempre dal registro.)
+async fn write_compose_env_file(cwd: &str, env_map: &std::collections::HashMap<String, String>) {
+    let ports: std::collections::BTreeMap<&str, &str> = env_map
+        .iter()
+        .filter(|(k, _)| k.starts_with("PORT"))
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    if ports.is_empty() {
+        return;
+    }
+    let env_path = format!("{}/.env", cwd.trim_end_matches('/'));
+    let existing = tokio::fs::read_to_string(&env_path).await.unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in existing.lines() {
+        let key = line.split('=').next().unwrap_or("").trim();
+        if let Some(v) = ports.get(key) {
+            out.push(format!("{}={}", key, v));
+            written.insert(key.to_string());
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    for (k, v) in &ports {
+        if !written.contains(*k) {
+            out.push(format!("{}={}", k, v));
+        }
+    }
+    let content = format!("{}\n", out.join("\n"));
+    match tokio::fs::write(&env_path, &content).await {
+        Ok(()) => tracing::info!(
+            "docker-compose: .env aggiornato con le porte gestite del bucket ({})",
+            env_path
+        ),
+        Err(e) => tracing::warn!("docker-compose: scrittura .env fallita ({}): {e}", env_path),
+    }
+}
+
 /// Installa un servizio come unit file systemd --user e lo abilita.
 /// Body JSON: { short, command, args, cwd, env, description }
 pub async fn wizard_install_service(
@@ -1266,6 +1310,18 @@ pub async fn wizard_install_service(
                 unit_name,
                 e
             );
+        }
+    }
+
+    // Fix sistemico: per i servizi docker-compose scrivi/aggiorna il .env nella
+    // dir del compose con le porte allocate. Cosi' anche un `docker compose up`
+    // lanciato a mano (non via unit) usa le porte del bucket, non i default
+    // hardcoded nel compose (es. ${PORT_FRONTEND:-20001}) che facevano ripartire
+    // i container su porte fuori bucket ("ripresenta sempre 20001/20002").
+    {
+        let el = exec_start.to_lowercase();
+        if el.contains("docker compose") || el.contains("docker-compose") {
+            write_compose_env_file(cwd, &env_map).await;
         }
     }
 
