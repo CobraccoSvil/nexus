@@ -414,10 +414,23 @@ export function ChatPanel({
   const scrollRestoredRef = useRef(false);
   const justRestoredRef = useRef(false); // blocca auto-scroll subito dopo restore
 
+  // "Near bottom" threshold: se distanza dal fondo < di questo, consideriamo
+  // l'utente attaccato al fondo e l'auto-scroll resta attivo. Sopra: l'utente
+  // sta leggendo storia precedente, l'auto-scroll si ferma. Coerente con la
+  // soglia del bottone "scroll to bottom" (showScrollBtn) per non avere due
+  // stati: o sei a fondo (auto attivo, bottone nascosto) o non lo sei.
+  const NEAR_BOTTOM_PX = 80;
+  // Stato (in ref per non causare re-render): true se l'ultimo onScroll
+  // osservato era near-bottom. Inizializzato a true: all'apertura della chat
+  // assumiamo che l'utente voglia vedere l'ultimo messaggio.
+  const wasNearBottomRef = useRef(true);
+
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
-    setShowScrollBtn(el.scrollHeight - el.scrollTop - el.clientHeight > 80);
+    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    wasNearBottomRef.current = distFromBottom < NEAR_BOTTOM_PX;
+    setShowScrollBtn(distFromBottom > NEAR_BOTTOM_PX);
     if (scrollRestoredRef.current && scrollKey) {
       try { sessionStorage.setItem(scrollKey, String(el.scrollTop)); } catch {}
     }
@@ -425,6 +438,50 @@ export function ChatPanel({
 
   const scrollToBottom = useCallback(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+  }, []);
+
+  // Auto-scroll resilient: un singolo MutationObserver + ResizeObserver sul
+  // container intercetta OGNI cambio di contenuto (streaming testo dei chunk
+  // del messaggio assistant, fumetti agente, nuovi step, thinking, etc.) senza
+  // dover incollare un useEffect per ogni variabile. Pattern standard delle
+  // chat: se l'utente era near-bottom prima del resize, lo teniamo a fondo.
+  // Se ha risalito (wasNearBottomRef=false), nessuno scroll. Se torna a fondo
+  // (handleScroll riporta wasNearBottomRef=true), il prossimo update lo
+  // ri-aggancia automaticamente.
+  //
+  // `behavior: "auto"` (non smooth) durante updates frequenti come lo streaming:
+  // animare ogni chunk creerebbe code di scroll che si sovrappongono e la chat
+  // saltellerebbe. L'utente percepisce comunque uno scroll fluido perche' gli
+  // update arrivano a 30+ Hz.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onContentChange = () => {
+      if (justRestoredRef.current) return;
+      if (!wasNearBottomRef.current) return;
+      // Usa rAF per coalescere bursts di update DOM in un singolo scroll.
+      requestAnimationFrame(() => {
+        const cur = scrollRef.current;
+        if (cur) cur.scrollTop = cur.scrollHeight;
+      });
+    };
+    const ro = new ResizeObserver(onContentChange);
+    // Osserva il primo figlio (wrapper interno con il contenuto della lista):
+    // quando i suoi children crescono, scattano sia ResizeObserver sia
+    // MutationObserver. Il doppio observer e' ridondante per design — se uno
+    // non scatta (es. il content cresce senza cambio di layout), l'altro
+    // copre il caso.
+    if (el.firstElementChild instanceof Element) {
+      ro.observe(el.firstElementChild);
+    } else {
+      ro.observe(el);
+    }
+    const mo = new MutationObserver(onContentChange);
+    mo.observe(el, { childList: true, subtree: true, characterData: true });
+    return () => {
+      ro.disconnect();
+      mo.disconnect();
+    };
   }, []);
 
   // Ripristina scroll dopo il caricamento iniziale dei messaggi
@@ -480,31 +537,19 @@ export function ChatPanel({
     }
   }, [messages]);
 
-  useEffect(() => {
-    if (!scrollRestoredRef.current || justRestoredRef.current || isLoading) return;
-    const el = scrollRef.current;
-    if (!el) return;
-    if (el.scrollHeight - el.scrollTop - el.clientHeight < 200) {
-      setTimeout(scrollToBottom, 30);
-    }
-  }, [isLoading, scrollToBottom]);
-
-  // Scroll to bottom when agent enters awaiting_confirmation so the Approva button is visible
+  // Scroll to bottom when agent enters awaiting_confirmation so the Approva
+  // button is visible: caso speciale che IGNORA wasNearBottomRef (vogliamo
+  // SEMPRE che il pulsante di conferma sia visibile).
   useEffect(() => {
     if (agentRun?.status === "awaiting_confirmation") {
       setTimeout(scrollToBottom, 60);
     }
   }, [agentRun?.status, scrollToBottom]);
 
-  // Auto-scroll when new agent steps arrive (P4)
-  useEffect(() => {
-    if (!isAgentRunning || agentSteps.length === 0) return;
-    if (!scrollRestoredRef.current || justRestoredRef.current) return;
-    const el = scrollRef.current;
-    if (!el) return;
-    const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
-    if (isNearBottom) setTimeout(scrollToBottom, 40);
-  }, [agentSteps.length, isAgentRunning, scrollToBottom]);
+  // NB: gli auto-scroll su isLoading change e su agentSteps.length change sono
+  // stati rimossi: il MutationObserver + ResizeObserver sopra li copre TUTTI
+  // (e qualsiasi altro cambio di contenuto: streaming token, thinking, fumetti)
+  // senza richiedere un useEffect per ogni variabile.
 
   // Restore-on-error: se la send fallisce, ripristina il testo+allegati che
   // l'utente aveva digitato cosi' non li perde. La logica funziona perche'
