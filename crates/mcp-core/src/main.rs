@@ -1033,6 +1033,12 @@ async fn main() -> anyhow::Result<()> {
     // Config DB-driven (agent.process_resume.*, mig 0360).
     process_resume::spawn_process_resume_worker(state.clone());
 
+    // Worker `monitor_seed`: popola il pannello Monitor con KPI di default
+    // (servizi attivi, container up, porte allocate, problemi aperti) cosi' il
+    // pannello e' utile anche senza che l'agente chiami `dispatcher_update_monitor`.
+    // Config DB-driven (monitor.seed.*).
+    crate::project_workspace::monitor_seed::spawn_monitor_seed_worker(state.clone());
+
     // Worker `catalog_sync`: aggiorna periodicamente ai_price_catalog dal
     // JSON LiteLLM. Cadenza configurabile via settings.model_catalog_sync_interval_s
     // (default 12h, minimo 1h). Disabilitabile via settings.model_catalog_sync_enabled.
@@ -1273,6 +1279,59 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
+    // Diagnostica: al SIGTERM raccoglie indizi sul possibile MITTENTE. tokio non
+    // espone il si_pid del segnale, quindi facciamo best-effort scansionando /proc
+    // per i processi che tipicamente inviano SIGTERM a mcp-core (deploy, pkill/kill,
+    // un secondo mcp-core in single-instance). Serve a capire in 10s chi ha ucciso
+    // il backend, invece di doverlo ricostruire a ritroso (incidente 2026-06-07).
+    fn diagnose_signal_origin() -> String {
+        let own = std::process::id();
+        let ppid = std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|s| {
+                // campo 4 (1-based) di /proc/self/stat = ppid; comm puo' avere spazi,
+                // quindi si parte dopo l'ultima ')'.
+                s.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(1).map(String::from))
+            })
+            .unwrap_or_else(|| "?".into());
+        let mut suspects: Vec<String> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for e in entries.flatten() {
+                let pid: u32 = match e.file_name().to_str().and_then(|s| s.parse().ok()) {
+                    Some(p) if p != own => p,
+                    _ => continue,
+                };
+                let raw = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                if raw.is_empty() {
+                    continue;
+                }
+                let cmd: String = raw
+                    .split(|b| *b == 0)
+                    .map(|s| String::from_utf8_lossy(s))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let l = cmd.to_lowercase();
+                if l.contains("deploy-local")
+                    || l.contains("pkill")
+                    || l.contains("supervisor")
+                    || l.contains("target/release/mcp-core")
+                    || l.contains("target/debug/mcp-core")
+                {
+                    suspects.push(format!(
+                        "pid={pid} cmd=\"{}\"",
+                        cmd.chars().take(120).collect::<String>()
+                    ));
+                }
+            }
+        }
+        if suspects.is_empty() {
+            format!(" [origine: ppid={ppid}; nessun mittente sospetto in /proc — probabile kill manuale o systemd]")
+        } else {
+            format!(" [origine: ppid={ppid}; candidati mittenti: {}]", suspects.join(" | "))
+        }
+    }
+
     // Graceful shutdown: SIGTERM o Ctrl-C → flush NexusBridge (Q-table + replication)
     // prima che il processo termini, per evitare perdita dati in-flight.
     let shutdown_signal = async {
@@ -1286,7 +1345,10 @@ async fn main() -> anyhow::Result<()> {
                     tracing::info!("Ctrl-C ricevuto — avvio graceful shutdown");
                 },
                 _ = terminate.recv() => {
-                    tracing::info!("SIGTERM ricevuto — avvio graceful shutdown");
+                    tracing::warn!(
+                        "SIGTERM ricevuto — avvio graceful shutdown.{}",
+                        diagnose_signal_origin()
+                    );
                 },
             }
         }

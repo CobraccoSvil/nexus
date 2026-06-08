@@ -7,6 +7,7 @@ pub mod changes;
 pub mod compose_ports;
 pub mod execute_cmd;
 pub mod fs_events;
+pub mod monitor_seed;
 pub mod logs;
 pub mod playwright_install;
 pub mod port_recovery;
