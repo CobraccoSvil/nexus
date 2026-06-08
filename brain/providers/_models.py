@@ -78,6 +78,36 @@ class ProviderCapability:
             return self.default_max_output_tokens
         return min(requested, self.max_output_tokens_hard)
 
+    @property
+    def thinking_disabled_for_tools(self) -> bool:
+        """True se, in una richiesta agentica CON tool, il thinking va spento.
+
+        Semantica della policy 'disable_for_tools' (ADR 0025): i modelli
+        dual-mode (claude-4.x, gemini-2.5/3.x, gpt-5.x, deepseek-v4) girano in
+        NON-THINKING quando ci sono tool, cosi' il function calling e'
+        deterministico e non resta reasoning_content da ri-passare.
+
+        Punto unico (regola L): e' l'unico posto che traduce la policy in
+        "thinking off per i tool". Gli adapter provider la usano per decidere se
+        inviare i parametri thinking; `thinking_active_with_tools` la usa per il
+        gate del tool_choice. Niente confronto-stringa duplicato nei call site.
+        """
+        return self.agentic_thinking_policy == "disable_for_tools"
+
+    @property
+    def thinking_active_with_tools(self) -> bool:
+        """True se il modello sta EFFETTIVAMENTE ragionando in una richiesta con tool.
+
+        Un modello thinking-capable (`self.thinking`, da uses_thinking_mode) NON
+        e' in thinking mode quando la policy lo disabilita per i tool. Usata da
+        `resolve_tool_choice`: con thinking ATTIVO l'API rifiuta un tool_choice
+        forzato (-> degrada ad auto); con thinking SPENTO si puo' forzare l'azione
+        al primo turno (anti-narration). Prima il gate guardava `self.thinking`
+        statico e annullava la forzatura per tutti i dual-mode 'disable_for_tools'
+        anche quando il thinking era spento -> "pianifica e non agisce".
+        """
+        return self.thinking and not self.thinking_disabled_for_tools
+
 
 @dataclass(slots=True)
 class CanonicalTool:

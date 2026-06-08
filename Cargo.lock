@@ -2019,6 +2019,7 @@ dependencies = [
  "mcp-quality",
  "mcp-token",
  "nexus-auth",
+ "nexus-cache",
  "nexus-events",
  "nexus-http",
  "nexus-mcp-client",

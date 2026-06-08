@@ -396,6 +396,14 @@ _EXPLORATION_ONLY_TOOLS: frozenset[str] = frozenset({
     "nexus_extract_docx_text", "nexus_extract_xlsx_data",
     "nexus_extract_pdf_text", "nexus_describe_image_attachment",
     "read_file",
+    # Esplorazione filesystem di SOLA lettura: senza queste voci un loop di
+    # list_files/grep/read_file_lines/search_in_files alternati azzerava il
+    # contatore anti-loop a ogni iterazione (viste come "produttive"),
+    # permettendo decine di letture consecutive senza mai scrivere -> context
+    # explosion (incidente osservato: 58 step di sola esplorazione, ctx al 205%).
+    # Sono TUTTI i tool read-only del filesystem (read_file, read_file_lines,
+    # list_files, grep, search_in_files) — vanno tenuti allineati a quelli reali.
+    "list_files", "grep", "read_file_lines", "search_in_files",
     # Discovery meta NON produttiva: cerca altri tool MCP ma non scrive ne'
     # risponde. Senza questa voce un loop di sole ricerche-tool azzererebbe
     # ad ogni iterazione il contatore anti-loop (visto come "produttivo"),

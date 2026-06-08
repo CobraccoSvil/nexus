@@ -991,21 +991,38 @@ export function useChat(
     feedbackPositive,
     positiveFeedback,
     confirmAgent,
-    cancelRun: useCallback(async (runId: string) => {
+    cancelRun: useCallback(async (runId?: string) => {
       // Resetta stato UI SUBITO per sbloccare l'input (prima delle chiamate async)
       setAgentRun(null);
       setAgentSteps([]);
       setIsLoading(false);
-      try { await cancelAgentRun(runId); } catch { /* ignore */ }
+      // Risoluzione del runId target. Il pulsante "Stop" puo' essere premuto in
+      // una finestra in cui `agentRun` lato client e' gia' null (SSE is_final
+      // emesso, oppure auto-continuazione in modalita' Continuo) mentre il
+      // backend ha ancora un run 'running'. In quel caso `runId` arriva
+      // undefined: senza fallback lo Stop sarebbe un no-op e il run resterebbe
+      // 'running' nel DB, bloccando la sessione col 409 per 15 min. Chiediamo
+      // quindi al server qual e' il run attivo della sessione e cancelliamo
+      // quello (il cancel backend e' cascade per sessione: chiude tutti i run
+      // attivi residui in un colpo).
+      let targetRunId = runId;
+      if (!targetRunId && sessionId) {
+        try {
+          const { activeRun } = await getActiveRunForSession(sessionId);
+          targetRunId = activeRun?.runId;
+        } catch { /* ignore — niente run attivo da risolvere */ }
+      }
+      if (!targetRunId) return;
+      try { await cancelAgentRun(targetRunId); } catch { /* ignore */ }
       // Recupera il run finale e mostra il messaggio di interruzione nel chat
       try {
-        const finalRun = await getAgentRun(runId);
+        const finalRun = await getAgentRun(targetRunId);
         if (finalRun) {
           const syntheticMsg = createTerminalMessage(finalRun, projectId);
           setMessages((current) => upsertSyntheticAssistantMessage(current, syntheticMsg));
         }
       } catch { /* ignore */ }
-    }, [projectId]),
+    }, [projectId, sessionId]),
     clear,
     clearTraces: () => setTraces([]),
     refresh: bootstrap,

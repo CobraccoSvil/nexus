@@ -383,6 +383,69 @@ async fn persist_diagnosis(
     .flatten()
 }
 
+/// Chiude (status='resolved') le anomalie aperte di un'unita' la cui metrica
+/// non supera piu' la soglia. `active_metrics` = metriche attualmente in anomalia
+/// per quell'unita'; tutte le diagnosi 'anomaly' aperte con metrica NON presente
+/// in quella lista vengono risolte. Se `active_metrics` e' vuoto (servizio sano)
+/// chiude tutte le anomalie aperte dell'unita'.
+///
+/// Simmetrico a `persist_diagnosis`: e' il punto unico che chiude il ciclo di vita
+/// delle anomalie, niente worker di cleanup separato (regola L). Si basa sullo
+/// stato DB corrente, quindi richiude anche le anomalie "fantasma" rimaste 'open'
+/// da prima di un restart (lo stato in-memory `active_anomalies` si perde, il DB no).
+/// I signal_kind 'crash'/'build_error' NON sono toccati: non sono stati continui
+/// basati su soglia, il loro ciclo di vita lo governa il Debugger.
+async fn resolve_stale_anomalies(
+    db: &PgPool,
+    project_id: Uuid,
+    unit: &str,
+    active_metrics: &[String],
+) {
+    let _ = sqlx::query(
+        r#"UPDATE service_diagnoses
+           SET status = 'resolved', resolved_at = NOW()
+           WHERE project_id = $1
+             AND unit = $2
+             AND signal_kind = 'anomaly'
+             AND status IN ('open', 'diagnosing')
+             AND metric <> ALL($3)"#,
+    )
+    .bind(project_id)
+    .bind(unit)
+    .bind(active_metrics)
+    .execute(db)
+    .await;
+}
+
+/// Chiude le anomalie aperte di un progetto le cui `unit` NON sono piu' tra i
+/// servizi osservati (rinominate/rimosse: lo unit file non esiste piu', quindi
+/// `list_user_services` non le elenca nemmeno con `--all`). Queste righe non
+/// verrebbero MAI richiuse dal resolve per-unit, perche' `run_cycle` non visita
+/// piu' quegli unit: restano 'open' a vita nel pannello Problemi (i veri
+/// "fantasma"). signal_kind='anomaly' soltanto; i crash li governa il Debugger.
+///
+/// Il chiamante DEVE garantire `observed_units` non vuoto: con lista vuota
+/// `unit <> ALL('{}')` matcherebbe tutto e azzererebbe ogni anomalia del
+/// progetto su un errore transitorio di systemctl.
+async fn resolve_anomalies_for_absent_units(
+    db: &PgPool,
+    project_id: Uuid,
+    observed_units: &[String],
+) {
+    let _ = sqlx::query(
+        r#"UPDATE service_diagnoses
+           SET status = 'resolved', resolved_at = NOW()
+           WHERE project_id = $1
+             AND signal_kind = 'anomaly'
+             AND status IN ('open', 'diagnosing')
+             AND unit <> ALL($2)"#,
+    )
+    .bind(project_id)
+    .bind(observed_units)
+    .execute(db)
+    .await;
+}
+
 fn sig_hash(s: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -416,6 +479,7 @@ async fn run_cycle(state: &AppState, cfg: &ObserverConfig, states: &mut HashMap<
 
     for (project_id, slug) in projects {
         let services = list_user_services(&slug).await;
+        let observed_units: Vec<String> = services.iter().map(|(u, _)| u.clone()).collect();
         for (unit, active) in services {
             let key = format!("{project_id}:{unit}");
             let st = states.entry(key).or_default();
@@ -522,6 +586,15 @@ async fn run_cycle(state: &AppState, cfg: &ObserverConfig, states: &mut HashMap<
             }
             st.active_anomalies = current;
 
+            // ── Auto-resolve: anomalie rientrate sotto soglia ──────────────
+            // Simmetrico all'apertura sopra: chiude le diagnosi 'anomaly' aperte
+            // la cui metrica non e' piu' attiva (anche le 'fantasma' storiche,
+            // perche' si basa sul DB, non sullo stato in-memory). Senza questo le
+            // righe restavano 'open' a vita nel pannello Problemi a servizio sano.
+            let active_metrics: Vec<String> =
+                st.active_anomalies.iter().cloned().collect();
+            resolve_stale_anomalies(&state.db, project_id, &unit, &active_metrics).await;
+
             // ── Crash detection (cap 1): emetti su firma nuova ─────────────
             if let Some((kind, last_log)) = crash {
                 let sig = sig_hash(&format!("{unit}:{last_log}"));
@@ -563,6 +636,18 @@ async fn run_cycle(state: &AppState, cfg: &ObserverConfig, states: &mut HashMap<
                     .await;
                 }
             }
+        }
+
+        // ── Sweep: anomalie di unit non piu' osservati (rinominati/rimossi) ─
+        // Le richiude qui perche' il resolve per-unit non le raggiunge mai.
+        // Guard !is_empty(): non azzerare tutto su un errore di systemctl.
+        if !observed_units.is_empty() {
+            resolve_anomalies_for_absent_units(
+                &state.db,
+                project_id,
+                &observed_units,
+            )
+            .await;
         }
     }
 }

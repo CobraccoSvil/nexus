@@ -1438,7 +1438,7 @@ export function ChatPanel({
         isLoading={isLoading || precheckPending}
         isAgentRunning={isAgentRunning}
         pendingCount={pendingCount}
-        onStopAgent={() => { if (agentRun?.runId) void cancelRun(agentRun.runId); }}
+        onStopAgent={() => void cancelRun(agentRun?.runId)}
         hasRunningServices={hasRunningServices}
         hasProject={hasProject}
         fileInputRef={fileInputRef}

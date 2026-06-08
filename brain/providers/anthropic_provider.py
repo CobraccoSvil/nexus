@@ -432,7 +432,7 @@ class AnthropicProvider(BaseProvider):
             _disable_thinking_tools = (
                 bool(tools)
                 and cap is not None
-                and getattr(cap, "agentic_thinking_policy", "none") == "disable_for_tools"
+                and cap.thinking_disabled_for_tools
             )
             use_thinking = (
                 _thinking_config.enabled()
@@ -514,6 +514,24 @@ class AnthropicProvider(BaseProvider):
                 btype = getattr(b, "type", None)
                 if btype == "text":
                     assistant_content.append({"type": "text", "text": b.text})
+                elif btype == "thinking":
+                    # Extended thinking: il blocco con la sua `signature` DEVE
+                    # essere rispedito nei turni successivi quando ci sono tool
+                    # (l'API Anthropic lo richiede). Lo conserviamo nativo qui in
+                    # testa al content (l'ordine di response.content mette gia' il
+                    # thinking prima di tool_use); _langchain_to_anthropic_messages
+                    # lo ripassa as-is. Guarded: presente solo con thinking attivo
+                    # (oggi 'disable_for_tools' nei tool-loop -> assente -> no-op).
+                    _blk: dict = {"type": "thinking", "thinking": getattr(b, "thinking", "")}
+                    _sig = getattr(b, "signature", None)
+                    if _sig:
+                        _blk["signature"] = _sig
+                    assistant_content.append(_blk)
+                elif btype == "redacted_thinking":
+                    assistant_content.append({
+                        "type": "redacted_thinking",
+                        "data": getattr(b, "data", ""),
+                    })
                 elif btype == "tool_use":
                     assistant_content.append({
                         "type": "tool_use",

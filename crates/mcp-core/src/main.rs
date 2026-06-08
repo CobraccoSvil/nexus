@@ -576,6 +576,12 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ADR 0028: garanzia del systemd --user manager (cintura race-window).
+    // La garanzia di boot e' la unit --system nexus-user-manager.service; qui
+    // copriamo la finestra in cui mcp-core parte prima che quella oneshot
+    // completi (e ogni restart di mcp-core). Best-effort: non blocca l'avvio.
+    crate::project_workspace::user_manager::ensure_user_manager(&db).await;
+
     // ADR 0017 v2 F8: rimosso `ensure_knowledge_collection` (collection
     // legacy `knowledge_notes`). La collection unificata `wiki_content` viene
     // garantita lazily dalle funzioni `vector_memory::ensure_wiki_content_collection`

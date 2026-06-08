@@ -280,8 +280,16 @@ def configure_services(
 
 # Intent per i quali il RAG inline e' utile: task che operano su codice/repo
 # e tipicamente beneficiano del ricordo di task simili passati.
+# Intent per cui si attiva il retrieve della memoria di progetto (RAG su
+# chat_messages + Knowledge Base). Include i task agentici autonomi
+# (`agentic_default`) e la diagnostica servizi (`system_admin`): sono proprio
+# i task complessi che traggono piu' beneficio dalla memoria del progetto.
+# Senza di essi la KB veniva popolata e indicizzata ma mai consumata dalla chat
+# (il task type dominante e' `agentic_default`). Punto unico: questo set governa
+# entrambi i gate (`_build_rag_context`, `_build_kb_rag_context`).
 _RAG_INTENTS = {"code", "code_edit", "code_read", "refactor", "analyze",
-                "fix", "implement", "debug", "review"}
+                "fix", "implement", "debug", "review",
+                "agentic_default", "system_admin"}
 
 # Soglia minima di similarita' per includere un'interazione nel contesto.
 # Sotto questa soglia il match non e' significativo e introdurrebbe rumore.
@@ -731,6 +739,22 @@ async def router_node(state: AgentState) -> dict[str, Any]:
                 except Exception as _exc:
                     logger.debug("pr3 injection skip: %s", _exc)
                 updates["system_text"] = rendered
+        # Task-Playbook Engine (mig 0366): inietta una guida di dominio riusabile
+        # (es. "implementa da Figma Make") quando il contesto del turno matcha un
+        # playbook in nexus_task_playbooks. La conoscenza di "come si fa" vive in
+        # DB, non nel prompt utente. Punto unico, attivo anche in automatico.
+        # FUORI dal blocco "if not system_text": il chiamante (mcp-core) spesso
+        # passa gia' un system_text, quindi va appeso al testo EFFETTIVO. Guardia
+        # anti-duplicato per non riaccodarlo ai turni successivi. Best-effort.
+        try:
+            from .. import task_playbook
+            effective_st = updates.get("system_text") or state.get("system_text") or ""
+            if effective_st and "<task_playbook" not in effective_st:
+                pb_block = task_playbook.guidance_for({"intent": intent, "text": str(text)})
+                if pb_block:
+                    updates["system_text"] = effective_st + "\n\n" + pb_block
+        except Exception as _exc:
+            logger.debug("task_playbook injection skip: %s", _exc)
         # Filtriamo tools_json combinando whitelist profilo + intent (BP5).
         # Il doppio filtraggio: per chat/analyze/review viene rimosso anche
         # cio' che il profilo permetterebbe ma che non serve all'intent.
@@ -1571,6 +1595,28 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     # Questo previene loop in cui modelli small (es. Mistral) fanno tool calls
     # continue senza mai produrre testo, consumando tutte le iterazioni senza
     # lasciare una risposta utile all'utente.
+    # ── Forza-azione (anti "pianifica e si ferma") ───────────────────────────
+    # Se l'agente ha gia' esplorato oltre la soglia (consecutive_exploration_calls
+    # >= soglia), rimuoviamo i tool di SOLA lettura dal set passato al modello:
+    # cosi' e' costretto a usare i tool PRODUTTIVI (write_file/edit_file/
+    # run_command/...) o a rispondere, invece di continuare a leggere/cercare e
+    # annunciare azioni che poi non esegue (incidente osservato: l'agente
+    # inventaria i componenti e chiude con "ora li creo" senza scriverli). Il
+    # nudge testuale sopra da' la direzione; questo toglie l'opzione di esplorare
+    # ancora. Solo se restano tool produttivi (non svuotiamo del tutto).
+    if tools_json and _exploration_count >= _exploration_threshold:
+        _productive_tools = [
+            t for t in tools_json if t.get("name") not in _EXPLORATION_ONLY_TOOLS
+        ]
+        if _productive_tools and len(_productive_tools) < len(tools_json):
+            logger.warning(
+                "executor_node: forza-azione — rimossi %d tool di sola lettura "
+                "(esplorazioni=%d >= soglia=%d), restano %d tool produttivi",
+                len(tools_json) - len(_productive_tools),
+                _exploration_count, _exploration_threshold, len(_productive_tools),
+            )
+            tools_json = _productive_tools
+
     _current_iterations = int(state.get("iterations") or 0)
     # Mig 0181: soglia forced-text proporzionale al budget adattivo del run.
     _iter_cap = int(state.get("iteration_budget") or 0) or MAX_AGENT_ITERATIONS

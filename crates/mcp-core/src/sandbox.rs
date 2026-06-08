@@ -627,6 +627,20 @@ pub fn safe_env_for_direct_spawn() -> HashMap<String, String> {
         .collect()
 }
 
+/// Crea un `tokio::process::Command` gia' isolato in un process group dedicato
+/// (`process_group(0)`). PUNTO UNICO (regola L) per spawnare comandi di progetto:
+/// mettendo ogni comando nel proprio process group, un `kill -<pgid>` su quel
+/// comando (es. cleanup di un dev-server duplicato) non puo' MAI risalire a
+/// mcp-core. E' la difesa universale anti-suicidio, complementare alle safety-net
+/// di `kill_process_tree`: invece di sperare che il killer riconosca mcp-core,
+/// rendiamo strutturalmente impossibile che il padre finisca nel gruppo killato.
+pub fn isolated_command(program: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd
+}
+
 // ─── Validation override env passate dall'agente ──────────────────────────────
 
 /// Valida le `env_overrides` che l'agente vuole iniettare in un processo del

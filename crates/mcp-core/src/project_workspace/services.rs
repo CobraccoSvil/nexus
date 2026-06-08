@@ -80,13 +80,84 @@ pub(super) async fn detached_process_running(exec_start: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Vero se l'ExecStart del servizio e' un comando `docker compose ... up`: un
+/// one-shot che avvia i container in background e POI ESCE. Per questi servizi
+/// lo stato del processo wrapper (pgrep sull'ExecStart) e' sempre "non in
+/// esecuzione" anche quando i container sono Up -> il pannello mostrerebbe
+/// "dead" pur essendo lo stack attivo. Vanno valutati via `docker compose ps`.
+pub(super) fn is_docker_compose_service(exec_start: &str) -> bool {
+    let e = exec_start.to_lowercase();
+    (e.contains("docker compose") || e.contains("docker-compose")) && e.contains(" up")
+}
+
+/// Stato REALE di un servizio docker-compose: conta i container in esecuzione
+/// via `docker compose ps -q --status running` nella working directory del
+/// servizio (dove risiede il compose file; il project name di default e' il nome
+/// della dir, quindi intercetta gli stessi container avviati dall'ExecStart anche
+/// con override `-f`). Ritorna true se almeno un container e' running. Cosi' il
+/// pannello riflette lo stato dei container, non quello del wrapper one-shot
+/// (`up -d` esce subito). Se docker non e' raggiungibile, ritorna false (come il
+/// comportamento pre-fix: nessun falso positivo).
+pub(super) async fn docker_compose_running(working_dir: &str) -> bool {
+    if working_dir.trim().is_empty() {
+        return false;
+    }
+    tokio::process::Command::new("docker")
+        .args(["compose", "ps", "-q", "--status", "running"])
+        .current_dir(working_dir)
+        .output()
+        .await
+        .map(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout)
+                    .split_whitespace()
+                    .next()
+                    .is_some()
+        })
+        .unwrap_or(false)
+}
+
+/// Nomi dei service del docker-compose del progetto che hanno container in
+/// esecuzione, via `docker compose ps --services --status running` nella root del
+/// progetto. Usato per ALLINEARE i servizi systemd per-componente (es. un
+/// `backend.service` che lancerebbe `npm run dev` sull'host) allo stato reale del
+/// container omonimo: se il progetto e' containerizzato, il backend/frontend sono
+/// forniti dai container di docker-compose, non dal processo host. Senza questo
+/// allineamento il pannello mostra "backend dead / frontend dead" mentre il
+/// servizio docker-compose e' "running" — incongruenza (i servizi rappresentano
+/// gli stessi container). Set vuoto se docker non e' raggiungibile o non c'e'
+/// compose.
+pub(super) async fn docker_compose_active_services(
+    project_root: &std::path::Path,
+) -> std::collections::HashSet<String> {
+    let out = tokio::process::Command::new("docker")
+        .args(["compose", "ps", "--services", "--status", "running"])
+        .current_dir(project_root)
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        _ => std::collections::HashSet::new(),
+    }
+}
+
 /// Elenca i servizi del progetto SENZA systemd --user (manager `user@<uid>`
 /// dead, tipico in WSL). Legge i file unit in `~/.config/systemd/user/{slug}-*.
 /// service` e ne deduce lo stato dal processo detached (pgrep sull'ExecStart).
 /// Cosi' il pannello funziona anche quando il bus systemd utente e' giu', senza
 /// richiedere sudo (fix definitivo, regola H: niente dipendenza dal manager
 /// fragile di WSL).
-pub(super) async fn list_services_fallback(slug: &str) -> Vec<serde_json::Value> {
+///
+/// `project_root` serve per allineare i servizi per-componente ai container
+/// docker-compose omonimi (vedi `docker_compose_active_services`).
+pub(super) async fn list_services_fallback(
+    slug: &str,
+    project_root: &std::path::Path,
+) -> Vec<serde_json::Value> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/administrator".to_string());
     let dir = format!("{home}/.config/systemd/user");
     let prefix = format!("{slug}-");
@@ -95,6 +166,8 @@ pub(super) async fn list_services_fallback(slug: &str) -> Vec<serde_json::Value>
         Ok(r) => r,
         Err(_) => return services,
     };
+    // Una sola interrogazione a docker per tutto il batch di servizi.
+    let compose_services = docker_compose_active_services(project_root).await;
     while let Ok(Some(entry)) = rd.next_entry().await {
         let fname = entry.file_name().to_string_lossy().to_string();
         if !fname.starts_with(&prefix) || !fname.ends_with(".service") {
@@ -108,13 +181,28 @@ pub(super) async fn list_services_fallback(slug: &str) -> Vec<serde_json::Value>
             .to_string();
         let content = tokio::fs::read_to_string(entry.path()).await.unwrap_or_default();
         let exec_start = unit_exec_start(&content);
-        let running = detached_process_running(&exec_start).await;
+        // Determinazione dello stato con 3 casi, dal piu' specifico al generico:
+        // 1) il servizio E' il wrapper docker-compose -> stato dai container;
+        // 2) il servizio CORRISPONDE a un service del compose attivo (es.
+        //    backend/frontend) -> e' gestito dal container omonimo, stato = running
+        //    (managed_by="docker-compose"): evita "dead" mentre il container gira;
+        // 3) altrimenti servizio host detached -> pgrep sull'ExecStart.
+        let (running, managed_by) = if is_docker_compose_service(&exec_start) {
+            (
+                docker_compose_running(&unit_working_dir(&content)).await,
+                "docker-compose",
+            )
+        } else if compose_services.contains(&short) {
+            (true, "docker-compose")
+        } else {
+            (detached_process_running(&exec_start).await, "detached")
+        };
         services.push(json!({
             "unit":       fname,
             "short":      short,
             "state":      if running { "active" } else { "inactive" },
             "sub":        if running { "running" } else { "dead" },
-            "managed_by": "detached",
+            "managed_by": managed_by,
         }));
     }
     services.sort_by(|a, b| a["short"].as_str().cmp(&b["short"].as_str()));
@@ -160,7 +248,7 @@ pub async fn get_project_services_status(
         // Fix definitivo (regola H): invece di mostrare solo il warning, elenca
         // i servizi dai file unit + stato dei processi detached. Il pannello
         // resta funzionale senza systemd --user e senza sudo.
-        let services = list_services_fallback(&slug).await;
+        let services = list_services_fallback(&slug, &context.root_path).await;
         return Ok(Json(json!({
             "services": services,
             "slug": slug,
@@ -263,7 +351,7 @@ pub async fn get_project_services_status(
             .iter()
             .filter_map(|s| s.get("unit").and_then(|u| u.as_str()).map(String::from))
             .collect();
-        for fb in list_services_fallback(&slug).await {
+        for fb in list_services_fallback(&slug, &context.root_path).await {
             let unit = fb
                 .get("unit")
                 .and_then(|u| u.as_str())
@@ -2205,4 +2293,33 @@ pub async fn port_allocated_to_project(
     .fetch_one(db)
     .await
     .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn riconosce_servizio_docker_compose() {
+        // ExecStart reali generati dal wizard: vanno riconosciuti come compose
+        // (one-shot) per leggere lo stato dai container e non dal processo.
+        assert!(is_docker_compose_service(
+            "/usr/bin/docker compose -f docker-compose.nexus.yml up --build"
+        ));
+        assert!(is_docker_compose_service(
+            "/usr/bin/docker compose -f docker-compose.yml -f docker-compose.nexus.yml up -d"
+        ));
+        assert!(is_docker_compose_service("docker-compose up"));
+    }
+
+    #[test]
+    fn non_confonde_altri_servizi() {
+        // Servizi applicativi normali: lo stato resta basato sul processo.
+        assert!(!is_docker_compose_service("/usr/bin/npm run dev"));
+        assert!(!is_docker_compose_service(
+            "/home/app/.bin/vite --host 0.0.0.0 --port 39566"
+        ));
+        // `docker compose` senza `up` (es. ps/logs) non e' un servizio di avvio.
+        assert!(!is_docker_compose_service("/usr/bin/docker compose ps"));
+    }
 }

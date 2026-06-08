@@ -93,7 +93,7 @@ pub async fn run_cmd(
     // env_clear() + whitelist: il processo figlio non eredita le credenziali
     // di sistema Nexus (DATABASE_URL, REDIS_URL, ecc.) dal processo padre.
     let safe_env = sandbox::safe_env_for_direct_spawn();
-    let child = Command::new(bin)
+    let child = crate::sandbox::isolated_command(bin)
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())

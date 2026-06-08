@@ -1,0 +1,33 @@
+# Nexus user-manager guarantee (Livello 1, ADR 0028)
+#
+# Garantisce che il systemd --user manager (user@<UID>.service) sia attivo a
+# OGNI boot della distro WSL, fornendo il trigger che in WSL manca (login PAM).
+# Senza questo, in WSL il manager utente non riparte dopo `wsl --shutdown` anche
+# con linger abilitato: `systemctl --user` da "Connection refused" e il
+# service_observer di Nexus diventa cieco.
+#
+# Installata da deploy/install-user-manager.sh, che sostituisce i placeholder
+# __NEXUS_ADMIN_USER__ / __NEXUS_ADMIN_UID__ con l'utente e l'UID reali (id -u),
+# quindi nessun UID e' hardcoded nel repo.
+#
+# Gira come root al boot (prima che mcp-core parta), non dipende da DB ne dal
+# sudo-runner: e' la garanzia REALE e isolata. Idempotente (oneshot).
+
+[Unit]
+Description=Nexus: garantisce il systemd --user manager (linger + start user@UID) [ADR 0028]
+After=systemd-logind.service
+Wants=systemd-logind.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Difensivo: ricrea la runtime dir se mancante (bug noto user-runtime-dir@UID
+# che la cancella). Idempotente: se esiste gia' con i permessi giusti, no-op.
+ExecStartPre=/usr/bin/install -d -m 0700 -o __NEXUS_ADMIN_USER__ -g __NEXUS_ADMIN_USER__ /run/user/__NEXUS_ADMIN_UID__
+# Linger persistente su disco (sopravvive a wsl --shutdown).
+ExecStart=/usr/bin/loginctl enable-linger __NEXUS_ADMIN_USER__
+# Il trigger mancante: avvia esplicitamente il manager utente.
+ExecStart=/usr/bin/systemctl start user@__NEXUS_ADMIN_UID__.service
+
+[Install]
+WantedBy=multi-user.target

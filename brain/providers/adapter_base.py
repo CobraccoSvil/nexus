@@ -67,6 +67,7 @@ def convert_messages_to_openai(messages: list[dict]) -> list[dict]:
             result.append({"role": role, "content": content})
         elif isinstance(content, list):
             text_parts: list[str] = []
+            reasoning_parts: list[str] = []
             tool_calls: list[dict] = []
             tool_results: list[dict] = []
 
@@ -74,6 +75,12 @@ def convert_messages_to_openai(messages: list[dict]) -> list[dict]:
                 btype = block.get("type")
                 if btype == "text":
                     text_parts.append(block.get("text", ""))
+                elif btype == "reasoning":
+                    # DeepSeek thinking mode: il reasoning_content del turno con
+                    # tool_calls DEVE essere rispedito (400 altrimenti). Guarded:
+                    # presente solo se il thinking era attivo (policy 'native');
+                    # con 'disable_for_tools' il blocco non esiste -> no-op.
+                    reasoning_parts.append(block.get("reasoning", ""))
                 elif btype == "tool_use":
                     tool_calls.append({
                         "id": block["id"],
@@ -98,6 +105,8 @@ def convert_messages_to_openai(messages: list[dict]) -> list[dict]:
                     oai_msg["content"] = " ".join(text_parts)
                 else:
                     oai_msg["content"] = None
+                if reasoning_parts:
+                    oai_msg["reasoning_content"] = "\n".join(p for p in reasoning_parts if p)
                 oai_msg["tool_calls"] = tool_calls
                 result.append(oai_msg)
             else:
@@ -215,13 +224,20 @@ def resolve_tool_choice(
         return None
 
     weak = bool(weak_models) and any(t in cap.model.lower() for t in weak_models)
-    # I modelli in thinking/reasoning mode non accettano un tool_choice forzato:
-    # DeepSeek V4 risponde HTTP 400 "Thinking mode does not support this
+    # I modelli EFFETTIVAMENTE in thinking mode non accettano un tool_choice
+    # forzato: DeepSeek V4 risponde HTTP 400 "Thinking mode does not support this
     # tool_choice", e lo stesso vincolo vale per Anthropic con extended thinking
     # e per i reasoning OpenAI (o1/o3, gia' style 'none'). In quel caso si degrada
-    # ad "auto": il modello decide da se' quando invocare i tool, senza la
-    # forzatura anti-narration del primo turno. Guard cross-provider, valido per
-    # qualunque modello thinking presente o futuro (la verita' resta cap.thinking).
+    # ad "auto": il modello decide da se' quando invocare i tool.
+    #
+    # CRITICO: la verita' e' `cap.thinking_active_with_tools`, NON `cap.thinking`
+    # statico. Quasi tutti i modelli agentici moderni (claude-4.x, gemini-2.5/3.x,
+    # gpt-5.x, deepseek-v4-pro) hanno uses_thinking_mode=TRUE ma policy
+    # 'disable_for_tools': in una richiesta con tool l'adapter SPEGNE il thinking,
+    # quindi il tool_choice forzato e' accettato e va usato. Guardare `cap.thinking`
+    # qui annullava silenziosamente la forzatura anti-narration del primo turno per
+    # tutti questi modelli -> "pianifica e non agisce". Il gate ora coincide con la
+    # disabilitazione del thinking lato adapter (punto unico, regola L).
     if force_override is False:
         # Override esplicito: il chiamante chiede di NON forzare (retry dopo
         # errore di forcing). Si degrada ad auto per questo turno.
@@ -235,7 +251,7 @@ def resolve_tool_choice(
             if force_override is None
             else True
         )
-        force_first = _base_force and not weak and not cap.thinking
+        force_first = _base_force and not weak and not cap.thinking_active_with_tools
 
     if style == "anthropic_any":
         return {"type": "any"} if force_first else {"type": "auto"}

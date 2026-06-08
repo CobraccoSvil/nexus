@@ -259,7 +259,7 @@ fn systemd_bus_unavailable(text: &str) -> bool {
 ///
 /// Default conservativo: in caso di dubbio (errore di spawn, output ambiguo)
 /// ritorna `false` -> si va in fallback detached, che e' sempre sicuro.
-async fn systemd_user_available() -> bool {
+pub(crate) async fn systemd_user_available() -> bool {
     match systemctl_user()
         .args(["--user", "is-system-running"])
         .output()
@@ -757,10 +757,10 @@ async fn generate_docker_port_override(
     state: &AppState,
     project_id: &Uuid,
     cwd: &str,
-) -> Option<String> {
+) -> Option<(String, String)> {
     use super::compose_ports;
     let dir = cwd.trim_end_matches('/');
-    let base = [
+    let base_name = [
         "docker-compose.yml",
         "docker-compose.yaml",
         "docker-compose.dev.yml",
@@ -769,8 +769,9 @@ async fn generate_docker_port_override(
         "compose.yaml",
     ]
     .iter()
-    .map(|n| format!("{dir}/{n}"))
-    .find(|p| std::path::Path::new(p).exists())?;
+    .copied()
+    .find(|n| std::path::Path::new(&format!("{dir}/{n}")).exists())?;
+    let base = format!("{dir}/{base_name}");
     let content = tokio::fs::read_to_string(&base).await.ok()?;
     let plans = compose_ports::planned_mappings(&compose_ports::parse_service_ports(&content));
     if plans.is_empty() {
@@ -809,8 +810,10 @@ async fn generate_docker_port_override(
     let path = format!("{dir}/{}", compose_ports::OVERRIDE_FILE);
     match tokio::fs::write(&path, yaml).await {
         Ok(()) => {
-            tracing::info!("docker-compose: override porte coerente generato ({path})");
-            Some(compose_ports::OVERRIDE_FILE.to_string())
+            tracing::info!(
+                "docker-compose: override porte coerente generato ({path}) sopra {base_name}"
+            );
+            Some((base_name.to_string(), compose_ports::OVERRIDE_FILE.to_string()))
         }
         Err(e) => {
             tracing::warn!("docker-compose: scrittura override fallita ({path}): {e}");
@@ -819,18 +822,43 @@ async fn generate_docker_port_override(
     }
 }
 
-/// Inserisce `-f <override>` nell'ExecStart di un `docker compose ... up`, subito
-/// prima del sottocomando `up`, cosi' l'override e' applicato sopra il compose
-/// base. Se non trova ` up`, lo aggiunge in coda. Idempotente.
-fn inject_override_flag(exec_start: &str, override_file: &str) -> String {
+/// Inserisce `-f <base> -f <override>` nell'ExecStart di un `docker compose ...
+/// up`, subito prima del sottocomando `up`. Entrambi i flag servono perche'
+/// `docker compose` DISATTIVA il discovery automatico del compose base quando
+/// vede un `-f` esplicito: passare solo `-f override` farebbe perdere il file
+/// base e tutti i suoi servizi. Se l'ExecStart contiene gia' qualunque `-f`
+/// (es. l'utente ha specificato un compose custom) non si tocca il base, si
+/// aggiunge SOLO l'override per non sovrascrivere la scelta. Idempotente.
+fn inject_override_flag(exec_start: &str, base_file: &str, override_file: &str) -> String {
     if exec_start.contains(override_file) {
+        // L'override e' gia' presente. Idempotente SOLO se accompagnato da almeno
+        // un altro `-f` (il base, qualunque esso sia): l'override Nexus e' parziale
+        // (solo i mapping ports), quindi da solo NON basta — mancherebbero
+        // image/build/volumes dei servizi. Se l'override e' l'UNICO `-f` (caso
+        // reale osservato su Beauty-Book: ExecStart `docker compose -f
+        // docker-compose.nexus.yml up`), anteponiamo il base prima del primo `-f`
+        // preservando l'ordine base-poi-override.
+        let f_count = exec_start.matches("-f ").count();
+        if f_count >= 2 {
+            return exec_start.to_string();
+        }
+        if let Some(pos) = exec_start.find("-f ") {
+            let (head, tail) = exec_start.split_at(pos);
+            return format!("{head}-f {base_file} {tail}");
+        }
         return exec_start.to_string();
     }
+    let has_explicit_f = exec_start.contains(" -f ") || exec_start.contains(" --file ");
+    let flags = if has_explicit_f {
+        format!("-f {override_file} ")
+    } else {
+        format!("-f {base_file} -f {override_file} ")
+    };
     if let Some(pos) = exec_start.find(" up") {
         let (head, tail) = exec_start.split_at(pos + 1);
-        format!("{head}-f {override_file} {tail}")
+        format!("{head}{flags}{tail}")
     } else {
-        format!("{exec_start} -f {override_file}")
+        format!("{exec_start} {flags}").trim_end().to_string()
     }
 }
 
@@ -1314,8 +1342,10 @@ pub async fn wizard_install_service(
     let exec_start = {
         let el = exec_start.to_lowercase();
         if el.contains("docker compose") || el.contains("docker-compose") {
-            if let Some(ov) = generate_docker_port_override(&state, &project_id, cwd).await {
-                inject_override_flag(&exec_start, &ov)
+            if let Some((base, ov)) =
+                generate_docker_port_override(&state, &project_id, cwd).await
+            {
+                inject_override_flag(&exec_start, &base, &ov)
             } else {
                 exec_start
             }
@@ -2526,6 +2556,72 @@ pub(super) fn detect_dotnet_suggestions(root: &std::path::Path) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inject_override_aggiunge_base_e_override_prima_di_up() {
+        // Caso reale Beauty-Book: il suggerimento docker non ha -f esplicito.
+        // Senza base, `docker compose -f override.yml up` perde il discovery del
+        // file principale -> nessun servizio. Devono comparire ENTRAMBI.
+        let r = inject_override_flag(
+            "/usr/bin/docker compose up --build",
+            "docker-compose.yml",
+            "docker-compose.nexus.yml",
+        );
+        assert_eq!(
+            r,
+            "/usr/bin/docker compose -f docker-compose.yml -f docker-compose.nexus.yml up --build"
+        );
+    }
+
+    #[test]
+    fn inject_override_rispetta_il_compose_custom_dellutente() {
+        // Se l'utente ha gia' indicato -f, non sovrascriviamo: aggiungiamo solo
+        // l'override sopra la sua scelta.
+        let r = inject_override_flag(
+            "docker compose -f docker-compose.dev.yml up",
+            "docker-compose.yml",
+            "docker-compose.nexus.yml",
+        );
+        assert_eq!(
+            r,
+            "docker compose -f docker-compose.dev.yml -f docker-compose.nexus.yml up"
+        );
+    }
+
+    #[test]
+    fn inject_override_idempotente() {
+        let already = "docker compose -f docker-compose.yml -f docker-compose.nexus.yml up";
+        assert_eq!(
+            inject_override_flag(already, "docker-compose.yml", "docker-compose.nexus.yml"),
+            already
+        );
+    }
+
+    #[test]
+    fn inject_override_aggiunge_base_se_override_e_unico_f() {
+        // Caso reale Beauty-Book: l'ExecStart conteneva SOLO l'override come `-f`
+        // (senza base) -> mancavano image/build/volumes. Il base va anteposto.
+        let r = inject_override_flag(
+            "/usr/bin/docker compose -f docker-compose.nexus.yml up --build",
+            "docker-compose.yml",
+            "docker-compose.nexus.yml",
+        );
+        assert_eq!(
+            r,
+            "/usr/bin/docker compose -f docker-compose.yml -f docker-compose.nexus.yml up --build"
+        );
+    }
+
+    #[test]
+    fn inject_override_preserva_base_custom_con_override() {
+        // base custom (dev) + override gia' presenti -> invariato (non forziamo
+        // docker-compose.yml sopra la scelta dell'utente).
+        let already = "docker compose -f docker-compose.dev.yml -f docker-compose.nexus.yml up";
+        assert_eq!(
+            inject_override_flag(already, "docker-compose.yml", "docker-compose.nexus.yml"),
+            already
+        );
+    }
 
     #[test]
     fn rileva_bus_non_disponibile_connection_refused() {

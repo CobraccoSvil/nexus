@@ -36,9 +36,11 @@ export function MonitorPanel(_props: MonitorPanelProps) {
                 borderRadius: 6,
                 background: tc.bgCard,
                 padding: "10px 12px",
+                minWidth: 0,
+                overflow: "hidden",
               }}>
-                <div style={{ fontSize: 11, color: tc.textMuted }}>{m.label ?? id}</div>
-                <div style={{ fontSize: 20, fontWeight: 600, color: tc.text, marginTop: 4 }}>
+                <div style={{ fontSize: 11, color: tc.textMuted, overflowWrap: "anywhere" }}>{m.label ?? id}</div>
+                <div style={{ fontSize: 20, fontWeight: 600, color: tc.text, marginTop: 4, overflowWrap: "anywhere" }}>
                   {formatMonitorValue(m.value)}
                 </div>
                 {m.updated_at && (

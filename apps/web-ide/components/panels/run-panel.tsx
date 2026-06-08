@@ -266,23 +266,7 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
   const [batchBusy, setBatchBusy] = useState(false);
 
   const handleRestartAll = async () => {
-    // Caso 1: manager systemd --user non attivo (es. WSL senza login persistent
-    // o ambiente detached). Spiegare ESPLICITAMENTE invece di chiamare
-    // systemctl che ritorna 0 unit senza errore (esito muto = "non succede
-    // nulla" lato utente, come segnalato).
-    if (managerUnavailable) {
-      await confirmDialog(
-        "Il manager systemd --user non è attivo: impossibile riavviare i servizi via systemctl.\n\n" +
-        (managerHint ? `Suggerimento: ${managerHint}\n\n` : "") +
-        "Alternativa: usa il terminale e lancia `./deploy/deploy-local.sh` " +
-        "(o il comando di restart specifico del tuo progetto) per riavviare i processi detached. " +
-        "Una volta riavviati, premi la X per azzerare il contatore.",
-      );
-      // Non chiamiamo bumpLastRestart automaticamente: l'utente deve fare il
-      // restart manuale e poi decidere se segnalarlo (X) o riavviare ancora.
-      return;
-    }
-    // Caso 2: nessun servizio systemd installato (M47).
+    // Caso 1: nessun servizio systemd installato (M47).
     if (services.length === 0) {
       await confirmDialog(
         "Nessun servizio systemd installato per questo progetto. " +
@@ -292,6 +276,29 @@ export function RunPanel({ projectId, onSendToChat, agentRunEndSignal }: RunPane
       bumpLastRestart(); // Azzera comunque il contatore "file modificati" se l'utente conferma
       return;
     }
+    // Caso 2: manager systemd --user non attivo (WSL/ambiente detached). Il
+    // restart batch via systemctl (endpoint restart-all) ritornerebbe 0 unit
+    // ("non succede nulla" lato utente, come segnalato). Ma i servizi detached
+    // SONO riavviabili individualmente: controlProjectService li gestisce, come i
+    // pulsanti "restart" singoli. Li riavviamo quindi in batch DALLA UI, senza
+    // rimandare l'utente al terminale (regola: tutto gestibile da Nexus).
+    if (managerUnavailable) {
+      if (!await confirmDialog("Riavviare tutti i servizi del progetto (modalità detached)?")) return;
+      setBatchBusy(true); setSvcMsg("Riavvio in corso…");
+      let ok = 0;
+      for (const svc of services) {
+        try {
+          const r = await controlProjectService(projectId, svc.short, "restart");
+          if (r.ok) ok += 1;
+        } catch { /* continua col prossimo servizio */ }
+      }
+      setSvcMsg(`Riavviati ${ok}/${services.length} servizi`);
+      if (ok > 0) bumpLastRestart();
+      setTimeout(() => { fetchServices(); fetchPorts(); }, 1500);
+      setBatchBusy(false); setTimeout(() => setSvcMsg(""), 10000);
+      return;
+    }
+    // Caso 3: manager attivo -> restart batch via systemctl (endpoint dedicato).
     if (!await confirmDialog("Riavviare tutti i servizi del progetto?")) return;
     setBatchBusy(true); setSvcMsg("Riavvio in corso…");
     try {

@@ -462,15 +462,25 @@ impl PortRegistryCache {
     }
 }
 
-/// Rilascia le allocazioni porta "dynamic"/"auto" (non systemd) ORFANE: oltre la
-/// grace period e SENZA alcun listener TCP. Sono i residui dei tentativi falliti
-/// degli agenti (es. `pnpm dev` su porte diverse) che il recovery systemd non
-/// pulisce. Ritorna il numero di allocazioni rilasciate.
+/// Rilascia le allocazioni porta auto-gestite ORFANE: oltre la grace period e
+/// SENZA alcun listener TCP. Sono i residui dei tentativi falliti degli agenti
+/// (es. `pnpm dev` su porte diverse) E i mapping stale lasciati da un servizio
+/// quando viene riavviato/ricreato su porte diverse (es. docker-compose
+/// rigenerato): in quest'ultimo caso l'allocazione conserva un `service_unit`
+/// valorizzato ma la porta non e' piu' quella reale del servizio, e il registro
+/// diverge dallo stato osservabile (porte fantasma nel pannello Run&Debug).
+///
+/// Criterio (regola H, causa radice della divergenza registro<->realta'):
+/// un'allocazione e' orfana se la sua porta non ha listener TCP da oltre la grace
+/// period, INDIPENDENTEMENTE da `service_unit`. Il probe TCP garantisce di non
+/// toccare mai una porta realmente in uso (servizio vivo). Le sole allocazioni
+/// preservate sono quelle `manual`: riserve intenzionali dell'utente, che restano
+/// anche se il servizio e' temporaneamente fermo. Ritorna il numero rilasciate.
 pub async fn cleanup_orphaned_ports(db: &PgPool, grace_secs: i64) -> u64 {
     let grace = grace_secs.max(60);
     let rows: Vec<(Uuid, i32)> = sqlx::query_as(
         "SELECT project_id, port FROM nexus_port_allocations \
-         WHERE service_unit IS NULL AND created_at < NOW() - make_interval(secs => $1)",
+         WHERE allocation_mode <> 'manual' AND created_at < NOW() - make_interval(secs => $1)",
     )
     .bind(grace as f64)
     .fetch_all(db)
@@ -486,7 +496,7 @@ pub async fn cleanup_orphaned_ports(db: &PgPool, grace_secs: i64) -> u64 {
         }
         let n = sqlx::query(
             "DELETE FROM nexus_port_allocations \
-             WHERE project_id = $1 AND port = $2 AND service_unit IS NULL",
+             WHERE project_id = $1 AND port = $2 AND allocation_mode <> 'manual'",
         )
         .bind(project_id)
         .bind(port)

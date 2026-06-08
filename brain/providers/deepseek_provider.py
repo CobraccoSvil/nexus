@@ -150,16 +150,27 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
                 # 'disable_for_tools' forziamo la modalita' NON-THINKING via il
                 # parametro ufficiale extra_body.thinking=disabled (DeepSeek thinking
                 # mode guide): function calling normale, nessuno stato reasoning.
-                if cap is not None and cap.agentic_thinking_policy == "disable_for_tools":
+                if cap is not None and cap.thinking_disabled_for_tools:
                     kwargs_call["extra_body"] = {"thinking": {"type": "disabled"}}
 
             response = await client.chat.completions.create(**kwargs_call)
             choice = response.choices[0]
             msg = choice.message
             text_content = msg.content or ""
+            # DeepSeek thinking mode: il reasoning_content del turno con tool_calls
+            # DEVE essere rispedito nei turni successivi (HTTP 400 altrimenti).
+            # Lo conserviamo in assistant_content come blocco type="reasoning";
+            # convert_messages_to_openai lo ri-traduce in reasoning_content.
+            # Guarded: presente solo con thinking attivo ('native'); con
+            # 'disable_for_tools' (default dual-mode) e' vuoto -> no-op.
+            reasoning_content = getattr(msg, "reasoning_content", "") or ""
             stop_reason = "end_turn"
             tool_use_blocks: list[dict] = []
             assistant_content: list[dict] = []
+            if reasoning_content:
+                assistant_content.append(
+                    {"type": "reasoning", "reasoning": reasoning_content}
+                )
 
             if choice.finish_reason == "tool_calls" and msg.tool_calls:
                 stop_reason = "tool_use"
