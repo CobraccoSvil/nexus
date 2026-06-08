@@ -327,6 +327,11 @@ pub(crate) struct CompactOutcome {
     pub point_id: String,
     /// Numero di messaggi user/assistant soft-deletati dal compact.
     pub soft_deleted: u64,
+    /// Totali post-compact: inclusi nella risposta HTTP cosi' il frontend
+    /// aggiorna la barra token in modo sincrono, senza dipendere dall'evento SSE
+    /// ChatSessionCompacted (che puo' essere emesso con subscribers=0 e perdersi).
+    pub total_tokens: i64,
+    pub total_cost_usd: f64,
 }
 
 /// Errore di compattazione che trasporta lo status HTTP coerente con il
@@ -662,6 +667,8 @@ pub(crate) async fn compact_session_core(
         summary_text,
         point_id,
         soft_deleted: soft_deleted.rows_affected(),
+        total_tokens,
+        total_cost_usd,
     })
 }
 
@@ -686,6 +693,8 @@ pub async fn compact_chat_session(
         "ok": true,
         "summary": outcome.summary_text,
         "pointId": outcome.point_id,
+        "totalTokens": outcome.total_tokens,
+        "totalCostUsd": outcome.total_cost_usd,
     })))
 }
 

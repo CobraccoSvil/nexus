@@ -133,6 +133,11 @@ export interface CompactSessionResponse {
   ok: boolean;
   summary: string;
   pointId: string;
+  // Totali post-compact: la UI aggiorna la barra token in modo sincrono dalla
+  // risposta HTTP, senza dipendere dall'evento SSE ChatSessionCompacted (che
+  // puo' perdersi se nessun client e' sottoscritto al topic in quell'istante).
+  totalTokens: number;
+  totalCostUsd: number;
 }
 
 export interface ProjectMemory {

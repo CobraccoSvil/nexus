@@ -9,6 +9,7 @@ import {
   compactChatSession,
   type ChatSessionSummary,
 } from "./api-client";
+import { useProjectStore } from "./project-dispatcher/store";
 
 const TABS_KEY = (pid: string) => `ideai:openTabs:${pid}`;
 const ACTIVE_KEY = (pid: string) => `ideai:activeTab:${pid}`;
@@ -204,11 +205,26 @@ export function useMultiChat(projectId: string): UseMultiChatReturn {
   }, [closeTab]);
 
   const compactSession = useCallback(async (id: string) => {
-    const result = await compactChatSession(id);
-    setAllSessions((prev) =>
-      prev.map((s) => (s.id === id ? { ...s, status: "compacted" } : s)),
-    );
-    return { summary: result.summary };
+    const store = useProjectStore.getState();
+    try {
+      const result = await compactChatSession(id);
+      setAllSessions((prev) =>
+        prev.map((s) => (s.id === id ? { ...s, status: "compacted" } : s)),
+      );
+      // Aggiorna la barra token SUBITO dalla risposta HTTP: non dipende
+      // dall'evento SSE ChatSessionCompacted (che puo' perdersi se subscribers=0).
+      store.recordChatCompaction(id, result.totalTokens, result.totalCostUsd);
+      store.pushToast("success", "Chat compattata");
+      return { summary: result.summary };
+    } catch (e) {
+      // Feedback esplicito: prima l'errore era silenzioso (void senza catch) e
+      // la compattazione "sembrava fallita" anche quando il backend riusciva.
+      store.pushToast(
+        "error",
+        e instanceof Error ? `Compattazione fallita: ${e.message}` : "Compattazione fallita",
+      );
+      throw e;
+    }
   }, []);
 
   // ── Agent activity tracking ──────────────────────────────────────────────────

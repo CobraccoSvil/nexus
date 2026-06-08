@@ -1468,9 +1468,11 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
                 onClick={() => {
                   const currentId = multiChat.activeTabId;
                   if (!currentId) return;
-                  // Il backend emette ChatSessionCompacted via dispatcher SSE,
-                  // use-chat ascolta e riallinea tokenUsage senza re-mount.
-                  void multiChat.compactSession(currentId);
+                  // compactSession aggiorna la barra token dalla risposta HTTP e
+                  // mostra un toast (successo/errore): non dipende piu' dall'evento
+                  // SSE ChatSessionCompacted, che puo' perdersi se subscribers=0.
+                  // .catch: l'errore e' gia' notificato via toast dentro compactSession.
+                  void multiChat.compactSession(currentId).catch(() => {});
                 }}
                 title={pct != null
                   ? `Compatta chat — context usato: ${pct}%`

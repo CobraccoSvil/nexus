@@ -140,6 +140,13 @@ export interface ProjectStoreState {
   applySnapshot: (snapshot: ProjectSnapshot) => void;
   applyEvent: (env: EnvelopedEvent) => void;
   dismissToast: (id: string) => void;
+  /// Mostra un toast in modo programmatico (feedback di azioni utente, es.
+  /// esito compattazione), oltre ai toast generati da applyEvent via ui_hint.
+  pushToast: (severity: ToastItem["severity"], message: string) => void;
+  /// Aggiorna i totali post-compact di una sessione dalla risposta HTTP, senza
+  /// dipendere dall'evento SSE ChatSessionCompacted (che puo' perdersi). Stessa
+  /// forma applicata dall'handler SSE in applyEvent.
+  recordChatCompaction: (sessionId: string, totalTokens: number, totalCostUsd: number) => void;
   bumpReconnect: () => void;
   resetReconnect: () => void;
   /**
@@ -617,6 +624,34 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
 
   dismissToast: (id) => set((state) => ({
     toasts: state.toasts.filter((t) => t.id !== id),
+  })),
+
+  pushToast: (severity, message) => set((state) => {
+    const id = (typeof crypto !== "undefined" && "randomUUID" in crypto)
+      ? crypto.randomUUID()
+      : `toast-${Date.now()}-${state.toasts.length}`;
+    const toast: ToastItem = {
+      id,
+      severity,
+      message,
+      ttl_ms: TOAST_DEFAULT_TTL,
+      createdAt: Date.now(),
+    };
+    if (typeof window !== "undefined") {
+      window.setTimeout(() => get().dismissToast(id), TOAST_DEFAULT_TTL);
+    }
+    return { toasts: [...state.toasts, toast].slice(-20) };
+  }),
+
+  recordChatCompaction: (sessionId, totalTokens, totalCostUsd) => set((state) => ({
+    chat: {
+      ...state.chat,
+      lastCompactBySession: {
+        ...state.chat.lastCompactBySession,
+        [sessionId]: { totalTokens, totalCostUsd, ts: Date.now() },
+      },
+      statusBySession: { ...state.chat.statusBySession, [sessionId]: "compacted" },
+    },
   })),
 
   bumpReconnect: () => set((state) => ({ reconnectAttempts: state.reconnectAttempts + 1 })),
