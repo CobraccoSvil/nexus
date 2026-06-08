@@ -99,9 +99,124 @@ fn output_tail(output: &str, error_output: &str, max_chars: usize) -> String {
     }
 }
 
+/// Annuncia in chat (una sola volta per sessione/ora) che il cap anti-loop dei
+/// risvegli automatici e' scattato. Senza questo messaggio l'utente vede la chat
+/// "ferma" senza capirne il motivo (il safety net opera silenzioso). Idempotente
+/// via query: se l'ultima ora ha gia' un messaggio sintetico `kind='cap_reached'`
+/// per quella sessione, no-op.
+async fn announce_cap_reached_in_chat(
+    db: &sqlx::PgPool,
+    session_id: Uuid,
+    project_id: Uuid,
+    cap: i64,
+    label: &str,
+) {
+    let already: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chat_messages \
+         WHERE session_id = $1 \
+           AND created_at > NOW() - INTERVAL '1 hour' \
+           AND metadata ->> 'kind' = 'cap_reached'",
+    )
+    .bind(session_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(0);
+    if already > 0 {
+        return;
+    }
+    let content = format!(
+        "Cap anti-loop raggiunto: il processo di sfondo \"{label}\" ha innescato \
+         {cap} risvegli automatici nell'ultima ora. L'agente NON verra' piu' \
+         risvegliato finche' la finestra oraria non si svuota. Cosa significa: \
+         l'agente stava ricucendo lo stesso comando in un loop (es. servizio che \
+         continua a terminare). Cosa fare: indagare la causa del fallimento \
+         ripetuto (container in crash-loop, dipendenze non pronte, porta \
+         occupata) prima di chiedere all'agente di riprovare."
+    );
+    let meta = serde_json::json!({
+        "kind": "cap_reached",
+        "synthetic": true,
+        "session_id": session_id.to_string(),
+        "label": label,
+        "cap": cap,
+        "source": "process_resume",
+    });
+    if let Err(e) =
+        insert_message(db, session_id, project_id, "user", &content, meta, None).await
+    {
+        tracing::warn!("process_resume: cap_reached announce fallito: {e:?}");
+    }
+}
+
+/// True se la riga di comando appartiene a un avvio docker compose. Cattura sia
+/// `docker compose up` sia `docker-compose up` (vecchio plugin).
+fn is_docker_compose_command(cmd: &str) -> bool {
+    let l = cmd.to_lowercase();
+    (l.contains("docker compose") || l.contains("docker-compose")) && l.contains(" up")
+}
+
+#[derive(Debug, Clone)]
+struct DockerHealth {
+    healthy: bool,
+    summary: String,
+}
+
+/// Verita' post-mortem sui container DEL PROGETTO (filtrati per slug, regola E:
+/// mai container globali / ideai-*). Esito `healthy=true` solo se TUTTI i
+/// container del progetto sono in stato "running" (o "healthy" se hanno
+/// healthcheck). Restart in corso / Exited / Restarting -> healthy=false con
+/// summary leggibile da iniettare all'agente.
+async fn inspect_docker_compose_health(db: &sqlx::PgPool, project_id: Uuid) -> Option<DockerHealth> {
+    let slug: String =
+        sqlx::query_scalar("SELECT lower(replace(replace(name, ' ', '-'), '_', '-')) FROM projects WHERE id = $1")
+            .bind(project_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten()?;
+    if slug.is_empty() {
+        return None;
+    }
+    let out = tokio::process::Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("name={slug}-"),
+            "--format",
+            "{{.Names}}\t{{.Status}}",
+        ])
+        .output()
+        .await
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let mut healthy = true;
+    for line in &lines {
+        let lower = line.to_lowercase();
+        // "Up X minutes" o "Up X (healthy)" = ok. Restarting / Exited / unhealthy = ko.
+        let is_up = lower.contains("\tup ") || lower.contains("\tup(");
+        let is_bad = lower.contains("restarting")
+            || lower.contains("exited")
+            || lower.contains("unhealthy")
+            || lower.contains("dead")
+            || lower.contains("created");
+        if !is_up || is_bad {
+            healthy = false;
+        }
+    }
+    Some(DockerHealth {
+        healthy,
+        summary: lines.join("\n"),
+    })
+}
+
 async fn run_one_round(state: &AppState) -> Result<(), String> {
     let rows = sqlx::query(
-        "SELECT id, project_id, session_id, label, status, exit_code, output, error_output \
+        "SELECT id, project_id, session_id, label, command, status, exit_code, output, error_output \
            FROM agent_processes \
           WHERE status IN ('stopped', 'failed') \
             AND session_id IS NOT NULL \
@@ -123,6 +238,7 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
         let project_id: Uuid = row.get("project_id");
         let session_id: Uuid = row.get("session_id");
         let label: String = row.try_get("label").unwrap_or_default();
+        let command: String = row.try_get("command").unwrap_or_default();
         let status: String = row.try_get("status").unwrap_or_default();
         let exit_code: Option<i32> = row.try_get("exit_code").unwrap_or(None);
         let output: String = row.try_get("output").unwrap_or_default();
@@ -158,6 +274,12 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
                 session_id,
                 id
             );
+            // Visibilita' in UI (regola: lo stato interno si vede sempre):
+            // un solo messaggio sintetico per sessione/ora con kind='cap_reached',
+            // cosi' l'utente capisce che la chat e' in pausa e perche'. Idempotente:
+            // se esiste gia' un messaggio cap_reached nell'ultima ora, non lo
+            // duplico (anti-spam strutturale, niente set in memoria).
+            announce_cap_reached_in_chat(&state.db, session_id, project_id, cap, &label).await;
             continue;
         }
 
@@ -174,7 +296,27 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
         };
 
         let tail = output_tail(&output, &error_output, tail_chars);
-        let ok = status == "stopped" && exit_code.unwrap_or(0) == 0;
+        // Verita' del processo: exit_code da solo NON basta per docker compose
+        // up: `docker compose up` puo' uscire con exit_code=0 anche se uno o
+        // piu' container del progetto sono in stato Restarting/Exited. Senza
+        // questo check post-mortem, l'agente riceveva "SUCCESSO", concludeva
+        // che il servizio era attivo, e — vedendo che non rispondeva — lo
+        // rilanciava: loop osservato finche' il cap risvegli non lo fermava.
+        // Container-aware: se il comando e' un docker compose, controlliamo i
+        // container del progetto e degradiamo l'esito a FALLITO se almeno uno
+        // non e' realmente up.
+        let docker_health = if is_docker_compose_command(&command) {
+            inspect_docker_compose_health(&state.db, project_id).await
+        } else {
+            None
+        };
+        let ok = status == "stopped" && exit_code.unwrap_or(0) == 0
+            && docker_health.as_ref().map(|h| h.healthy).unwrap_or(true);
+        let docker_note = docker_health
+            .as_ref()
+            .filter(|h| !h.healthy)
+            .map(|h| format!("\n\nStato container del progetto:\n```\n{}\n```", h.summary))
+            .unwrap_or_default();
         let content = if ok {
             format!(
                 "Il comando in background \"{label}\" e' terminato con SUCCESSO (exit_code={}).\n\n\
@@ -184,9 +326,11 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
             )
         } else {
             format!(
-                "Il comando in background \"{label}\" e' FALLITO (exit_code={}).\n\n\
+                "Il comando in background \"{label}\" e' FALLITO (exit_code={}).{docker_note}\n\n\
                  Output finale:\n```\n{tail}\n```\n\n\
-                 Analizza l'errore nell'output e proponi (o applica) la correzione.",
+                 Analizza l'errore nell'output e proponi (o applica) la correzione. \
+                 NON ri-lanciare lo stesso comando senza prima aver capito e mitigato la causa \
+                 (es. container in crash-loop, dipendenze non pronte, porta gia' occupata).",
                 exit_code.unwrap_or(-1)
             )
         };
@@ -268,6 +412,16 @@ mod tests {
         assert!(t.contains("out"));
         assert!(t.contains("--- stderr ---"));
         assert!(t.contains("err"));
+    }
+
+    #[test]
+    fn riconosce_docker_compose() {
+        assert!(is_docker_compose_command("docker compose up"));
+        assert!(is_docker_compose_command("docker compose -f compose.yml up --build"));
+        assert!(is_docker_compose_command("docker-compose up -d"));
+        assert!(!is_docker_compose_command("docker compose ps"));
+        assert!(!is_docker_compose_command("docker run nginx"));
+        assert!(!is_docker_compose_command("pnpm dev"));
     }
 
     #[test]
