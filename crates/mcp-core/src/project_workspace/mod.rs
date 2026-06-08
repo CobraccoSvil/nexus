@@ -4,6 +4,7 @@ pub mod auto_bootstrap;
 pub mod browser_check;
 pub mod build_diagnostics;
 pub mod changes;
+pub mod compose_ports;
 pub mod execute_cmd;
 pub mod fs_events;
 pub mod logs;

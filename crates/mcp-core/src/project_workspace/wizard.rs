@@ -745,6 +745,95 @@ async fn write_compose_env_file(cwd: &str, env_map: &std::collections::HashMap<S
     }
 }
 
+/// Genera (e scrive) l'override docker-compose con il mapping porte coerente:
+/// host = porta del bucket di progetto, container = porta interna reale del
+/// servizio. Ritorna il nome del file override da passare a `docker compose -f`,
+/// oppure None se non c'e' nulla da rimappare. La logica di parsing/render e' nel
+/// punto unico `compose_ports` (regola L); qui si alloca la porta host dal
+/// registro e si scrive il file. Risolve il mismatch host/container (es. vite su
+/// 20001 dentro il container vs porta host gestita) SENZA toccare i file del
+/// progetto.
+async fn generate_docker_port_override(
+    state: &AppState,
+    project_id: &Uuid,
+    cwd: &str,
+) -> Option<String> {
+    use super::compose_ports;
+    let dir = cwd.trim_end_matches('/');
+    let base = [
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "docker-compose.dev.yml",
+        "docker-compose.dev.yaml",
+        "compose.yml",
+        "compose.yaml",
+    ]
+    .iter()
+    .map(|n| format!("{dir}/{n}"))
+    .find(|p| std::path::Path::new(p).exists())?;
+    let content = tokio::fs::read_to_string(&base).await.ok()?;
+    let plans = compose_ports::planned_mappings(&compose_ports::parse_service_ports(&content));
+    if plans.is_empty() {
+        return None;
+    }
+    let mut entries: Vec<compose_ports::OverrideEntry> = Vec::new();
+    for pm in plans {
+        let key = format!("docker-{}-{}", pm.service, pm.container);
+        let host = super::services::deterministic_project_port_for_key(
+            project_id,
+            &key,
+            &state.port_registry,
+        )
+        .await;
+        if let Some(e) = entries.iter_mut().find(|e| e.service == pm.service) {
+            e.ports.push(format!("{host}:{}", pm.container));
+            for v in pm.vars {
+                if !e.env.iter().any(|(k, _)| *k == v) {
+                    e.env.push((v, pm.container.to_string()));
+                }
+            }
+        } else {
+            let env: Vec<(String, String)> = pm
+                .vars
+                .into_iter()
+                .map(|v| (v, pm.container.to_string()))
+                .collect();
+            entries.push(compose_ports::OverrideEntry {
+                service: pm.service.clone(),
+                ports: vec![format!("{host}:{}", pm.container)],
+                env,
+            });
+        }
+    }
+    let yaml = compose_ports::render_override_yaml(&entries);
+    let path = format!("{dir}/{}", compose_ports::OVERRIDE_FILE);
+    match tokio::fs::write(&path, yaml).await {
+        Ok(()) => {
+            tracing::info!("docker-compose: override porte coerente generato ({path})");
+            Some(compose_ports::OVERRIDE_FILE.to_string())
+        }
+        Err(e) => {
+            tracing::warn!("docker-compose: scrittura override fallita ({path}): {e}");
+            None
+        }
+    }
+}
+
+/// Inserisce `-f <override>` nell'ExecStart di un `docker compose ... up`, subito
+/// prima del sottocomando `up`, cosi' l'override e' applicato sopra il compose
+/// base. Se non trova ` up`, lo aggiunge in coda. Idempotente.
+fn inject_override_flag(exec_start: &str, override_file: &str) -> String {
+    if exec_start.contains(override_file) {
+        return exec_start.to_string();
+    }
+    if let Some(pos) = exec_start.find(" up") {
+        let (head, tail) = exec_start.split_at(pos + 1);
+        format!("{head}-f {override_file} {tail}")
+    } else {
+        format!("{exec_start} -f {override_file}")
+    }
+}
+
 /// Installa un servizio come unit file systemd --user e lo abilita.
 /// Body JSON: { short, command, args, cwd, env, description }
 pub async fn wizard_install_service(
@@ -1215,6 +1304,25 @@ pub async fn wizard_install_service(
             }
         }
     }
+
+    // Funzione unica (regola L): per i servizi docker-compose, Nexus genera un
+    // OVERRIDE deterministico (docker-compose.nexus.yml) con il mapping coerente
+    // host_bucket:porta_interna. Risolve il mismatch (es. vite --port 20001
+    // hardcoded dentro il container vs porta host gestita): l'override fissa il
+    // mapping reale + la variabile di porta -> il servizio risponde sulla porta
+    // host gestita SENZA toccare i file del progetto.
+    let exec_start = {
+        let el = exec_start.to_lowercase();
+        if el.contains("docker compose") || el.contains("docker-compose") {
+            if let Some(ov) = generate_docker_port_override(&state, &project_id, cwd).await {
+                inject_override_flag(&exec_start, &ov)
+            } else {
+                exec_start
+            }
+        } else {
+            exec_start
+        }
+    };
 
     let env_lines: String = env_map
         .iter()
