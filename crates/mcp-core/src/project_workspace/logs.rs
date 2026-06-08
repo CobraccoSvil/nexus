@@ -108,6 +108,121 @@ pub async fn get_project_problems(
         }));
     }
 
+    // PUNTO UNICO (regola L): il pannello "Problemi" e' la vista canonica della
+    // UI per i problemi del progetto e deve aggregare ANCHE i runtime issues
+    // (project_runtime_issues, mig M10) — errori catturati dai tool agente
+    // (run_command exit != 0, browser-check console errors) e dal service_observer
+    // (container in Restarting/Exited, unit systemd failed). Prima erano visibili
+    // solo all'endpoint separato /runtime-issues, e il pannello "Problemi" appariva
+    // vuoto anche quando c'erano errori runtime evidenti (es. db in crash-loop con
+    // `EAI_AGAIN postgres`). Filtra status open/in_progress (i resolved spariscono).
+    let runtime_rows = sqlx::query(
+        r#"
+        SELECT id, source, severity, message, details, tool_name, command, exit_code, created_at
+          FROM project_runtime_issues
+         WHERE project_id = $1
+           AND status IN ('open', 'in_progress')
+         ORDER BY created_at DESC
+         LIMIT 200
+        "#,
+    )
+    .bind(project_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Aggrega anche le diagnosi del service_observer (anomaly/crash su servizi
+    // systemd del progetto). E' il secondo store di "problemi" del progetto:
+    // prima visibile solo via UI separata, ora compare nel pannello "Problemi"
+    // come deve essere (regola L: un solo posto dove l'utente cerca i problemi).
+    let diag_rows = sqlx::query(
+        r#"
+        SELECT id, unit, signal_kind, metric, value, threshold, detail, created_at
+          FROM service_diagnoses
+         WHERE project_id = $1
+           AND status = 'open'
+         ORDER BY created_at DESC
+         LIMIT 100
+        "#,
+    )
+    .bind(project_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    for row in diag_rows {
+        let unit: String = row.get("unit");
+        let signal_kind: String = row.get("signal_kind");
+        let metric: Option<String> = row.try_get("metric").ok().flatten();
+        let value: Option<f64> = row.try_get("value").ok().flatten();
+        let threshold: Option<f64> = row.try_get("threshold").ok().flatten();
+        let detail: Option<String> = row.try_get("detail").ok().flatten();
+        // signal_kind = "crash" e' grave; "anomaly" e' warning a meno che la
+        // metrica non sia chiaramente critica (cpu fuori range, errori/min alti).
+        let severity = if signal_kind == "crash" { "error" } else { "warning" };
+        let metric_part = match (metric.as_deref(), value, threshold) {
+            (Some(m), Some(v), Some(t)) => format!(" — {m}={v:.1} (soglia {t:.1})"),
+            (Some(m), Some(v), None) => format!(" — {m}={v:.1}"),
+            (Some(m), None, _) => format!(" — {m}"),
+            _ => String::new(),
+        };
+        let mut message = format!("Servizio {unit}: {signal_kind}{metric_part}");
+        if let Some(d) = detail.as_deref().filter(|s| !s.is_empty()) {
+            message.push_str("\n");
+            message.push_str(d);
+        }
+        items.push(json!({
+            "id": row.get::<Uuid, _>("id").to_string(),
+            "severity": severity,
+            "source": format!("service_observer:{signal_kind}"),
+            "message": message,
+            "filePath": serde_json::Value::Null,
+            "line": serde_json::Value::Null,
+            "column": serde_json::Value::Null,
+            "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
+        }));
+    }
+
+    for row in runtime_rows {
+        let details = row
+            .try_get::<Option<String>, _>("details")
+            .ok()
+            .flatten();
+        let tool_name = row
+            .try_get::<Option<String>, _>("tool_name")
+            .ok()
+            .flatten();
+        let command = row.try_get::<Option<String>, _>("command").ok().flatten();
+        let exit_code = row.try_get::<Option<i32>, _>("exit_code").ok().flatten();
+        let source = row.get::<String, _>("source");
+        // `details` contiene una stringa libera (output troncato, hint, ecc.).
+        // La esponiamo nel campo unificato "message" come append del messaggio
+        // breve, cosi' la UI puo' mostrare l'errore + il contesto senza serializzare
+        // nuovi campi.
+        let base_msg = row.get::<String, _>("message");
+        let mut message = base_msg.clone();
+        if let Some(cmd) = command.as_deref().filter(|s| !s.is_empty()) {
+            message = format!("{message}\n$ {cmd}");
+            if let Some(code) = exit_code {
+                message.push_str(&format!(" (exit={code})"));
+            }
+        }
+        if let Some(d) = details.as_deref().filter(|s| !s.is_empty()) {
+            message.push_str("\n");
+            message.push_str(d);
+        }
+        items.push(json!({
+            "id": row.get::<Uuid, _>("id").to_string(),
+            "severity": row.get::<String, _>("severity"),
+            "source": tool_name.unwrap_or_else(|| format!("runtime:{source}")),
+            "message": message,
+            "filePath": serde_json::Value::Null,
+            "line": serde_json::Value::Null,
+            "column": serde_json::Value::Null,
+            "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
+        }));
+    }
+
     items.sort_by(|left, right| {
         let left_severity = left
             .get("severity")
@@ -128,6 +243,73 @@ pub async fn get_project_problems(
     });
 
     Ok(Json(json!({ "items": items })))
+}
+
+/// Legge gli ultimi N log da un file generato da `spawn_detached_service`
+/// (`/tmp/nexus-proj-<unit>.log`). Usato in WSL/quando il manager systemd --user
+/// non c'e' e quindi `journalctl` non vede il servizio. Output coerente con
+/// `read_service_logs` (stesso schema evento per la UI). Niente filtro `--since`
+/// del restart: il file di log e' append-only e copre l'intera vita del servizio
+/// detached, quindi prendiamo solo l'ultima coda (`limit * 10`, capped 2000) —
+/// la UI conserva gli ID gia' visti via `seenLogIdsRef` (debug-panel.tsx:178).
+async fn read_detached_logfile(
+    path: &str,
+    limit: usize,
+    service: &str,
+    channel: &str,
+) -> Vec<serde_json::Value> {
+    let max_lines = (limit * 10).clamp(200, 2000);
+    let text = match tokio::fs::read_to_string(path).await {
+        Ok(s) => s,
+        Err(e) => {
+            return vec![serde_json::json!({
+                "id": format!("{service}-detached-err"),
+                "channel": channel,
+                "level": "error",
+                "title": format!("Errore lettura log detached {service}"),
+                "text": e.to_string(),
+                "createdAt": chrono::Utc::now().to_rfc3339(),
+            })];
+        }
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return vec![serde_json::json!({
+            "id": format!("{service}-detached-empty"),
+            "channel": channel,
+            "level": "info",
+            "title": format!("{service} — nessun output (detached)"),
+            "text": format!("Il servizio gira in modalita' detached (systemd --user non attivo). Logfile: {path}"),
+            "createdAt": chrono::Utc::now().to_rfc3339(),
+        })];
+    }
+    let mut lines: Vec<&str> = trimmed.lines().collect();
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+    }
+    let body = lines.join("\n");
+    let lower = body.to_lowercase();
+    let level = if lower.contains(" error ")
+        || lower.contains("error:")
+        || lower.contains("panicked")
+        || lower.contains("exception:")
+        || lower.contains("[error]")
+    {
+        "error"
+    } else if lower.contains(" warn ") || lower.contains("warning:") || lower.contains("[warn]") {
+        "warn"
+    } else {
+        "info"
+    };
+    let line_count = lines.len();
+    vec![serde_json::json!({
+        "id": format!("{service}-detached-{}", line_count),
+        "channel": channel,
+        "level": level,
+        "title": format!("{service} — ultimi {line_count} log (detached)"),
+        "text": body,
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+    })]
 }
 
 pub(super) fn severity_rank(value: &str) -> i32 {
@@ -159,6 +341,19 @@ pub(super) async fn read_service_logs(
     // dopo clamp in get_output_events) — moltiplicato x10 per dare contesto
     // sufficiente, capped a 2000 per evitare payload enormi.
     let n_lines = (limit * 10).clamp(200, 2000).to_string();
+
+    // Fallback DETACHED (regola L: la fonte del log e' una soltanto, ma il
+    // backend storage cambia in base al manager attivo). In WSL `systemd --user`
+    // non e' attivo, quindi `spawn_detached_service` (wizard.rs) scrive l'output
+    // del servizio in `/tmp/nexus-proj-<unit>.log`. Senza questo fallback,
+    // journalctl non vede nulla -> read_service_logs ritornava "Nessun log
+    // disponibile" e il pannello Console Debug appariva sempre vuoto in WSL.
+    let detached_path = format!("/tmp/nexus-proj-{service}.log");
+    if let Ok(meta) = tokio::fs::metadata(&detached_path).await {
+        if meta.is_file() {
+            return read_detached_logfile(&detached_path, limit, service, channel).await;
+        }
+    }
 
     // Recupera il timestamp dell'ultimo avvio del servizio per il filtro --since.
     // ActiveEnterTimestamp e' in formato systemd ("Sun 2026-04-26 16:30:00 CEST"); journalctl
