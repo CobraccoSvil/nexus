@@ -165,7 +165,7 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
         "/bin/sh"
     };
 
-    let child = Command::new(shell_path)
+    let child = crate::sandbox::isolated_command(shell_path)
         .arg("-c")
         .arg(&command)
         .current_dir(&work_dir)
@@ -334,7 +334,7 @@ pub(crate) async fn tool_run_tests(
         .min(RUN_TESTS_MAX_TIMEOUT);
 
     // 4. Esecuzione sincrona — NESSUN auto-routing a background
-    let child = Command::new("/bin/sh")
+    let child = crate::sandbox::isolated_command("/bin/sh")
         .arg("-c")
         .arg(&command)
         .current_dir(&work_dir)
@@ -738,7 +738,13 @@ async fn ensure_project_db_url(ctx: &AgentToolContext) -> (String, String) {
     // NEXUS_PROJECT_DB_URL/DATABASE_URL), ma il pannello DB Nexus restava
     // vuoto perche' legge solo da project_database_config.
     //
-    // Idempotente via ON CONFLICT sul vincolo unique (project_id, lower(name)).
+    // Idempotente via ON CONFLICT sull'UNIQUE INDEX (project_id, LOWER(name))
+    // creato dalla mig 0083 (`uq_project_database_config_project_name`). Nota:
+    // l'INDEX e' su un'espressione (LOWER(name)), quindi NON puo' essere
+    // promosso a CONSTRAINT nominato e va referenziato con `ON CONFLICT (cols)`
+    // — non `ON CONFLICT ON CONSTRAINT <nome>`, che richiede un constraint vero
+    // e provocava "constraint does not exist" (148 errori/log spam, regola H:
+    // la causa era il codice che divergeva dal commento e dallo schema).
     // connection_secret e' bytea contenente la URL raw (decifrato a runtime
     // con ENCODE escape — vedi project_db_set_connection per il pattern).
     let upsert_res = sqlx::query(
@@ -749,7 +755,7 @@ async fn ensure_project_db_url(ctx: &AgentToolContext) -> (String, String) {
            VALUES (gen_random_uuid(), $1, 'primary', 'postgres', 'internal', $2::bytea,
                    NULL, NULL, true, false, '{"source":"auto_provisioning"}'::jsonb,
                    NOW(), NOW())
-           ON CONFLICT ON CONSTRAINT uq_project_database_config_project_name
+           ON CONFLICT (project_id, LOWER(name))
            DO UPDATE SET
              connection_secret = EXCLUDED.connection_secret,
              engine = EXCLUDED.engine,
