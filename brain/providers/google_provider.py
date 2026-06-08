@@ -548,12 +548,30 @@ class GoogleProvider(BaseProvider):
             # Normalizza risposta al formato Anthropic
             text_content = ""
             thoughts_content = ""  # Reasoning interno del modello (include_thoughts=True).
+            # Firma opaca del thinking Gemini (thought_signature): va rispedita
+            # IDENTICA nei turni successivi quando il turno contiene function call
+            # (obbligatoria su Gemini 3 -> 400 se omessa; raccomandata su 2.5).
+            # Serializzata in base64 perche' assistant_content e' JSON. Guarded:
+            # con thinking spento (disable_for_tools) la signature non esiste.
+            thought_signature_b64: str | None = None
             stop_reason = "end_turn"
             tool_use_blocks: list[dict] = []
             assistant_content: list[dict] = []
 
             if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
                 for part in response.candidates[0].content.parts:
+                    # Cattura la firma opaca dovunque appaia (thought o
+                    # function_call part), una sola volta: e' per-turno e
+                    # non va duplicata tra Part. base64 subito (i bytes non
+                    # sono JSON-serializzabili). Difensivo su SDK senza il campo.
+                    if thought_signature_b64 is None:
+                        try:
+                            _sig = getattr(part, "thought_signature", None)
+                            if _sig:
+                                import base64 as _b64
+                                thought_signature_b64 = _b64.b64encode(_sig).decode("utf-8")
+                        except Exception:
+                            thought_signature_b64 = None
                     if part.text:
                         # I "thoughts" (reasoning interno dei modelli 2.5)
                         # arrivano come part.text con part.thought=True.
@@ -576,6 +594,23 @@ class GoogleProvider(BaseProvider):
 
             if not tool_use_blocks and text_content:
                 assistant_content.append({"type": "text", "text": text_content})
+
+            # Riattacca la firma opaca al PRIMO blocco tool_use (regola Gemini:
+            # la signature sta sulla prima functionCall part del turno). Fallback
+            # al primo text se non ci sono tool (caso text-only Gemini 3). Una
+            # sola volta, mai duplicata. Guarded: senza thinking e' None -> no-op.
+            if thought_signature_b64:
+                _attached = False
+                for _blk in assistant_content:
+                    if _blk.get("type") == "tool_use":
+                        _blk["thought_signature"] = thought_signature_b64
+                        _attached = True
+                        break
+                if not _attached:
+                    for _blk in assistant_content:
+                        if _blk.get("type") == "text":
+                            _blk["thought_signature"] = thought_signature_b64
+                            break
 
             # finish_reason esplicito (recovery fix Vertex): i modelli thinking
             # possono chiudere con output vuoto (0 testo + 0 tool call). Senza
@@ -698,6 +733,25 @@ def _clean_schema_for_google(schema: dict) -> dict:
     return compress_schema(schema)
 
 
+def _apply_thought_signature(part: Any, sig_b64: str | None) -> Any:
+    """Riattacca la firma opaca del thinking Gemini (base64 -> bytes) a una Part.
+
+    Difensivo: qualunque errore (base64 invalido, SDK senza il campo) lascia la
+    Part invariata col comportamento odierno. La firma e' un dato opaco cifrato,
+    non viene loggata (niente leak).
+    """
+    if not sig_b64:
+        return part
+    try:
+        import base64 as _b64
+        raw = _b64.b64decode(sig_b64)
+        if hasattr(part, "thought_signature"):
+            part.thought_signature = raw
+    except Exception:
+        pass
+    return part
+
+
 def _convert_messages_to_google(messages: list[dict]) -> list[Any]:
     """Converte messaggi formato Anthropic (con tool_use/tool_result) in formato Google genai Contents."""
     from google.genai import types  # type: ignore[import]
@@ -726,18 +780,32 @@ def _convert_messages_to_google(messages: list[dict]) -> list[Any]:
         elif isinstance(content, list):
             parts: list[Any] = []
             tool_response_parts: list[Any] = []
+            # La firma opaca del thinking va su UNA sola Part del turno (la prima
+            # functionCall, o il primo text se text-only): Gemini vieta di
+            # duplicarla tra Part. Guarded: senza thinking il campo non c'e'.
+            _sig_consumed = False
             for block in content:
                 btype = block.get("type")
                 if btype == "text":
                     text_val = block.get("text", "")
                     if text_val:
-                        parts.append(types.Part.from_text(text=text_val))
+                        _p = types.Part.from_text(text=text_val)
+                        _sig = block.get("thought_signature")
+                        if _sig and not _sig_consumed:
+                            _apply_thought_signature(_p, _sig)
+                            _sig_consumed = True
+                        parts.append(_p)
                 elif btype == "tool_use":
                     # Blocco tool_use (assistant chiede di chiamare un tool)
-                    parts.append(types.Part.from_function_call(
+                    _p = types.Part.from_function_call(
                         name=block["name"],
                         args=block.get("input", {}),
-                    ))
+                    )
+                    _sig = block.get("thought_signature")
+                    if _sig and not _sig_consumed:
+                        _apply_thought_signature(_p, _sig)
+                        _sig_consumed = True
+                    parts.append(_p)
                 elif btype == "tool_result":
                     # Blocco tool_result — Google vuole il name del tool, non l'id
                     result_content = block.get("content", "")
