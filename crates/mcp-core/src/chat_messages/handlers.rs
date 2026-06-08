@@ -140,6 +140,23 @@ pub async fn send_chat_message(
     // verranno marcati 'interrupted' dal cleanup di startup (vedi main.rs).
     // Soglia: 15 minuti — copre i turni piu' lunghi visti in produzione con
     // largo margine, ma sblocca la chat se qualcosa e' rimasto sospeso.
+    // Persiste la modalita' scelta sulla sessione (mig 0371): i run risvegliati
+    // (process_resume, service_observer) la ereditano invece di defaultare a
+    // Confirm. Solo quando il body porta un valore esplicito.
+    if let Some(m) = body
+        .automation_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let canonical = parse_automation_mode(Some(m)).as_str();
+        let _ = sqlx::query("UPDATE chat_sessions SET automation_mode = $1 WHERE id = $2")
+            .bind(canonical)
+            .bind(context.session_id)
+            .execute(&state.db)
+            .await;
+    }
+
     if parse_automation_mode(body.automation_mode.as_deref()) != AutomationMode::Study {
         let active_run: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM agent_runs \
@@ -368,11 +385,20 @@ pub async fn send_chat_message(
     let (profile_prompt_block, profile_provider, profile_model, profile_automation) =
         fetch_profile_context(&state.db, user_id, &profile_id, &body.content).await;
 
-    let automation_mode = parse_automation_mode(
-        body.automation_mode
-            .as_deref()
-            .or(profile_automation.as_deref()),
-    );
+    // Precedenza modalita' (regola L): body > profilo > sessione persistita
+    // (mig 0371) > default colonna. Se il client non invia il campo NON si ricade
+    // su Confirm ma sulla modalita' scelta per la sessione (fix: dopo un reload UI
+    // la modalita' Automatico non veniva piu' rispettata).
+    let automation_mode = match body
+        .automation_mode
+        .as_deref()
+        .or(profile_automation.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(v) => parse_automation_mode(Some(v)),
+        None => read_session_automation_mode(&state.db, context.session_id).await,
+    };
     let supervisor_mode =
         SupervisorMode::from_str(body.supervisor_mode.as_deref().unwrap_or("none"));
 

@@ -367,7 +367,10 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
             project_id,
             user_message_id,
             content,
-            automation_mode: AutomationMode::Confirm,
+            // Eredita la modalita' scelta dall'utente per la sessione (mig 0371)
+            // invece di hardcodare Confirm: un run risvegliato in Automatico non
+            // deve tornare a chiedere conferme.
+            automation_mode: crate::chat_messages::read_session_automation_mode(&state.db, session_id).await,
             supervisor_mode: SupervisorMode::None,
             profile_prompt_block: String::new(),
             system_context,

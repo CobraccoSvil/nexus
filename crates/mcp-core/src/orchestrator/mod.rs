@@ -87,6 +87,24 @@ impl AutomationMode {
         }
     }
 
+    /// Parsa la modalita' da stringa (DB o body HTTP), case-insensitive e
+    /// tollerante (accetta sinonimi it/en). Punto unico (regola L): `parse_automation_mode`
+    /// e i lettori della colonna `chat_sessions.automation_mode` delegano qui.
+    /// Default `Confirm` (la modalita' piu' conservativa) per valore mancante/ignoto.
+    pub fn from_str_lenient(value: Option<&str>) -> Self {
+        match value
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or("confirm")
+            .to_lowercase()
+            .as_str()
+        {
+            "study" | "studio" => Self::Study,
+            "automatic" | "automatico" | "auto" => Self::Automatic,
+            _ => Self::Confirm,
+        }
+    }
+
     /// Restituisce la chiave DB del template per le istruzioni di modalità.
     fn prompt_instruction_template_key(self) -> &'static str {
         match self {

@@ -248,7 +248,10 @@ export async function sendChatMessage(
       activeFiles: options.activeFiles ?? [],
       providerOverride: options.providerOverride,
       modelOverride: options.modelOverride,
-      automationMode: options.automationMode ?? "confirm",
+      // Niente default mascherante: se il valore manca si invia undefined (omesso
+      // dal JSON) e il backend usa la modalita' persistita della sessione
+      // (mig 0371), invece di forzare 'confirm' e ignorare la scelta dell'utente.
+      automationMode: options.automationMode,
       supervisorMode: options.supervisorMode ?? "none",
       attachments: options.attachments ?? [],
       // BP13: dichiara la finestra di messaggi che il client e' disposto a

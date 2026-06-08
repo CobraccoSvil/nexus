@@ -1,17 +1,27 @@
 use super::*;
 
 pub(crate) fn parse_automation_mode(value: Option<&str>) -> AutomationMode {
-    match value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("confirm")
-        .to_lowercase()
-        .as_str()
-    {
-        "study" | "studio" => AutomationMode::Study,
-        "automatic" | "automatico" | "auto" => AutomationMode::Automatic,
-        _ => AutomationMode::Confirm,
-    }
+    // Delega al punto unico (regola L): stessa logica usata anche per leggere
+    // la colonna persistita chat_sessions.automation_mode.
+    AutomationMode::from_str_lenient(value)
+}
+
+/// Legge la modalita' di automazione persistita sulla sessione (mig 0371).
+/// Usata dai run che NON ricevono un body HTTP (process_resume, service_observer):
+/// ereditano la modalita' scelta dall'utente invece di hardcodare Confirm.
+/// Fallback al DEFAULT della colonna se la sessione manca o la query fallisce.
+pub(crate) async fn read_session_automation_mode(
+    db: &PgPool,
+    session_id: Uuid,
+) -> AutomationMode {
+    let raw: Option<String> =
+        sqlx::query_scalar("SELECT automation_mode FROM chat_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    AutomationMode::from_str_lenient(raw.as_deref())
 }
 #[allow(dead_code)]
 pub(crate) fn parse_provider_hierarchy(raw: &str) -> Vec<String> {

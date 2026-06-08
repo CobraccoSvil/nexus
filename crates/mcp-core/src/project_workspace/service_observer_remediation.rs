@@ -139,7 +139,9 @@ pub(crate) async fn maybe_trigger_debugger(
         project_id,
         user_message_id,
         content,
-        automation_mode: AutomationMode::Confirm,
+        // Eredita la modalita' della sessione (mig 0371) invece di hardcodare
+        // Confirm, cosi' l'auto-debug rispetta la scelta dell'utente.
+        automation_mode: crate::chat_messages::read_session_automation_mode(&state.db, session).await,
         supervisor_mode: SupervisorMode::None,
         profile_prompt_block: String::new(),
         system_context,
