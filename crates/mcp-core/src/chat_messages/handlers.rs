@@ -468,6 +468,17 @@ pub async fn send_chat_message(
                     .unwrap_or_else(|_| "none".to_string());
                 let prev_supervisor = SupervisorMode::from_str(&prev_supervisor_str);
 
+                // Last-wins atomico (punto unico, regola L): cancella TUTTI i run
+                // attivi della sessione (incluso il precedente) PRIMA di inserire
+                // il nuovo. Elimina la race "INSERT-poi-UPDATE" che lasciava due
+                // run attivi per una finestra, e ferma cooperativamente il vecchio.
+                let _ = crate::chat_messages::agent_run::supersede_active_runs(
+                    &state,
+                    context.session_id,
+                    "resume",
+                )
+                .await;
+
                 let _ = sqlx::query(
                     r#"INSERT INTO agent_runs
                        (id, session_id, project_id, user_id, run_message_id, status,
@@ -483,14 +494,6 @@ pub async fn send_chat_message(
                 .bind(&prev_provider)
                 .bind(&prev_model)
                 .bind(prev_supervisor.as_str())
-                .bind(prev_run_id)
-                .execute(&state.db)
-                .await;
-
-                // Marca il vecchio run come ripreso
-                let _ = sqlx::query(
-                    "UPDATE agent_runs SET status='cancelled', final_answer='Ripreso da nuovo run.' WHERE id=$1"
-                )
                 .bind(prev_run_id)
                 .execute(&state.db)
                 .await;

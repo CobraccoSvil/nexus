@@ -546,43 +546,12 @@ pub async fn cancel_agent_run(
     // Stop, la POST successiva sulla stessa sessione torna 409 ripetuto).
     // Cancellando TUTTI i run attivi della sessione si ristabilisce
     // l'invariante e si sblocca subito l'utente, in modo idempotente.
-    let cancelled_ids: Vec<Uuid> = sqlx::query_scalar(
-        "UPDATE agent_runs \
-         SET status='cancelled', completed_at=NOW(), \
-             final_answer='Operazione annullata.' \
-         WHERE session_id = $1 \
-           AND status IN ('running', 'awaiting_confirmation') \
-         RETURNING id",
-    )
-    .bind(session_id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Emetti is_final sul broadcast di OGNI run cancellato: il frontend chiude
-    // gli SSE immediatamente e poll il DB per leggere 'cancelled'. Senza questo
-    // evento la UI rimarrebbe "in esecuzione" finche' il tokio::spawn
-    // sottostante non termina autonomamente (anche minuti).
-    for cid in &cancelled_ids {
-        if let Some(ch) = state.agent_channels.get(cid) {
-            let _ = ch.send(AgentStepEvent {
-                run_id: cid.to_string(),
-                step: None,
-                trace: None,
-                is_final: true,
-                token_delta: None,
-                thinking_delta: None,
-                meta_step: None,
-            });
-        }
-    }
-    if cancelled_ids.len() > 1 {
-        tracing::warn!(
-            "cancel_agent_run: cancellati {} run attivi sulla session {} (atteso 1, sintomo di run stuck precedenti)",
-            cancelled_ids.len(),
-            session_id
-        );
-    }
+    // Delega al punto unico (regola L): stessa logica autoritativa usata dal
+    // last-wins di spawn_agent_run e dal resume. Marca i run attivi della
+    // sessione 'cancelled' + cancellation_requested (segnale di stop cooperativo
+    // che il brain rispetta tra le iterazioni) ed emette is_final sui channel.
+    let cancelled_ids =
+        crate::chat_messages::supersede_active_runs(&state, session_id, "user_cancel").await;
 
     Ok(Json(json!({
         "runId": run_id.to_string(),

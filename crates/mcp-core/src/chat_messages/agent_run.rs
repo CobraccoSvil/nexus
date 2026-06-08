@@ -355,6 +355,70 @@ pub(crate) async fn build_initial_msg_with_attachments(
 
     format!("{}\n\n{}", content, block)
 }
+/// Punto unico (regola L) dell'invariante "al piu' UN run agentico attivo per
+/// session_id". Applica il last-wins: marca 'cancelled' + `cancellation_requested`
+/// TUTTI i run ancora attivi della sessione (il nuovo richiedente supera i
+/// precedenti) ed emette `is_final` sui loro broadcast channel cosi' la UI chiude
+/// subito gli SSE. Il flag `cancellation_requested` e' il segnale di stop
+/// COOPERATIVO che il brain controlla tra le iterazioni del grafo
+/// (`route_after_executor` -> `_check_superseded`) per terminare DAVVERO il loop
+/// in memoria del run superato (marcare il DB da solo non lo fermerebbe).
+///
+/// Tutti i call site che creano o annullano run delegano qui (spawn_agent_run,
+/// resume-handler, cancel_agent_run): nessuna re-implementazione della query
+/// "cancella gli attivi della sessione". Ritorna gli id cancellati.
+pub(crate) async fn supersede_active_runs(
+    state: &AppState,
+    session_id: Uuid,
+    reason: &str,
+) -> Vec<Uuid> {
+    // Messaggio finale leggibile per la UI (il cancellation_reason resta il
+    // valore macchina). COALESCE: non sovrascrive un final_answer gia' presente.
+    let final_msg = if reason == "user_cancel" {
+        "Operazione annullata."
+    } else {
+        "Superato da un nuovo run."
+    };
+    let cancelled_ids: Vec<Uuid> = sqlx::query_scalar(
+        "UPDATE agent_runs \
+         SET status='cancelled', completed_at=NOW(), \
+             cancellation_requested=NOW(), cancellation_reason=$2, \
+             final_answer=COALESCE(final_answer, $3) \
+         WHERE session_id = $1 \
+           AND status IN ('running', 'awaiting_confirmation') \
+         RETURNING id",
+    )
+    .bind(session_id)
+    .bind(reason)
+    .bind(final_msg)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    for cid in &cancelled_ids {
+        if let Some(ch) = state.agent_channels.get(cid) {
+            let _ = ch.send(AgentStepEvent {
+                run_id: cid.to_string(),
+                step: None,
+                trace: None,
+                is_final: true,
+                token_delta: None,
+                thinking_delta: None,
+                meta_step: None,
+            });
+        }
+    }
+    if !cancelled_ids.is_empty() {
+        tracing::info!(
+            "supersede_active_runs: cancellati {} run attivi sulla session {} (reason={})",
+            cancelled_ids.len(),
+            session_id,
+            reason
+        );
+    }
+    cancelled_ids
+}
+
 /// Logica condivisa: carica progetto, costruisce contesto, avvia AgentLoop in background.
 /// Ritorna `None` se il progetto non è caricabile (fallback al singolo turn).
 pub(crate) async fn spawn_agent_run(
@@ -620,6 +684,13 @@ pub(crate) async fn spawn_agent_run(
             maybe_auto_compact(&state_bg, session_id, project_id, &provider_bg, &model_bg).await;
         });
     }
+
+    // Last-wins (punto unico, regola L): questo nuovo run supera OGNI run ancora
+    // attivo sulla stessa sessione, fermandoli cooperativamente. Vale per tutti i
+    // call site (chat, resume, process_resume, service_observer) perche' passano
+    // tutti da spawn_agent_run -> l'invariante "max 1 run attivo per sessione" e'
+    // applicata in un solo posto e nessun nuovo call site puo' dimenticarla.
+    let _superseded = supersede_active_runs(state, params.session_id, "superseded_by_new_run").await;
 
     // Persist initial run in DB
     let _ = sqlx::query(

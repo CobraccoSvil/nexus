@@ -1202,6 +1202,46 @@ def _apply_token_brake(
         return messages
 
 
+def _check_superseded(state: dict[str, Any]) -> bool:
+    """True se il run corrente e' stato superato/cancellato (stop COOPERATIVO).
+
+    Legge `agent_runs.status` / `cancellation_requested` per il PROPRIO run
+    (thread_id == run_id). Il flag e' scritto da `supersede_active_runs` (Rust)
+    quando un nuovo run sulla stessa sessione supera questo (last-wins), o da un
+    Forza Stop utente. Serve perche' il grafo non leggerebbe altrimenti lo stato
+    del run: marcare il DB da solo non fermerebbe il loop in memoria.
+
+    Fail-open: qualunque errore DB -> False + WARN, per non uccidere run legittimi
+    per un glitch di rete (regola: degrado esplicito, non try/except che maschera).
+    """
+    _run_id = str(state.get("thread_id") or "")
+    if not _run_id:
+        return False
+    try:
+        import os
+        import psycopg2  # type: ignore[import-untyped]
+        _dburl = os.environ.get("DATABASE_URL")
+        if not _dburl:
+            return False
+        _conn = psycopg2.connect(_dburl)
+        try:
+            with _conn.cursor() as _cur:
+                _cur.execute(
+                    "SELECT status, cancellation_requested FROM agent_runs WHERE id=%s",
+                    (_run_id,),
+                )
+                _row = _cur.fetchone()
+        finally:
+            _conn.close()
+        if not _row:
+            return False
+        _status, _cancel_req = _row[0], _row[1]
+        return _status in ("cancelled", "failed", "timed_out") or _cancel_req is not None
+    except Exception as _exc:
+        logger.warning("_check_superseded: lettura agent_runs fallita (fail-open): %s", _exc)
+        return False
+
+
 async def executor_node(state: AgentState) -> dict[str, Any]:
     """Chiama il provider LLM. In modalita' agent (tools_json non vuoto) usa
     `generate_agent_turn` e popola `pending_tool_uses` + `stop_reason`.
@@ -1217,6 +1257,18 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     token_budget = state.get("token_budget", 400)
     tools_json = state.get("tools_json") or []
     system_text = state.get("system_text") or ""
+
+    # Cancellazione cooperativa (single-run-per-session): se questo run e' stato
+    # superato da un nuovo run sulla stessa sessione (last-wins) o cancellato
+    # dall'utente, esci SUBITO senza chiamare il modello. E' qui (nodo async, una
+    # volta per iterazione) e non nella route condizionale (sync, non puo' query
+    # il DB). route_after_executor legge stop_reason='superseded' -> learner.
+    if _check_superseded(state):
+        logger.warning(
+            "executor_node: run superato/cancellato, uscita cooperativa (thread=%s)",
+            state.get("thread_id"),
+        )
+        return {"stop_reason": "superseded"}
 
     # ── M16: merge tool scoperti (discovery-first) per QUESTO turno ───────────
     # Il turno precedente ha eseguito nexus_mcp_tool_search; tool_dispatch_node

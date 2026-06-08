@@ -42,6 +42,12 @@ def route_after_executor(state: AgentState) -> str:
     if stop_reason == "loop_detected":
         logger.warning("route_after_executor: loop detected, chiusura forzata")
         return "learner"
+    # Cancellazione cooperativa (single-run-per-session): executor_node ha
+    # rilevato che questo run e' stato superato/cancellato sulla stessa sessione.
+    # Chiusura immediata: il loop in memoria termina, niente altri step in chat.
+    if stop_reason == "superseded":
+        logger.warning("route_after_executor: run superato (last-wins), chiusura cooperativa")
+        return "learner"
     # G1 escalation: l'executor ha promosso il turno a un modello piu' capace
     # (sticky_model aggiornato, reroute azzerato). Ri-entra nell'executor per
     # far agire il modello escalato. Il cap iterazioni globale resta la safety.
