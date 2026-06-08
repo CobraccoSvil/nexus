@@ -185,6 +185,88 @@ fn build_connection_from_env_vars(
     None
 }
 
+/// Sostituisce hostname che sono nomi di servizio compose con 'localhost' per
+/// l'accesso dall'host esterno (il mapping di porta espone il servizio sul
+/// loopback host). Lista non esaustiva ma copre i nomi convenzionali piu'
+/// comuni: `db`, `postgres`, `postgresql`, `pg`, `mysql`, `mariadb`. Altri
+/// hostname (es. `db.local`, IP, FQDN) vengono lasciati invariati.
+fn normalize_compose_host(host: &str) -> &str {
+    match host.to_ascii_lowercase().as_str() {
+        "db" | "postgres" | "postgresql" | "pg" | "mysql" | "mariadb" => "localhost",
+        _ => host,
+    }
+}
+
+/// Cerca una connection string DB nel content di un docker-compose. Strategia:
+///
+/// (a) Una variabile env tipo `DATABASE_URL=postgres://user:pass@host:port/db`
+///     dentro un blocco `environment:` (sotto qualsiasi servizio): e' la fonte
+///     piu' affidabile perche' e' gia' parametrizzata correttamente per
+///     l'applicazione. L'host viene normalizzato via `normalize_compose_host`.
+///
+/// (b) Se non c'e' una URL gia' pronta, si combinano i valori
+///     POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB visti nel docker-compose con
+///     la porta HOST del mapping `ports: HOST:CONTAINER`. La porta default e'
+///     5432 per postgres. Host fisso a `localhost` perche' siamo sull'host
+///     esterno che accede al servizio via port mapping.
+///
+/// Ritorna None se non riesce a costruire una stringa utile. Niente full YAML
+/// parser: lettura riga per riga con regex/string match, sufficiente per i
+/// pattern reali osservati nei docker-compose generati dall'agente Nexus.
+fn extract_compose_connection_string(content: &str) -> Option<String> {
+    use regex::Regex;
+    // (a) DATABASE_URL / POSTGRES_URL / DB_URL gia' pronta.
+    let url_re = Regex::new(
+        r#"(?im)^\s*-?\s*(?:DATABASE_URL|POSTGRES_URL|DB_URL)\s*[:=]\s*['"]?(\w+://[^\s'"]+)['"]?"#,
+    )
+    .ok()?;
+    if let Some(cap) = url_re.captures(content) {
+        let raw = cap.get(1)?.as_str();
+        // Sostituzione hostname: cerchiamo lo schema://[user[:pass]@]host[:port]/db
+        let split_re = Regex::new(r#"^(\w+://)(?:([^@/]+)@)?([^:/]+)(:\d+)?(.*)$"#).ok()?;
+        if let Some(parts) = split_re.captures(raw) {
+            let scheme = parts.get(1)?.as_str();
+            let userinfo = parts.get(2).map(|m| m.as_str()).unwrap_or("");
+            let host = parts.get(3)?.as_str();
+            let port = parts.get(4).map(|m| m.as_str()).unwrap_or("");
+            let tail = parts.get(5).map(|m| m.as_str()).unwrap_or("");
+            let host_norm = normalize_compose_host(host);
+            let auth = if userinfo.is_empty() {
+                String::new()
+            } else {
+                format!("{userinfo}@")
+            };
+            return Some(format!("{scheme}{auth}{host_norm}{port}{tail}"));
+        }
+        return Some(raw.to_string());
+    }
+    // (b) POSTGRES_USER + POSTGRES_PASSWORD + POSTGRES_DB + porta host.
+    let postgres_var = |name: &str| -> Option<String> {
+        let re = Regex::new(&format!(
+            r#"(?im)^\s*-?\s*{name}\s*[:=]\s*['"]?([^\s'"]+)['"]?"#,
+        ))
+        .ok()?;
+        re.captures(content)
+            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+    };
+    let user = postgres_var("POSTGRES_USER")?;
+    let db = postgres_var("POSTGRES_DB")?;
+    let pass = postgres_var("POSTGRES_PASSWORD").unwrap_or_default();
+    // Porta host dal mapping `- "5432:5432"` o `- 5432:5432`. Default 5432.
+    let port_re =
+        Regex::new(r#"(?m)^\s*-\s*['"]?(\d{2,5})\s*:\s*5432['"]?"#).ok()?;
+    let port = port_re
+        .captures(content)
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+        .unwrap_or_else(|| "5432".to_string());
+    let auth = if pass.is_empty() {
+        format!("{user}@")
+    } else {
+        format!("{user}:{pass}@")
+    };
+    Some(format!("postgres://{auth}localhost:{port}/{db}"))
+}
+
 fn scan_project_db(root: &std::path::Path) -> DetectionResult {
     let mut r = DetectionResult::default();
 
@@ -231,6 +313,27 @@ fn scan_project_db(root: &std::path::Path) -> DetectionResult {
                 r.hints.push(format!("{name}: servizio mysql/mariadb"));
                 if r.hosting_mode.is_none() {
                     r.hosting_mode = Some("internal".into());
+                }
+            }
+            // Estrai la connection string EFFETTIVA dal docker-compose. Bug
+            // storico: il pannello DB rilevava il servizio postgres ma metteva
+            // credenziali placeholder (username/password/db vuoti) perche' qui
+            // non si parsava la sezione environment del servizio. Risultato:
+            // l'utente vedeva "Database progetto non configurato" e non capiva
+            // se il DB applicativo esistesse o no. Ora cerchiamo, in ordine:
+            //   (a) DATABASE_URL / POSTGRES_URL / DB_URL gia' pronto (la fonte
+            //       piu' affidabile, e' una connection string completa);
+            //   (b) altrimenti combiniamo POSTGRES_USER/PASSWORD/DB visti nella
+            //       sezione environment del servizio db + porta host del
+            //       mapping ports (es. 5432:5432 -> host=localhost:5432).
+            // Gli hostname che corrispondono a nomi di servizio docker (db,
+            // postgres, postgresql, pg, mysql, mariadb) vengono sostituiti con
+            // 'localhost' perche' dall'host esterno il servizio risponde
+            // sul mapping di porta, non sul nome di servizio del network compose.
+            if r.connection_string.is_none() {
+                if let Some(cs) = extract_compose_connection_string(&content) {
+                    r.connection_string = Some(cs);
+                    r.hints.push(format!("{name}: connection string estratta"));
                 }
             }
         }
@@ -961,4 +1064,60 @@ fn build_sqlserver_config(conn_str: &str) -> anyhow::Result<tiberius::Config> {
     }
 
     Ok(config)
+}
+
+#[cfg(test)]
+mod compose_detection_tests {
+    use super::extract_compose_connection_string;
+
+    #[test]
+    fn estrae_database_url_e_normalizza_host_servizio() {
+        // Caso Beauty-Book reale: DATABASE_URL referenzia il nome servizio 'db'
+        // (network compose). Dall'host esterno si accede via localhost + port
+        // mapping, quindi il detector deve sostituire 'db' con 'localhost'.
+        let compose = r#"
+services:
+  db:
+    image: postgres:14-alpine
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=beauty_book
+    ports:
+      - '5432:5432'
+  backend:
+    environment:
+      - DATABASE_URL=postgres://user:password@db:5432/beauty_book
+"#;
+        let cs = extract_compose_connection_string(compose).expect("estratta");
+        assert_eq!(cs, "postgres://user:password@localhost:5432/beauty_book");
+    }
+
+    #[test]
+    fn fallback_a_pg_vars_se_no_database_url() {
+        let compose = r#"
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: myapp
+      POSTGRES_PASSWORD: s3cr3t
+      POSTGRES_DB: app_dev
+    ports:
+      - "5433:5432"
+"#;
+        let cs = extract_compose_connection_string(compose).expect("estratta");
+        // porta HOST 5433, container 5432: il detector deve usare 5433.
+        assert_eq!(cs, "postgres://myapp:s3cr3t@localhost:5433/app_dev");
+    }
+
+    #[test]
+    fn nessuna_url_e_nessuna_pg_var_ritorna_none() {
+        let compose = r#"
+services:
+  redis:
+    image: redis:7
+"#;
+        assert!(extract_compose_connection_string(compose).is_none());
+    }
 }

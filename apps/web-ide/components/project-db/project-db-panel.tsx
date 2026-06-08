@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useThemeColors } from "../../lib/theme";
 import {
   useProjectStore,
@@ -237,6 +237,35 @@ export function ProjectDbPanel({ project }: Props) {
   useEffect(() => {
     if (migrationsChangedAt > 0) void load();
   }, [migrationsChangedAt, load]);
+
+  // Auto-test della config rilevata, best-effort. Risolve il caso in cui il DB
+  // applicativo ESISTE ed e' raggiungibile, ma non e' registrato in
+  // `project_database_config`: prima della UI mostrava solo "Database progetto
+  // non configurato" e l'utente non poteva distinguere fra "non esiste" e "non
+  // lo vede". Ora il test gira automaticamente quando viene rilevata una
+  // connection_string nei sorgenti del progetto e non c'e' ancora una config
+  // registrata; il risultato (raggiungibile/non raggiungibile + n. tabelle)
+  // viene mostrato dal pannello DetectConfig accanto al bottone "Usa questa
+  // configurazione". Idempotente: parte una sola volta per ogni connection
+  // string osservata (skip se gia' testata o se test in corso).
+  const lastAutoTestedConnRef = useRef<string | null>(null);
+  useEffect(() => {
+    const cs = detectedConfig?.connection_string?.trim();
+    if (
+      !cs ||
+      !!config ||
+      busy ||
+      detectedTestResult !== null ||
+      lastAutoTestedConnRef.current === cs
+    ) {
+      return;
+    }
+    lastAutoTestedConnRef.current = cs;
+    void handleTestDetected();
+    // handleTestDetected definita sopra; le sue dipendenze (projectId,
+    // detectedConfig) sono catturate via closure stabile.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detectedConfig?.connection_string, config, busy, detectedTestResult]);
 
   const pending = migrations.filter((m) => m.status === "pending");
   const applied = migrations.filter((m) => m.status === "applied");
