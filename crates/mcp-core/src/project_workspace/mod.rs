@@ -13,6 +13,7 @@ pub mod playwright_install;
 pub mod port_recovery;
 pub mod processes;
 pub mod run_configs;
+pub mod run_mode;
 pub mod runtime_issues;
 pub mod scan_ports;
 pub mod service_discovery;

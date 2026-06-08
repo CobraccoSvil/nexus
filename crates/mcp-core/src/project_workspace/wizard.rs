@@ -1369,6 +1369,53 @@ pub async fn wizard_install_service(
     let svc_dir = format!("{}/.config/systemd/user", home);
     let svc_path = format!("{}/{}", svc_dir, unit_name);
 
+    // ── Coerenza modalita' di avvio del progetto (regola L, run_mode) ─────────
+    // Un progetto usa UNA sola modalita': NATIVO (npm/dotnet/...) oppure CONTAINER
+    // (docker compose). Installare un servizio nell'altra modalita' crea unit che
+    // si uccidono a vicenda (SIGTERM) -> il sito non parte (incidente beauty-book:
+    // backend.service npm + docker-compose insieme). Difesa autoritativa nel punto
+    // unico di creazione unit: si rifiuta il mix con 409, indicando come switchare.
+    // Fail-open: se la dir non e' leggibile o non si classifica, si procede come
+    // prima (nessuna regressione sul flusso esistente).
+    {
+        use super::run_mode::{exec_start_of_unit, run_mode_of};
+        let candidate_mode = run_mode_of(&exec_start);
+        if let Ok(mut rd) = tokio::fs::read_dir(&svc_dir).await {
+            let prefix = format!("{}-", slug);
+            while let Ok(Some(ent)) = rd.next_entry().await {
+                let fname = ent.file_name().to_string_lossy().to_string();
+                if fname == unit_name
+                    || !fname.starts_with(&prefix)
+                    || !fname.ends_with(".service")
+                {
+                    continue;
+                }
+                let Ok(content) = tokio::fs::read_to_string(ent.path()).await else {
+                    continue;
+                };
+                if let Some(es) = exec_start_of_unit(&content) {
+                    let other_mode = run_mode_of(&es);
+                    if other_mode != candidate_mode {
+                        return Err(api_error(
+                            StatusCode::CONFLICT,
+                            format!(
+                                "Conflitto di modalita' di avvio: il progetto ha gia' il servizio \
+                                 '{}' in modalita' {}, mentre '{}' sarebbe {}. Avvio nativo e \
+                                 container per lo stesso progetto si uccidono a vicenda (SIGTERM) e \
+                                 il sito non parte. Disinstalla i servizi dell'altra modalita' \
+                                 prima di installare questo, oppure usa la stessa modalita'.",
+                                fname,
+                                other_mode.label(),
+                                unit_name,
+                                candidate_mode.label()
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     tokio::fs::create_dir_all(&svc_dir)
         .await
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {}", e)))?;
