@@ -13,8 +13,42 @@ interface Props {
   depth: number;
   selectedId: string | null;
   onSelect: (id: string) => void;
-  /** Solo per il nodo radice: espandi i figli al primo livello. */
+  /** Stato iniziale se non c'e' un valore persistito; default false (chiuso). */
   defaultOpen?: boolean;
+  /** Prefisso univoco per persistere lo stato open/chiuso in localStorage.
+   *  Per i figli viene esteso col path del nodo: cosi' aprire una cartella in
+   *  un progetto/scope NON influenza lo stato in altri progetti. Se omesso, lo
+   *  stato non viene persistito (es. per un tree usa-e-getta).
+   */
+  persistKey?: string;
+}
+
+/** Storage key per il singolo nodo: prefisso + path completo. Path null
+ *  (radice) -> uso "_root" come placeholder. */
+function nodeStorageKey(prefix: string | undefined, path: string): string | null {
+  if (!prefix || typeof window === "undefined") return null;
+  return `${prefix}::${path || "_root"}`;
+}
+
+function readStoredOpen(key: string | null, fallback: boolean): boolean {
+  if (!key) return fallback;
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (raw === "1") return true;
+    if (raw === "0") return false;
+    return fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStoredOpen(key: string | null, value: boolean): void {
+  if (!key) return;
+  try {
+    window.localStorage.setItem(key, value ? "1" : "0");
+  } catch {
+    /* best-effort: quota / privacy mode */
+  }
 }
 
 export function WikiTreeNodeView({
@@ -23,9 +57,25 @@ export function WikiTreeNodeView({
   selectedId,
   onSelect,
   defaultOpen,
+  persistKey,
 }: Props) {
   const tc = useThemeColors();
-  const [open, setOpen] = React.useState(!!defaultOpen);
+  // Stato persistito: a primo render leggiamo da localStorage; se assente, usiamo
+  // `defaultOpen` (default false = tutti compressi). Ogni toggle salva su LS.
+  const storageKey = nodeStorageKey(persistKey, node.path);
+  const [open, setOpenState] = React.useState<boolean>(() =>
+    readStoredOpen(storageKey, !!defaultOpen),
+  );
+  const setOpen = React.useCallback(
+    (updater: boolean | ((prev: boolean) => boolean)) => {
+      setOpenState((prev) => {
+        const next = typeof updater === "function" ? updater(prev) : updater;
+        writeStoredOpen(storageKey, next);
+        return next;
+      });
+    },
+    [storageKey],
+  );
 
   // Radice: rende solo i figli senza header.
   if (depth === 0) {
@@ -38,7 +88,10 @@ export function WikiTreeNodeView({
             depth={depth + 1}
             selectedId={selectedId}
             onSelect={onSelect}
-            defaultOpen={depth < 1}
+            // Tutti i nodi (anche top-level) partono COMPRESSI di default. Lo
+            // stato eventualmente persistito in localStorage ha priorita'.
+            defaultOpen={false}
+            persistKey={persistKey}
           />
         ))}
       </>
@@ -79,6 +132,7 @@ export function WikiTreeNodeView({
               depth={depth + 1}
               selectedId={selectedId}
               onSelect={onSelect}
+              persistKey={persistKey}
             />
           ))}
       </>

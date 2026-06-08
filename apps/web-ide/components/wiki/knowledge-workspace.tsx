@@ -439,7 +439,12 @@ export function KnowledgeWorkspace({ scope, projectId, initialDocId }: Props) {
               setSelectedId(id);
               if (isMobile) setDrawerTree(false);
             }}
-            defaultOpen
+            // Tutti i gruppi top-level (es. "(senza path)", "backend",
+            // "frontend") partono COMPRESSI all'apertura del pannello.
+            // Lo stato viene persistito per scope/progetto in localStorage,
+            // cosi' al re-render successivo il pannello ricorda cosa aveva
+            // aperto l'utente.
+            persistKey={`wiki:${scope}:${projectId ?? "_meta"}`}
           />
         )}
       </div>

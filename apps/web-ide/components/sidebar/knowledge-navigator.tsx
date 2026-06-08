@@ -141,7 +141,12 @@ export function KnowledgeNavigator({ projectId }: Props) {
             depth={0}
             selectedId={null}
             onSelect={openDoc}
-            defaultOpen
+            // Tutti i gruppi top-level partono COMPRESSI all'apertura del
+            // pannello laterale Knowledge. Lo stato di apertura/chiusura viene
+            // persistito per progetto in localStorage (chiave
+            // `wiki:project:<projectId>:<path>`), cosi' al re-render successivo
+            // il pannello ricorda cosa aveva aperto l'utente.
+            persistKey={`wiki:project:${projectId}`}
           />
         )}
       </div>
