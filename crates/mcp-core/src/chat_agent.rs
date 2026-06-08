@@ -165,10 +165,21 @@ pub async fn agent_stream(
                 let s = BroadcastStream::new(rx).filter_map(|msg| async move {
                     match msg {
                         Ok(event) => {
+                            // Snapshot token cumulativi (kind="usage_snapshot"):
+                            // mappato a `agent_usage` PRIMA del ramo meta_step
+                            // generico, cosi' non appare come card meta-step in
+                            // chat ma alimenta la barra context live nel frontend.
+                            let is_usage_snapshot = event
+                                .meta_step
+                                .as_ref()
+                                .map(|m| m.kind == "usage_snapshot")
+                                .unwrap_or(false);
                             let event_type = if event.token_delta.is_some() {
                                 "agent_token"
                             } else if event.thinking_delta.is_some() {
                                 "agent_thinking"
+                            } else if is_usage_snapshot {
+                                "agent_usage"
                             } else if event.meta_step.is_some() {
                                 "agent_meta_step"
                             } else if event.is_final {
@@ -182,6 +193,13 @@ pub async fn agent_stream(
                                 serde_json::json!({ "delta": event.token_delta }).to_string()
                             } else if event_type == "agent_thinking" {
                                 serde_json::json!({ "text": event.thinking_delta }).to_string()
+                            } else if event_type == "agent_usage" {
+                                // Solo il payload con i token (camelCase gia' pronto).
+                                event
+                                    .meta_step
+                                    .as_ref()
+                                    .map(|m| m.payload.to_string())
+                                    .unwrap_or_else(|| "{}".to_string())
                             } else {
                                 serde_json::to_string(&event).unwrap_or_default()
                             };

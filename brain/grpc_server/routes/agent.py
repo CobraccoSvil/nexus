@@ -976,6 +976,26 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                         if delta.get("model_used"):
                             effective_model = delta["model_used"]
 
+                        # Token live: emette i token cumulativi a ogni iterazione
+                        # executor, cosi' la barra context della UI si aggiorna in
+                        # tempo reale senza attendere end_turn (event-driven, niente
+                        # polling). mcp-core lo ritrasmette come `agent_usage`.
+                        # `last_prompt_tokens` = prompt dell'iterazione corrente,
+                        # usato dal frontend per il ratio di riempimento context.
+                        if acc_total_tokens > 0:
+                            yield (
+                                "data: "
+                                + _json.dumps({
+                                    "type": "usage",
+                                    "prompt_tokens": acc_prompt_tokens,
+                                    "completion_tokens": acc_completion_tokens,
+                                    "total_tokens": acc_total_tokens,
+                                    "total_cost": acc_total_cost,
+                                    "last_prompt_tokens": int(delta.get("prompt_tokens") or 0),
+                                })
+                                + "\n\n"
+                            )
+
                         result_text = delta.get("result") or ""
                         if result_text:
                             yield (

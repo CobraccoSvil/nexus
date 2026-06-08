@@ -977,6 +977,54 @@ pub async fn run_via_brain(
                     // si riavvia ad ogni Ok). Nessuna azione necessaria.
                     tracing::debug!("brain SSE ping: run attivo");
                 }
+                "usage" => {
+                    // Token cumulativi live emessi dal brain a ogni iterazione
+                    // executor (vedi brain/grpc_server/routes/agent.py). Vengono
+                    // ritrasmessi al frontend come meta_step kind="usage_snapshot"
+                    // che chat_agent.rs mappa all'evento SSE `agent_usage`, cosi'
+                    // la barra context si aggiorna in tempo reale senza polling.
+                    // Riusa il campo meta_step esistente per non toccare i 12 call
+                    // site di AgentStepEvent (regola: niente patch speculative).
+                    let prompt_t = evt.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let completion_t =
+                        evt.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let total_t = evt.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let cost_t = evt.get("total_cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let last_pt =
+                        evt.get("last_prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    // Mantieni gli accumulatori coerenti col risultato finale anche
+                    // se end_turn non dovesse arrivare (es. stream troncato).
+                    if total_t > 0 {
+                        acc_prompt_tokens = prompt_t;
+                        acc_completion_tokens = completion_t;
+                        acc_total_tokens = total_t;
+                        acc_total_cost = cost_t;
+                    }
+                    if last_pt > 0 {
+                        last_prompt_tokens = Some(last_pt);
+                    }
+                    let _ = step_tx.send(AgentStepEvent {
+                        run_id: run_id_str.clone(),
+                        step: None,
+                        trace: None,
+                        is_final: false,
+                        token_delta: None,
+                        thinking_delta: None,
+                        meta_step: Some(AgentMetaStep {
+                            kind: "usage_snapshot".to_string(),
+                            title: String::new(),
+                            payload: json!({
+                                "totalTokens": total_t,
+                                "promptTokens": prompt_t,
+                                "completionTokens": completion_t,
+                                "lastPromptTokens": last_pt,
+                                "totalCostUsd": cost_t,
+                            }),
+                            correlation_id: None,
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                        }),
+                    });
+                }
                 "meta_step" => {
                     // Step semantico (plan/routing/clarify/fallback/reflection)
                     // ritrasmesso al frontend come AgentMetaStep. La persistenza

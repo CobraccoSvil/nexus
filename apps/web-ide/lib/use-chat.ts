@@ -577,6 +577,31 @@ export function useChat(
             return prev ? prev + "\n" + trimmed : trimmed;
           });
         } : undefined,
+        (usage) => {
+          // Token live (evento agent_usage): aggiorna la barra context in tempo
+          // reale durante il run. ctxRatio usa usage.totalPromptTokens = prompt
+          // dell'ultima chiamata (riempimento context). Patcha sia la map (per i
+          // pannelli) sia agentRun (per il composer) se primary.
+          const applyUsage = (run: AgentRunInfo): AgentRunInfo => ({
+            ...run,
+            usage: {
+              ...run.usage,
+              totalPromptTokens:
+                usage.lastPromptTokens || usage.promptTokens || run.usage?.totalPromptTokens,
+              totalCompletionTokens: usage.completionTokens ?? run.usage?.totalCompletionTokens,
+              totalTokens: usage.totalTokens ?? run.usage?.totalTokens,
+            },
+            totalCostUsd: usage.totalCostUsd ?? run.totalCostUsd,
+          });
+          setAgentRuns((prevMap) => {
+            const cur = prevMap.get(runId);
+            if (!cur) return prevMap;
+            return new Map(prevMap).set(runId, applyUsage(cur));
+          });
+          if (isPrimary) {
+            setAgentRun((prev) => (prev && prev.runId === runId ? applyUsage(prev) : prev));
+          }
+        },
       );
     },
     [projectId],
@@ -896,6 +921,28 @@ export function useChat(
                 );
                 if (isDup) return prev;
                 return new Map(prev).set(runId, [...current, meta.metaStep]);
+              });
+            },
+            undefined,
+            (usage) => {
+              // Token live anche per i run ripresi dopo conferma (stesso patch
+              // della sottoscrizione primaria).
+              const applyUsage = (run: AgentRunInfo): AgentRunInfo => ({
+                ...run,
+                usage: {
+                  ...run.usage,
+                  totalPromptTokens:
+                    usage.lastPromptTokens || usage.promptTokens || run.usage?.totalPromptTokens,
+                  totalCompletionTokens: usage.completionTokens ?? run.usage?.totalCompletionTokens,
+                  totalTokens: usage.totalTokens ?? run.usage?.totalTokens,
+                },
+                totalCostUsd: usage.totalCostUsd ?? run.totalCostUsd,
+              });
+              setAgentRun((prev) => (prev && prev.runId === runId ? applyUsage(prev) : prev));
+              setAgentRuns((prevMap) => {
+                const cur = prevMap.get(runId);
+                if (!cur) return prevMap;
+                return new Map(prevMap).set(runId, applyUsage(cur));
               });
             },
           );

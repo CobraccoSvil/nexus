@@ -248,6 +248,15 @@ export function subscribeAgentStream(
   onToken?: (delta: string) => void,
   onMetaStep?: (meta: AgentMetaStepPayload) => void,
   onThinking?: (text: string) => void,
+  /** Snapshot token cumulativi live (evento `agent_usage`), emesso a ogni
+   *  iterazione executor. Permette di aggiornare la barra context senza polling. */
+  onUsage?: (usage: {
+    totalTokens?: number;
+    promptTokens?: number;
+    completionTokens?: number;
+    lastPromptTokens?: number;
+    totalCostUsd?: number;
+  }) => void,
 ): () => void {
   const url = `${API_BASE}/api/chat/sessions/${sessionId}/agent-stream?run_id=${runId}`;
 
@@ -406,6 +415,13 @@ export function subscribeAgentStream(
       try {
         const data = JSON.parse((e as MessageEvent).data);
         onThinking?.(data.text as string);
+      } catch {}
+    });
+
+    es.addEventListener("agent_usage", (e) => {
+      try {
+        const data = JSON.parse((e as MessageEvent).data);
+        onUsage?.(data);
       } catch {}
     });
 
