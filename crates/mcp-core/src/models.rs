@@ -265,6 +265,14 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
             &vision_routable,
         );
 
+        // performance_tier inferito dal punto unico (regola L): prima era
+        // applicato SOLO ai nuovi insert (e solo nel path discovery API), quindi
+        // i flagship con naming recente (es. claude-opus-4-8, gpt-5.x) restavano
+        // 'medium' di default e l'auto-promoter non li trovava come 'heavy'.
+        // Qui lo (ri)calcoliamo ad ogni sync e lo propaghiamo anche alle righe
+        // esistenti 'auto' (le 'manual' restano protette dalla CASE sotto).
+        let inferred_tier = crate::model_catalog_sync::infer_tier_from_name(provider, model_id);
+
         // UPSERT: l'UPDATE dei flag avviene SOLO se capability_source='auto'
         // (le righe 'manual' curate da admin/migrazioni sono protette, ADR 0024).
         // I costi/context si aggiornano sempre.
@@ -272,12 +280,16 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
             r#"INSERT INTO ai_price_catalog (
                 provider, model, input_cost_per_million_tokens, output_cost_per_million_tokens,
                 currency, context_window, supports_tool_use, supports_vision,
-                is_thinking, uses_thinking_mode, agentic_thinking_policy, capability_source, is_enabled, display_name
-              ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, $9, $10, 'auto', FALSE, $2)
+                is_thinking, uses_thinking_mode, agentic_thinking_policy, capability_source, is_enabled, display_name,
+                performance_tier
+              ) VALUES ($1, $2, $3, $4, 'USD', $5, $6, $7, $8, $9, $10, 'auto', FALSE, $2, $11)
               ON CONFLICT (provider, model) DO UPDATE SET
                 input_cost_per_million_tokens = EXCLUDED.input_cost_per_million_tokens,
                 output_cost_per_million_tokens = EXCLUDED.output_cost_per_million_tokens,
                 context_window = EXCLUDED.context_window,
+                performance_tier = CASE WHEN ai_price_catalog.capability_source = 'auto'
+                                        THEN EXCLUDED.performance_tier
+                                        ELSE ai_price_catalog.performance_tier END,
                 supports_tool_use = CASE WHEN ai_price_catalog.capability_source = 'auto'
                                          THEN EXCLUDED.supports_tool_use
                                          ELSE ai_price_catalog.supports_tool_use END,
@@ -306,6 +318,7 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
         .bind(caps.is_thinking)
         .bind(caps.uses_thinking_mode)
         .bind(caps.agentic_thinking_policy)
+        .bind(inferred_tier)
         .fetch_one(db)
         .await;
 

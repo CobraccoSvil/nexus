@@ -204,6 +204,18 @@ pub(crate) fn infer_capabilities_from_name(provider: &str, model: &str) -> Vec<&
 /// Regole per famiglia (allineate alla migrazione 0354 che riclassifica gli
 /// esistenti): i modelli "piccoli" (mini/nano/lite/haiku/ministral/small/nemo)
 /// sono light; i flagship (opus/o3/o1/*-pro) heavy; il resto medium.
+/// Estrae il major version number da un nome modello OpenAI della famiglia
+/// `gpt-N` / `gpt-N.M` (es. "gpt-5.5" -> 5, "gpt-4.1-nano" -> 4). Ritorna None
+/// se il nome non e' un modello `gpt-` numerato (es. o-series, chatgpt-*).
+/// Usato dall'euristica tier per distinguere i flagship recenti (gpt-5+) dai
+/// modelli precedenti senza hardcodare i nomi esatti (regola G).
+fn openai_gpt_major(model_lower: &str) -> Option<u32> {
+    let rest = model_lower.strip_prefix("gpt-")?;
+    // Prende le cifre iniziali del token di versione (fino a '.', '-' o fine).
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 pub(crate) fn infer_tier_from_name(provider: &str, model: &str) -> &'static str {
     let m = model.to_ascii_lowercase();
     match provider {
@@ -226,12 +238,28 @@ pub(crate) fn infer_tier_from_name(provider: &str, model: &str) -> &'static str 
             }
         }
         "openai" => {
-            // o3/o1 reasoning + *-pro = flagship. o4-mini/gpt-*-mini/nano = piccoli.
-            if m.contains("o3") || m.contains("o1") || (m.contains("pro") && !m.contains("mini")) {
-                "heavy"
-            } else if m.contains("nano") || m.contains("mini") {
+            // I "piccoli" hanno la precedenza assoluta: qualunque variante
+            // mini/nano (anche di un flagship, es. gpt-5.4-mini) e' light.
+            if m.contains("nano") || m.contains("mini") {
                 "light"
+            } else if m.contains("o3") || m.contains("o1") || m.contains("pro") {
+                // Reasoning o-series (o1/o3) e varianti *-pro = flagship heavy.
+                "heavy"
+            } else if openai_gpt_major(&m).is_some_and(|major| major >= 5) {
+                // Flagship GPT di punta: gpt-5, gpt-5.x e successivi senza
+                // suffisso mini/nano e che non siano chat-only sono heavy.
+                // Parsare il major number (anziche' confrontare nomi esatti)
+                // mantiene l'euristica robusta alle versioni future della
+                // famiglia (regola G: niente nome modello hardcoded).
+                // I "chat-latest" sono varianti ottimizzate per chat veloce,
+                // non i flagship reasoning: restano medium.
+                if m.contains("chat") {
+                    "medium"
+                } else {
+                    "heavy"
+                }
             } else {
+                // gpt-4o, gpt-4.1, ecc. restano medium.
                 "medium"
             }
         }
@@ -655,6 +683,9 @@ async fn sync_provider(
     let mut inserted = 0u32;
     let mut disabled = 0u32;
     let mut reenabled = 0u32;
+    // Quante righe 'auto' di questo provider hanno avuto il performance_tier
+    // riallineato all'euristica corrente in questa passata (vedi blocco Some).
+    let mut tier_realigned = 0u32;
 
     // 1. Nuovi modelli dall'API non presenti nel catalog -> INSERT
     for api_model in &api_models {
@@ -864,6 +895,36 @@ async fn sync_provider(
                     .bind(cc.supports_vision)
                     .execute(db)
                     .await;
+
+                    // Stesso principio (regola H + L) per performance_tier: la
+                    // correzione dell'euristica infer_tier_from_name (es. i
+                    // flagship con naming recente) deve propagarsi alle righe
+                    // 'auto' GIA' presenti, non solo ai nuovi insert. Prima il
+                    // tier era scritto SOLO all'INSERT (ON CONFLICT DO NOTHING),
+                    // quindi i modelli flagship restavano 'medium' e l'auto-
+                    // promoter non li selezionava come 'heavy'. UPDATE mirato
+                    // (solo dove il tier differisce); le righe 'manual' restano
+                    // intatte (guard capability_source='auto').
+                    let inferred_tier = infer_tier_from_name(provider, api_model);
+                    let tier_res = sqlx::query(
+                        "UPDATE ai_price_catalog SET performance_tier = $3, updated_at = NOW() \
+                         WHERE provider = $1 AND model = $2 AND capability_source = 'auto' \
+                           AND performance_tier IS DISTINCT FROM $3",
+                    )
+                    .bind(provider)
+                    .bind(api_model)
+                    .bind(inferred_tier)
+                    .execute(db)
+                    .await;
+                    if let Ok(r) = tier_res {
+                        if r.rows_affected() > 0 {
+                            tier_realigned += 1;
+                            tracing::info!(
+                                "catalog_sync[{}]: tier riallineato '{}' -> {}",
+                                provider, api_model, inferred_tier
+                            );
+                        }
+                    }
                 }
                 // Re-enable SOLO se il modello e' ammesso dalla policy (ADR 0025):
                 // un legacy ricomparso nell'API non deve rientrare.
@@ -1043,6 +1104,13 @@ async fn sync_provider(
                 }
             }
         }
+    }
+
+    if tier_realigned > 0 {
+        tracing::info!(
+            "catalog_sync[{}]: performance_tier riallineato su {} righe 'auto'",
+            provider, tier_realigned
+        );
     }
 
     Ok((inserted, disabled, reenabled))
@@ -1249,6 +1317,27 @@ mod tests {
         assert_eq!(infer_tier_from_name("openai", "gpt-4.1-nano"), "light");
         assert_eq!(infer_tier_from_name("openai", "o4-mini"), "light");
         assert_eq!(infer_tier_from_name("openai", "gpt-4.1"), "medium");
+    }
+
+    #[test]
+    fn test_infer_tier_flagship_naming_recente() {
+        // OpenAI: i flagship gpt-5+ senza suffisso mini/nano sono heavy
+        // (prima erano erroneamente medium perche' l'euristica marcava heavy
+        // solo con 'pro' nel nome). Robusto alle versioni future via major.
+        assert_eq!(infer_tier_from_name("openai", "gpt-5"), "heavy");
+        assert_eq!(infer_tier_from_name("openai", "gpt-5.5"), "heavy");
+        assert_eq!(infer_tier_from_name("openai", "gpt-5.4"), "heavy");
+        assert_eq!(infer_tier_from_name("openai", "gpt-6"), "heavy");
+        // Le varianti piccole di un flagship restano light.
+        assert_eq!(infer_tier_from_name("openai", "gpt-5.4-mini"), "light");
+        assert_eq!(infer_tier_from_name("openai", "gpt-5-nano"), "light");
+        // chat-latest = variante chat veloce, non flagship reasoning -> medium.
+        assert_eq!(infer_tier_from_name("openai", "gpt-5-chat-latest"), "medium");
+        // I gpt precedenti (4.x, 4o) restano medium.
+        assert_eq!(infer_tier_from_name("openai", "gpt-4o"), "medium");
+        assert_eq!(infer_tier_from_name("openai", "gpt-4.1"), "medium");
+        // Anthropic: naming nuovo opus-4-8 deve restare heavy (caso del bug).
+        assert_eq!(infer_tier_from_name("anthropic", "claude-opus-4-8"), "heavy");
     }
 
     #[test]
