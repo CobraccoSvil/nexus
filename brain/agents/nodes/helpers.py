@@ -447,6 +447,41 @@ def _load_exploration_loop_threshold() -> int:
     return value
 
 
+# ── Cache flag progress_controller (TTL 60s) ────────────────────────────────
+# Interruttore del punto unico di controllo avanzamento (progress_controller):
+# quando attivo, gli stalli del ciclo agentico seguono la gerarchia coordinata
+# guida(forza-azione) -> escalate -> abort-verso-verifica invece di abortire
+# subito. Default true (regola G: niente hardcode, DB unica fonte). OFF = ripristina
+# il comportamento legacy (abort immediato) senza redeploy.
+_PROGRESS_CTRL_CACHE: dict[str, Any] = {"loaded_at": 0.0, "enabled": None}
+_PROGRESS_CTRL_TTL_SEC = 60.0
+_PROGRESS_CTRL_DEFAULT = True
+
+
+def _load_progress_controller_enabled() -> bool:
+    """Legge agent.progress_controller_enabled dal DB con cache 60s.
+
+    Ritorna il default (True) se il DB e' irraggiungibile o la chiave non esiste:
+    get_bool_setting non solleva mai.
+    """
+    now = time.time()
+    cached = _PROGRESS_CTRL_CACHE["enabled"]
+    if cached is not None and (now - _PROGRESS_CTRL_CACHE["loaded_at"]) < _PROGRESS_CTRL_TTL_SEC:
+        return bool(cached)
+    try:
+        from brain.utils.settings_db import get_bool_setting
+        value = bool(get_bool_setting("agent.progress_controller_enabled", _PROGRESS_CTRL_DEFAULT))
+    except Exception as exc:
+        logger.warning(
+            "progress_controller_enabled: load DB fallito, uso default %s (%s)",
+            _PROGRESS_CTRL_DEFAULT, exc,
+        )
+        value = _PROGRESS_CTRL_DEFAULT
+    _PROGRESS_CTRL_CACHE["enabled"] = value
+    _PROGRESS_CTRL_CACHE["loaded_at"] = now
+    return value
+
+
 # ── Cache reminder lingua resiliente (TTL 60s) ──────────────────────────────
 # Bug #88: a contesto saturo (>400K token) i modelli small con forte recency
 # bias ignorano la direttiva di lingua presente solo in testa al system prompt

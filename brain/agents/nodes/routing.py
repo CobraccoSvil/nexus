@@ -24,6 +24,29 @@ from .helpers import (
 logger = logging.getLogger(__name__)
 
 
+def _final_gate_eligible(state: AgentState) -> bool:
+    """Punto unico: True se per questo stato e' eleggibile la verifica E2E
+    pre-chiusura (task software, gate abilitato, cap non raggiunto).
+
+    Usato sia dal ramo end_turn-senza-plan sia dagli abort coordinati
+    (loop_abort / loop_detected / g1_cap_reached): cosi' un run che chiude NON
+    salta mai la verifica disponibile. Best-effort: ogni errore -> non eleggibile
+    (mai bloccare il routing).
+    """
+    if state.get("plan_phase_active"):
+        return False
+    try:
+        from .. import final_gate as _fg
+        _cfg = orchestrator_config.get()
+        if not _cfg.get("final_gate_enabled") or not _fg._is_software_task(state, _cfg):
+            return False
+        _fc = int(state.get("final_gate_cycle", 0) or 0)
+        return _fc < int(_cfg["final_gate_max_cycles"])
+    except Exception as _e:
+        logger.debug("route_after_executor: final_gate eligibility skip (%s)", _e)
+        return False
+
+
 def route_after_executor(state: AgentState) -> str:
     """Decide se iterare (tool_dispatch), verificare (verifier), o chiudere (learner).
 
@@ -39,12 +62,9 @@ def route_after_executor(state: AgentState) -> str:
     pending = state.get("pending_tool_uses") or []
     # Mig 0181: cap adattivo dal router_node, fallback a MAX_AGENT_ITERATIONS.
     iter_cap = int(state.get("iteration_budget") or 0) or MAX_AGENT_ITERATIONS
-    if stop_reason == "loop_detected":
-        logger.warning("route_after_executor: loop detected, chiusura forzata")
-        return "learner"
     # Cancellazione cooperativa (single-run-per-session): executor_node ha
     # rilevato che questo run e' stato superato/cancellato sulla stessa sessione.
-    # Chiusura immediata: il loop in memoria termina, niente altri step in chat.
+    # Chiusura immediata SENZA verifica: il run e' obsoleto, niente altri step.
     if stop_reason == "superseded":
         logger.warning("route_after_executor: run superato (last-wins), chiusura cooperativa")
         return "learner"
@@ -54,11 +74,24 @@ def route_after_executor(state: AgentState) -> str:
     if stop_reason == "g1_escalated":
         logger.warning("route_after_executor: G1 escalation orchestratore -> re-executor")
         return "executor"
-    # G1 cap: l'executor stesso ha gia' segnalato di aver raggiunto il
-    # numero massimo di re-execution G1 e ha emesso il messaggio assistant
-    # esplicativo. Andiamo direttamente al learner senza altri giri.
-    if stop_reason == "g1_cap_reached":
-        logger.warning("route_after_executor: G1 cap raggiunto, chiusura forzata")
+    # Abort coordinato (loop_abort, progress_controller) o legacy (loop_detected /
+    # g1_cap_reached): NON chiudere "morto". Causa radice corretta qui: gli abort
+    # scavalcavano il final_gate andando dritti al learner, chiudendo un task
+    # potenzialmente incompleto senza alcuna verifica del flusso reale. Ora, se il
+    # task e' software e la verifica E2E e' disponibile, si passa per il final_gate
+    # (che puo' rimandare all'executor con la diagnosi del flusso, o chiudere se
+    # pulito). Il cap final_gate_max_cycles resta la safety anti-loop.
+    if stop_reason in ("loop_abort", "loop_detected", "g1_cap_reached"):
+        if _final_gate_eligible(state):
+            logger.warning(
+                "route_after_executor: stop=%s -> final_gate (verifica E2E prima di chiudere)",
+                stop_reason,
+            )
+            return "final_gate"
+        logger.warning(
+            "route_after_executor: stop=%s, verifica E2E non eleggibile -> learner",
+            stop_reason,
+        )
         return "learner"
     if iterations >= iter_cap:
         logger.warning(
@@ -157,23 +190,11 @@ def route_after_executor(state: AgentState) -> str:
             )
     # Final gate generale (fail-closed): per task software che chiudono SENZA
     # plan_phase (il verifier non gira), un gate minimo verifica che il codice
-    # importato non resti orfano (app placeholder). Indipendente dal planner.
-    if not state.get("plan_phase_active"):
-        try:
-            # orchestrator_config e' gia' importato a livello modulo (riga ~27).
-            # NON re-importarlo qui: un import locale lo renderebbe variabile
-            # locale per TUTTA la funzione, e l'uso precedente a riga ~4004
-            # (ramo plan_phase_active) solleverebbe UnboundLocalError quando un
-            # piano e' attivo. Importiamo solo final_gate (non globale, cicli).
-            from .. import final_gate as _fg
-            _cfg = orchestrator_config.get()
-            if _cfg.get("final_gate_enabled") and _fg._is_software_task(state, _cfg):
-                _fc = int(state.get("final_gate_cycle", 0) or 0)
-                if _fc < int(_cfg["final_gate_max_cycles"]):
-                    logger.info("route_after_executor: software task end_turn senza plan -> final_gate")
-                    return "final_gate"
-        except Exception as _e:
-            logger.debug("route_after_executor: final_gate skip (%s)", _e)
+    # importato non resti orfano (app placeholder) e che i log dei servizi siano
+    # puliti. Stesso punto unico di eleggibilita' usato dagli abort coordinati.
+    if _final_gate_eligible(state):
+        logger.info("route_after_executor: software task end_turn senza plan -> final_gate")
+        return "final_gate"
     return "learner"
 
 

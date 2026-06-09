@@ -187,6 +187,18 @@ class AgentState(TypedDict, total=False):
     # continua a chiamare lo stesso comando fallito.
     repeated_cmd_nudge_sent: bool
 
+    # progress_controller (punto unico, regola L): assi di stallo per i quali la
+    # forza-azione (GUIDE) e' GIA' stata applicata in questo run. Un asse qui
+    # presente sale di livello al prossimo stallo (escalate/abort) invece di
+    # ri-guidare. L'asse "exploration" viene rimosso quando il modello torna
+    # produttivo (reset coordinato). Sostituisce concettualmente i flag *_nudge_sent
+    # sparsi durante la convergenza al punto unico.
+    progress_guided_axes: list[str]
+    # True quando un abort coordinato (stop_reason="loop_abort") ha chiuso il run
+    # senza che il task sia stato verificato: instrada alla verifica E2E
+    # (final_gate) invece che al learner morto. Letto da route_after_executor.
+    forced_close_unverified: bool
+
     # M61 sticky cascade fallback: dopo un cascade riuscito, persisti il
     # provider/model effettivo cosi' le iter successive partono direttamente
     # da li' invece di ri-tentare il primario fallito ad ogni round.

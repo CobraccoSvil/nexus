@@ -63,6 +63,7 @@ from .helpers import (
     _EXPLORATION_LOOP_TTL_SEC,
     _EXPLORATION_LOOP_DEFAULT,
     _load_exploration_loop_threshold,
+    _load_progress_controller_enabled,
     _LANG_REMINDER_MARKER,
     _LANG_REMINDER_CACHE,
     _LANG_REMINDER_TTL_SEC,
@@ -1593,10 +1594,61 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     _exploration_threshold = _load_exploration_loop_threshold()
     _exploration_nudge_sent = bool(state.get("exploration_nudge_sent") or False)
     _exploration_nudge_injected = False
-    if _exploration_count >= 2 * _exploration_threshold:
+    # Forza-azione hard: quando attivo, il blocco a valle rimuove TUTTI i tool di
+    # sola lettura e il forcing obbliga una tool call (tool_choice required).
+    # Veicolato dal progress_controller (livello GUIDE) attraverso il nodo.
+    _force_action_hard = False
+    _progress_guided: set[str] = set(state.get("progress_guided_axes") or [])
+    _progress_ctrl_on = _load_progress_controller_enabled()
+    if _exploration_count >= 2 * _exploration_threshold and _progress_ctrl_on:
+        # PUNTO UNICO (progress_controller): a 2x soglia NON abortiamo subito. La
+        # gerarchia coordinata decide guida(forza-azione) -> abort-verso-verifica.
+        # provider/model non sono ancora risolti qui: l'escalation vera avviene
+        # sugli assi signature/G1 (dove il modello e' noto); per l'esplorazione la
+        # forza-azione e' il livello che mancava ed e' sufficiente a sbloccare.
+        from .. import progress_controller as _pc
+        _pc_dec = _pc.decide(_pc.ProgressSignals(
+            exploration_count=_exploration_count,
+            exploration_threshold=_exploration_threshold,
+            already_guided=frozenset(_progress_guided),
+            has_escalation_candidate=False,
+        ))
+        if _pc_dec.action == "guide":
+            _force_action_hard = True
+            _progress_guided.add("exploration")
+            if _pc_dec.nudge_text:
+                messages = list(messages) + [HumanMessage(content=_pc_dec.nudge_text)]
+            logger.warning(
+                "executor_node: progress_controller GUIDE esplorazione (count=%d) -> "
+                "forza-azione (read-only disabilitati + tool_choice required)",
+                _exploration_count,
+            )
+        else:
+            logger.warning(
+                "executor_node: progress_controller ABORT esplorazione (count=%d): %s",
+                _exploration_count, _pc_dec.reason,
+            )
+            _expl_text = (
+                f"Esplorazione ripetuta ({_exploration_count} letture consecutive) "
+                f"senza produrre un risultato, anche dopo il sollecito ad agire. "
+                f"Chiudo passando per la verifica del flusso."
+            )
+            return {
+                "messages": [AIMessage(content=_expl_text)],
+                "result": _expl_text,
+                "pending_tool_uses": [],
+                "stop_reason": _pc_dec.stop_reason,
+                "iterations": int(state.get("iterations") or 0) + 1,
+                "consecutive_exploration_calls": _exploration_count,
+                "exploration_nudge_sent": _exploration_nudge_sent,
+                "progress_guided_axes": sorted(_progress_guided),
+                "forced_close_unverified": True,
+            }
+    elif _exploration_count >= 2 * _exploration_threshold:
+        # Controller disattivato (flag DB off): comportamento legacy (abort secco).
         logger.warning(
             "executor_node: LOOP esplorativo (%d chiamate >= 2x soglia %d) senza "
-            "scrittura. Abort.",
+            "scrittura, controller OFF -> abort legacy.",
             _exploration_count, _exploration_threshold,
         )
         _expl_text = (
@@ -2092,7 +2144,17 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 )
             except Exception:
                 _supports_forcing = False
-            if should_force_tool_choice(
+            if _force_action_hard and _supports_forcing:
+                # Forza-azione del progress_controller: a prescindere dalle soglie
+                # del forcing "early action", l'agente in stallo esplorativo DEVE
+                # emettere una tool call produttiva (i read-only sono gia' rimossi).
+                _force_tc = True
+                logger.warning(
+                    "executor_node: progress_controller forza tool_choice required "
+                    "(forza-azione esplorazione, provider=%s)",
+                    provider,
+                )
+            elif should_force_tool_choice(
                 tools_available=bool(tools_json),
                 action_oriented=_action_oriented_tc,
                 iteration=_current_iterations,
@@ -2461,8 +2523,12 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             _updated_exploration_count += len(_pending_names)
         else:
             # Almeno una call produttiva: il modello sta scrivendo, reset.
+            # Reset coordinato (progress_controller): l'asse esplorazione esce
+            # dagli assi gia' guidati, cosi' un nuovo eventuale stallo riparte
+            # dalla forza-azione (GUIDE) e non salta dritto all'abort.
             _updated_exploration_count = 0
             _updated_exploration_nudge_sent = False
+            _progress_guided.discard("exploration")
 
     # Calcola cache hit rate
     total_tokens = prompt_tokens + completion_tokens + cache_creation_tokens + cache_read_tokens
@@ -2582,6 +2648,7 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         "recent_tool_signatures": updated_signatures,
         "consecutive_exploration_calls": _updated_exploration_count,
         "exploration_nudge_sent": _updated_exploration_nudge_sent,
+        "progress_guided_axes": sorted(_progress_guided),
         "repeated_cmd_nudge_sent": _repeated_cmd_nudge_sent,
         "auto_escalations": escalations if loop_sig is not None else int(state.get("auto_escalations") or 0),
         "prompt_tokens": prompt_tokens,
