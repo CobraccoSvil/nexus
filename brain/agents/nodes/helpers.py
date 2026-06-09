@@ -485,9 +485,12 @@ def _load_progress_controller_enabled() -> bool:
 # ── Cache reminder lingua resiliente (TTL 60s) ──────────────────────────────
 # Bug #88: a contesto saturo (>400K token) i modelli small con forte recency
 # bias ignorano la direttiva di lingua presente solo in testa al system prompt
-# e rispondono in cinese, allucinando l'identita'. Iniettiamo SEMPRE un reminder
-# di lingua in coda al system_text e in coda all'ultimo HumanMessage (recency),
-# coprendo cosi' anche i profili custom e gli 82 template senza direttiva.
+# e rispondono in una lingua diversa da quella dell'utente (es. inglese su
+# richiesta italiana, o cinese allucinando l'identita'). Iniettiamo SEMPRE un
+# reminder di lingua in coda al system_text e in coda all'ultimo HumanMessage
+# (recency), coprendo cosi' anche i profili custom e i template senza direttiva.
+# Il reminder NON impone una lingua fissa: impone di seguire la lingua del
+# messaggio utente (regola: la lingua di risposta e' quella della richiesta).
 # I default valgono SOLO se il DB e' down (regola G: niente hardcode sparso).
 _LANG_REMINDER_MARKER = "[[NEXUS_LANG_REMINDER]]"
 _LANG_REMINDER_CACHE: dict[str, Any] = {
@@ -498,8 +501,12 @@ _LANG_REMINDER_CACHE: dict[str, Any] = {
 _LANG_REMINDER_TTL_SEC = 60.0
 _LANG_REMINDER_DEFAULT_ENABLED = True
 _LANG_REMINDER_DEFAULT_TEXT = (
-    "Rispondi SEMPRE e SOLO in italiano. Mai cinese, giapponese o altre "
-    "lingue, qualunque sia la lingua del contesto o degli allegati."
+    "Rispondi SEMPRE nella STESSA lingua del messaggio dell'utente "
+    "(la lingua dell'ultima richiesta in chat). Se l'utente scrive in "
+    "italiano rispondi in italiano, se scrive in inglese rispondi in "
+    "inglese, e cosi' via. NON cambiare lingua per via del contesto, del "
+    "codice, della documentazione o degli allegati: la lingua di risposta "
+    "e' SOLO quella dell'utente."
 )
 
 # ── Forced RAG reminder (ADR 0016 Fase A.4) ─────────────────────────────────
@@ -623,8 +630,9 @@ def _inject_forced_rag_reminder(
 def _load_language_reminder() -> tuple[bool, str]:
     """Legge agent.language_reminder_enabled / _text dal DB con cache 60s.
 
-    Ritorna (enabled, text). I default sicuri (True, testo italiano) valgono
-    SOLO se il DB e' irraggiungibile o la chiave non esiste: get_bool_setting /
+    Ritorna (enabled, text). I default sicuri (True, "rispondi nella lingua
+    dell'utente") valgono SOLO se il DB e' irraggiungibile o la chiave non
+    esiste: get_bool_setting /
     get_setting non sollevano mai. Quando enabled e' False l'iniezione del
     reminder non avviene affatto (vedi _inject_language_reminder).
     """
@@ -996,6 +1004,126 @@ def _detect_action_request(text: str) -> bool:
         return False
     lower = text.lower()
     return any(p in lower for p in _ACTION_PATTERNS)
+
+
+# ── FIX C: richiesta esplicita di verifica/test da parte dell'utente ────────
+# Incident run f1db9550: l'utente ha chiesto "verifica tu stesso provando ad
+# accedere con costantino@cobracco.it" ma l'agente ha chiuso senza eseguire
+# alcun login/test. Quando il messaggio utente contiene una richiesta esplicita
+# di verifica, l'agente DEVE eseguire davvero la verifica (chiamata HTTP/comando)
+# e riportarne l'esito reale PRIMA di dichiarare completato. Punto unico:
+# rilevatore + iniezione direttiva (riusa il pattern idempotente del lang reminder).
+_VERIFICATION_REQUEST_PATTERNS: tuple[str, ...] = (
+    # Italiano
+    "verifica tu", "verifica che", "verifica il", "verifica la", "verifica se",
+    "verifica personalmente", "verifica direttamente", "verificalo",
+    "prova ad accedere", "prova a fare", "prova tu", "prova il login",
+    "prova a loggarti", "prova a entrare", "provalo", "fai una prova",
+    "testa tu", "testa il", "testa la", "testa che", "testalo", "fai un test",
+    "assicurati che funzioni", "assicurati che funzionino",
+    "controlla che funzioni", "controlla che funzionino",
+    "accertati che funzioni", "verifica che funzioni",
+    "verifica il funzionamento", "verifica che tutto funzioni",
+    # Inglese (l'utente puo' scrivere in inglese: regola lingua a parte)
+    "verify yourself", "verify that", "verify it", "test it yourself",
+    "try to log in", "try logging in", "try to access", "make sure it works",
+    "check that it works", "test that it works", "verify it works",
+)
+
+
+def _detect_verification_request(text: str) -> bool:
+    """True se il messaggio utente chiede esplicitamente di verificare/testare.
+
+    Diverso da `_detect_action_request` (che valuta una richiesta d'azione
+    generica): qui isoliamo la richiesta di VERIFICA reale (provare il flusso,
+    fare login, testare il funzionamento) cosi' l'agente sa che deve eseguire
+    la prova e riportarne l'esito, non solo "fare" e dichiarare completato.
+    """
+    if not text or not text.strip():
+        return False
+    lower = text.lower()
+    return any(p in lower for p in _VERIFICATION_REQUEST_PATTERNS)
+
+
+# Direttiva di auto-verifica iniettata quando l'utente la richiede (FIX C).
+# DB-driven (regola G): testo configurabile, default sicuro se DB down.
+_VERIFY_DIRECTIVE_MARKER = "[[NEXUS_VERIFY_DIRECTIVE]]"
+_VERIFY_DIRECTIVE_CACHE: dict[str, Any] = {
+    "loaded_at": 0.0,
+    "enabled": None,
+    "text": None,
+}
+_VERIFY_DIRECTIVE_TTL_SEC = 60.0
+_VERIFY_DIRECTIVE_DEFAULT_ENABLED = True
+_VERIFY_DIRECTIVE_DEFAULT_TEXT = (
+    "L'utente ha chiesto ESPLICITAMENTE di verificare/testare il risultato. "
+    "Prima di dichiarare completato DEVI eseguire davvero la verifica con una "
+    "tool call concreta (es. run_command con curl/HTTP per provare il login o "
+    "l'endpoint, oppure il comando di test pertinente) e riportare l'ESITO "
+    "REALE osservato (codice di stato, output, successo/fallimento). NON "
+    "inventare ne' assumere il risultato. Se non puoi eseguire la verifica "
+    "(strumento mancante, credenziali non disponibili, ambiente non avviabile), "
+    "DICHIARALO esplicitamente spiegando cosa manca, invece di dare per scontato "
+    "che funzioni."
+)
+
+
+def _load_verification_directive() -> tuple[bool, str]:
+    """Legge agent.verification_directive_enabled / _text dal DB (cache 60s).
+
+    Ritorna (enabled, text). Default sicuri se DB down: get_*_setting non
+    sollevano mai.
+    """
+    now = time.time()
+    cached = _VERIFY_DIRECTIVE_CACHE["enabled"]
+    if cached is not None and (
+        now - _VERIFY_DIRECTIVE_CACHE["loaded_at"]
+    ) < _VERIFY_DIRECTIVE_TTL_SEC:
+        return bool(cached), str(_VERIFY_DIRECTIVE_CACHE["text"])
+    enabled = _VERIFY_DIRECTIVE_DEFAULT_ENABLED
+    text = _VERIFY_DIRECTIVE_DEFAULT_TEXT
+    try:
+        from brain.utils.settings_db import get_bool_setting, get_setting
+        enabled = get_bool_setting(
+            "agent.verification_directive_enabled", _VERIFY_DIRECTIVE_DEFAULT_ENABLED
+        )
+        text = get_setting(
+            "agent.verification_directive_text", _VERIFY_DIRECTIVE_DEFAULT_TEXT
+        ).strip() or _VERIFY_DIRECTIVE_DEFAULT_TEXT
+    except Exception as exc:
+        logger.warning(
+            "verification_directive: load DB fallito, uso default (enabled=%s) (%s)",
+            _VERIFY_DIRECTIVE_DEFAULT_ENABLED, exc,
+        )
+    _VERIFY_DIRECTIVE_CACHE["enabled"] = enabled
+    _VERIFY_DIRECTIVE_CACHE["text"] = text
+    _VERIFY_DIRECTIVE_CACHE["loaded_at"] = now
+    return enabled, text
+
+
+def _inject_verification_directive(
+    system_text: str,
+    first_human_text: str,
+) -> str:
+    """Inietta la direttiva di auto-verifica nel system_text se l'utente la chiede.
+
+    Funzione pura e idempotente (marcatore univoco). Iniezione in coda al
+    system prompt: la direttiva integra il protocollo agente solo per i run in
+    cui l'utente ha chiesto una verifica reale, senza appesantire gli altri.
+
+    Ritorna `system_text` (eventualmente esteso). Invariato se la richiesta non
+    contiene una verifica esplicita, se disabilitata, o se gia' presente.
+    """
+    if not _detect_verification_request(first_human_text):
+        return system_text
+    enabled, directive = _load_verification_directive()
+    if not enabled or not directive:
+        return system_text
+    base = system_text or ""
+    if _VERIFY_DIRECTIVE_MARKER in base:
+        return system_text
+    block = f"### AUTO-VERIFICA RICHIESTA DALL'UTENTE ###\n{directive}"
+    return f"{base}\n\n{_VERIFY_DIRECTIVE_MARKER}\n{block}"
 
 
 # Pattern di "intenzione imminente non compiuta": il modello annuncia la
@@ -1373,6 +1501,118 @@ def _detect_repeated_failed_command(messages: list, lookback: int = 12) -> tuple
     # Ritorna la signature piu' frequente (preferisce l'ultima in caso di parita').
     top = max(failed_signatures.items(), key=lambda kv: (kv[1], kv[0] == last_signature))
     return (top[0].split("|", 1)[0], top[1])
+
+
+# ── Cache soglia azioni produttive ripetute identiche (TTL 60s) ─────────────
+# FIX B (incident run f1db9550): il signature-loop esistente cattura SOLO la
+# stessa identica tool call ripetuta >=3 volte in una finestra di 6 signature.
+# Una SEQUENZA di azioni diverse (es. edit_file -> npm install -> rm node_modules
+# -> npm install -> npm run build) ripetuta integralmente 2 volte non scatta: ogni
+# singola azione appare 2 volte, sotto la soglia 3. Qui rileviamo la ripetizione
+# IDENTICA di una azione PRODUTTIVA (scrittura/comando), indipendentemente
+# dall'esito (diverso da _detect_repeated_failed_command, che richiede errore).
+# Soglia DB-driven (regola G): default 2 (la seconda ripetizione identica e'
+# gia' sintomo di stallo su lavoro reale, non vale la pena ripetere una terza).
+_REPEATED_ACTION_CACHE: dict[str, Any] = {"loaded_at": 0.0, "threshold": None}
+_REPEATED_ACTION_TTL_SEC = 60.0
+_REPEATED_ACTION_DEFAULT_THRESHOLD = 2
+
+# Tool PRODUTTIVI tracciati per azione ripetuta -> chiave argomento che ne
+# definisce l'identita'. Una ripetizione identica = stesso tool + stesso valore
+# della chiave (path per le scritture, command per i comandi).
+_REPEATED_ACTION_TOOLS: dict[str, tuple[str, ...]] = {
+    "write_file": ("path", "file_path"),
+    "edit_file": ("path", "file_path"),
+    "run_command": ("command",),
+    "run_service": ("command",),
+    "run_in_terminal": ("command",),
+}
+
+
+def _load_repeated_action_threshold() -> int:
+    """Legge agent.repeated_action_threshold dal DB con cache 60s.
+
+    Ritorna il default sicuro (2) se il DB e' irraggiungibile o la chiave non
+    esiste: get_int_setting non solleva mai. Soglia minima 2 (1 sarebbe la
+    prima esecuzione legittima, non una ripetizione).
+    """
+    now = time.time()
+    cached = _REPEATED_ACTION_CACHE["threshold"]
+    if cached is not None and (
+        now - _REPEATED_ACTION_CACHE["loaded_at"]
+    ) < _REPEATED_ACTION_TTL_SEC:
+        return int(cached)
+    value = _REPEATED_ACTION_DEFAULT_THRESHOLD
+    try:
+        from brain.utils.settings_db import get_int_setting
+        value = int(get_int_setting(
+            "agent.repeated_action_threshold", _REPEATED_ACTION_DEFAULT_THRESHOLD
+        ))
+        if value < 2:
+            value = _REPEATED_ACTION_DEFAULT_THRESHOLD
+    except Exception as exc:
+        logger.warning(
+            "repeated_action_threshold: load DB fallito, uso default %d (%s)",
+            _REPEATED_ACTION_DEFAULT_THRESHOLD, exc,
+        )
+        value = _REPEATED_ACTION_DEFAULT_THRESHOLD
+    _REPEATED_ACTION_CACHE["threshold"] = value
+    _REPEATED_ACTION_CACHE["loaded_at"] = now
+    return value
+
+
+def _detect_repeated_action(messages: list, lookback: int = 24) -> tuple[str | None, int]:
+    """Rileva la ripetizione IDENTICA di una azione produttiva (scrittura/comando).
+
+    Diverso da `_detect_repeated_failed_command`: NON richiede che l'azione sia
+    fallita. Cattura il pattern "stessa azione produttiva eseguita N volte" che
+    indica uno stallo su lavoro reale (incident run f1db9550: stessa sequenza
+    edit_file/npm install/build ripetuta integralmente).
+
+    Scansiona gli ultimi `lookback` messaggi, estrae i blocchi tool_use dei tool
+    in `_REPEATED_ACTION_TOOLS` e costruisce una signature `name|valore-chiave`.
+    Conta le occorrenze di ogni signature.
+
+    Ritorna `(label, count)` della signature piu' frequente (label leggibile
+    "name: valore"), oppure `(None, 0)` se nessuna azione tracciata e' presente.
+    """
+    if not messages:
+        return (None, 0)
+    counts: dict[str, int] = {}
+    labels: dict[str, str] = {}
+    last_sig: str | None = None
+    recent = messages[-lookback:] if len(messages) > lookback else messages
+    for m in recent:
+        if not isinstance(m, AIMessage):
+            continue
+        extra = getattr(m, "additional_kwargs", {}) or {}
+        blocks = extra.get("anthropic_content") or []
+        if not isinstance(blocks, list):
+            continue
+        for b in blocks:
+            if not isinstance(b, dict) or b.get("type") != "tool_use":
+                continue
+            name = b.get("name", "")
+            keys = _REPEATED_ACTION_TOOLS.get(name)
+            if not keys:
+                continue
+            inp = b.get("input", {}) or {}
+            value = ""
+            for k in keys:
+                v = str(inp.get(k, "") or "").strip()
+                if v:
+                    value = v
+                    break
+            if not value:
+                continue
+            sig = f"{name}|{value}"
+            counts[sig] = counts.get(sig, 0) + 1
+            labels[sig] = f"{name}: {value[:120]}"
+            last_sig = sig
+    if not counts:
+        return (None, 0)
+    top = max(counts.items(), key=lambda kv: (kv[1], kv[0] == last_sig))
+    return (labels.get(top[0], top[0]), top[1])
 
 
 def _detect_recent_tool_error(messages: list, lookback: int = 4) -> bool:

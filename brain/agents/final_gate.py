@@ -175,10 +175,18 @@ async def final_gate_node(state: dict[str, Any]) -> dict[str, Any]:
         logger.info("final_gate: passato (cycle=%d) -> chiusura", cycle)
         return {"final_gate_cycle": 0, "stop_reason": "end_turn"}
 
-    if cycle >= max_cycles:
+    # Chiusura SENZA re-executor quando:
+    #  - forced_close_unverified: siamo qui per un ABORT anti-loop. L'agente e'
+    #    gia' dichiarato bloccato; rimandarlo all'executor lo fa ri-abortire,
+    #    accumulando un secondo AIMessage identico -> messaggio finale DUPLICATO
+    #    (bug osservato) e un mini-loop abort<->final_gate. La verifica E2E e'
+    #    stata comunque eseguita una volta sopra: chiudiamo.
+    #  - cap raggiunto: chiusura per evitare loop infinito.
+    forced_close = bool(state.get("forced_close_unverified"))
+    if forced_close or cycle >= max_cycles:
         logger.warning(
-            "final_gate cap raggiunto (cycle=%d/%d): chiudo comunque per evitare loop",
-            cycle, max_cycles,
+            "final_gate: chiusura senza re-executor (forced_close=%s, cycle=%d/%d)",
+            forced_close, cycle, max_cycles,
         )
         return {"final_gate_cycle": 0, "stop_reason": "end_turn"}
 

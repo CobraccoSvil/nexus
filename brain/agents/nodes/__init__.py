@@ -72,6 +72,8 @@ from .helpers import (
     _load_language_reminder,
     _inject_forced_rag_reminder,
     _inject_language_reminder,
+    _detect_verification_request,
+    _inject_verification_directive,
     estimate_prompt_complexity,
     compute_iteration_budget,
     apply_agentic_tier_floor,
@@ -93,6 +95,8 @@ from .helpers import (
     _has_tool_calls_in_history,
     _TOOL_ERROR_HINTS,
     _detect_repeated_failed_command,
+    _detect_repeated_action,
+    _load_repeated_action_threshold,
     _detect_recent_tool_error,
     _PRICE_CACHE,
     _PRICE_CACHE_TS,
@@ -1715,6 +1719,61 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             _repeat_cmd[:80], _repeat_count,
         )
 
+    # ── Loop-detection AZIONE produttiva ripetuta identica (FIX B) ───────────
+    # Il signature-loop classico (recent_tool_signatures, LOOP_THRESHOLD=3 in una
+    # finestra di 6) NON cattura una SEQUENZA di azioni diverse ripetuta
+    # integralmente: ogni azione appare 2 volte, sotto soglia. Caso reale (run
+    # f1db9550): edit_file bookingService.ts -> npm install -> rm node_modules ->
+    # npm install -> npm run build, poi RIPETUTA identica. Qui contiamo la
+    # ripetizione IDENTICA di una azione produttiva (scrittura/comando) a
+    # prescindere dall'esito e, oltre soglia DB-driven (default 2), deleghiamo al
+    # PUNTO UNICO (progress_controller, regola L): GUIDE -> nudge anti-ripetizione;
+    # se persiste, ABORT verso final_gate (verifica E2E), non chiusura morta.
+    if _progress_ctrl_on:
+        _ra_threshold = _load_repeated_action_threshold()
+        _ra_label, _ra_count = _detect_repeated_action(messages, lookback=24)
+        if not (_ra_label and _ra_count >= _ra_threshold):
+            # Nessuna ripetizione in corso: l'asse esce dagli assi guidati cosi'
+            # una futura ripetizione (anche di un'azione diversa) riparte da GUIDE
+            # e non salta dritta all'abort (reset coordinato, regola L).
+            _progress_guided.discard("repeated_action")
+        else:
+            from .. import progress_controller as _pc_ra
+            _ra_dec = _pc_ra.decide(_pc_ra.ProgressSignals(
+                repeated_action=(_ra_label, _ra_count),
+                already_guided=frozenset(_progress_guided),
+                has_escalation_candidate=False,
+            ))
+            if _ra_dec.action == "guide":
+                _progress_guided.add("repeated_action")
+                if _ra_dec.nudge_text:
+                    messages = list(messages) + [HumanMessage(content=_ra_dec.nudge_text)]
+                logger.warning(
+                    "executor_node: progress_controller GUIDE repeated_action "
+                    "('%s' x%d) -> nudge anti-ripetizione",
+                    _ra_label, _ra_count,
+                )
+            elif _ra_dec.action == "abort":
+                logger.warning(
+                    "executor_node: progress_controller ABORT repeated_action "
+                    "('%s' x%d): %s",
+                    _ra_label, _ra_count, _ra_dec.reason,
+                )
+                _ra_text = (
+                    f"Hai ripetuto la stessa azione ({_ra_label}) {_ra_count} volte "
+                    f"senza progresso, anche dopo il sollecito a procedere. Chiudo "
+                    f"passando per la verifica del flusso reale."
+                )
+                return {
+                    "messages": [AIMessage(content=_ra_text)],
+                    "result": _ra_text,
+                    "pending_tool_uses": [],
+                    "stop_reason": _ra_dec.stop_reason,
+                    "iterations": int(state.get("iterations") or 0) + 1,
+                    "progress_guided_axes": sorted(_progress_guided),
+                    "forced_close_unverified": True,
+                }
+
     # ── Forced text response (anti-loop tool-only) ────────────────────────
     # Se il loop ha gia' consumato la maggior parte delle iterazioni concesse
     # (>= MAX_AGENT_ITERATIONS - 5) e il modello sta ancora facendo tool calls
@@ -2114,6 +2173,27 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         messages, system_text = _inject_language_reminder(
             messages, system_text, _lang_enabled, _lang_text
         )
+        # ── FIX C: direttiva auto-verifica se l'utente la chiede esplicitamente ─
+        # Quando il primo messaggio utente contiene una richiesta di verifica/test
+        # ("verifica tu stesso", "prova ad accedere", "assicurati che funzioni"),
+        # iniettiamo nel system la direttiva che obbliga l'agente a eseguire la
+        # verifica reale e riportarne l'esito prima di chiudere (run f1db9550).
+        try:
+            _first_human_vf = next(
+                (
+                    getattr(m, "content", "")
+                    for m in messages
+                    if hasattr(m, "type") and m.type == "human"
+                ),
+                "",
+            )
+            if isinstance(_first_human_vf, list):
+                _first_human_vf = " ".join(
+                    b.get("text", "") for b in _first_human_vf if isinstance(b, dict)
+                )
+            system_text = _inject_verification_directive(system_text, str(_first_human_vf))
+        except Exception as _vf_exc:
+            logger.debug("executor_node: iniezione direttiva verifica saltata (%s)", _vf_exc)
         # ── ADR 0016 Fase A.4: forced RAG reminder ───────────────────────────
         # Quando il context stimato supera forced_rag_threshold_ratio*window,
         # iniettiamo un'istruzione assertiva: l'agente deve usare

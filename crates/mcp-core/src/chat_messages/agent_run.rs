@@ -44,7 +44,11 @@ pub(crate) fn trunc_chars(s: String, max: usize) -> String {
 /// chiamata LLM: rete di sicurezza garantita, indipendente da provider/cooldown.
 /// Ritorna `None` se non c'e' alcuna azione concreta (l'agente non ha fatto
 /// nulla) — in quel caso il chiamante usa il placeholder generico.
-fn build_action_recap(steps: &[AgentStep]) -> Option<String> {
+/// Raccoglie, dagli step COMPLETATI, le righe-azione leggibili (deduplicate) e
+/// l'insieme dei file creati/modificati. Punto unico (regola L) condiviso da
+/// `build_action_recap` (caso hollow: final_answer vuoto) e `action_recap_footer`
+/// (caso final_answer non-conclusivo).
+fn collect_actions(steps: &[AgentStep]) -> (Vec<String>, std::collections::BTreeSet<String>) {
     use std::collections::BTreeSet;
     let mut lines: Vec<String> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -74,6 +78,11 @@ fn build_action_recap(steps: &[AgentStep]) -> Option<String> {
             }
         }
     }
+    (lines, files_touched)
+}
+
+fn build_action_recap(steps: &[AgentStep]) -> Option<String> {
+    let (lines, files_touched) = collect_actions(steps);
     if lines.is_empty() {
         return None;
     }
@@ -87,6 +96,36 @@ fn build_action_recap(steps: &[AgentStep]) -> Option<String> {
         "\n\n_(Riepilogo generato automaticamente: l'agente ha eseguito le azioni \
          sopra ma non ha prodotto un messaggio finale. Verifica i risultati.)_",
     );
+    Some(out)
+}
+
+/// Footer da appendere a un `final_answer` NON conclusivo (es. frase
+/// interlocutoria "Ora elenco i file...") che NON riflette il lavoro svolto:
+/// l'agente ha modificato file ma la risposta non li menziona, lasciando
+/// l'utente con l'impressione che "non sia stato prodotto nulla di valido"
+/// (incidente run gemini-2.5-pro f1db9550). Ritorna `None` se non ci sono state
+/// scritture o se la risposta menziona gia' almeno un file modificato (allora e'
+/// gia' informativa e non serve appendere nulla).
+fn action_recap_footer(answer: &str, steps: &[AgentStep]) -> Option<String> {
+    let (lines, files_touched) = collect_actions(steps);
+    if files_touched.is_empty() {
+        return None;
+    }
+    let lo = answer.to_lowercase();
+    let mentions = files_touched.iter().any(|f| {
+        let base = f.rsplit('/').next().unwrap_or(f).to_lowercase();
+        !base.is_empty() && lo.contains(&base)
+    });
+    if mentions {
+        return None;
+    }
+    let mut out = String::from(
+        "\n\n---\n_Riepilogo automatico delle azioni eseguite in questo turno \
+         (la risposta sopra non le riflette):_\n",
+    );
+    out.push_str(&lines.join("\n"));
+    let files: Vec<String> = files_touched.iter().map(|f| format!("`{f}`")).collect();
+    out.push_str(&format!("\n\nFile creati/modificati: {}", files.join(", ")));
     Some(out)
 }
 /// Costruisce il messaggio iniziale per il brain arricchendolo con il contenuto
@@ -1930,7 +1969,17 @@ pub(crate) async fn spawn_agent_run(
             // senza alcun contenuto, lasciando l'utente con l'impressione che il
             // sistema abbia "fatto qualcosa" che in realta' non e' avvenuto.
             let answer_owned: Option<String> = match result.final_answer.as_ref() {
-                Some(s) if !s.trim().is_empty() => Some(s.clone()),
+                Some(s) if !s.trim().is_empty() => {
+                    // Fix "riepilogo finale garantito": se l'agente ha modificato
+                    // file ma la risposta (es. frase interlocutoria non conclusiva)
+                    // non li menziona, allega il riepilogo deterministico delle
+                    // azioni cosi' l'utente vede sempre cosa e' stato fatto.
+                    let mut a = s.clone();
+                    if let Some(footer) = action_recap_footer(&a, &result.steps) {
+                        a.push_str(&footer);
+                    }
+                    Some(a)
+                }
                 // Final answer mancante o vuoto: siamo qui DOPO il retry loop
                 // (hollow_completion confermato e tentativi esauriti). Se l'agente
                 // ha comunque ESEGUITO azioni concrete (tool completati), produci

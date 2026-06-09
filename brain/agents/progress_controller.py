@@ -37,7 +37,9 @@ from typing import Literal
 
 # Assi di stallo riconosciuti. Stringhe stabili: usate come chiavi negli insiemi
 # di stato ("assi gia' guidati") e nei log/meta_step.
-Axis = Literal["exploration", "signature", "g1_descriptive", "repeated_command"]
+Axis = Literal[
+    "exploration", "signature", "g1_descriptive", "repeated_command", "repeated_action"
+]
 
 # Azioni possibili, in ordine di severita' crescente.
 Action = Literal["proceed", "guide", "escalate", "abort"]
@@ -66,6 +68,9 @@ class ProgressSignals:
     g1_over_cap: bool = False
     # Comando ripetuto fallito: (comando, conteggio) oppure None.
     repeated_command: tuple[str, int] | None = None
+    # Azione produttiva (scrittura/comando) ripetuta identica oltre soglia:
+    # (label, conteggio) oppure None. Indipendente dall'esito (anche se riesce).
+    repeated_action: tuple[str, int] | None = None
     # Budget di escalation gia' consumato e candidato disponibile.
     escalations: int = 0
     max_escalations: int = 3
@@ -129,6 +134,23 @@ def _g1_nudge() -> str:
     )
 
 
+def _repeated_action_nudge(label: str, count: int) -> str:
+    """Nudge per la ripetizione identica di una azione produttiva.
+
+    Caso reale (run f1db9550): stessa sequenza edit_file -> npm install ->
+    npm run build ripetuta integralmente. Ordina di NON ripeterla e di
+    procedere/concludere verificando l'esito.
+    """
+    return (
+        f"STOP: hai gia' eseguito la stessa azione ({label}) {count} volte. "
+        "Ripeterla identica NON cambia il risultato. NON ripeterla: leggi "
+        "l'esito dell'esecuzione precedente, e poi (a) se l'azione e' riuscita, "
+        "PROCEDI al passo successivo o concludi verificando il risultato reale; "
+        "(b) se e' fallita, cambia approccio (causa radice diversa), non rieseguire "
+        "lo stesso comando/edit."
+    )
+
+
 def decide(signals: ProgressSignals) -> ProgressDecision:
     """Punto unico: data la fotografia del progresso, decide la prossima mossa.
 
@@ -149,6 +171,8 @@ def decide(signals: ProgressSignals) -> ProgressDecision:
         axis = "exploration"
     elif signals.signature_loop_tool:
         axis = "signature"
+    elif signals.repeated_action is not None:
+        axis = "repeated_action"
     elif signals.g1_over_cap:
         axis = "g1_descriptive"
 
@@ -167,14 +191,26 @@ def decide(signals: ProgressSignals) -> ProgressDecision:
             nudge = _exploration_nudge(signals.exploration_count)
         elif axis == "signature":
             nudge = _signature_nudge(signals.signature_loop_tool or "")
+        elif axis == "repeated_action":
+            _ra_label, _ra_count = signals.repeated_action or ("", 0)
+            nudge = _repeated_action_nudge(_ra_label, _ra_count)
         else:
             nudge = _g1_nudge()
+        # Per repeated_action NON forziamo una nuova tool call (rischio di
+        # rieseguire la stessa azione): il nudge ordina di procedere/verificare
+        # o concludere. Per gli altri assi la forza-azione rimuove i read-only.
+        _force = axis != "repeated_action"
+        _reason = (
+            f"stallo {axis}: nudge anti-ripetizione (procedi/verifica)"
+            if axis == "repeated_action"
+            else f"stallo {axis}: forza-azione (rimuovo read-only + tool_choice required)"
+        )
         return ProgressDecision(
             action="guide",
             axis=axis,
-            force_action=True,
+            force_action=_force,
             nudge_text=nudge,
-            reason=f"stallo {axis}: forza-azione (rimuovo read-only + tool_choice required)",
+            reason=_reason,
         )
 
     # Livello 2 — ESCALATE: gia' guidato ma ancora bloccato, c'e' budget.
