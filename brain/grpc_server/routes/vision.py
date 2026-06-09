@@ -258,9 +258,10 @@ async def vision_describe(body: VisionDescribeRequest) -> dict[str, object]:
             status_code=501,
             detail=(
                 f"Provider {provider_name!r} non ancora supportato dall endpoint vision. "
-                "Provider vision instradabili: google, anthropic, openai. Configura uno "
-                "di questi in nexus_purpose_model.vision_describe (capability vision e' "
-                "ristretta a questi provider in classify_capabilities)."
+                "I provider instradabili sono nel setting DB `vision.routable_providers` "
+                "(mig 0373, punto unico): classify_capabilities marca supports_vision solo "
+                "per quelli, quindi il routing per tier non li sceglie. Aggiungere un "
+                "provider = aggiornare il setting + il ramo corrispondente qui in vision.py."
             ),
         )
 

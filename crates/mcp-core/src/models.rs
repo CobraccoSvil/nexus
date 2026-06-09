@@ -251,12 +251,18 @@ pub async fn run_catalog_sync(db: &sqlx::PgPool) -> Result<(i32, i32, i32), Stri
             .and_then(Value::as_bool);
         let meta_vision = entry.get("supports_vision").and_then(Value::as_bool);
         let meta_reasoning = entry.get("supports_reasoning").and_then(Value::as_bool);
+        // Punto unico DB-driven della lista vision-routable (mig 0373): qui
+        // classify_capabilities scarta i falsi positivi vision di LiteLLM (es.
+        // mistral-small con supports_vision=true) per i provider senza ramo
+        // /vision/describe.
+        let vision_routable = crate::model_catalog_sync::load_vision_routable(db).await;
         let caps = crate::model_catalog_sync::classify_capabilities(
             provider,
             model_id,
             meta_tool_use,
             meta_vision,
             meta_reasoning,
+            &vision_routable,
         );
 
         // UPSERT: l'UPDATE dei flag avviene SOLO se capability_source='auto'

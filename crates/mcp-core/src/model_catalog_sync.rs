@@ -294,6 +294,11 @@ pub(crate) fn classify_capabilities(
     meta_tool_use: Option<bool>,
     meta_vision: Option<bool>,
     meta_reasoning: Option<bool>,
+    // Provider instradabili da /vision/describe (punto unico DB-driven, setting
+    // `vision.routable_providers`, mig 0373). Letto dal chiamante e passato qui:
+    // la funzione resta pura/sincrona/testabile. supports_vision=true SOLO se il
+    // provider e' in questo set (regola G/L: niente lista hardcoded duplicata).
+    vision_routable: &std::collections::HashSet<String>,
 ) -> ClassifiedCaps {
     let p = provider.to_ascii_lowercase();
     let m = model.to_ascii_lowercase();
@@ -303,29 +308,32 @@ pub(crate) fn classify_capabilities(
     let supports_tool_use = meta_tool_use.unwrap_or(true);
 
     // ── vision: riflette l'instradabilita' REALE da brain/grpc_server/routes/
-    //    vision.py (rami implementati: google, anthropic, openai). Il match
-    //    decide per provider PRIMA di consultare `meta_vision`: il metadata di
-    //    LiteLLM e' lasco ("accetta immagini in input") e marca falsi positivi
-    //    (es. mistral-small) che il routing per tier (best_model_for_tier,
-    //    capability=vision, ORDER BY costo) sceglierebbe per il purpose
-    //    vision_describe -> /vision/describe risponde 501 (provider non
-    //    instradabile). Per i provider SENZA ramo vision il flag e' SEMPRE false,
-    //    ignorando meta_vision. Punto unico (regola L): la verita'
-    //    "vision-instradabile" si decide qui; estendere vision.py a un nuovo
-    //    provider = aggiungere il suo ramo a questo match.
-    let supports_vision = match p.as_str() {
-        "openai" => meta_vision.unwrap_or_else(|| {
-            m.starts_with("gpt-4o")
-                || m.starts_with("gpt-4.1")
-                || m.starts_with("gpt-4-turbo")
-                || m.starts_with("o1")
-                || m.starts_with("o3")
-        }),
-        "anthropic" => {
-            meta_vision.unwrap_or_else(|| m.contains("opus") || m.contains("sonnet") || m.contains("haiku"))
+    //    vision.py. La lista dei provider instradabili NON e' piu' hardcoded ma
+    //    vive nel setting DB `vision.routable_providers` (mig 0373), passato qui
+    //    in `vision_routable` (punto unico DB-driven, regola G/L). Il metadata
+    //    `meta_vision` di LiteLLM e' lasco ("accetta immagini in input") e marca
+    //    falsi positivi (es. mistral-small) che il routing per tier sceglierebbe
+    //    per vision_describe -> /vision/describe 501. Quindi: vision=true SOLO se
+    //    il provider e' routable; l'euristica/metadata per-modello distingue poi
+    //    QUALI modelli del provider hanno vision.
+    let supports_vision = if vision_routable.contains(p.as_str()) {
+        match p.as_str() {
+            "openai" => meta_vision.unwrap_or_else(|| {
+                m.starts_with("gpt-4o")
+                    || m.starts_with("gpt-4.1")
+                    || m.starts_with("gpt-4-turbo")
+                    || m.starts_with("o1")
+                    || m.starts_with("o3")
+            }),
+            "anthropic" => meta_vision
+                .unwrap_or_else(|| m.contains("opus") || m.contains("sonnet") || m.contains("haiku")),
+            "google" => meta_vision.unwrap_or_else(|| m.contains("gemini")),
+            // Provider routable senza euristica per-modello nota: usa il metadata.
+            _ => meta_vision.unwrap_or(false),
         }
-        "google" => meta_vision.unwrap_or_else(|| m.contains("gemini")),
-        _ => false,
+    } else {
+        // Provider senza ramo in vision.py: non instradabile -> niente vision.
+        false
     };
 
     // ── Detection reasoning model (guida sia A sia B). ──
@@ -498,6 +506,26 @@ async fn load_interval_hours(db: &PgPool) -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_INTERVAL_HOURS)
         .max(1) // mai meno di 1h per non hammerare le API
+}
+
+/// Provider instradabili dall'endpoint /vision/describe (setting
+/// `vision.routable_providers`, mig 0373). Punto unico DB-driven della lista
+/// (regola G/L): `classify_capabilities` lo usa per marcare supports_vision e
+/// `vision.py` lo legge per il routing/messaggio. Default vuoto se il setting
+/// manca: fail-safe VISIBILE (nessun modello vision -> il purpose vision_describe
+/// segnala no_capable), niente magic fallback hardcoded (regola G).
+pub(crate) async fn load_vision_routable(db: &PgPool) -> std::collections::HashSet<String> {
+    get_setting(db, "vision.routable_providers")
+        .await
+        .ok()
+        .flatten()
+        .map(|csv| {
+            csv.split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Trigger manuale sync (endpoint admin / test E2E).
@@ -702,8 +730,10 @@ async fn sync_provider(
                                         // discovery -> solo euristica nome (niente
                                         // metadata LiteLLM). Scritti SOLO su righe
                                         // 'auto' (le 'manual' restano intatte).
+                                        let vision_routable = load_vision_routable(db).await;
                                         let cc = classify_capabilities(
                                             provider, api_model, None, None, None,
+                                            &vision_routable,
                                         );
                                         // Gate allowlist (ADR 0025): abilita SOLO se il
                                         // modello e' ammesso dalla model_selection_policy.
@@ -812,6 +842,29 @@ async fn sync_provider(
                 }
             }
             Some(&(is_enabled, manual_locked)) => {
+                // FIX A (regola H): riallinea supports_vision dei modelli GIA'
+                // presenti (capability_source='auto') da classify_capabilities a
+                // ogni passata. Prima il sync toccava SOLO is_enabled: una
+                // correzione dell'euristica vision (o la rimozione di un falso
+                // positivo come mistral) non si propagava ai modelli esistenti ->
+                // serviva una migrazione-dati manuale (es. 0372). Ora si propaga
+                // da sola. Le righe 'manual' (curate dall'admin) restano intatte.
+                {
+                    let vision_routable = load_vision_routable(db).await;
+                    let cc = classify_capabilities(
+                        provider, api_model, None, None, None, &vision_routable,
+                    );
+                    let _ = sqlx::query(
+                        "UPDATE ai_price_catalog SET supports_vision = $3, updated_at = NOW() \
+                         WHERE provider = $1 AND model = $2 AND capability_source = 'auto' \
+                           AND supports_vision <> $3",
+                    )
+                    .bind(provider)
+                    .bind(api_model)
+                    .bind(cc.supports_vision)
+                    .execute(db)
+                    .await;
+                }
                 // Re-enable SOLO se il modello e' ammesso dalla policy (ADR 0025):
                 // un legacy ricomparso nell'API non deve rientrare.
                 let policy_ok = model_passes_selection_policy(db, provider, api_model).await;
@@ -1245,10 +1298,18 @@ mod tests {
 
     // ── ADR 0024: classificatore unico delle capability ──
 
+    /// Routable di test: i provider con ramo vision.py (setting reale: mig 0373).
+    fn rt() -> std::collections::HashSet<String> {
+        ["google", "anthropic", "openai"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
     #[test]
     fn classify_metadata_litellm_ha_priorita() {
         // function_calling/vision espliciti vincono sull'euristica.
-        let c = classify_capabilities("openai", "gpt-4o", Some(true), Some(true), Some(false));
+        let c = classify_capabilities("openai", "gpt-4o", Some(true), Some(true), Some(false), &rt());
         assert!(c.supports_tool_use);
         assert!(c.supports_vision);
         assert!(!c.is_thinking);
@@ -1258,7 +1319,7 @@ mod tests {
     #[test]
     fn classify_o_series_e_reasoning_only_escluso_da_agentico() {
         // o-series: reasoning-only -> A (escludi) e B (non forzare) entrambi true.
-        let c = classify_capabilities("openai", "o3-mini", None, None, None);
+        let c = classify_capabilities("openai", "o3-mini", None, None, None, &rt());
         assert!(c.is_thinking, "o-series deve essere escluso da agentico");
         assert!(c.uses_thinking_mode);
     }
@@ -1266,7 +1327,7 @@ mod tests {
     #[test]
     fn classify_deepseek_v4_reasoning_only() {
         // deepseek-v4-pro: reasoning-only (no reasoning_content passback) -> A+B.
-        let c = classify_capabilities("deepseek", "deepseek-v4-pro", None, None, None);
+        let c = classify_capabilities("deepseek", "deepseek-v4-pro", None, None, None, &rt());
         assert!(c.is_thinking);
         assert!(c.uses_thinking_mode);
     }
@@ -1276,7 +1337,7 @@ mod tests {
         // Claude opus/sonnet: NON escluso da agentico (A=false) ma extended
         // thinking -> non forzare tool_choice (B=true). Caso che il merge naïf
         // avrebbe rotto.
-        let c = classify_capabilities("anthropic", "claude-sonnet-4-6", None, None, None);
+        let c = classify_capabilities("anthropic", "claude-sonnet-4-6", None, None, None, &rt());
         assert!(!c.is_thinking, "Claude deve restare agentic-eligibile");
         assert!(c.uses_thinking_mode, "Claude usa extended thinking -> non forzare");
         assert!(c.supports_vision);
@@ -1285,7 +1346,7 @@ mod tests {
     #[test]
     fn classify_modello_chat_standard_non_thinking() {
         // mistral-large: tool-capable, non-thinking -> candidato agentico ideale.
-        let c = classify_capabilities("mistral", "mistral-large-2411", None, None, None);
+        let c = classify_capabilities("mistral", "mistral-large-2411", None, None, None, &rt());
         assert!(c.supports_tool_use);
         assert!(!c.is_thinking);
         assert!(!c.uses_thinking_mode);
@@ -1298,18 +1359,18 @@ mod tests {
         // devono avere supports_vision=false ANCHE se LiteLLM passa meta_vision=true
         // (falso positivo): altrimenti best_model_for_tier li sceglierebbe per il
         // purpose vision_describe -> /vision/describe 501.
-        let mistral = classify_capabilities("mistral", "mistral-small-latest", None, Some(true), None);
+        let mistral = classify_capabilities("mistral", "mistral-small-latest", None, Some(true), None, &rt());
         assert!(!mistral.supports_vision, "mistral non e' instradabile da vision.py: vision=false");
-        let pixtral = classify_capabilities("mistral", "pixtral-large-latest", None, Some(true), None);
+        let pixtral = classify_capabilities("mistral", "pixtral-large-latest", None, Some(true), None, &rt());
         assert!(!pixtral.supports_vision, "pixtral non e' instradabile finche' vision.py non supporta mistral");
-        let deepseek = classify_capabilities("deepseek", "deepseek-chat", None, Some(true), None);
+        let deepseek = classify_capabilities("deepseek", "deepseek-chat", None, Some(true), None, &rt());
         assert!(!deepseek.supports_vision, "deepseek non e' instradabile: vision=false");
         // Provider instradabili: vision corretta.
-        assert!(classify_capabilities("google", "gemini-2.5-flash-lite", None, None, None).supports_vision);
-        assert!(classify_capabilities("anthropic", "claude-haiku-4-5", None, None, None).supports_vision);
-        assert!(classify_capabilities("openai", "gpt-4o", None, None, None).supports_vision);
+        assert!(classify_capabilities("google", "gemini-2.5-flash-lite", None, None, None, &rt()).supports_vision);
+        assert!(classify_capabilities("anthropic", "claude-haiku-4-5", None, None, None, &rt()).supports_vision);
+        assert!(classify_capabilities("openai", "gpt-4o", None, None, None, &rt()).supports_vision);
         // Per i provider instradabili, meta_vision esplicito e' rispettato.
-        assert!(classify_capabilities("openai", "gpt-4o-mini", None, Some(true), None).supports_vision);
+        assert!(classify_capabilities("openai", "gpt-4o-mini", None, Some(true), None, &rt()).supports_vision);
     }
 
     #[test]
@@ -1318,14 +1379,14 @@ mod tests {
         // NON reasoning-only. Quindi is_thinking=false (eleggibile all'agentico),
         // uses_thinking_mode=true e policy='disable_for_tools' (non-thinking nei
         // tool-loop -> niente MALFORMED_FUNCTION_CALL). flash-lite NON ha thinking.
-        let flash = classify_capabilities("google", "gemini-2.5-flash", None, None, None);
+        let flash = classify_capabilities("google", "gemini-2.5-flash", None, None, None, &rt());
         assert!(!flash.is_thinking, "gemini-2.5-flash NON va escluso dall'agentico");
         assert!(flash.uses_thinking_mode, "gemini-2.5-flash e' thinking");
         assert_eq!(flash.agentic_thinking_policy, "disable_for_tools");
-        let pro = classify_capabilities("google", "gemini-2.5-pro", None, None, None);
+        let pro = classify_capabilities("google", "gemini-2.5-pro", None, None, None, &rt());
         assert!(!pro.is_thinking, "gemini-2.5-pro e' dual-mode, non reasoning-only");
         assert_eq!(pro.agentic_thinking_policy, "disable_for_tools");
-        let lite = classify_capabilities("google", "gemini-2.5-flash-lite", None, None, None);
+        let lite = classify_capabilities("google", "gemini-2.5-flash-lite", None, None, None, &rt());
         assert!(!lite.uses_thinking_mode, "gemini-2.5-flash-lite NON e' thinking");
         assert_eq!(lite.agentic_thinking_policy, "none");
     }
@@ -1334,7 +1395,7 @@ mod tests {
 
     #[test]
     fn classify_agentic_thinking_policy_per_famiglia() {
-        let p = |prov, model| classify_capabilities(prov, model, None, None, None).agentic_thinking_policy;
+        let p = |prov, model| classify_capabilities(prov, model, None, None, None, &rt()).agentic_thinking_policy;
         // Reasoning-only senza function calling -> exclude.
         assert_eq!(p("deepseek", "deepseek-reasoner"), "exclude");
         // OpenAI o-series: tool nativi -> native.
