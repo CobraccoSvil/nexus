@@ -170,14 +170,97 @@ async def vision_describe(body: VisionDescribeRequest) -> dict[str, object]:
                 status_code=502,
                 detail=f"Provider google vision fallito: {exc}",
             )
+    elif provider_name == "anthropic":
+        # Vision via Anthropic Messages API (image block base64). Riusa il client
+        # del provider gia' istanziato nel registry (stesso pattern di google).
+        from brain.providers.anthropic_provider import AnthropicProvider
+
+        ap = runtime.providers.get_provider("anthropic")
+        if ap is None or not isinstance(ap, AnthropicProvider):
+            raise HTTPException(
+                status_code=503,
+                detail="Provider anthropic non istanziato nel registry.",
+            )
+        try:
+            import base64 as _b64
+
+            b64 = _b64.b64encode(image_bytes).decode("ascii")
+            client = ap._get_client()
+            response = await client.messages.create(
+                model=model,
+                max_tokens=2048,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": mime, "data": b64},
+                            },
+                            {"type": "text", "text": prompt_text},
+                        ],
+                    }
+                ],
+            )
+            text = "".join(
+                getattr(blk, "text", "") for blk in (response.content or [])
+                if getattr(blk, "type", "") == "text"
+            )
+        except Exception as exc:
+            logger.error("vision_describe: provider anthropic ha fallito: %s", exc)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Provider anthropic vision fallito: {exc}",
+            )
+    elif provider_name == "openai":
+        # Vision via OpenAI Chat Completions API (image_url data URI). Riusa il
+        # client OpenAI-compatible del provider (stesso pattern di google).
+        from brain.providers.openai_provider import OpenAIProvider
+
+        op = runtime.providers.get_provider("openai")
+        if op is None or not isinstance(op, OpenAIProvider):
+            raise HTTPException(
+                status_code=503,
+                detail="Provider openai non istanziato nel registry.",
+            )
+        try:
+            import base64 as _b64
+
+            b64 = _b64.b64encode(image_bytes).decode("ascii")
+            client = op._get_client()
+            response = await client.chat.completions.create(
+                model=model,
+                max_tokens=2048,
+                temperature=0.2,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt_text},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mime};base64,{b64}"},
+                            },
+                        ],
+                    }
+                ],
+            )
+            text = response.choices[0].message.content or ""
+        except Exception as exc:
+            logger.error("vision_describe: provider openai ha fallito: %s", exc)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Provider openai vision fallito: {exc}",
+            )
     else:
         logger.error("vision_describe: provider %r non supportato.", provider_name)
         raise HTTPException(
             status_code=501,
             detail=(
                 f"Provider {provider_name!r} non ancora supportato dall endpoint vision. "
-                "Configura google in nexus_purpose_model.vision_describe oppure estendi "
-                "brain/grpc_server/main.py per il provider scelto."
+                "Provider vision instradabili: google, anthropic, openai. Configura uno "
+                "di questi in nexus_purpose_model.vision_describe (capability vision e' "
+                "ristretta a questi provider in classify_capabilities)."
             ),
         )
 

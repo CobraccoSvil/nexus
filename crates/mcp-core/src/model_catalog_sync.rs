@@ -302,19 +302,31 @@ pub(crate) fn classify_capabilities(
     //    maggioranza dei modelli chat moderni supporta function calling). ──
     let supports_tool_use = meta_tool_use.unwrap_or(true);
 
-    // ── vision: metadata esplicito, altrimenti euristica per famiglia. ──
-    let supports_vision = meta_vision.unwrap_or_else(|| match p.as_str() {
-        "openai" => {
+    // ── vision: riflette l'instradabilita' REALE da brain/grpc_server/routes/
+    //    vision.py (rami implementati: google, anthropic, openai). Il match
+    //    decide per provider PRIMA di consultare `meta_vision`: il metadata di
+    //    LiteLLM e' lasco ("accetta immagini in input") e marca falsi positivi
+    //    (es. mistral-small) che il routing per tier (best_model_for_tier,
+    //    capability=vision, ORDER BY costo) sceglierebbe per il purpose
+    //    vision_describe -> /vision/describe risponde 501 (provider non
+    //    instradabile). Per i provider SENZA ramo vision il flag e' SEMPRE false,
+    //    ignorando meta_vision. Punto unico (regola L): la verita'
+    //    "vision-instradabile" si decide qui; estendere vision.py a un nuovo
+    //    provider = aggiungere il suo ramo a questo match.
+    let supports_vision = match p.as_str() {
+        "openai" => meta_vision.unwrap_or_else(|| {
             m.starts_with("gpt-4o")
                 || m.starts_with("gpt-4.1")
                 || m.starts_with("gpt-4-turbo")
                 || m.starts_with("o1")
                 || m.starts_with("o3")
+        }),
+        "anthropic" => {
+            meta_vision.unwrap_or_else(|| m.contains("opus") || m.contains("sonnet") || m.contains("haiku"))
         }
-        "anthropic" => m.contains("opus") || m.contains("sonnet"),
-        "google" => m.contains("gemini"),
+        "google" => meta_vision.unwrap_or_else(|| m.contains("gemini")),
         _ => false,
-    });
+    };
 
     // ── Detection reasoning model (guida sia A sia B). ──
     // Famiglie reasoning-only note (incompatibili col tool-forcing o col loop
@@ -1277,6 +1289,27 @@ mod tests {
         assert!(c.supports_tool_use);
         assert!(!c.is_thinking);
         assert!(!c.uses_thinking_mode);
+    }
+
+    #[test]
+    fn classify_vision_solo_provider_instradabili() {
+        // La capability vision riflette l'instradabilita' da vision.py (google,
+        // anthropic, openai). I provider SENZA ramo vision (mistral, deepseek)
+        // devono avere supports_vision=false ANCHE se LiteLLM passa meta_vision=true
+        // (falso positivo): altrimenti best_model_for_tier li sceglierebbe per il
+        // purpose vision_describe -> /vision/describe 501.
+        let mistral = classify_capabilities("mistral", "mistral-small-latest", None, Some(true), None);
+        assert!(!mistral.supports_vision, "mistral non e' instradabile da vision.py: vision=false");
+        let pixtral = classify_capabilities("mistral", "pixtral-large-latest", None, Some(true), None);
+        assert!(!pixtral.supports_vision, "pixtral non e' instradabile finche' vision.py non supporta mistral");
+        let deepseek = classify_capabilities("deepseek", "deepseek-chat", None, Some(true), None);
+        assert!(!deepseek.supports_vision, "deepseek non e' instradabile: vision=false");
+        // Provider instradabili: vision corretta.
+        assert!(classify_capabilities("google", "gemini-2.5-flash-lite", None, None, None).supports_vision);
+        assert!(classify_capabilities("anthropic", "claude-haiku-4-5", None, None, None).supports_vision);
+        assert!(classify_capabilities("openai", "gpt-4o", None, None, None).supports_vision);
+        // Per i provider instradabili, meta_vision esplicito e' rispettato.
+        assert!(classify_capabilities("openai", "gpt-4o-mini", None, Some(true), None).supports_vision);
     }
 
     #[test]
