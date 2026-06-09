@@ -292,22 +292,66 @@ async fn unit_active_enter(unit: &str) -> Option<String> {
         .filter(|v| !v.is_empty() && v != "n/a")
 }
 
-/// Porte allocate per (project, unit) da `nexus_port_allocations`. Usate per il
-/// readiness check TCP (cross-tecnologia): un servizio che non ascolta su NESSUNA
-/// delle sue porte e' giu', qualunque sia il linguaggio. Vuoto = servizio senza
-/// porta (worker): readiness non applicabile.
+/// Porte "attese" di un servizio, per il readiness check TCP (cross-tecnologia):
+/// un servizio che non ascolta su NESSUNA delle sue porte e' giu', qualunque sia
+/// il linguaggio. Unione di due fonti, per robustezza (un unit puo' dichiarare la
+/// porta solo in un modo):
+///   1. `nexus_port_allocations` (porte allocate dal port_registry);
+///   2. variabili `Environment` del unit il cui nome contiene PORT (es. PORT,
+///      PORT_BACKEND) — copre gli unit creati fuori dal flusso port_registry.
+/// Vuoto = servizio senza porta nota (worker): readiness non applicabile.
 async fn ports_for_unit(db: &PgPool, project_id: Uuid, unit: &str) -> Vec<u16> {
-    sqlx::query_scalar::<_, i32>(
+    let mut ports: HashSet<u16> = HashSet::new();
+    if let Ok(rows) = sqlx::query_scalar::<_, i32>(
         "SELECT port FROM nexus_port_allocations WHERE project_id = $1 AND service_unit = $2",
     )
     .bind(project_id)
     .bind(unit)
     .fetch_all(db)
     .await
-    .unwrap_or_default()
-    .into_iter()
-    .filter_map(|p| u16::try_from(p).ok())
-    .collect()
+    {
+        for p in rows {
+            if let Ok(p) = u16::try_from(p) {
+                ports.insert(p);
+            }
+        }
+    }
+    for p in unit_env_ports(unit).await {
+        ports.insert(p);
+    }
+    ports.into_iter().collect()
+}
+
+/// Estrae le porte dalle variabili `Environment` del unit il cui NOME contiene
+/// "PORT" (es. `PORT`, `PORT_BACKEND`). `systemctl show --property=Environment`
+/// restituisce le coppie KEY=VALUE separate da spazio.
+async fn unit_env_ports(unit: &str) -> Vec<u16> {
+    let out = match tokio::process::Command::new("systemctl")
+        .args(["--user", "show", unit, "--property=Environment"])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let val = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("Environment="))
+        .unwrap_or("");
+    let mut ports = Vec::new();
+    for tok in val.split_whitespace() {
+        if let Some((k, v)) = tok.split_once('=') {
+            if k.to_ascii_uppercase().contains("PORT") {
+                if let Ok(p) = v.trim().parse::<u16>() {
+                    if p > 0 {
+                        ports.push(p);
+                    }
+                }
+            }
+        }
+    }
+    ports
 }
 
 /// Chiude (resolved) le diagnosi 'crash' aperte di un'unita' tornata sana. Punto
