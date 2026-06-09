@@ -204,6 +204,19 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
                 elif text_content:
                     assistant_content.append({"type": "text", "text": text_content})
 
+            # Diagnostica (regola F: solo lunghezze + finish_reason, niente payload):
+            # i modelli deepseek a volte chiudono con content vuoto (la risposta
+            # finisce nel reasoning, o il turno e' troncato per length), causando
+            # il soft-failure M4 + fallback. Logghiamo i segnali per la causa radice.
+            if not text_content.strip() and stop_reason == "end_turn":
+                logger.warning(
+                    "deepseek %s: content VUOTO a end_turn (finish_reason=%s, "
+                    "reasoning_len=%d, completion_tokens=%s) -> soft-failure/fallback probabile",
+                    model,
+                    choice.finish_reason,
+                    len(reasoning_content),
+                    response.usage.completion_tokens if response.usage else "?",
+                )
             usage_data = {}
             if response.usage:
                 usage_data = {
