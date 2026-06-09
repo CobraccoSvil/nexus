@@ -2191,11 +2191,15 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                         meta_steps.persist_async(state.get("thread_id"), _tools_meta)
                 except Exception as _hb_exc:
                     logger.debug("executor_node: heartbeat tool_calls fallito: %s", _hb_exc)
-            usage = meta.get("usage") or {}
-            prompt_tokens = int(usage.get("input_tokens", 0))
-            completion_tokens = int(usage.get("output_tokens", 0))
-            cache_creation_tokens = int(usage.get("cache_creation_input_tokens", 0))
-            cache_read_tokens = int(usage.get("cache_read_input_tokens", 0))
+            # Punto unico di normalizzazione usage (regola L): gestisce sia
+            # input_tokens/output_tokens (Anthropic) sia prompt_tokens/
+            # completion_tokens (OpenAI/Mistral/DeepSeek/Google). Prima leggeva
+            # solo input_tokens -> token=0 nello stream per i provider
+            # non-Anthropic, quindi la barra context live restava a 0.
+            from brain.providers.registry import extract_usage_tokens
+            prompt_tokens, completion_tokens, _total_norm, cache_creation_tokens, cache_read_tokens = (
+                extract_usage_tokens(meta.get("usage"))
+            )
             token_usage = prompt_tokens + completion_tokens
 
             input_price, output_price = _lookup_price(provider, model)
@@ -2236,10 +2240,11 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 provider, model, last_text
             )
             result_text = prov_result.content
-            usage = prov_result.metadata.get("usage", {})
-            prompt_tokens = int(usage.get("input_tokens", 0))
-            completion_tokens = int(usage.get("output_tokens", 0))
-            cache_read_tokens = int(usage.get("cache_read_input_tokens", 0))
+            # Punto unico di normalizzazione usage (regola L), come sopra.
+            from brain.providers.registry import extract_usage_tokens
+            prompt_tokens, completion_tokens, _total_norm, cache_creation_tokens, cache_read_tokens = (
+                extract_usage_tokens(prov_result.metadata.get("usage"))
+            )
             token_usage = prompt_tokens + completion_tokens
 
             input_price, output_price = _lookup_price(provider, model)

@@ -387,6 +387,35 @@ def _lookup_price_any_currency(provider: str, model: str) -> tuple[float, float,
 _SYSTEM_UUID = "00000000-0000-0000-0000-000000000000"
 
 
+def extract_usage_tokens(usage: dict[str, Any] | None) -> tuple[int, int, int, int, int]:
+    """Punto unico di normalizzazione dei token usage cross-provider (regola L).
+
+    Gestisce sia la convenzione Anthropic (input_tokens/output_tokens) sia quella
+    OpenAI/Mistral/DeepSeek/Google (prompt_tokens/completion_tokens), piu' le
+    varianti delle chiavi cache. Va usato OVUNQUE si leggano i token da
+    `metadata["usage"]`: senza punto unico le letture divergevano (es. l'executor
+    leggeva solo input_tokens -> token=0 nello stream per i provider non-Anthropic,
+    pur avendo il DB i token corretti via _record_usage).
+
+    Ritorna (prompt_tokens, completion_tokens, total_tokens,
+    cache_creation_tokens, cache_read_tokens).
+    """
+    usage = usage or {}
+    prompt_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    completion_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+    cache_read_tokens = int(
+        usage.get("cache_read_input_tokens", 0) or usage.get("cache_read_tokens", 0) or 0
+    )
+    cache_creation_tokens = int(
+        usage.get("cache_creation_input_tokens", 0)
+        or usage.get("cache_created_tokens", 0)
+        or usage.get("cache_creation_tokens", 0)
+        or 0
+    )
+    return prompt_tokens, completion_tokens, total_tokens, cache_creation_tokens, cache_read_tokens
+
+
 def _record_usage(provider: str, model: str, usage: dict[str, Any] | None, details: dict[str, Any]) -> None:
     """Scrive su ai_usage_ledger (best-effort).
 
@@ -410,13 +439,10 @@ def _record_usage(provider: str, model: str, usage: dict[str, Any] | None, detai
             provider, model,
         )
 
-    prompt_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
-    completion_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
-    total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
-
-    # Token cache Anthropic (o altri provider con struttura analoga)
-    cache_read_tokens = int(usage.get("cache_read_input_tokens", 0) or usage.get("cache_read_tokens", 0) or 0)
-    cache_creation_tokens = int(usage.get("cache_creation_input_tokens", 0) or usage.get("cache_created_tokens", 0) or usage.get("cache_creation_tokens", 0) or 0)
+    # Punto unico di normalizzazione (regola L): stessa logica usata dall'executor.
+    prompt_tokens, completion_tokens, total_tokens, cache_creation_tokens, cache_read_tokens = (
+        extract_usage_tokens(usage)
+    )
 
     in_cost_m, out_cost_m, cache_read_m, cache_creation_m, currency = _lookup_price_any_currency(provider, model)
     input_cost = (prompt_tokens / 1_000_000.0) * in_cost_m
