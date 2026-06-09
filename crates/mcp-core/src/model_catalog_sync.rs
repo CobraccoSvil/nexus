@@ -333,7 +333,20 @@ pub(crate) fn classify_capabilities(
 
     // ── tool_use: metadata esplicito, altrimenti default true (la stragrande
     //    maggioranza dei modelli chat moderni supporta function calling). ──
-    let supports_tool_use = meta_tool_use.unwrap_or(true);
+    //    ECCEZIONE per FAMIGLIA (regola L): i magistral sono la linea reasoning
+    //    di Mistral e SUPPORTANO function calling (docs.mistral.ai/capabilities/
+    //    function_calling elenca Magistral Small/Medium 1.2 tra i modelli
+    //    function-calling), ma il metadata LiteLLM e' INCOERENTE tra varianti
+    //    (alcune ritornano tool_use=false). Classifichiamo per famiglia con un
+    //    valore unico (tool_use=true), ignorando il metadata per-modello
+    //    inaffidabile. Verificato live: i magistral chiamano i tool col
+    //    tool_choice forzato MANTENENDO il reasoning attivo (non serve, ne' e'
+    //    possibile, spegnerlo: reasoning_effort non e' supportato dai magistral).
+    let supports_tool_use = if p == "mistral" && m.contains("magistral") {
+        true
+    } else {
+        meta_tool_use.unwrap_or(true)
+    };
 
     // ── vision: riflette l'instradabilita' REALE da brain/grpc_server/routes/
     //    vision.py. La lista dei provider instradabili NON e' piu' hardcoded ma
@@ -1501,5 +1514,42 @@ mod tests {
         // flash-lite NON e' thinking -> none.
         assert_eq!(p("google", "gemini-2.5-flash"), "disable_for_tools");
         assert_eq!(p("google", "gemini-2.5-flash-lite"), "none");
+    }
+
+    #[test]
+    fn classify_magistral_tool_use_uniforme_per_famiglia() {
+        // I magistral (linea reasoning Mistral) supportano function calling
+        // (doc Mistral). La classificazione DEVE essere uniforme per l'intera
+        // famiglia, indipendentemente dalla variante e dal metadata LiteLLM
+        // (che e' incoerente: alcune varianti ritornano tool_use=false). Tutte:
+        //   - supports_tool_use=true (verita' Mistral, per famiglia)
+        //   - is_thinking=true + uses_thinking_mode=true (linea reasoning)
+        //   - agentic_thinking_policy='disable_for_tools' (non-thinking nei tool)
+        for model in [
+            "magistral-small-latest",
+            "magistral-medium-latest",
+            "magistral-small-2509",
+            "magistral-medium-2509",
+            "magistral-medium-1-2-2509",
+        ] {
+            // Metadata assente.
+            let c = classify_capabilities("mistral", model, None, None, None, &rt());
+            assert!(c.supports_tool_use, "{model}: tool_use deve essere true (doc Mistral)");
+            assert!(c.is_thinking, "{model}: e' reasoning-only -> is_thinking");
+            assert!(c.uses_thinking_mode, "{model}: e' reasoning -> uses_thinking_mode");
+            assert_eq!(
+                c.agentic_thinking_policy, "disable_for_tools",
+                "{model}: reasoning dual-mode -> disable_for_tools"
+            );
+            // REGRESSIONE: anche col metadata LiteLLM incoerente (tool_use=false),
+            // la classificazione per famiglia forza true. E' il bug che causava il
+            // degrado a supports_tool_use=false di alcune varianti magistral.
+            let c_bad_meta =
+                classify_capabilities("mistral", model, Some(false), None, None, &rt());
+            assert!(
+                c_bad_meta.supports_tool_use,
+                "{model}: il metadata tool_use=false di LiteLLM va ignorato per la famiglia magistral"
+            );
+        }
     }
 }

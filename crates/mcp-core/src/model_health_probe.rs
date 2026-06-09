@@ -152,7 +152,16 @@ pub(crate) async fn run_one_round(
             .filter(|t| *t > 0)
             .unwrap_or(3);
 
-    for (provider, model, consecutive_failures, supports_tool_use, tool_failures) in models {
+    for pm in models {
+        let ProbeModel {
+            provider,
+            model,
+            consecutive_failures,
+            supports_tool_use,
+            consecutive_tool_failures: tool_failures,
+            capability_source,
+            auto_disabled_reason,
+        } = pm;
         // Salta se il provider e' in cooldown lungo: faremmo solo rumore
         // (tutte le probe ritornerebbero errore di quota/billing che e'
         // gia' noto al sistema).
@@ -182,10 +191,22 @@ pub(crate) async fn run_one_round(
 
         sleep(Duration::from_millis(INTER_PROBE_SLEEP_MS)).await;
 
-        // FIX 1: tool-probe SOLO per i modelli candidati agli intent agentici
-        // (supports_tool_use=true). Costo contenuto: i modelli pure-chat non
-        // vengono toccati. Il provider in cooldown e' gia' stato saltato sopra.
-        if tool_probe_enabled && supports_tool_use {
+        // Il tool-probe gira sui candidati agentici (supports_tool_use=true) E
+        // sui modelli che IL TOOL-PROBE STESSO ha degradato (supports_tool_use=
+        // false con reason 'tool_probe_failed:%', solo capability_source='auto').
+        // Senza questo secondo caso il re-enable promesso era IRRAGGIUNGIBILE: un
+        // modello marcato non-tool-capable non veniva mai piu' ri-testato (catch-22)
+        // e restava degradato anche dopo che il provider tornava sano (es. i
+        // magistral: API Mistral tornata a gestire il tool-forcing, ma restavano
+        // false). I modelli pure-chat (mai tool-capable) e le curature manual
+        // (capability_source='manual') NON vengono toccati. Provider in cooldown
+        // gia' saltato sopra.
+        let tool_probe_was_auto_degraded = !supports_tool_use
+            && capability_source == "auto"
+            && auto_disabled_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("tool_probe_failed:"));
+        if tool_probe_enabled && (supports_tool_use || tool_probe_was_auto_degraded) {
             match tool_probe_one_model(
                 orchestrator,
                 db,
@@ -262,13 +283,27 @@ enum ToolProbeOutcome {
     Skipped,
 }
 
-/// Legge i modelli enabled dal catalog. Ritorna
-/// (provider, model, consecutive_failures, supports_tool_use, consecutive_tool_failures).
-async fn load_enabled_models(db: &PgPool) -> sqlx::Result<Vec<(String, String, i32, bool, i32)>> {
+/// Riga del catalog per il probe. `capability_source` e `auto_disabled_reason`
+/// servono al tool-probe per decidere se RI-testare un modello gia' marcato
+/// non-tool-capable (chiude il catch-22 del re-enable, vedi loop principale).
+struct ProbeModel {
+    provider: String,
+    model: String,
+    consecutive_failures: i32,
+    supports_tool_use: bool,
+    consecutive_tool_failures: i32,
+    capability_source: String,
+    auto_disabled_reason: Option<String>,
+}
+
+/// Legge i modelli enabled dal catalog (con i campi necessari al tool-probe).
+async fn load_enabled_models(db: &PgPool) -> sqlx::Result<Vec<ProbeModel>> {
     let rows = sqlx::query(
         "SELECT provider, model, consecutive_failures, \
                 COALESCE(supports_tool_use, false) AS supports_tool_use, \
-                COALESCE(consecutive_tool_failures, 0) AS consecutive_tool_failures
+                COALESCE(consecutive_tool_failures, 0) AS consecutive_tool_failures, \
+                COALESCE(capability_source, 'auto') AS capability_source, \
+                auto_disabled_reason
            FROM ai_price_catalog
           WHERE is_enabled = true
           ORDER BY provider, model",
@@ -278,13 +313,16 @@ async fn load_enabled_models(db: &PgPool) -> sqlx::Result<Vec<(String, String, i
 
     Ok(rows
         .into_iter()
-        .map(|r| {
-            let p: String = r.try_get("provider").unwrap_or_default();
-            let m: String = r.try_get("model").unwrap_or_default();
-            let f: i32 = r.try_get("consecutive_failures").unwrap_or(0);
-            let stu: bool = r.try_get("supports_tool_use").unwrap_or(false);
-            let tf: i32 = r.try_get("consecutive_tool_failures").unwrap_or(0);
-            (p, m, f, stu, tf)
+        .map(|r| ProbeModel {
+            provider: r.try_get("provider").unwrap_or_default(),
+            model: r.try_get("model").unwrap_or_default(),
+            consecutive_failures: r.try_get("consecutive_failures").unwrap_or(0),
+            supports_tool_use: r.try_get("supports_tool_use").unwrap_or(false),
+            consecutive_tool_failures: r.try_get("consecutive_tool_failures").unwrap_or(0),
+            capability_source: r
+                .try_get("capability_source")
+                .unwrap_or_else(|_| "auto".to_string()),
+            auto_disabled_reason: r.try_get("auto_disabled_reason").ok().flatten(),
         })
         .collect())
 }
@@ -640,13 +678,16 @@ async fn tool_probe_one_model(
         ToolProbeVerdict::Success => {
             // Reset contatore + riabilita tool-capability se era stata marcata
             // off da un precedente tool_probe_failed (NON tocca un disable manuale
-            // ne' is_enabled). Reset idempotente.
+            // ne' is_enabled). Reset idempotente. Guard capability_source='auto'
+            // (ADR 0024, regola L): il probe non modifica MAI le righe curate a
+            // mano dall'admin (vale per reset, increment e mark non-tool-capable).
             let _ = sqlx::query(
                 "UPDATE ai_price_catalog
                     SET consecutive_tool_failures = 0,
                         supports_tool_use = true,
                         updated_at = NOW()
                   WHERE provider = $1 AND model = $2
+                    AND capability_source = 'auto'
                     AND (consecutive_tool_failures > 0 OR supports_tool_use = false)
                     AND (auto_disabled_reason IS NULL OR auto_disabled_reason LIKE 'tool_probe_failed:%')",
             )
@@ -661,13 +702,18 @@ async fn tool_probe_one_model(
             let new_count = prior_tool_failures + 1;
             if new_count >= threshold {
                 let reason = format!("tool_probe_failed:{kind}");
+                // Guard capability_source='auto': non degradare righe curate a
+                // mano (ADR 0024, regola L). Le decisioni 'manual' (es. flag
+                // thinking della mig 0318) sono protette dal classificatore E dal
+                // probe: l'enforcement del 'manual' e' unico in tutto il sistema.
                 let _ = sqlx::query(
                     "UPDATE ai_price_catalog
                         SET supports_tool_use = false,
                             consecutive_tool_failures = $3,
                             auto_disabled_reason = $4,
                             updated_at = NOW()
-                      WHERE provider = $1 AND model = $2",
+                      WHERE provider = $1 AND model = $2
+                        AND capability_source = 'auto'",
                 )
                 .bind(provider)
                 .bind(model)
@@ -681,10 +727,14 @@ async fn tool_probe_one_model(
                 );
                 ToolProbeOutcome::MarkedNonToolCapable
             } else {
+                // Guard capability_source='auto' (regola L): il counter NON sale
+                // sulle righe manual, cosi' una curatela admin non raggiunge mai
+                // la soglia di degrado per colpa del probe.
                 let _ = sqlx::query(
                     "UPDATE ai_price_catalog
                         SET consecutive_tool_failures = $3, updated_at = NOW()
-                      WHERE provider = $1 AND model = $2",
+                      WHERE provider = $1 AND model = $2
+                        AND capability_source = 'auto'",
                 )
                 .bind(provider)
                 .bind(model)
@@ -757,13 +807,21 @@ async fn apply_provider_wide_cooldown(db: &PgPool, provider: &str, model: &str, 
             tracing::info!(
                 "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
             );
-            put_provider_in_short_cooldown(provider, "Rate limit raggiunto", 60);
+            put_provider_in_short_cooldown(
+                provider,
+                "Rate limit raggiunto",
+                crate::provider_cooldown::provider_health_timings().slow_cooldown_s,
+            );
         }
         "connection_error" => {
             tracing::info!(
                 "model_health_probe: provider {provider} messo in cooldown per {kind} (rilevato in probe model {model})"
             );
-            put_provider_in_short_cooldown(provider, "Provider non raggiungibile", 300);
+            put_provider_in_short_cooldown(
+                provider,
+                "Provider non raggiungibile",
+                crate::provider_cooldown::provider_health_timings().cooldown_default_s,
+            );
         }
         _ => {
             tracing::debug!(
