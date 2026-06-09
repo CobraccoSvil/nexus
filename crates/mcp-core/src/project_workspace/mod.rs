@@ -17,6 +17,7 @@ pub mod run_mode;
 pub mod runtime_issues;
 pub mod scan_ports;
 pub mod service_discovery;
+pub mod service_log_diagnose;
 pub mod service_observer;
 pub mod service_observer_remediation;
 pub mod services;

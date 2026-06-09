@@ -48,6 +48,8 @@ struct ObserverConfig {
     auto_diagnose_enabled: bool,
     diagnose_cooldown_seconds: i64,
     diagnose_max_per_hour: i64,
+    /// Secondi di attesa dopo l'avvio prima del readiness check TCP (mig 0384).
+    readiness_grace_seconds: i64,
 }
 
 /// Stato runtime per unit, tra i cicli.
@@ -61,10 +63,16 @@ struct UnitState {
     prev_restarts: Option<u32>,
     /// Anomalie attualmente attive (metric), per emettere solo sulla transizione.
     active_anomalies: HashSet<String>,
-    /// Firma dell'ultimo crash gestito (anti-ripetizione).
+    /// Firma dell'ultimo problema (crash/unhealthy) gestito (anti-ripetizione).
     last_crash_sig: Option<String>,
     /// Timestamp (unix) dell'ultima scansione log incrementale.
     last_log_scan_ts: i64,
+    /// Valore di `ActiveEnterTimestamp` visto al ciclo precedente: se cambia, e'
+    /// un nuovo avvio ("run") -> si resetta il grace di readiness e l'anti-spam.
+    prev_active_enter: Option<String>,
+    /// Istante in cui e' stato osservato l'avvio corrente (per il grace period
+    /// readiness, in-memory: niente parsing del timestamp systemd).
+    run_seen_at: Option<Instant>,
 }
 
 /// Campione metriche grezze da /proc.
@@ -108,6 +116,8 @@ async fn load_config(db: &PgPool) -> ObserverConfig {
         auto_diagnose_enabled: b(s(db, "agent.observer.auto_diagnose_enabled").await, false),
         diagnose_cooldown_seconds: i(s(db, "agent.observer.diagnose_cooldown_seconds").await, 600),
         diagnose_max_per_hour: i(s(db, "agent.observer.diagnose_max_per_hour").await, 5),
+        readiness_grace_seconds: i(s(db, "agent.observer.readiness_grace_seconds").await, 12)
+            .max(0),
     }
 }
 
@@ -266,10 +276,61 @@ async fn unit_restarts(unit: &str) -> Option<u32> {
         .and_then(|v| v.trim().parse::<u32>().ok())
 }
 
+/// `ActiveEnterTimestamp` dell'unita' (stringa systemd, es. "Sun 2026-06-09
+/// 19:25:05 CEST"). Confrontata col valore del ciclo precedente per rilevare un
+/// nuovo avvio ("run"): NON la parsiamo, basta sapere se e' cambiata.
+async fn unit_active_enter(unit: &str) -> Option<String> {
+    let out = tokio::process::Command::new("systemctl")
+        .args(["--user", "show", unit, "--property=ActiveEnterTimestamp"])
+        .output()
+        .await
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("ActiveEnterTimestamp="))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && v != "n/a")
+}
+
+/// Porte allocate per (project, unit) da `nexus_port_allocations`. Usate per il
+/// readiness check TCP (cross-tecnologia): un servizio che non ascolta su NESSUNA
+/// delle sue porte e' giu', qualunque sia il linguaggio. Vuoto = servizio senza
+/// porta (worker): readiness non applicabile.
+async fn ports_for_unit(db: &PgPool, project_id: Uuid, unit: &str) -> Vec<u16> {
+    sqlx::query_scalar::<_, i32>(
+        "SELECT port FROM nexus_port_allocations WHERE project_id = $1 AND service_unit = $2",
+    )
+    .bind(project_id)
+    .bind(unit)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .filter_map(|p| u16::try_from(p).ok())
+    .collect()
+}
+
+/// Chiude (resolved) le diagnosi 'crash' aperte di un'unita' tornata sana. Punto
+/// unico del ciclo di vita dei crash strutturali: quando il servizio e' di nuovo
+/// healthy (porta in ascolto / non failed) il problema sparisce dal pannello,
+/// simmetrico a `resolve_stale_anomalies` per le anomalie.
+async fn resolve_open_crashes(db: &PgPool, project_id: Uuid, unit: &str) {
+    let _ = sqlx::query(
+        "UPDATE service_diagnoses SET status = 'resolved', resolved_at = NOW() \
+         WHERE project_id = $1 AND unit = $2 AND signal_kind = 'crash' \
+           AND status IN ('open', 'diagnosing')",
+    )
+    .bind(project_id)
+    .bind(unit)
+    .execute(db)
+    .await;
+}
+
 /// Scansione incrementale dei log dell'unita' dal timestamp `since_unix`.
-/// Ritorna (n_righe_error, eventuale_crash). Usa journalctl one-shot (no follow):
-/// si integra nel loop unico evitando di gestire processi `-f` per servizio.
-async fn scan_new_logs(unit: &str, since_unix: i64) -> (u64, Option<(String, String)>) {
+/// Ritorna (n_righe_error, testo_completo). Usa journalctl one-shot (no follow).
+/// Il testo serve alla diagnosi LLM (service_log_diagnose) quando la detection
+/// strutturale segnala un servizio non funzionante: niente piu' pattern fissi.
+async fn scan_new_logs(unit: &str, since_unix: i64) -> (u64, String) {
     let since = chrono::DateTime::from_timestamp(since_unix.max(0), 0)
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_else(|| "-5 min".to_string());
@@ -288,7 +349,7 @@ async fn scan_new_logs(unit: &str, since_unix: i64) -> (u64, Option<(String, Str
         .await;
     let text = match out {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-        Err(_) => return (0, None),
+        Err(_) => return (0, String::new()),
     };
     let mut error_lines = 0u64;
     for line in text.lines() {
@@ -299,43 +360,7 @@ async fn scan_new_logs(unit: &str, since_unix: i64) -> (u64, Option<(String, Str
             error_lines += 1;
         }
     }
-    (error_lines, detect_crash(&text))
-}
-
-// ── Detector (logica pura, testabile) ─────────────────────────────────────────
-
-/// Rileva un crash/eccezione runtime, O un AVVIO FALLITO, in un blocco di log.
-/// Ritorna (kind, riga). I pattern di avvio fallito sono fondamentali per i casi
-/// in cui il supervisore (es. nodemon) ingoia l'errore del processo figlio ed
-/// esce con exit 0: systemd vede `Result=success`/`dead` (non `failed`) e il
-/// check sullo stato non scatta -> l'unico segnale e' nei log. Caso reale:
-/// `ts-node: not found` -> `[nodemon] failed to start process`.
-fn detect_crash(text: &str) -> Option<(String, String)> {
-    for (pattern, kind) in [
-        ("panicked at", "rust_panic"),
-        ("Traceback (most recent call last)", "python_traceback"),
-        ("Unhandled exception", "dotnet_exception"),
-        ("UnhandledPromiseRejection", "node_unhandled_rejection"),
-        ("segmentation fault", "segfault"),
-        ("Segmentation fault", "segfault"),
-        ("FATAL ERROR", "fatal"),
-        // Avvii falliti (dipendenza/eseguibile mancante, porta occupata) che
-        // spesso escono con exit 0 e sfuggono al check ActiveState=failed.
-        ("failed to start process", "startup_failed"),
-        ("command not found", "command_not_found"),
-        ("MODULE_NOT_FOUND", "module_not_found"),
-        ("Cannot find module", "module_not_found"),
-        ("EADDRINUSE", "port_in_use"),
-    ] {
-        if let Some(line) = text.lines().find(|l| l.contains(pattern)) {
-            // Strippa gli escape ANSI: nodemon & co. colorano i log (es. \x1B[31m);
-            // senza questo finirebbero grezzi nel messaggio del pannello Problemi,
-            // mostrati come caratteri di controllo malformati.
-            let snippet: String = strip_ansi(line.trim()).chars().take(400).collect();
-            return Some((kind.to_string(), snippet));
-        }
-    }
-    None
+    (error_lines, text)
 }
 
 /// Rimuove le sequenze di escape ANSI (CSI: `ESC [` ... lettera finale `@`-`~`)
@@ -628,7 +653,7 @@ async fn run_cycle(state: &AppState, cfg: &ObserverConfig, states: &mut HashMap<
                 now_ts - 60
             };
             let window_min = ((now_ts - since).max(1) as f64) / 60.0;
-            let (error_lines, crash) = scan_new_logs(&unit, since).await;
+            let (error_lines, log_text) = scan_new_logs(&unit, since).await;
             st.last_log_scan_ts = now_ts;
             let error_per_min = error_lines as f64 / window_min;
 
@@ -680,17 +705,90 @@ async fn run_cycle(state: &AppState, cfg: &ObserverConfig, states: &mut HashMap<
                 st.active_anomalies.iter().cloned().collect();
             resolve_stale_anomalies(&state.db, project_id, &unit, &active_metrics).await;
 
-            // ── Crash detection (cap 1): emetti su firma nuova ─────────────
-            if let Some((kind, last_log)) = crash {
-                let sig = sig_hash(&format!("{unit}:{last_log}"));
+            // ── Detection STRUTTURALE di servizio non funzionante (cap 1) ───
+            // Niente piu' pattern testuali per-linguaggio: si rileva in modo
+            // OGGETTIVO che il servizio e' giu' (stato failed / porta non in
+            // ascolto dopo l'avvio / restart-loop), poi un LLM classifica i log
+            // (cross-tecnologia). Vedi service_log_diagnose + mig 0384.
+
+            // Nuovo "run"? (ActiveEnterTimestamp cambiato) -> reset grace + anti-spam.
+            let active_enter = unit_active_enter(&unit).await;
+            if active_enter != st.prev_active_enter {
+                st.prev_active_enter = active_enter;
+                st.run_seen_at = Some(Instant::now());
+                st.last_crash_sig = None;
+            }
+            let grace_ok = st
+                .run_seen_at
+                .map(|t| t.elapsed().as_secs() as i64 >= cfg.readiness_grace_seconds)
+                .unwrap_or(false);
+
+            // Readiness TCP: servizio attivo da > grace con porte allocate ma
+            // NESSUNA in ascolto -> e' giu' (cattura i supervisori che restano
+            // vivi con l'app crashata, qualunque tecnologia). Servizio senza porte
+            // (worker): readiness non applicabile -> solo failed/restart-loop.
+            let ports = ports_for_unit(&state.db, project_id, &unit).await;
+            let mut readiness_failed = false;
+            if grace_ok && active == "active" && !ports.is_empty() {
+                let mut any_up = false;
+                for p in &ports {
+                    if crate::project_workspace::port_recovery::tcp_probe(*p, 400).await {
+                        any_up = true;
+                        break;
+                    }
+                }
+                readiness_failed = !any_up;
+            }
+
+            let reason: Option<&str> = if active == "failed" {
+                Some("service_failed")
+            } else if readiness_failed {
+                Some("port_not_listening")
+            } else if restart_delta > cfg.restart_rate_max {
+                Some("restart_loop")
+            } else {
+                None
+            };
+
+            if let Some(reason) = reason {
+                // Firma per anti-spam: unit + run corrente + natura del problema.
+                let sig = sig_hash(&format!(
+                    "{unit}:{}:{reason}",
+                    st.prev_active_enter.as_deref().unwrap_or("")
+                ));
                 if st.last_crash_sig.as_deref() != Some(sig.as_str()) {
                     st.last_crash_sig = Some(sig.clone());
+
+                    // Diagnosi LLM dei log (cross-tech, no pattern). Best-effort:
+                    // se non disponibile, si registra con la coda del log grezzo.
+                    let clean = strip_ansi(&log_text);
+                    let diag = crate::project_workspace::service_log_diagnose::diagnose_logs(
+                        state, &unit, &clean,
+                    )
+                    .await;
+                    let (error_kind, detail) = match diag {
+                        Some(d) => (d.error_kind, format!("[{}] {}", d.language, d.summary)),
+                        None => {
+                            let tail: Vec<&str> = clean.lines().rev().take(15).collect();
+                            let tail: String =
+                                tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+                            let tail: String = tail.chars().take(600).collect();
+                            (
+                                reason.to_string(),
+                                format!(
+                                    "Servizio non operativo ({reason}); diagnosi LLM non \
+                                     disponibile. Ultime righe di log:\n{tail}"
+                                ),
+                            )
+                        }
+                    };
+
                     nexus_events::dispatcher::emit_global(
                         project_id,
                         ProjectEvent::ServiceCrashDetected {
                             unit: unit.clone(),
-                            error_kind: kind.clone(),
-                            last_log: last_log.clone(),
+                            error_kind: error_kind.clone(),
+                            last_log: detail.clone(),
                         },
                     );
                     let diag_id = persist_diagnosis(
@@ -698,14 +796,13 @@ async fn run_cycle(state: &AppState, cfg: &ObserverConfig, states: &mut HashMap<
                         project_id,
                         &unit,
                         "crash",
-                        None,
+                        Some(&error_kind),
                         None,
                         None,
                         Some(&sig),
-                        Some(&format!("{kind}: {last_log}")),
+                        Some(&detail),
                     )
                     .await;
-                    // cap 1 — auto-debug (gated da auto_diagnose_enabled).
                     crate::project_workspace::service_observer_remediation::maybe_trigger_debugger(
                         state,
                         cfg.auto_diagnose_enabled,
@@ -713,13 +810,18 @@ async fn run_cycle(state: &AppState, cfg: &ObserverConfig, states: &mut HashMap<
                         cfg.diagnose_max_per_hour,
                         project_id,
                         &unit,
-                        &kind,
-                        &last_log,
+                        &error_kind,
+                        &detail,
                         &sig,
                         diag_id,
                     )
                     .await;
                 }
+            } else if grace_ok {
+                // Servizio sano dopo il grace: chiude eventuali crash aperti
+                // (ciclo di vita: quando viene riparato, il problema sparisce).
+                resolve_open_crashes(&state.db, project_id, &unit).await;
+                st.last_crash_sig = None;
             }
         }
 
@@ -753,6 +855,7 @@ mod tests {
             auto_diagnose_enabled: false,
             diagnose_cooldown_seconds: 600,
             diagnose_max_per_hour: 5,
+            readiness_grace_seconds: 12,
         }
     }
 
@@ -800,46 +903,9 @@ mod tests {
     }
 
     #[test]
-    fn detect_startup_failed_nodemon() {
-        // Caso reale: nodemon non trova ts-node ed esce con exit 0 (sfugge a
-        // ActiveState=failed, va catturato dai log). Il log e' colorato ANSI:
-        // lo snippet restituito DEVE essere ripulito.
-        let log = "\u{1B}[31m[nodemon] failed to start process, \"ts-node src/server.ts\" exec not found\u{1B}[39m";
-        let (kind, snippet) = detect_crash(log).unwrap();
-        assert_eq!(kind, "startup_failed");
-        assert!(!snippet.contains('\u{1B}'), "lo snippet non deve contenere ESC ANSI");
-        assert!(!snippet.contains("[31m"), "i codici colore ANSI vanno strippati");
-        assert!(snippet.contains("failed to start process"));
-    }
-
-    #[test]
     fn strip_ansi_removes_color_codes() {
         assert_eq!(strip_ansi("\u{1B}[31mrosso\u{1B}[0m normale"), "rosso normale");
         assert_eq!(strip_ansi("nessun codice"), "nessun codice");
     }
 
-    #[test]
-    fn detect_module_not_found() {
-        let log = "Error: Cannot find module 'express'\n    at Module._resolveFilename";
-        assert_eq!(detect_crash(log).unwrap().0, "module_not_found");
-    }
-
-    #[test]
-    fn detect_rust_panic() {
-        let log = "thread 'main' panicked at src/main.rs:10:5:\nindex out of bounds";
-        let c = detect_crash(log);
-        assert!(c.is_some());
-        assert_eq!(c.unwrap().0, "rust_panic");
-    }
-
-    #[test]
-    fn detect_python_traceback() {
-        let log = "Traceback (most recent call last):\n  File x";
-        assert_eq!(detect_crash(log).unwrap().0, "python_traceback");
-    }
-
-    #[test]
-    fn no_crash_on_clean_log() {
-        assert!(detect_crash("server started on :3000\nrequest handled").is_none());
-    }
 }
