@@ -1547,6 +1547,29 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             f"anche i modelli piu' capaci provati in escalation non hanno agito. "
             f"Fermo l'esecuzione: riformula la richiesta in modo piu' specifico."
         )
+        # G1 cap: l'agente ha DESCRITTO i passi senza eseguirli. Prima di fermare,
+        # rendi cliccabili i "Prossimi passi" dell'ultima risposta del modello, cosi'
+        # l'utente puo' lanciarli con un click invece di riscrivere il prompt (il
+        # prompt generato istruisce a ESEGUIRE, non descrivere). La derivazione qui
+        # e' necessaria perche' il punto unico in executor end_turn (riga ~2492) e'
+        # gated su stop_reason='end_turn' e questo stop forzato lo salterebbe.
+        # Best-effort: nessun errore blocca lo stop.
+        _g1_na_payload: dict[str, Any] = {}
+        try:
+            from .. import next_actions as _na_mod
+            _last_model_text = ""
+            for _mm in reversed(state.get("messages") or []):
+                if isinstance(_mm, AIMessage):
+                    _cc = getattr(_mm, "content", "")
+                    if isinstance(_cc, str) and _cc.strip():
+                        _last_model_text = _cc
+                        break
+            if _last_model_text:
+                _, _g1_na_step = await _na_mod.derive(_last_model_text, _providers)
+                if _g1_na_step is not None:
+                    _g1_na_payload["meta_steps"] = [_g1_na_step]
+        except Exception as _g1_na_exc:
+            logger.debug("executor_node: G1 cap next_actions derive fallita: %s", _g1_na_exc)
         return {
             "messages": [AIMessage(content=_cap_text)],
             "result": _cap_text,
@@ -1555,6 +1578,7 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             "iterations": int(state.get("iterations") or 0) + 1,
             "g1_reroute_count": _g1_reroute_count,
             "action_nudge_count": int(state.get("action_nudge_count") or 0),
+            **_g1_na_payload,
         }
 
     # ── Loop-detection semantica: esplorazione allegati senza scrittura ───────

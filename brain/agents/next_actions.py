@@ -74,6 +74,47 @@ def _list_item_count(text: str) -> int:
     return len(_LIST_ITEM_RE.findall(text or ""))
 
 
+# Header che introducono una lista di azioni operative proponibili come pulsanti
+# ("Prossimi passi", "Soluzione immediata", ...). Pattern deterministico per il
+# caso comune in cui l'agente DESCRIVE i passi invece di eseguirli (e magari il
+# G1 anti-loop ferma il run): cosi' i passi diventano comunque cliccabili senza
+# dipendere dal fallback LLM (che richiede un provider non in cooldown).
+_NEXT_STEPS_HEADER_RE = re.compile(
+    r"(?im)^\s*#{0,4}\s*\**\s*(?:prossimi passi|prossime azioni|next steps|"
+    r"soluzione immediata|azioni suggerite|come proseguire|cosa fare ora)\s*\**\s*:?\s*$"
+)
+_NEXT_STEP_ITEM_LINE_RE = re.compile(r"(?m)^\s*(?:\d+[.)]|[-*•])\s+(.+?)\s*$")
+
+
+def extract_next_steps(text: str) -> list[dict[str, str]]:
+    """FALLBACK DETERMINISTICO (no LLM): se il testo ha un header tipo "Prossimi
+    passi" seguito da una lista, genera una choice per voce. Robusto quando il
+    fallback LLM non e' disponibile (provider in cooldown / router giu') o quando
+    lo stop e' forzato (G1). Il `prompt` istruisce esplicitamente a ESEGUIRE il
+    passo (non descriverlo), per non ricadere nel loop "propone invece di fare"."""
+    if not text:
+        return []
+    m = _NEXT_STEPS_HEADER_RE.search(text)
+    if not m:
+        return []
+    tail = text[m.end():]  # solo la sezione DOPO l'header
+    out: list[dict[str, str]] = []
+    for raw in _NEXT_STEP_ITEM_LINE_RE.findall(tail):
+        label_full = re.sub(r"\*\*|`", "", raw).strip().rstrip(".")
+        if not label_full or len(label_full) < 4:
+            continue
+        label = label_full.split(":")[0].split(".")[0].strip()[:_MAX_LABEL_CHARS]
+        prompt = (
+            "Esegui ORA questo passo modificando i file del progetto (non "
+            f"limitarti a descriverlo): {label_full}. Al termine verifica che "
+            "funzioni davvero end-to-end."
+        )
+        out.append({"label": label, "prompt": prompt[:_MAX_PROMPT_CHARS]})
+        if len(out) >= _MAX_CHOICES:
+            break
+    return out
+
+
 # ── Detector semantico ("la risposta propone scelte all'utente?") ────────────
 # Riusa lo STESSO meccanismo embedding+exemplars+cosine del SemanticRouter
 # (brain/router/service.py::_classify_by_embedding) e lo STESSO EmbeddingService
@@ -414,6 +455,13 @@ async def derive(assistant_text: str, providers: Any) -> tuple[str, dict[str, An
     if choices:
         logger.info("next_actions: %d scelte dal blocco primario", len(choices))
         return cleaned, build_step(choices)
+
+    # Fallback DETERMINISTICO (no LLM): liste "Prossimi passi" -> choices. Robusto
+    # quando il provider del fallback e' in cooldown o lo stop e' forzato (G1).
+    det_choices = extract_next_steps(cleaned)
+    if det_choices:
+        logger.info("next_actions: %d scelte dall'estrattore deterministico", len(det_choices))
+        return cleaned, build_step(det_choices)
 
     # Nessun blocco: fallback LLM solo se l'euristica lo giustifica.
     if looks_like_choices(cleaned) and providers is not None:
