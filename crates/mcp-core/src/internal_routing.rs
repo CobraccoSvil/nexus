@@ -397,6 +397,13 @@ pub struct RoutingDecideRequest {
     /// Se assente o stringa vuota, si usa il valore DB globale come fallback.
     #[serde(default)]
     pub behavior_mode: Option<String>,
+    /// Intent gia' classificato dal chiamante (es. brain router_node). Se
+    /// presente, il routing salta la classificazione LLM ridondante (regola L:
+    /// punto unico classificazione). Evita il timeout del client su message non
+    /// cachati, che costava 0.7-0.9s per la classificazione. Se assente,
+    /// mcp-core classifica come prima.
+    #[serde(default)]
+    pub intent: Option<String>,
 }
 
 /// Handler `POST /api/internal/routing/decide`.
@@ -429,6 +436,7 @@ pub async fn decide_routing(
             body.behavior_mode
                 .as_deref()
                 .filter(|v| !v.trim().is_empty()),
+            body.intent.as_deref().filter(|v| !v.trim().is_empty()),
         )
         .await;
     // Se nessun provider e' utilizzabile, ritorna 503 ma comunque con il body
@@ -470,6 +478,7 @@ pub async fn decide_routing_get(
             None,
             0,
             q.mode.as_deref().filter(|v| !v.trim().is_empty()),
+            None,
         )
         .await;
     (StatusCode::OK, Json(result)).into_response()

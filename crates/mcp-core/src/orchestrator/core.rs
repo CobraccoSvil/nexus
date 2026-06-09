@@ -236,6 +236,9 @@ impl Orchestrator {
         // Modalita' scelta per la singola sessione (es. dal dropdown chat).
         // Se `Some`, sovrascrive `nexus_behavior_mode` DB solo per questa chiamata.
         behavior_mode_session: Option<&str>,
+        // Intent gia' classificato dal chiamante (regola L). Propagato a
+        // resolve_agent_provider e usato per gate/source senza ri-classificare.
+        intent_hint: Option<&str>,
     ) -> RoutingResolveResult {
         // Snapshot della routing matrix DB (cache 60s, lock-free clone Arc).
         // Se la matrice non e' caricata (DB down all'avvio), ritorniamo
@@ -290,11 +293,20 @@ impl Orchestrator {
                 model_override,
                 context_message_count,
                 Some(&configured_behavior_mode),
+                intent_hint,
             )
             .await;
-        // Riclassifica via classifier LLM (gemini-flash, cache 24h) con fallback
-        // keyword + promozione agentic. Vedi `classify_intent_async`.
-        let (intent, confidence) = self.classify_intent_with_db_thresholds(message).await;
+        // Intent per gate/source: se fornito dal chiamante (brain), lo usiamo
+        // (regola L, niente doppia classificazione); altrimenti classifichiamo
+        // via classifier LLM (gemini-flash, cache 24h). Vedi `classify_intent_async`.
+        let (intent_owned, confidence): (String, f32) = match intent_hint {
+            Some(h) if !h.trim().is_empty() => (h.to_string(), 1.0),
+            _ => {
+                let (i, c) = self.classify_intent_with_db_thresholds(message).await;
+                (i.to_string(), c)
+            }
+        };
+        let intent: &str = intent_owned.as_str();
 
         // ── Gate di capability tool-use (ADR 0018, leva 0) ──────────────────
         // Un RUN AGENTICO (intent != "chat") non deve MAI usare un modello con
@@ -591,6 +603,11 @@ impl Orchestrator {
         // Override del behavior_mode per questa singola chiamata (sessione utente).
         // Se `Some`, sostituisce `routing.behavior_mode` letto dal DB.
         behavior_mode_override: Option<&str>,
+        // Intent gia' classificato dal chiamante (es. brain router_node). Se
+        // `Some` e non vuoto, si SALTA la classificazione LLM ridondante (regola
+        // L: punto unico, niente doppia classificazione) che costa 0.7-0.9s e fa
+        // sforare il timeout del client. Se `None`, mcp-core classifica.
+        intent_hint: Option<&str>,
     ) -> (String, String) {
         // Snapshot della routing matrix DB (cache 60s, await sul lock se busy).
         // Se la matrice non e' caricata (caso impossibile dopo init() che ha
@@ -661,7 +678,18 @@ impl Orchestrator {
         // Ogni 10 messaggi = +1000 token equivalenti (cap a 6000).
         let context_bonus = ((context_message_count / 10) as u32 * 1_000).min(6_000);
         let estimated_tokens = base_estimated.saturating_add(context_bonus);
-        let (intent, _confidence) = self.classify_intent_with_db_thresholds(message).await;
+        // Punto unico classificazione (regola L): se il chiamante ha gia' l'intent
+        // lo usiamo, altrimenti classifichiamo. Evita la classificazione LLM
+        // ridondante e il timeout client su message non cachati.
+        let intent_owned: String = match intent_hint {
+            Some(h) if !h.trim().is_empty() => h.to_string(),
+            _ => self
+                .classify_intent_with_db_thresholds(message)
+                .await
+                .0
+                .to_string(),
+        };
+        let intent = intent_owned.as_str();
         // La RoutingConfig admin può sovrascrivere il modello per provider.
         // Il behavior_mode effettivo: override sessione > DB globale.
         let routing = match Self::load_routing_config(db).await {

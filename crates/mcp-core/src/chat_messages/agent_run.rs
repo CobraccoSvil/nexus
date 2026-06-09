@@ -589,6 +589,7 @@ pub(crate) async fn spawn_agent_run(
             effective_model_override.as_deref(),
             context_message_count,
             None, // behavior_mode_session: nessun override per il pre-check routing
+            None, // intent_hint: il pre-check classifica (non e' nel loop, no timeout client)
         )
         .await;
 

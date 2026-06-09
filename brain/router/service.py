@@ -52,24 +52,34 @@ class _RoutingClient:
             or os.getenv("MCP_CORE_URL")
             or get_setting("mcp_core_url", "http://127.0.0.1:4000")
         ).rstrip("/")
-        self._cache: dict[tuple[str, str], tuple[float, RoutingDecision]] = {}
+        self._cache: dict[tuple[str, str, str], tuple[float, RoutingDecision]] = {}
         # Cache del set provider in cooldown (ADR 0020), TTL condiviso.
         self._cooldown_cache: tuple[float, set[str]] | None = None
 
-    def decide(self, *, message: str, behavior_mode: str) -> RoutingDecision:
+    def decide(
+        self, *, message: str, behavior_mode: str, intent: str | None = None
+    ) -> RoutingDecision:
         import time
         import urllib.request
         import urllib.error
         import json as _json
-        key = (message[:512], behavior_mode)  # cap message length nella key
+        # L'intent gia' classificato dal brain (router_node) viene propagato al
+        # router Rust: mcp-core SALTA la classificazione LLM ridondante (regola L)
+        # che costa 0.7-0.9s su message non cachati e faceva sforare il timeout
+        # client di 1.5s -> __router_unavailable__. Con l'intent il /decide e'
+        # un lookup matrix (<5ms) e non va mai in timeout.
+        key = (message[:512], behavior_mode, intent or "")  # cap message length nella key
         now = time.monotonic()
         entry = self._cache.get(key)
         if entry and now - entry[0] < self._CACHE_TTL_S:
             return entry[1]
-        body = _json.dumps({
+        _payload: dict[str, str] = {
             "message": message,
             "behavior_mode": behavior_mode,
-        }).encode("utf-8")
+        }
+        if intent:
+            _payload["intent"] = intent
+        body = _json.dumps(_payload).encode("utf-8")
         url = f"{self._base}/api/internal/routing/decide"
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
         try:
@@ -429,6 +439,7 @@ class SemanticRouter:
         decision = _routing_client_singleton().decide(
             message=message or "",
             behavior_mode=behavior_mode,
+            intent=intent or None,
         )
         if has_image_attachments and not decision.provider.startswith("__"):
             return _apply_vision_override(decision)
