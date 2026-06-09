@@ -803,36 +803,23 @@ async fn run_cycle(state: &AppState, cfg: &ObserverConfig, states: &mut HashMap<
                 if st.last_crash_sig.as_deref() != Some(sig.as_str()) {
                     st.last_crash_sig = Some(sig.clone());
 
-                    // Diagnosi LLM dei log (cross-tech, no pattern). Best-effort:
-                    // se non disponibile, si registra con la coda del log grezzo.
+                    // Register-then-refine: registra SUBITO il problema (sincrono,
+                    // veloce, col log grezzo) cosi' compare in Problemi e il persist
+                    // NON dipende dall'LLM; poi la diagnosi LLM raffina il detail in
+                    // BACKGROUND (con timeout), senza bloccare il ciclo observer.
                     let clean = strip_ansi(&log_text);
-                    let diag = crate::project_workspace::service_log_diagnose::diagnose_logs(
-                        state, &unit, &clean,
-                    )
-                    .await;
-                    let (error_kind, detail) = match diag {
-                        Some(d) => (d.error_kind, format!("[{}] {}", d.language, d.summary)),
-                        None => {
-                            let tail: Vec<&str> = clean.lines().rev().take(15).collect();
-                            let tail: String =
-                                tail.into_iter().rev().collect::<Vec<_>>().join("\n");
-                            let tail: String = tail.chars().take(600).collect();
-                            (
-                                reason.to_string(),
-                                format!(
-                                    "Servizio non operativo ({reason}); diagnosi LLM non \
-                                     disponibile. Ultime righe di log:\n{tail}"
-                                ),
-                            )
-                        }
-                    };
+                    let tail: Vec<&str> = clean.lines().rev().take(15).collect();
+                    let tail: String = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+                    let tail: String = tail.chars().take(600).collect();
+                    let initial_detail =
+                        format!("Servizio non operativo ({reason}). Ultime righe di log:\n{tail}");
 
                     nexus_events::dispatcher::emit_global(
                         project_id,
                         ProjectEvent::ServiceCrashDetected {
                             unit: unit.clone(),
-                            error_kind: error_kind.clone(),
-                            last_log: detail.clone(),
+                            error_kind: reason.to_string(),
+                            last_log: initial_detail.clone(),
                         },
                     );
                     let diag_id = persist_diagnosis(
@@ -840,26 +827,26 @@ async fn run_cycle(state: &AppState, cfg: &ObserverConfig, states: &mut HashMap<
                         project_id,
                         &unit,
                         "crash",
-                        Some(&error_kind),
+                        Some(reason),
                         None,
                         None,
                         Some(&sig),
-                        Some(&detail),
+                        Some(&initial_detail),
                     )
                     .await;
-                    crate::project_workspace::service_observer_remediation::maybe_trigger_debugger(
-                        state,
+
+                    // Diagnosi LLM + auto-debug in BACKGROUND (non blocca il ciclo).
+                    crate::project_workspace::service_log_diagnose::spawn_diagnosis(
+                        state.clone(),
+                        project_id,
+                        unit.clone(),
+                        clean,
+                        sig,
+                        diag_id,
                         cfg.auto_diagnose_enabled,
                         cfg.diagnose_cooldown_seconds,
                         cfg.diagnose_max_per_hour,
-                        project_id,
-                        &unit,
-                        &error_kind,
-                        &detail,
-                        &sig,
-                        diag_id,
-                    )
-                    .await;
+                    );
                 }
             } else if grace_ok {
                 // Servizio sano dopo il grace: chiude eventuali crash aperti

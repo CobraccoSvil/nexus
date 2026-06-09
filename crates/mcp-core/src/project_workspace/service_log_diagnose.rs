@@ -17,6 +17,8 @@
 //! giudica i log sani (`is_error=false`), ritorna `None`. Il chiamante registra
 //! comunque il problema strutturale con il log grezzo, cosi' resta visibile.
 
+use uuid::Uuid;
+
 use crate::internal_routing::{resolve_purpose_model, PurposeResolution};
 use crate::AppState;
 
@@ -26,6 +28,9 @@ const TEMPLATE_KEY: &str = "system.service_log_diagnosis";
 /// Coda di log inviata all'LLM (gli ultimi caratteri: la parte piu' informativa
 /// di un crash). Tiene il prompt entro dimensioni ragionevoli.
 const MAX_LOG_CHARS: usize = 6000;
+/// Tetto alla chiamata LLM: un modello reasoning lento non deve bloccare a vita
+/// il task di diagnosi. Oltre, si tiene il detail iniziale (log grezzo).
+const LLM_TIMEOUT_S: u64 = 25;
 
 /// Esito della diagnosi LLM di un blocco di log applicativi.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,15 +181,22 @@ pub(crate) async fn diagnose_logs(
         "service_log_diagnose: invio LLM"
     );
 
-    let resp = match state
-        .orchestrator
-        .neural
-        .generate_completion(&provider, &model, &prompt)
-        .await
+    let resp = match tokio::time::timeout(
+        std::time::Duration::from_secs(LLM_TIMEOUT_S),
+        state
+            .orchestrator
+            .neural
+            .generate_completion(&provider, &model, &prompt),
+    )
+    .await
     {
-        Ok(v) => v,
-        Err(e) => {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
             tracing::warn!(unit = %unit, error = %e, "service_log_diagnose: generate_completion fallito, uso log grezzo");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(unit = %unit, "service_log_diagnose: timeout LLM ({LLM_TIMEOUT_S}s), uso log grezzo");
             return None;
         }
     };
@@ -194,6 +206,64 @@ pub(crate) async fn diagnose_logs(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     parse_diagnosis(content)
+}
+
+/// Lancia in BACKGROUND la diagnosi LLM di un crash GIA' registrato (`diag_id`):
+/// raffina il `detail`/`metric` del record con la diagnosi e, se abilitato, avvia
+/// l'auto-debug. NON blocca il ciclo dell'observer (la chiamata LLM puo' essere
+/// lenta). Pattern "register-then-refine": il problema e' gia' visibile nel
+/// pannello (col log grezzo) prima che l'LLM risponda.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_diagnosis(
+    state: AppState,
+    project_id: Uuid,
+    unit: String,
+    log_text: String,
+    sig: String,
+    diag_id: Option<Uuid>,
+    auto_diagnose_enabled: bool,
+    diagnose_cooldown_seconds: i64,
+    diagnose_max_per_hour: i64,
+) {
+    tokio::spawn(async move {
+        // kind/detail per l'auto-debug: la diagnosi LLM se disponibile, altrimenti
+        // un fallback generico (il record mantiene il detail iniziale col log).
+        let (kind, dbg_log) = match diagnose_logs(&state, &unit, &log_text).await {
+            Some(d) => {
+                let detail = format!("[{}] {}", d.language, d.summary);
+                if let Some(id) = diag_id {
+                    let _ = sqlx::query(
+                        "UPDATE service_diagnoses SET metric = $2, detail = $3 \
+                         WHERE id = $1 AND status IN ('open', 'diagnosing')",
+                    )
+                    .bind(id)
+                    .bind(&d.error_kind)
+                    .bind(&detail)
+                    .execute(&state.db)
+                    .await;
+                }
+                (d.error_kind, detail)
+            }
+            None => (
+                "unknown".to_string(),
+                "diagnosi LLM non disponibile (vedi log grezzo)".to_string(),
+            ),
+        };
+
+        crate::project_workspace::service_observer_remediation::maybe_trigger_debugger(
+            &state,
+            auto_diagnose_enabled,
+            diagnose_cooldown_seconds,
+            diagnose_max_per_hour,
+            project_id,
+            &unit,
+            &kind,
+            &dbg_log,
+            &sig,
+            diag_id,
+        )
+        .await;
+    });
 }
 
 #[cfg(test)]
