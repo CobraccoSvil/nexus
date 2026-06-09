@@ -1919,6 +1919,25 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 "G1 nudge iniettato (iter=%d, nudge_count=%d, intent=%s, motivo=%s)",
                 _current_iter, _nudge_count, intent, _nudge_reason,
             )
+            # Convergenza punto unico (progress_controller): il nudge testuale e'
+            # ignorabile. Alla PRIMA occorrenza affianchiamo la FORZA-AZIONE hard
+            # (tool_choice required) come per l'esplorazione, cosi' il modello e'
+            # OBBLIGATO a emettere una tool call invece di ri-descrivere. L'asse
+            # g1_descriptive entra negli assi guidati; le occorrenze successive
+            # restano gestite dal cap G1 + escalation a monte (rete a valle).
+            if _progress_ctrl_on:
+                from .. import progress_controller as _pc_g1
+                _g1_dec = _pc_g1.decide(_pc_g1.ProgressSignals(
+                    g1_over_cap=True,
+                    already_guided=frozenset(_progress_guided),
+                ))
+                if _g1_dec.action == "guide" and _g1_dec.force_action:
+                    _force_action_hard = True
+                    _progress_guided.add("g1_descriptive")
+                    logger.warning(
+                        "executor_node: progress_controller GUIDE g1_descriptive -> "
+                        "forza tool_choice required (oltre al nudge testuale)"
+                    )
 
     # Heartbeat A: pubblica step "calling_model" cosi' l'utente vede in chat
     # che l'agente sta lavorando (LLM call puo' durare 30-60s su contesti grandi).
@@ -2517,6 +2536,10 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         else bool(state.get("exploration_nudge_sent") or False)
     )
     if pending_tool_uses:
+        # Reset coordinato g1_descriptive: il modello ha emesso una tool call
+        # (qualsiasi), quindi NON sta piu' "descrivendo senza agire". L'asse esce
+        # dagli assi guidati cosi' un eventuale stallo G1 futuro riparte da GUIDE.
+        _progress_guided.discard("g1_descriptive")
         _pending_names = [str(tu.get("name", "")) for tu in pending_tool_uses]
         _all_exploration = all(n in _EXPLORATION_ONLY_TOOLS for n in _pending_names)
         if _all_exploration:
