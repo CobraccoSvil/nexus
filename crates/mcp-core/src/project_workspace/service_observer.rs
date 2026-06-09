@@ -407,6 +407,46 @@ async fn scan_new_logs(unit: &str, since_unix: i64) -> (u64, String) {
     (error_lines, text)
 }
 
+/// Log dell'INTERO run corrente dell'unita' (dal suo avvio), filtrati per
+/// `InvocationID` di systemd. Cattura sempre lo startup completo a prescindere
+/// da quanti minuti fa il servizio e' partito, ed e' indispensabile per la
+/// diagnosi di `port_not_listening`: la riga chiave ("listening on <porta>")
+/// e' nello startup, non negli ultimi secondi della finestra error-rate.
+/// L'InvocationID e' l'identificatore stabile del run corrente: niente parsing
+/// di timestamp/fuso orario. Stringa vuota -> il chiamante usa il suo fallback.
+async fn scan_run_logs(unit: &str) -> String {
+    let inv = tokio::process::Command::new("systemctl")
+        .args(["--user", "show", unit, "--property=InvocationID"])
+        .output()
+        .await
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .find_map(|l| l.strip_prefix("InvocationID="))
+                .map(|v| v.trim().to_string())
+        })
+        .filter(|v| !v.is_empty());
+    let inv = match inv {
+        Some(v) => v,
+        None => return String::new(),
+    };
+    let out = tokio::process::Command::new("journalctl")
+        .args([
+            "--user",
+            &format!("_SYSTEMD_INVOCATION_ID={inv}"),
+            "--no-pager",
+            "-o",
+            "cat",
+        ])
+        .output()
+        .await;
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(_) => String::new(),
+    }
+}
+
 /// Rimuove le sequenze di escape ANSI (CSI: `ESC [` ... lettera finale `@`-`~`)
 /// da un testo. Serve a ripulire le righe di log colorate (nodemon, vite, ...)
 /// prima di mostrarle nel pannello Problemi o di passarle al Debugger.
@@ -813,7 +853,17 @@ async fn run_cycle(state: &AppState, cfg: &ObserverConfig, states: &mut HashMap<
                     // veloce, col log grezzo) cosi' compare in Problemi e il persist
                     // NON dipende dall'LLM; poi la diagnosi LLM raffina il detail in
                     // BACKGROUND (con timeout), senza bloccare il ciclo observer.
-                    let mut clean = strip_ansi(&log_text);
+                    // Per la diagnosi usa il log dell'INTERO run corrente (startup
+                    // incluso) anziche' la sola finestra error-rate: lo startup
+                    // contiene il segnale chiave (es. la porta reale in ascolto).
+                    // Fallback alla finestra se l'InvocationID non e' disponibile.
+                    let run_log = scan_run_logs(&unit).await;
+                    let source: &str = if run_log.trim().is_empty() {
+                        &log_text
+                    } else {
+                        &run_log
+                    };
+                    let mut clean = strip_ansi(source);
                     // Gestione porte STRUTTURALE (no liste/regex): se il servizio e'
                     // su ma non ascolta sulle porte ALLOCATE (fonte unica), passa il
                     // fatto alla diagnosi. L'LLM, leggendo i log, rileva se ascolta

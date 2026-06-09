@@ -458,6 +458,38 @@ pub(crate) async fn supersede_active_runs(
     cancelled_ids
 }
 
+/// Punto unico (regola L) della domanda "c'e' un run agentico attivo su questa
+/// sessione?". Usa gli STESSI stati che `supersede_active_runs` (sopra)
+/// considera attivi (`running`/`awaiting_confirmation`): coerenza garantita,
+/// nessuna re-implementazione del predicato sparsa nei call site.
+///
+/// Fail-safe: in caso di errore DB assume run attivo (`true`) per NON rischiare
+/// di interrompere un run in corso. Il chiamante critico e' `process_resume`,
+/// che usa questa funzione per decidere se RISVEGLIARE l'agente (a riposo) o
+/// RIMANDARE il resume (run ancora attivo) invece di superarlo via last-wins.
+pub(crate) async fn session_has_active_run(db: &sqlx::PgPool, session_id: Uuid) -> bool {
+    match sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS( \
+             SELECT 1 FROM agent_runs \
+              WHERE session_id = $1 \
+                AND status IN ('running', 'awaiting_confirmation') \
+         )",
+    )
+    .bind(session_id)
+    .fetch_one(db)
+    .await
+    {
+        Ok(active) => active,
+        Err(e) => {
+            tracing::warn!(
+                "session_has_active_run: query fallita su session {session_id} ({e}); \
+                 assumo run attivo (skip per sicurezza)"
+            );
+            true
+        }
+    }
+}
+
 /// Logica condivisa: carica progetto, costruisce contesto, avvia AgentLoop in background.
 /// Ritorna `None` se il progetto non è caricabile (fallback al singolo turn).
 pub(crate) async fn spawn_agent_run(
@@ -479,6 +511,12 @@ pub(crate) async fn spawn_agent_run(
     // "Risolvi con Nexus" o dall'auto-debug del service_observer), antepone il
     // system prompt specializzato di quel ruolo al contesto di sistema, cosi'
     // l'agente assume davvero quel comportamento. Riusa get_agent_system_prompt.
+    // Traccia se il chiamante ha gia' DECISO il ruolo/intent (hint forzato): in
+    // tal caso la disambiguazione piu' sotto e' incoerente (l'intent NON e'
+    // ambiguo per costruzione) e va saltata. Critico per i trigger AUTOMATICI
+    // fuori-chat (auto-debug del service_observer): nessun umano risponde al
+    // chiarimento, quindi senza questo bypass il loop di remediation si blocca.
+    let mut agent_type_forced = false;
     if let Some(hint) = params.nexus_agent_type_hint.as_deref() {
         if !hint.trim().is_empty() {
             let pascal = crate::internal_learning::snake_to_pascal(hint);
@@ -490,6 +528,7 @@ pub(crate) async fn spawn_agent_run(
                 } else {
                     format!("{}\n\n{}", agent_prompt, params.system_context)
                 };
+                agent_type_forced = true;
                 tracing::info!("spawn_agent_run: AgentType forzato via hint = {}", pascal);
             }
         }
@@ -505,6 +544,9 @@ pub(crate) async fn spawn_agent_run(
     //
     // Modalita' automatic salta la disambiguazione: l'utente vuole che il
     // sistema agisca anche con incertezza moderata (top candidato vince).
+    // Anche un AgentType FORZATO via hint la salta: il ruolo/intent e' gia'
+    // deciso dal chiamante, chiedere chiarimenti sarebbe ridondante e (per i
+    // trigger automatici fuori-chat) bloccherebbe il flusso senza un umano.
     // Arricchiamo il messaggio passato al classifier con un breve contesto
     // dei turni recenti: il classifier LLM NON ha accesso autonomo alla
     // cronologia, quindi senza questo prefisso messaggi tipo "riepiloga
@@ -521,7 +563,10 @@ pub(crate) async fn spawn_agent_run(
         .orchestrator
         .classify_intent_full(&classifier_input)
         .await;
-    if classified.is_ambiguous && !matches!(params.automation_mode, AutomationMode::Automatic) {
+    if classified.is_ambiguous
+        && !matches!(params.automation_mode, AutomationMode::Automatic)
+        && !agent_type_forced
+    {
         tracing::info!(
             "spawn_agent_run: intent ambiguo (conf={:.2}, candidati={}), chiedo disambiguazione",
             classified.confidence,
@@ -2306,4 +2351,76 @@ pub(crate) async fn spawn_agent_run(
         provider,
         model: model_str,
     })
+}
+
+#[cfg(test)]
+mod tests_session_active {
+    use super::*;
+
+    async fn create_agent_runs_table(pool: &sqlx::PgPool) {
+        sqlx::query(
+            "CREATE TABLE agent_runs ( \
+                 id UUID NOT NULL DEFAULT gen_random_uuid(), \
+                 session_id UUID NOT NULL, \
+                 status TEXT NOT NULL \
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create table agent_runs");
+    }
+
+    #[sqlx::test]
+    async fn vero_su_running(pool: sqlx::PgPool) {
+        create_agent_runs_table(&pool).await;
+        let sess = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (session_id, status) VALUES ($1, 'running')")
+            .bind(sess)
+            .execute(&pool)
+            .await
+            .expect("insert running");
+        assert!(session_has_active_run(&pool, sess).await);
+    }
+
+    #[sqlx::test]
+    async fn vero_su_awaiting_confirmation(pool: sqlx::PgPool) {
+        create_agent_runs_table(&pool).await;
+        let sess = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_runs (session_id, status) VALUES ($1, 'awaiting_confirmation')")
+            .bind(sess)
+            .execute(&pool)
+            .await
+            .expect("insert awaiting");
+        assert!(session_has_active_run(&pool, sess).await);
+    }
+
+    #[sqlx::test]
+    async fn falso_se_solo_run_conclusi(pool: sqlx::PgPool) {
+        create_agent_runs_table(&pool).await;
+        let sess = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agent_runs (session_id, status) \
+             VALUES ($1, 'completed'), ($1, 'cancelled'), ($1, 'failed')",
+        )
+        .bind(sess)
+        .execute(&pool)
+        .await
+        .expect("insert conclusi");
+        assert!(!session_has_active_run(&pool, sess).await);
+    }
+
+    #[sqlx::test]
+    async fn isolamento_per_sessione(pool: sqlx::PgPool) {
+        create_agent_runs_table(&pool).await;
+        let sess_a = Uuid::new_v4();
+        let sess_b = Uuid::new_v4();
+        // Solo sess_b ha un run attivo.
+        sqlx::query("INSERT INTO agent_runs (session_id, status) VALUES ($1, 'running')")
+            .bind(sess_b)
+            .execute(&pool)
+            .await
+            .expect("insert running sess_b");
+        assert!(!session_has_active_run(&pool, sess_a).await);
+        assert!(session_has_active_run(&pool, sess_b).await);
+    }
 }
