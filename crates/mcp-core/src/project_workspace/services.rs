@@ -533,6 +533,56 @@ pub async fn control_project_service(
     })))
 }
 
+/// Riavvia un'unita' systemd di progetto per NOME COMPLETO (es.
+/// "beauty-book-backend.service"), best-effort, senza passare per l'handler HTTP.
+/// Usato dall'auto-remediation (dopo che il debugger ha applicato un fix) per
+/// chiudere il loop rileva->ripara->RIAVVIA->verifica: l'observer al ciclo
+/// successivo vede il nuovo stato. Condivide gli helper di
+/// `control_project_service` (free_ports_for_unit, fallback detached WSL) — punto
+/// unico a livello di helper (regola L).
+pub async fn restart_project_unit(state: &AppState, project_id: Uuid, unit: &str) {
+    if unit.contains('/') || unit.contains("..") || !unit.ends_with(".service") {
+        tracing::warn!(unit = %unit, "restart_project_unit: nome unit non valido, skip");
+        return;
+    }
+    // Pre-restart: libera eventuali porte occupate da processi estranei.
+    free_ports_for_unit(unit).await;
+
+    let out = tokio::process::Command::new("systemctl")
+        .args(["--user", "restart", unit])
+        .output()
+        .await;
+    let needs_detached = match &out {
+        Ok(o) => user_manager_unavailable(o),
+        Err(_) => true,
+    };
+    if needs_detached {
+        // Manager --user giu' (WSL): avvio detached leggendo l'unit file.
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/administrator".to_string());
+        let unit_path = format!("{home}/.config/systemd/user/{unit}");
+        if let Ok(content) = tokio::fs::read_to_string(&unit_path).await {
+            let exec_start = unit_exec_start(&content);
+            let cwd = unit_working_dir(&content);
+            if !exec_start.is_empty() && !cwd.is_empty() {
+                let env_map = unit_env_map(&content);
+                if let Err(e) =
+                    super::wizard::spawn_detached_service(unit, &cwd, &env_map, &exec_start).await
+                {
+                    tracing::warn!(unit = %unit, error = %e, "restart_project_unit: spawn detached fallito");
+                }
+            }
+        }
+    }
+    nexus_events::dispatcher::emit(
+        &state.project_channels,
+        project_id,
+        nexus_events::event::ProjectEvent::ServiceRestarted {
+            name: unit.to_string(),
+        },
+    );
+    tracing::info!(unit = %unit, "restart_project_unit: riavvio richiesto (auto-remediation)");
+}
+
 // ── POST /api/projects/:id/services/restart-all ─────────────────────────────
 /// Riavvia in batch tutti i `{slug}-*.service` del progetto.
 pub async fn restart_all_project_services(

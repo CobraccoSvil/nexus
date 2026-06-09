@@ -179,5 +179,36 @@ pub(crate) async fn maybe_trigger_debugger(
             unit,
             kind
         );
+
+        // Auto-remediation loop (chiusura del ciclo): quando il debugger termina,
+        // riavvia il servizio cosi' l'observer al ciclo successivo ri-verifica la
+        // readiness. Se il servizio e' UP -> resolve; se ancora giu' con causa
+        // DIVERSA (nuova firma) -> nuovo trigger. Il cap orario + cooldown per
+        // firma sono il freno anti-loop. Task in background: non blocca l'observer.
+        let state_cl = state.clone();
+        let unit_cl = unit.to_string();
+        tokio::spawn(async move {
+            // Attende la fine del run debugger (max ~5 min), poi riavvia.
+            for _ in 0..60u32 {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let status: Option<String> =
+                    sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1")
+                        .bind(run_id)
+                        .fetch_optional(&state_cl.db)
+                        .await
+                        .ok()
+                        .flatten();
+                match status.as_deref() {
+                    // run ancora in corso: continua ad attendere
+                    Some("running") | Some("awaiting_confirmation") | None => continue,
+                    // terminato (completed/failed/...): procedi al riavvio
+                    _ => break,
+                }
+            }
+            crate::project_workspace::services::restart_project_unit(
+                &state_cl, project_id, &unit_cl,
+            )
+            .await;
+        });
     }
 }

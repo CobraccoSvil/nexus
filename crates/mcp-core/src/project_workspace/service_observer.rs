@@ -761,6 +761,12 @@ async fn run_cycle(state: &AppState, cfg: &ObserverConfig, states: &mut HashMap<
                 st.prev_active_enter = active_enter;
                 st.run_seen_at = Some(Instant::now());
                 st.last_crash_sig = None;
+                // Nuovo avvio del servizio (es. il debugger ha applicato un fix e
+                // l'auto-remediation ha riavviato): i crash dei run PRECEDENTI sono
+                // obsoleti -> risolvili, cosi' il pannello mostra solo il problema
+                // del run corrente. Se il nuovo run e' ancora unhealthy, la
+                // detection sotto crea un nuovo crash aggiornato.
+                resolve_open_crashes(&state.db, project_id, &unit).await;
             }
             let grace_ok = st
                 .run_seen_at
@@ -807,7 +813,25 @@ async fn run_cycle(state: &AppState, cfg: &ObserverConfig, states: &mut HashMap<
                     // veloce, col log grezzo) cosi' compare in Problemi e il persist
                     // NON dipende dall'LLM; poi la diagnosi LLM raffina il detail in
                     // BACKGROUND (con timeout), senza bloccare il ciclo observer.
-                    let clean = strip_ansi(&log_text);
+                    let mut clean = strip_ansi(&log_text);
+                    // Gestione porte STRUTTURALE (no liste/regex): se il servizio e'
+                    // su ma non ascolta sulle porte ALLOCATE (fonte unica), passa il
+                    // fatto alla diagnosi. L'LLM, leggendo i log, rileva se ascolta
+                    // su una porta hardcoded diversa e suggerisce process.env.PORT.
+                    if reason == "port_not_listening" && !ports.is_empty() {
+                        let plist = ports
+                            .iter()
+                            .map(u16::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        clean = format!(
+                            "[Nexus] Il servizio risulta avviato ma non ascolta sulle porte ALLOCATE \
+                             attese ({plist}). Se dai log ascolta su una porta diversa, la causa \
+                             probabile e' una porta HARDCODED nel codice invece della porta allocata: \
+                             il fix corretto e' leggere la porta da process.env.PORT (porta allocata da \
+                             Nexus), non un valore fisso.\n\nLog del servizio:\n{clean}"
+                        );
+                    }
                     let tail: Vec<&str> = clean.lines().rev().take(15).collect();
                     let tail: String = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
                     let tail: String = tail.chars().take(600).collect();
