@@ -108,6 +108,8 @@ async def run_criterion(criterion: dict[str, Any], ctx: dict[str, Any]) -> tuple
         ok, ev = await _check_db_query(spec, expected, timeout_s)
     elif c_type in ("no_orphan_imported", "imported_code_mounted"):
         ok, ev = await _check_no_orphan_imported(spec, expected, ctx, timeout_s)
+    elif c_type == "service_logs_clean":
+        ok, ev = await _check_service_logs_clean(spec, expected, ctx, timeout_s)
     else:
         ok = False
         ev = {"error": f"tipo di criterion sconosciuto: '{c_type}'"}
@@ -311,6 +313,74 @@ async def _check_no_orphan_imported(
             f"{len(matched)}/{len(staging_key)} moduli del design in {staging_dirs} "
             f"(ratio {round(ratio, 2)} < {min_ratio}). Integra gli entrypoint del "
             f"design in {src_root}/ e montali da {entry} (non lasciare un placeholder)."
+        )
+    return passed, evidence
+
+
+# ── service_logs_clean (verifica runtime E2E) ─────────────────────────────
+
+
+async def _check_service_logs_clean(
+    spec: dict[str, Any], expected: dict[str, Any], ctx: dict[str, Any], timeout_s: float,
+) -> tuple[bool, dict[str, Any]]:
+    """Verifica runtime E2E (anti "ho scritto il codice ma il flusso reale fallisce").
+
+    Legge i log dei servizi del progetto (comando in spec.command, eseguito nella
+    project_root via run_command) e fallisce se contengono pattern di errore
+    runtime (spec.patterns). Cattura il caso reale in cui un endpoint risponde 500
+    perche' una tabella manca / una migrazione non e' applicata: l'agente lo
+    avrebbe ignorato (dichiarando "fatto") senza questo gate.
+
+    spec: {command: "<comando log>", patterns: ["does not exist", ...]}
+    """
+    cmd = spec.get("command") or ""
+    patterns = [str(p) for p in (spec.get("patterns") or []) if str(p).strip()]
+    if not cmd or not patterns:
+        return True, {"skipped": "service_logs_clean: command/patterns mancanti (N/A)"}
+    tool_runner = ctx.get("tool_runner")
+    session_id = ctx.get("session_id")
+    if not tool_runner or not session_id:
+        return False, {"error": "tool_runner o session_id assenti"}
+
+    try:
+        result = await asyncio.wait_for(
+            tool_runner.execute_tool(
+                tool_name="run_command", tool_input={"command": cmd},
+                session_id=str(session_id), tool_use_id=str(uuid.uuid4()),
+            ),
+            timeout=timeout_s,
+        )
+    except asyncio.TimeoutError:
+        # Inconclusivo (non un fallimento): non blocchiamo la chiusura su un
+        # timeout di lettura log.
+        return True, {"inconclusive": True, "skipped_reason": "timeout lettura log servizi"}
+    except Exception as exc:
+        return True, {"inconclusive": True, "skipped_reason": f"run_command log fallito: {exc}"}
+
+    raw = result.result_json or ""
+    lows = [p.lower() for p in patterns]
+    hits: list[str] = []
+    for line in raw.splitlines():
+        ll = line.lower()
+        if any(p in ll for p in lows):
+            hits.append(line.strip()[:200])
+            if len(hits) >= 8:
+                break
+
+    passed = not hits
+    evidence: dict[str, Any] = {
+        "command": cmd[:120],
+        "error_lines": len(hits),
+        "matched": hits,
+    }
+    if not passed:
+        evidence["verdict"] = "errori runtime nei log dei servizi"
+        evidence["output_excerpt"] = (
+            "ERRORI RUNTIME nei log dei servizi: il codice e' stato scritto ma il "
+            "flusso reale FALLISCE.\n" + "\n".join(hits) + "\n"
+            "AGISCI: trova e correggi la causa (es. applica le migrazioni / crea le "
+            "tabelle mancanti, sistema la rotta), poi RIESERCITA il flusso reale "
+            "(chiama l'endpoint, prova l'accesso) e verifica che gli errori siano spariti."
         )
     return passed, evidence
 

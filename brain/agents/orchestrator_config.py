@@ -100,6 +100,12 @@ _KEYS = (
     "import_staging_dirs",
     "no_orphan_min_ratio",
     "verifier_fail_closed",
+    # Verifica runtime E2E obbligatoria (mig 0374): il final_gate controlla i log
+    # dei servizi per errori runtime prima di chiudere; se non ne trova al primo
+    # ciclo, OBBLIGA l'agente a esercitare il flusso (smoke) e ricontrolla.
+    "final_gate_runtime_check_enabled",
+    "final_gate_runtime_log_command",
+    "final_gate_runtime_error_patterns",
 )
 
 # Override del nome completo (key DB) per le chiavi che NON usano il prefisso
@@ -113,6 +119,9 @@ _KEY_FULL_NAME: dict[str, str] = {
     "import_staging_dirs": "agent.import_staging_dirs",
     "no_orphan_min_ratio": "agent.no_orphan.min_ratio",
     "verifier_fail_closed": "agent.verifier.fail_closed",
+    "final_gate_runtime_check_enabled": "agent.final_gate.runtime_check_enabled",
+    "final_gate_runtime_log_command": "agent.final_gate.runtime_log_command",
+    "final_gate_runtime_error_patterns": "agent.final_gate.runtime_error_patterns",
 }
 
 
@@ -187,6 +196,24 @@ _SAFE_DEFAULTS: dict[str, Any] = {
     "import_staging_dirs": ["figma_export"],
     "no_orphan_min_ratio": 0.4,
     "verifier_fail_closed": True,
+    # Verifica runtime E2E (mig 0374): comando per leggere i log dei servizi del
+    # progetto (eseguito nella project_root) e pattern di errore runtime che, se
+    # presenti, fanno fallire il gate -> l'agente deve correggere e riverificare.
+    "final_gate_runtime_check_enabled": True,
+    "final_gate_runtime_log_command": "docker compose logs --tail 200 --no-color 2>&1 | tail -n 200",
+    "final_gate_runtime_error_patterns": [
+        "does not exist",
+        "ECONNREFUSED",
+        "Traceback (most recent call last)",
+        "UnhandledPromiseRejection",
+        "Cannot find module",
+        "MODULE_NOT_FOUND",
+        "relation \"",
+        "SequelizeDatabaseError",
+        "ER_NO_SUCH_TABLE",
+        "500 (Internal Server Error)",
+        "Internal Server Error",
+    ],
 }
 
 _lock = threading.RLock()

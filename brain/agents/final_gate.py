@@ -79,6 +79,19 @@ async def run_general_gates(
             "expected": {"mounted": True},
         }
     ]
+    # Verifica runtime E2E (mig 0374): i log dei servizi non devono contenere
+    # errori runtime. Cattura il pattern "codice scritto ma flusso reale rotto"
+    # (es. endpoint 500 perche' una tabella manca) che l'agente ignorerebbe.
+    if cfg.get("final_gate_runtime_check_enabled"):
+        criteria.append({
+            "type": "service_logs_clean",
+            "spec": {
+                "command": cfg.get("final_gate_runtime_log_command")
+                or "docker compose logs --tail 200 --no-color 2>&1 | tail -n 200",
+                "patterns": cfg.get("final_gate_runtime_error_patterns") or [],
+            },
+            "expected": {},
+        })
 
     results: list[dict[str, Any]] = []
     for c in criteria:
@@ -105,28 +118,24 @@ def _render_failed_block(
     Rispetta la modalita' autonoma (automatic/continuo) prependendo un blocco
     <autonomy_hint> come fa verifier_node._render_failed_block.
     """
+    # Corpo specifico per criterio fallito: ogni criterio (no_orphan_imported,
+    # service_logs_clean, ...) fornisce gia' il suo output_excerpt con diagnosi +
+    # "AGISCI". Li aggreghiamo invece di un testo fisso (prima parlava solo del
+    # caso Figma; ora copre anche gli errori runtime).
     failed = [r for r in results if not r.get("passed")]
-    diagnostic = ""
-    verdict = ""
-    if failed:
-        ev = failed[0].get("evidence") or {}
-        diagnostic = ev.get("output_excerpt") or ev.get("error") or ""
-        verdict = ev.get("verdict") or ev.get("reason") or ""
+    body_parts: list[str] = []
+    for r in failed:
+        ev = r.get("evidence") or {}
+        excerpt = ev.get("output_excerpt") or ev.get("verdict") or ev.get("error") or ""
+        if excerpt:
+            body_parts.append(f"[{r.get('type')}]\n{str(excerpt)[:900]}")
+    detail = "\n\n".join(body_parts) if body_parts else "Una verifica del gate e' fallita."
 
     body = (
         f"<final_gate_failed cycle=\"{cycle}/{max_cycles}\">\n"
-        f"Verifica generale fallita: il codice importato (design staged) NON e'\n"
-        f"raggiungibile dall'entry servito dell'app. Sembra un'app placeholder\n"
-        f"(es. hello-world) montata SOPRA un design importato che resta orfano.\n"
-    )
-    if verdict:
-        body += f"Verdetto: {verdict}\n"
-    if diagnostic:
-        body += f"Dettaglio:\n{str(diagnostic)[:800]}\n"
-    body += (
-        "AGISCI: integra il codice importato e montalo dall'entry (es. importa il\n"
-        "componente App reale in src/main.tsx e collega routes/pagine/servizi).\n"
-        "Non lasciare un placeholder sopra il design.\n"
+        "Verifica pre-chiusura FALLITA. NON dichiarare il task completato finche'\n"
+        "non e' risolto e RIVERIFICATO esercitando il flusso reale.\n\n"
+        f"{detail}\n"
         "</final_gate_failed>"
     )
 
