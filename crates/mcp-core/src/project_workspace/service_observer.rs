@@ -177,14 +177,21 @@ async fn projects_with_slug(db: &PgPool) -> Vec<(Uuid, String)> {
 }
 
 /// Unit systemd `{slug}-*.service` con il loro stato active (es. "active",
-/// "failed", "activating").
+/// "failed", "inactive", "activating").
+///
+/// CAUSA RADICE (caso reale: backend morto per ts-node mancante): si enumera dai
+/// FILE unit (`list-unit-files`), NON da `list-units`. Un servizio `Type=simple`
+/// che muore con exit 0 viene SCARICATO (unloaded) da systemd e sparisce da
+/// `list-units --all`, restando invisibile all'observer: non se ne scansionano
+/// mai i log ne' lo stato. I file `{slug}-*.service` invece ci sono sempre; per
+/// ciascuno interroghiamo lo stato corrente per nome con `is-active` (che
+/// funziona anche su unit scaricati).
 async fn list_user_services(slug: &str) -> Vec<(String, String)> {
     let out = tokio::process::Command::new("systemctl")
         .args([
             "--user",
-            "list-units",
+            "list-unit-files",
             "--type=service",
-            "--all",
             "--no-legend",
             "--no-pager",
         ])
@@ -197,16 +204,39 @@ async fn list_user_services(slug: &str) -> Vec<(String, String)> {
     let prefix = format!("{slug}-");
     let mut units = Vec::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        // Formato: UNIT LOAD ACTIVE SUB DESCRIPTION...
-        if let Some(unit) = cols.first() {
-            if unit.ends_with(".service") && unit.starts_with(&prefix) {
-                let active = cols.get(2).copied().unwrap_or("unknown").to_string();
-                units.push((unit.to_string(), active));
-            }
+        // Formato list-unit-files: "UNIT_FILE STATE [PRESET]".
+        let unit = match line.split_whitespace().next() {
+            Some(u) => u,
+            None => continue,
+        };
+        if unit.ends_with(".service") && unit.starts_with(&prefix) {
+            let active = unit_active_state(unit).await;
+            units.push((unit.to_string(), active));
         }
     }
     units
+}
+
+/// `ActiveState` corrente di un'unita' per nome (active|inactive|failed|...).
+/// Usa `is-active`, che risponde anche se l'unit e' stato scaricato dalla
+/// memoria (a differenza di `list-units`). Exit code != 0 e' normale per
+/// inactive/failed: lo stato e' comunque stampato su stdout.
+async fn unit_active_state(unit: &str) -> String {
+    match tokio::process::Command::new("systemctl")
+        .args(["--user", "is-active", unit])
+        .output()
+        .await
+    {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() {
+                "unknown".to_string()
+            } else {
+                s
+            }
+        }
+        Err(_) => "unknown".to_string(),
+    }
 }
 
 /// MainPID di un'unita' systemd --user (0/None se non attiva).
@@ -274,7 +304,12 @@ async fn scan_new_logs(unit: &str, since_unix: i64) -> (u64, Option<(String, Str
 
 // ── Detector (logica pura, testabile) ─────────────────────────────────────────
 
-/// Rileva un crash/eccezione runtime in un blocco di log. Ritorna (kind, riga).
+/// Rileva un crash/eccezione runtime, O un AVVIO FALLITO, in un blocco di log.
+/// Ritorna (kind, riga). I pattern di avvio fallito sono fondamentali per i casi
+/// in cui il supervisore (es. nodemon) ingoia l'errore del processo figlio ed
+/// esce con exit 0: systemd vede `Result=success`/`dead` (non `failed`) e il
+/// check sullo stato non scatta -> l'unico segnale e' nei log. Caso reale:
+/// `ts-node: not found` -> `[nodemon] failed to start process`.
 fn detect_crash(text: &str) -> Option<(String, String)> {
     for (pattern, kind) in [
         ("panicked at", "rust_panic"),
@@ -284,14 +319,49 @@ fn detect_crash(text: &str) -> Option<(String, String)> {
         ("segmentation fault", "segfault"),
         ("Segmentation fault", "segfault"),
         ("FATAL ERROR", "fatal"),
+        // Avvii falliti (dipendenza/eseguibile mancante, porta occupata) che
+        // spesso escono con exit 0 e sfuggono al check ActiveState=failed.
+        ("failed to start process", "startup_failed"),
+        ("command not found", "command_not_found"),
+        ("MODULE_NOT_FOUND", "module_not_found"),
+        ("Cannot find module", "module_not_found"),
+        ("EADDRINUSE", "port_in_use"),
     ] {
         if let Some(line) = text.lines().find(|l| l.contains(pattern)) {
-            let trimmed = line.trim();
-            let snippet: String = trimmed.chars().take(400).collect();
+            // Strippa gli escape ANSI: nodemon & co. colorano i log (es. \x1B[31m);
+            // senza questo finirebbero grezzi nel messaggio del pannello Problemi,
+            // mostrati come caratteri di controllo malformati.
+            let snippet: String = strip_ansi(line.trim()).chars().take(400).collect();
             return Some((kind.to_string(), snippet));
         }
     }
     None
+}
+
+/// Rimuove le sequenze di escape ANSI (CSI: `ESC [` ... lettera finale `@`-`~`)
+/// da un testo. Serve a ripulire le righe di log colorate (nodemon, vite, ...)
+/// prima di mostrarle nel pannello Problemi o di passarle al Debugger.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1B}' {
+            // Control Sequence Introducer: ESC '[' ... terminatore in '@'..='~'.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if ('@'..='~').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            // Altri ESC isolati: scartati (anche il '[' senza terminatore).
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Anomalia rilevata dal detector.
@@ -305,6 +375,7 @@ struct AnomalySignal {
 
 /// Valuta le metriche correnti contro le soglie. Funzione pura.
 fn evaluate_anomalies(
+    active_state: &str,
     cpu_pct: Option<f64>,
     rss_bytes: u64,
     restart_delta: u32,
@@ -312,6 +383,20 @@ fn evaluate_anomalies(
     cfg: &ObserverConfig,
 ) -> Vec<AnomalySignal> {
     let mut out = Vec::new();
+    // B2: un servizio gestito in stato 'failed' e' sempre un problema -> cattura i
+    // crash che escono con exit code != 0. (Il caso exit-0/dead, dove systemd vede
+    // Result=success, NON e' 'failed': lo copre il crash-detector sui log, cap 1.)
+    // Trattato come anomalia 'down' cosi' il ciclo di vita (apertura sulla
+    // transizione + auto-resolve quando il servizio torna attivo) e' gia' gestito
+    // da resolve_stale_anomalies, senza logica nuova (regola L).
+    if active_state == "failed" {
+        out.push(AnomalySignal {
+            metric: "down".into(),
+            value: 1.0,
+            threshold: 0.0,
+            severity: "critical".into(),
+        });
+    }
     if let Some(cpu) = cpu_pct {
         if cpu > cfg.cpu_pct_threshold {
             out.push(AnomalySignal {
@@ -556,7 +641,7 @@ async fn run_cycle(state: &AppState, cfg: &ObserverConfig, states: &mut HashMap<
 
             // ── Anomalie: emetti solo sulla transizione ────────────────────
             let signals =
-                evaluate_anomalies(cpu_pct, rss, restart_delta, error_per_min, cfg);
+                evaluate_anomalies(&active, cpu_pct, rss, restart_delta, error_per_min, cfg);
             let current: HashSet<String> = signals.iter().map(|s| s.metric.clone()).collect();
             for sig in &signals {
                 if !st.active_anomalies.contains(&sig.metric) {
@@ -673,20 +758,20 @@ mod tests {
 
     #[test]
     fn no_anomaly_when_under_thresholds() {
-        let s = evaluate_anomalies(Some(10.0), 100_000, 0, 1.0, &cfg());
+        let s = evaluate_anomalies("active", Some(10.0), 100_000, 0, 1.0, &cfg());
         assert!(s.is_empty());
     }
 
     #[test]
     fn cpu_over_threshold_flags() {
-        let s = evaluate_anomalies(Some(95.0), 0, 0, 0.0, &cfg());
+        let s = evaluate_anomalies("active", Some(95.0), 0, 0, 0.0, &cfg());
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].metric, "cpu");
     }
 
     #[test]
     fn restart_spike_is_critical() {
-        let s = evaluate_anomalies(None, 0, 5, 0.0, &cfg());
+        let s = evaluate_anomalies("active", None, 0, 5, 0.0, &cfg());
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].metric, "restart");
         assert_eq!(s[0].severity, "critical");
@@ -694,8 +779,49 @@ mod tests {
 
     #[test]
     fn multiple_anomalies() {
-        let s = evaluate_anomalies(Some(99.0), 2_000_000_000, 10, 50.0, &cfg());
+        let s = evaluate_anomalies("active", Some(99.0), 2_000_000_000, 10, 50.0, &cfg());
         assert_eq!(s.len(), 4);
+    }
+
+    #[test]
+    fn failed_state_flags_down_critical() {
+        // B2: un servizio in stato 'failed' e' segnalato come anomalia 'down'
+        // critica anche senza altre metriche sopra soglia.
+        let s = evaluate_anomalies("failed", None, 0, 0, 0.0, &cfg());
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].metric, "down");
+        assert_eq!(s[0].severity, "critical");
+    }
+
+    #[test]
+    fn active_service_not_flagged_down() {
+        let s = evaluate_anomalies("active", Some(10.0), 0, 0, 0.0, &cfg());
+        assert!(s.iter().all(|x| x.metric != "down"));
+    }
+
+    #[test]
+    fn detect_startup_failed_nodemon() {
+        // Caso reale: nodemon non trova ts-node ed esce con exit 0 (sfugge a
+        // ActiveState=failed, va catturato dai log). Il log e' colorato ANSI:
+        // lo snippet restituito DEVE essere ripulito.
+        let log = "\u{1B}[31m[nodemon] failed to start process, \"ts-node src/server.ts\" exec not found\u{1B}[39m";
+        let (kind, snippet) = detect_crash(log).unwrap();
+        assert_eq!(kind, "startup_failed");
+        assert!(!snippet.contains('\u{1B}'), "lo snippet non deve contenere ESC ANSI");
+        assert!(!snippet.contains("[31m"), "i codici colore ANSI vanno strippati");
+        assert!(snippet.contains("failed to start process"));
+    }
+
+    #[test]
+    fn strip_ansi_removes_color_codes() {
+        assert_eq!(strip_ansi("\u{1B}[31mrosso\u{1B}[0m normale"), "rosso normale");
+        assert_eq!(strip_ansi("nessun codice"), "nessun codice");
+    }
+
+    #[test]
+    fn detect_module_not_found() {
+        let log = "Error: Cannot find module 'express'\n    at Module._resolveFilename";
+        assert_eq!(detect_crash(log).unwrap().0, "module_not_found");
     }
 
     #[test]
