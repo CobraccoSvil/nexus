@@ -782,7 +782,14 @@ class ProviderRegistry:
         if p == "deepseek":
             return m.startswith("deepseek")
         if p == "mistral":
-            return m.startswith(("mistral", "codestral", "ministral", "pixtral"))
+            # Censimento 2026-06-10: mancavano magistral/devstral/open-* — 8
+            # modelli VALIDI del catalog venivano rifiutati come mismatch nel
+            # fallback (provider skippato su coppia legittima). La famiglia di
+            # prefissi va tenuta allineata al catalog reale (fonte: DB).
+            return m.startswith((
+                "mistral", "codestral", "ministral", "pixtral",
+                "magistral", "devstral", "open-mistral", "open-mixtral",
+            ))
         # Provider non riconosciuto: non blocchiamo (la verita resta il DB).
         return True
 

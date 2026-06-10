@@ -30,7 +30,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, asdict, field
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -581,7 +581,15 @@ class AgenticIntentClassifier:
             if intent not in ALLOWED_INTENTS:
                 return None
             agentic_score = float(parsed["agentic_score"])
-            requires_tools = bool(parsed["requires_tools"])
+            # Validazione STRETTA dei booleani (censimento 2026-06-10): prima
+            # `bool(parsed[...])` trasformava la stringa "false" in True —
+            # parsing permissivo che ribaltava silenziosamente il giudizio del
+            # modello. Accettiamo bool nativo o le stringhe canoniche true/false
+            # (modelli che quotano i booleani); altro -> WARN + coercizione
+            # esplicita, mai silenzio.
+            requires_tools = AgenticIntentClassifier._strict_bool(
+                parsed["requires_tools"], "requires_tools", default=True
+            )
             complexity = str(parsed["complexity"]).strip().lower()
             if complexity not in ALLOWED_COMPLEXITY:
                 return None
@@ -602,11 +610,12 @@ class AgenticIntentClassifier:
             # Slot filling (Livello 4 NLU): se il campo manca o e' invalido,
             # ritorna ActionSlots() vuoto — il caller usera' routing classico.
             slots = AgenticIntentClassifier._parse_slots(parsed)
-            # Giudizio diretto report-vs-act. Default True (fail-safe): se il
-            # campo manca o non e' un bool, NON si blocca l'azione.
-            _auth_raw = parsed.get("authorizes_changes", True)
-            authorizes_changes = (
-                bool(_auth_raw) if isinstance(_auth_raw, bool) else True
+            # Giudizio diretto report-vs-act. Default True (fail-safe: non si
+            # bloccano i fix), ma MAI piu' silenzioso: il degrado e' loggato.
+            authorizes_changes = AgenticIntentClassifier._strict_bool(
+                parsed.get("authorizes_changes", True),
+                "authorizes_changes",
+                default=True,
             )
             return AgenticIntent(
                 intent=intent,
@@ -623,6 +632,31 @@ class AgenticIntentClassifier:
         except (KeyError, ValueError, TypeError) as exc:
             logger.warning("classifier: parsed JSON malformed: %s", exc)
             return None
+
+    @staticmethod
+    def _strict_bool(raw: Any, field: str, *, default: bool) -> bool:
+        """Parsing STRETTO di un booleano dal JSON LLM (punto unico, regola L).
+
+        - bool nativo -> usato com'e'.
+        - stringhe canoniche "true"/"false" (case-insensitive) -> convertite
+          (alcuni modelli quotano i booleani nel JSON).
+        - qualsiasi altro valore -> `default`, con WARN esplicito: il degrado
+          di un campo di GOVERNANCE (es. authorizes_changes) non deve mai
+          essere silenzioso (censimento 2026-06-10: bool("false") era True).
+        """
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            v = raw.strip().lower()
+            if v == "true":
+                return True
+            if v == "false":
+                return False
+        logger.warning(
+            "classifier: campo %s malformato (%r) -> default %s (degrado loggato)",
+            field, raw, default,
+        )
+        return default
 
     @staticmethod
     def _extract_json(content: str) -> Optional[dict]:

@@ -65,10 +65,19 @@ pub(crate) fn model_belongs_to_provider(provider: &str, model: &str) -> bool {
         }
         "deepseek" => m.starts_with("deepseek"),
         "mistral" => {
+            // Censimento 2026-06-10: mancavano magistral/devstral/open-* — 8
+            // modelli VALIDI del catalog venivano rifiutati come mismatch nel
+            // fallback. Stesso fix applicato al gemello Python
+            // (brain/providers/registry.py::_model_belongs_to_provider);
+            // tenere le due liste allineate finche' non convergono sul catalog.
             m.starts_with("mistral")
                 || m.starts_with("codestral")
                 || m.starts_with("ministral")
                 || m.starts_with("pixtral")
+                || m.starts_with("magistral")
+                || m.starts_with("devstral")
+                || m.starts_with("open-mistral")
+                || m.starts_with("open-mixtral")
         }
         _ => true,
     }

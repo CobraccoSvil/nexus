@@ -101,8 +101,13 @@ def _load_from_db(provider: str, model: str) -> ProviderCapability | None:
             )
             row = cur.fetchone()
             if row is None:
+                # NB: lo spazio prima di WHERE e' obbligatorio — senza, la query
+                # concatenata diventava "...v_model_capabilitiesWHERE..." e il
+                # fallback wildcard (provider, '*') non e' MAI scattato (bug
+                # trovato dal censimento 2026-06-10: i fallback per-nome a valle
+                # scattavano piu' spesso del progettato proprio per questo).
                 cur.execute(
-                    f"SELECT {_COLUMNS} FROM v_model_capabilities"
+                    f"SELECT {_COLUMNS} FROM v_model_capabilities "
                     "WHERE provider = %s AND model = %s",
                     (provider, "*"),
                 )
