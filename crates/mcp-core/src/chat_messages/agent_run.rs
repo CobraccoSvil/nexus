@@ -183,6 +183,62 @@ pub(crate) fn canonical_run_status(
     result.status.clone()
 }
 
+/// Nota di chiusura ONESTA quando un run hollow coincide con provider AI in
+/// cooldown. Causa-radice del messaggio fuorviante "completamento vuoto" (regola
+/// H): quando i provider buoni (anthropic/openai/google) sono in cooldown per
+/// quota/credito esaurito, l'agente non puo' produrre output, ma il sistema
+/// mostrava un generico "completamento vuoto, cambia modello" invece della causa
+/// reale. Qui si legge la fonte autoritativa `provider_cooldown::cooldown_snapshot()`
+/// (regola L, stessa usata dal frontend e dal pre-check) e si dice all'utente cosa
+/// fare (ricaricare i crediti). `None` se nessun provider e' in cooldown: vale il
+/// placeholder generico.
+fn cooldown_exhaustion_note() -> Option<String> {
+    cooldown_note_from_snapshot(&crate::provider_cooldown::cooldown_snapshot())
+}
+
+/// Logica pura (testabile, regola F): compone la nota dato lo snapshot dei
+/// cooldown. Separata dalla fonte globale per non dipendere da stato condiviso.
+fn cooldown_note_from_snapshot(snap: &[(String, u64, Option<String>)]) -> Option<String> {
+    if snap.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut any_billing = false;
+    for (name, secs, reason) in snap {
+        let r = reason.as_deref().unwrap_or("");
+        let rl = r.to_lowercase();
+        if rl.contains("credit")
+            || rl.contains("quota")
+            || rl.contains("billing")
+            || rl.contains("balance")
+        {
+            any_billing = true;
+        }
+        if r.is_empty() {
+            let mins = (secs + 59) / 60;
+            parts.push(format!("{} (~{} min)", name, mins));
+        } else {
+            parts.push(format!("{} ({})", name, r));
+        }
+    }
+    let list = parts.join(", ");
+    let msg = if any_billing {
+        format!(
+            "_(Il turno non ha prodotto una risposta perche' i provider AI principali sono \
+             in cooldown per quota/credito esaurito: {}. Ricarica i crediti (o attendi il \
+             reset) e riprova.)_",
+            list
+        )
+    } else {
+        format!(
+            "_(Il turno non ha prodotto una risposta: i provider AI sono temporaneamente non \
+             disponibili ({}). Attendi qualche istante e riprova.)_",
+            list
+        )
+    };
+    Some(msg)
+}
+
 /// Messaggio finale GARANTITO (ADR 0025): la risposta reale + footer di recap se
 /// non menziona i file toccati; oppure, per un run hollow, il recap deterministico
 /// delle azioni o un placeholder esplicito. `None` solo se non c'e' nulla da dire
@@ -198,14 +254,16 @@ pub(crate) fn compose_turn_answer(
             }
             Some(a)
         }
-        _ if is_report_hollow(result) => build_action_recap(&result.steps).or_else(|| {
-            Some(format!(
-                "_(Nessuna risposta utile prodotta dall'agente — {} / {} ha chiuso \
-                 il turno con un completamento vuoto dopo aver esaurito i tentativi \
-                 di fallback. Riformula la richiesta o cambia provider/modello manualmente.)_",
-                result.provider, result.model
-            ))
-        }),
+        _ if is_report_hollow(result) => build_action_recap(&result.steps)
+            .or_else(cooldown_exhaustion_note)
+            .or_else(|| {
+                Some(format!(
+                    "_(Nessuna risposta utile prodotta dall'agente — {} / {} ha chiuso \
+                     il turno con un completamento vuoto dopo aver esaurito i tentativi \
+                     di fallback. Riformula la richiesta o cambia provider/modello manualmente.)_",
+                    result.provider, result.model
+                ))
+            }),
         _ => None,
     }
 }
@@ -2357,14 +2415,16 @@ pub(crate) async fn spawn_agent_run(
                 // un recap deterministico (ADR 0025) cosi' l'utente vede cosa e'
                 // stato fatto invece di un generico "nessuna risposta". Solo se
                 // non c'e' alcuna azione si usa il placeholder generico.
-                _ if report_hollow => build_action_recap(&result.steps).or_else(|| {
-                    Some(format!(
-                        "_(Nessuna risposta utile prodotta dall'agente — {} / {} ha chiuso \
+                _ if report_hollow => build_action_recap(&result.steps)
+                    .or_else(cooldown_exhaustion_note)
+                    .or_else(|| {
+                        Some(format!(
+                            "_(Nessuna risposta utile prodotta dall'agente — {} / {} ha chiuso \
                      il turno con un completamento vuoto dopo aver esaurito i tentativi \
                      di fallback. Riformula la richiesta o cambia provider/modello manualmente.)_",
-                        result.provider, result.model
-                    ))
-                }),
+                            result.provider, result.model
+                        ))
+                    }),
                 _ => None,
             };
 
@@ -2910,5 +2970,34 @@ mod tests_finalize_turn {
             AgentRunStatus::Completed, vec![], None, false, "", Some("chat"),
         );
         assert!(compose_turn_answer(&r).is_none());
+    }
+
+    #[test]
+    fn cooldown_note_vuoto_se_nessun_cooldown() {
+        // Nessun provider in cooldown -> None: vale il placeholder generico.
+        assert!(super::cooldown_note_from_snapshot(&[]).is_none());
+    }
+
+    #[test]
+    fn cooldown_note_billing_dice_ricarica() {
+        // Provider buoni in cooldown per credito/quota -> messaggio ONESTO che
+        // indica la causa reale e l'azione, non "completamento vuoto".
+        let snap = vec![
+            ("anthropic".to_string(), 300u64, Some("credit balance too low".to_string())),
+            ("openai".to_string(), 250u64, Some("you exceeded your current quota".to_string())),
+        ];
+        let msg = super::cooldown_note_from_snapshot(&snap).expect("nota attesa");
+        assert!(msg.contains("quota/credito esaurito"), "deve indicare la causa billing: {msg}");
+        assert!(msg.contains("Ricarica"), "deve suggerire la ricarica: {msg}");
+        assert!(msg.contains("anthropic") && msg.contains("openai"), "deve elencare i provider: {msg}");
+    }
+
+    #[test]
+    fn cooldown_note_non_billing_dice_attendi() {
+        // Cooldown transitorio (rate-limit) -> "attendi", NON "ricarica".
+        let snap = vec![("mistral".to_string(), 60u64, Some("rate limit".to_string()))];
+        let msg = super::cooldown_note_from_snapshot(&snap).expect("nota attesa");
+        assert!(msg.contains("temporaneamente non disponibili"), "non-billing -> attendi: {msg}");
+        assert!(!msg.contains("Ricarica"), "non deve dire ricarica per rate-limit: {msg}");
     }
 }
