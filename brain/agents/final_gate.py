@@ -91,7 +91,16 @@ async def run_general_gates(
                 "min_reached_ratio": cfg.get("no_orphan_min_ratio", 0.4),
             },
             "expected": {"mounted": True},
-        }
+        },
+        # Claim-vs-fatti (incidente Beauty-Book 2026-06-11): gli output dichiarati
+        # dagli STEP del run (write/edit/rename-to) devono esistere su disco a
+        # fine run. Strutturale puro (agent_steps -> filesystem), nessuna lettura
+        # del final_answer. N/A se il run non ha step mutativi file.
+        {
+            "type": "outputs_exist",
+            "spec": {"run_id": str(state.get("thread_id") or "")},
+            "expected": {},
+        },
     ]
     # Verifica runtime E2E (mig 0374): i log dei servizi non devono contenere
     # errori runtime. Cattura il pattern "codice scritto ma flusso reale rotto"

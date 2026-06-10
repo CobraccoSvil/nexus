@@ -106,6 +106,8 @@ async def run_criterion(criterion: dict[str, Any], ctx: dict[str, Any]) -> tuple
         ok, ev = await _check_regex_in_output(spec, expected, ctx, timeout_s)
     elif c_type == "db_query":
         ok, ev = await _check_db_query(spec, expected, timeout_s)
+    elif c_type == "outputs_exist":
+        ok, ev = await _check_outputs_exist(spec, expected, ctx, timeout_s)
     elif c_type in ("no_orphan_imported", "imported_code_mounted"):
         ok, ev = await _check_no_orphan_imported(spec, expected, ctx, timeout_s)
     elif c_type == "service_logs_clean":
@@ -428,6 +430,98 @@ async def _check_http(
         "expected_status": expected_status,
         "body_excerpt": body_excerpt,
     }
+
+
+# ── outputs_exist (claim-vs-fatti, incidente Beauty-Book 2026-06-11) ─────
+
+
+# Tool mutativi file -> chiave dell'input che contiene il path di OUTPUT.
+# Strutturale puro: nessuna lettura del final_answer (sarebbe lessicale).
+_OUTPUT_PATH_KEYS: dict[str, str] = {
+    "write_file": "path",
+    "edit_file": "path",
+    "create_file": "path",
+    "apply_patch": "path",
+    "rename_file": "to",
+    "fs_move": "to",
+}
+
+
+async def _check_outputs_exist(
+    spec: dict[str, Any], expected: dict[str, Any], ctx: dict[str, Any], timeout_s: float,
+) -> tuple[bool, dict[str, Any]]:
+    """Verifica STRUTTURALE che gli output dichiarati dagli STEP esistano su disco.
+
+    Legge da agent_steps (DB) i tool mutativi file del run (write/edit/create/
+    patch -> input.path; rename/fs_move -> input.to) e verifica che ogni path
+    esista a fine run (riusa _check_file_exists). Cattura scritture fantasma,
+    spostamenti falliti e file rimossi dopo la scrittura — il run chiude solo se
+    i FATTI degli step trovano riscontro sul filesystem. Nessuna analisi del
+    final_answer (regola de-lessicalizzazione): il confronto e' contabile,
+    step-vs-disco. N/A (pass) se il run non ha step mutativi file.
+    spec: {run_id}.
+    """
+    run_id = str(spec.get("run_id") or "").strip()
+    if not run_id:
+        return True, {"skipped": "outputs_exist senza run_id: N/A"}
+    conn_str = os.environ.get("DATABASE_URL")
+    if not conn_str:
+        return True, {"skipped": "DATABASE_URL assente: N/A (fail-open diagnostico)"}
+    paths: list[str] = []
+    try:
+        import psycopg2  # type: ignore[import-untyped]
+
+        conn = psycopg2.connect(conn_str)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT tool_name, tool_input FROM agent_steps "
+                    "WHERE run_id = %s AND status = 'completed' "
+                    "AND tool_name = ANY(%s) ORDER BY created_at",
+                    (run_id, list(_OUTPUT_PATH_KEYS.keys())),
+                )
+                for tool_name, tool_input in cur.fetchall():
+                    key = _OUTPUT_PATH_KEYS.get(tool_name or "")
+                    if not key:
+                        continue
+                    raw = tool_input
+                    if isinstance(raw, str):
+                        try:
+                            import json as _json
+                            raw = _json.loads(raw)
+                        except Exception:
+                            continue
+                    if isinstance(raw, dict):
+                        p = str(raw.get(key) or "").strip()
+                        if p and p not in paths:
+                            paths.append(p)
+        finally:
+            conn.close()
+    except Exception as exc:
+        return True, {"skipped": f"lettura agent_steps fallita ({exc}): N/A"}
+
+    if not paths:
+        return True, {"skipped": "nessuno step mutativo file nel run: N/A"}
+
+    missing: list[str] = []
+    checked: list[str] = []
+    for p in paths[:20]:  # cap difensivo: i run normali hanno pochi output
+        ok, _ev = await _check_file_exists({"path": p}, {}, ctx, timeout_s)
+        checked.append(p)
+        if not ok:
+            missing.append(p)
+
+    if missing:
+        return False, {
+            "missing": missing,
+            "checked": checked,
+            "diagnosis": (
+                "Gli step del run dichiarano output che NON esistono sul "
+                "filesystem a fine run (scrittura fantasma o file spostato/"
+                "rimosso dopo). Verificare lo stato reale prima di chiudere."
+            ),
+        }
+    return True, {"checked": checked}
 
 
 # ── file_exists ──────────────────────────────────────────────────────────

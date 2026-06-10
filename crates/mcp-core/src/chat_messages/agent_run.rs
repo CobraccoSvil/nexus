@@ -79,7 +79,8 @@ fn collect_actions(steps: &[AgentStep]) -> (Vec<String>, std::collections::BTree
             continue;
         }
         // Dettaglio leggibile dall'input del tool, in ordine di preferenza.
-        let detail = ["path", "file", "command", "pattern", "query"]
+        // "to" copre rename_file/fs_move (usano from/to, non path).
+        let detail = ["path", "file", "command", "pattern", "query", "to"]
             .iter()
             .find_map(|k| step.tool_input.get(*k).and_then(|v| v.as_str()))
             .map(|s| trunc_chars(s.to_string(), 120));
@@ -96,6 +97,16 @@ fn collect_actions(steps: &[AgentStep]) -> (Vec<String>, std::collections::BTree
         ) {
             if let Some(p) = step.tool_input.get("path").and_then(|v| v.as_str()) {
                 files_touched.insert(p.to_string());
+            }
+        }
+        // Spostamenti: la destinazione E' un file/albero toccato. Senza questo,
+        // un run di soli rename aveva files_touched VUOTO: il recap non poteva
+        // contraddire un resoconto che dichiarava path ormai svuotati dai rename
+        // stessi (incidente Beauty-Book: "scritto in figma_export/" dopo aver
+        // spostato tutto in src/ con 2 rename).
+        if matches!(step.tool_name.as_str(), "rename_file" | "fs_move") {
+            if let Some(to) = step.tool_input.get("to").and_then(|v| v.as_str()) {
+                files_touched.insert(to.to_string());
             }
         }
     }
@@ -2898,6 +2909,32 @@ mod tests_finalize_turn {
             status: AgentStepStatus::Completed,
             created_at: String::new(),
         }
+    }
+
+    fn rename_step() -> AgentStep {
+        AgentStep {
+            run_id: "r".into(),
+            step_index: 2,
+            tool_name: "rename_file".into(),
+            tool_input: serde_json::json!({"from": "figma_export/src/app", "to": "src/app"}),
+            tool_result: Some("ok".into()),
+            status: AgentStepStatus::Completed,
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn collect_actions_include_rename_to() {
+        // Incidente Beauty-Book: run di soli rename aveva files_touched VUOTO,
+        // quindi il recap non poteva contraddire un resoconto che dichiarava
+        // path ormai svuotati dai rename stessi. La destinazione del rename E'
+        // un file toccato.
+        let (lines, files) = collect_actions(&[rename_step()]);
+        assert!(!lines.is_empty());
+        assert!(
+            files.contains("src/app"),
+            "files_touched deve includere il 'to' del rename: {files:?}"
+        );
     }
 
     #[test]
