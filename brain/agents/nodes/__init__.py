@@ -2025,7 +2025,6 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         tools_json                                        # l'agente ha tool disponibili
         and _current_iter >= 1                            # route_after_executor ha già ri-mandato qui
         and _nudge_count < 2                              # max 2 nudge totali
-        and not _has_tool_calls_in_history(messages)     # nessun tool call nella history
     ):
         # G1 esteso: il nudge scatta sia quando la richiesta utente e' un'azione
         # concreta (input action-oriented) sia quando il modello ha appena
@@ -2035,11 +2034,20 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         # imperativo ma l'agente narra il piano invece di agire.
         # action-oriented dal punto unico (classifier LLM sul turno corrente,
         # regola L): niente piu' euristica sul primo messaggio della history.
+        #
+        # Il filtro storico "nessun tool call nella history" resta per il caso
+        # action-request (risposta SOLO descrittiva dall'inizio), ma NON per
+        # l'intenzione non compiuta: un run che ha gia' eseguito check/letture
+        # e chiude annunciando il passo successivo ("Inizio con la verifica...")
+        # va nudgiato a COMPIERE quel passo (incidente "non finisce il lavoro"
+        # 2026-06-10: routing rimandava ma il nudge era filtrato -> reroute a
+        # vuoto). Coerenza col guard raffinato in routing.py.
         _is_action_req = turn_action_oriented(state)
         _last_asst_text = _last_assistant_text(messages)
         _is_unfulfilled = _detect_unfulfilled_intent(_last_asst_text)
         _is_polling = _detect_polling_wait(_last_asst_text)
-        if _is_action_req or _is_unfulfilled:
+        _no_tools_yet = not _has_tool_calls_in_history(messages)
+        if (_is_action_req and _no_tools_yet) or _is_unfulfilled:
             if _is_polling:
                 # Anti wait-loop: l'agente sta aspettando passivamente uno stato
                 # che potrebbe non cambiare (container/servizio in crash-loop).

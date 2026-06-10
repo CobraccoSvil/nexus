@@ -135,7 +135,18 @@ def route_after_executor(state: AgentState) -> str:
             # non veniva iniettato perche' _has_tool_calls_in_history filtrava:
             # il routing e il nudge erano INCOERENTI), bruciando reroute +
             # escalation e incollando il cap-text in coda alla risposta buona.
-            if has_productive_action_in_history(_msgs):
+            #
+            # RAFFINAMENTO (incidente "non finisce il lavoro" 2026-06-10 pom.):
+            # il guard NON deve scattare se l'ultima risposta ANNUNCIA un'azione
+            # imminente non compiuta ("Inizio con la verifica...", "Ora verifico
+            # il frontend:"): un run_command di solo check (tsc --noEmit) conta
+            # come azione produttiva e faceva accettare come "resoconto finale"
+            # una frase che dichiara lavoro futuro -> run 'completed' a meta'.
+            # Un resoconto CONCLUSIVO resta protetto; un'intenzione aperta torna
+            # all'executor per essere compiuta (cap reroute a protezione).
+            if has_productive_action_in_history(_msgs) and not _detect_unfulfilled_intent(
+                state.get("result")
+            ):
                 logger.info(
                     "route_after_executor: chiusura con azioni produttive gia' "
                     "eseguite nel run -> resoconto finale legittimo, niente G1"

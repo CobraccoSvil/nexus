@@ -68,3 +68,30 @@ def test_mix_esplorazione_poi_scrittura():
 
 def test_history_vuota():
     assert has_productive_action_in_history([]) is False
+
+
+# ── Raffinamento guard (incidente "non finisce il lavoro" 2026-06-10 pom.) ──
+# Il guard salta il G1 solo se la chiusura e' un resoconto CONCLUSIVO: una
+# frase che ANNUNCIA un'azione imminente (intenzione non compiuta) deve
+# tornare all'executor anche se il run ha gia' azioni produttive (es. un
+# run_command di solo check). Qui si fissa il comportamento del rilevatore
+# sulle frasi REALI dei due run incriminati.
+from brain.agents.nodes.helpers import _detect_unfulfilled_intent
+
+
+def test_intenzione_annunciata_run_reale_1():
+    txt = ("1. Forza una ricompilazione pulita.\n"
+           "2. Verifica eventuali errori di compilazione.\n\n"
+           "Inizio con la verifica dei file generati in dist/services/.")
+    assert _detect_unfulfilled_intent(txt) is True
+
+
+def test_intenzione_annunciata_run_reale_2():
+    txt = "Backend compila senza errori. Ora verifico il frontend:"
+    assert _detect_unfulfilled_intent(txt) is True
+
+
+def test_resoconto_conclusivo_non_e_intenzione():
+    txt = ("Ho diagnosticato e risolto il problema. La correzione e' stata "
+           "applicata con successo. Considero l'intervento concluso.")
+    assert _detect_unfulfilled_intent(txt) is False
