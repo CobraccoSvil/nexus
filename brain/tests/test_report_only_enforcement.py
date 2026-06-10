@@ -14,12 +14,13 @@ nessuna chiamata LLM/DB).
 """
 
 
-def _derive_report_only(intent, action_verb, slots_conf, intent_hint=None):
-    """Replica la logica del router_node (punto unico) per testarla isolata."""
-    return (not intent_hint) and (
-        intent == "code_read"
-        or (action_verb in ("read", "analyze") and slots_conf >= 0.7)
-    )
+def _derive_report_only(authorizes_changes, intent_hint=None):
+    """Replica la logica del router_node (punto unico) per testarla isolata.
+
+    Fonte: il giudizio agentico DIRETTO del classifier (authorizes_changes),
+    non un proxy su action_verb.
+    """
+    return (not intent_hint) and (not authorizes_changes)
 
 
 _MUTATING_FILE_TOOLS = {
@@ -32,29 +33,25 @@ def _filter_report_only(tools):
     return [t for t in tools if t.get("name") not in _MUTATING_FILE_TOOLS]
 
 
-def test_verifica_e_analyze_e_report_only():
-    assert _derive_report_only("code_read", "analyze", 0.85) is True
-    assert _derive_report_only("system_admin", "analyze", 0.85) is True
+def test_non_autorizza_modifiche_e_report_only():
+    # L'LLM ha giudicato che l'utente vuole solo un report.
+    assert _derive_report_only(authorizes_changes=False) is True
 
 
-def test_intent_code_read_sempre_report_only():
-    assert _derive_report_only("code_read", "read", 0.5) is True
+def test_autorizza_modifiche_non_e_report_only():
+    # "verifica e CORREGGI" / fix / implement -> l'LLM autorizza le modifiche.
+    assert _derive_report_only(authorizes_changes=True) is False
 
 
-def test_fix_resolve_non_e_report_only():
-    # "verifica e CORREGGI" -> resolve -> deve poter modificare
-    assert _derive_report_only("fix", "resolve", 0.9) is False
-    assert _derive_report_only("debug", "resolve", 0.9) is False
-
-
-def test_classifier_incerto_non_blocca():
-    # slot_conf basso: guard fail-safe, non report-only (non si bloccano i fix)
-    assert _derive_report_only("system_admin", "analyze", 0.5) is False
+def test_default_fail_safe_non_blocca():
+    # Classifier-down / campo assente -> default True -> mai report_only.
+    assert _derive_report_only(authorizes_changes=True) is False
 
 
 def test_disambiguazione_risolta_mai_report_only():
-    # intent_hint presente: l'utente ha scelto un'azione, mai report-only
-    assert _derive_report_only("code_read", "analyze", 0.9, intent_hint="fix") is False
+    # intent_hint presente: l'utente ha scelto un'azione, mai report-only,
+    # anche se per qualche motivo authorizes_changes risultasse False.
+    assert _derive_report_only(authorizes_changes=False, intent_hint="fix") is False
 
 
 def test_filtro_rimuove_solo_tool_di_modifica():

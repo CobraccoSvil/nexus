@@ -569,8 +569,8 @@ async def router_node(state: AgentState) -> dict[str, Any]:
     agentic_score_val: float | None = None
     is_ambiguous_val: bool | None = None
     requires_tools_val: bool | None = None
-    _action_verb_val: str = ""
-    _slots_conf_val: float = 0.0
+    # Default True: classifier-down o campo assente NON blocca i fix (fail-safe).
+    _authorizes_changes_val: bool = True
     # Intent gia' RISOLTO a monte (mcp-core, risposta dell'utente a una
     # disambiguazione "A"/"B"/"C"): si usa quello, NIENTE ri-classificazione.
     # Ri-classificare la lettera secca dava 'chat' (prompt_len=1), vanificando
@@ -597,13 +597,11 @@ async def router_node(state: AgentState) -> dict[str, Any]:
                 agentic_score_val = getattr(ag, "agentic_score", None)
                 is_ambiguous_val = getattr(ag, "is_ambiguous", None)
                 requires_tools_val = getattr(ag, "requires_tools", None)
-                _slots = getattr(ag, "slots", None)
-                _action_verb_val = (
-                    getattr(_slots, "action_verb", "") if _slots else ""
-                )
-                _slots_conf_val = (
-                    float(getattr(_slots, "confidence", 0.0) or 0.0)
-                    if _slots else 0.0
+                # Giudizio agentico DIRETTO report-vs-act (default True = non
+                # blocca i fix se l'LLM non lo popola). Sostituisce il vecchio
+                # proxy "action_verb in {read,analyze}".
+                _authorizes_changes_val = bool(
+                    getattr(ag, "authorizes_changes", True)
                 )
                 logger.info(
                     "router_node: classifier LLM -> intent=%s conf=%.2f complexity=%s "
@@ -660,24 +658,21 @@ async def router_node(state: AgentState) -> dict[str, Any]:
 
     # ── Punto unico report-only (incidente "verifica->fix" 2026-06-10) ──────
     # Il task chiede di VERIFICARE/LEGGERE e RIPORTARE l'esito, non di
-    # modificare il codice. Segnale STRUTTURALE dal classifier LLM (regola
-    # utente: niente keyword): action_verb 'read'/'analyze' con slot affidabili,
-    # oppure intent 'code_read'. In report_only i tool di MODIFICA file
-    # (write/edit/delete/rename) vengono rimossi ANCHE se in _ALWAYS_ON_TOOLS:
-    # senza questo l'agente, trovato un problema durante la verifica, lo
-    # CORREGGEVA invece di riportarlo (scope-creep), spesso bloccandosi.
-    # Guard di confidence (>=0.7) per non bloccare i fix legittimi quando il
-    # classifier e' incerto. Una disambiguazione risolta (_intent_hint) o una
-    # richiesta esplicita d'azione non sono mai report-only.
-    report_only_val = (not _intent_hint) and (
-        intent == "code_read"
-        or (_action_verb_val in ("read", "analyze") and _slots_conf_val >= 0.7)
-    )
+    # modificare il codice. Fonte: il GIUDIZIO AGENTICO DIRETTO del classifier
+    # LLM (`authorizes_changes`), che risponde alla domanda esatta "l'utente
+    # autorizza modifiche?" — non un proxy sintattico su action_verb. In
+    # report_only i tool di MODIFICA file (write/edit/delete/rename) vengono
+    # rimossi ANCHE se in _ALWAYS_ON_TOOLS: senza questo l'agente, trovato un
+    # problema durante la verifica, lo CORREGGEVA invece di riportarlo
+    # (scope-creep), spesso bloccandosi. Default authorizes_changes=True (LLM
+    # down o campo assente) -> mai report_only -> i fix non vengono bloccati.
+    # Una disambiguazione risolta (_intent_hint) e' sempre un'azione.
+    report_only_val = (not _intent_hint) and (not _authorizes_changes_val)
     if report_only_val:
         logger.info(
-            "router_node: report_only=True (intent=%s action_verb=%s slots_conf=%.2f)"
+            "router_node: report_only=True (authorizes_changes=False intent=%s)"
             " -> tool di modifica rimossi, atteso REPORT non fix",
-            intent, _action_verb_val, _slots_conf_val,
+            intent,
         )
 
     behavior_mode = state.get("behavior_mode", "bilanciata")

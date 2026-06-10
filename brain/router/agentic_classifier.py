@@ -264,6 +264,14 @@ class AgenticIntent:
     model_used: str
     cached: bool = False
     fallback_used: bool = False
+    # Giudizio agentico DIRETTO (non un proxy): l'utente AUTORIZZA modifiche al
+    # codice/sistema in questo turno, o vuole solo una verifica/lettura/report?
+    # True = puo' modificare (fix/implement/refactor/...); False = solo eseguire
+    # controlli e RIPORTARE l'esito, niente write/edit (incident "verifica->fix"
+    # 2026-06-10). Default True = fail-safe: se l'LLM non popola il campo NON si
+    # bloccano i fix legittimi. Ortogonale ad action_verb (che serve al routing
+    # del modello, non alla decisione "report vs act").
+    authorizes_changes: bool = True
     # Lista candidati alternativi (top 3 sortati per confidence DESC).
     # Sempre contiene almeno [self.intent] come primo elemento.
     candidates: list[IntentCandidate] = field(default_factory=list)
@@ -336,6 +344,7 @@ Schema (all keys required):
 "intent": one of ["chat","debug","fix","refactor","test","docs","architecture","file_ops","system_admin","code_read"],
 "agentic_score": 0.0..1.0,
 "requires_tools": bool,
+"authorizes_changes": bool,
 "complexity": "low"|"medium"|"high",
 "confidence": 0.0..1.0,
 "candidates": [{{"intent":"...","confidence":0..1}}, up to 3],
@@ -363,7 +372,11 @@ CRITICAL:
 - "scaffold/genera progetto" / "boilerplate" / "starter kit" → intent=architecture, scope=system_wide.
 - "imposta/configura/abilita un utente admin|il backend|un servizio|CORS|HTTPS", "setup X", "deploya/avvia X" → intent=system_admin, requires_tools=true. E' un task agentico multi-step, NON chat anche se la frase e' breve.
 - RETROSPECTIVE/META requests about work ALREADY done in this conversation — "riassumi cosa hai fatto/sistemato", "spiega cosa e' successo", "che modifiche hai applicato?", "fammi il punto" → intent=chat, requires_tools=false, agentic_score<=0.2. The user wants a TEXT answer about past work, NOT new actions or documentation files. NOT docs (docs = write documentation files into the repo).
-- VERIFY/REPORT requests — "verifica/controlla che X compili|funzioni|risponda E riporta/dimmi l'esito", "controlla lo stato di X e fammi sapere", "fai un check di X e riportami" → action_verb=analyze, requires_tools=true (the checks need build/test/curl/read), agentic_score~0.5. The user wants the RESULT of checks REPORTED, NOT code changes. CRITICAL: this is report-only even if a check FAILS — do NOT switch to action_verb=resolve/write just because something is broken. If instead the user says "verifica e CORREGGI|SISTEMA|fai funzionare X" → action_verb=resolve (modification authorized).
+"authorizes_changes" — THE KEY report-vs-act judgment, decide it from the user's intent:
+- true when the user wants the assistant to MODIFY code/system: fix, implement, refactor, scaffold, configure, deploy, delete, "fai funzionare", "correggi", "sistema", "crea". This is the default for action intents.
+- false when the user wants only to INSPECT and be TOLD the result: "verifica/controlla che X compili|funzioni|risponda E riporta/dimmi l'esito", "controlla lo stato di X e fammi sapere", "fai un check e riportami", "leggi/spiega X". requires_tools can still be true (checks need build/test/curl/read) but NO code changes are wanted.
+- CRITICAL: a verify/report task stays authorizes_changes=false EVEN IF a check FAILS — finding something broken does NOT authorize fixing it; report it instead. Only switch to true if the user explicitly also asks to fix ("verifica e CORREGGI|SISTEMA|fai funzionare X").
+- When unsure, prefer true (do not block legitimate fixes).
 
 Use confidence<0.7 honestly when ambiguous (downstream asks user). NEVER inflate.
 
@@ -378,8 +391,9 @@ Examples:
 - "fix null pointer at handlers.py:42" → {{"intent":"fix","agentic_score":0.85,"requires_tools":true,"complexity":"medium","confidence":0.90,"candidates":[{{"intent":"fix","confidence":0.90}}],"slots":{{"action_verb":"resolve","target_type":"code","framework":"","scope":"single","confidence":0.85}}}}
 - "deploya il microservizio doc-service" → {{"intent":"system_admin","agentic_score":0.9,"requires_tools":true,"complexity":"high","confidence":0.92,"candidates":[{{"intent":"system_admin","confidence":0.92}}],"slots":{{"action_verb":"deploy","target_type":"service","framework":"docker","scope":"cross_service","confidence":0.90}}}}
 - "elimina i dockerfile rimasti" → {{"intent":"file_ops","agentic_score":0.7,"requires_tools":true,"complexity":"low","confidence":0.88,"candidates":[{{"intent":"file_ops","confidence":0.88}}],"slots":{{"action_verb":"delete","target_type":"infrastructure","framework":"docker","scope":"multi_file","confidence":0.85}}}}
-- "verifica che il backend compili e che il frontend buildi, riporta l'esito di ogni controllo" → {{"intent":"code_read","agentic_score":0.5,"requires_tools":true,"complexity":"medium","confidence":0.85,"candidates":[{{"intent":"code_read","confidence":0.85}}],"slots":{{"action_verb":"analyze","target_type":"code","framework":"","scope":"multi_file","confidence":0.85}}}}
-- "controlla che il servizio risponda e dimmi lo stato" → {{"intent":"code_read","agentic_score":0.4,"requires_tools":true,"complexity":"low","confidence":0.88,"candidates":[{{"intent":"code_read","confidence":0.88}}],"slots":{{"action_verb":"analyze","target_type":"service","framework":"","scope":"single","confidence":0.88}}}}
+- "verifica che il backend compili e che il frontend buildi, riporta l'esito di ogni controllo" → {{"intent":"code_read","agentic_score":0.5,"requires_tools":true,"authorizes_changes":false,"complexity":"medium","confidence":0.85,"candidates":[{{"intent":"code_read","confidence":0.85}}],"slots":{{"action_verb":"analyze","target_type":"code","framework":"","scope":"multi_file","confidence":0.85}}}}
+- "controlla che il servizio risponda e dimmi lo stato" → {{"intent":"code_read","agentic_score":0.4,"requires_tools":true,"authorizes_changes":false,"complexity":"low","confidence":0.88,"candidates":[{{"intent":"code_read","confidence":0.88}}],"slots":{{"action_verb":"analyze","target_type":"service","framework":"","scope":"single","confidence":0.88}}}}
+- "verifica perche' il backend crasha e correggilo" → {{"intent":"debug","agentic_score":0.9,"requires_tools":true,"authorizes_changes":true,"complexity":"high","confidence":0.85,"candidates":[{{"intent":"debug","confidence":0.85}}],"slots":{{"action_verb":"resolve","target_type":"service","framework":"","scope":"multi_file","confidence":0.85}}}}
 
 Return ONLY the JSON object."""
 
@@ -588,6 +602,12 @@ class AgenticIntentClassifier:
             # Slot filling (Livello 4 NLU): se il campo manca o e' invalido,
             # ritorna ActionSlots() vuoto — il caller usera' routing classico.
             slots = AgenticIntentClassifier._parse_slots(parsed)
+            # Giudizio diretto report-vs-act. Default True (fail-safe): se il
+            # campo manca o non e' un bool, NON si blocca l'azione.
+            _auth_raw = parsed.get("authorizes_changes", True)
+            authorizes_changes = (
+                bool(_auth_raw) if isinstance(_auth_raw, bool) else True
+            )
             return AgenticIntent(
                 intent=intent,
                 agentic_score=agentic_score,
@@ -598,6 +618,7 @@ class AgenticIntentClassifier:
                 candidates=candidates,
                 is_ambiguous=is_ambiguous,
                 slots=slots,
+                authorizes_changes=authorizes_changes,
             )
         except (KeyError, ValueError, TypeError) as exc:
             logger.warning("classifier: parsed JSON malformed: %s", exc)
