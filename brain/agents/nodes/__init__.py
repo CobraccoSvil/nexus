@@ -1402,6 +1402,21 @@ def _check_superseded(state: dict[str, Any]) -> bool:
                     (_run_id,),
                 )
                 _row = _cur.fetchone()
+                # Heartbeat di liveness (recovery selettivo, mig 0392): batte
+                # updated_at a OGNI iterazione del loop. Il brain e' l'unico che
+                # sa se il run e' vivo (mcp-core e' solo proxy SSE e sopravvive
+                # separatamente): cosi' il recovery/reaper di mcp-core marca
+                # 'interrupted' SOLO i run davvero fermi oltre soglia, non quelli
+                # ancora in elaborazione. Best-effort: se la colonna non esiste
+                # (migrazione non applicata) non compromette il check superseded.
+                try:
+                    _cur.execute(
+                        "UPDATE agent_runs SET updated_at=now() WHERE id=%s",
+                        (_run_id,),
+                    )
+                    _conn.commit()
+                except Exception:
+                    _conn.rollback()
         finally:
             _conn.close()
         if not _row:

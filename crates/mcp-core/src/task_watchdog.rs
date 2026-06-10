@@ -83,10 +83,10 @@ const STALE_SCAN_MINUTES: i32 = 5;
 /// Soglia per considerare un agent process bloccato (10 minuti).
 const STALE_PROCESS_MINUTES: i32 = 10;
 
-/// Soglia per considerare un agent_run orfano (15 minuti senza completamento).
-/// Coperto da catch_unwind nel tokio::spawn ma serve safety-net per panic
-/// fuori dal body (es. crash mcp-core, DB tx fail post-emit).
-const STALE_AGENT_RUN_MINUTES: i32 = 15;
+// La soglia degli agent_run orfani e' ora DB-driven (mig 0392,
+// agent.run_recovery.stale_after_seconds) e applicata dal punto unico
+// run_reaper::reap_stale_runs sul criterio di LIVENESS (updated_at), non sull'eta'
+// assoluta. Vedi terminate_stale_tasks.
 
 // ── Spawn ────────────────────────────────────────────────────────────────────
 
@@ -646,43 +646,18 @@ async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
         tracing::warn!("task_watchdog: terminato agent process bloccato id={}", id);
     }
 
-    // Agent runs orfani (>15 minuti senza completamento). Tipico scenario:
-    // panic NON catturato fuori dal catch_unwind del body, crash mcp-core
-    // prima del UPDATE finale, oppure DB tx fallita post-emit. La query
-    // ritorna anche session_id per emettere un messaggio assistant di errore
-    // in chat (cosi' l'utente vede il fallimento e puo' riprovare).
-    let stale_runs = sqlx::query_as::<
-        _,
-        (
-            uuid::Uuid,
-            uuid::Uuid,
-            Option<uuid::Uuid>,
-            Option<uuid::Uuid>,
-        ),
-    >(
-        "UPDATE agent_runs SET \
-             status = 'timed_out', \
-             completed_at = NOW(), \
-             final_answer = COALESCE(final_answer, \
-                 'Watchdog: run terminato per timeout (>15 minuti senza completamento). Riprova.') \
-         WHERE status IN ('running', 'awaiting_confirmation') \
-           AND created_at < NOW() - make_interval(mins => $1) \
-         RETURNING id, session_id, project_id, run_message_id",
-    )
-    .bind(STALE_AGENT_RUN_MINUTES)
-    .fetch_all(db)
-    .await
-    .unwrap_or_default();
-
-    for (run_id, session_id, project_id_opt, request_msg_id) in &stale_runs {
-        tracing::warn!(
-            "task_watchdog: terminato agent_run orfano id={} session={}",
-            run_id,
-            session_id
-        );
-
-        // 1. Emetti is_final sul broadcast (se canale ancora attivo) per
-        //    sbloccare eventuali EventSource ancora in ascolto.
+    // Agent runs orfani: chiusura selettiva via PUNTO UNICO (regola L,
+    // run_reaper::reap_stale_runs). Marca 'interrupted' SOLO i run 'running'
+    // senza battito `updated_at` oltre soglia (heartbeat dal brain, mig 0392),
+    // NON gli 'awaiting_confirmation' (resumibili via checkpoint LangGraph). Il
+    // criterio e' la LIVENESS (updated_at), non l'eta' assoluta (created_at):
+    // cosi' un run legittimamente lungo che batte non viene piu' ucciso.
+    // L'UPDATE e il messaggio assistente sono nel punto unico; qui sblocchiamo
+    // gli EventSource ancora in ascolto sui run reapati.
+    let stale_seconds = crate::run_reaper::stale_seconds_from_settings(db).await;
+    let reaped = crate::run_reaper::reap_stale_runs(db, stale_seconds).await;
+    for run_id in &reaped {
+        tracing::warn!("task_watchdog: terminato agent_run orfano id={}", run_id);
         if let Some(tx) = agent_channels.get(run_id) {
             let _ = tx.send(AgentStepEvent {
                 run_id: run_id.to_string(),
@@ -695,24 +670,6 @@ async fn terminate_stale_tasks(db: &PgPool, agent_channels: &AgentChannels) {
             });
         }
         agent_channels.remove(run_id);
-
-        // 2. Inserisci un assistant_message di errore visibile in chat,
-        //    cosi' l'utente sa che il run e' fallito (anziche' fissare
-        //    una UI vuota).
-        if let Some(project_id) = project_id_opt {
-            let _ = sqlx::query(
-                r#"INSERT INTO chat_messages
-                   (id, session_id, project_id, role, content, metadata, request_message_id, created_at)
-                   VALUES (gen_random_uuid(),$1,$2,'assistant',$3,$4,$5,NOW())"#,
-            )
-            .bind(session_id)
-            .bind(project_id)
-            .bind("⚠ Watchdog: il run agente e' stato terminato per timeout (>15 minuti senza completamento). Puoi riprovare la richiesta.")
-            .bind(json!({"errorClass": "watchdog_timeout", "agentRunId": run_id.to_string()}))
-            .bind(request_msg_id)
-            .execute(db)
-            .await;
-        }
     }
 }
 

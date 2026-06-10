@@ -71,6 +71,7 @@ mod routing_config;
 mod routing_matrix;
 mod routing_matrix_auto_promoter;
 mod routing_slots;
+mod run_reaper;
 mod sandbox;
 mod security;
 mod services_watchdog;
@@ -367,78 +368,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Marca le agent_run rimaste in stato 'running' o 'awaiting_confirmation' come interrotte.
-    // Questo accade quando il server si riavvia durante un'elaborazione attiva.
+    // Recovery SELETTIVO all'avvio (mig 0392): marca 'interrupted' SOLO i run
+    // 'running' orfani (heartbeat agent_runs.updated_at oltre soglia), NON gli
+    // 'awaiting_confirmation' (stato resumibile via checkpoint LangGraph +
+    // /agent/approve) ne' i run VIVI (il brain — separato da mcp-core — li sta
+    // ancora elaborando e batte updated_at). Punto unico in
+    // run_reaper::reap_stale_runs, condiviso col loop periodico (regola L).
+    //
+    // NOTA: il cleanup dei processi 'running'/'starting' è già gestito dal blocco
+    // di riconciliazione PID sopra (kill -0).
     {
-        let interrupted_msg = "Il server è stato riavviato durante l'elaborazione. \
-            L'operazione è stata interrotta. Puoi ripetere la richiesta.";
-        let affected = sqlx::query(
-            r#"
-            UPDATE agent_runs
-            SET status = 'interrupted',
-                final_answer = $1,
-                completed_at = NOW()
-            WHERE status IN ('running', 'awaiting_confirmation')
-              AND completed_at IS NULL
-            "#,
-        )
-        .bind(interrupted_msg)
-        .execute(&db)
-        .await
-        .map(|r| r.rows_affected())
-        .unwrap_or(0);
-
-        if affected > 0 {
-            tracing::warn!(
-                "Marcate {} agent_run interrotte dal riavvio come 'interrupted'",
-                affected
-            );
-
-            // Salva il messaggio di interruzione in chat_messages per ogni run orfano
-            // che non ha già un messaggio assistente associato.
-            let inserted = sqlx::query(
-                r#"
-                INSERT INTO chat_messages
-                    (id, session_id, project_id, role, content, metadata, request_message_id, created_at)
-                SELECT
-                    gen_random_uuid(),
-                    ar.session_id,
-                    ar.project_id,
-                    'assistant',
-                    $1,
-                    jsonb_build_object(
-                        'agentRunId', ar.id::text,
-                        'automationMode', 'agent',
-                        'interrupted', true
-                    ),
-                    ar.run_message_id,
-                    NOW()
-                FROM agent_runs ar
-                WHERE ar.status = 'interrupted'
-                  AND ar.run_message_id IS NOT NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM chat_messages cm
-                      WHERE cm.request_message_id = ar.run_message_id
-                        AND cm.role = 'assistant'
-                  )
-                "#,
-            )
-            .bind(interrupted_msg)
-            .execute(&db)
-            .await
-            .map(|r| r.rows_affected())
-            .unwrap_or(0);
-
-            if inserted > 0 {
-                tracing::warn!(
-                    "Inseriti {} messaggi assistente per run interrotti senza risposta",
-                    inserted
-                );
-            }
-        }
-
-        // NOTA: il cleanup dei processi 'running'/'starting' è già gestito dal blocco di
-        // riconciliazione PID sopra (kill -0). Non sovrascrivere qui i processi ancora vivi.
+        let stale_seconds = run_reaper::stale_seconds_from_settings(&db).await;
+        // All'avvio non ci sono broadcast channel attivi: ignoriamo gli id reapati.
+        let _ = run_reaper::reap_stale_runs(&db, stale_seconds).await;
     }
 
     let redis = cache::init_redis(&redis_url).await?;
@@ -817,6 +759,10 @@ async fn main() -> anyhow::Result<()> {
         state.db.clone(),
         state.project_channels.clone(),
     ));
+
+    // Lo sweep periodico dei run orfani e' delegato al task_watchdog (gia'
+    // periodico): chiama run_reaper::reap_stale_runs come punto unico (regola L).
+    // Copre anche l'orfano da restart del SOLO brain (mcp-core resta su).
 
     // Il worker billing_cooldown_recovery_loop viene avviato piu' sotto, dopo
     // aver inizializzato la config health/cooldown provider DB-driven (cosi'
