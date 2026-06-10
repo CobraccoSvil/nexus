@@ -3912,6 +3912,18 @@ async def learner_node(state: AgentState) -> dict[str, Any]:
         thread_id, task_type, latency_ms or 0, qdrant_id,
     )
 
+    # ── WAVE 3.3: giudice LLM di chiusura in SHADOW (mig 0391) ───────────────
+    # Off-path e best-effort: registra il verdetto del judge e il disaccordo con
+    # la blacklist lessicale (_detect_unfulfilled_intent) SENZA cambiare nulla.
+    # Avvia la finestra di confronto telemetrico prerequisito per rimuovere le
+    # blacklist (regola H: niente promozione cieca). Ogni errore e' ignorato:
+    # il learner e' terminale, non deve mai fallire per il judge.
+    try:
+        from . import closure_judge as _closure_judge
+        await _closure_judge.run_shadow(state, _providers, _detect_unfulfilled_intent)
+    except Exception as _cj_exc:  # pragma: no cover - difensivo
+        logger.debug("learner_node: closure_judge shadow skip (%s)", _cj_exc)
+
     return {
         "completed_at": completed_at,
     }
