@@ -408,6 +408,61 @@ def structural_unfulfilled_signal(
     return True
 
 
+# ── Tool task_complete: chiusura DICHIARATA dal modello (WAVE 3) ─────────────
+# Tool brain-only (NON eseguito dal ToolRunner): il modello lo chiama per
+# DICHIARARE l'esito del turno in modo strutturato e indipendente dalla lingua.
+# Sostituisce l'inferenza lessicale dell'esito (_detect_unfulfilled_intent ~150
+# frasi it/en, resigned_patterns) con un segnale esplicito. La dichiarazione e'
+# un segnale PREFERITO ma gated dai fatti: outcome=done senza azioni produttive
+# non e' fidato ciecamente (vedi route_after_executor).
+TASK_COMPLETE_TOOL_NAME = "task_complete"
+
+TASK_COMPLETE_TOOL: dict = {
+    "name": TASK_COMPLETE_TOOL_NAME,
+    "description": (
+        "Chiudi il turno dichiarando l'esito in modo strutturato. Chiamalo "
+        "quando hai finito (o sei bloccato), invece di rispondere solo a parole. "
+        "outcome='done' se il compito e' completato; 'blocked' se non puoi "
+        "proseguire per una causa esterna (dipendenza/credenziale/permesso/"
+        "servizio mancante); 'needs_input' se ti serve una decisione dell'utente. "
+        "summary: 1-2 frasi sull'esito. next_step: il prossimo passo concreto se "
+        "non done. blocked_by: cosa ti blocca se blocked."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "outcome": {
+                "type": "string",
+                "enum": ["done", "blocked", "needs_input"],
+            },
+            "summary": {"type": "string"},
+            "next_step": {"type": "string"},
+            "blocked_by": {"type": "string"},
+        },
+        "required": ["outcome", "summary"],
+    },
+}
+
+_VALID_OUTCOMES = frozenset({"done", "blocked", "needs_input"})
+
+
+def normalize_declared_outcome(tool_input: dict | None) -> dict | None:
+    """Valida/normalizza l'input di task_complete (punto unico). None se invalido
+    (outcome fuori enum o input non-dict): il chiamante ricade sui segnali
+    strutturali/lessicali come se la dichiarazione non ci fosse."""
+    if not isinstance(tool_input, dict):
+        return None
+    outcome = str(tool_input.get("outcome", "")).strip().lower()
+    if outcome not in _VALID_OUTCOMES:
+        return None
+    out: dict = {"outcome": outcome, "summary": str(tool_input.get("summary", "")).strip()}
+    for k in ("next_step", "blocked_by"):
+        v = tool_input.get(k)
+        if v:
+            out[k] = str(v).strip()
+    return out
+
+
 # ── Loop-detection semantica: tool di sola esplorazione ─────────────────────
 # Tool che leggono/ispezionano allegati e file senza produrre codice o
 # side-effect. Quando il modello ne incatena troppi di fila (variando

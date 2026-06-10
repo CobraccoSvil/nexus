@@ -49,6 +49,13 @@ class AgentState(TypedDict, total=False):
     # Calcolato UNA volta da router_node dal classifier LLM (requires_tools /
     # agentic_score >= soglia DB). Letto ovunque via turn_action_oriented().
     action_oriented: bool
+    # Esito DICHIARATO dal modello via tool task_complete (WAVE 3,
+    # de-lessicalizzazione): {outcome: done|blocked|needs_input, summary,
+    # next_step?, blocked_by?}. None = il modello non ha dichiarato (fallback ai
+    # segnali strutturali/lessicali). Segnale PREFERITO ma additivo: la chiusura
+    # resta governata dai fatti, la dichiarazione e' un segnale in piu' affidabile
+    # e indipendente dalla lingua (sostituisce le blacklist _INTENT_NARRATION).
+    declared_outcome: dict | None
     task_type: str
     behavior_mode: str
     token_budget: int

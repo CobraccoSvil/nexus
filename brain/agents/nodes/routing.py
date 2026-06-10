@@ -25,6 +25,18 @@ from .helpers import (
 logger = logging.getLogger(__name__)
 
 
+def _unfulfilled_lexical(result: str | None) -> bool:
+    """Wrapper di _detect_unfulfilled_intent con TELEMETRIA (WAVE 3): logga
+    `lexical_fallback_used` quando l'euristica lessicale DECIDE (ritorna True),
+    cosi' su una settimana di log si misura quanto il segnale dichiarato
+    (task_complete) ha gia' sostituito le blacklist. Usato SOLO quando l'esito
+    NON e' stato dichiarato dal modello (vedi route_after_executor)."""
+    hit = _detect_unfulfilled_intent(result)
+    if hit:
+        logger.info("lexical_fallback_used: route_after_executor/_detect_unfulfilled_intent")
+    return hit
+
+
 def _final_gate_eligible(state: AgentState) -> bool:
     """Punto unico: True se per questo stato e' eleggibile la verifica E2E
     pre-chiusura (task software, gate abilitato, cap non raggiunto).
@@ -126,6 +138,22 @@ def route_after_executor(state: AgentState) -> str:
         _max_nudges = _load_g1_max_nudges()
         if _reroute_count < _max_nudges:
             _msgs = state.get("messages") or []
+            # ── Esito DICHIARATO dal modello (WAVE 3, segnale PRIMARIO) ──────
+            # Se il modello ha chiuso con task_complete, l'esito e' esplicito e
+            # indipendente dalla lingua: niente inferenza lessicale. outcome=done
+            # e' una chiusura legittima (i fatti la confermano a valle: final_gate/
+            # verifier restano il gate di verita'); blocked/needs_input sono
+            # chiusure oneste dichiarate. In tutti e tre i casi NON si fa reroute
+            # G1. Solo se la dichiarazione MANCA si ricade sui segnali sotto.
+            _declared = state.get("declared_outcome")
+            if isinstance(_declared, dict) and _declared.get("outcome") in (
+                "done", "blocked", "needs_input",
+            ):
+                logger.info(
+                    "route_after_executor: esito DICHIARATO '%s' (task_complete) "
+                    "-> chiusura, niente G1 (segnale strutturale, no lessicale)",
+                    _declared["outcome"],
+                )
             # ── Guard strutturale "fine lavoro" (PRIMA di ogni trigger) ──────
             # Se il run ha GIA' eseguito azioni produttive (write/edit/run, fatto
             # strutturale dal punto unico has_productive_action_in_history), la
@@ -144,7 +172,10 @@ def route_after_executor(state: AgentState) -> str:
             # una frase che dichiara lavoro futuro -> run 'completed' a meta'.
             # Un resoconto CONCLUSIVO resta protetto; un'intenzione aperta torna
             # all'executor per essere compiuta (cap reroute a protezione).
-            if has_productive_action_in_history(_msgs) and not _detect_unfulfilled_intent(
+            # NB: questo ramo (e il G1 sotto) si valuta SOLO se l'esito non e'
+            # gia' stato dichiarato via task_complete (elif). _detect_unfulfilled_intent
+            # resta come fallback lessicale quando la dichiarazione manca: loggato.
+            elif has_productive_action_in_history(_msgs) and not _unfulfilled_lexical(
                 state.get("result")
             ):
                 logger.info(
@@ -161,7 +192,7 @@ def route_after_executor(state: AgentState) -> str:
                 # action-oriented dal punto unico (classifier LLM sul turno corrente,
                 # regola L): niente piu' euristica sul primo messaggio della history.
                 _is_action_req = turn_action_oriented(state)
-                _is_unfulfilled = _detect_unfulfilled_intent(state.get("result"))
+                _is_unfulfilled = _unfulfilled_lexical(state.get("result"))
                 # Gating modalita': in confirm l'utente vuole controllo step-by-step,
                 # quindi una mera intenzione/attesa narrata e non eseguita NON innesca
                 # auto-azione (re-entry); l'executor produce un resoconto onesto.

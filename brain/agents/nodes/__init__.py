@@ -47,6 +47,9 @@ logger = logging.getLogger(__name__)
 # 'import *' non porterebbe) cosi' i nodi di questo modulo li usano invariati.
 from .helpers import (
     MAX_AGENT_ITERATIONS,
+    TASK_COMPLETE_TOOL,
+    TASK_COMPLETE_TOOL_NAME,
+    normalize_declared_outcome,
     _ADAPTIVE_BUDGET_CACHE,
     _ADAPTIVE_BUDGET_TTL_SEC,
     _ADAPTIVE_BUDGET_DEFAULTS,
@@ -923,6 +926,37 @@ async def router_node(state: AgentState) -> dict[str, Any]:
         if "<modalita_verifica>" not in _eff_st:
             updates["system_text"] = (
                 (_eff_st + "\n\n" + _ro_directive) if _eff_st else _ro_directive
+            )
+
+    # ── Iniezione tool task_complete (WAVE 3: chiusura dichiarata) ──────────
+    # Per i run agentici (hanno tool e non sono chat puro) aggiungiamo il tool
+    # brain-only task_complete, cosi' il modello puo' DICHIARARE l'esito invece
+    # di farlo inferire dal testo. Additivo: se il modello non lo chiama, la
+    # chiusura resta governata dai segnali esistenti. Iniettato qui dopo tutti i
+    # filtri tool (punto unico), una sola volta.
+    _tc_tools = updates.get("tools_json", state.get("tools_json")) or []
+    if _tc_tools and intent not in ("chat", "general_chat"):
+        if not any(
+            isinstance(t, dict) and t.get("name") == TASK_COMPLETE_TOOL_NAME
+            for t in _tc_tools
+        ):
+            updates["tools_json"] = list(_tc_tools) + [TASK_COMPLETE_TOOL]
+        # Direttiva che attiva il comportamento (additiva, gated): senza, il
+        # tool resta disponibile ma inerte. Iniettata dinamicamente nel router
+        # invece che nel prompt base, cosi' e' reversibile e non tocca tutti i run.
+        _tc_directive = (
+            "<chiusura_dichiarata>\n"
+            "Quando hai finito il compito (o sei bloccato), CHIUDI il turno "
+            "chiamando il tool task_complete con l'esito strutturato "
+            "(outcome=done|blocked|needs_input + summary), invece di rispondere "
+            "solo a parole. E' il modo corretto per dichiarare che il lavoro e' "
+            "concluso o spiegare cosa ti blocca.\n"
+            "</chiusura_dichiarata>"
+        )
+        _tc_st = updates.get("system_text") or state.get("system_text") or ""
+        if "<chiusura_dichiarata>" not in _tc_st:
+            updates["system_text"] = (
+                (_tc_st + "\n\n" + _tc_directive) if _tc_st else _tc_directive
             )
 
     # ── Chat: meta-tool di gestione/discovery, NON azzeramento totale ───────
@@ -3072,8 +3106,10 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     except Exception:
         _discovery_first_on = False
         _df_whitelist = set()
-    # Tool sempre ammessi dalla validazione M16 = meta di discovery + whitelist DB.
-    _M16_ALLOWED = _M16_META_TOOLS | _df_whitelist
+    # Tool sempre ammessi dalla validazione M16 = meta di discovery + whitelist DB
+    # + task_complete (WAVE 3): e' brain-only, iniettato direttamente in tools_json
+    # dal router, quindi non passa per la "scoperta" e altrimenti verrebbe rifiutato.
+    _M16_ALLOWED = _M16_META_TOOLS | _df_whitelist | {TASK_COMPLETE_TOOL_NAME}
     for _i, b in enumerate(pending):
         name = b.get("name", "")
         # FIX D: predictive cap (ha priorita' sul budget allegati: se passa di qui,
@@ -3150,10 +3186,34 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
             pending_kept.append(b)
             pending_kept_indices.append(_i)
 
+    # Holder degli esiti DICHIARATI via task_complete in questo turno (WAVE 3):
+    # _run e' una closure, raccoglie qui senza poter scrivere nello state.
+    _declared_outcomes: list[dict] = []
+
     async def _run(block: dict) -> dict:
         tool_use_id = block.get("id", "")
         _t_name = block.get("name", "")
         _t_input = block.get("input", {}) or {}
+        # task_complete e' brain-only: non lo eseguiamo via gRPC. Registriamo
+        # l'esito dichiarato e rispondiamo con un ack. Se l'input e' invalido
+        # (outcome fuori enum), is_error=True cosi' il modello lo ri-emette bene.
+        if _t_name == TASK_COMPLETE_TOOL_NAME:
+            decl = normalize_declared_outcome(_t_input)
+            if decl is not None:
+                _declared_outcomes.append(decl)
+                logger.info(
+                    "task_complete dichiarato: outcome=%s (run=%s)",
+                    decl["outcome"], state.get("thread_id"),
+                )
+            return {
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": json.dumps(
+                    {"acknowledged": decl is not None, "outcome": (decl or {}).get("outcome")},
+                    ensure_ascii=False,
+                ),
+                "is_error": decl is None,
+            }
         logger.info(
             "TOOL_CALL tool=%s session=%s input_keys=%s",
             _t_name,
@@ -3423,7 +3483,7 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
             len(_discovered_next),
         )
 
-    return {
+    _dispatch_updates = {
         "messages": [tool_msg],
         "pending_tool_uses": [],
         "stop_reason": "tool_use",
@@ -3433,6 +3493,11 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
         # M16: durata 1 turno (overwrite reducer). [] azzera i discovered precedenti.
         "discovered_tools_next_turn": _discovered_next,
     }
+    # WAVE 3: esito dichiarato dal modello in questo turno (task_complete).
+    # L'ultimo prevale se piu' chiamate. Consumato da route_after_executor.
+    if _declared_outcomes:
+        _dispatch_updates["declared_outcome"] = _declared_outcomes[-1]
+    return _dispatch_updates
 
 
 # ─── Routing condizionale post-executor ──────────────────────────────────────
