@@ -37,12 +37,26 @@ def configure(tool_runner: Any) -> None:
 
 
 def _is_software_task(state: dict[str, Any], cfg: dict[str, Any]) -> bool:
-    """True se l'intent del task corrente e' un task software (build/code/debug...).
+    """True se il run va trattato come task software (quindi verificabile dal gate).
 
-    Lo state usa `user_intent` (popolato da router_node). Manteniamo anche un
-    fallback su `intent` per robustezza verso eventuali percorsi che usano
-    quella chiave.
+    Due segnali in OR (de-lessicalizzazione, incidente Beauty-Book 2026-06-11):
+    1. STRUTTURALE (primario): il run ha gia' eseguito tool che MUTANO il
+       filesystem/progetto (write/edit/rename/estrazioni/comandi). Un run che ha
+       toccato il progetto va verificato A PRESCINDERE dall'intent classificato:
+       il caso reale era intent=architecture (fuori whitelist) che aveva spostato
+       file con rename e ha chiuso senza alcuna verifica.
+    2. Whitelist intent (legacy, `agent.final_gate.software_intents`): copre i
+       run software che chiudono senza step mutativi (es. solo pianificazione
+       che DEVE comunque passare dal gate per il no-orphan check).
+
+    Lo state usa `user_intent` (popolato da router_node); fallback su `intent`.
     """
+    try:
+        from .nodes.helpers import has_filesystem_mutation_in_history
+        if has_filesystem_mutation_in_history(state.get("messages") or []):
+            return True
+    except Exception as exc:  # pragma: no cover - difensivo
+        logger.debug("final_gate: check strutturale mutazioni saltato (%s)", exc)
     intent = str(state.get("user_intent") or state.get("intent") or "").lower()
     if not intent:
         return False

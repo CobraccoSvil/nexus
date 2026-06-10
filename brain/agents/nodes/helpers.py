@@ -1574,6 +1574,67 @@ def has_productive_action_in_history(messages: list) -> bool:
     return False
 
 
+# Default IDENTICO a MUTATORS_DEFAULT in crates/mcp-core/src/agent_tool_result_cache.rs
+# (mig 0394). Il punto unico dei DATI e' il setting DB condiviso; questo default
+# serve solo se la chiave manca o il DB e' irraggiungibile.
+_FS_MUTATORS_DEFAULT = (
+    "write_file,edit_file,delete_file,rename_file,file_write,fs_copy,fs_mkdir,"
+    "fs_move,format_file,run_lint_fix,run_command,command,run_in_terminal,"
+    "git_command,git_pull,git_commit,git_stage,git_push,nexus_extract_figma_code,"
+    "nexus_install_shadcn_components,nexus_mcp_tool_call,cargo_install,run_service,"
+    "service_restart,stop_service"
+)
+_fs_mutators_cache: frozenset[str] | None = None
+_fs_mutators_ts: float = 0.0
+
+
+def _load_fs_mutator_tools() -> frozenset[str]:
+    """Tool che MUTANO filesystem/progetto. Punto unico dei dati: setting
+    `agent.tools.result_cache_mutators` (mig 0394), condiviso con la cache
+    tool_result lato Rust. Cache 60s; fail-safe sul default."""
+    global _fs_mutators_cache, _fs_mutators_ts
+    import time as _time
+
+    now = _time.monotonic()
+    if _fs_mutators_cache is not None and now - _fs_mutators_ts < 60.0:
+        return _fs_mutators_cache
+    try:
+        from brain.utils import settings_db
+        csv = settings_db.get_setting(
+            "agent.tools.result_cache_mutators", _FS_MUTATORS_DEFAULT
+        ) or _FS_MUTATORS_DEFAULT
+    except Exception:
+        csv = _FS_MUTATORS_DEFAULT
+    out = frozenset(s.strip() for s in csv.split(",") if s.strip())
+    _fs_mutators_cache, _fs_mutators_ts = out, now
+    return out
+
+
+def has_filesystem_mutation_in_history(messages: list) -> bool:
+    """True se il run ha eseguito almeno un tool che MUTA filesystem/progetto
+    (write/edit/rename/estrazioni/comandi). Fatto STRUTTURALE, nessuna analisi
+    lessicale. Usato dall'eleggibilita' del final_gate: un run che ha toccato il
+    progetto va verificato a prescindere dall'intent classificato (il caso reale
+    era intent=architecture — fuori dalla whitelist software_intents — che pero'
+    aveva spostato file con rename: chiusura senza alcuna verifica)."""
+    mutators = _load_fs_mutator_tools()
+    for m in messages:
+        if not isinstance(m, AIMessage):
+            continue
+        extra = getattr(m, "additional_kwargs", {}) or {}
+        blocks = extra.get("anthropic_content") or []
+        if not isinstance(blocks, list):
+            continue
+        for b in blocks:
+            if (
+                isinstance(b, dict)
+                and b.get("type") == "tool_use"
+                and (b.get("name") or "") in mutators
+            ):
+                return True
+    return False
+
+
 # Pattern testuali che indicano errore dentro un tool_result. Match case-insensitive.
 # Non e' esaustivo, copre i casi piu' frequenti (npm/cargo/python/shell/network).
 _TOOL_ERROR_HINTS = (
