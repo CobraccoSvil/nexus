@@ -188,6 +188,10 @@ def _smart_truncate_lossless(
 
 # Riferimenti ai servizi globali — iniettati da graph.py dopo l'inizializzazione
 _providers: ProviderRegistry | None = None
+
+# Run NON registrati in agent_runs (fantasmi, FK violation sugli step): rilevati
+# una volta per run dalla persistenza incrementale, poi skip silenzioso. Bounded.
+_UNTRACKED_RUN_IDS: set[str] = set()
 _router: SemanticRouter | None = None
 _embeddings: EmbeddingService | None = None
 _storage: LocalLearningStorage | None = None
@@ -3365,23 +3369,47 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
         from psycopg2.extras import Json as _Json  # type: ignore[import-untyped]
         _run_id = state.get("thread_id") or ""
         _dburl = os.environ.get("DATABASE_URL")
-        if _run_id and _dburl:
+        if _run_id and _dburl and _run_id not in _UNTRACKED_RUN_IDS:
             _step_base = int(state.get("iterations") or 0) * 1000
             _conn = psycopg2.connect(_dburl)
             try:
                 with _conn.cursor() as _cur:
-                    for _idx, (_block, _result) in enumerate(zip(pending, results)):
-                        _t_name = _block.get("name", "")
-                        _t_input = _block.get("input", {}) or {}
-                        _t_result = _result.get("content", "")
-                        _status = "failed" if _result.get("is_error") else "completed"
-                        _cur.execute(
-                            """INSERT INTO agent_steps
-                               (id, run_id, step_index, tool_name, tool_input, tool_result, status, created_at)
-                               VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, NOW())
-                               ON CONFLICT DO NOTHING""",
-                            (_run_id, _step_base + _idx, _t_name, _Json(_t_input), _t_result, _status),
+                    # Guard run-fantasma (incidente Beauty-Book, run e51a6ed9/
+                    # 1ae40cd6): se il run NON e' registrato in agent_runs, ogni
+                    # INSERT step fallirebbe con FK violation A RAFFICA e il run
+                    # lavorerebbe INVISIBILE a UI/governance/supersede. Il
+                    # contratto e' che il CHIAMANTE di /agent/run/stream registri
+                    # il run PRIMA; qui rileviamo la violazione UNA volta per
+                    # run, logghiamo la diagnostica (grep: untracked_run) con i
+                    # dati che identificano il call site colpevole, e saltiamo
+                    # la persistenza per il resto del run (niente spam FK).
+                    _cur.execute("SELECT 1 FROM agent_runs WHERE id = %s", (_run_id,))
+                    if _cur.fetchone() is None:
+                        _UNTRACKED_RUN_IDS.add(_run_id)
+                        if len(_UNTRACKED_RUN_IDS) > 256:
+                            _UNTRACKED_RUN_IDS.pop()
+                        logger.warning(
+                            "tool_dispatch_node: untracked_run %s — il run NON e' "
+                            "registrato in agent_runs (chiamante fuori-chat senza "
+                            "INSERT? session=%s intent=%s). Step non persistiti: "
+                            "registrare il run nel call site che invoca il brain.",
+                            _run_id,
+                            state.get("session_id"),
+                            state.get("user_intent"),
                         )
+                    else:
+                        for _idx, (_block, _result) in enumerate(zip(pending, results)):
+                            _t_name = _block.get("name", "")
+                            _t_input = _block.get("input", {}) or {}
+                            _t_result = _result.get("content", "")
+                            _status = "failed" if _result.get("is_error") else "completed"
+                            _cur.execute(
+                                """INSERT INTO agent_steps
+                                   (id, run_id, step_index, tool_name, tool_input, tool_result, status, created_at)
+                                   VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, NOW())
+                                   ON CONFLICT DO NOTHING""",
+                                (_run_id, _step_base + _idx, _t_name, _Json(_t_input), _t_result, _status),
+                            )
                 _conn.commit()
             finally:
                 _conn.close()
