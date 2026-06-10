@@ -150,6 +150,22 @@ struct SessionInfo {
     user_role: String,
 }
 
+/// Estrae l'exit code dal testo "EXIT CODE: N" emesso da run_command &c.
+/// (formato CONTROLLATO da noi in agent_tools/command.rs — questo e' un parser
+/// del nostro stesso output, non un'euristica sul testo del modello). Punto
+/// unico Rust della traduzione testo->strutturato: prima ogni consumer Python
+/// ri-parsava la stringa con regex (`EXIT CODE: N`); ora il valore viaggia
+/// strutturato nel proto (contratto dati A, censimento 2026-06-10).
+fn extract_exit_code(result: &str) -> Option<i32> {
+    let marker = "EXIT CODE: ";
+    let start = result.find(marker)? + marker.len();
+    let rest = &result[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '-')
+        .unwrap_or(rest.len());
+    rest[..end].trim().parse::<i32>().ok()
+}
+
 #[tonic::async_trait]
 impl ToolRunner for ToolRunnerService {
     async fn execute_tool(
@@ -190,11 +206,14 @@ impl ToolRunner for ToolRunnerService {
                     cache_key = %&hit.cache_key[..12.min(hit.cache_key.len())],
                     "tool_result_cache: hit"
                 );
+                let exit_code = extract_exit_code(&hit.payload);
                 return Ok(Response::new(ExecuteToolResponse {
                     tool_use_id: req.tool_use_id,
                     tool_result_json: hit.payload,
                     is_error: false,
                     duration_ms,
+                    has_exit_code: exit_code.is_some(),
+                    exit_code: exit_code.unwrap_or(0),
                 }));
             }
         }
@@ -228,11 +247,14 @@ impl ToolRunner for ToolRunnerService {
             });
         }
 
+        let exit_code = extract_exit_code(&result);
         Ok(Response::new(ExecuteToolResponse {
             tool_use_id: req.tool_use_id,
             tool_result_json: result,
             is_error,
             duration_ms,
+            has_exit_code: exit_code.is_some(),
+            exit_code: exit_code.unwrap_or(0),
         }))
     }
 
@@ -337,4 +359,27 @@ pub async fn spawn_tool_runner_server(
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests_exit_code {
+    use super::extract_exit_code;
+
+    #[test]
+    fn estrae_exit_code_da_output_run_command() {
+        let out = "hints\nEXIT CODE: 0\nSTDOUT:\nok\nSTDERR:\n";
+        assert_eq!(extract_exit_code(out), Some(0));
+        let fail = "EXIT CODE: 1\nSTDOUT:\n\nSTDERR:\nboom";
+        assert_eq!(extract_exit_code(fail), Some(1));
+        let neg = "EXIT CODE: -1\nSTDOUT:";
+        assert_eq!(extract_exit_code(neg), Some(-1));
+        let big = "EXIT CODE: 127\nSTDOUT:";
+        assert_eq!(extract_exit_code(big), Some(127));
+    }
+
+    #[test]
+    fn nessun_marker_ritorna_none() {
+        assert_eq!(extract_exit_code("output di read_file senza exit code"), None);
+        assert_eq!(extract_exit_code(""), None);
+    }
 }

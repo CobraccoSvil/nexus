@@ -153,9 +153,15 @@ async def _check_run_command(
         return False, {"error": f"execute_tool: {exc}", "command": cmd}
 
     raw = result.result_json or ""
-    # `run_command` ritorna testo con "EXIT CODE: N" + STDOUT/STDERR
-    m = re.search(r"EXIT CODE:\s*(-?\d+)", raw)
-    actual_exit = int(m.group(1)) if m else None
+    # Esito STRUTTURATO primario (contratto dati A): mcp-core propaga l'exit
+    # code nel ToolResult. Si ri-parsa "EXIT CODE: N" dal testo SOLO se il
+    # campo strutturato e' assente (run vecchio/cache), loggando il fallback.
+    actual_exit = getattr(result, "exit_code", None)
+    if actual_exit is None:
+        m = re.search(r"EXIT CODE:\s*(-?\d+)", raw)
+        actual_exit = int(m.group(1)) if m else None
+        if actual_exit is not None:
+            logger.info("lexical_fallback_used: criteria_runner/_check_run_command exit_code da testo")
     expected_exit = expected.get("exit_code", 0)
 
     passed = (actual_exit is not None and actual_exit == int(expected_exit))

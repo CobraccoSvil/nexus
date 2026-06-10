@@ -43,6 +43,12 @@ class ToolResult:
     result_json: str
     is_error: bool
     duration_ms: int
+    # Exit code STRUTTURATO (contratto dati A, censimento 2026-06-10): per i
+    # tool che eseguono comandi, mcp-core lo estrae UNA VOLTA dal proprio output
+    # e lo propaga qui. None = non applicabile (tool non-comando). I consumer
+    # (helpers anti-stallo, criteria_runner) lo leggono invece di ri-parsare
+    # "EXIT CODE: N" dal testo.
+    exit_code: int | None = None
 
     def parsed(self) -> Any:
         """Decodifica `result_json` come JSON se possibile, altrimenti
@@ -197,6 +203,7 @@ class ToolRunnerClient:
             result_json=resp.tool_result_json,
             is_error=resp.is_error,
             duration_ms=resp.duration_ms,
+            exit_code=(resp.exit_code if getattr(resp, "has_exit_code", False) else None),
         )
 
     async def stream_tool_output(

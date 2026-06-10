@@ -1649,6 +1649,12 @@ def _tool_result_outcome_after(recent: list, idx: int, max_ahead: int = 3) -> bo
     e HumanMessage con anthropic_content=[{type: tool_result, ...}] (formato
     emesso da tool_dispatch_node). Punto unico (regola L) della domanda
     "il tool_use a recent[idx] e' riuscito?".
+
+    Gerarchia dei segnali (contratto dati A, censimento 2026-06-10):
+      1. exit_code STRUTTURATO (tool-comando): 0=successo, !=0=errore. Certo.
+      2. is_error STRUTTURATO del blocco/ToolMessage.
+      3. _TOOL_ERROR_HINTS sul testo: SOLO fallback, loggato come
+         lexical_fallback_used per misurarne la residualita'.
     """
     for j in range(idx + 1, min(idx + 1 + max_ahead, len(recent))):
         nm = recent[j]
@@ -1663,9 +1669,13 @@ def _tool_result_outcome_after(recent: list, idx: int, max_ahead: int = 3) -> bo
                             return True
                         txt = str(cc.get("text", "") or cc.get("content", ""))
                         if any(h in txt.lower() for h in _TOOL_ERROR_HINTS):
+                            logger.info("lexical_fallback_used: _tool_result_outcome_after/ToolMessage")
                             return True
                 return False
-            return any(h in str(c).lower() for h in _TOOL_ERROR_HINTS)
+            if any(h in str(c).lower() for h in _TOOL_ERROR_HINTS):
+                logger.info("lexical_fallback_used: _tool_result_outcome_after/ToolMessage-str")
+                return True
+            return False
         if isinstance(nm, HumanMessage):
             extra = getattr(nm, "additional_kwargs", {}) or {}
             blocks = extra.get("anthropic_content") or []
@@ -1674,8 +1684,14 @@ def _tool_result_outcome_after(recent: list, idx: int, max_ahead: int = 3) -> bo
                 if not isinstance(bb, dict) or bb.get("type") != "tool_result":
                     continue
                 found_result = True
+                # 1) Segnale strutturale primario: exit_code (tool-comando).
+                ec = bb.get("exit_code")
+                if isinstance(ec, int):
+                    return ec != 0
+                # 2) is_error strutturato.
                 if bb.get("is_error"):
                     return True
+                # 3) Fallback lessicale sul testo (loggato).
                 cont = bb.get("content")
                 txts: list[str] = []
                 if isinstance(cont, list):
@@ -1684,9 +1700,8 @@ def _tool_result_outcome_after(recent: list, idx: int, max_ahead: int = 3) -> bo
                             txts.append(str(cc.get("text", "") or cc.get("content", "")))
                 elif cont is not None:
                     txts.append(str(cont))
-                if any(
-                    h in t.lower() for t in txts for h in _TOOL_ERROR_HINTS
-                ):
+                if any(h in t.lower() for t in txts for h in _TOOL_ERROR_HINTS):
+                    logger.info("lexical_fallback_used: _tool_result_outcome_after/anthropic_content")
                     return True
             if found_result:
                 return False

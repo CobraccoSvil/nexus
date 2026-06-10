@@ -32,6 +32,14 @@ message ExecuteToolResponse {
   bool is_error = 3;
   // Durata totale dell'esecuzione in millisecondi.
   uint64 duration_ms = 4;
+  // Exit code STRUTTURATO del processo per i tool che eseguono comandi
+  // (run_command/run_service/run_in_terminal). Contratto dati A della
+  // de-lessicalizzazione (censimento 2026-06-10): prima l'exit code
+  // viaggiava SOLO dentro il testo ("EXIT CODE: N") e i consumer lo
+  // ri-parsavano con regex. has_exit_code distingue "exit 0" da
+  // "non applicabile" (proto3 non ha optional per gli scalar).
+  bool has_exit_code = 5;
+  int32 exit_code = 6;
 }
 
 // Chunk di output per tool long-running (run_service, build, ecc.).

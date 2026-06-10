@@ -3176,12 +3176,29 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
                     "thread_id": str(state.get("thread_id") or ""),
                 },
             )
-            return {
+            _block_out = {
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
                 "content": content,
                 "is_error": bool(result.is_error),
             }
+            # Esito STRUTTURATO (contratto dati A): l'exit code propagato da
+            # mcp-core viaggia nel blocco accanto a is_error, cosi' i rilevatori
+            # anti-stallo (_tool_result_outcome_after &c.) lo leggono invece di
+            # ri-parsare "EXIT CODE: N" dal testo. Presente solo per i tool-comando.
+            if getattr(result, "exit_code", None) is not None:
+                _block_out["exit_code"] = int(result.exit_code)
+            # M16 ROOT CAUSE (2026-06-10, loop di scoperta infinito): il payload
+            # di nexus_mcp_tool_search supera il cap del truncate -> il parser
+            # M16 faceva json.loads sul content TRONCATO (JSON invalido) -> 0
+            # tool estratti -> il turno restava in "scoperta" per sempre e
+            # l'anti-loop abortiva il run. Il parser ha bisogno del JSON
+            # INTEGRO; il prompt del modello continua a ricevere la versione
+            # troncata. `raw_content` e' rimosso dai blocchi prima del
+            # tool_msg (vedi parser M16 sotto).
+            if _t_name == "nexus_mcp_tool_search":
+                _block_out["raw_content"] = result.result_json
+            return _block_out
         except Exception as exc:
             logger.exception("tool_dispatch_node: errore tool %s", block.get("name"))
             return {
@@ -3362,11 +3379,21 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     except Exception:
         pass
     for b, r in zip(pending, results):
+        # Il raw integro serve SOLO a questo parser: lo si rimuove dal blocco
+        # in ogni caso (i dict sono condivisi con final_blocks/tool_msg, il
+        # campo non deve arrivare al modello ne' al checkpoint).
+        _raw = r.pop("raw_content", None) if isinstance(r, dict) else None
         if b.get("name") != "nexus_mcp_tool_search" or r.get("is_error"):
             continue
         try:
-            _payload = json.loads(r.get("content") or "{}")
+            # JSON integro (pre-truncation): il content troncato per il prompt
+            # non e' parsabile quando il payload del search supera il cap.
+            _payload = json.loads(_raw or r.get("content") or "{}")
         except Exception:
+            logger.warning(
+                "M16: payload nexus_mcp_tool_search non parsabile (raw=%s) — nessun tool estratto",
+                _raw is not None,
+            )
             continue
         for _res in (_payload.get("results") or []):
             if not isinstance(_res, dict):

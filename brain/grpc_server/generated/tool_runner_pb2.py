@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x11tool_runner.proto\x12\x1b\x61i_orchestrator.tool_runner\"\x81\x01\n\x12\x45xecuteToolRequest\x12\x11\n\ttool_name\x18\x01 \x01(\t\x12\x17\n\x0ftool_input_json\x18\x02 \x01(\t\x12\x12\n\nsession_id\x18\x03 \x01(\t\x12\x13\n\x0btool_use_id\x18\x04 \x01(\t\x12\x16\n\x0e\x63orrelation_id\x18\x05 \x01(\t\"k\n\x13\x45xecuteToolResponse\x12\x13\n\x0btool_use_id\x18\x01 \x01(\t\x12\x18\n\x10tool_result_json\x18\x02 \x01(\t\x12\x10\n\x08is_error\x18\x03 \x01(\x08\x12\x13\n\x0b\x64uration_ms\x18\x04 \x01(\x04\"K\n\tToolChunk\x12\x13\n\x0btool_use_id\x18\x01 \x01(\t\x12\x0c\n\x04kind\x18\x02 \x01(\t\x12\x0c\n\x04\x64\x61ta\x18\x03 \x01(\t\x12\r\n\x05ts_ms\x18\x04 \x01(\x04\x32\xed\x01\n\nToolRunner\x12p\n\x0b\x45xecuteTool\x12/.ai_orchestrator.tool_runner.ExecuteToolRequest\x1a\x30.ai_orchestrator.tool_runner.ExecuteToolResponse\x12m\n\x10StreamToolOutput\x12/.ai_orchestrator.tool_runner.ExecuteToolRequest\x1a&.ai_orchestrator.tool_runner.ToolChunk0\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x11tool_runner.proto\x12\x1b\x61i_orchestrator.tool_runner\"\x81\x01\n\x12\x45xecuteToolRequest\x12\x11\n\ttool_name\x18\x01 \x01(\t\x12\x17\n\x0ftool_input_json\x18\x02 \x01(\t\x12\x12\n\nsession_id\x18\x03 \x01(\t\x12\x13\n\x0btool_use_id\x18\x04 \x01(\t\x12\x16\n\x0e\x63orrelation_id\x18\x05 \x01(\t\"\x95\x01\n\x13\x45xecuteToolResponse\x12\x13\n\x0btool_use_id\x18\x01 \x01(\t\x12\x18\n\x10tool_result_json\x18\x02 \x01(\t\x12\x10\n\x08is_error\x18\x03 \x01(\x08\x12\x13\n\x0b\x64uration_ms\x18\x04 \x01(\x04\x12\x15\n\rhas_exit_code\x18\x05 \x01(\x08\x12\x11\n\texit_code\x18\x06 \x01(\x05\"K\n\tToolChunk\x12\x13\n\x0btool_use_id\x18\x01 \x01(\t\x12\x0c\n\x04kind\x18\x02 \x01(\t\x12\x0c\n\x04\x64\x61ta\x18\x03 \x01(\t\x12\r\n\x05ts_ms\x18\x04 \x01(\x04\x32\xed\x01\n\nToolRunner\x12p\n\x0b\x45xecuteTool\x12/.ai_orchestrator.tool_runner.ExecuteToolRequest\x1a\x30.ai_orchestrator.tool_runner.ExecuteToolResponse\x12m\n\x10StreamToolOutput\x12/.ai_orchestrator.tool_runner.ExecuteToolRequest\x1a&.ai_orchestrator.tool_runner.ToolChunk0\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -33,10 +33,10 @@ if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_EXECUTETOOLREQUEST']._serialized_start=51
   _globals['_EXECUTETOOLREQUEST']._serialized_end=180
-  _globals['_EXECUTETOOLRESPONSE']._serialized_start=182
-  _globals['_EXECUTETOOLRESPONSE']._serialized_end=289
-  _globals['_TOOLCHUNK']._serialized_start=291
-  _globals['_TOOLCHUNK']._serialized_end=366
-  _globals['_TOOLRUNNER']._serialized_start=369
-  _globals['_TOOLRUNNER']._serialized_end=606
+  _globals['_EXECUTETOOLRESPONSE']._serialized_start=183
+  _globals['_EXECUTETOOLRESPONSE']._serialized_end=332
+  _globals['_TOOLCHUNK']._serialized_start=334
+  _globals['_TOOLCHUNK']._serialized_end=409
+  _globals['_TOOLRUNNER']._serialized_start=412
+  _globals['_TOOLRUNNER']._serialized_end=649
 # @@protoc_insertion_point(module_scope)
