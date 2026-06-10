@@ -607,6 +607,37 @@ export function useChat(
     [projectId],
   );
 
+  // Riaggancia un run attivo del backend non ancora noto al client (post-refresh,
+  // race, o finestra reflection/generation con generation_ended_at NULL). Usato
+  // dal recovery di bootstrap e dal gestore del 409 in send(): senza l'aggancio,
+  // agentRun resta null e il drain della coda re-invierebbe subito, ribeccando il
+  // 409 in loop. Ritorna true se ha agganciato un run attivo. Punto unico (regola L).
+  const reattachActiveRun = useCallback(
+    async (sid: string): Promise<boolean> => {
+      try {
+        const { activeRun } = await getActiveRunForSession(sid);
+        if (
+          !activeRun ||
+          (activeRun.status !== "running" &&
+            activeRun.status !== "awaiting_confirmation")
+        ) {
+          return false;
+        }
+        const runId = activeRun.runId;
+        setAgentRun(activeRun);
+        setAgentSteps(activeRun.steps ?? []);
+        setAgentRuns((prev) => new Map(prev).set(runId, activeRun));
+        setAgentStepsMap((prev) => new Map(prev).set(runId, activeRun.steps ?? []));
+        setIsLoading(true);
+        subscribeToRun(sid, runId, true);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [subscribeToRun],
+  );
+
   const send = useCallback(
     async (content: string, options: SendChatMessageOptions = {}) => {
       if (!hasProject || !isReady || !sessionId || !content.trim()) {
@@ -703,13 +734,39 @@ export function useChat(
           });
         }
       } catch (e) {
+        // 409 = un run e' gia' attivo sulla sessione ma il client non lo sapeva
+        // (race / post-refresh / finestra reflection). Non e' un errore per
+        // l'utente: accodiamo il messaggio e ci riagganciamo al run in corso, cosi'
+        // il drain lo invia a fine run invece di mostrare "Invio fallito". L'isLoading
+        // viene gestito da reattachActiveRun; non lo resettiamo qui.
+        const is409 = e instanceof Error && e.message.includes("409");
+        if (is409) {
+          setPendingQueue((q) => [...q, { content: content.trim(), options }]);
+          const attached = await reattachActiveRun(sessionId);
+          // attached=true: reattach ha messo isLoading=true (c'e' un run da
+          // attendere) e il finally NON deve resettarlo -> isAgentMode=true.
+          // attached=false: il run e' gia' finito tra la POST e il riaggancio ->
+          // isAgentMode=false fa resettare isLoading nel finally e il drain
+          // invia subito il messaggio appena accodato.
+          isAgentMode = attached;
+          return;
+        }
         setError(formatChatError(e, "Invio messaggio fallito."));
         isAgentMode = false;
       } finally {
         if (!isAgentMode) setIsLoading(false);
       }
     },
-    [hasProject, isLoading, isReady, profileId, sessionId, subscribeToRun, agentRun],
+    [
+      hasProject,
+      isLoading,
+      isReady,
+      profileId,
+      sessionId,
+      subscribeToRun,
+      agentRun,
+      reattachActiveRun,
+    ],
   );
 
   // Drain della coda messaggi: quando non c'e' piu' un run attivo (agentRun null)

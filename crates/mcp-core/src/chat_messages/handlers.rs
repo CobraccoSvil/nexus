@@ -615,7 +615,17 @@ pub async fn send_chat_message(
                         .await;
                         channels2.remove(&new_run_id);
 
-                        if let Some(ref answer) = result.final_answer {
+                        // Esito CERTO anche sul resume (regola L + ADR 0025): stesso
+                        // punto unico dello spawn principale. compose_turn_answer
+                        // garantisce un messaggio (risposta reale + recap, oppure
+                        // recap/placeholder se hollow); canonical_run_status declassa
+                        // l'hollow-senza-lavoro a failed_diagnosed. Prima il resume
+                        // inseriva nulla per i run vuoti e finalizzava lo status grezzo.
+                        let resume_answer =
+                            crate::chat_messages::agent_run::compose_turn_answer(&result);
+                        let resume_status =
+                            crate::chat_messages::agent_run::canonical_run_status(&result);
+                        if let Some(ref answer) = resume_answer {
                             let meta = serde_json::json!({
                                 "provider": &result.provider,
                                 "model": &result.model,
@@ -623,6 +633,7 @@ pub async fn send_chat_message(
                                 "iterationCount": result.iteration_count,
                                 "automationMode": "automatic",
                                 "resumed": true,
+                                "hollowCompletion": result.hollow_completion,
                                 "promptTokens": result.prompt_tokens,
                                 "completionTokens": result.completion_tokens,
                                 "totalTokens": result.total_tokens,
@@ -643,12 +654,12 @@ pub async fn send_chat_message(
                             .await;
                         }
 
-                        let _run_completed = result.status.is_success();
+                        let _run_completed = resume_status.is_success();
                         crate::agent_types::finalize_agent_run(
                             &db_clone2,
                             new_run_id,
-                            result.status,
-                            result.final_answer.as_deref(),
+                            resume_status,
+                            resume_answer.as_deref().or(result.final_answer.as_deref()),
                             result.iteration_count,
                         )
                         .await;

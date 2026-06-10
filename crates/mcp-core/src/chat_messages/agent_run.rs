@@ -149,6 +149,67 @@ fn action_recap_footer(answer: &str, steps: &[AgentStep]) -> Option<String> {
     out.push_str(&format!("\n\nFile creati/modificati: {}", files.join(", ")));
     Some(out)
 }
+
+// ── Punto unico di finalizzazione del turno (regola L) ──────────────────────
+// Estratto perche' DUE call-site finalizzano un run: lo spawn principale
+// (spawn_agent_run) e il resume di conferma (handlers.rs). Prima divergevano: il
+// resume inseriva il messaggio SOLO se final_answer era presente (niente recap
+// per i run hollow) e usava lo status grezzo (bypassando il declassamento
+// hollow->failed_diagnosed). Queste tre funzioni pure rendono l'esito IDENTICO
+// e CERTO su entrambi i percorsi.
+
+/// True se il run e' hollow E l'intent NON e' conversazionale (per la chat pura
+/// il completamento "vuoto" e' atteso). Fonte intent: nexus_task_type (router del
+/// brain), come il calcolo `report_hollow` dello spawn principale.
+fn is_report_hollow(result: &crate::agent_types::AgentRunResult) -> bool {
+    let intent = result.nexus_task_type.as_deref().unwrap_or("");
+    result.hollow_completion && intent != "chat"
+}
+
+/// Status canonico del run: declassa l'hollow SENZA LAVORO (0 step + risposta
+/// vuota, oppure rinuncia esplicita) a `FailedDiagnosed` — mai un "completed"
+/// muto (esito certo). L'hollow CON step completati resta lo status originale.
+pub(crate) fn canonical_run_status(
+    result: &crate::agent_types::AgentRunResult,
+) -> AgentRunStatus {
+    if is_report_hollow(result) {
+        let no_work = (result.steps.is_empty()
+            && result.hollow_completion_kind.contains("EMPTY_ANSWER"))
+            || result.hollow_completion_kind == "RESIGNED";
+        if no_work {
+            return AgentRunStatus::FailedDiagnosed;
+        }
+    }
+    result.status.clone()
+}
+
+/// Messaggio finale GARANTITO (ADR 0025): la risposta reale + footer di recap se
+/// non menziona i file toccati; oppure, per un run hollow, il recap deterministico
+/// delle azioni o un placeholder esplicito. `None` solo se non c'e' nulla da dire
+/// (run non-hollow senza risposta, es. intent chat che chiude legittimamente).
+pub(crate) fn compose_turn_answer(
+    result: &crate::agent_types::AgentRunResult,
+) -> Option<String> {
+    match result.final_answer.as_deref() {
+        Some(s) if !s.trim().is_empty() => {
+            let mut a = s.to_string();
+            if let Some(footer) = action_recap_footer(&a, &result.steps) {
+                a.push_str(&footer);
+            }
+            Some(a)
+        }
+        _ if is_report_hollow(result) => build_action_recap(&result.steps).or_else(|| {
+            Some(format!(
+                "_(Nessuna risposta utile prodotta dall'agente — {} / {} ha chiuso \
+                 il turno con un completamento vuoto dopo aver esaurito i tentativi \
+                 di fallback. Riformula la richiesta o cambia provider/modello manualmente.)_",
+                result.provider, result.model
+            ))
+        }),
+        _ => None,
+    }
+}
+
 /// Costruisce il messaggio iniziale per il brain arricchendolo con il contenuto
 /// reale degli allegati (pre-extraction nel prompt — ADR 0010/0011/0012).
 ///
@@ -2622,5 +2683,130 @@ mod tests_session_active {
             .expect("insert running sess_b");
         assert!(!session_has_active_run(&pool, sess_a).await);
         assert!(session_has_active_run(&pool, sess_b).await);
+    }
+}
+
+#[cfg(test)]
+mod tests_finalize_turn {
+    use super::*;
+    use crate::agent_types::{AgentRunResult, AgentRunStatus, AgentStep};
+
+    fn mk_result(
+        status: AgentRunStatus,
+        steps: Vec<AgentStep>,
+        final_answer: Option<&str>,
+        hollow_completion: bool,
+        hollow_kind: &str,
+        task_type: Option<&str>,
+    ) -> AgentRunResult {
+        AgentRunResult {
+            run_id: "r".into(),
+            status,
+            steps,
+            pending_actions: vec![],
+            final_answer: final_answer.map(str::to_string),
+            provider: "mistral".into(),
+            model: "mistral-large".into(),
+            iteration_count: 1,
+            nexus_override_applied: false,
+            nexus_agent_type: None,
+            nexus_q_value: None,
+            provider_privacy_notice: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            total_cost: 0.0,
+            last_prompt_tokens: None,
+            error_class: None,
+            stop_reason: None,
+            nexus_task_type: task_type.map(str::to_string),
+            hollow_completion,
+            hollow_no_tools: false,
+            hollow_completion_kind: hollow_kind.into(),
+        }
+    }
+
+    fn write_step() -> AgentStep {
+        AgentStep {
+            run_id: "r".into(),
+            step_index: 1,
+            tool_name: "write_file".into(),
+            tool_input: serde_json::json!({"path": "src/a.ts"}),
+            tool_result: Some("ok".into()),
+            status: AgentStepStatus::Completed,
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn hollow_senza_lavoro_declassato_a_failed_diagnosed() {
+        // 0 step + EMPTY_ANSWER -> failed_diagnosed (esito certo, mai completed muto).
+        let r = mk_result(
+            AgentRunStatus::Completed, vec![], None, true,
+            "EMPTY_ANSWER", Some("fix"),
+        );
+        assert_eq!(canonical_run_status(&r), AgentRunStatus::FailedDiagnosed);
+        // RESIGNED -> failed_diagnosed anche con risposta.
+        let r2 = mk_result(
+            AgentRunStatus::Completed, vec![], Some("non posso"), true,
+            "RESIGNED", Some("fix"),
+        );
+        assert_eq!(canonical_run_status(&r2), AgentRunStatus::FailedDiagnosed);
+    }
+
+    #[test]
+    fn hollow_con_lavoro_resta_completed() {
+        // Hollow ma con step produttivi -> NON declassato (il lavoro c'e').
+        let r = mk_result(
+            AgentRunStatus::Completed, vec![write_step()], None, true,
+            "EMPTY_ANSWER", Some("fix"),
+        );
+        assert_eq!(canonical_run_status(&r), AgentRunStatus::Completed);
+    }
+
+    #[test]
+    fn chat_hollow_non_e_report_hollow() {
+        // intent chat: completamento vuoto atteso, non declassato.
+        let r = mk_result(
+            AgentRunStatus::Completed, vec![], None, true,
+            "EMPTY_ANSWER", Some("chat"),
+        );
+        assert_eq!(canonical_run_status(&r), AgentRunStatus::Completed);
+    }
+
+    #[test]
+    fn compose_garantisce_messaggio_su_hollow() {
+        // Hollow con step -> recap delle azioni (mai messaggio assente).
+        let r = mk_result(
+            AgentRunStatus::Completed, vec![write_step()], None, true,
+            "EMPTY_ANSWER", Some("fix"),
+        );
+        let msg = compose_turn_answer(&r).expect("recap atteso");
+        assert!(msg.contains("a.ts"), "il recap deve elencare il file toccato");
+        // Hollow senza step -> placeholder esplicito.
+        let r2 = mk_result(
+            AgentRunStatus::Completed, vec![], None, true,
+            "EMPTY_ANSWER", Some("fix"),
+        );
+        let msg2 = compose_turn_answer(&r2).expect("placeholder atteso");
+        assert!(msg2.contains("Nessuna risposta utile"));
+    }
+
+    #[test]
+    fn compose_usa_risposta_reale_quando_presente() {
+        let r = mk_result(
+            AgentRunStatus::Completed, vec![], Some("Ecco il risultato."), false,
+            "", Some("fix"),
+        );
+        assert_eq!(compose_turn_answer(&r).unwrap(), "Ecco il risultato.");
+    }
+
+    #[test]
+    fn compose_none_se_non_hollow_e_senza_risposta() {
+        // Run non-hollow senza final_answer (es. chat che chiude): nessun messaggio.
+        let r = mk_result(
+            AgentRunStatus::Completed, vec![], None, false, "", Some("chat"),
+        );
+        assert!(compose_turn_answer(&r).is_none());
     }
 }

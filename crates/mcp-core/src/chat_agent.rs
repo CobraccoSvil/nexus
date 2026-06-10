@@ -122,16 +122,14 @@ pub async fn agent_stream(
                 .await
         {
             let status: String = run_row.try_get("status").unwrap_or_default();
-            let is_terminal = matches!(
-                status.as_str(),
-                "completed"
-                    | "failed"
-                    | "timed_out"
-                    | "cancelled"
-                    | "interrupted"
-                    | "loop_aborted"
-                    | "provider_unavailable"
-            );
+            // Punto unico (regola L): include gli esiti canonici nuovi
+            // (failed_diagnosed, completed_verified) che il match inline
+            // precedente dimenticava -> un run chiuso con la "determinazione
+            // certa" ora viene riconosciuto come terminato nel replay/recovery.
+            // awaiting_confirmation/blocked_needs_input restano NON terminali
+            // (run in pausa che attende input): non si emette agent_final.
+            let is_terminal =
+                crate::agent_types::AgentRunStatus::from_db_str(&status).is_terminal();
             if is_terminal {
                 let final_answer: Option<String> = run_row.try_get("final_answer").unwrap_or(None);
                 let data = json!({

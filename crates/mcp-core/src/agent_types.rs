@@ -187,6 +187,46 @@ impl AgentRunStatus {
     pub fn is_success(&self) -> bool {
         matches!(self, Self::Completed | Self::CompletedVerified)
     }
+
+    /// Parsing inverso di `as_str` (punto unico, regola L): da stringa
+    /// persistita in `agent_runs.status` all'enum. `interrupted` (scritto dal
+    /// cleanup di startup sui run rimasti `running` dopo un crash) e' terminale
+    /// e viene mappato a `Cancelled` (semanticamente: interrotto, non riprende).
+    /// Stringa ignota -> `Running` conservativo: chi interroga `is_terminal`
+    /// continua ad attendere invece di chiudere un run di stato non riconosciuto.
+    pub fn from_db_str(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "running" => Self::Running,
+            "completed" => Self::Completed,
+            "awaiting_confirmation" => Self::AwaitingConfirmation,
+            "failed" => Self::Failed,
+            "timed_out" => Self::TimedOut,
+            "cancelled" | "interrupted" => Self::Cancelled,
+            "loop_aborted" => Self::LoopAborted,
+            "provider_unavailable" => Self::ProviderUnavailable,
+            "completed_verified" => Self::CompletedVerified,
+            "failed_diagnosed" => Self::FailedDiagnosed,
+            "blocked_needs_input" => Self::BlockedNeedsInput,
+            _ => Self::Running,
+        }
+    }
+
+    /// `true` se il run e' in uno stato TERMINALE (concluso, non riprendera' da
+    /// solo). Punto unico (regola L): sostituisce i `matches!` inline sparsi che
+    /// dimenticavano gli esiti canonici nuovi (`failed_diagnosed`,
+    /// `completed_verified`) -> un run chiuso con la "determinazione certa" non
+    /// veniva riconosciuto come terminato nel replay/recovery SSE.
+    ///
+    /// NON terminali: `Running` (in corso) e i due stati "in pausa che attendono
+    /// input" — `AwaitingConfirmation` e `BlockedNeedsInput`: il run non e'
+    /// concluso, attende un'azione dell'utente, quindi il client deve restare in
+    /// ascolto / mostrare la richiesta, non considerarlo finito.
+    pub fn is_terminal(&self) -> bool {
+        !matches!(
+            self,
+            Self::Running | Self::AwaitingConfirmation | Self::BlockedNeedsInput
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -855,5 +895,68 @@ mod tests {
     fn tool_action_not_completed_is_none() {
         let a = tool_failure_action(true, false, true, false, 0, 3);
         assert_eq!(a, ToolCapabilityAction::None);
+    }
+
+    // ── is_terminal / from_db_str (punto unico stati run) ──────────────────
+    #[test]
+    fn from_db_str_roundtrip_su_ogni_variante() {
+        // as_str -> from_db_str deve tornare alla stessa variante per tutte
+        // le varianti dell'enum (eccetto i sinonimi gestiti a parte).
+        for st in [
+            AgentRunStatus::Running,
+            AgentRunStatus::Completed,
+            AgentRunStatus::AwaitingConfirmation,
+            AgentRunStatus::Failed,
+            AgentRunStatus::TimedOut,
+            AgentRunStatus::Cancelled,
+            AgentRunStatus::LoopAborted,
+            AgentRunStatus::ProviderUnavailable,
+            AgentRunStatus::CompletedVerified,
+            AgentRunStatus::FailedDiagnosed,
+            AgentRunStatus::BlockedNeedsInput,
+        ] {
+            assert_eq!(AgentRunStatus::from_db_str(st.as_str()), st);
+        }
+    }
+
+    #[test]
+    fn from_db_str_interrupted_e_ignoto() {
+        // 'interrupted' (cleanup di startup) -> Cancelled (terminale).
+        assert_eq!(
+            AgentRunStatus::from_db_str("interrupted"),
+            AgentRunStatus::Cancelled
+        );
+        // Stringa ignota -> Running conservativo (non terminale).
+        assert_eq!(
+            AgentRunStatus::from_db_str("qualcosa_di_strano"),
+            AgentRunStatus::Running
+        );
+    }
+
+    #[test]
+    fn is_terminal_include_esiti_canonici_nuovi() {
+        // Gli esiti della "determinazione certa" DEVONO essere terminali:
+        // era il bug del match inline in chat_agent.rs.
+        assert!(AgentRunStatus::FailedDiagnosed.is_terminal());
+        assert!(AgentRunStatus::CompletedVerified.is_terminal());
+        // Terminali classici.
+        for st in [
+            AgentRunStatus::Completed,
+            AgentRunStatus::Failed,
+            AgentRunStatus::TimedOut,
+            AgentRunStatus::Cancelled,
+            AgentRunStatus::LoopAborted,
+            AgentRunStatus::ProviderUnavailable,
+        ] {
+            assert!(st.is_terminal(), "{} deve essere terminale", st.as_str());
+        }
+    }
+
+    #[test]
+    fn is_terminal_esclude_in_corso_e_in_pausa() {
+        // Running = in corso; Awaiting/Blocked = in pausa che attende input.
+        assert!(!AgentRunStatus::Running.is_terminal());
+        assert!(!AgentRunStatus::AwaitingConfirmation.is_terminal());
+        assert!(!AgentRunStatus::BlockedNeedsInput.is_terminal());
     }
 }
