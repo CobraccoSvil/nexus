@@ -56,6 +56,10 @@ class AgentState(TypedDict, total=False):
     # resta governata dai fatti, la dichiarazione e' un segnale in piu' affidabile
     # e indipendente dalla lingua (sostituisce le blacklist _INTENT_NARRATION).
     declared_outcome: dict | None
+    # WAVE 2.2: True se un tool e' fallito per ToolRunner gRPC down (infrastruttura).
+    # Propagato a mcp-core via error_class=infrastructure nell'end_turn -> non si
+    # scalano i provider (il problema non e' il modello).
+    tool_infra_error: bool
     task_type: str
     behavior_mode: str
     token_budget: int

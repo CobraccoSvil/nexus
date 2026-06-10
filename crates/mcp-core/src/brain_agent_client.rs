@@ -956,6 +956,13 @@ pub async fn run_via_brain(
                     if let Some(at) = evt.get("nexus_agent_type").and_then(|v| v.as_str()) {
                         nexus_agent_type = Some(at.to_string());
                     }
+                    // WAVE 2.2: error_class infrastruttura propagato nell'end_turn
+                    // (ToolRunner down): mcp-core non scala i provider.
+                    if let Some(ec) = evt.get("error_class").and_then(|v| v.as_str()) {
+                        if !ec.trim().is_empty() {
+                            last_error_class = Some(ec.to_string());
+                        }
+                    }
                     // WAVE 3.2: esito dichiarato {outcome, summary, ...}.
                     if let Some(d) = evt.get("declared_outcome").and_then(|v| v.as_object()) {
                         if let Some(o) = d.get("outcome").and_then(|v| v.as_str()) {

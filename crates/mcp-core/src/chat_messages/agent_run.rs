@@ -1804,28 +1804,43 @@ pub(crate) async fn spawn_agent_run(
                 )
                 .await;
 
-                // ── Fix D: detection errore infrastrutturale ────────────────────
-                // Se la risposta menziona ToolRunner/sandbox down, NON e' colpa del
-                // modello — non incrementare consecutive_failures (evita di
-                // auto-disabilitare modelli sani per problemi infra) e termina
-                // subito senza scalare (gli altri provider avrebbero lo stesso esito).
-                let is_infrastructure_error = result
-                    .final_answer
-                    .as_ref()
-                    .map(|s| {
-                        let lower = s.to_lowercase();
-                        lower.contains("sandbox")
-                            && (lower.contains("gr pc")
-                                || lower.contains("grpc")
-                                || lower.contains("connession")
-                                || lower.contains("non e' raggiungibile")
-                                || lower.contains("non raggiungibile"))
-                            || lower.contains("50500")
-                            || lower.contains("tool_runner")
-                            || lower.contains("toolrunner")
-                            || lower.contains("tcp handshaker")
-                    })
-                    .unwrap_or(false);
+                // ── Detection errore infrastrutturale ───────────────────────────
+                // Il ToolRunner/sandbox down NON e' colpa del modello: non
+                // incrementare consecutive_failures e terminare senza scalare (gli
+                // altri provider hanno lo stesso ToolRunner).
+                // WAVE 2.2: fonte PRIMARIA = error_class STRUTTURATO "infrastructure"
+                // emesso dal brain (tool_runner_client su gRPC UNAVAILABLE). Il
+                // contains testuale su final_answer resta SOLO come fallback quando
+                // il brain non ha propagato la classe (run vecchio), loggato.
+                let is_infrastructure_error = if result.error_class.as_deref()
+                    == Some("infrastructure")
+                {
+                    true
+                } else {
+                    let hit = result
+                        .final_answer
+                        .as_ref()
+                        .map(|s| {
+                            let lower = s.to_lowercase();
+                            lower.contains("sandbox")
+                                && (lower.contains("gr pc")
+                                    || lower.contains("grpc")
+                                    || lower.contains("connession")
+                                    || lower.contains("non e' raggiungibile")
+                                    || lower.contains("non raggiungibile"))
+                                || lower.contains("50500")
+                                || lower.contains("tool_runner")
+                                || lower.contains("toolrunner")
+                                || lower.contains("tcp handshaker")
+                        })
+                        .unwrap_or(false);
+                    if hit {
+                        tracing::info!(
+                            "lexical_fallback_used: is_infrastructure_error (contains su final_answer)"
+                        );
+                    }
+                    hit
+                };
                 if is_infrastructure_error {
                     tracing::warn!(
                     "agent_run {}: errore INFRASTRUTTURALE rilevato (ToolRunner/sandbox down) — \

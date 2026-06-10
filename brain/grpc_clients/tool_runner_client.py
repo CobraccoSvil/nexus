@@ -49,6 +49,10 @@ class ToolResult:
     # (helpers anti-stallo, criteria_runner) lo leggono invece di ri-parsare
     # "EXIT CODE: N" dal testo.
     exit_code: int | None = None
+    # Classe d'errore STRUTTURATA (contratto dati B, WAVE 2.2): "infrastructure"
+    # quando il ToolRunner gRPC non risponde (UNAVAILABLE/DEADLINE). Propagata a
+    # valle per decidere il break del fallback dal campo, non da contains testuale.
+    error_class: str | None = None
 
     def parsed(self) -> Any:
         """Decodifica `result_json` come JSON se possibile, altrimenti
@@ -189,13 +193,28 @@ class ToolRunnerClient:
             )
             # Propaghiamo come tool_result d'errore, non come eccezione:
             # il loop LangGraph deve poter continuare con is_error=True.
+            # WAVE 2.2: error_class STRUTTURATO. UNAVAILABLE/DEADLINE_EXCEEDED =
+            # il ToolRunner gRPC (mcp-core) non risponde -> errore INFRASTRUTTURALE
+            # (non colpa del modello). Lo segnaliamo strutturato cosi' a valle
+            # (executor end_turn -> Rust) si decide il break del fallback dal campo
+            # error_class invece che dal contains su "sandbox"/"grpc" nel testo.
+            _code = e.code().name
+            _err_class = (
+                "infrastructure"
+                if _code in ("UNAVAILABLE", "DEADLINE_EXCEEDED")
+                else "tool_error"
+            )
             return ToolResult(
                 tool_use_id=tool_use_id,
                 result_json=json.dumps(
-                    {"error": f"gRPC {e.code().name}: {e.details()}"}
+                    {
+                        "error": f"gRPC {_code}: {e.details()}",
+                        "error_class": _err_class,
+                    }
                 ),
                 is_error=True,
                 duration_ms=0,
+                error_class=_err_class,
             )
 
         return ToolResult(

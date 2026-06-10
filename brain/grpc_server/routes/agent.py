@@ -873,6 +873,7 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
         forced_close_unverified = False
         final_gate_passed = False
         declared_outcome = None
+        tool_infra_error = False
         # Provider/model EFFETTIVI dell'ultima iterazione executor: catturano il
         # cascade fallback sticky intra-run (es. deepseek -> google/gemini-2.5-pro).
         # Propagati nell'evento end_turn cosi' mcp-core salva su agent_runs il
@@ -997,6 +998,9 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                     # summary come risposta se il modello non ha prodotto testo.
                     if delta.get("declared_outcome"):
                         declared_outcome = delta["declared_outcome"]
+                    # WAVE 2.2: errore infrastruttura tool (ToolRunner down).
+                    if delta.get("tool_infra_error"):
+                        tool_infra_error = True
                     if node == "router":
                         # Cattura metadata routing (B5 fix: propagazione nexus_task_type/agent_type)
                         if delta.get("user_intent"):
@@ -1077,6 +1081,8 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                                 end_turn_payload["final_gate_passed"] = True
                             if declared_outcome:
                                 end_turn_payload["declared_outcome"] = declared_outcome
+                            if tool_infra_error:
+                                end_turn_payload["error_class"] = "infrastructure"
                             # Provider/model effettivi (cascade fallback sticky):
                             # mcp-core li usa per salvare il modello reale nel
                             # messaggio assistant invece di quello iniziale.
@@ -1129,6 +1135,8 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                             _final_payload["final_gate_passed"] = True
                         if declared_outcome:
                             _final_payload["declared_outcome"] = declared_outcome
+                        if tool_infra_error:
+                            _final_payload["error_class"] = "infrastructure"
                         if effective_provider:
                             _final_payload["provider_used"] = effective_provider
                         if effective_model:

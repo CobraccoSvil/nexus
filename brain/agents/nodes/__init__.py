@@ -3196,6 +3196,8 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     # Holder degli esiti DICHIARATI via task_complete in questo turno (WAVE 3):
     # _run e' una closure, raccoglie qui senza poter scrivere nello state.
     _declared_outcomes: list[dict] = []
+    # WAVE 2.2: True se almeno un tool e' fallito per ToolRunner gRPC down.
+    _infra_tool_errors: list[bool] = []
 
     async def _run(block: dict) -> dict:
         tool_use_id = block.get("id", "")
@@ -3234,6 +3236,11 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
                 session_id=session_id,
                 tool_use_id=tool_use_id,
             )
+            # WAVE 2.2: il ToolRunner gRPC e' down (infrastruttura). Lo segnaliamo
+            # strutturato cosi' a fine run mcp-core NON scala i provider (il
+            # problema non e' il modello). Raccolto nell'holder come declared_outcome.
+            if getattr(result, "error_class", None) == "infrastructure":
+                _infra_tool_errors.append(True)
             content = _smart_truncate_lossless(
                 result.result_json,
                 source_kind="tool_result",
@@ -3504,6 +3511,10 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     # L'ultimo prevale se piu' chiamate. Consumato da route_after_executor.
     if _declared_outcomes:
         _dispatch_updates["declared_outcome"] = _declared_outcomes[-1]
+    # WAVE 2.2: errore infrastruttura tool (ToolRunner down) -> propagato a
+    # end_turn perche' mcp-core non scali i provider.
+    if _infra_tool_errors:
+        _dispatch_updates["tool_infra_error"] = True
     return _dispatch_updates
 
 
