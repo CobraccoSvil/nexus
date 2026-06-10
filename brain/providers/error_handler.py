@@ -171,6 +171,26 @@ def _extract_retry_after(exc: Exception, raw: str) -> int | None:
     return None
 
 
+def _extract_http_status_structured(exc: Exception) -> int | None:
+    """HTTP status STRUTTURATO dagli attributi dell'eccezione SDK (contratto
+    dati B, censimento 2026-06-10): prima il numero veniva estratto con regex da
+    str(exc) ("Error code: 429"), fragile al wording. Gli SDK
+    Anthropic/OpenAI/Mistral/DeepSeek espongono `status_code` sull'errore o
+    `response.status_code`; httpx espone `response.status_code`. Ritorna None se
+    nessun attributo strutturato e' presente (il chiamante ricade sul regex).
+    """
+    for attr in ("status_code", "status", "code"):
+        val = getattr(exc, attr, None)
+        if isinstance(val, int) and 100 <= val <= 599:
+            return val
+    response = getattr(exc, "response", None)
+    if response is not None:
+        sc = getattr(response, "status_code", None)
+        if isinstance(sc, int) and 100 <= sc <= 599:
+            return sc
+    return None
+
+
 def classify_error(exc: Exception, provider: str = "") -> dict[str, Any]:
     """
     Classifica un'eccezione del provider e restituisce:
@@ -187,10 +207,14 @@ def classify_error(exc: Exception, provider: str = "") -> dict[str, Any]:
     raw_lower = raw.lower()
 
     # ── 1. Estrai HTTP status code ────────────────────────────────────────────
-    http_status: int | None = None
-    m = re.search(r"(?:Error code|status)[:\s]+(\d{3})", raw, re.IGNORECASE)
-    if m:
-        http_status = int(m.group(1))
+    # Fonte PRIMARIA: attributo strutturato dell'eccezione SDK (affidabile).
+    # Fallback: regex su str(exc) solo se l'SDK non espone lo status (loggato).
+    http_status: int | None = _extract_http_status_structured(exc)
+    if http_status is None:
+        m = re.search(r"(?:Error code|status)[:\s]+(\d{3})", raw, re.IGNORECASE)
+        if m:
+            http_status = int(m.group(1))
+            logger.info("lexical_fallback_used: classify_error/http_status da str(exc)")
     # Estrai Retry-After (prioritario per cooldown dinamico)
     retry_after = _extract_retry_after(exc, raw)
 
