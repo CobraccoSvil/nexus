@@ -680,6 +680,11 @@ pub async fn run_via_brain(
     // Macchina a stati (mig 0386): verifica E2E (final_gate) superata -> esito
     // canonico CompletedVerified. Propagato dal brain nell'evento end_turn.
     let mut final_gate_passed = false;
+    // WAVE 3.2: esito DICHIARATO dal modello via task_complete (outcome + summary),
+    // propagato nell'end_turn. `blocked`/`needs_input` mappano su BlockedNeedsInput;
+    // il summary diventa la risposta se il modello non ha prodotto testo.
+    let mut declared_outcome: Option<String> = None;
+    let mut declared_summary: Option<String> = None;
     // Provider/model EFFETTIVI dell'ultima iterazione, propagati dal brain
     // nell'evento end_turn quando avviene un cascade fallback sticky intra-run
     // (es. deepseek -> google/gemini-2.5-pro). Default al provider/model iniziale
@@ -951,6 +956,17 @@ pub async fn run_via_brain(
                     if let Some(at) = evt.get("nexus_agent_type").and_then(|v| v.as_str()) {
                         nexus_agent_type = Some(at.to_string());
                     }
+                    // WAVE 3.2: esito dichiarato {outcome, summary, ...}.
+                    if let Some(d) = evt.get("declared_outcome").and_then(|v| v.as_object()) {
+                        if let Some(o) = d.get("outcome").and_then(|v| v.as_str()) {
+                            declared_outcome = Some(o.to_string());
+                        }
+                        if let Some(s) = d.get("summary").and_then(|v| v.as_str()) {
+                            if !s.trim().is_empty() {
+                                declared_summary = Some(s.to_string());
+                            }
+                        }
+                    }
                     // Provider/model effettivi dopo cascade fallback sticky:
                     // sovrascrivono i valori iniziali nel risultato finale.
                     if let Some(pu) = evt.get("provider_used").and_then(|v| v.as_str()) {
@@ -1174,6 +1190,15 @@ pub async fn run_via_brain(
         // il caso in cui il final_gate ha riscritto stop_reason a "end_turn" sul
         // ramo forced_close (prima un abort finiva erroneamente come Completed).
         AgentRunStatus::FailedDiagnosed
+    } else if matches!(
+        declared_outcome.as_deref(),
+        Some("blocked") | Some("needs_input")
+    ) {
+        // WAVE 3.2: il modello ha DICHIARATO via task_complete di essere bloccato
+        // (causa esterna mancante) o di aver bisogno di input. Esito canonico
+        // BlockedNeedsInput, indipendente dalla lingua del testo. Sostituisce
+        // l'inferenza lessicale resigned_patterns per questo caso.
+        AgentRunStatus::BlockedNeedsInput
     } else if ended && final_gate_passed {
         // Verifica E2E (final_gate) superata: successo verificato (mig 0386).
         AgentRunStatus::CompletedVerified
@@ -1304,6 +1329,12 @@ pub async fn run_via_brain(
         steps,
         pending_actions: Vec::new(),
         final_answer: if final_answer.is_empty() {
+            // WAVE 3.2: il modello ha chiuso con task_complete SENZA testo: il
+            // summary dichiarato e' la risposta (evita hollow/placeholder per i
+            // run che dichiarano l'esito ma non scrivono un body).
+            if let Some(summary) = declared_summary.clone() {
+                Some(summary)
+            } else {
             last_error.as_ref().map(|e| {
                 // Fix M23: distingue le due cause piu comuni di interruzione SSE
                 // dal brain Python (chunk decode error, silenzio prolungato) dal
@@ -1340,6 +1371,7 @@ pub async fn run_via_brain(
                     )
                 }
             })
+            }
         } else {
             // Se ci sono stati tool_use, salva solo l'ultimo segmento di testo
             // (la risposta finale dell'agente, non il ragionamento intermedio).

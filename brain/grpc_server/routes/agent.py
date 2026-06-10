@@ -872,6 +872,7 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
         #  - final_gate_passed: verifica E2E superata -> CompletedVerified.
         forced_close_unverified = False
         final_gate_passed = False
+        declared_outcome = None
         # Provider/model EFFETTIVI dell'ultima iterazione executor: catturano il
         # cascade fallback sticky intra-run (es. deepseek -> google/gemini-2.5-pro).
         # Propagati nell'evento end_turn cosi' mcp-core salva su agent_runs il
@@ -990,6 +991,12 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                         forced_close_unverified = True
                     if delta.get("final_gate_passed"):
                         final_gate_passed = True
+                    # WAVE 3.2: esito DICHIARATO dal modello (task_complete),
+                    # propagato a mcp-core per derivare lo status canonico
+                    # (blocked/needs_input -> BlockedNeedsInput) e usare il
+                    # summary come risposta se il modello non ha prodotto testo.
+                    if delta.get("declared_outcome"):
+                        declared_outcome = delta["declared_outcome"]
                     if node == "router":
                         # Cattura metadata routing (B5 fix: propagazione nexus_task_type/agent_type)
                         if delta.get("user_intent"):
@@ -1068,6 +1075,8 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                                 end_turn_payload["forced_close_unverified"] = True
                             if final_gate_passed:
                                 end_turn_payload["final_gate_passed"] = True
+                            if declared_outcome:
+                                end_turn_payload["declared_outcome"] = declared_outcome
                             # Provider/model effettivi (cascade fallback sticky):
                             # mcp-core li usa per salvare il modello reale nel
                             # messaggio assistant invece di quello iniziale.
@@ -1118,6 +1127,8 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                             _final_payload["forced_close_unverified"] = True
                         if final_gate_passed:
                             _final_payload["final_gate_passed"] = True
+                        if declared_outcome:
+                            _final_payload["declared_outcome"] = declared_outcome
                         if effective_provider:
                             _final_payload["provider_used"] = effective_provider
                         if effective_model:
