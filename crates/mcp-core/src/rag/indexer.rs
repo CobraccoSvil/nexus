@@ -9,22 +9,19 @@ use uuid::Uuid;
 
 use super::{chunker, current_config, qdrant_client, RagError, SourceKind};
 
-fn brain_base_url() -> String {
-    std::env::var("BRAIN_REST_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8088".into())
-        .trim_end_matches('/')
-        .to_string()
-}
+// URL del brain dal punto unico crate::brain_url (regola L): leggeva
+// BRAIN_REST_URL con fallback refuso 127.0.0.1:8088 (porta inesistente).
 
 async fn embed_batch(
     http: &Client,
+    base_url: &str,
     endpoint_path: &str,
     texts: &[String],
 ) -> Result<Vec<Vec<f32>>, RagError> {
     if texts.is_empty() {
         return Ok(Vec::new());
     }
-    let url = format!("{}{}", brain_base_url(), endpoint_path);
+    let url = format!("{}{}", base_url, endpoint_path);
     let body = json!({"texts": texts});
     let resp = http
         .post(&url)
@@ -93,7 +90,8 @@ pub async fn index_text(
         .build()
         .map_err(|e| RagError::Embed(format!("reqwest build: {e}")))?;
 
-    let vectors = embed_batch(&http, &cfg.embedding_endpoint, &chunks).await?;
+    let base_url = crate::brain_url::brain_rest_base_url(db).await;
+    let vectors = embed_batch(&http, &base_url, &cfg.embedding_endpoint, &chunks).await?;
     if vectors.len() != chunks.len() {
         return Err(RagError::Embed(format!(
             "mismatch vectors={} chunks={}",

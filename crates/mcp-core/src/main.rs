@@ -71,6 +71,7 @@ mod routing_config;
 mod routing_matrix;
 mod routing_matrix_auto_promoter;
 mod routing_slots;
+mod brain_url;
 mod run_reaper;
 mod sandbox;
 mod security;

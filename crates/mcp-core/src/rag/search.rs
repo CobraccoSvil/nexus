@@ -18,19 +18,17 @@ pub struct SearchHit {
     pub metadata: Value,
 }
 
-fn brain_base_url() -> String {
-    std::env::var("BRAIN_REST_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8088".into())
-        .trim_end_matches('/')
-        .to_string()
-}
+// URL del brain dal punto unico crate::brain_url (regola L): leggeva
+// BRAIN_REST_URL con fallback refuso 127.0.0.1:8088 (porta inesistente) -> ogni
+// embed della query falliva e nexus_search_semantic era strutturalmente rotto.
 
 async fn embed_query(
     http: &Client,
+    base_url: &str,
     endpoint_path: &str,
     query: &str,
 ) -> Result<Vec<f32>, RagError> {
-    let url = format!("{}{}", brain_base_url(), endpoint_path);
+    let url = format!("{}{}", base_url, endpoint_path);
     let resp = http
         .post(&url)
         .json(&json!({"texts": [query]}))
@@ -96,7 +94,8 @@ pub async fn search_semantic(
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|e| RagError::Embed(format!("reqwest: {e}")))?;
-    let query_vec = embed_query(&http, &cfg.embedding_endpoint, query).await?;
+    let base_url = crate::brain_url::brain_rest_base_url(db).await;
+    let query_vec = embed_query(&http, &base_url, &cfg.embedding_endpoint, query).await?;
 
     let mut all_hits: Vec<SearchHit> = Vec::new();
     for kind in kinds {
