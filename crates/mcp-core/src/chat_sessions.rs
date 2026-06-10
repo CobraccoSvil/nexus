@@ -369,6 +369,67 @@ impl CompactError {
 /// emette gli eventi SSE. Niente auth qui: il chiamante deve aver gia'
 /// verificato l'accesso (l'endpoint via load_session_context, l'auto-compact
 /// perche' opera nel contesto del run gia' autorizzato).
+/// Sezione "stato lavori" DETERMINISTICA per il summary di compattazione.
+///
+/// Causa radice (incidente Beauty-Book 2026-06-11): il summary LLM del compact
+/// aveva PERSO ogni traccia dell'estrazione figma gia' eseguita (parlava solo di
+/// file di test e porte) -> ogni run successivo ripartiva cieco, ri-estraeva e
+/// ri-esplorava da capo (9 run ridondanti, ~353K token). I fatti strutturali dei
+/// run NON possono dipendere da cosa l'LLM decide di tenere: questa sezione e'
+/// generata da query su agent_runs/agent_steps e APPESA al summary, sempre.
+async fn structured_work_state(db: &sqlx::PgPool, session_id: Uuid) -> Option<String> {
+    let runs: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT status, model FROM agent_runs WHERE session_id = $1 \
+         ORDER BY created_at DESC LIMIT 50",
+    )
+    .bind(session_id)
+    .fetch_all(db)
+    .await
+    .ok()?;
+    if runs.is_empty() {
+        return None;
+    }
+    let total = runs.len();
+    let completed = runs.iter().filter(|(s, _)| s.starts_with("completed")).count();
+    let failed = runs
+        .iter()
+        .filter(|(s, _)| s.starts_with("failed") || s == &"timed_out".to_string())
+        .count();
+
+    // File creati/modificati/spostati dagli step mutativi dei run della sessione
+    // (path per write/edit/create/patch, destinazione per rename/move).
+    let files: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT COALESCE(s.tool_input->>'path', s.tool_input->>'to') AS p
+        FROM agent_steps s
+        JOIN agent_runs r ON r.id = s.run_id
+        WHERE r.session_id = $1
+          AND s.status = 'completed'
+          AND s.tool_name IN ('write_file','edit_file','create_file','apply_patch','rename_file','fs_move')
+          AND COALESCE(s.tool_input->>'path', s.tool_input->>'to') IS NOT NULL
+        LIMIT 30
+        "#,
+    )
+    .bind(session_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    let mut out = format!(
+        "\n\n## Stato lavori (strutturale, generato dai run — non perdere questi fatti)\n\
+         - Run agentici in sessione: {total} (completed {completed}, failed {failed})\n"
+    );
+    if !files.is_empty() {
+        let list: Vec<String> = files.iter().map(|(p,)| format!("`{p}`")).collect();
+        out.push_str(&format!(
+            "- File creati/modificati/spostati dai run: {}\n\
+             - NON rifare lavoro gia' presente in questi path: verificarne lo stato con list_files prima di ri-estrarre o ri-generare.\n",
+            list.join(", ")
+        ));
+    }
+    Some(out)
+}
+
 pub(crate) async fn compact_session_core(
     state: &AppState,
     session_id: Uuid,
@@ -509,6 +570,15 @@ pub(crate) async fn compact_session_core(
              Riprova fra qualche minuto o sblocca un provider in /admin/settings/providers.",
         ));
     }
+
+    // Sezione "stato lavori" DETERMINISTICA (incidente Beauty-Book): i fatti
+    // strutturali dei run (esiti, file toccati) vengono appesi al summary da
+    // query, mai delegati alla memoria dell'LLM. Cosi' il prossimo run sa cosa
+    // e' gia' stato fatto anche se il riassunto testuale lo omette.
+    let summary_text = match structured_work_state(&state.db, session_id).await {
+        Some(work_state) => format!("{summary_text}{work_state}"),
+        None => summary_text,
+    };
 
     // Embed the summary — guard: se dipendenze vettoriali down, skip (non bloccante)
     let qdrant_ok = state
