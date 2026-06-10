@@ -38,6 +38,17 @@ class AgentState(TypedDict, total=False):
     # True quando clarify_or_expand_node ha emesso una richiesta di chiarimento
     # e il turno deve fermarsi in attesa di risposta utente.
     pending_clarify: bool
+    # Numero di richieste di chiarimento gia' emesse in questo run (mig 0386):
+    # al raggiungimento di clarify.max_attempts il nodo procede col candidato
+    # top invece di ri-chiedere (fail-open). Reset a 0 nell'initial_state.
+    clarify_attempts: int
+    # Intent gia' risolto a monte da mcp-core (risposta a disambiguazione):
+    # router_node lo usa al posto di ri-classificare. None = classify normale.
+    intent_hint: str | None
+    # Punto unico (regola L): il TURNO CORRENTE richiede azione con tool?
+    # Calcolato UNA volta da router_node dal classifier LLM (requires_tools /
+    # agentic_score >= soglia DB). Letto ovunque via turn_action_oriented().
+    action_oriented: bool
     task_type: str
     behavior_mode: str
     token_budget: int
@@ -194,6 +205,9 @@ class AgentState(TypedDict, total=False):
     # produttivo (reset coordinato). Sostituisce concettualmente i flag *_nudge_sent
     # sparsi durante la convergenza al punto unico.
     progress_guided_axes: list[str]
+    # Assi gia' passati per la diagnosi forzata (force_diagnose) in questo run
+    # (mig 0386): al loro ritorno la gerarchia sale a escalate/abort.
+    progress_diagnosed_axes: list[str]
     # True quando un abort coordinato (stop_reason="loop_abort") ha chiuso il run
     # senza che il task sia stato verificato: instrada alla verifica E2E
     # (final_gate) invece che al learner morto. Letto da route_after_executor.

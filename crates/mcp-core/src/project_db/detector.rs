@@ -443,17 +443,13 @@ fn scan_csproj_in(dir: &Path) -> Option<DbEngine> {
             Err(_) => continue,
         };
         let lc = content.to_ascii_lowercase();
-        if lc.contains("entityframeworkcore.sqlserver")
-            || lc.contains("microsoft.data.sqlclient")
-        {
+        if lc.contains("entityframeworkcore.sqlserver") || lc.contains("microsoft.data.sqlclient") {
             return Some(DbEngine::Sqlserver);
         }
         if lc.contains("npgsql.entityframeworkcore.postgresql") || lc.contains("npgsql") {
             return Some(DbEngine::Postgres);
         }
-        if lc.contains("pomelo.entityframeworkcore.mysql")
-            || lc.contains("mysqlconnector")
-        {
+        if lc.contains("pomelo.entityframeworkcore.mysql") || lc.contains("mysqlconnector") {
             return Some(DbEngine::Mysql);
         }
         if lc.contains("microsoft.entityframeworkcore.sqlite") {

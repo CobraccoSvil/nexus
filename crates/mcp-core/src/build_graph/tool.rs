@@ -31,8 +31,9 @@ pub async fn handle_build_graph_info(default_project_id: Uuid, arguments: &Value
     };
 
     match cache.get_or_compute(project_id).await {
-        Ok(info) => serde_json::to_string(&info)
-            .unwrap_or_else(|e| json!({"error": format!("serializzazione fallita: {}", e)}).to_string()),
+        Ok(info) => serde_json::to_string(&info).unwrap_or_else(|e| {
+            json!({"error": format!("serializzazione fallita: {}", e)}).to_string()
+        }),
         Err(e) => json!({
             "error": format!("build_graph compute fallito: {}", e),
             "project_id": project_id.to_string(),

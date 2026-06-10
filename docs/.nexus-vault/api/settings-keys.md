@@ -631,18 +631,12 @@ Vedi anche: [[postgres-tables]], [[routing-matrix]], [[meta-vault-architettura]]
 | `agent.model_tool_probe.enabled` | `true` | Se true, model_health_probe esegue (oltre al ping chat) un tool-probe sul path agente per i soli modelli supports_tool_use=true: forza una tool call su un tool fittizio. A soglia (agent.model_tool_failure_threshold) marca supports_tool_use=false senza toccare is_enabled. Disattivabile per ridurre il costo delle chiamate API. |
 | `agent.routing_matrix_cleanup_stale_enabled` | `true` | Se true, l'auto-promoter disattiva (is_active=false) le righe della routing matrix non-manuali il cui (provider, model_id) non ha piu un modello sano nel catalog (is_enabled=true AND consecutive_failures=0). |
 | `billing_base_currency` | `USD` | Currency di piattaforma per il calcolo billing. DEVE essere allineato a ai_price_catalog (USD: i provider AI fatturano in dollari). Cambiarlo qui senza aggiornare il catalog produce ledger orfani con cost=0. |
-| `default_model` | `claude-sonnet-4-6` | Default model for chat |
 | `default_provider` | `anthropic` | Default LLM provider |
 | `max_token_budget` | `32000` | Maximum token budget allowed |
 | `model_catalog_last_sync` | `2026-06-04T11:35:33.019738534+00:00` | Timestamp ultimo sync catalogo da LiteLLM |
 | `nexus_active_routing_pct` | `50` | Percentuale di richieste chat gestite dal router Q-Learning Nexus (0=off, 100=tutto). A/B testing: imposta 10-50 per un rollout graduale. |
 | `nexus_behavior_mode` | `dinamico` | Modalità comportamento Nexus: veloce|economica|bilanciata|approfondita |
 | `provider_hierarchy` | `anthropic,openai,google,deepseek,mistral` | Ordered fallback chain for chat providers |
-| `provider_model_anthropic` | `claude-sonnet-4-6` | Preferred Anthropic model for chat routing |
-| `provider_model_deepseek` | `deepseek-chat` | Modello default DeepSeek |
-| `provider_model_google` | `gemini-2.5-flash` | Preferred Google model for chat routing |
-| `provider_model_mistral` | `mistral-small-latest` | Modello default Mistral |
-| `provider_model_openai` | `gpt-4o-mini` | Preferred OpenAI model for chat routing |
 | `routing.ambiguity_min_confidence` | `0.70` | Top intent confidence sotto questa soglia → richiesta disambiguazione all'utente (NLU best practice). Range [0.0, 1.0]. |
 | `routing.ambiguity_min_margin` | `0.15` | Margine (top_confidence − second_candidate_confidence) sotto questa soglia → disambiguazione. Range [0.0, 0.5]. |
 | `routing_architecture_providers` | `anthropic,openai,google,deepseek,mistral` | Provider order for architecture requests |

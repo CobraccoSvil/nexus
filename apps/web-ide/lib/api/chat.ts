@@ -102,6 +102,11 @@ export interface SendChatMessageOptions {
   /** Se true, marca il messaggio come auto-generato dal sistema (es. auto-continuazione).
       Il backend lo persiste in metadata.synthetic; la UI lo nasconde. */
   synthetic?: boolean;
+  /** Hint strutturale sul tipo di agente (es. "debugger" dai pannelli error-fix).
+      Il backend lo mappa su agent_type_hint -> nexus_agent_type_hint, attiva
+      agent_type_forced e SALTA la disambiguazione d'intent (A/B). Non dedotto dal
+      testo: e' un parametro esplicito del call site. */
+  agentTypeHint?: string;
 }
 
 export interface FeedbackErrorResponse {
@@ -258,6 +263,10 @@ export async function sendChatMessage(
       // inviare. Il backend usa questo hint per pruning lato suo.
       messageWindowSize: options.messageWindowSize ?? 30,
       synthetic: options.synthetic ?? false,
+      // Hint strutturale (es. "debugger" dai pannelli error-fix): se assente si
+      // invia undefined (omesso dal JSON) e il backend classifica l'intent come
+      // di consueto. Vedi SendChatMessageOptions.agentTypeHint.
+      agentTypeHint: options.agentTypeHint,
     }),
   }, 120000);
 }

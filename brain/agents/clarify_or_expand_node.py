@@ -88,6 +88,10 @@ def _load_config() -> dict[str, Any]:
         "require_llm_classifier": False,
         "prompt_key": "agent.clarify.base",
         "max_question_chars": 280,
+        # Tetto ai tentativi di clarify per run (mig 0386): oltre la soglia
+        # l'agente procede col candidato top invece di ri-chiedere (fail-open
+        # verso l'azione), eliminando il loop di disambiguazione ripetuta.
+        "max_attempts": 1,
         # Cluster 4: lookup decisione gia' presa + conferma decisioni di prodotto.
         "decision_lookup_enabled": False,
         "decision_min_score": 0.7,
@@ -129,6 +133,11 @@ def _load_config() -> dict[str, Any]:
                     elif short == "max_question_chars":
                         try:
                             defaults["max_question_chars"] = int(value)
+                        except (TypeError, ValueError):
+                            pass
+                    elif short == "max_attempts":
+                        try:
+                            defaults["max_attempts"] = int(value)
                         except (TypeError, ValueError):
                             pass
                     elif short == "decision_lookup_enabled":
@@ -660,6 +669,19 @@ async def clarify_or_expand_node(state: AgentState) -> dict[str, Any]:
             automation,
         )
         return {}
+    # Tetto ai tentativi di clarify per run (mig 0386, fail-open verso l'azione).
+    # Oltre la soglia NON ri-chiediamo la stessa cosa: l'agente procede col
+    # candidato a confidence piu' alta. Elimina il loop di disambiguazione
+    # ripetuta (la domanda "A/B" emessa due volte identica).
+    _clarify_attempts = int(state.get("clarify_attempts") or 0)
+    _max_clarify = int(cfg.get("max_attempts") or 1)
+    if _clarify_attempts >= _max_clarify:
+        logger.info(
+            "clarify_or_expand: tetto tentativi raggiunto (%d/%d) -> fail-open, "
+            "procedo senza ri-chiedere",
+            _clarify_attempts, _max_clarify,
+        )
+        return {}
     confidence = float(state.get("intent_confidence") or 1.0)
     logger.info(
         "clarify_or_expand: entrata run_id=%s confidence=%.2f threshold=%.2f",
@@ -667,31 +689,23 @@ async def clarify_or_expand_node(state: AgentState) -> dict[str, Any]:
     )
     threshold = float(cfg["confidence_threshold"])
 
-    # Trigger secondario euristico: il classifier keyword di Nexus restituisce
-    # confidence >= 0.75 anche per match deboli, sotto la soglia 0.6 non si
-    # scenderebbe mai. Mentre attendiamo il classifier embedding completo,
-    # consideriamo "ambigui" i messaggi corti che contengono fillers vaghi.
-    _AMBIG_TOKENS = (
-        "quella cosa", "qualcosa", "boh", "non so", "aiuto",
-        "fai tu", "fai un po'", "non saprei", "fai quello",
-        "puoi farmi", "puoi farci",
-    )
-    is_heuristic_ambiguous = (
-        len(user_msg_preview) < 40
-        and any(tok in user_msg_preview.lower() for tok in _AMBIG_TOKENS)
-    )
+    # L'interpretazione semantica del testo passa SOLO per il classifier LLM
+    # (brain/router/agentic_classifier.py): la sua confidence in intent_confidence
+    # e' l'unico segnale di ambiguita'. Niente matching di keyword/stringhe come
+    # trigger secondario (coerente con la rimozione di _classify_by_keywords nel
+    # SemanticRouter, brain/router/service.py).
     # force_classify (Cluster 4): in automatico con conferma decisioni di
     # prodotto attiva, classifichiamo SEMPRE per intercettare le decisioni
     # irreversibili, anche con confidence alta.
-    if confidence >= threshold and not is_heuristic_ambiguous and not force_classify:
+    if confidence >= threshold and not force_classify:
         logger.info(
-            "clarify_or_expand: skip (confidence %.2f >= %.2f, no heuristic match)",
+            "clarify_or_expand: skip (confidence %.2f >= %.2f)",
             confidence, threshold,
         )
         return {}
     logger.info(
-        "clarify_or_expand: trigger (confidence=%.2f heuristic=%s msg=%r)",
-        confidence, is_heuristic_ambiguous, user_msg_preview[:60],
+        "clarify_or_expand: trigger (confidence=%.2f msg=%r)",
+        confidence, user_msg_preview[:60],
     )
 
     if _providers is None or _routing_client is None:
@@ -820,13 +834,20 @@ async def clarify_or_expand_node(state: AgentState) -> dict[str, Any]:
                 "confidence": confidence,
             },
         )
-        updates: dict[str, Any] = {"pending_clarify": True}
+        # Incrementa il contatore di clarify del run (mig 0386): al prossimo
+        # ingresso nel nodo il tetto max_attempts fara' fail-open verso l'azione
+        # invece di ri-emettere la stessa domanda.
+        updates: dict[str, Any] = {
+            "pending_clarify": True,
+            "clarify_attempts": _clarify_attempts + 1,
+        }
         if ms:
             updates["meta_steps"] = [ms]
             meta_steps.persist_async(run_id, ms)
         logger.info(
-            "clarify_or_expand: ASK emesso run_id=%s confidence=%.2f question=%r",
-            run_id, confidence, question[:60],
+            "clarify_or_expand: ASK emesso run_id=%s confidence=%.2f question=%r "
+            "(tentativo %d/%d)",
+            run_id, confidence, question[:60], _clarify_attempts + 1, _max_clarify,
         )
         return updates
 

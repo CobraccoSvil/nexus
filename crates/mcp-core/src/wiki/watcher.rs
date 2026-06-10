@@ -370,8 +370,7 @@ async fn maybe_invalidate_build_graph(event: &Event, roots: &[ProjectRootMap]) {
     let Some(cache) = crate::build_graph::BuildGraphCache::global() else {
         return;
     };
-    let mut already_invalidated: std::collections::HashSet<Uuid> =
-        std::collections::HashSet::new();
+    let mut already_invalidated: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     for p in &event.paths {
         let Some(file_name) = p.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -386,9 +385,7 @@ async fn maybe_invalidate_build_graph(event: &Event, roots: &[ProjectRootMap]) {
             if p.starts_with(&r.path) {
                 match best {
                     None => best = Some(r),
-                    Some(prev)
-                        if r.path.as_os_str().len() > prev.path.as_os_str().len() =>
-                    {
+                    Some(prev) if r.path.as_os_str().len() > prev.path.as_os_str().len() => {
                         best = Some(r)
                     }
                     _ => {}

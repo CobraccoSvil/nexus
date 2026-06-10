@@ -1189,7 +1189,6 @@ pub fn conversation_point_id(session_id: Uuid, message_id: Uuid) -> String {
     format!("{:x}", hash)[..32].to_string()
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Wiki content (ADR 0017 v2) — collection Qdrant unificata per `wiki_docs`.
 //
@@ -1324,9 +1323,7 @@ pub async fn get_wiki_content_point_vector(
         .context("get_wiki_content_point_vector: GET point fallito")?;
     if !response.status().is_success() {
         let text = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "get_wiki_content_point_vector: HTTP error: {text}"
-        ));
+        return Err(anyhow!("get_wiki_content_point_vector: HTTP error: {text}"));
     }
     let payload: Value = response
         .json()

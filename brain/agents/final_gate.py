@@ -173,7 +173,14 @@ async def final_gate_node(state: dict[str, Any]) -> dict[str, Any]:
 
     if passed:
         logger.info("final_gate: passato (cycle=%d) -> chiusura", cycle)
-        return {"final_gate_cycle": 0, "stop_reason": "end_turn"}
+        # Segnale per la macchina a stati di terminazione (mig 0386): la verifica
+        # E2E e' passata -> esito canonico CompletedVerified lato mcp-core. NON
+        # impostato sul ramo forced_close (abort: resta FailedDiagnosed).
+        return {
+            "final_gate_cycle": 0,
+            "stop_reason": "end_turn",
+            "final_gate_passed": True,
+        }
 
     # Chiusura SENZA re-executor quando:
     #  - forced_close_unverified: siamo qui per un ABORT anti-loop. L'agente e'

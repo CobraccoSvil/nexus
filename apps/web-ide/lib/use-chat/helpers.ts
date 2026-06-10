@@ -29,6 +29,10 @@ export function isStatusTerminal(status: string): boolean {
     status === "cancelled" ||
     status === "interrupted" ||
     status === "loop_aborted" ||
-    status === "provider_unavailable"
+    status === "provider_unavailable" ||
+    // Esiti canonici macchina a stati (mig 0386): terminali. blocked_needs_input
+    // NO: e' in attesa di input (come awaiting_confirmation), non terminale.
+    status === "completed_verified" ||
+    status === "failed_diagnosed"
   );
 }

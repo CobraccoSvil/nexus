@@ -46,11 +46,7 @@ pub struct PatchOutcome {
 
 /// Crea un nuovo documento applicando l'ACL: scope=meta richiede admin,
 /// scope=project richiede membership.
-pub async fn create_doc(
-    state: &AppState,
-    acl: &WikiAcl,
-    input: WikiDocCreate,
-) -> Result<WikiDoc> {
+pub async fn create_doc(state: &AppState, acl: &WikiAcl, input: WikiDocCreate) -> Result<WikiDoc> {
     // ── ACL preventiva ───────────────────────────────────────────────────
     match input.scope {
         WikiScope::Meta => {

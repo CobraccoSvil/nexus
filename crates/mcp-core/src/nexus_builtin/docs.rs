@@ -263,9 +263,12 @@ pub async fn handle_doc_generate(
             // tier e il routing. handle_doc_generate non ha AppState, quindi usa
             // l'adapter `_db` (stessa logica, fonte DB invece della matrix cache).
             let (gen_provider, gen_model): (String, String) =
-                match crate::internal_routing::resolve_purpose_model_db(db, "docs_generator").await {
+                match crate::internal_routing::resolve_purpose_model_db(db, "docs_generator").await
+                {
                     crate::internal_routing::PurposeResolution::Resolved {
-                        provider, model, rationale,
+                        provider,
+                        model,
+                        rationale,
                     } => {
                         tracing::info!(
                             "nexus_doc_generate: modello risolto {provider}/{model} ({rationale})"

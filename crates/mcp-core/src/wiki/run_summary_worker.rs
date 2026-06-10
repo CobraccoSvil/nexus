@@ -142,10 +142,7 @@ pub fn start_run_summary_worker(state: Arc<AppState>) {
             match scan_and_ingest(&state, &settings).await {
                 Ok(n) => {
                     if n > 0 {
-                        tracing::info!(
-                            ingested = n,
-                            "wiki.run_summary: batch completato"
-                        );
+                        tracing::info!(ingested = n, "wiki.run_summary: batch completato");
                     }
                 }
                 Err(e) => {
@@ -270,7 +267,10 @@ async fn ingest_run(
         }
     }
     if tool_rows.len() > 50 {
-        tool_lines.push(format!("- ... e altri {} step omessi", tool_rows.len() - 50));
+        tool_lines.push(format!(
+            "- ... e altri {} step omessi",
+            tool_rows.len() - 50
+        ));
     }
     let tools_section = if tool_lines.is_empty() {
         "_Nessun tool registrato._".to_string()
@@ -284,7 +284,10 @@ async fn ingest_run(
             // superano questa soglia ma capita per output strutturati).
             let truncated: String = s.chars().take(4000).collect();
             if s.chars().count() > 4000 {
-                format!("{truncated}\n\n_[troncato: output originale ({} char)]_", s.chars().count())
+                format!(
+                    "{truncated}\n\n_[troncato: output originale ({} char)]_",
+                    s.chars().count()
+                )
             } else {
                 truncated
             }
@@ -434,11 +437,12 @@ async fn ingest_run(
 }
 
 async fn mark_processed(db: &PgPool, run_id: Uuid) {
-    if let Err(e) =
-        sqlx::query("UPDATE agent_runs SET kb_ingested = TRUE WHERE id = $1 AND kb_ingested IS NULL")
-            .bind(run_id)
-            .execute(db)
-            .await
+    if let Err(e) = sqlx::query(
+        "UPDATE agent_runs SET kb_ingested = TRUE WHERE id = $1 AND kb_ingested IS NULL",
+    )
+    .bind(run_id)
+    .execute(db)
+    .await
     {
         tracing::debug!(
             run_id = %run_id,

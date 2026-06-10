@@ -187,13 +187,11 @@ async fn load_ttl_setting(db: &PgPool) -> u64 {
 }
 
 async fn load_project_root(db: &PgPool, project_id: Uuid) -> anyhow::Result<String> {
-    let row = sqlx::query(
-        "SELECT repository_root_path FROM projects WHERE id = $1 LIMIT 1",
-    )
-    .bind(project_id)
-    .fetch_optional(db)
-    .await?
-    .ok_or_else(|| anyhow::anyhow!("project_id {} non trovato", project_id))?;
+    let row = sqlx::query("SELECT repository_root_path FROM projects WHERE id = $1 LIMIT 1")
+        .bind(project_id)
+        .fetch_optional(db)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("project_id {} non trovato", project_id))?;
     let root: Option<String> = row.try_get("repository_root_path").ok();
     let root = root.unwrap_or_default();
     if root.trim().is_empty() {

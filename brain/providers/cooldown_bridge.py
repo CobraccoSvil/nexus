@@ -72,3 +72,37 @@ async def notify_provider_error(
             "cooldown_bridge: POST %s fallito (provider=%s): %s",
             url, provider, exc,
         )
+
+
+def notify_provider_error_sync(
+    provider: str,
+    error_class: str,
+    retry_after_seconds: int | None = None,
+) -> None:
+    """Variante SINCRONA di notify_provider_error per chiamanti non-async.
+
+    Usata da registry._mark_billing_cooldown, che gira dentro
+    generate_agent_turn_sync (sync, in un thread executor). Best-effort,
+    timeout breve, non solleva mai: serve solo a far persistere il cooldown
+    lato mcp-core (Rust = writer unico di nexus_provider_health).
+    """
+    url = f"{_get_mcp_core_url()}/api/internal/provider-error"
+    payload = {
+        "provider": provider,
+        "error_class": error_class,
+    }
+    if retry_after_seconds is not None:
+        payload["retry_after_seconds"] = retry_after_seconds
+    try:
+        with httpx.Client(timeout=3.0) as client:
+            resp = client.post(url, json=payload)
+            if resp.status_code != 200:
+                logger.warning(
+                    "cooldown_bridge(sync): mcp-core ha risposto %d per provider=%s",
+                    resp.status_code, provider,
+                )
+    except Exception as exc:
+        logger.warning(
+            "cooldown_bridge(sync): POST %s fallito (provider=%s): %s",
+            url, provider, exc,
+        )

@@ -10,10 +10,7 @@ pub(crate) fn parse_automation_mode(value: Option<&str>) -> AutomationMode {
 /// Usata dai run che NON ricevono un body HTTP (process_resume, service_observer):
 /// ereditano la modalita' scelta dall'utente invece di hardcodare Confirm.
 /// Fallback al DEFAULT della colonna se la sessione manca o la query fallisce.
-pub(crate) async fn read_session_automation_mode(
-    db: &PgPool,
-    session_id: Uuid,
-) -> AutomationMode {
+pub(crate) async fn read_session_automation_mode(db: &PgPool, session_id: Uuid) -> AutomationMode {
     let raw: Option<String> =
         sqlx::query_scalar("SELECT automation_mode FROM chat_sessions WHERE id = $1")
             .bind(session_id)

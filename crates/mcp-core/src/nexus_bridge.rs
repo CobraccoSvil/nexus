@@ -359,9 +359,7 @@ impl NexusBridge {
             scheduler.register(Arc::new(GuidelineAlignmentWorker::new(pool.clone())));
             info!("PromptOptimizerWorker e GuidelineAlignmentWorker registrati (pool disponibile)");
         } else {
-            info!(
-                "PromptOptimizerWorker/GuidelineAlignmentWorker non registrati: pool DB assente"
-            );
+            info!("PromptOptimizerWorker/GuidelineAlignmentWorker non registrati: pool DB assente");
         }
 
         let observability_ns = Arc::new(MemoryNamespace::new("nexus-bridge-global"));

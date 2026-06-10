@@ -498,7 +498,12 @@ pub async fn ai_suggest_handler(
         crate::internal_routing::resolve_purpose_model(&state, "admin_fallback_default")
             .await
             .into_model("admin_fallback_default")
-            .map_err(|m| (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": m}))))?;
+            .map_err(|m| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": m})),
+                )
+            })?;
     let provider: String = req
         .provider
         .as_deref()

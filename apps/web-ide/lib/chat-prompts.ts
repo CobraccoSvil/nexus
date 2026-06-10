@@ -1,5 +1,13 @@
 import type { ProblemItem, PortEntry, PlaywrightRunSummary } from "./api-client";
 
+/** Hint di tipo agente per i prompt d'azione (error-fix) generati dai pannelli
+ *  diagnostici. Propagato come `agentTypeHint` nel POST del messaggio: il backend
+ *  lo mappa su `agent_type_hint` -> `nexus_agent_type_hint`, attiva
+ *  `agent_type_forced` e SALTA la disambiguazione d'intent (A/B) che altrimenti
+ *  bloccherebbe l'avvio del run. Valore coerente con il canale fuori-chat
+ *  service_observer (service_observer_remediation.rs:155). */
+export const ACTION_AGENT_HINT = "debugger";
+
 type Severity = "error" | "warn" | "info";
 
 /** Prefisso comune: i testi lunghi "solo analisi" spingevano l'LLM a rispondere senza tool. */

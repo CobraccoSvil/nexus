@@ -38,8 +38,16 @@ pub struct SudoConfig {
 impl SudoConfig {
     pub async fn load(db: &PgPool) -> Self {
         let enabled = read_bool(db, "agent.sudo.manager_enabled", true).await;
-        let runner_path = read_text(db, "agent.sudo.runner_path", "/usr/local/bin/nexus-sudo-runner").await;
-        Self { enabled, runner_path }
+        let runner_path = read_text(
+            db,
+            "agent.sudo.runner_path",
+            "/usr/local/bin/nexus-sudo-runner",
+        )
+        .await;
+        Self {
+            enabled,
+            runner_path,
+        }
     }
 }
 
@@ -109,8 +117,7 @@ pub async fn execute(db: &PgPool, purpose: &str) -> Result<SudoOutcome> {
     // Detection di "sudo NOPASSWD non configurato": stderr contiene
     // "a password is required" o "sudo: a terminal is required".
     if exit_code != 0
-        && (stderr.contains("a password is required")
-            || stderr.contains("a terminal is required"))
+        && (stderr.contains("a password is required") || stderr.contains("a terminal is required"))
     {
         return Err(anyhow!(
             "sudo NOPASSWD non configurato per {}. Eseguire: bash deploy/install-sudo-manager.sh",
@@ -140,14 +147,13 @@ pub async fn is_executable(db: &PgPool, purpose: &str) -> Result<bool> {
     if !cfg.enabled || !std::path::Path::new(&cfg.runner_path).exists() {
         return Ok(false);
     }
-    let enabled: Option<bool> = sqlx::query_scalar(
-        "SELECT enabled FROM nexus_sudo_purposes WHERE name = $1",
-    )
-    .bind(purpose)
-    .fetch_optional(db)
-    .await
-    .ok()
-    .flatten();
+    let enabled: Option<bool> =
+        sqlx::query_scalar("SELECT enabled FROM nexus_sudo_purposes WHERE name = $1")
+            .bind(purpose)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
     Ok(enabled.unwrap_or(false))
 }
 
@@ -171,12 +177,11 @@ pub async fn status(db: &PgPool) -> Result<SudoManagerStatus> {
     let cfg = SudoConfig::load(db).await;
     let runner_installed = std::path::Path::new(&cfg.runner_path).exists();
     let sudoers_installed = std::path::Path::new("/etc/sudoers.d/nexus-runner").exists();
-    let purposes_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM nexus_sudo_purposes WHERE enabled = TRUE",
-    )
-    .fetch_one(db)
-    .await
-    .unwrap_or(0);
+    let purposes_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM nexus_sudo_purposes WHERE enabled = TRUE")
+            .fetch_one(db)
+            .await
+            .unwrap_or(0);
     let audit_recent_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM nexus_sudo_audit_log WHERE executed_at > NOW() - INTERVAL '24 hours'",
     )

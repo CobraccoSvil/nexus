@@ -163,7 +163,10 @@ async fn serve_preview_inner(
         Err(_) => return plain(StatusCode::NOT_FOUND, "file non trovato"),
     };
     if !target_canon.starts_with(&root_canon) {
-        return plain(StatusCode::FORBIDDEN, "accesso fuori dalla root del progetto");
+        return plain(
+            StatusCode::FORBIDDEN,
+            "accesso fuori dalla root del progetto",
+        );
     }
     if !target_canon.is_file() {
         return plain(StatusCode::NOT_FOUND, "non e' un file");

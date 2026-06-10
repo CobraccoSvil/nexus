@@ -140,6 +140,17 @@ pub async fn send_chat_message(
     // verranno marcati 'interrupted' dal cleanup di startup (vedi main.rs).
     // Soglia: 15 minuti — copre i turni piu' lunghi visti in produzione con
     // largo margine, ma sblocca la chat se qualcosa e' rimasto sospeso.
+    //
+    // Fix mig 0388: si esclude anche `generation_ended_at IS NOT NULL`. Nel grafo
+    // LangGraph l'ordine terminale e' executor -> reflection -> regression_gate ->
+    // learner -> END: l'evento end_turn (che libera il pulsante invio nel frontend)
+    // e' emesso a fine executor, MA reflection_node fa ancora una chiamata LLM di
+    // valutazione (secondi) prima che il run sia finalizzato. In quella finestra
+    // il run e' 'running' ma la generazione e' di fatto conclusa: senza questa
+    // esclusione l'utente vedeva "la chat sembra libera" e prendeva 409. Un run in
+    // awaiting_confirmation NON ha emesso end_turn (generation_ended_at IS NULL) e
+    // resta correttamente bloccante (pausa-conferma reale).
+    //
     // Persiste la modalita' scelta sulla sessione (mig 0371): i run risvegliati
     // (process_resume, service_observer) la ereditano invece di defaultare a
     // Confirm. Solo quando il body porta un valore esplicito.
@@ -163,6 +174,7 @@ pub async fn send_chat_message(
              WHERE session_id = $1 \
                AND status IN ('running', 'awaiting_confirmation') \
                AND created_at > NOW() - INTERVAL '15 minutes' \
+               AND generation_ended_at IS NULL \
              LIMIT 1",
         )
         .bind(context.session_id)
@@ -597,6 +609,8 @@ pub async fn send_chat_message(
                             sse_silence_resume,
                             true, // emit_final_event: caller singolo-shot, nessun retry loop
                             automation_r.as_str().to_string(),
+                            None, // intent_hint: resume di conferma, nessuna disambiguazione risolta
+                            db_clone2.clone(),
                         )
                         .await;
                         channels2.remove(&new_run_id);
@@ -629,8 +643,7 @@ pub async fn send_chat_message(
                             .await;
                         }
 
-                        let _run_completed =
-                            matches!(result.status, crate::agent_types::AgentRunStatus::Completed);
+                        let _run_completed = result.status.is_success();
                         crate::agent_types::finalize_agent_run(
                             &db_clone2,
                             new_run_id,
@@ -734,7 +747,7 @@ pub async fn send_chat_message(
 
     // ── Modalita' agente: dispatcha al loop agente invece del singolo turn ──
     if automation_mode != AutomationMode::Study {
-        if let Some(result) = spawn_agent_run(
+        match spawn_agent_run(
             &state,
             SpawnAgentParams {
                 user_id,
@@ -760,21 +773,37 @@ pub async fn send_chat_message(
         )
         .await
         {
-            // Avvia il file watcher anche in modalita' agente asincrona.
-            update_user_active_project(&state, user_id, context.project_id).await;
-            return Ok(Json(json!({
-                "sessionId": context.session_id.to_string(),
-                "userMessage": user_message,
-                "agentRun": {
-                    "runId": result.run_id.to_string(),
-                    "status": "running",
-                    "provider": result.provider,
-                    "model": result.model,
-                },
-                "savedAttachments": saved_attachments_json.clone(),
-            })));
+            SpawnOutcome::Started(result) => {
+                // Avvia il file watcher anche in modalita' agente asincrona.
+                update_user_active_project(&state, user_id, context.project_id).await;
+                return Ok(Json(json!({
+                    "sessionId": context.session_id.to_string(),
+                    "userMessage": user_message,
+                    "agentRun": {
+                        "runId": result.run_id.to_string(),
+                        "status": "running",
+                        "provider": result.provider,
+                        "model": result.model,
+                    },
+                    "savedAttachments": saved_attachments_json.clone(),
+                })));
+            }
+            SpawnOutcome::Disambiguation(view) => {
+                // Intent ambiguo: la domanda A/B e' gia' stata inserita. Il turno
+                // si ferma QUI in attesa della risposta utente: non si deve cadere
+                // su run_turn (che eseguirebbe un secondo giro LLM incoerente).
+                update_user_active_project(&state, user_id, context.project_id).await;
+                return Ok(Json(json!({
+                    "sessionId": context.session_id.to_string(),
+                    "userMessage": user_message,
+                    "assistantMessage": view,
+                    "savedAttachments": saved_attachments_json.clone(),
+                })));
+            }
+            SpawnOutcome::NotStarted => {
+                // Progetto non caricabile: fallback al singolo turn sotto.
+            }
         }
-        // Se il caricamento del progetto fallisce, fallback al singolo turn
     }
 
     let run_turn_result = run_turn(
@@ -1103,7 +1132,7 @@ pub async fn resend_chat_message(
             ctx
         };
 
-        if let Some(result) = spawn_agent_run(
+        match spawn_agent_run(
             &state,
             SpawnAgentParams {
                 user_id,
@@ -1126,17 +1155,32 @@ pub async fn resend_chat_message(
         )
         .await
         {
-            update_user_active_project(&state, user_id, project_id).await;
-            return Ok(Json(json!({
-                "sessionId": session_id.to_string(),
-                "userMessage": resent_user_message,
-                "agentRun": {
-                    "runId": result.run_id.to_string(),
-                    "status": "running",
-                    "provider": result.provider,
-                    "model": result.model,
-                }
-            })));
+            SpawnOutcome::Started(result) => {
+                update_user_active_project(&state, user_id, project_id).await;
+                return Ok(Json(json!({
+                    "sessionId": session_id.to_string(),
+                    "userMessage": resent_user_message,
+                    "agentRun": {
+                        "runId": result.run_id.to_string(),
+                        "status": "running",
+                        "provider": result.provider,
+                        "model": result.model,
+                    }
+                })));
+            }
+            SpawnOutcome::Disambiguation(view) => {
+                // Intent ambiguo: domanda di chiarimento gia' inserita, il turno
+                // si ferma in attesa della risposta utente (no fallback run_turn).
+                update_user_active_project(&state, user_id, project_id).await;
+                return Ok(Json(json!({
+                    "sessionId": session_id.to_string(),
+                    "userMessage": resent_user_message,
+                    "assistantMessage": view,
+                })));
+            }
+            SpawnOutcome::NotStarted => {
+                // Fallback al singolo turno sotto.
+            }
         }
     }
 

@@ -44,6 +44,11 @@ class CompletionRequest(BaseModel):
     max_tokens: int | None = None
     json_mode: bool = False
     temperature: float | None = None
+    # Mig 0390: /complete e' un canale REST fuori chat (client noti: doc gen di
+    # mcp-core, worker). Default True: sui modelli dual-mode il thinking viene
+    # spento (anti-hollow). Un eventuale client conversazionale puo' passare
+    # esplicitamente false.
+    internal_task: bool = True
 
 
 class EmbedRequest(BaseModel):
@@ -211,7 +216,10 @@ async def provider_health(provider: str) -> dict[str, object]:
 async def complete(body: CompletionRequest) -> dict[str, object]:
     # Inoltra solo i kwargs valorizzati: i provider applicano i propri default
     # per quelli assenti (regola: nessun magic default duplicato qui).
-    extra: dict[str, object] = {"json_mode": body.json_mode}
+    extra: dict[str, object] = {
+        "json_mode": body.json_mode,
+        "internal_task": body.internal_task,
+    }
     if body.max_tokens is not None:
         extra["max_tokens"] = body.max_tokens
     if body.temperature is not None:

@@ -362,6 +362,7 @@ CRITICAL:
 - "fai/crea/costruisci/realizza una app|applicazione|sistema|sito|servizio|piattaforma per X" → intent=architecture, action_verb=write, scope=system_wide, complexity=high. E' scaffolding completo (PRD + schema DB + backend + frontend + test). NON e' docs.
 - "scaffold/genera progetto" / "boilerplate" / "starter kit" → intent=architecture, scope=system_wide.
 - "imposta/configura/abilita un utente admin|il backend|un servizio|CORS|HTTPS", "setup X", "deploya/avvia X" → intent=system_admin, requires_tools=true. E' un task agentico multi-step, NON chat anche se la frase e' breve.
+- RETROSPECTIVE/META requests about work ALREADY done in this conversation — "riassumi cosa hai fatto/sistemato", "spiega cosa e' successo", "che modifiche hai applicato?", "fammi il punto" → intent=chat, requires_tools=false, agentic_score<=0.2. The user wants a TEXT answer about past work, NOT new actions or documentation files. NOT docs (docs = write documentation files into the repo).
 
 Use confidence<0.7 honestly when ambiguous (downstream asks user). NEVER inflate.
 
@@ -687,7 +688,7 @@ class AgenticIntentClassifier:
             attempted.append(f"{cl_provider}/{cl_model}")
             try:
                 llm_call = self._providers.generate_completion_async(
-                    cl_provider, cl_model, prompt
+                    cl_provider, cl_model, prompt, internal_task=True,
                 )
                 llm_result = await asyncio.wait_for(llm_call, timeout=timeout_s)
             except asyncio.TimeoutError:

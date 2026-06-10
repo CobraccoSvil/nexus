@@ -164,13 +164,11 @@ async fn normalize_rel_path(
     if file_path.is_relative() {
         return Ok(file_path.to_path_buf());
     }
-    let row = sqlx::query(
-        "SELECT repository_root_path FROM projects WHERE id = $1 LIMIT 1",
-    )
-    .bind(project_id)
-    .fetch_optional(cache.db())
-    .await?
-    .ok_or_else(|| anyhow::anyhow!("project_id {} non trovato", project_id))?;
+    let row = sqlx::query("SELECT repository_root_path FROM projects WHERE id = $1 LIMIT 1")
+        .bind(project_id)
+        .fetch_optional(cache.db())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("project_id {} non trovato", project_id))?;
     let root_str: String = row.try_get("repository_root_path").unwrap_or_default();
     let root = PathBuf::from(root_str);
     Ok(file_path
@@ -206,11 +204,7 @@ mod tests {
             exclude_globs: vec!["src/legacy/**".into()],
             entry_points: vec!["src/main.ts".into()],
             monorepo_members: vec![],
-            generated_dirs: vec![
-                "node_modules".into(),
-                "dist".into(),
-                "build".into(),
-            ],
+            generated_dirs: vec!["node_modules".into(), "dist".into(), "build".into()],
             sources: vec!["/tmp/tsconfig.json".into()],
             computed_at: Utc::now(),
         }
@@ -220,7 +214,11 @@ mod tests {
     fn beauty_book_src_is_in_graph() {
         let info = sample_info();
         let m = membership_for(&info, Path::new("src/app/pages/BookingPage.tsx")).unwrap();
-        assert!(matches!(m, BuildGraphMembership::InGraph { .. }), "got {:?}", m);
+        assert!(
+            matches!(m, BuildGraphMembership::InGraph { .. }),
+            "got {:?}",
+            m
+        );
     }
 
     #[test]
@@ -242,14 +240,22 @@ mod tests {
     fn node_modules_is_generated() {
         let info = sample_info();
         let m = membership_for(&info, Path::new("node_modules/react/index.js")).unwrap();
-        assert!(matches!(m, BuildGraphMembership::Generated { .. }), "got {:?}", m);
+        assert!(
+            matches!(m, BuildGraphMembership::Generated { .. }),
+            "got {:?}",
+            m
+        );
     }
 
     #[test]
     fn entrypoint_detected() {
         let info = sample_info();
         let m = membership_for(&info, Path::new("src/main.ts")).unwrap();
-        assert!(matches!(m, BuildGraphMembership::Entrypoint { .. }), "got {:?}", m);
+        assert!(
+            matches!(m, BuildGraphMembership::Entrypoint { .. }),
+            "got {:?}",
+            m
+        );
     }
 
     #[test]
@@ -277,10 +283,22 @@ mod tests {
             computed_at: Utc::now(),
         };
         let m = membership_for(&info, Path::new("crates/mcp-core/src/lib.rs")).unwrap();
-        assert!(matches!(m, BuildGraphMembership::InGraph { .. }), "got {:?}", m);
+        assert!(
+            matches!(m, BuildGraphMembership::InGraph { .. }),
+            "got {:?}",
+            m
+        );
         let m2 = membership_for(&info, Path::new("docs/readme.md")).unwrap();
-        assert!(matches!(m2, BuildGraphMembership::OutOfGraph { .. }), "got {:?}", m2);
+        assert!(
+            matches!(m2, BuildGraphMembership::OutOfGraph { .. }),
+            "got {:?}",
+            m2
+        );
         let m3 = membership_for(&info, Path::new("target/debug/foo")).unwrap();
-        assert!(matches!(m3, BuildGraphMembership::Generated { .. }), "got {:?}", m3);
+        assert!(
+            matches!(m3, BuildGraphMembership::Generated { .. }),
+            "got {:?}",
+            m3
+        );
     }
 }

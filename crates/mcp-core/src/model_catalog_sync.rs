@@ -266,10 +266,7 @@ pub(crate) fn infer_tier_from_name(provider: &str, model: &str) -> &'static str 
         "mistral" => {
             // Mistral non ha un tier "heavy" reale: large e' il loro massimo.
             // Piccoli (ministral 3b/8b/14b, small, nemo) -> light.
-            if m.contains("ministral")
-                || m.contains("small")
-                || m.contains("nemo")
-            {
+            if m.contains("ministral") || m.contains("small") || m.contains("nemo") {
                 "light"
             } else {
                 // large, medium, codestral, devstral, magistral
@@ -342,7 +339,17 @@ pub(crate) fn classify_capabilities(
     //    inaffidabile. Verificato live: i magistral chiamano i tool col
     //    tool_choice forzato MANTENENDO il reasoning attivo (non serve, ne' e'
     //    possibile, spegnerlo: reasoning_effort non e' supportato dai magistral).
-    let supports_tool_use = if p == "mistral" && m.contains("magistral") {
+    //    Stessa eccezione per FAMIGLIA per DeepSeek V4 (v4-pro, v4-flash):
+    //    verificato live (2026-06-10, probe API diretto) che ENTRAMBI eseguono
+    //    function calling correttamente (finish_reason=tool_calls, tool call ben
+    //    formata, reasoning attivo insieme ai tool; nel tool-loop l'adapter li fa
+    //    girare non-thinking via extra_body.thinking=disabled, policy
+    //    'disable_for_tools'). Il FALSE storico nel catalog era un degrado
+    //    runtime (malformed_tool_calls da run hollow) scritto senza guard
+    //    capability_source, non una verita' del provider.
+    let supports_tool_use = if (p == "mistral" && m.contains("magistral"))
+        || (p == "deepseek" && m.contains("v4"))
+    {
         true
     } else {
         meta_tool_use.unwrap_or(true)
@@ -366,8 +373,9 @@ pub(crate) fn classify_capabilities(
                     || m.starts_with("o1")
                     || m.starts_with("o3")
             }),
-            "anthropic" => meta_vision
-                .unwrap_or_else(|| m.contains("opus") || m.contains("sonnet") || m.contains("haiku")),
+            "anthropic" => meta_vision.unwrap_or_else(|| {
+                m.contains("opus") || m.contains("sonnet") || m.contains("haiku")
+            }),
             "google" => meta_vision.unwrap_or_else(|| m.contains("gemini")),
             // Provider routable senza euristica per-modello nota: usa il metadata.
             _ => meta_vision.unwrap_or(false),
@@ -382,9 +390,7 @@ pub(crate) fn classify_capabilities(
     // multi-turno nell'integrazione attuale).
     let reasoning_only_family = match p.as_str() {
         // OpenAI o-series: o1/o3/o4 (prefisso "o" + cifra).
-        "openai" => {
-            m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
-        }
+        "openai" => m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4"),
         // DeepSeek reasoner e V4 (richiede reasoning_content passback non
         // implementato -> non regge il loop agentico, vedi mig 0317).
         "deepseek" => m.contains("reasoner") || m.contains("v4"),
@@ -405,8 +411,7 @@ pub(crate) fn classify_capabilities(
     // *-pro fossero thinking ("flash NON lo sono"), lasciando gemini-2.5-flash
     // con policy 'none' -> thinking attivo coi tool -> MALFORMED ad ogni run.
     // flash-lite NON ha thinking di default: resta policy 'none'.
-    let gemini_25_thinking =
-        p == "google" && m.contains("gemini-2.5") && !m.contains("flash-lite");
+    let gemini_25_thinking = p == "google" && m.contains("gemini-2.5") && !m.contains("flash-lite");
     // Marker generici nel nome, cross-provider.
     let name_reasoning = m.contains("reasoner")
         || m.contains("reasoning")
@@ -418,13 +423,12 @@ pub(crate) fn classify_capabilities(
     // Concetto A (escludi da agentico): solo le famiglie reasoning-only. Gli
     // ibridi (Claude opus/sonnet, gpt non-o) restano agentic-eligibili anche
     // se hanno una modalita' thinking.
-    let is_thinking = reasoning_only_family
-        || (meta_reasoning.unwrap_or(false) && !is_hybrid_agentic(&p, &m));
+    let is_thinking =
+        reasoning_only_family || (meta_reasoning.unwrap_or(false) && !is_hybrid_agentic(&p, &m));
 
     // Concetto B (non forzare tool_choice): tutti i reasoning + gli ibridi con
     // extended thinking (Claude opus/sonnet) + i Gemini 2.5 thinking.
-    let uses_thinking_mode =
-        is_reasoning_signal || is_hybrid_agentic(&p, &m) || gemini_25_thinking;
+    let uses_thinking_mode = is_reasoning_signal || is_hybrid_agentic(&p, &m) || gemini_25_thinking;
 
     // Policy agentica canonica (ADR 0025):
     //   - exclude: reasoning-only SENZA function calling (deepseek-reasoner).
@@ -467,7 +471,11 @@ fn is_hybrid_agentic(provider: &str, model_lc: &str) -> bool {
 /// provider, ammette (true) per non bloccare provider non ancora configurati.
 /// La discovery la consulta prima di abilitare un modello, cosi' i modelli
 /// legacy (pruned dalla mig 0320) non rientrano via probe-on-insert.
-pub(crate) async fn model_passes_selection_policy(db: &PgPool, provider: &str, model: &str) -> bool {
+pub(crate) async fn model_passes_selection_policy(
+    db: &PgPool,
+    provider: &str,
+    model: &str,
+) -> bool {
     let row: Option<(bool,)> = sqlx::query_as::<_, (bool,)>(
         "SELECT (
              ( $2 ~ ANY(allowed_patterns) OR cardinality(allowed_patterns) = 0 )
@@ -776,7 +784,11 @@ async fn sync_provider(
                                         // 'auto' (le 'manual' restano intatte).
                                         let vision_routable = load_vision_routable(db).await;
                                         let cc = classify_capabilities(
-                                            provider, api_model, None, None, None,
+                                            provider,
+                                            api_model,
+                                            None,
+                                            None,
+                                            None,
                                             &vision_routable,
                                         );
                                         // Gate allowlist (ADR 0025): abilita SOLO se il
@@ -896,7 +908,12 @@ async fn sync_provider(
                 {
                     let vision_routable = load_vision_routable(db).await;
                     let cc = classify_capabilities(
-                        provider, api_model, None, None, None, &vision_routable,
+                        provider,
+                        api_model,
+                        None,
+                        None,
+                        None,
+                        &vision_routable,
                     );
                     let _ = sqlx::query(
                         "UPDATE ai_price_catalog SET supports_vision = $3, updated_at = NOW() \
@@ -934,7 +951,9 @@ async fn sync_provider(
                             tier_realigned += 1;
                             tracing::info!(
                                 "catalog_sync[{}]: tier riallineato '{}' -> {}",
-                                provider, api_model, inferred_tier
+                                provider,
+                                api_model,
+                                inferred_tier
                             );
                         }
                     }
@@ -944,11 +963,22 @@ async fn sync_provider(
                 let policy_ok = model_passes_selection_policy(db, provider, api_model).await;
                 if !is_enabled && !manual_locked && policy_ok {
                     // Modello disabilitato dal worker (missing_from_api) ma ricomparso: re-enable.
-                    let res = sqlx::query(
+                    // Il reason si azzera SOLO se appartiene al ciclo is_enabled: i reason del
+                    // ciclo tool-capability ('malformed_tool_calls', 'tool_probe_failed:%')
+                    // vanno PRESERVATI — azzerarli lasciava supports_tool_use=false orfano
+                    // (reason NULL), irraggiungibile dal ri-test del probe (incidente
+                    // magistral-small-2509, 2026-06-10).
+                    let sql = format!(
                         "UPDATE ai_price_catalog SET is_enabled = true, effective_from = NOW(), \
-                         auto_disabled_at = NULL, auto_disabled_reason = NULL \
+                         auto_disabled_at = NULL, \
+                         auto_disabled_reason = CASE WHEN {tool_reason} \
+                                                     THEN auto_disabled_reason \
+                                                     ELSE NULL END, \
+                         updated_at = NOW() \
                          WHERE provider = $1 AND model = $2",
-                    )
+                        tool_reason = crate::tool_capability::TOOL_REASON_PREDICATE_SQL
+                    );
+                    let res = sqlx::query(&sql)
                     .bind(provider)
                     .bind(api_model)
                     .execute(db)
@@ -1020,7 +1050,9 @@ async fn sync_provider(
                         .await;
                         tracing::warn!(
                             "catalog_sync[{}]: disabled '{}' ({})",
-                            provider, catalog_model, reason,
+                            provider,
+                            catalog_model,
+                            reason,
                         );
                     }
                 }
@@ -1122,7 +1154,8 @@ async fn sync_provider(
     if tier_realigned > 0 {
         tracing::info!(
             "catalog_sync[{}]: performance_tier riallineato su {} righe 'auto'",
-            provider, tier_realigned
+            provider,
+            tier_realigned
         );
     }
 
@@ -1302,15 +1335,39 @@ mod tests {
     #[test]
     fn test_infer_tier_mistral_small_families_are_light() {
         // Caso del bug: ministral/small/nemo NON devono essere medium.
-        assert_eq!(infer_tier_from_name("mistral", "ministral-8b-2512"), "light");
-        assert_eq!(infer_tier_from_name("mistral", "ministral-3b-latest"), "light");
-        assert_eq!(infer_tier_from_name("mistral", "mistral-small-2506"), "light");
-        assert_eq!(infer_tier_from_name("mistral", "magistral-small-latest"), "light");
-        assert_eq!(infer_tier_from_name("mistral", "open-mistral-nemo-2407"), "light");
+        assert_eq!(
+            infer_tier_from_name("mistral", "ministral-8b-2512"),
+            "light"
+        );
+        assert_eq!(
+            infer_tier_from_name("mistral", "ministral-3b-latest"),
+            "light"
+        );
+        assert_eq!(
+            infer_tier_from_name("mistral", "mistral-small-2506"),
+            "light"
+        );
+        assert_eq!(
+            infer_tier_from_name("mistral", "magistral-small-latest"),
+            "light"
+        );
+        assert_eq!(
+            infer_tier_from_name("mistral", "open-mistral-nemo-2407"),
+            "light"
+        );
         // I capaci restano medium (Mistral non ha heavy reale).
-        assert_eq!(infer_tier_from_name("mistral", "mistral-large-latest"), "medium");
-        assert_eq!(infer_tier_from_name("mistral", "mistral-medium-3"), "medium");
-        assert_eq!(infer_tier_from_name("mistral", "codestral-latest"), "medium");
+        assert_eq!(
+            infer_tier_from_name("mistral", "mistral-large-latest"),
+            "medium"
+        );
+        assert_eq!(
+            infer_tier_from_name("mistral", "mistral-medium-3"),
+            "medium"
+        );
+        assert_eq!(
+            infer_tier_from_name("mistral", "codestral-latest"),
+            "medium"
+        );
         assert_eq!(infer_tier_from_name("mistral", "devstral-2512"), "medium");
     }
 
@@ -1319,14 +1376,29 @@ mod tests {
         // Google: pro=heavy, flash*=light.
         assert_eq!(infer_tier_from_name("google", "gemini-2.5-pro"), "heavy");
         assert_eq!(infer_tier_from_name("google", "gemini-2.5-flash"), "light");
-        assert_eq!(infer_tier_from_name("google", "gemini-2.5-flash-lite"), "light");
+        assert_eq!(
+            infer_tier_from_name("google", "gemini-2.5-flash-lite"),
+            "light"
+        );
         // Anthropic: opus=heavy, sonnet=medium, haiku=light.
-        assert_eq!(infer_tier_from_name("anthropic", "claude-opus-4-6"), "heavy");
-        assert_eq!(infer_tier_from_name("anthropic", "claude-sonnet-4-6"), "medium");
-        assert_eq!(infer_tier_from_name("anthropic", "claude-haiku-4-5-20251001"), "light");
+        assert_eq!(
+            infer_tier_from_name("anthropic", "claude-opus-4-6"),
+            "heavy"
+        );
+        assert_eq!(
+            infer_tier_from_name("anthropic", "claude-sonnet-4-6"),
+            "medium"
+        );
+        assert_eq!(
+            infer_tier_from_name("anthropic", "claude-haiku-4-5-20251001"),
+            "light"
+        );
         // OpenAI: o3/o1/pro=heavy, nano/mini=light, resto medium.
         assert_eq!(infer_tier_from_name("openai", "o3"), "heavy");
-        assert_eq!(infer_tier_from_name("openai", "gpt-5.4-pro-2026-03-05"), "heavy");
+        assert_eq!(
+            infer_tier_from_name("openai", "gpt-5.4-pro-2026-03-05"),
+            "heavy"
+        );
         assert_eq!(infer_tier_from_name("openai", "gpt-4.1-nano"), "light");
         assert_eq!(infer_tier_from_name("openai", "o4-mini"), "light");
         assert_eq!(infer_tier_from_name("openai", "gpt-4.1"), "medium");
@@ -1345,12 +1417,18 @@ mod tests {
         assert_eq!(infer_tier_from_name("openai", "gpt-5.4-mini"), "light");
         assert_eq!(infer_tier_from_name("openai", "gpt-5-nano"), "light");
         // chat-latest = variante chat veloce, non flagship reasoning -> medium.
-        assert_eq!(infer_tier_from_name("openai", "gpt-5-chat-latest"), "medium");
+        assert_eq!(
+            infer_tier_from_name("openai", "gpt-5-chat-latest"),
+            "medium"
+        );
         // I gpt precedenti (4.x, 4o) restano medium.
         assert_eq!(infer_tier_from_name("openai", "gpt-4o"), "medium");
         assert_eq!(infer_tier_from_name("openai", "gpt-4.1"), "medium");
         // Anthropic: naming nuovo opus-4-8 deve restare heavy (caso del bug).
-        assert_eq!(infer_tier_from_name("anthropic", "claude-opus-4-8"), "heavy");
+        assert_eq!(
+            infer_tier_from_name("anthropic", "claude-opus-4-8"),
+            "heavy"
+        );
     }
 
     #[test]
@@ -1411,7 +1489,14 @@ mod tests {
     #[test]
     fn classify_metadata_litellm_ha_priorita() {
         // function_calling/vision espliciti vincono sull'euristica.
-        let c = classify_capabilities("openai", "gpt-4o", Some(true), Some(true), Some(false), &rt());
+        let c = classify_capabilities(
+            "openai",
+            "gpt-4o",
+            Some(true),
+            Some(true),
+            Some(false),
+            &rt(),
+        );
         assert!(c.supports_tool_use);
         assert!(c.supports_vision);
         assert!(!c.is_thinking);
@@ -1435,13 +1520,34 @@ mod tests {
     }
 
     #[test]
+    fn classify_deepseek_v4_famiglia_tool_capable() {
+        // Verita' di famiglia (verificata live 2026-06-10): i deepseek-v4 fanno
+        // function calling. tool_use=true ANCHE con metadata assente o false
+        // (il FALSE storico era un degrado runtime, non una verita' provider).
+        // Policy dual-mode: 'disable_for_tools' (non-thinking nei tool-loop).
+        for model in ["deepseek-v4-pro", "deepseek-v4-flash"] {
+            for meta in [None, Some(false)] {
+                let c = classify_capabilities("deepseek", model, meta, None, None, &rt());
+                assert!(
+                    c.supports_tool_use,
+                    "{model} (meta_tool_use={meta:?}) deve restare tool-capable"
+                );
+                assert_eq!(c.agentic_thinking_policy, "disable_for_tools");
+            }
+        }
+    }
+
+    #[test]
     fn classify_claude_ibrido_agentico_ma_thinking_mode() {
         // Claude opus/sonnet: NON escluso da agentico (A=false) ma extended
         // thinking -> non forzare tool_choice (B=true). Caso che il merge naïf
         // avrebbe rotto.
         let c = classify_capabilities("anthropic", "claude-sonnet-4-6", None, None, None, &rt());
         assert!(!c.is_thinking, "Claude deve restare agentic-eligibile");
-        assert!(c.uses_thinking_mode, "Claude usa extended thinking -> non forzare");
+        assert!(
+            c.uses_thinking_mode,
+            "Claude usa extended thinking -> non forzare"
+        );
         assert!(c.supports_vision);
     }
 
@@ -1461,18 +1567,51 @@ mod tests {
         // devono avere supports_vision=false ANCHE se LiteLLM passa meta_vision=true
         // (falso positivo): altrimenti best_model_for_tier li sceglierebbe per il
         // purpose vision_describe -> /vision/describe 501.
-        let mistral = classify_capabilities("mistral", "mistral-small-latest", None, Some(true), None, &rt());
-        assert!(!mistral.supports_vision, "mistral non e' instradabile da vision.py: vision=false");
-        let pixtral = classify_capabilities("mistral", "pixtral-large-latest", None, Some(true), None, &rt());
-        assert!(!pixtral.supports_vision, "pixtral non e' instradabile finche' vision.py non supporta mistral");
-        let deepseek = classify_capabilities("deepseek", "deepseek-chat", None, Some(true), None, &rt());
-        assert!(!deepseek.supports_vision, "deepseek non e' instradabile: vision=false");
+        let mistral = classify_capabilities(
+            "mistral",
+            "mistral-small-latest",
+            None,
+            Some(true),
+            None,
+            &rt(),
+        );
+        assert!(
+            !mistral.supports_vision,
+            "mistral non e' instradabile da vision.py: vision=false"
+        );
+        let pixtral = classify_capabilities(
+            "mistral",
+            "pixtral-large-latest",
+            None,
+            Some(true),
+            None,
+            &rt(),
+        );
+        assert!(
+            !pixtral.supports_vision,
+            "pixtral non e' instradabile finche' vision.py non supporta mistral"
+        );
+        let deepseek =
+            classify_capabilities("deepseek", "deepseek-chat", None, Some(true), None, &rt());
+        assert!(
+            !deepseek.supports_vision,
+            "deepseek non e' instradabile: vision=false"
+        );
         // Provider instradabili: vision corretta.
-        assert!(classify_capabilities("google", "gemini-2.5-flash-lite", None, None, None, &rt()).supports_vision);
-        assert!(classify_capabilities("anthropic", "claude-haiku-4-5", None, None, None, &rt()).supports_vision);
+        assert!(
+            classify_capabilities("google", "gemini-2.5-flash-lite", None, None, None, &rt())
+                .supports_vision
+        );
+        assert!(
+            classify_capabilities("anthropic", "claude-haiku-4-5", None, None, None, &rt())
+                .supports_vision
+        );
         assert!(classify_capabilities("openai", "gpt-4o", None, None, None, &rt()).supports_vision);
         // Per i provider instradabili, meta_vision esplicito e' rispettato.
-        assert!(classify_capabilities("openai", "gpt-4o-mini", None, Some(true), None, &rt()).supports_vision);
+        assert!(
+            classify_capabilities("openai", "gpt-4o-mini", None, Some(true), None, &rt())
+                .supports_vision
+        );
     }
 
     #[test]
@@ -1482,14 +1621,24 @@ mod tests {
         // uses_thinking_mode=true e policy='disable_for_tools' (non-thinking nei
         // tool-loop -> niente MALFORMED_FUNCTION_CALL). flash-lite NON ha thinking.
         let flash = classify_capabilities("google", "gemini-2.5-flash", None, None, None, &rt());
-        assert!(!flash.is_thinking, "gemini-2.5-flash NON va escluso dall'agentico");
+        assert!(
+            !flash.is_thinking,
+            "gemini-2.5-flash NON va escluso dall'agentico"
+        );
         assert!(flash.uses_thinking_mode, "gemini-2.5-flash e' thinking");
         assert_eq!(flash.agentic_thinking_policy, "disable_for_tools");
         let pro = classify_capabilities("google", "gemini-2.5-pro", None, None, None, &rt());
-        assert!(!pro.is_thinking, "gemini-2.5-pro e' dual-mode, non reasoning-only");
+        assert!(
+            !pro.is_thinking,
+            "gemini-2.5-pro e' dual-mode, non reasoning-only"
+        );
         assert_eq!(pro.agentic_thinking_policy, "disable_for_tools");
-        let lite = classify_capabilities("google", "gemini-2.5-flash-lite", None, None, None, &rt());
-        assert!(!lite.uses_thinking_mode, "gemini-2.5-flash-lite NON e' thinking");
+        let lite =
+            classify_capabilities("google", "gemini-2.5-flash-lite", None, None, None, &rt());
+        assert!(
+            !lite.uses_thinking_mode,
+            "gemini-2.5-flash-lite NON e' thinking"
+        );
         assert_eq!(lite.agentic_thinking_policy, "none");
     }
 
@@ -1497,7 +1646,9 @@ mod tests {
 
     #[test]
     fn classify_agentic_thinking_policy_per_famiglia() {
-        let p = |prov, model| classify_capabilities(prov, model, None, None, None, &rt()).agentic_thinking_policy;
+        let p = |prov, model| {
+            classify_capabilities(prov, model, None, None, None, &rt()).agentic_thinking_policy
+        };
         // Reasoning-only senza function calling -> exclude.
         assert_eq!(p("deepseek", "deepseek-reasoner"), "exclude");
         // OpenAI o-series: tool nativi -> native.
@@ -1534,9 +1685,15 @@ mod tests {
         ] {
             // Metadata assente.
             let c = classify_capabilities("mistral", model, None, None, None, &rt());
-            assert!(c.supports_tool_use, "{model}: tool_use deve essere true (doc Mistral)");
+            assert!(
+                c.supports_tool_use,
+                "{model}: tool_use deve essere true (doc Mistral)"
+            );
             assert!(c.is_thinking, "{model}: e' reasoning-only -> is_thinking");
-            assert!(c.uses_thinking_mode, "{model}: e' reasoning -> uses_thinking_mode");
+            assert!(
+                c.uses_thinking_mode,
+                "{model}: e' reasoning -> uses_thinking_mode"
+            );
             assert_eq!(
                 c.agentic_thinking_policy, "disable_for_tools",
                 "{model}: reasoning dual-mode -> disable_for_tools"

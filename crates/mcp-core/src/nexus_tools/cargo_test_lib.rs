@@ -1,5 +1,7 @@
 //! `testing::cargo_test_lib` — `cargo test --lib`.
-use super::{run_cargo_test_subset, NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
+use super::{
+    run_cargo_test_subset, NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety,
+};
 use async_trait::async_trait;
 use serde_json::Value;
 

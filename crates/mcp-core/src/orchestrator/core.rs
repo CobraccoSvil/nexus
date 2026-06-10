@@ -475,15 +475,16 @@ impl Orchestrator {
     ) {
         // Flag DB (default true). Stesso pattern di lettura settings usato
         // altrove (es. agent.model_tool_failure_threshold in agent_run.rs).
-        let gate_enabled: bool = crate::settings::get_setting(db, "agent.require_tool_use_capability")
-            .await
-            .ok()
-            .flatten()
-            .map(|v| {
-                let t = v.trim().to_ascii_lowercase();
-                !(t == "false" || t == "0" || t == "no")
-            })
-            .unwrap_or(true);
+        let gate_enabled: bool =
+            crate::settings::get_setting(db, "agent.require_tool_use_capability")
+                .await
+                .ok()
+                .flatten()
+                .map(|v| {
+                    let t = v.trim().to_ascii_lowercase();
+                    !(t == "false" || t == "0" || t == "no")
+                })
+                .unwrap_or(true);
 
         // Capability del modello risolto dal catalog. None = modello assente
         // (problema di sync, gestito conservativamente dalla funzione pura).
@@ -508,12 +509,11 @@ impl Orchestrator {
         let policy: Option<&str> = caps.as_ref().map(|(_, p, _)| p.as_str());
         let model_disabled = matches!(caps.as_ref(), Some((_, _, false)));
 
-        let gate_decision =
-            if model_disabled && intent != "chat" && gate_enabled {
-                ToolCapabilityGate::NeedsFallback
-            } else {
-                decide_tool_capability_gate(intent, gate_enabled, supports, policy)
-            };
+        let gate_decision = if model_disabled && intent != "chat" && gate_enabled {
+            ToolCapabilityGate::NeedsFallback
+        } else {
+            decide_tool_capability_gate(intent, gate_enabled, supports, policy)
+        };
         match gate_decision {
             ToolCapabilityGate::KeepOriginal => {}
             ToolCapabilityGate::NeedsFallback => {
@@ -790,6 +790,23 @@ impl Orchestrator {
         let decision_provider = d.provider.to_string();
         let decision_model = d.model.to_string();
 
+        // FASE 3 (Stadio 1) — shadow-compare opt-in (ADR 0030): NON cambia la
+        // decisione servita; quando il flag routing.per_intent_runtime_shadow e'
+        // attivo, calcola in parallelo la risoluzione tier-runtime e logga la
+        // divergenza per misurare la parita' prima di abilitare il routing runtime
+        // (stadi 2-3). Solo intent SENZA manual_override (i pin admin non si toccano).
+        if !matrix.is_manual_override(intent, effective_mode) {
+            crate::orchestrator::shadow_compare_per_intent(
+                db,
+                intent,
+                effective_mode,
+                estimated_tokens,
+                &decision_provider,
+                &decision_model,
+            )
+            .await;
+        }
+
         // La matrice gestisce già cooldown e fallback internamente.
         // Usa direttamente provider+model dalla matrice: la decisione
         // (intent, mode) → (provider, model) è specifica e non deve
@@ -809,10 +826,13 @@ impl Orchestrator {
                 .into_iter()
                 .find(|p| !is_provider_in_cooldown(p))
                 .unwrap_or_else(|| decision_provider.clone());
+            // Modello: override esplicito del chiamante, altrimenti il default-per-
+            // provider dalla fonte DB unica (nexus_provider_default_model via
+            // default_model_for_provider). Rimosso il branch su provider_models
+            // (settings hardcoded, regola G).
             let model = model_override
                 .filter(|v| !v.trim().is_empty())
                 .map(str::to_string)
-                .or_else(|| routing.provider_models.get(&provider).cloned())
                 .unwrap_or_else(|| default_model_for_provider(matrix, &provider).to_string());
             (provider, model)
         };
@@ -861,7 +881,9 @@ impl Orchestrator {
                 if let Some((ref alt_provider, ref alt_model)) = found {
                     tracing::info!(
                         "Agent routing (cooldown-fallback, selettore unico): {} → {}/{}",
-                        provider, alt_provider, alt_model
+                        provider,
+                        alt_provider,
+                        alt_model
                     );
                 }
 
@@ -996,7 +1018,8 @@ impl Orchestrator {
                     .map(|(p, m)| {
                         tracing::info!(
                             "Dynamic catalog routing (cooldown-fallback, selettore unico): → {}/{}",
-                            p, m
+                            p,
+                            m
                         );
                         (Some(p), Some(m))
                     });
@@ -1628,15 +1651,12 @@ impl Orchestrator {
                     'provider_order',
                     'fallback_order',
                     'default_provider',
-                    'default_model',
                     'token_budget',
                     'max_token_budget',
-                    'provider_model_openai',
-                    'provider_model_anthropic',
-                    'provider_model_google',
-                    'openai_model',
-                    'anthropic_model',
-                    'google_model',
+                    -- NB: default_model, provider_model_*, <provider>_model NON sono
+                    -- piu' selezionati: RoutingConfig::from_settings non li legge
+                    -- (rimossi, fix __no_model__ / ADR 0030). Il default-per-provider
+                    -- viene da nexus_provider_default_model (mig 0101).
                     'routing_fix_providers',
                     'routing_refactor_providers',
                     'routing_test_providers',

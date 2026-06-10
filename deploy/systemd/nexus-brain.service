@@ -1,0 +1,38 @@
+# nexus-brain.service — Neural Core del meta-progetto Nexus come unit systemd --user.
+#
+# Perche': il brain era lanciato da deploy-local.sh con `setsid nohup ... &`
+# (processo nudo): a ogni crash restava giu' finche' qualcuno non lo riavviava a
+# mano (incidente osservato: crash sotto doppio run parallelo durante un encode
+# embeddings -> "Brain offline" in UI finche' non riavviato manualmente).
+# Restart=on-failure chiude il buco. Il lingering del manager --user e' gia'
+# garantito da nexus-user-manager.service (ADR 0028).
+#
+# Install: bash deploy/install-nexus-units.sh (one-shot). deploy-local.sh rileva
+# la unit e usa systemctl al posto di nohup (stop_brain/start_brain).
+#
+# Log: append sullo stesso file storico /tmp/nexus-neural.log cosi' tutti gli
+# strumenti e runbook esistenti (tail, scan log) continuano a funzionare;
+# disponibile anche journalctl --user -u nexus-brain.
+
+[Unit]
+Description=Nexus Neural Core (brain Python: classifier, agenti LangGraph, embeddings)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/administrator/ideai
+# Credenziali/bootstrap dal .env del meta-progetto (stessa fonte del deploy
+# script; verificato compatibile con EnvironmentFile). Il '-' rende il file
+# opzionale: senza .env la unit parte comunque e il brain fallira' in modo
+# esplicito sulla mancanza di DATABASE_URL (niente fallback nascosti, regola G).
+EnvironmentFile=-/home/administrator/ideai/.env
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+ExecStart=/usr/bin/python3 -m brain.grpc_server.main --rest
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/tmp/nexus-neural.log
+StandardError=append:/tmp/nexus-neural.log
+
+[Install]
+WantedBy=default.target

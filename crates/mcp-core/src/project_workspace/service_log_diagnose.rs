@@ -67,7 +67,11 @@ pub(crate) fn parse_diagnosis(raw: &str) -> Option<LlmDiagnosis> {
     let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
 
     // Solo errori reali: is_error deve essere esplicitamente true.
-    if !v.get("is_error").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+    if !v
+        .get("is_error")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
         return None;
     }
 

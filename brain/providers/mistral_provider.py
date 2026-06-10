@@ -114,8 +114,16 @@ class MistralProvider(BaseProvider, ApiKeyClientMixin):
             # - ministral-*     : sì
             # - open-mistral-nemo: sì (a partire da mistral-nemo-2407)
             # - open-mistral-7b / mixtral-*: no (modelli deprecati/open weights)
-            _TOOL_CAPABLE = ("large", "medium", "small", "codestral", "ministral", "nemo", "pixtral")
-            supports_tools = any(tag in model.lower() for tag in _TOOL_CAPABLE)
+            # Capability tool_use dalla fonte UNICA (vista 0318 / ADR 0024) via
+            # cap.tool_use: niente piu' decisione di capability dal nome modello
+            # (regola L). L'euristica _TOOL_CAPABLE sul nome resta SOLO come
+            # fallback se la riga capability manca (cap is None), per non bloccare
+            # modelli non ancora presenti in vista (degrado safe, come google_provider).
+            if cap is not None:
+                supports_tools = cap.tool_use
+            else:
+                _TOOL_CAPABLE = ("large", "medium", "small", "codestral", "ministral", "nemo", "pixtral")
+                supports_tools = any(tag in model.lower() for tag in _TOOL_CAPABLE)
             compressed = compress_tool_list(tools) if tools and supports_tools else []
             oai_tools = [_anthropic_tool_to_openai(t) for t in compressed] if compressed else []
 

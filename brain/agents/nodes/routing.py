@@ -14,11 +14,12 @@ from .. import orchestrator_config
 from ..state import AgentState
 from .helpers import (
     MAX_AGENT_ITERATIONS,
-    _detect_action_request,
     _detect_unfulfilled_intent,
     _load_g1_max_nudges,
     _load_tool_choice_forcing_config,
+    has_productive_action_in_history,
     structural_unfulfilled_signal,
+    turn_action_oriented,
 )
 
 logger = logging.getLogger(__name__)
@@ -125,63 +126,72 @@ def route_after_executor(state: AgentState) -> str:
         _max_nudges = _load_g1_max_nudges()
         if _reroute_count < _max_nudges:
             _msgs = state.get("messages") or []
-            _first_human = next(
-                (getattr(m, "content", "") for m in _msgs if hasattr(m, "type") and m.type == "human"),
-                "",
-            )
-            if isinstance(_first_human, list):
-                _first_human = " ".join(
-                    b.get("text", "") for b in _first_human if isinstance(b, dict)
+            # ── Guard strutturale "fine lavoro" (PRIMA di ogni trigger) ──────
+            # Se il run ha GIA' eseguito azioni produttive (write/edit/run, fatto
+            # strutturale dal punto unico has_productive_action_in_history), la
+            # chiusura testuale e' il RESOCONTO FINALE del lavoro svolto: NON e'
+            # una "risposta descrittiva da rieseguire". Senza questo guard il G1
+            # ri-mandava all'executor anche i resoconti conclusivi (il nudge poi
+            # non veniva iniettato perche' _has_tool_calls_in_history filtrava:
+            # il routing e il nudge erano INCOERENTI), bruciando reroute +
+            # escalation e incollando il cap-text in coda alla risposta buona.
+            if has_productive_action_in_history(_msgs):
+                logger.info(
+                    "route_after_executor: chiusura con azioni produttive gia' "
+                    "eseguite nel run -> resoconto finale legittimo, niente G1"
                 )
-            # Re-routing G1: scatta sia quando la richiesta originale e'
-            # action-oriented, sia quando l'ULTIMA risposta del modello ha
-            # annunciato un'azione imminente senza eseguirla (intenzione non
-            # compiuta). Il secondo caso copre i debug dove il primo messaggio
-            # umano non e' imperativo ma il modello narra "Inizio verificando X"
-            # e chiude. Cap g1_reroute_count previene loop su falsi positivi.
-            _is_action_req = _detect_action_request(str(_first_human))
-            _is_unfulfilled = _detect_unfulfilled_intent(state.get("result"))
-            # Gating modalita': in confirm l'utente vuole controllo step-by-step,
-            # quindi una mera intenzione/attesa narrata e non eseguita NON innesca
-            # auto-azione (re-entry); l'executor produce un resoconto onesto.
-            # action_req e structural restano attivi in ogni modalita'.
-            _automation_mode = (state.get("automation_mode") or "confirm").strip().lower()
-            _unfulfilled_triggers = _is_unfulfilled and _automation_mode in (
-                "automatic",
-                "continuous",
-            )
-            # ── ADR 0018 (c): segnale STRUTTURALE primario ───────────────────
-            # Il caso BookingPage (0 tool call su un task d'azione mentre i tool
-            # erano disponibili) scatta per via strutturale, indipendentemente
-            # dai verbi del testo. had_tools_available = tools_json non vuoto;
-            # no_tool_call_this_turn = nessun pending (gia' garantito dal gate
-            # `not pending` del ramo); action_oriented = richiesta utente
-            # d'azione. La soglia iterazione riusa il config del tool_choice
-            # forcing (stessa nozione di "primi turni d'azione").
-            _had_tools = bool(state.get("tools_json"))
-            _tc_enabled, _tc_max_iter = _load_tool_choice_forcing_config()
-            _structural_unfulfilled = structural_unfulfilled_signal(
-                had_tools_available=_had_tools,
-                no_tool_call_this_turn=not pending,
-                action_oriented=_is_action_req,
-                iteration=iterations,
-                max_iteration=_tc_max_iter,
-            )
-            if _structural_unfulfilled or _is_action_req or _unfulfilled_triggers:
-                _nudge_count_log = int(state.get("action_nudge_count") or 0)
-                if _structural_unfulfilled:
-                    _trigger = "structural(had_tools+no_tool_call+action)"
-                elif _is_action_req:
-                    _trigger = "textual(action-request)"
-                else:
-                    _trigger = "textual(intent-non-compiuta)"
-                logger.warning(
-                    "route_after_executor: G1 risposta descrittiva, segnale=%s "
-                    "(iter=%d reroute=%d/%d nudge=%d) -> re-executor",
-                    _trigger,
-                    iterations, _reroute_count, _max_nudges, _nudge_count_log,
+            else:
+                # Re-routing G1: scatta sia quando la richiesta originale e'
+                # action-oriented, sia quando l'ULTIMA risposta del modello ha
+                # annunciato un'azione imminente senza eseguirla (intenzione non
+                # compiuta). Il secondo caso copre i debug dove il primo messaggio
+                # umano non e' imperativo ma il modello narra "Inizio verificando X"
+                # e chiude. Cap g1_reroute_count previene loop su falsi positivi.
+                # action-oriented dal punto unico (classifier LLM sul turno corrente,
+                # regola L): niente piu' euristica sul primo messaggio della history.
+                _is_action_req = turn_action_oriented(state)
+                _is_unfulfilled = _detect_unfulfilled_intent(state.get("result"))
+                # Gating modalita': in confirm l'utente vuole controllo step-by-step,
+                # quindi una mera intenzione/attesa narrata e non eseguita NON innesca
+                # auto-azione (re-entry); l'executor produce un resoconto onesto.
+                # action_req e structural restano attivi in ogni modalita'.
+                _automation_mode = (state.get("automation_mode") or "confirm").strip().lower()
+                _unfulfilled_triggers = _is_unfulfilled and _automation_mode in (
+                    "automatic",
+                    "continuous",
                 )
-                return "executor"
+                # ── ADR 0018 (c): segnale STRUTTURALE primario ───────────────────
+                # Il caso BookingPage (0 tool call su un task d'azione mentre i tool
+                # erano disponibili) scatta per via strutturale, indipendentemente
+                # dai verbi del testo. had_tools_available = tools_json non vuoto;
+                # no_tool_call_this_turn = nessun pending (gia' garantito dal gate
+                # `not pending` del ramo); action_oriented = richiesta utente
+                # d'azione. La soglia iterazione riusa il config del tool_choice
+                # forcing (stessa nozione di "primi turni d'azione").
+                _had_tools = bool(state.get("tools_json"))
+                _tc_enabled, _tc_max_iter = _load_tool_choice_forcing_config()
+                _structural_unfulfilled = structural_unfulfilled_signal(
+                    had_tools_available=_had_tools,
+                    no_tool_call_this_turn=not pending,
+                    action_oriented=_is_action_req,
+                    iteration=iterations,
+                    max_iteration=_tc_max_iter,
+                )
+                if _structural_unfulfilled or _is_action_req or _unfulfilled_triggers:
+                    _nudge_count_log = int(state.get("action_nudge_count") or 0)
+                    if _structural_unfulfilled:
+                        _trigger = "structural(had_tools+no_tool_call+action)"
+                    elif _is_action_req:
+                        _trigger = "textual(action-request)"
+                    else:
+                        _trigger = "textual(intent-non-compiuta)"
+                    logger.warning(
+                        "route_after_executor: G1 risposta descrittiva, segnale=%s "
+                        "(iter=%d reroute=%d/%d nudge=%d) -> re-executor",
+                        _trigger,
+                        iterations, _reroute_count, _max_nudges, _nudge_count_log,
+                    )
+                    return "executor"
         else:
             logger.warning(
                 "route_after_executor: G1 cap reroute raggiunto "

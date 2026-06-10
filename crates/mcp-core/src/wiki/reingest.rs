@@ -131,13 +131,7 @@ async fn reingest_scope(
 ) -> Result<usize> {
     let vault_root_str = vault_root_for_scope(state, scope, project_id)
         .await
-        .with_context(|| {
-            format!(
-                "vault_root_for_scope({}, {:?})",
-                scope.as_str(),
-                project_id
-            )
-        })?;
+        .with_context(|| format!("vault_root_for_scope({}, {:?})", scope.as_str(), project_id))?;
     let vault_root = PathBuf::from(&vault_root_str);
 
     if !vault_root.exists() {
@@ -481,8 +475,10 @@ async fn ingest_one_file(
                 "kind": kind,
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             });
-            if let Err(e) =
-                crate::vector_memory::upsert_wiki_content_point(&state.db, &point_id, vector, payload).await
+            if let Err(e) = crate::vector_memory::upsert_wiki_content_point(
+                &state.db, &point_id, vector, payload,
+            )
+            .await
             {
                 tracing::debug!(slug = %slug, error = %e, "wiki.reingest: upsert Qdrant fallito");
             } else {
@@ -505,7 +501,11 @@ async fn ingest_one_file(
 /// il frontmatter non lo specifica. Riusa la classificazione di
 /// `docs_core::vault::build_vault_path`.
 fn infer_kind_from_path(rel_path: &str) -> String {
-    let first = rel_path.split('/').next().unwrap_or("").to_ascii_lowercase();
+    let first = rel_path
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     match first.as_str() {
         "adr" | "api" | "schema" | "runbook" | "architecture" | "changelog" | "concepts"
         | "decisions" => {
@@ -533,7 +533,10 @@ mod tests {
         assert_eq!(infer_kind_from_path("adr/0017.md"), "adr");
         assert_eq!(infer_kind_from_path("api/rest.md"), "api");
         assert_eq!(infer_kind_from_path("concepts/foo.md"), "concept");
-        assert_eq!(infer_kind_from_path("decisions/2026-01-01-x.md"), "decision");
+        assert_eq!(
+            infer_kind_from_path("decisions/2026-01-01-x.md"),
+            "decision"
+        );
         assert_eq!(infer_kind_from_path("README.md"), "note");
         assert_eq!(infer_kind_from_path("misc/x.md"), "note");
     }

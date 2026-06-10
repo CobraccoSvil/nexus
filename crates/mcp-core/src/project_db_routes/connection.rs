@@ -253,8 +253,7 @@ fn extract_compose_connection_string(content: &str) -> Option<String> {
     let db = postgres_var("POSTGRES_DB")?;
     let pass = postgres_var("POSTGRES_PASSWORD").unwrap_or_default();
     // Porta host dal mapping `- "5432:5432"` o `- 5432:5432`. Default 5432.
-    let port_re =
-        Regex::new(r#"(?m)^\s*-\s*['"]?(\d{2,5})\s*:\s*5432['"]?"#).ok()?;
+    let port_re = Regex::new(r#"(?m)^\s*-\s*['"]?(\d{2,5})\s*:\s*5432['"]?"#).ok()?;
     let port = port_re
         .captures(content)
         .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))

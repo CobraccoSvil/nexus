@@ -25,11 +25,21 @@ impl NexusToolHandler for SecSqlInjectionCheckTool {
         let mut medium = 0usize;
         let mut findings: Vec<Value> = Vec::new();
 
-        let candidates: [PathBuf; 2] =
-            [ctx.project_root.join("src"), ctx.project_root.join("crates")];
+        let candidates: [PathBuf; 2] = [
+            ctx.project_root.join("src"),
+            ctx.project_root.join("crates"),
+        ];
         for c in &candidates {
             if c.is_dir() {
-                walk(c, &ctx.project_root, &mut files_scanned, &mut findings, &mut high, &mut medium, 0);
+                walk(
+                    c,
+                    &ctx.project_root,
+                    &mut files_scanned,
+                    &mut findings,
+                    &mut high,
+                    &mut medium,
+                    0,
+                );
             }
         }
         // Se non esistono src/ o crates/ (progetto con layout diverso), scansiona
@@ -104,7 +114,11 @@ fn walk(
             continue;
         };
         *files += 1;
-        let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().to_string();
+        let rel = p
+            .strip_prefix(root)
+            .unwrap_or(&p)
+            .to_string_lossy()
+            .to_string();
         for inj in mcp_quality::injection::detect_sql_injection(&rel, &content) {
             if inj.severity == "high" {
                 *high += 1;

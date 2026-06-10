@@ -15,7 +15,7 @@
 //! con messaggio chiaro). Questa scelta e' intenzionale: niente
 //! "magic fallback" che mascheri bug di configurazione.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -71,6 +71,12 @@ pub struct RoutingMatrix {
     /// NB: una entry esiste solo se l'admin ha configurato escalation per
     /// quella combinazione (mig 0120).
     pub escalations: HashMap<(String, String), EscalationRule>,
+    /// (intent, behavior_mode) la cui riga SERVITA (priority piu' alta) ha
+    /// `manual_override = true` (pin admin). FASE 3 (ADR 0030), override-first:
+    /// per queste chiavi il pin ha precedenza assoluta e la risoluzione
+    /// tier-runtime NON deve sovrascriverle. Campo PARALLELO a `by_intent_mode`
+    /// (non cambia lookup): zero impatto sui call site esistenti.
+    pub manual_overrides: HashSet<(String, String)>,
     /// Quando e' stata caricata l'ultima volta (per debug/UI)
     pub loaded_at: Instant,
 }
@@ -101,6 +107,14 @@ impl RoutingMatrix {
             }
         }
         self.by_intent_mode.get(&key).cloned()
+    }
+
+    /// True se la riga servita per (intent, behavior_mode) ha
+    /// `manual_override = true` (pin admin). FASE 3: la risoluzione tier-runtime
+    /// (override-first) NON deve sovrascrivere queste chiavi.
+    pub fn is_manual_override(&self, intent: &str, behavior_mode: &str) -> bool {
+        self.manual_overrides
+            .contains(&(intent.to_string(), behavior_mode.to_string()))
     }
 
     /// Modello di default per un provider.
@@ -251,6 +265,7 @@ impl RoutingMatrix {
             purpose_models: HashMap::new(),
             purpose_tiers: HashMap::new(),
             escalations: HashMap::new(),
+            manual_overrides: HashSet::new(),
             loaded_at: Instant::now(),
         }
     }
@@ -266,12 +281,13 @@ async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
         String,         // behavior_mode
         String,         // provider
         String,         // model_id
+        Option<bool>,   // manual_override (FASE 3)
         Option<i32>,    // escalation_threshold_tokens
         Option<String>, // escalation_provider
         Option<String>, // escalation_model_id
     );
     let matrix_rows = sqlx::query_as::<_, RoutingRow>(
-        r#"SELECT intent, behavior_mode, provider, model_id,
+        r#"SELECT intent, behavior_mode, provider, model_id, manual_override,
                   escalation_threshold_tokens, escalation_provider, escalation_model_id
            FROM nexus_routing_matrix
            WHERE is_active = true
@@ -331,12 +347,21 @@ async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
     }
 
     let mut by_intent_mode: HashMap<(String, String), (String, String)> = HashMap::new();
+    let mut manual_overrides: HashSet<(String, String)> = HashSet::new();
     let mut escalations: HashMap<(String, String), EscalationRule> = HashMap::new();
-    for (intent, mode, provider, model_id, esc_thr, esc_prov, esc_model) in matrix_rows {
+    for (intent, mode, provider, model_id, manual_override, esc_thr, esc_prov, esc_model) in
+        matrix_rows
+    {
         let key = (intent.clone(), mode.clone());
-        by_intent_mode
-            .entry(key.clone())
-            .or_insert((provider, model_id));
+        // La query e' ORDER BY priority DESC: la PRIMA riga vista per (intent,mode)
+        // e' quella servita. Tracciamo manual_override SOLO della riga vincente
+        // (FASE 3, override-first), in parallelo a by_intent_mode.
+        if !by_intent_mode.contains_key(&key) {
+            by_intent_mode.insert(key.clone(), (provider, model_id));
+            if manual_override.unwrap_or(false) {
+                manual_overrides.insert(key.clone());
+            }
+        }
         // Inserisci escalation solo se tutti e tre i campi sono presenti
         // (admin ha completato la configurazione).
         if let (Some(thr), Some(prov), Some(model)) = (esc_thr, esc_prov, esc_model) {
@@ -377,6 +402,7 @@ async fn fetch_from_db(db: &PgPool) -> Result<RoutingMatrix, String> {
         purpose_models,
         purpose_tiers,
         escalations,
+        manual_overrides,
         loaded_at: Instant::now(),
     })
 }
@@ -544,6 +570,7 @@ mod tests {
             purpose_models,
             purpose_tiers: HashMap::new(),
             escalations: HashMap::new(),
+            manual_overrides: HashSet::new(),
             loaded_at: Instant::now(),
         }
     }
@@ -582,6 +609,20 @@ mod tests {
     // Validano che la matrice di routing supporti scaling intra-provider
     // (stesso intent con behavior_mode diverso → modello piu' capace) e
     // copertura completa di tutti i 5 provider configurati.
+
+    #[test]
+    fn is_manual_override_riconosce_solo_le_chiavi_pinnate() {
+        // FASE 3: il set manual_overrides e' parallelo a by_intent_mode e non
+        // tocca lookup. is_manual_override risponde true solo per le chiavi pinnate.
+        let mut m = RoutingMatrix::fallback_safe();
+        assert!(!m.is_manual_override("debug", "approfondita"));
+        m.manual_overrides
+            .insert(("debug".to_string(), "approfondita".to_string()));
+        assert!(m.is_manual_override("debug", "approfondita"));
+        // Chiave non pinnata e lookup invariato (zero impatto).
+        assert!(!m.is_manual_override("chat_breve", "veloce"));
+        assert!(m.lookup("chat_breve", "veloce").is_some());
+    }
 
     #[test]
     fn fallback_safe_copre_tutti_e_5_i_provider_default() {

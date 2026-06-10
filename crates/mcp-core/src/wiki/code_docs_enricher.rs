@@ -279,7 +279,16 @@ async fn scan_and_enrich(state: &AppState, settings: &CodeDocsEnricherSettings) 
             }
         };
 
-        match enrich_code_doc(state, settings, doc_id, project_id, &relative_path, &content).await {
+        match enrich_code_doc(
+            state,
+            settings,
+            doc_id,
+            project_id,
+            &relative_path,
+            &content,
+        )
+        .await
+        {
             Ok(true) => done += 1,
             Ok(false) => {}
             Err(e) => {
@@ -399,35 +408,39 @@ async fn enrich_code_doc(
         let snip: String = description.chars().take(2000).collect();
         format!("{title}\n\n{snip}")
     };
-    let qdrant_point_id: Option<String> =
-        match state.orchestrator.neural.embed_text("", &combined).await {
-            Ok(vector) => {
-                let point_id = doc_id.to_string();
-                let payload = json!({
-                    "scope": "project",
-                    "project_id": project_id.to_string(),
-                    "doc_id": point_id,
-                    "title": title,
-                    "kind": "code",
-                    "updated_at": chrono::Utc::now().to_rfc3339(),
-                });
-                match crate::vector_memory::upsert_wiki_content_point(
-                    &state.db, &point_id, vector, payload,
-                )
-                .await
-                {
-                    Ok(_) => Some(point_id),
-                    Err(e) => {
-                        tracing::debug!(doc_id = %doc_id, error = %e, "wiki.code_docs: upsert Qdrant fallito (proseguo)");
-                        None
-                    }
+    let qdrant_point_id: Option<String> = match state
+        .orchestrator
+        .neural
+        .embed_text("", &combined)
+        .await
+    {
+        Ok(vector) => {
+            let point_id = doc_id.to_string();
+            let payload = json!({
+                "scope": "project",
+                "project_id": project_id.to_string(),
+                "doc_id": point_id,
+                "title": title,
+                "kind": "code",
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+            });
+            match crate::vector_memory::upsert_wiki_content_point(
+                &state.db, &point_id, vector, payload,
+            )
+            .await
+            {
+                Ok(_) => Some(point_id),
+                Err(e) => {
+                    tracing::debug!(doc_id = %doc_id, error = %e, "wiki.code_docs: upsert Qdrant fallito (proseguo)");
+                    None
                 }
             }
-            Err(e) => {
-                tracing::debug!(doc_id = %doc_id, error = %e, "wiki.code_docs: embed_text fallito (proseguo)");
-                None
-            }
-        };
+        }
+        Err(e) => {
+            tracing::debug!(doc_id = %doc_id, error = %e, "wiki.code_docs: embed_text fallito (proseguo)");
+            None
+        }
+    };
 
     // Aggiorna il doc. Rispetta manually_edited (non sovrascrive doc editati a mano).
     sqlx::query(
@@ -547,8 +560,14 @@ mod tests {
     #[test]
     fn build_prompt_include_path_e_sorgente() {
         let p = build_prompt("src/foo/bar.rs", "fn main() {}");
-        assert!(p.contains("src/foo/bar.rs"), "il path deve comparire nel prompt");
-        assert!(p.contains("fn main() {}"), "il sorgente deve comparire nel prompt");
+        assert!(
+            p.contains("src/foo/bar.rs"),
+            "il path deve comparire nel prompt"
+        );
+        assert!(
+            p.contains("fn main() {}"),
+            "il sorgente deve comparire nel prompt"
+        );
         // Deve chiedere output in italiano e solo la scheda (call site fuori chat).
         assert!(p.contains("italiano"));
         assert!(p.contains("**Scopo**"));

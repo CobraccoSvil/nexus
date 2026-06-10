@@ -51,6 +51,7 @@ fn test_route_model_with_mode_no_hardcoded_last_resort() {
         purpose_models: HashMap::new(),
         purpose_tiers: HashMap::new(),
         escalations: HashMap::new(),
+        manual_overrides: std::collections::HashSet::new(),
         loaded_at: std::time::Instant::now(),
     };
     let thr = TokenThresholds::defaults();
@@ -144,7 +145,10 @@ fn intent_str_to_static_mappa_code_read_e_agentic_default() {
     // cadeva nel fallback. E il fallback neutro `agentic_default` deve essere
     // riconosciuto. Un intent sconosciuto resta None.
     assert_eq!(intent_str_to_static("code_read"), Some("code_read"));
-    assert_eq!(intent_str_to_static("agentic_default"), Some("agentic_default"));
+    assert_eq!(
+        intent_str_to_static("agentic_default"),
+        Some("agentic_default")
+    );
     assert_eq!(intent_str_to_static("chat"), Some("chat"));
     assert_eq!(intent_str_to_static("intent_inventato_xyz"), None);
 }

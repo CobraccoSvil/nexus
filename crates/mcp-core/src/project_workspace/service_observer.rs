@@ -91,7 +91,10 @@ async fn load_config(db: &PgPool) -> ObserverConfig {
     }
     fn b(v: Option<String>, def: bool) -> bool {
         match v {
-            Some(x) => !matches!(x.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"),
+            Some(x) => !matches!(
+                x.trim().to_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            ),
             None => def,
         }
     }
@@ -111,8 +114,11 @@ async fn load_config(db: &PgPool) -> ObserverConfig {
         error_rate_max_per_min: f(s(db, "agent.observer.error_rate_max_per_min").await, 10.0),
         restart_rate_max: u(s(db, "agent.observer.restart_rate_max").await, 3),
         cpu_pct_threshold: f(s(db, "agent.observer.cpu_pct_threshold").await, 90.0),
-        rss_bytes_threshold: i(s(db, "agent.observer.rss_bytes_threshold").await, 1_073_741_824)
-            .max(0) as u64,
+        rss_bytes_threshold: i(
+            s(db, "agent.observer.rss_bytes_threshold").await,
+            1_073_741_824,
+        )
+        .max(0) as u64,
         auto_diagnose_enabled: b(s(db, "agent.observer.auto_diagnose_enabled").await, false),
         diagnose_cooldown_seconds: i(s(db, "agent.observer.diagnose_cooldown_seconds").await, 600),
         diagnose_max_per_hour: i(s(db, "agent.observer.diagnose_max_per_hour").await, 5),
@@ -138,8 +144,14 @@ fn read_proc_metrics(pid: u32) -> Option<ProcSample> {
     let fields: Vec<&str> = after.split_whitespace().collect();
     // Dopo ')' i campi ripartono da "state" (campo 3). utime=campo14 -> idx 11,
     // stime=campo15 -> idx 12.
-    let utime = fields.get(11).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-    let stime = fields.get(12).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let utime = fields
+        .get(11)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let stime = fields
+        .get(12)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
 
     let rss_bytes = std::fs::read_to_string(format!("/proc/{pid}/statm"))
         .ok()
@@ -398,7 +410,9 @@ async fn scan_new_logs(unit: &str, since_unix: i64) -> (u64, String) {
     let mut error_lines = 0u64;
     for line in text.lines() {
         let low = line.to_lowercase();
-        if low.contains("error") || low.contains("exception") || low.contains("panic")
+        if low.contains("error")
+            || low.contains("exception")
+            || low.contains("panic")
             || low.contains("fatal")
         {
             error_lines += 1;
@@ -667,7 +681,11 @@ pub fn spawn_service_observer(state: AppState) {
     tracing::info!("service_observer: avviato (config DB-driven, gating runtime)");
 }
 
-async fn run_cycle(state: &AppState, cfg: &ObserverConfig, states: &mut HashMap<String, UnitState>) {
+async fn run_cycle(
+    state: &AppState,
+    cfg: &ObserverConfig,
+    states: &mut HashMap<String, UnitState>,
+) {
     let now_ts = chrono::Utc::now().timestamp();
     let projects = projects_with_slug(&state.db).await;
 
@@ -785,8 +803,7 @@ async fn run_cycle(state: &AppState, cfg: &ObserverConfig, states: &mut HashMap<
             // la cui metrica non e' piu' attiva (anche le 'fantasma' storiche,
             // perche' si basa sul DB, non sullo stato in-memory). Senza questo le
             // righe restavano 'open' a vita nel pannello Problemi a servizio sano.
-            let active_metrics: Vec<String> =
-                st.active_anomalies.iter().cloned().collect();
+            let active_metrics: Vec<String> = st.active_anomalies.iter().cloned().collect();
             resolve_stale_anomalies(&state.db, project_id, &unit, &active_metrics).await;
 
             // ── Detection STRUTTURALE di servizio non funzionante (cap 1) ───
@@ -934,12 +951,7 @@ async fn run_cycle(state: &AppState, cfg: &ObserverConfig, states: &mut HashMap<
         // Le richiude qui perche' il resolve per-unit non le raggiunge mai.
         // Guard !is_empty(): non azzerare tutto su un errore di systemctl.
         if !observed_units.is_empty() {
-            resolve_anomalies_for_absent_units(
-                &state.db,
-                project_id,
-                &observed_units,
-            )
-            .await;
+            resolve_anomalies_for_absent_units(&state.db, project_id, &observed_units).await;
         }
     }
 }
@@ -1009,8 +1021,10 @@ mod tests {
 
     #[test]
     fn strip_ansi_removes_color_codes() {
-        assert_eq!(strip_ansi("\u{1B}[31mrosso\u{1B}[0m normale"), "rosso normale");
+        assert_eq!(
+            strip_ansi("\u{1B}[31mrosso\u{1B}[0m normale"),
+            "rosso normale"
+        );
         assert_eq!(strip_ansi("nessun codice"), "nessun codice");
     }
-
 }

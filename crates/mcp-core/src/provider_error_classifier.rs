@@ -80,8 +80,7 @@ fn auth_re() -> &'static Regex {
 fn http_status_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(r"(?i)(?:Error code|status)[:\s]+(\d{3})")
-            .expect("HTTP status regex valida")
+        Regex::new(r"(?i)(?:Error code|status)[:\s]+(\d{3})").expect("HTTP status regex valida")
     })
 }
 
@@ -187,16 +186,18 @@ mod tests {
     // rag::chunker::tests, il loro scopo e' essere simili (golden test).
     #[test]
     fn parita_cross_language_da_fixture_golden() {
-        const FIXTURE: &str = include_str!(
-            "../../../tests/fixtures/error_classifier_golden.json"
-        );
-        let parsed: serde_json::Value = serde_json::from_str(FIXTURE)
-            .expect("fixture golden non e' JSON valido");
-        let cases = parsed["cases"].as_array().expect("fixture senza array 'cases'");
+        const FIXTURE: &str = include_str!("../../../tests/fixtures/error_classifier_golden.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(FIXTURE).expect("fixture golden non e' JSON valido");
+        let cases = parsed["cases"]
+            .as_array()
+            .expect("fixture senza array 'cases'");
         for case in cases {
             let name = case["name"].as_str().unwrap_or("<senza nome>");
             let input = case["input"].as_str().expect("input string");
-            let expected = case["expected_stop_reason"].as_str().expect("expected_stop_reason");
+            let expected = case["expected_stop_reason"]
+                .as_str()
+                .expect("expected_stop_reason");
             let actual = classify_text(input);
             assert_eq!(
                 actual.stop_reason, expected,

@@ -100,8 +100,13 @@ pub(super) async fn discover_services_agentic(
     }
 
     // 1. Raccolta contenuti dei file di config (con budget).
-    let max_chars = load_u64(db, "agent.service_discovery.max_config_bytes", 60_000, 1_000).await
-        as usize;
+    let max_chars = load_u64(
+        db,
+        "agent.service_discovery.max_config_bytes",
+        60_000,
+        1_000,
+    )
+    .await as usize;
     let payload = collect_config_payload(root, max_chars).await;
     if payload.trim().is_empty() {
         // Nessun file di config: lascia decidere all'euristica.
@@ -126,9 +131,7 @@ pub(super) async fn discover_services_agentic(
         {
             Ok(pm) => pm,
             Err(e) => {
-                tracing::warn!(
-                    "service_discovery: purpose non risolto ({e}); fallback euristica"
-                );
+                tracing::warn!("service_discovery: purpose non risolto ({e}); fallback euristica");
                 return None;
             }
         };
@@ -263,7 +266,11 @@ fn validate_and_map_service(svc: &Value) -> Option<MappedService> {
     if !VALID_KINDS.contains(&kind.as_str()) {
         return None;
     }
-    let command = svc.get("command").and_then(Value::as_str)?.trim().to_string();
+    let command = svc
+        .get("command")
+        .and_then(Value::as_str)?
+        .trim()
+        .to_string();
     if command.is_empty() {
         return None;
     }
@@ -383,7 +390,12 @@ async fn load_bool(db: &sqlx::PgPool, key: &str, default: bool) -> bool {
         .await
         .ok()
         .flatten()
-        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .map(|v| {
+            !matches!(
+                v.trim().to_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(default)
 }
 

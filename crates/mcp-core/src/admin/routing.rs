@@ -112,7 +112,8 @@ pub async fn update_purpose_model(
     }
 
     // Normalizza il tier (punto unico testabile). 400 se valore non valido.
-    let tier: Option<String> = normalize_tier(body.tier.as_deref()).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let tier: Option<String> =
+        normalize_tier(body.tier.as_deref()).map_err(|_| StatusCode::BAD_REQUEST)?;
     let required_capability: Option<String> = body
         .required_capability
         .as_deref()
@@ -175,8 +176,14 @@ mod tests {
     #[test]
     fn normalize_tier_accetta_categorie_valide() {
         assert_eq!(normalize_tier(Some("light")).unwrap(), Some("light".into()));
-        assert_eq!(normalize_tier(Some("MEDIUM")).unwrap(), Some("medium".into()));
-        assert_eq!(normalize_tier(Some(" heavy ")).unwrap(), Some("heavy".into()));
+        assert_eq!(
+            normalize_tier(Some("MEDIUM")).unwrap(),
+            Some("medium".into())
+        );
+        assert_eq!(
+            normalize_tier(Some(" heavy ")).unwrap(),
+            Some("heavy".into())
+        );
     }
 
     #[test]

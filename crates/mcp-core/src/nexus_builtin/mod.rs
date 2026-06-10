@@ -195,14 +195,10 @@ pub async fn execute(
         "nexus_doc_search" => handle_doc_search(db, project_id, &arguments).await,
         "nexus_doc_status" => handle_doc_status(db, &arguments).await,
         // ── file mutations / rollback ────────────────────────────────
-        "nexus_file_mutations_list" => {
-            handle_file_mutations_list(db, project_id, &arguments).await
-        }
+        "nexus_file_mutations_list" => handle_file_mutations_list(db, project_id, &arguments).await,
         "nexus_file_mutation_diff" => handle_file_mutation_diff(db, project_id, &arguments).await,
         "nexus_file_revert" => handle_file_revert(db, project_id, user_id, &arguments).await,
-        "nexus_session_branch_info" => {
-            handle_session_branch_info(db, project_id, &arguments).await
-        }
+        "nexus_session_branch_info" => handle_session_branch_info(db, project_id, &arguments).await,
         // ── editor UI ────────────────────────────────────────────────
         "nexus_open_file_in_editor" => handle_open_file_in_editor(db, project_id, &arguments).await,
         // ── nexus_tool_catalog (Fase 9A) ──────────────────────────────
@@ -1627,14 +1623,13 @@ async fn handle_impact_brief(db: &PgPool, project_id: Uuid, arguments: &Value) -
     let mut briefs: Vec<Value> = Vec::with_capacity(seed_doc_ids.len());
     for doc_id in &seed_doc_ids {
         // Header doc: usato come "self" nel payload.
-        let header: Option<(String, String, String, Option<Uuid>)> = sqlx::query_as(
-            "SELECT title, slug, scope, project_id FROM wiki_docs WHERE id = $1",
-        )
-        .bind(doc_id)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten();
+        let header: Option<(String, String, String, Option<Uuid>)> =
+            sqlx::query_as("SELECT title, slug, scope, project_id FROM wiki_docs WHERE id = $1")
+                .bind(doc_id)
+                .fetch_optional(db)
+                .await
+                .ok()
+                .flatten();
         let Some((title, slug, scope, doc_project_id)) = header else {
             briefs.push(json!({
                 "doc_id": doc_id.to_string(),

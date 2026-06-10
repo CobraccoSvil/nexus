@@ -18,7 +18,11 @@ pub(crate) struct SpawnAgentParams {
     pub(crate) attachments: Vec<ChatAttachment>,
     /// Ruolo utente JWT (es. "admin", "editor") — per i tool nexus_builtin
     pub(crate) user_role: String,
-    /// Agent type hint dal client (bypassa Q-Learning se presente)
+    /// Agent type hint dal client (bypassa Q-Learning se presente).
+    /// Quando valorizzato attiva `agent_type_forced` in `spawn_agent_run`, che
+    /// e' il punto unico (regola L) di bypass del gate di disambiguazione: i
+    /// workflow d'azione (error-fix in-chat, auto-debug service_observer) passano
+    /// l'AgentType e quindi non vengono mai bloccati da una domanda all'utente.
     pub(crate) nexus_agent_type_hint: Option<String>,
 }
 /// Risultato di spawn_agent_run: (run_id, provider, model)
@@ -26,6 +30,23 @@ pub(crate) struct SpawnAgentResult {
     pub(crate) run_id: Uuid,
     pub(crate) provider: String,
     pub(crate) model: String,
+}
+
+/// Esito di `spawn_agent_run`. Distingue i due casi che prima collassavano
+/// entrambi su `None` (regola H: la causa radice del bug "disambiguazione +
+/// run_turn doppio" era proprio l'indistinguibilita' semantica):
+///
+/// - `Started`: l'agent run e' stato avviato (caso nominale).
+/// - `Disambiguation`: l'intent era ambiguo, il messaggio di chiarimento A/B e'
+///   gia' stato inserito; il turno DEVE fermarsi in attesa della risposta utente
+///   (mai cadere su `run_turn`). Il payload e' il message-view JSON gia' pronto
+///   per il frontend.
+/// - `NotStarted`: fallback (es. progetto non caricabile); il chiamante puo'
+///   ripiegare su `run_turn`. Equivale all'ex `None` di fallback.
+pub(crate) enum SpawnOutcome {
+    Started(SpawnAgentResult),
+    Disambiguation(serde_json::Value),
+    NotStarted,
 }
 /// Troncamento per caratteri (mai per byte: evita di spezzare sequenze UTF-8).
 pub(crate) fn trunc_chars(s: String, max: usize) -> String {
@@ -490,16 +511,74 @@ pub(crate) async fn session_has_active_run(db: &sqlx::PgPool, session_id: Uuid) 
     }
 }
 
+/// Risolve la RISPOSTA dell'utente a una richiesta di disambiguazione.
+///
+/// Quando l'ultimo messaggio assistant della sessione e' una
+/// `disambiguation_request` (metadata.kind) e il nuovo messaggio utente e' la
+/// scelta secca di un'opzione ("A", "b.", "C)"), l'intent va risolto dal
+/// candidato corrispondente gia' salvato nel metadata della domanda — NON
+/// ri-classificato: la ri-classificazione della lettera singola risultava di
+/// nuovo ambigua e il gate ri-emetteva la stessa domanda in loop (bug di
+/// continuita' osservato in UI: l'utente rispondeva "A" e riceveva un'altra
+/// volta la domanda A/B). Un testo piu' lungo della sola lettera e' una nuova
+/// descrizione e segue la classify normale, come da istruzioni nella domanda.
+/// Ritorna l'intent scelto, o None se non e' una risposta di disambiguazione.
+async fn resolve_disambiguation_reply(
+    db: &sqlx::PgPool,
+    session_id: Uuid,
+    content: &str,
+) -> Option<String> {
+    let t = content.trim();
+    if t.is_empty() || t.len() > 2 {
+        return None;
+    }
+    let mut chars = t.chars();
+    let letter = chars.next()?.to_ascii_uppercase();
+    if !('A'..='C').contains(&letter) {
+        return None;
+    }
+    if let Some(p) = chars.next() {
+        if p != '.' && p != ')' {
+            return None;
+        }
+    }
+    let idx = (letter as u8 - b'A') as usize;
+
+    let meta = sqlx::query_scalar::<_, serde_json::Value>(
+        r#"SELECT metadata FROM chat_messages
+            WHERE session_id = $1 AND role = 'assistant'
+            ORDER BY created_at DESC LIMIT 1"#,
+    )
+    .bind(session_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()?;
+
+    if meta.get("kind").and_then(|v| v.as_str()) != Some("disambiguation_request") {
+        return None;
+    }
+    Some(
+        meta.get("candidates")?
+            .get(idx)?
+            .get("intent")?
+            .as_str()?
+            .to_string(),
+    )
+}
+
 /// Logica condivisa: carica progetto, costruisce contesto, avvia AgentLoop in background.
-/// Ritorna `None` se il progetto non è caricabile (fallback al singolo turn).
+/// Ritorna `SpawnOutcome::NotStarted` se il progetto non è caricabile (fallback al
+/// singolo turn) e `SpawnOutcome::Disambiguation` se l'intent e' ambiguo (turno
+/// fermato in attesa della risposta utente).
 pub(crate) async fn spawn_agent_run(
     state: &AppState,
     mut params: SpawnAgentParams,
-) -> Option<SpawnAgentResult> {
+) -> SpawnOutcome {
     let project_ctx = load_project_context(&state.db, params.project_id, params.user_id).await;
     let proj = match project_ctx {
         Ok(p) => p,
-        Err(_) => return None,
+        Err(_) => return SpawnOutcome::NotStarted,
     };
 
     let run_id = Uuid::new_v4();
@@ -559,10 +638,40 @@ pub(crate) async fn spawn_agent_run(
         &params.content,
     )
     .await;
-    let classified = state
+    let mut classified = state
         .orchestrator
         .classify_intent_full(&classifier_input)
         .await;
+    // Continuita' della disambiguazione: se questo messaggio E' la risposta
+    // ("A"/"B"/"C") alla domanda appena posta, l'intent e' quello del candidato
+    // scelto — risolto dal metadata della domanda, non ri-classificato (la
+    // lettera secca verrebbe ri-marcata ambigua e la stessa domanda ri-emessa
+    // in loop). intent_str_to_static e' il punto unico di interning (regola L).
+    // Quando il resolver scatta, l'intent va propagato anche al brain come
+    // intent_hint: il router_node ri-classificherebbe la lettera secca come
+    // 'chat' (prompt_len=1), vanificando la scelta dell'utente.
+    let mut resolved_intent_hint: Option<String> = None;
+    if let Some(chosen) =
+        resolve_disambiguation_reply(&state.db, params.session_id, &params.content).await
+    {
+        if let Some(static_intent) = crate::orchestrator::intent_str_to_static(&chosen) {
+            tracing::info!(
+                "spawn_agent_run: risposta di disambiguazione '{}' -> intent '{}' (gate saltato)",
+                params.content.trim(),
+                static_intent,
+            );
+            classified.intent = static_intent;
+            classified.is_ambiguous = false;
+            classified.confidence = 1.0;
+            resolved_intent_hint = Some(static_intent.to_string());
+        } else {
+            tracing::warn!(
+                "spawn_agent_run: risposta di disambiguazione con intent sconosciuto '{}' — \
+                 procedo con la classify normale",
+                chosen,
+            );
+        }
+    }
     if classified.is_ambiguous
         && !matches!(params.automation_mode, AutomationMode::Automatic)
         && !agent_type_forced
@@ -578,8 +687,21 @@ pub(crate) async fn spawn_agent_run(
             "intent": classified.intent,
             "confidence": classified.confidence,
             "candidates": classified.candidates,
+            // Metriche a 0: la disambiguazione non consuma token. Il frontend legge
+            // totalTokens/totalCost dal metadata (to_message_view, persistence.rs)
+            // e li formatta con toFixed; senza questi campi il view avrebbe null
+            // -> crash JS nel processing della risposta live del send.
+            "promptTokens": 0,
+            "completionTokens": 0,
+            "totalTokens": 0,
+            "totalCost": 0.0,
         });
-        let _ = insert_message(
+        // Inseriamo il messaggio di chiarimento e ne recuperiamo l'id: serve sia
+        // per costruire il message-view da restituire al frontend, sia per
+        // emettere l'evento SSE (la disambiguazione prima NON ne emetteva nessuno,
+        // quindi i client che ascoltano lo stream non vedevano il messaggio finche'
+        // non ricaricavano). Stesso pattern di run.rs (insert -> emit -> view).
+        let msg_id = match insert_message(
             &state.db,
             params.session_id,
             params.project_id,
@@ -588,10 +710,60 @@ pub(crate) async fn spawn_agent_run(
             meta,
             Some(params.user_message_id),
         )
-        .await;
+        .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    "spawn_agent_run: insert messaggio disambiguazione fallito: {}",
+                    e.1["error"].as_str().unwrap_or("errore sconosciuto")
+                );
+                state.agent_channels.remove(&run_id);
+                return SpawnOutcome::NotStarted;
+            }
+        };
+        nexus_events::dispatcher::emit(
+            &state.project_channels,
+            params.project_id,
+            nexus_events::ProjectEvent::ChatMessageAdded {
+                session_id: params.session_id,
+                message_id: msg_id,
+                role: "assistant".into(),
+                total_tokens: None,
+                total_cost_usd: None,
+            },
+        );
         // Rimuoviamo il canale broadcast: non avviamo l'agent run.
         state.agent_channels.remove(&run_id);
-        return None;
+        let view = match load_message_by_id(&state.db, msg_id).await {
+            Ok(row) => match to_message_view(&row) {
+                Ok(v) => match serde_json::to_value(v) {
+                    Ok(json_view) => json_view,
+                    Err(e) => {
+                        tracing::warn!(
+                            "spawn_agent_run: serializzazione view disambiguazione fallita: {}",
+                            e
+                        );
+                        return SpawnOutcome::NotStarted;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        "spawn_agent_run: to_message_view disambiguazione fallita: {}",
+                        e.1["error"].as_str().unwrap_or("errore sconosciuto")
+                    );
+                    return SpawnOutcome::NotStarted;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "spawn_agent_run: load_message_by_id disambiguazione fallito: {}",
+                    e.1["error"].as_str().unwrap_or("errore sconosciuto")
+                );
+                return SpawnOutcome::NotStarted;
+            }
+        };
+        return SpawnOutcome::Disambiguation(view);
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -739,7 +911,7 @@ pub(crate) async fn spawn_agent_run(
             thinking_delta: None,
             meta_step: None,
         });
-        return Some(SpawnAgentResult {
+        return SpawnOutcome::Started(SpawnAgentResult {
             run_id,
             provider,
             model: model_str,
@@ -775,7 +947,8 @@ pub(crate) async fn spawn_agent_run(
     // call site (chat, resume, process_resume, service_observer) perche' passano
     // tutti da spawn_agent_run -> l'invariante "max 1 run attivo per sessione" e'
     // applicata in un solo posto e nessun nuovo call site puo' dimenticarla.
-    let _superseded = supersede_active_runs(state, params.session_id, "superseded_by_new_run").await;
+    let superseded_runs =
+        supersede_active_runs(state, params.session_id, "superseded_by_new_run").await;
 
     // Persist initial run in DB
     let _ = sqlx::query(
@@ -1079,6 +1252,24 @@ pub(crate) async fn spawn_agent_run(
     )
     .await;
 
+    // Se questo run ha SUPERATO run attivi (last-wins), il modello vedra' nella
+    // history della sessione il task precedente ancora "aperto" e tende a
+    // continuarlo ignorando il nuovo messaggio (incidente reale: l'istruzione
+    // error-fix M44 ha prodotto un run che ha proseguito i formatters del task
+    // precedente). Nota OPERATIVA strutturale anteposta al prompt: fatto reale
+    // (run interrotto), non euristica. Solo quando il supersede e' avvenuto.
+    let initial_msg = if superseded_runs.is_empty() {
+        initial_msg
+    } else {
+        format!(
+            "[NOTA OPERATIVA — generata dal sistema]\nIl run precedente su questa \
+             sessione e' stato INTERROTTO e sostituito da questo messaggio. Il task \
+             corrente e' SOLO quello del messaggio qui sotto: non riprendere ne' \
+             continuare il lavoro del run precedente se non e' esplicitamente \
+             richiesto dal nuovo messaggio.\n\n{initial_msg}"
+        )
+    };
+
     tracing::warn!(
         "TOKEN_OPT: system_text_len={} initial_msg_len={} recent_ctx_len={} history_turns={}",
         system_text.len(),
@@ -1123,6 +1314,9 @@ pub(crate) async fn spawn_agent_run(
     let classified_intent_for_loop: &'static str = classified.intent;
     // Modalita' automazione propagata al brain (per clarify_or_expand skip).
     let automation_mode_for_brain: String = params.automation_mode.as_str().to_string();
+    // Intent risolto dalla risposta di disambiguazione, propagato al brain
+    // (None per i run normali: il router_node classifica come sempre).
+    let intent_hint_for_brain: Option<String> = resolved_intent_hint.clone();
 
     // Calcola il payload tools dinamico (discovery mode vs inline) prima dello spawn.
     // Il filtering per automation_mode avviene dentro build_tools_json_for_agent:
@@ -1364,7 +1558,9 @@ pub(crate) async fn spawn_agent_run(
                     tracing::warn!(
                         "agent_run {}: {}/{} assente dal catalog per il check idoneita', \
                          fallback conservativo (8192, non-tool)",
-                        run_id, current_provider, current_model
+                        run_id,
+                        current_provider,
+                        current_model
                     );
                     (8192, false)
                 }
@@ -1372,7 +1568,9 @@ pub(crate) async fn spawn_agent_run(
                     tracing::error!(
                         "agent_run {}: query idoneita' context fallita per {}/{}: {e} \
                          (fallback conservativo)",
-                        run_id, current_provider, current_model
+                        run_id,
+                        current_provider,
+                        current_model
                     );
                     (8192, false)
                 }
@@ -1398,7 +1596,10 @@ pub(crate) async fn spawn_agent_run(
                 if let Some((p, m)) = alt {
                     tracing::info!(
                         "agent_run {}: re-route agentico: {} -> {}/{}",
-                        run_id, current_model, p, m
+                        run_id,
+                        current_model,
+                        p,
+                        m
                     );
                     current_provider = p;
                     current_model = m;
@@ -1412,12 +1613,13 @@ pub(crate) async fn spawn_agent_run(
             // leggono agentRun.provider/model) convergono sul modello reale.
             // Best-effort: un fallimento qui non deve bloccare il run.
             if current_provider != provider_clone || current_model != model_clone {
-                let _ = sqlx::query("UPDATE agent_runs SET provider = $1, model = $2 WHERE id = $3")
-                    .bind(&current_provider)
-                    .bind(&current_model)
-                    .bind(run_id)
-                    .execute(&db_clone)
-                    .await;
+                let _ =
+                    sqlx::query("UPDATE agent_runs SET provider = $1, model = $2 WHERE id = $3")
+                        .bind(&current_provider)
+                        .bind(&current_model)
+                        .bind(run_id)
+                        .execute(&db_clone)
+                        .await;
                 tracing::info!(
                     "agent_run {}: agent_runs.provider/model aggiornato al modello effettivo {}/{} (era {}/{})",
                     run_id,
@@ -1452,6 +1654,8 @@ pub(crate) async fn spawn_agent_run(
                     sse_max_silence_secs,
                     false, // emit_final_event: emesso manualmente dopo il break del retry loop
                     automation_mode_for_brain.clone(),
+                    intent_hint_for_brain.clone(),
+                    db_clone.clone(),
                 )
                 .await;
 
@@ -1498,7 +1702,7 @@ pub(crate) async fn spawn_agent_run(
                 // Soglia 3 fallimenti consecutivi → is_enabled=false. Reset a 0 al
                 // primo successo (status=Completed e final_answer NON vuoto).
                 let intent_uses_tools = classified_intent_for_loop != "chat";
-                if matches!(result.status, AgentRunStatus::Completed) && intent_uses_tools {
+                if result.status.is_success() && intent_uses_tools {
                     let success_now = !result.hollow_completion
                         && result
                             .final_answer
@@ -1531,55 +1735,27 @@ pub(crate) async fn spawn_agent_run(
                         .filter(|n| *n > 0)
                         .unwrap_or(3);
 
-                        // Incrementa il contatore DEDICATO e decide l'azione con la
-                        // funzione pura testata (agent_types::tool_failure_action).
-                        let new_count: Option<i32> = sqlx::query_scalar(
-                            "UPDATE ai_price_catalog
-                            SET consecutive_tool_failures = consecutive_tool_failures + 1,
-                                updated_at = NOW()
-                          WHERE provider = $1 AND model = $2
-                        RETURNING consecutive_tool_failures",
+                        // PUNTO UNICO (regola L): counter + degrado a soglia con
+                        // guard capability_source='auto' vivono in tool_capability.
+                        // Le righe curate a mano (manual) non vengono mai degradate
+                        // dal runtime (incidente deepseek-v4, 2026-06-10).
+                        let rec = crate::tool_capability::record_tool_failure(
+                            &db_clone,
+                            &result.provider,
+                            &result.model,
+                            tool_threshold,
+                            crate::tool_capability::REASON_MALFORMED_TOOL_CALLS,
                         )
-                        .bind(&result.provider)
-                        .bind(&result.model)
-                        .fetch_optional(&db_clone)
-                        .await
-                        .ok()
-                        .flatten();
-                        if let Some(n) = new_count {
-                            let action = crate::agent_types::tool_failure_action(
-                                true,
-                                true,
-                                true,
-                                false,
-                                n - 1,
-                                tool_threshold,
-                            );
+                        .await;
+                        if let crate::tool_capability::ToolFailureRecord::Counted { failures }
+                        | crate::tool_capability::ToolFailureRecord::MarkedNonToolCapable {
+                            failures,
+                        } = rec
+                        {
                             tracing::warn!(
                             "agent_run {}: tool-failure (MALFORMED/empty su tool) su {}/{} — tool_counter={}/{}",
-                            run_id, result.provider, result.model, n, tool_threshold
+                            run_id, result.provider, result.model, failures, tool_threshold
                         );
-                            if matches!(
-                                action,
-                                crate::agent_types::ToolCapabilityAction::MarkNonToolCapable
-                            ) {
-                                let _ = sqlx::query(
-                                    "UPDATE ai_price_catalog
-                                    SET supports_tool_use = false,
-                                        auto_disabled_reason = 'malformed_tool_calls',
-                                        updated_at = NOW()
-                                  WHERE provider = $1 AND model = $2
-                                    AND supports_tool_use = true",
-                                )
-                                .bind(&result.provider)
-                                .bind(&result.model)
-                                .execute(&db_clone)
-                                .await;
-                                tracing::warn!(
-                                "MARK NON-TOOL-CAPABLE {}/{} dopo {} tool-failure consecutivi (supports_tool_use=false). Resta disponibile per i task chat.",
-                                result.provider, result.model, n
-                            );
-                            }
                         }
                     } else if result.hollow_completion {
                         // Hollow generico NON dovuto al tool-forcing (empty answer /
@@ -1631,27 +1807,14 @@ pub(crate) async fn spawn_agent_run(
                     } else if success_now {
                         // Turno-con-tool andato a buon fine: reset di ENTRAMBI i
                         // contatori (generico e tool-specific) e riabilita la
-                        // tool-capability se era stata revocata per malformed.
-                        let _ = sqlx::query(
-                            "UPDATE ai_price_catalog
-                            SET consecutive_failures = 0,
-                                consecutive_tool_failures = 0,
-                                supports_tool_use = CASE
-                                    WHEN auto_disabled_reason = 'malformed_tool_calls' THEN true
-                                    ELSE supports_tool_use END,
-                                auto_disabled_at = NULL,
-                                auto_disabled_reason = CASE
-                                    WHEN auto_disabled_reason = 'malformed_tool_calls' THEN NULL
-                                    ELSE auto_disabled_reason END,
-                                updated_at = NOW()
-                          WHERE provider = $1 AND model = $2
-                            AND (consecutive_failures > 0
-                                 OR consecutive_tool_failures > 0
-                                 OR auto_disabled_reason = 'malformed_tool_calls')",
+                        // tool-capability se il degrado era automatico, da
+                        // QUALUNQUE fonte (runtime O tool-probe) — punto unico.
+                        crate::tool_capability::reset_tool_failures_on_success(
+                            &db_clone,
+                            &result.provider,
+                            &result.model,
+                            true,
                         )
-                        .bind(&result.provider)
-                        .bind(&result.model)
-                        .execute(&db_clone)
                         .await;
                     }
                 }
@@ -1696,8 +1859,8 @@ pub(crate) async fn spawn_agent_run(
                     .nexus_task_type
                     .as_deref()
                     .unwrap_or(classified_intent_for_loop);
-                let hollow_retry = result.hollow_completion
-                    && (brain_intent != "chat" || is_action_request);
+                let hollow_retry =
+                    result.hollow_completion && (brain_intent != "chat" || is_action_request);
                 let should_retry = failed_retry || hollow_retry;
 
                 if !should_retry || fallback_attempt + 1 >= max_provider_fallbacks {
@@ -2103,15 +2266,38 @@ pub(crate) async fn spawn_agent_run(
             }
 
             // Update run status in DB
-            let status_str = match result.status {
-                AgentRunStatus::Completed => "completed",
-                AgentRunStatus::AwaitingConfirmation => "awaiting_confirmation",
-                AgentRunStatus::Failed => "failed",
-                AgentRunStatus::TimedOut => "timed_out",
-                AgentRunStatus::Cancelled => "cancelled",
-                AgentRunStatus::Running => "running",
-                AgentRunStatus::LoopAborted => "loop_aborted",
-                AgentRunStatus::ProviderUnavailable => "provider_unavailable",
+            //
+            // Esito CERTO (mai "completed" vuoto): un run hollow confermato dopo
+            // l'esaurimento dei retry, che NON ha eseguito alcuna azione e non ha
+            // prodotto risposta (EMPTY_ANSWER con steps vuoti) oppure ha rinunciato
+            // esplicitamente (RESIGNED), non e' un successo: marcarlo 'completed'
+            // mostrava all'utente un esito ambiguo ("completato" + nessun
+            // contenuto). Lo si declassa all'esito canonico failed_diagnosed: la
+            // diagnosi e' il placeholder/recap gia' composto sopra (answer_owned).
+            // Un hollow con step completati resta invece Completed (il lavoro c'e',
+            // manca solo la conferma testuale del modello).
+            let hollow_no_work = report_hollow
+                && ((result.steps.is_empty()
+                    && result.hollow_completion_kind.contains("EMPTY_ANSWER"))
+                    || result.hollow_completion_kind == "RESIGNED");
+            let status_canonical = if hollow_no_work {
+                tracing::warn!(
+                    "agent_run {}: hollow senza lavoro ({}) — status declassato \
+                     completed -> failed_diagnosed (esito certo)",
+                    run_id,
+                    result.hollow_completion_kind
+                );
+                crate::agent_types::AgentRunStatus::FailedDiagnosed
+            } else {
+                result.status.clone()
+            };
+            let status_str = status_canonical.as_str();
+            // final_answer nel run record: per i run vuoti persiste il
+            // placeholder/diagnosi (answer_owned) cosi' run e messaggio chat
+            // raccontano lo stesso esito; per i run normali resta la risposta.
+            let final_answer_db: Option<String> = match result.final_answer.as_deref() {
+                Some(s) if !s.trim().is_empty() => Some(s.to_string()),
+                _ => answer_owned.clone(),
             };
             // ADR 0023 (Fix 3a): aggiorna anche provider/model col valore
             // EFFETTIVO usato dal run (result.provider/result.model). Cattura i
@@ -2128,7 +2314,7 @@ pub(crate) async fn spawn_agent_run(
             )
             .bind(run_id)
             .bind(status_str)
-            .bind(result.final_answer.as_deref())
+            .bind(final_answer_db.as_deref())
             .bind(result.iteration_count as i32)
             .bind(result.prompt_tokens as i32)
             .bind(result.completion_tokens as i32)
@@ -2145,13 +2331,25 @@ pub(crate) async fn spawn_agent_run(
             // ── Monitor finale del run (regola H, indipendente dall'LLM) ───────
             // Porta la card `agent_run` allo stato terminale. Non cancelliamo i
             // monitor: restano visibili come ultimo stato del run.
-            let (run_state, run_label): (&str, String) = match result.status {
-                AgentRunStatus::Completed => (
+            let (run_state, run_label): (&str, String) = match status_canonical {
+                AgentRunStatus::Completed | AgentRunStatus::CompletedVerified => (
                     "completato",
-                    format!("{} step · {} iter", result.steps.len(), result.iteration_count),
+                    format!(
+                        "{} step · {} iter",
+                        result.steps.len(),
+                        result.iteration_count
+                    ),
                 ),
-                AgentRunStatus::AwaitingConfirmation => {
-                    ("in attesa conferma", "conferma utente richiesta".to_string())
+                AgentRunStatus::AwaitingConfirmation => (
+                    "in attesa conferma",
+                    "conferma utente richiesta".to_string(),
+                ),
+                AgentRunStatus::FailedDiagnosed => (
+                    "non completato",
+                    "diagnosi e prossimo passo disponibili".to_string(),
+                ),
+                AgentRunStatus::BlockedNeedsInput => {
+                    ("bloccato", "richiede input o conferma".to_string())
                 }
                 _ => (
                     "errore",
@@ -2174,7 +2372,7 @@ pub(crate) async fn spawn_agent_run(
             // Se il run è completato con successo e ha eseguito un `docker compose up`,
             // salva il comando in memory_entries → al turno successivo l'agente lo
             // trova in "Memoria di progetto" e sa già cosa eseguire.
-            if matches!(result.status, AgentRunStatus::Completed) {
+            if status_canonical.is_success() {
                 crate::agent_types::save_startup_command_if_needed(
                     &db_clone,
                     project_id_cp,
@@ -2346,7 +2544,7 @@ pub(crate) async fn spawn_agent_run(
         }
     });
 
-    Some(SpawnAgentResult {
+    SpawnOutcome::Started(SpawnAgentResult {
         run_id,
         provider,
         model: model_str,
@@ -2386,11 +2584,13 @@ mod tests_session_active {
     async fn vero_su_awaiting_confirmation(pool: sqlx::PgPool) {
         create_agent_runs_table(&pool).await;
         let sess = Uuid::new_v4();
-        sqlx::query("INSERT INTO agent_runs (session_id, status) VALUES ($1, 'awaiting_confirmation')")
-            .bind(sess)
-            .execute(&pool)
-            .await
-            .expect("insert awaiting");
+        sqlx::query(
+            "INSERT INTO agent_runs (session_id, status) VALUES ($1, 'awaiting_confirmation')",
+        )
+        .bind(sess)
+        .execute(&pool)
+        .await
+        .expect("insert awaiting");
         assert!(session_has_active_run(&pool, sess).await);
     }
 

@@ -312,7 +312,10 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
         // e' stata allocata via request_port (evita porte scelte a mano nel range
         // ma non tracciate, fonte di collisioni tra progetti).
         if let Some(msg) = super::port_scanner::reject_unallocated_bucket_ports(
-            &ctx.db, ctx.project_id, path_str, content,
+            &ctx.db,
+            ctx.project_id,
+            path_str,
+            content,
         )
         .await
         {
@@ -778,7 +781,10 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
         }
         // Allocation-aware: porte nel bucket non allocate via request_port -> reject.
         if let Some(msg) = super::port_scanner::reject_unallocated_bucket_ports(
-            &ctx.db, ctx.project_id, path_str, new_string,
+            &ctx.db,
+            ctx.project_id,
+            path_str,
+            new_string,
         )
         .await
         {

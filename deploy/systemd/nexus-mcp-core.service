@@ -1,0 +1,37 @@
+# nexus-mcp-core.service — mcp-core del meta-progetto Nexus come unit systemd --user.
+#
+# Prerequisito risolto (fix shutdown-hang 2026-06-10, main.rs): lo shutdown su
+# SIGTERM era appeso 1+ min (watchdog force-exit spawnato DOPO il flush del
+# NexusBridge: se era il flush a bloccarsi sull'acquire del pool sqlx, il timer
+# non partiva mai e la porta 4000 restava occupata -> serviva pkill -9). Ora il
+# watchdog parte PRIMA del flush (limite assoluto 10s) e il flush ha timeout
+# proprio (5s). Senza quel fix questa unit avrebbe creato restart-loop con
+# doppio binario.
+#
+# ExecStart punta al symlink stabile target/nexus-current/mcp-core, aggiornato
+# da deploy-local.sh a ogni build: la unit esegue sempre l'ultima build,
+# indipendentemente dal profilo (debug|release).
+#
+# TimeoutStopSec=15 e' il safety net finale (SIGKILL) sopra il force-exit 10s
+# interno, come prescritto dalla regola H del CLAUDE.md per questo incidente.
+#
+# Install: bash deploy/install-nexus-units.sh (one-shot). Log invariato su
+# /tmp/nexus-mcp-core.log + journalctl --user -u nexus-mcp-core.
+
+[Unit]
+Description=Nexus mcp-core (routing AI, agent runner, ToolRunner gRPC)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/administrator/ideai
+EnvironmentFile=-/home/administrator/ideai/.env
+ExecStart=/home/administrator/ideai/target/nexus-current/mcp-core
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+StandardOutput=append:/tmp/nexus-mcp-core.log
+StandardError=append:/tmp/nexus-mcp-core.log
+
+[Install]
+WantedBy=default.target

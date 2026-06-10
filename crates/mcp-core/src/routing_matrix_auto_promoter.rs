@@ -6,10 +6,12 @@
 //!   1. Leggi requisiti: capabilities richieste, tool_use, tier preferito,
 //!      direzione costo, pesi scoring.
 //!   2. Filtra candidati dal catalog:
-//!      - is_enabled=true
-//!      - consecutive_failures=0 (oppure < model_health_probe_failure_threshold)
+//!      - is_enabled=true (la salute e' garantita da is_enabled; NON si filtra
+//!        consecutive_failures: causava starvation, ADR 0025 / FASE 2b)
 //!      - supports_tool_use=true se requires_tool_use
-//!      - capabilities @> required_capabilities (se non vuoto)
+//!      - agentic_thinking_policy<>'exclude' se requires_tool_use (FASE 2b)
+//!      - capabilities: soglia di rilevanza capability_match_pct>=0.5 (il grado
+//!        esatto pesa nel cap_score)
 //!   3. Score ogni candidato (0..1) come somma pesata di 4 score:
 //!      - tier_score: 1.0 se match preferred_tier, 0.5 se adiacente, 0.0 lontano
 //!      - cost_score: normalizzato 0..1, direzione asc/desc
@@ -52,6 +54,10 @@ struct CatalogModel {
     context_window: i32,
     supports_tool_use: bool,
     capabilities: Vec<String>,
+    /// FASE 2b: allinea l'eleggibilita' offline al routing live (ADR 0025): un
+    /// modello con `agentic_thinking_policy='exclude'` non e' candidabile per
+    /// gli slot che richiedono tool_use (il live lo scarta gia').
+    agentic_thinking_policy: String,
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +117,9 @@ pub async fn run_one_round(db: &PgPool) -> anyhow::Result<PromoteStats> {
     // promote/cleanup successivi e il routing live non vedono mai modelli morti.
     match heal_orphan_pinned_models(db).await {
         Ok(healed) => stats.healed = healed as usize,
-        Err(e) => tracing::warn!("routing_matrix_auto_promoter: heal_orphan_pinned_models fallito: {e}"),
+        Err(e) => {
+            tracing::warn!("routing_matrix_auto_promoter: heal_orphan_pinned_models fallito: {e}")
+        }
     }
 
     let requirements = load_requirements(db).await?;
@@ -431,7 +439,9 @@ pub async fn heal_orphan_pinned_models(db: &PgPool) -> sqlx::Result<u64> {
     })
     .unwrap_or(true);
     if !enabled {
-        tracing::info!("routing_matrix_auto_promoter: heal_orphan_pinned_models DISABILITATO (flag)");
+        tracing::info!(
+            "routing_matrix_auto_promoter: heal_orphan_pinned_models DISABILITATO (flag)"
+        );
         return Ok(0);
     }
 
@@ -492,9 +502,8 @@ pub async fn heal_orphan_pinned_models(db: &PgPool) -> sqlx::Result<u64> {
 
         // 3. UPDATE tutte le righe (qualsiasi manual_override) che puntano al
         //    modello morto: cambia SOLO il model_id, preserva il pin.
-        let note = format!(
-            " [auto-heal: {dead_model} deprecato (missing_from_api) -> {replacement}]"
-        );
+        let note =
+            format!(" [auto-heal: {dead_model} deprecato (missing_from_api) -> {replacement}]");
         let res = sqlx::query(
             "UPDATE nexus_routing_matrix
                 SET model_id = $1,
@@ -531,6 +540,7 @@ async fn load_requirements(db: &PgPool) -> sqlx::Result<Vec<IntentRequirement>> 
                 preferred_tier, weight_tier, weight_cost, weight_context,
                 weight_capabilities, cost_direction
            FROM nexus_intent_routing_requirements
+          WHERE intent <> '*'
           ORDER BY intent, behavior_mode",
     )
     .fetch_all(db)
@@ -557,14 +567,20 @@ async fn load_requirements(db: &PgPool) -> sqlx::Result<Vec<IntentRequirement>> 
 }
 
 async fn load_catalog(db: &PgPool) -> sqlx::Result<Vec<CatalogModel>> {
+    // FASE 2b (regola L, allineamento al routing live / ADR 0025): si carica il
+    // catalog SANO con il solo `is_enabled = true`. Il filtro
+    // `consecutive_failures = 0` e' stato RIMOSSO: la salute e' gia' garantita da
+    // is_enabled (il model_health_probe auto-disabilita a soglia) e filtrarlo
+    // causava starvation (un modello con 1 fail transitorio sparito dal pool e
+    // mai piu' scelto -> counter mai resettato). Identica scelta di
+    // select_models_tierchain (path live).
     let rows = sqlx::query(
         "SELECT provider, model, performance_tier,
                 input_cost_per_million_tokens::float8 AS input_cost,
                 context_window, supports_tool_use,
-                capabilities
+                capabilities, agentic_thinking_policy
            FROM ai_price_catalog
-          WHERE is_enabled = true
-            AND consecutive_failures = 0",
+          WHERE is_enabled = true",
     )
     .fetch_all(db)
     .await?;
@@ -591,6 +607,9 @@ async fn load_catalog(db: &PgPool) -> sqlx::Result<Vec<CatalogModel>> {
                 context_window: r.try_get("context_window").unwrap_or(8192),
                 supports_tool_use: r.try_get("supports_tool_use").unwrap_or(true),
                 capabilities,
+                agentic_thinking_policy: r
+                    .try_get("agentic_thinking_policy")
+                    .unwrap_or_else(|_| "none".into()),
             }
         })
         .collect())
@@ -604,6 +623,12 @@ fn select_top_candidates(req: &IntentRequirement, catalog: &[CatalogModel]) -> V
         .filter(|m| {
             // Filtri obbligatori.
             if req.requires_tool_use && !m.supports_tool_use {
+                return false;
+            }
+            // FASE 2b: per gli slot che richiedono tool_use, escludi i modelli
+            // con agentic_thinking_policy='exclude' (allineamento al routing live,
+            // ADR 0025): cosi' la matrix non pinna modelli che il live scarta.
+            if req.requires_tool_use && m.agentic_thinking_policy == "exclude" {
                 return false;
             }
             if !req.required_capabilities.is_empty() && !m.capabilities.is_empty() {
@@ -664,9 +689,11 @@ fn select_top_candidates(req: &IntentRequirement, catalog: &[CatalogModel]) -> V
 ///     provider+modello concreto viene scelto QUI. Niente piu' modelli pinnati
 ///     che marciscono (regola G/H).
 ///
-/// I pesi sono i default della tabella `nexus_intent_routing_requirements`
-/// (vedi `load_requirements`): il routing slot-based eredita la stessa
-/// calibrazione del routing per intent, senza duplicarla.
+/// I pesi di scoring provengono dalla riga sentinella `intent='*'` di
+/// `nexus_intent_routing_requirements`, lette via
+/// `orchestrator::default_scoring_weights` (regola G: niente pesi hardcoded;
+/// punto unico dei pesi di default, condiviso con le viste runtime in FASE 2).
+/// `cost_direction` resta una scelta esplicita del chiamante.
 pub(crate) async fn select_models_for_requirement(
     db: &PgPool,
     preferred_tier: &str,
@@ -675,16 +702,19 @@ pub(crate) async fn select_models_for_requirement(
     cost_direction: &str,
 ) -> sqlx::Result<Vec<(String, String)>> {
     let catalog = load_catalog(db).await?;
+    let weights = crate::orchestrator::default_scoring_weights(db)
+        .await
+        .map_err(sqlx::Error::Protocol)?;
     let req = IntentRequirement {
         intent: String::new(),
         behavior_mode: String::new(),
         required_capabilities: required_capabilities.to_vec(),
         requires_tool_use,
         preferred_tier: preferred_tier.to_string(),
-        weight_tier: 0.35,
-        weight_cost: 0.25,
-        weight_context: 0.20,
-        weight_capabilities: 0.20,
+        weight_tier: weights.tier,
+        weight_cost: weights.cost,
+        weight_context: weights.context,
+        weight_capabilities: weights.capabilities,
         cost_direction: cost_direction.to_string(),
     };
     Ok(select_top_candidates(&req, &catalog)
@@ -717,7 +747,7 @@ fn score_model(req: &IntentRequirement, m: &CatalogModel, full_catalog: &[Catalo
         + req.weight_capabilities * cap_score
 }
 
-fn tier_score(preferred: &str, actual: &str) -> f32 {
+pub(crate) fn tier_score(preferred: &str, actual: &str) -> f32 {
     let pref_rank = tier_rank(preferred);
     let actual_rank = tier_rank(actual);
     let diff = (pref_rank - actual_rank).abs();
@@ -728,7 +758,7 @@ fn tier_score(preferred: &str, actual: &str) -> f32 {
     }
 }
 
-fn tier_rank(tier: &str) -> i32 {
+pub(crate) fn tier_rank(tier: &str) -> i32 {
     match tier {
         "heavy" => 2,
         "medium" => 1,
@@ -737,9 +767,15 @@ fn tier_rank(tier: &str) -> i32 {
     }
 }
 
-fn cost_score(req: &IntentRequirement, m: &CatalogModel, catalog: &[CatalogModel]) -> f32 {
-    // Trova min e max cost nel catalog (filtrato per tier match per essere
-    // confrontabile).
+pub(crate) fn cost_score(
+    req: &IntentRequirement,
+    m: &CatalogModel,
+    catalog: &[CatalogModel],
+) -> f32 {
+    // Normalizza il costo sul pool di candidati passato (l'INTERO catalog
+    // eleggibile ricevuto da score_model, NON filtrato per tier). min/max sono
+    // calcolati su quei costi; in pool piccoli la normalizzazione e' sensibile
+    // al range (nota per FASE 2).
     let costs: Vec<f64> = catalog
         .iter()
         .map(|c| c.input_cost)
@@ -763,7 +799,7 @@ fn cost_score(req: &IntentRequirement, m: &CatalogModel, catalog: &[CatalogModel
     }
 }
 
-fn context_score(ctx: i32) -> f32 {
+pub(crate) fn context_score(ctx: i32) -> f32 {
     // log scale: 8k = 0, 1M = 1.
     if ctx <= 8192 {
         return 0.0;
@@ -774,7 +810,7 @@ fn context_score(ctx: i32) -> f32 {
     ((log_ctx - min_log) / (max_log - min_log)).clamp(0.0, 1.0)
 }
 
-fn capability_match_pct(required: &[String], available: &[String]) -> f32 {
+pub(crate) fn capability_match_pct(required: &[String], available: &[String]) -> f32 {
     if required.is_empty() {
         return 1.0;
     }
@@ -805,7 +841,28 @@ mod tests {
             context_window: ctx,
             supports_tool_use: tools,
             capabilities: caps.iter().map(|s| s.to_string()).collect(),
+            agentic_thinking_policy: "none".into(),
         }
+    }
+
+    fn model_with_policy(
+        p: &str,
+        name: &str,
+        tier: &str,
+        tools: bool,
+        policy: &str,
+    ) -> CatalogModel {
+        let mut m = model(
+            p,
+            name,
+            tier,
+            1.0,
+            200_000,
+            tools,
+            vec!["code", "reasoning"],
+        );
+        m.agentic_thinking_policy = policy.into();
+        m
     }
 
     fn req(
@@ -890,6 +947,28 @@ mod tests {
         );
         assert_eq!(capability_match_pct(&req_caps, &["code".into()]), 0.5);
         assert_eq!(capability_match_pct(&req_caps, &[]), 0.0);
+    }
+
+    #[test]
+    fn select_top_excludes_policy_exclude_when_tool() {
+        let catalog = vec![
+            model_with_policy("a", "escluso", "heavy", true, "exclude"),
+            model_with_policy("b", "ok", "heavy", true, "none"),
+        ];
+        let r = req(
+            "agentic_default",
+            "approfondita",
+            vec!["code"],
+            true,
+            "heavy",
+            "asc",
+        );
+        let top = select_top_candidates(&r, &catalog);
+        assert!(
+            top.iter().all(|s| s.catalog.model != "escluso"),
+            "agentic_thinking_policy='exclude' non deve essere candidabile per slot tool"
+        );
+        assert!(top.iter().any(|s| s.catalog.model == "ok"));
     }
 
     #[test]

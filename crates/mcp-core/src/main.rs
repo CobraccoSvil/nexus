@@ -1,6 +1,5 @@
 mod admin;
 mod agent_processes;
-mod process_resume;
 mod agent_router_server;
 mod agent_todos_routes;
 mod agent_tool_result_cache;
@@ -27,12 +26,10 @@ mod dlp;
 mod documents;
 mod domain;
 mod environment;
+mod file_mutations;
 mod github;
 mod internal_learning;
-mod file_mutations;
 mod internal_routing;
-mod mutations_api;
-mod session_autocommit;
 mod llm_json;
 mod long_running;
 mod mcp_client;
@@ -41,6 +38,7 @@ mod middleware;
 mod model_catalog_sync;
 mod model_health_probe;
 mod models;
+mod mutations_api;
 mod nexus_autofix_worker;
 mod nexus_bridge;
 mod nexus_builtin;
@@ -53,6 +51,7 @@ mod orchestrator;
 pub mod playwright_live;
 mod plugins;
 mod port_registry;
+mod process_resume;
 mod profiles;
 mod project_context;
 mod project_db;
@@ -75,11 +74,13 @@ mod routing_slots;
 mod sandbox;
 mod security;
 mod services_watchdog;
+mod session_autocommit;
 mod settings;
 mod static_preview;
 mod sudo_manager;
 mod sudo_routes;
 mod task_watchdog;
+mod tool_capability;
 mod tool_runner_server;
 mod vector_memory;
 mod wiki;
@@ -665,11 +666,9 @@ async fn main() -> anyhow::Result<()> {
     {
         let state_bootstrap = state.clone();
         tokio::spawn(async move {
-            let empty: bool = match sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM wiki_docs",
-            )
-            .fetch_one(&state_bootstrap.db)
-            .await
+            let empty: bool = match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM wiki_docs")
+                .fetch_one(&state_bootstrap.db)
+                .await
             {
                 Ok(n) => n == 0,
                 Err(e) => {
@@ -1334,7 +1333,10 @@ async fn main() -> anyhow::Result<()> {
         if suspects.is_empty() {
             format!(" [origine: ppid={ppid}; nessun mittente sospetto in /proc — probabile kill manuale o systemd]")
         } else {
-            format!(" [origine: ppid={ppid}; candidati mittenti: {}]", suspects.join(" | "))
+            format!(
+                " [origine: ppid={ppid}; candidati mittenti: {}]",
+                suspects.join(" | ")
+            )
         }
     }
 
@@ -1364,23 +1366,39 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Ctrl-C ricevuto — avvio graceful shutdown");
         }
 
-        // Flush NexusBridge state (Q-table + replication:pending → PostgreSQL)
-        if let Some(bridge) = nexus_bridge::NexusBridge::global() {
-            bridge.shutdown().await;
-        }
-
-        // Safety net force-exit (Bug D fix #80): se axum::serve non si chiude
-        // entro 10s dopo il signal (es. SSE/long-poll in-flight), forziamo
-        // l'exit del processo. I dati critici (Q-table) sono gia' stati
-        // flushati da `bridge.shutdown()`. La unit systemd ha TimeoutStopSec=15
-        // come ulteriore safety net (SIGKILL forzato dopo 15s).
+        // Safety net force-exit (Bug D fix #80 + fix shutdown-hang 2026-06-10):
+        // spawnato PRIMA di qualunque flush. Il bug storico: il watchdog partiva
+        // DOPO `bridge.shutdown().await`, quindi se era proprio il flush a
+        // bloccarsi (acquire del pool sqlx senza timeout: 2 flush x ~30s = il
+        // "deactivating 1+ min" osservato, porta 4000 occupata, serviva
+        // pkill -9) il timer di sicurezza non partiva mai. Ora il limite
+        // massimo ASSOLUTO dello shutdown e' 10s dal segnale, qualunque cosa
+        // si blocchi dopo (flush, SSE/long-poll in-flight, lock contesi).
+        // La unit systemd (nexus-mcp-core.service) ha TimeoutStopSec=15 come
+        // ulteriore safety net (SIGKILL dopo 15s).
         tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             tracing::warn!(
-                "shutdown timeout 10s superato (probabilmente SSE/long-poll in-flight), force-exit"
+                "shutdown timeout 10s superato (flush appeso o SSE/long-poll in-flight), force-exit"
             );
             std::process::exit(0);
         });
+
+        // Flush NexusBridge state (Q-table + replication:pending → PostgreSQL).
+        // Best-effort con timeout proprio: un DB lento/irraggiungibile durante lo
+        // shutdown non deve tenere in ostaggio il processo (i flush periodici in
+        // esercizio hanno gia' persistito quasi tutto; questo e' l'ultimo delta).
+        if let Some(bridge) = nexus_bridge::NexusBridge::global() {
+            if tokio::time::timeout(std::time::Duration::from_secs(5), bridge.shutdown())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "NexusBridge.shutdown() oltre 5s (DB lento o lock conteso): \
+                     procedo con lo shutdown senza attendere il flush"
+                );
+            }
+        }
     };
 
     axum::serve(listener, app)

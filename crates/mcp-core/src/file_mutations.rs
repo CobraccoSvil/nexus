@@ -250,7 +250,10 @@ pub enum RevertOutcome {
     /// registrato: significa che l'utente o un altro tool ha modificato il file
     /// dopo questa mutazione. Per non perdere quelle modifiche silenziosamente
     /// rifiutiamo (regola H) — il chiamante puo' forzare con `force=true`.
-    Conflict { current_sha: String, expected_sha: String },
+    Conflict {
+        current_sha: String,
+        expected_sha: String,
+    },
     /// Errore I/O o DB.
     IoError(String),
 }
@@ -333,7 +336,9 @@ pub async fn revert_mutation(
             if before_content.is_some() {
                 // Inconsistenza: op=created ma before_content presente. Per non
                 // perdere dati lo ripristiniamo come scrittura.
-                if let Err(e) = tokio::fs::write(&abs, before_content.as_deref().unwrap_or("")).await {
+                if let Err(e) =
+                    tokio::fs::write(&abs, before_content.as_deref().unwrap_or("")).await
+                {
                     return RevertOutcome::IoError(e.to_string());
                 }
                 new_after_content = before_content.clone();

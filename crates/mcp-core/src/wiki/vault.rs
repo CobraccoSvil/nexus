@@ -299,14 +299,13 @@ pub async fn vault_root_for_scope(
         WikiScope::Meta => {
             // Stessa logica di `meta_docs::apply::resolve_vault_root`, replicata
             // qui per non dipendere dal modulo legacy.
-            let vault_rel: String = sqlx::query_scalar(
-                "SELECT value FROM settings WHERE key = 'meta_docs.vault_path'",
-            )
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "docs/.nexus-vault".to_string());
+            let vault_rel: String =
+                sqlx::query_scalar("SELECT value FROM settings WHERE key = 'meta_docs.vault_path'")
+                    .fetch_optional(&state.db)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "docs/.nexus-vault".to_string());
             let repo_root = std::env::var("NEXUS_REPO_ROOT")
                 .unwrap_or_else(|_| "/home/administrator/ideai".to_string());
             Ok(format!("{}/{}", repo_root.trim_end_matches('/'), vault_rel))
@@ -314,14 +313,13 @@ pub async fn vault_root_for_scope(
         WikiScope::Project => {
             let pid = project_id
                 .context("scope=project ma project_id assente in vault_root_for_scope")?;
-            let root: Option<String> = sqlx::query_scalar(
-                "SELECT repository_root_path FROM projects WHERE id = $1",
-            )
-            .bind(pid)
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten();
+            let root: Option<String> =
+                sqlx::query_scalar("SELECT repository_root_path FROM projects WHERE id = $1")
+                    .bind(pid)
+                    .fetch_optional(&state.db)
+                    .await
+                    .ok()
+                    .flatten();
             let base = root
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| format!("/tmp/nexus-vault-{pid}"));

@@ -53,8 +53,8 @@ impl ChatNoteSettings {
             enabled: true,
             interval_secs: 30,
             min_body_chars: 100,
-            skip_pattern_raw:
-                r"^(ok|si|sì|no|grazie|ciao|bene|perfetto|ottimo)[.!?\s]*$".to_string(),
+            skip_pattern_raw: r"^(ok|si|sì|no|grazie|ciao|bene|perfetto|ottimo)[.!?\s]*$"
+                .to_string(),
             max_per_minute: 50,
         }
     }
@@ -165,10 +165,7 @@ pub fn start_chat_note_worker(state: Arc<AppState>) {
             match scan_and_ingest(&state, &settings).await {
                 Ok(n) => {
                     if n > 0 {
-                        tracing::info!(
-                            ingested = n,
-                            "wiki.chat_note: batch completato"
-                        );
+                        tracing::info!(ingested = n, "wiki.chat_note: batch completato");
                     }
                 }
                 Err(e) => {
@@ -239,8 +236,9 @@ async fn scan_and_ingest(state: &AppState, settings: &ChatNoteSettings) -> Resul
             Err(_) => continue,
         };
         let content: String = row.try_get("content").unwrap_or_default();
-        let created_at: chrono::DateTime<chrono::Utc> =
-            row.try_get("created_at").unwrap_or_else(|_| chrono::Utc::now());
+        let created_at: chrono::DateTime<chrono::Utc> = row
+            .try_get("created_at")
+            .unwrap_or_else(|_| chrono::Utc::now());
 
         // Filtro 1: lunghezza minima.
         if content.trim().chars().count() < settings.min_body_chars {
@@ -255,7 +253,10 @@ async fn scan_and_ingest(state: &AppState, settings: &ChatNoteSettings) -> Resul
             }
         }
 
-        match ingest_message(state, message_id, project_id, session_id, &content, created_at).await
+        match ingest_message(
+            state, message_id, project_id, session_id, &content, created_at,
+        )
+        .await
         {
             Ok(true) => {
                 ingested += 1;

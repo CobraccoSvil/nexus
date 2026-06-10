@@ -39,8 +39,17 @@ impl NexusToolHandler for ProjectDbDumpSchemaTool {
         // Punto unico in nexus_tools::run_pg_dump (regola L, S74).
         let outcome = super::run_pg_dump(
             &[
-                "-h", &host, "-p", &port, "-U", &user, "-d", &dbname,
-                "--schema-only", "-f", &backup_path_str,
+                "-h",
+                &host,
+                "-p",
+                &port,
+                "-U",
+                &user,
+                "-d",
+                &dbname,
+                "--schema-only",
+                "-f",
+                &backup_path_str,
             ],
             &password,
             None,

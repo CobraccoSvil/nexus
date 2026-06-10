@@ -159,7 +159,11 @@ pub async fn get_project_problems(
         let detail: Option<String> = row.try_get("detail").ok().flatten();
         // signal_kind = "crash" e' grave; "anomaly" e' warning a meno che la
         // metrica non sia chiaramente critica (cpu fuori range, errori/min alti).
-        let severity = if signal_kind == "crash" { "error" } else { "warning" };
+        let severity = if signal_kind == "crash" {
+            "error"
+        } else {
+            "warning"
+        };
         let metric_part = match (metric.as_deref(), value, threshold) {
             (Some(m), Some(v), Some(t)) => format!(" — {m}={v:.1} (soglia {t:.1})"),
             (Some(m), Some(v), None) => format!(" — {m}={v:.1}"),
@@ -184,14 +188,8 @@ pub async fn get_project_problems(
     }
 
     for row in runtime_rows {
-        let details = row
-            .try_get::<Option<String>, _>("details")
-            .ok()
-            .flatten();
-        let tool_name = row
-            .try_get::<Option<String>, _>("tool_name")
-            .ok()
-            .flatten();
+        let details = row.try_get::<Option<String>, _>("details").ok().flatten();
+        let tool_name = row.try_get::<Option<String>, _>("tool_name").ok().flatten();
         let command = row.try_get::<Option<String>, _>("command").ok().flatten();
         let exit_code = row.try_get::<Option<i32>, _>("exit_code").ok().flatten();
         let source = row.get::<String, _>("source");

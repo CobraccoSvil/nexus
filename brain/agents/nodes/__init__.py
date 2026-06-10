@@ -85,7 +85,7 @@ from .helpers import (
     _emit_thinking,
     _describe_tool_call,
     _ACTION_PATTERNS,
-    _detect_action_request,
+    turn_action_oriented,
     _INTENT_NARRATION_PATTERNS,
     _detect_unfulfilled_intent,
     _detect_polling_wait,
@@ -97,6 +97,7 @@ from .helpers import (
     _detect_repeated_failed_command,
     _detect_repeated_action,
     _load_repeated_action_threshold,
+    _load_repeated_action_force_diagnose_enabled,
     _detect_recent_tool_error,
     _PRICE_CACHE,
     _PRICE_CACHE_TS,
@@ -567,7 +568,22 @@ async def router_node(state: AgentState) -> dict[str, Any]:
     task_complexity: str | None = None
     agentic_score_val: float | None = None
     is_ambiguous_val: bool | None = None
-    if _agentic_classifier is not None:
+    requires_tools_val: bool | None = None
+    # Intent gia' RISOLTO a monte (mcp-core, risposta dell'utente a una
+    # disambiguazione "A"/"B"/"C"): si usa quello, NIENTE ri-classificazione.
+    # Ri-classificare la lettera secca dava 'chat' (prompt_len=1), vanificando
+    # la scelta appena fatta dall'utente (bug di continuita' osservato in UI).
+    _intent_hint = str(state.get("intent_hint") or "").strip()
+    if _intent_hint:
+        logger.info(
+            "router_node: intent_hint='%s' da mcp-core (disambiguazione risolta) "
+            "-> salto la classificazione",
+            _intent_hint,
+        )
+        intent = _intent_hint
+        intent_confidence = 1.0
+        is_ambiguous_val = False
+    elif _agentic_classifier is not None:
         try:
             ag = await _agentic_classifier.classify(str(text))
             if ag is not None:
@@ -578,6 +594,7 @@ async def router_node(state: AgentState) -> dict[str, Any]:
                 task_complexity = getattr(ag, "complexity", None)
                 agentic_score_val = getattr(ag, "agentic_score", None)
                 is_ambiguous_val = getattr(ag, "is_ambiguous", None)
+                requires_tools_val = getattr(ag, "requires_tools", None)
                 logger.info(
                     "router_node: classifier LLM -> intent=%s conf=%.2f complexity=%s "
                     "agentic=%.2f ambiguous=%s",
@@ -594,6 +611,42 @@ async def router_node(state: AgentState) -> dict[str, Any]:
         logger.warning(
             "router_node: _agentic_classifier non configurato -> agentic_default"
         )
+
+    # ── Punto unico action-oriented (regola L, incidente "riassumi" 2026-06-10) ──
+    # Decide UNA volta per turno se la richiesta CORRENTE e' d'azione (tool use)
+    # o conversazionale (risposta testuale), dalla semantica del classifier LLM
+    # sul TURNO CORRENTE — niente euristiche keyword sparse valutate sul PRIMO
+    # messaggio della history (che rendevano "azione" per sempre ogni turno di
+    # una sessione iniziata con una richiesta operativa). Consumatori via
+    # helpers.turn_action_oriented(): tool_choice forcing, G1 anti-descrittivo,
+    # resoconto onesto, route_after_executor.
+    if _intent_hint:
+        # Disambiguazione risolta dall'utente: i candidati proposti sono intent
+        # operativi -> il turno e' d'azione per costruzione.
+        action_oriented_val = True
+    elif requires_tools_val is not None or agentic_score_val is not None:
+        _ao_min = 0.5
+        try:
+            from brain.utils.settings_db import get_setting as _ao_get
+            _ao_min = float(
+                _ao_get("routing.action_oriented_min_agentic_score", "0.5")
+            )
+        except Exception:
+            pass
+        action_oriented_val = (
+            bool(requires_tools_val)
+            or float(agentic_score_val or 0.0) >= _ao_min
+        )
+    else:
+        # Classifier non disponibile (agentic_default): conservativo True — i
+        # guard anti-descrittivi restano attivi e il toolkit minimal lascia
+        # comunque l'agente libero di interpretare.
+        action_oriented_val = True
+    logger.info(
+        "router_node: action_oriented=%s (requires_tools=%s agentic=%.2f hint=%s)",
+        action_oriented_val, requires_tools_val,
+        float(agentic_score_val or 0.0), bool(_intent_hint),
+    )
 
     behavior_mode = state.get("behavior_mode", "bilanciata")
 
@@ -710,6 +763,9 @@ async def router_node(state: AgentState) -> dict[str, Any]:
         updates["agentic_score"] = agentic_score_val
     if is_ambiguous_val is not None:
         updates["is_ambiguous"] = is_ambiguous_val
+    # Punto unico action-oriented: SEMPRE presente nello state dopo il router
+    # (i consumatori leggono via turn_action_oriented, default True se assente).
+    updates["action_oriented"] = action_oriented_val
 
     if profile is not None:
         updates["profile_name"] = profile.name
@@ -1454,20 +1510,14 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         and _prev_stop_for_g1 in ("end_turn", "stop", None)
         and not (state.get("pending_tool_uses") or [])
     ):
-        _first_human_for_g1 = next(
-            (getattr(m, "content", "") for m in messages if hasattr(m, "type") and m.type == "human"),
-            "",
-        )
-        if isinstance(_first_human_for_g1, list):
-            _first_human_for_g1 = " ".join(
-                b.get("text", "") for b in _first_human_for_g1 if isinstance(b, dict)
-            )
         # Conta la re-entry G1 sia per richiesta action-oriented (input) sia
         # per intenzione annunciata e non compiuta (output): cosi' il cap
         # anti-loop si applica anche ai debug dove il primo messaggio non e'
         # imperativo ma il modello narra "Inizio verificando X" senza agire.
+        # action-oriented dal punto unico (classifier LLM sul turno corrente,
+        # regola L): niente piu' euristica sul primo messaggio della history.
         _g1_should_count = (
-            _detect_action_request(str(_first_human_for_g1))
+            turn_action_oriented(state)
             or _detect_unfulfilled_intent(_last_assistant_text(messages))
         )
         if _g1_should_count:
@@ -1603,6 +1653,9 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     # Veicolato dal progress_controller (livello GUIDE) attraverso il nodo.
     _force_action_hard = False
     _progress_guided: set[str] = set(state.get("progress_guided_axes") or [])
+    # Assi gia' passati per la diagnosi forzata (force_diagnose), persistiti tra
+    # i turni del run (mig 0386): al loro ritorno la gerarchia sale a escalate/abort.
+    _progress_diagnosed: set[str] = set(state.get("progress_diagnosed_axes") or [])
     _progress_ctrl_on = _load_progress_controller_enabled()
     if _exploration_count >= 2 * _exploration_threshold and _progress_ctrl_on:
         # PUNTO UNICO (progress_controller): a 2x soglia NON abortiamo subito. La
@@ -1737,11 +1790,14 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             # una futura ripetizione (anche di un'azione diversa) riparte da GUIDE
             # e non salta dritta all'abort (reset coordinato, regola L).
             _progress_guided.discard("repeated_action")
+            _progress_diagnosed.discard("repeated_action")
         else:
             from .. import progress_controller as _pc_ra
             _ra_dec = _pc_ra.decide(_pc_ra.ProgressSignals(
                 repeated_action=(_ra_label, _ra_count),
                 already_guided=frozenset(_progress_guided),
+                already_diagnosed=frozenset(_progress_diagnosed),
+                force_diagnose_enabled=_load_repeated_action_force_diagnose_enabled(),
                 has_escalation_candidate=False,
             ))
             if _ra_dec.action == "guide":
@@ -1753,16 +1809,48 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                     "('%s' x%d) -> nudge anti-ripetizione",
                     _ra_label, _ra_count,
                 )
+            elif _ra_dec.action == "force_diagnose":
+                # Stadio intermedio: GUIDE non ha cambiato nulla. Obbliga la
+                # diagnosi del fallimento e un cambio di azione (o la dichiarazione
+                # esplicita di blocco), prima di abortire. Persistiamo l'asse cosi'
+                # al prossimo turno la gerarchia sale ad abort (mig 0386).
+                _progress_diagnosed.add("repeated_action")
+                if _ra_dec.nudge_text:
+                    messages = list(messages) + [HumanMessage(content=_ra_dec.nudge_text)]
+                logger.warning(
+                    "executor_node: progress_controller FORCE_DIAGNOSE repeated_action "
+                    "('%s' x%d) -> nudge diagnosi forzata",
+                    _ra_label, _ra_count,
+                )
             elif _ra_dec.action == "abort":
                 logger.warning(
                     "executor_node: progress_controller ABORT repeated_action "
                     "('%s' x%d): %s",
                     _ra_label, _ra_count, _ra_dec.reason,
                 )
+                # Recap M44 deterministico (esito + cosa fatto + prossimo passo)
+                # invece del messaggio grezzo: il finale non e' piu' ambiguo. I file
+                # toccati arrivano da agent_steps (estrattore riusato, regola L).
+                from ..regression_gate_node import _modified_files_from_steps
+                _run_id_recap = str(state.get("thread_id") or "")
+                _modified = (
+                    _modified_files_from_steps(_run_id_recap) if _run_id_recap else []
+                )
+                _files_line = (
+                    "File toccati: " + ", ".join(_modified)
+                    if _modified
+                    else "File toccati: nessuno."
+                )
                 _ra_text = (
-                    f"Hai ripetuto la stessa azione ({_ra_label}) {_ra_count} volte "
-                    f"senza progresso, anche dopo il sollecito a procedere. Chiudo "
-                    f"passando per la verifica del flusso reale."
+                    f"ESITO: non completato.\n"
+                    f"Mi sono bloccato ripetendo la stessa azione ({_ra_label}) "
+                    f"{_ra_count} volte senza che il risultato cambiasse; interrompo "
+                    f"invece di insistere a vuoto.\n"
+                    f"{_files_line}\n"
+                    f"Prossimo passo: identificare la causa radice del fallimento di "
+                    f"'{_ra_label}' dall'output/errore qui sopra e procedere con un "
+                    f"approccio diverso; se sei bloccato da una dipendenza/credenziale/"
+                    f"permesso/servizio mancante, indicalo esplicitamente."
                 )
                 return {
                     "messages": [AIMessage(content=_ra_text)],
@@ -1771,6 +1859,7 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                     "stop_reason": _ra_dec.stop_reason,
                     "iterations": int(state.get("iterations") or 0) + 1,
                     "progress_guided_axes": sorted(_progress_guided),
+                    "progress_diagnosed_axes": sorted(_progress_diagnosed),
                     "forced_close_unverified": True,
                 }
 
@@ -1835,7 +1924,20 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             # Passa anche il message originale: il router lo usa per detection
             # task rischiosi (override automatico a behavior_mode "approfondita"
             # se rileva verbi distruttivi: rm -rf, drop table, docker prune, ecc.)
-            _last_msg_text = messages[-1].content if messages else ""
+            # ROOT CAUSE (2026-06-10, run hollow al 2o turno): messages[-1] dopo
+            # un tool e' il tool-result (content anche vuoto/strutturato), NON il
+            # task utente. Un message vuoto al /decide produce HTTP 400 ->
+            # sentinella __router_unavailable__ -> il run muore con
+            # EMPTY_ANSWER+NO_TOOLS. Si usa l'ultimo messaggio UTENTE non vuoto
+            # (semanticamente corretto anche per la risky-detection).
+            _last_msg_text = ""
+            for _m in reversed(messages):
+                if getattr(_m, "type", None) in ("human", "user"):
+                    _c = getattr(_m, "content", "") or ""
+                    _c_text = _c if isinstance(_c, str) else str(_c)
+                    if _c_text.strip():
+                        _last_msg_text = _c_text
+                        break
             # Floor selettivo: un task agentico "pesante" (agentic_score/budget alto)
             # in modalita' veloce/economica viene elevato a un tier tool-robust, cosi'
             # il loop tool-use non cade su un modello lite. Non tocca sticky/override.
@@ -1925,22 +2027,15 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         and _nudge_count < 2                              # max 2 nudge totali
         and not _has_tool_calls_in_history(messages)     # nessun tool call nella history
     ):
-        # Estrai il primo messaggio umano per capire se è action-oriented
-        _first_human_text = next(
-            (getattr(m, "content", "") for m in messages if hasattr(m, "type") and m.type == "human"),
-            "",
-        )
-        if isinstance(_first_human_text, list):
-            _first_human_text = " ".join(
-                b.get("text", "") for b in _first_human_text if isinstance(b, dict)
-            )
         # G1 esteso: il nudge scatta sia quando la richiesta utente e' un'azione
         # concreta (input action-oriented) sia quando il modello ha appena
         # ANNUNCIATO un'azione imminente senza eseguirla (output con intenzione
         # non compiuta — "Inizio verificando index.html" e poi chiude). Questo
         # secondo caso copre i debug/diagnosi dove il primo messaggio non e'
         # imperativo ma l'agente narra il piano invece di agire.
-        _is_action_req = _detect_action_request(str(_first_human_text))
+        # action-oriented dal punto unico (classifier LLM sul turno corrente,
+        # regola L): niente piu' euristica sul primo messaggio della history.
+        _is_action_req = turn_action_oriented(state)
         _last_asst_text = _last_assistant_text(messages)
         _is_unfulfilled = _detect_unfulfilled_intent(_last_asst_text)
         _is_polling = _detect_polling_wait(_last_asst_text)
@@ -2219,16 +2314,13 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 should_force_tool_choice,
             )
             _tc_enabled, _tc_max_iter = _load_tool_choice_forcing_config()
-            # action_oriented: riusa il rilevamento sul primo messaggio umano.
-            _first_human_tc = next(
-                (getattr(m, "content", "") for m in messages if hasattr(m, "type") and m.type == "human"),
-                "",
-            )
-            if isinstance(_first_human_tc, list):
-                _first_human_tc = " ".join(
-                    b.get("text", "") for b in _first_human_tc if isinstance(b, dict)
-                )
-            _action_oriented_tc = _detect_action_request(str(_first_human_tc))
+            # action_oriented dal punto unico (classifier LLM sul TURNO CORRENTE,
+            # regola L). L'euristica sul PRIMO messaggio della history rendeva
+            # "azione" per sempre ogni turno di una sessione iniziata con una
+            # richiesta operativa: "riassumi in due righe cosa hai sistemato"
+            # finiva con tool_choice forzato e npm run dev rieseguito invece
+            # della risposta testuale (incidente 2026-06-10).
+            _action_oriented_tc = turn_action_oriented(state)
             # in_discovery_phase: turno M16 dove esponiamo solo il meta-tool di
             # search (il forcing della search e' gia' gestito separatamente).
             _names_tc = {t.get("name") for t in tools_json if isinstance(t, dict)}
@@ -2713,19 +2805,9 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         if _auto_mode not in ("automatic", "continuous") and _detect_unfulfilled_intent(
             result_text
         ):
-            _first_human_rep = next(
-                (
-                    getattr(m, "content", "")
-                    for m in messages
-                    if hasattr(m, "type") and m.type == "human"
-                ),
-                "",
-            )
-            if isinstance(_first_human_rep, list):
-                _first_human_rep = " ".join(
-                    b.get("text", "") for b in _first_human_rep if isinstance(b, dict)
-                )
-            if not _detect_action_request(str(_first_human_rep)):
+            # action-oriented dal punto unico (classifier LLM sul turno corrente,
+            # regola L): niente piu' euristica sul primo messaggio della history.
+            if not turn_action_oriented(state):
                 _report = build_unfulfilled_report(result_text, messages)
                 result_text = _report
                 assistant_msg = AIMessage(
@@ -2752,6 +2834,7 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         "consecutive_exploration_calls": _updated_exploration_count,
         "exploration_nudge_sent": _updated_exploration_nudge_sent,
         "progress_guided_axes": sorted(_progress_guided),
+        "progress_diagnosed_axes": sorted(_progress_diagnosed),
         "repeated_cmd_nudge_sent": _repeated_cmd_nudge_sent,
         "auto_escalations": escalations if loop_sig is not None else int(state.get("auto_escalations") or 0),
         "prompt_tokens": prompt_tokens,
@@ -2811,6 +2894,24 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
 
     if not pending:
         return {"pending_tool_uses": [], "stop_reason": "end_turn"}
+
+    # Stop COOPERATIVO anche qui (estensione mig 0370): se il run e' stato
+    # superato/cancellato mentre l'LLM produceva i tool_use, NON eseguiamo i
+    # tool. Senza questo check il run superato esegue comunque l'intera batch
+    # pending (npm install, run_command lunghi...) prima di rientrare in
+    # executor_node — l'unico punto che controllava _check_superseded — e per
+    # tutta quella finestra girano DUE run davvero paralleli sulla stessa
+    # sessione (doppio carico LLM+embedding, contesa risorse: osservato come
+    # "2 agenti in esecuzione parallela" + pressione memoria sul brain).
+    # L'edge fisso tool_dispatch->executor porta poi alla chiusura cooperativa
+    # gia' esistente (route_after_executor: stop_reason='superseded' -> learner).
+    if _check_superseded(state):
+        logger.warning(
+            "tool_dispatch_node: run superato/cancellato, salto %d tool pending "
+            "(uscita cooperativa, thread=%s)",
+            len(pending), state.get("thread_id"),
+        )
+        return {"pending_tool_uses": [], "stop_reason": "superseded"}
 
     if _tool_runner is None:
         logger.error("tool_dispatch_node: ToolRunnerClient non configurato")

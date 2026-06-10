@@ -21,7 +21,9 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::agent_types::SupervisorMode;
-use crate::chat_messages::{insert_message, spawn_agent_run, SpawnAgentParams};
+use crate::chat_messages::{
+    insert_message, session_has_active_run, spawn_agent_run, SpawnAgentParams, SpawnOutcome,
+};
 use crate::orchestrator::AutomationMode;
 use crate::AppState;
 
@@ -41,9 +43,7 @@ pub fn spawn_process_resume_worker(state: AppState) {
             sleep(Duration::from_secs(poll)).await;
         }
     });
-    tracing::info!(
-        "process_resume worker: avviato (cablaggio process-completion -> agent-resume)"
-    );
+    tracing::info!("process_resume worker: avviato (cablaggio process-completion -> agent-resume)");
 }
 
 async fn is_enabled(db: &PgPool) -> bool {
@@ -51,7 +51,12 @@ async fn is_enabled(db: &PgPool) -> bool {
         .await
         .ok()
         .flatten()
-        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .map(|v| {
+            !matches!(
+                v.trim().to_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(true)
 }
 
@@ -141,9 +146,7 @@ async fn announce_cap_reached_in_chat(
         "cap": cap,
         "source": "process_resume",
     });
-    if let Err(e) =
-        insert_message(db, session_id, project_id, "user", &content, meta, None).await
-    {
+    if let Err(e) = insert_message(db, session_id, project_id, "user", &content, meta, None).await {
         tracing::warn!("process_resume: cap_reached announce fallito: {e:?}");
     }
 }
@@ -166,14 +169,18 @@ struct DockerHealth {
 /// container del progetto sono in stato "running" (o "healthy" se hanno
 /// healthcheck). Restart in corso / Exited / Restarting -> healthy=false con
 /// summary leggibile da iniettare all'agente.
-async fn inspect_docker_compose_health(db: &sqlx::PgPool, project_id: Uuid) -> Option<DockerHealth> {
-    let slug: String =
-        sqlx::query_scalar("SELECT lower(replace(replace(name, ' ', '-'), '_', '-')) FROM projects WHERE id = $1")
-            .bind(project_id)
-            .fetch_optional(db)
-            .await
-            .ok()
-            .flatten()?;
+async fn inspect_docker_compose_health(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+) -> Option<DockerHealth> {
+    let slug: String = sqlx::query_scalar(
+        "SELECT lower(replace(replace(name, ' ', '-'), '_', '-')) FROM projects WHERE id = $1",
+    )
+    .bind(project_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()?;
     if slug.is_empty() {
         return None;
     }
@@ -230,8 +237,13 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
 
     let cap = load_i64(&state.db, "agent.process_resume.max_per_session_hour", 12).await;
-    let tail_chars =
-        load_u64(&state.db, "agent.process_resume.output_tail_chars", 2000, 200).await as usize;
+    let tail_chars = load_u64(
+        &state.db,
+        "agent.process_resume.output_tail_chars",
+        2000,
+        200,
+    )
+    .await as usize;
 
     for row in rows {
         let id: Uuid = row.get("id");
@@ -243,6 +255,27 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
         let exit_code: Option<i32> = row.try_get("exit_code").unwrap_or(None);
         let output: String = row.try_get("output").unwrap_or_default();
         let error_output: String = row.try_get("error_output").unwrap_or_default();
+
+        // Guard anti auto-supersede (fix run uccisi dal proprio comando background):
+        // il resume serve a RISVEGLIARE l'agente quando e' a riposo, NON a
+        // interromperlo. Se sulla sessione c'e' gia' un run attivo (tipicamente
+        // proprio quello che ha lanciato questo comando background e sta ancora
+        // lavorando), spawn_agent_run lo supererebbe via last-wins
+        // (supersede_active_runs), uccidendo il run in corso. In quel caso NON
+        // marchiamo resume_dispatched_at: il processo resta candidato e il
+        // prossimo round (poll_seconds) riprovera' quando il run sara' concluso,
+        // entro la finestra stopped_at < 1h (clausola della SELECT sopra). Cosi'
+        // l'esito del comando viene comunque consegnato, ma senza interrompere il
+        // lavoro in corso ne' innescare il loop di run che si superano a vicenda.
+        if session_has_active_run(&state.db, session_id).await {
+            tracing::debug!(
+                "process_resume: run attivo sulla sessione {}, rimando il resume del processo {} (label='{}')",
+                session_id,
+                id,
+                label
+            );
+            continue;
+        }
 
         // Marca SUBITO come dispatchato (idempotenza): meglio perdere un resume
         // che ripeterlo. Se rows_affected == 0 un altro ciclo l'ha gia' preso.
@@ -310,7 +343,8 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
         } else {
             None
         };
-        let ok = status == "stopped" && exit_code.unwrap_or(0) == 0
+        let ok = status == "stopped"
+            && exit_code.unwrap_or(0) == 0
             && docker_health.as_ref().map(|h| h.healthy).unwrap_or(true);
         let docker_note = docker_health
             .as_ref()
@@ -343,16 +377,17 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
             "source": "process_resume",
         });
 
-        let user_message_id =
-            match insert_message(&state.db, session_id, project_id, "user", &content, meta, None)
-                .await
-            {
-                Ok(mid) => mid,
-                Err(e) => {
-                    tracing::warn!("process_resume: insert messaggio sintetico fallito: {e:?}");
-                    continue;
-                }
-            };
+        let user_message_id = match insert_message(
+            &state.db, session_id, project_id, "user", &content, meta, None,
+        )
+        .await
+        {
+            Ok(mid) => mid,
+            Err(e) => {
+                tracing::warn!("process_resume: insert messaggio sintetico fallito: {e:?}");
+                continue;
+            }
+        };
 
         let system_context = crate::prompt_templates::get_template_or_default(
             &state.db,
@@ -370,7 +405,10 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
             // Eredita la modalita' scelta dall'utente per la sessione (mig 0371)
             // invece di hardcodare Confirm: un run risvegliato in Automatico non
             // deve tornare a chiedere conferme.
-            automation_mode: crate::chat_messages::read_session_automation_mode(&state.db, session_id).await,
+            automation_mode: crate::chat_messages::read_session_automation_mode(
+                &state.db, session_id,
+            )
+            .await,
             supervisor_mode: SupervisorMode::None,
             profile_prompt_block: String::new(),
             system_context,
@@ -384,14 +422,18 @@ async fn run_one_round(state: &AppState) -> Result<(), String> {
         };
 
         match spawn_agent_run(state, params).await {
-            Some(r) => tracing::info!(
+            SpawnOutcome::Started(r) => tracing::info!(
                 "process_resume: agente risvegliato per processo {} (label='{}', run={})",
                 id,
                 label,
                 r.run_id
             ),
-            None => tracing::warn!(
+            SpawnOutcome::NotStarted => tracing::warn!(
                 "process_resume: spawn_agent_run non ha prodotto un run per processo {}",
+                id
+            ),
+            SpawnOutcome::Disambiguation(_) => tracing::warn!(
+                "process_resume: disambiguazione inattesa (risveglio di sistema), nessun run avviato per processo {}",
                 id
             ),
         }
@@ -420,7 +462,9 @@ mod tests {
     #[test]
     fn riconosce_docker_compose() {
         assert!(is_docker_compose_command("docker compose up"));
-        assert!(is_docker_compose_command("docker compose -f compose.yml up --build"));
+        assert!(is_docker_compose_command(
+            "docker compose -f compose.yml up --build"
+        ));
         assert!(is_docker_compose_command("docker-compose up -d"));
         assert!(!is_docker_compose_command("docker compose ps"));
         assert!(!is_docker_compose_command("docker run nginx"));

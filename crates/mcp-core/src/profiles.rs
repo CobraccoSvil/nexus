@@ -113,7 +113,10 @@ impl<'a> ProfileInsertBinds<'a> {
         };
         Self {
             description: description.map(|s| s.as_str().trim()),
-            avatar_emoji: avatar_emoji.map(|s| s.as_str()).unwrap_or("\u{1F916}").trim(),
+            avatar_emoji: avatar_emoji
+                .map(|s| s.as_str())
+                .unwrap_or("\u{1F916}")
+                .trim(),
             system_prompt: system_prompt.map(|s| s.as_str()).unwrap_or("").trim(),
             default_provider: default_provider.and_then(|s| non_empty(s.as_str())),
             default_model: default_model.and_then(|s| non_empty(s.as_str())),
@@ -650,7 +653,9 @@ pub async fn admin_create_profile(
     .bind(binds.default_automation)
     .fetch_one(&state.db)
     .await
-    .map_err(|e| map_profile_insert_error(e, "Un profilo di sistema con questo nome esiste gia'"))?;
+    .map_err(|e| {
+        map_profile_insert_error(e, "Un profilo di sistema con questo nome esiste gia'")
+    })?;
 
     Ok(Json(row_to_json(&row)))
 }

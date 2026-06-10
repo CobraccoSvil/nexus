@@ -382,17 +382,26 @@ pub fn infer_slots_heuristic(message: &str) -> ActionSlots {
 }
 
 async fn fetch_slots_from_db(db: &PgPool) -> Result<SlotsRoutingMatrix, String> {
-    let rows: Vec<(String, String, String, String, String, Vec<String>, bool, String, String)> =
-        sqlx::query_as(
-            r#"SELECT action_verb, target_type, framework, scope,
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        Vec<String>,
+        bool,
+        String,
+        String,
+    )> = sqlx::query_as(
+        r#"SELECT action_verb, target_type, framework, scope,
                       preferred_tier, required_capabilities, requires_tool_use,
                       cost_direction, rationale
                  FROM nexus_routing_slots_matrix
                 WHERE is_active = TRUE"#,
-        )
-        .fetch_all(db)
-        .await
-        .map_err(|e| format!("query nexus_routing_slots_matrix fallita: {e}"))?;
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("query nexus_routing_slots_matrix fallita: {e}"))?;
     let entries: Vec<SlotsRoutingEntry> = rows
         .into_iter()
         .map(
@@ -515,10 +524,42 @@ mod tests {
         // Matrice tier-based (mig 0357): ogni chiave -> tier, niente provider.
         SlotsRoutingMatrix {
             entries: vec![
-                entry("resolve", "tests", "playwright", "multi_file", "medium", &["code", "fix"], "asc"),
-                entry("resolve", "tests", "*", "multi_file", "medium", &["code", "fix"], "asc"),
-                entry("resolve", "tests", "*", "single", "light", &["code", "fix"], "asc"),
-                entry("resolve", "code", "*", "cross_service", "heavy", &["code", "reasoning", "fix"], "desc"),
+                entry(
+                    "resolve",
+                    "tests",
+                    "playwright",
+                    "multi_file",
+                    "medium",
+                    &["code", "fix"],
+                    "asc",
+                ),
+                entry(
+                    "resolve",
+                    "tests",
+                    "*",
+                    "multi_file",
+                    "medium",
+                    &["code", "fix"],
+                    "asc",
+                ),
+                entry(
+                    "resolve",
+                    "tests",
+                    "*",
+                    "single",
+                    "light",
+                    &["code", "fix"],
+                    "asc",
+                ),
+                entry(
+                    "resolve",
+                    "code",
+                    "*",
+                    "cross_service",
+                    "heavy",
+                    &["code", "reasoning", "fix"],
+                    "desc",
+                ),
                 entry("write", "tests", "*", "single", "light", &["code"], "asc"),
                 entry("delete", "*", "*", "*", "medium", &["code"], "desc"),
             ],
@@ -759,8 +800,24 @@ mod tests {
         // wildcard, vince la piu' specifica.
         let m = SlotsRoutingMatrix {
             entries: vec![
-                entry("resolve", "tests", "playwright", "multi_file", "heavy", &["code"], "desc"),
-                entry("resolve", "tests", "*", "multi_file", "light", &["code"], "asc"),
+                entry(
+                    "resolve",
+                    "tests",
+                    "playwright",
+                    "multi_file",
+                    "heavy",
+                    &["code"],
+                    "desc",
+                ),
+                entry(
+                    "resolve",
+                    "tests",
+                    "*",
+                    "multi_file",
+                    "light",
+                    &["code"],
+                    "asc",
+                ),
             ],
             loaded_at: Instant::now(),
         };
@@ -799,16 +856,88 @@ mod tests {
         SlotsRoutingMatrix {
             entries: vec![
                 entry("read", "code", "*", "single", "light", &["code"], "asc"),
-                entry("read", "code", "*", "multi_file", "medium", &["code"], "asc"),
-                entry("read", "code", "*", "cross_service", "medium", &["code"], "asc"),
+                entry(
+                    "read",
+                    "code",
+                    "*",
+                    "multi_file",
+                    "medium",
+                    &["code"],
+                    "asc",
+                ),
+                entry(
+                    "read",
+                    "code",
+                    "*",
+                    "cross_service",
+                    "medium",
+                    &["code"],
+                    "asc",
+                ),
                 entry("write", "code", "*", "single", "light", &["code"], "asc"),
-                entry("write", "code", "*", "multi_file", "medium", &["code"], "asc"),
-                entry("resolve", "code", "*", "single", "light", &["code", "fix"], "asc"),
-                entry("resolve", "code", "*", "multi_file", "medium", &["code", "fix"], "asc"),
-                entry("resolve", "code", "*", "cross_service", "heavy", &["code", "reasoning", "fix"], "desc"),
-                entry("analyze", "code", "*", "cross_service", "heavy", &["code", "reasoning"], "desc"),
-                entry("refactor", "code", "*", "cross_service", "heavy", &["code", "reasoning"], "desc"),
-                entry("deploy", "infrastructure", "*", "system_wide", "heavy", &["code", "reasoning"], "desc"),
+                entry(
+                    "write",
+                    "code",
+                    "*",
+                    "multi_file",
+                    "medium",
+                    &["code"],
+                    "asc",
+                ),
+                entry(
+                    "resolve",
+                    "code",
+                    "*",
+                    "single",
+                    "light",
+                    &["code", "fix"],
+                    "asc",
+                ),
+                entry(
+                    "resolve",
+                    "code",
+                    "*",
+                    "multi_file",
+                    "medium",
+                    &["code", "fix"],
+                    "asc",
+                ),
+                entry(
+                    "resolve",
+                    "code",
+                    "*",
+                    "cross_service",
+                    "heavy",
+                    &["code", "reasoning", "fix"],
+                    "desc",
+                ),
+                entry(
+                    "analyze",
+                    "code",
+                    "*",
+                    "cross_service",
+                    "heavy",
+                    &["code", "reasoning"],
+                    "desc",
+                ),
+                entry(
+                    "refactor",
+                    "code",
+                    "*",
+                    "cross_service",
+                    "heavy",
+                    &["code", "reasoning"],
+                    "desc",
+                ),
+                entry(
+                    "deploy",
+                    "infrastructure",
+                    "*",
+                    "system_wide",
+                    "heavy",
+                    &["code", "reasoning"],
+                    "desc",
+                ),
                 entry("delete", "*", "*", "*", "medium", &["code"], "desc"),
             ],
             loaded_at: Instant::now(),
@@ -841,7 +970,10 @@ mod tests {
             (s("resolve", "code", "", "cross_service"), "heavy"),
             (s("analyze", "code", "", "cross_service"), "heavy"),
             (s("deploy", "infrastructure", "", "system_wide"), "heavy"),
-            (s("delete", "infrastructure", "docker", "multi_file"), "medium"),
+            (
+                s("delete", "infrastructure", "docker", "multi_file"),
+                "medium",
+            ),
         ];
         for (slots, expected_tier) in cases {
             let req = m

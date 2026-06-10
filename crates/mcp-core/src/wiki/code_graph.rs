@@ -54,7 +54,10 @@ fn rust_use_re() -> &'static Regex {
     RE.get_or_init(|| {
         // Catturiamo qualunque `use X::Y...;` (anche crate esterni). Tronchiamo
         // sui caratteri di blocco/raggruppamento (`{`, ` as`, `;`).
-        Regex::new(r"(?m)^\s*(?:pub\s+)?use\s+([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)").unwrap()
+        Regex::new(
+            r"(?m)^\s*(?:pub\s+)?use\s+([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)",
+        )
+        .unwrap()
     })
 }
 
@@ -73,7 +76,9 @@ fn py_import_re() -> &'static Regex {
 fn py_from_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     // `from X[.Y] import ...` (relativo o assoluto: catturiamo entrambi).
-    RE.get_or_init(|| Regex::new(r"(?m)^\s*from\s+(\.*[A-Za-z_][A-Za-z0-9_.]*|\.+)\s+import\b").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(r"(?m)^\s*from\s+(\.*[A-Za-z_][A-Za-z0-9_.]*|\.+)\s+import\b").unwrap()
+    })
 }
 
 fn ts_import_re() -> &'static Regex {

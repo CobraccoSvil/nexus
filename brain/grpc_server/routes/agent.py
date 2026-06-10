@@ -369,8 +369,11 @@ async def project_analyze(body: ProjectAnalyzeRequest) -> dict[str, object]:
         if not prov or not mdl:
             continue
         try:
-            # Riusa la stessa pipeline del /complete
-            result = await runtime.providers.generate_completion_async(prov, mdl, rendered)
+            # Riusa la stessa pipeline del /complete. internal_task: task fuori
+            # chat (project-analyze) — thinking off sui dual-mode (mig 0390).
+            result = await runtime.providers.generate_completion_async(
+                prov, mdl, rendered, internal_task=True,
+            )
             content = (result.content or "").strip()
             if not content:
                 last_error = f"{prov}/{mdl}: risposta vuota"
@@ -492,7 +495,7 @@ async def prompt_revise(body: PromptReviseRequest) -> dict[str, object]:
     # 4. Chiamata provider + parse JSON robusto
     try:
         result = await runtime.providers.generate_completion_async(
-            decision.provider, decision.model, full_prompt,
+            decision.provider, decision.model, full_prompt, internal_task=True,
         )
     except Exception as e:
         return {
@@ -576,6 +579,12 @@ class AgentRunRequest(BaseModel):
     # Valori attesi: "none" | "confirm" | "automatic" | "continuous".
     # Letta da clarify_or_expand_node per skip in modalita' autonoma.
     automation_mode: str | None = None
+    # Intent gia' RISOLTO a monte da mcp-core (oggi: risposta dell'utente a una
+    # disambiguazione "A"/"B"/"C", resolve_disambiguation_reply). Quando
+    # presente, router_node lo usa al posto di ri-classificare il prompt: la
+    # lettera secca verrebbe ri-marcata 'chat' (prompt_len=1) perdendo la
+    # scelta dell'utente. None = classificazione normale.
+    intent_hint: str | None = None
 
 
 class AgentFeedbackRequest(BaseModel):
@@ -619,6 +628,11 @@ async def agent_run(body: AgentRunRequest) -> dict[str, object]:
         "pending_tool_uses": [],
         "stop_reason": None,
         "approved": False,
+        # Reset clarify per run (mig 0386): ogni run parte senza clarify pendente
+        # e con contatore azzerato, indipendentemente dal checkpointer.
+        "pending_clarify": False,
+        "clarify_attempts": 0,
+        "intent_hint": body.intent_hint,
         "prompt_tokens": None,
         "completion_tokens": None,
         "cache_creation_tokens": None,
@@ -833,6 +847,11 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
         "pending_tool_uses": [],
         "stop_reason": None,
         "approved": False,
+        # Reset clarify per run (mig 0386): ogni run parte senza clarify pendente
+        # e con contatore azzerato, indipendentemente dal checkpointer.
+        "pending_clarify": False,
+        "clarify_attempts": 0,
+        "intent_hint": body.intent_hint,
     }
 
     async def generate():
@@ -846,6 +865,13 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
         # Metadata routing (B5): catturati dal nodo router per propagare a Rust
         nexus_task_type: str | None = None
         nexus_agent_type: str | None = None
+        # Segnali macchina a stati di terminazione (mig 0386), propagati a mcp-core
+        # nell'evento end_turn:
+        #  - forced_close_unverified: abort anti-loop -> FailedDiagnosed (non
+        #    Completed, anche se final_gate riscrive stop_reason a "end_turn").
+        #  - final_gate_passed: verifica E2E superata -> CompletedVerified.
+        forced_close_unverified = False
+        final_gate_passed = False
         # Provider/model EFFETTIVI dell'ultima iterazione executor: catturano il
         # cascade fallback sticky intra-run (es. deepseek -> google/gemini-2.5-pro).
         # Propagati nell'evento end_turn cosi' mcp-core salva su agent_runs il
@@ -957,6 +983,13 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                             + _json.dumps({"type": "thinking_delta", "text": _thinking.strip()})
                             + "\n\n"
                         )
+                    # Punto unico di cattura dei segnali di terminazione (mig 0386):
+                    # da qualunque nodo li emetta (executor abort / final_gate pass),
+                    # cosi' l'esito e' corretto indipendentemente da quale nodo chiude.
+                    if delta.get("forced_close_unverified"):
+                        forced_close_unverified = True
+                    if delta.get("final_gate_passed"):
+                        final_gate_passed = True
                     if node == "router":
                         # Cattura metadata routing (B5 fix: propagazione nexus_task_type/agent_type)
                         if delta.get("user_intent"):
@@ -1031,6 +1064,10 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                                 end_turn_payload["nexus_task_type"] = nexus_task_type
                             if nexus_agent_type:
                                 end_turn_payload["nexus_agent_type"] = nexus_agent_type
+                            if forced_close_unverified:
+                                end_turn_payload["forced_close_unverified"] = True
+                            if final_gate_passed:
+                                end_turn_payload["final_gate_passed"] = True
                             # Provider/model effettivi (cascade fallback sticky):
                             # mcp-core li usa per salvare il modello reale nel
                             # messaggio assistant invece di quello iniziale.
@@ -1077,6 +1114,10 @@ async def agent_run_stream(body: AgentRunRequest) -> StreamingResponse:
                             _final_payload["nexus_task_type"] = nexus_task_type
                         if nexus_agent_type:
                             _final_payload["nexus_agent_type"] = nexus_agent_type
+                        if forced_close_unverified:
+                            _final_payload["forced_close_unverified"] = True
+                        if final_gate_passed:
+                            _final_payload["final_gate_passed"] = True
                         if effective_provider:
                             _final_payload["provider_used"] = effective_provider
                         if effective_model:

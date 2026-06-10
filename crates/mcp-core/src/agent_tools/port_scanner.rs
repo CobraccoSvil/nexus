@@ -206,7 +206,11 @@ fn collect_ports(content: &str, keep: impl Fn(u32) -> bool) -> Vec<PortFinding> 
             let hi = caps.get(2).and_then(|m| m.as_str().parse::<u32>().ok());
             for opt in [lo, hi].iter().flatten() {
                 if keep(*opt) {
-                    findings.push(PortFinding { line: line_idx + 1, port: *opt, snippet: snip(raw_line) });
+                    findings.push(PortFinding {
+                        line: line_idx + 1,
+                        port: *opt,
+                        snippet: snip(raw_line),
+                    });
                 }
             }
         }
@@ -215,7 +219,11 @@ fn collect_ports(content: &str, keep: impl Fn(u32) -> bool) -> Vec<PortFinding> 
                 if let Some(port_str) = caps.get(1) {
                     if let Ok(port) = port_str.as_str().parse::<u32>() {
                         if keep(port) {
-                            findings.push(PortFinding { line: line_idx + 1, port, snippet: snip(raw_line) });
+                            findings.push(PortFinding {
+                                line: line_idx + 1,
+                                port,
+                                snippet: snip(raw_line),
+                            });
                         }
                     }
                 }
@@ -292,10 +300,18 @@ fn format_unallocated_message(path: &str, findings: &[PortFinding]) -> String {
         findings.len()
     );
     for f in findings.iter().take(10) {
-        msg.push_str(&format!("  - riga {}: porta {} | {}\n", f.line, f.port, f.snippet.trim()));
+        msg.push_str(&format!(
+            "  - riga {}: porta {} | {}\n",
+            f.line,
+            f.port,
+            f.snippet.trim()
+        ));
     }
     if findings.len() > 10 {
-        msg.push_str(&format!("  ... e altri {} riscontri.\n", findings.len() - 10));
+        msg.push_str(&format!(
+            "  ... e altri {} riscontri.\n",
+            findings.len() - 10
+        ));
     }
     msg.push_str(
         "\nUna porta nel range Nexus NON va scelta a mano: anche se il numero e' nel bucket, \
@@ -468,8 +484,14 @@ mod tests {
             "services:\n  web:\n    ports:\n      - 20001:3000\n",
             port_in_bucket,
         );
-        assert!(ports.iter().any(|p| p.port == 20001), "host 20001 (bucket) raccolta");
-        assert!(!ports.iter().any(|p| p.port == 3000), "container 3000 NON raccolta");
+        assert!(
+            ports.iter().any(|p| p.port == 20001),
+            "host 20001 (bucket) raccolta"
+        );
+        assert!(
+            !ports.iter().any(|p| p.port == 3000),
+            "container 3000 NON raccolta"
+        );
         // scan_content (violazioni fuori-bucket) NON deve segnalare 20001.
         assert!(!collect_ports("x PORT=20001", port_is_violating)
             .iter()
@@ -547,7 +569,10 @@ mod tests {
         );
         match res {
             PortScanOutcome::Reject(f) => {
-                assert!(f.iter().any(|x| x.port == 3000), "default 3000 deve essere rilevato");
+                assert!(
+                    f.iter().any(|x| x.port == 3000),
+                    "default 3000 deve essere rilevato"
+                );
             }
             _ => panic!("default ${{PORT:-3000}} fuori bucket deve essere rifiutato"),
         }

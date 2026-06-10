@@ -144,6 +144,49 @@ pub enum AgentRunStatus {
     /// Nessun provider disponibile: tutti in cooldown (billing_error / rate_limit)
     /// o non configurati. Il turno non ha potuto essere elaborato.
     ProviderUnavailable,
+    // ── Esiti terminali canonici (macchina a stati deterministica, ADR terminazione) ──
+    // Emessi dal punto unico `outcome_node` del brain via `nexus_run_outcome` e mappati
+    // qui da `derive_status` (brain_agent_client.rs). Mutuamente esclusivi: un run d'azione
+    // termina SEMPRE in uno di questi tre, mai in una domanda di disambiguazione.
+    /// Il task e' completato E verificato: final_gate passato (o non applicabile),
+    /// almeno un'azione produttiva applicata, risposta finale non vuota.
+    CompletedVerified,
+    /// Il task NON e' completato: il run e' stato chiuso da abort anti-loop, cap o budget,
+    /// MA l'agente ha prodotto una diagnosi (perche' e' fallito, cosa lo blocca, prossimo
+    /// passo). E' un esito definitivo e onesto, non un errore infrastrutturale.
+    FailedDiagnosed,
+    /// Il run e' bloccato e richiede input esterno reale (segreto/credenziale mancante,
+    /// permesso non disponibile, servizio offline) OPPURE la conferma di un'azione
+    /// irreversibile (governata da automation_mode). MAI per ambiguita' di intent.
+    BlockedNeedsInput,
+}
+
+impl AgentRunStatus {
+    /// Stringa snake_case persistita in `agent_runs.status`. Punto unico (regola L):
+    /// usato sia da `finalize_agent_run` sia dall'update inline in `agent_run.rs`,
+    /// che prima duplicavano lo stesso match.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::AwaitingConfirmation => "awaiting_confirmation",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::LoopAborted => "loop_aborted",
+            Self::ProviderUnavailable => "provider_unavailable",
+            Self::CompletedVerified => "completed_verified",
+            Self::FailedDiagnosed => "failed_diagnosed",
+            Self::BlockedNeedsInput => "blocked_needs_input",
+        }
+    }
+
+    /// `true` se il run e' terminato con successo (con o senza verifica E2E).
+    /// Punto unico della semantica "run riuscito": i call site usano questo invece
+    /// di `matches!(status, Completed)`, cosi' l'esito verificato non viene perso.
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Completed | Self::CompletedVerified)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -459,16 +502,7 @@ pub async fn finalize_agent_run(
     final_answer: Option<&str>,
     iteration_count: u32,
 ) {
-    let status_str = match &status {
-        AgentRunStatus::Completed => "completed",
-        AgentRunStatus::Failed => "failed",
-        AgentRunStatus::TimedOut => "timed_out",
-        AgentRunStatus::AwaitingConfirmation => "awaiting_confirmation",
-        AgentRunStatus::Cancelled => "cancelled",
-        AgentRunStatus::Running => "running",
-        AgentRunStatus::LoopAborted => "loop_aborted",
-        AgentRunStatus::ProviderUnavailable => "provider_unavailable",
-    };
+    let status_str = status.as_str();
     let _ = sqlx::query("UPDATE agent_runs SET status = $2, final_answer = $3, iteration_count = $4, completed_at = NOW() WHERE id = $1")
     .bind(run_id)
     .bind(status_str)
@@ -481,7 +515,7 @@ pub async fn finalize_agent_run(
     // git add -A + commit nel project_root se ci sono cambiamenti.
     // Idempotente (skip se git status pulito), best-effort (errori solo loggati),
     // NO push automatico. L'utente decide se/quando pushare via UI.
-    if matches!(status, AgentRunStatus::Completed) {
+    if status.is_success() {
         let db_clone = db.clone();
         tokio::spawn(async move {
             auto_commit_project_changes(&db_clone, run_id).await;

@@ -401,7 +401,9 @@ async def extract_via_llm(assistant_text: str, providers: Any) -> list[dict[str,
 
     prompt = _build_extractor_prompt(assistant_text)
     try:
-        result = await providers.generate_completion_async(provider, model, prompt)
+        result = await providers.generate_completion_async(
+            provider, model, prompt, internal_task=True,
+        )
     except Exception as exc:
         logger.warning("next_actions: estrazione LLM fallita su %s/%s (%s)", provider, model, exc)
         return []

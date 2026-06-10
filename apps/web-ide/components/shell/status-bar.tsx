@@ -3,6 +3,7 @@
 import type { useThemeColors } from "../../lib/theme";
 import type { WorkbenchLayoutMode } from "../../lib/api-client";
 import { StatusDot } from "./shell-helpers";
+import { FooterToastCenter } from "./footer-toast-center";
 
 type LiveHealth = {
   database: boolean;
@@ -34,7 +35,7 @@ export function StatusBar({
         gridRow: "4",
         display: "flex",
         alignItems: "center",
-        justifyContent: "space-between",
+        gap: 12,
         padding: "0 10px",
         borderTop: `1px solid ${tc.border}`,
         background: tc.bgHeader,
@@ -42,13 +43,17 @@ export function StatusBar({
         fontSize: 11,
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
         <span>{currentBranch}</span>
         <span>{projectName}</span>
         <span>{layoutMode}</span>
         <span>{problemCount} problemi</span>
       </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+      {/* Centro: messaggio di stato non invasivo (toast + esiti azioni + pending). */}
+      <div style={{ flex: 1, minWidth: 0, display: "flex", justifyContent: "center", overflow: "hidden" }}>
+        <FooterToastCenter tc={tc} />
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
         <span>UTF-8</span>
         <span>LF</span>
         <span title={liveHealth.database ? "Database online" : "Database offline"} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>

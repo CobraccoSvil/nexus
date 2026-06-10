@@ -148,9 +148,52 @@ def prepare_openai_compat_request(
         cap = None
     oai_messages = convert_messages_to_openai(messages)
     oai_messages = _sanitize_tool_message_sequence(oai_messages)
+    oai_messages = _strip_trailing_assistant(oai_messages)
     if system_text:
         oai_messages.insert(0, {"role": "system", "content": system_text})
     return cap, oai_messages, max_tokens
+
+
+def _strip_trailing_assistant(oai_messages: list[dict]) -> list[dict]:
+    """Rimuove gli `assistant` message in CODA. I provider OpenAI-compat strict
+    rifiutano una conversazione che termina con assistant: Mistral risponde HTTP
+    422 "Expected last role User or Tool ... but got assistant". Punto unico
+    cross-provider (regola L): tutti i provider OpenAI-compatible passano da qui.
+
+    Semantica: `generate_agent_turn` deve GENERARE il prossimo turno assistant,
+    quindi l'input non deve mai terminare con assistant — si genera "dopo"
+    user/tool, non "dopo" assistant. Nel flusso normale la history finisce gia'
+    con user/tool e questa funzione e' un no-op. Si attiva nel cascade/fallback
+    mid-turn dopo un soft-failure (is_soft_failure): la history reinviata al
+    provider di fallback finisce con il turno "molle" (end_turn, poco contenuto,
+    niente tool) del provider che ha mollato. Rimuoverlo e' esattamente cio' che
+    vogliamo: il fallback RIGENERA quel turno dalla stessa situazione (ultimo
+    user/tool) che aveva il provider fallito.
+
+    Guard: non svuota mai la lista. Se restassero solo assistant (caso
+    patologico, mai osservato), ripristina l'originale e lascia che sia il
+    provider a dare l'errore esplicito invece di inviare una richiesta vuota."""
+    out = list(oai_messages)
+    dropped = 0
+    while out and out[-1].get("role") == "assistant":
+        out.pop()
+        dropped += 1
+    if not out:
+        # Solo assistant: non possiamo normalizzare senza svuotare. Ripristina.
+        logger.error(
+            "adapter sanitize: conversazione di soli assistant (%d msg), "
+            "impossibile garantire ultimo ruolo user/tool — invio invariato",
+            dropped,
+        )
+        return list(oai_messages)
+    if dropped:
+        logger.warning(
+            "adapter sanitize: rimossi %d assistant message in coda "
+            "(provider OpenAI-compat richiede ultimo ruolo user/tool; "
+            "tipico di cascade/fallback dopo soft-failure)",
+            dropped,
+        )
+    return out
 
 
 def _sanitize_tool_message_sequence(oai_messages: list[dict]) -> list[dict]:
@@ -264,6 +307,66 @@ def resolve_tool_choice(
         return {"function_calling_config": {"mode": mode}}
     # Stile sconosciuto: nessuna forzatura (degradazione esplicita, non crash).
     return "auto"
+
+
+# ── Thinking OFF per task interni testuali (mig 0390) ────────────────────────
+# Cache 60s del flag settings.providers.thinking_disable_internal_text, stesso
+# pattern del TTL in capability_loader. Default True (il valore canonico vive
+# nel DB, mig 0390; il default qui copre solo il best-effort se il DB cade).
+_INTERNAL_TEXT_THINKING_KEY = "providers.thinking_disable_internal_text"
+_internal_text_flag: bool = True
+_internal_text_ts: float = 0.0
+_INTERNAL_TEXT_REFRESH_S = 60.0
+
+
+def _internal_text_thinking_disabled() -> bool:
+    """Flag DB (cache 60s): thinking off nelle chiamate testuali interne."""
+    global _internal_text_flag, _internal_text_ts
+    import time
+
+    now = time.time()
+    if (now - _internal_text_ts) < _INTERNAL_TEXT_REFRESH_S:
+        return _internal_text_flag
+    try:
+        from brain.utils.settings_db import get_bool_setting
+        _internal_text_flag = get_bool_setting(_INTERNAL_TEXT_THINKING_KEY, True)
+    except Exception:  # noqa: BLE001
+        _internal_text_flag = True
+    _internal_text_ts = now
+    return _internal_text_flag
+
+
+def should_disable_thinking(
+    cap: ProviderCapability | None,
+    has_tools: bool,
+    internal_task: bool = False,
+) -> bool:
+    """PUNTO UNICO (regola L): decide se l'adapter deve forzare la modalita'
+    NON-THINKING per questa richiesta. Si applica SOLO ai modelli dual-mode con
+    policy 'disable_for_tools' (ADR 0025): per gli altri (policy 'native',
+    'none', 'exclude' o capability assente) non si tocca nulla.
+
+    Due rami:
+    - ``has_tools``: comportamento ADR 0025 invariato — nel loop agentico il
+      thinking va spento (function calling deterministico, niente
+      reasoning_content da ri-passare).
+    - ``internal_task`` senza tool (mig 0390): i task interni TESTUALI (purpose:
+      chat title, doc gen, summary, classifier, ...) NON beneficiano del
+      reasoning e col thinking acceso bruciano il budget di output in
+      reasoning_content producendo content vuoto (incidenti "deepseek non
+      scrive" / hollow_completion). Gate dal setting DB
+      ``providers.thinking_disable_internal_text`` (regola G, cache 60s).
+
+    La chat utente (non marcata internal_task, senza tool) mantiene il
+    comportamento di default del modello: il reasoning li' puo' avere valore.
+    Il COME spegnere e' provider-specifico (deepseek: extra_body
+    ``{"thinking": {"type": "disabled"}}``); qui vive solo la decisione.
+    """
+    if cap is None or not cap.thinking_disabled_for_tools:
+        return False
+    if has_tools:
+        return True
+    return internal_task and _internal_text_thinking_disabled()
 
 
 def translate_tools_for(

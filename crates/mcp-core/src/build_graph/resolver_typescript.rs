@@ -238,12 +238,11 @@ fn parse_tsconfig_with_extends<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<MergedTsConfig>> + Send + 'a>>
 {
     Box::pin(async move {
-        let canonical = cfg_path.canonicalize().unwrap_or_else(|_| cfg_path.to_path_buf());
+        let canonical = cfg_path
+            .canonicalize()
+            .unwrap_or_else(|_| cfg_path.to_path_buf());
         if !visited.insert(canonical.clone()) {
-            anyhow::bail!(
-                "ciclo extends rilevato su tsconfig: {}",
-                cfg_path.display()
-            );
+            anyhow::bail!("ciclo extends rilevato su tsconfig: {}", cfg_path.display());
         }
         let raw = tokio::fs::read_to_string(cfg_path)
             .await
@@ -333,7 +332,10 @@ fn parse_pnpm_workspace_packages(raw: &str) -> Vec<String> {
         }
         if in_packages {
             if let Some(rest) = trimmed.strip_prefix('-') {
-                let val = rest.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+                let val = rest
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .to_string();
                 if !val.is_empty() {
                     out.push(val);
                 }
@@ -375,9 +377,7 @@ mod tests {
         assert_eq!(info.language, "typescript");
         assert!(info.include_globs.contains(&"src".to_string()));
         assert!(info.exclude_globs.contains(&"node_modules/**".to_string()));
-        assert!(info
-            .generated_dirs
-            .contains(&"node_modules".to_string()));
+        assert!(info.generated_dirs.contains(&"node_modules".to_string()));
     }
 
     #[tokio::test]

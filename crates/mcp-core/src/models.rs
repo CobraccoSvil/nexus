@@ -596,39 +596,26 @@ pub async fn auto_upgrade_models_and_routing(db: &sqlx::PgPool) -> Result<(), St
             }
         }
 
-        // Aggiorna routing_matrix: per ogni record con stesso provider e
-        // model "vecchio" della famiglia (model che matcha la regex ma e
-        // diverso dal top), sostituisci con top.
-        // RISPETTA `manual_override`: i record con manual_override=true sono
-        // pinned dall'admin (es. ha scelto esplicitamente un preview) e NON
-        // vengono toccati dall'auto-upgrade. Bug osservato 30/05/2026: senza
-        // questo, ogni restart di mcp-core ri-sostituiva il preview scelto a
-        // mano con lo stable top family.
+        // NB (ADR 0030, regola L): la materializzazione del `model_id` della
+        // routing matrix e' ESCLUSIVA di
+        // `routing_matrix_auto_promoter::run_one_round` (via il selettore unico
+        // di model_selection.rs). auto_upgrade NON scrive piu' `model_id` sulla
+        // matrix: prima lo sostituiva per nome-famiglia (FAMILY_RULES), in
+        // conflitto con lo scoring di run_one_round -> ping-pong non
+        // deterministico sulle righe non-manual (chi gira per ultimo vince).
+        // L'upgrade alla versione nuova avviene comunque: il modello nuovo e'
+        // gia' stato abilitato qui sopra (is_enabled=true) e run_one_round lo
+        // seleziona via scoring; le righe stale (modello deprecato) sono gestite
+        // da heal_orphan_pinned_models + cleanup_stale_rows. Verificato: tutte le
+        // righe non-manual attive sono coperte da un requirement, quindi
+        // run_one_round le materializza al 100% (nessun buco di copertura).
+        //
+        // Il default-per-provider (nexus_provider_default_model) NON e'
+        // materializzato da run_one_round: resta aggiornato qui per famiglia,
+        // rispettando i pin manuali.
         let to_replace: Vec<String> = candidates.iter().filter(|m| **m != top).cloned().collect();
         if !to_replace.is_empty() {
-            let res = sqlx::query(
-                "UPDATE nexus_routing_matrix \
-                 SET model_id = $1, updated_at = NOW() \
-                 WHERE provider = $2 AND model_id = ANY($3) \
-                   AND (manual_override IS NULL OR manual_override = false)",
-            )
-            .bind(&top)
-            .bind(provider)
-            .bind(&to_replace)
-            .execute(db)
-            .await;
-            if let Ok(r) = res {
-                if r.rows_affected() > 0 {
-                    tracing::info!(
-                        "auto_upgrade: routing_matrix [{}/{}] {} record -> {}",
-                        provider,
-                        family_label,
-                        r.rows_affected(),
-                        top
-                    );
-                }
-            }
-            // Idem per default_model_for_provider (se il default e vecchio
+            // default_model_for_provider (se il default e vecchio
             // della stessa famiglia). NB: la tabella nexus_provider_default_model
             // non ha un campo manual_override; come heuristica, rispettiamo
             // le note che iniziano con "manual fix" o "pin:" come marker

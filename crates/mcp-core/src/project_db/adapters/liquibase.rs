@@ -27,10 +27,7 @@ impl MigrationAdapter for LiquibaseAdapter {
     ) -> Result<PathBuf, ProjectDbError> {
         // Punto unico in super::write_timestamped_sql_migration (regola L, S68).
         super::write_timestamped_sql_migration(ctx, name, sql, |n, ts, body| {
-            format!(
-                "-- Liquibase changeset: {}\n-- id: {}\n\n{}\n",
-                n, ts, body
-            )
+            format!("-- Liquibase changeset: {}\n-- id: {}\n\n{}\n", n, ts, body)
         })
     }
 

@@ -44,6 +44,7 @@ pub(crate) const KNOWN_INTENTS: [&str; 6] =
 mod core;
 mod intent;
 mod model_routing;
+mod model_selection;
 mod neural_client;
 #[cfg(test)]
 mod tests;
@@ -53,6 +54,7 @@ mod tests;
 // invariati i call site esistenti.
 pub(crate) use intent::*;
 pub(crate) use model_routing::*;
+pub(crate) use model_selection::*;
 pub(crate) use neural_client::*;
 
 #[derive(Debug, Clone)]

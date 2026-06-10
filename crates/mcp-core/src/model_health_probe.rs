@@ -158,9 +158,9 @@ pub(crate) async fn run_one_round(
             model,
             consecutive_failures,
             supports_tool_use,
-            consecutive_tool_failures: tool_failures,
             capability_source,
             auto_disabled_reason,
+            consecutive_tool_failures,
         } = pm;
         // Salta se il provider e' in cooldown lungo: faremmo solo rumore
         // (tutte le probe ritornerebbero errore di quota/billing che e'
@@ -192,27 +192,35 @@ pub(crate) async fn run_one_round(
         sleep(Duration::from_millis(INTER_PROBE_SLEEP_MS)).await;
 
         // Il tool-probe gira sui candidati agentici (supports_tool_use=true) E
-        // sui modelli che IL TOOL-PROBE STESSO ha degradato (supports_tool_use=
-        // false con reason 'tool_probe_failed:%', solo capability_source='auto').
-        // Senza questo secondo caso il re-enable promesso era IRRAGGIUNGIBILE: un
-        // modello marcato non-tool-capable non veniva mai piu' ri-testato (catch-22)
-        // e restava degradato anche dopo che il provider tornava sano (es. i
-        // magistral: API Mistral tornata a gestire il tool-forcing, ma restavano
-        // false). I modelli pure-chat (mai tool-capable) e le curature manual
+        // sui modelli AUTO-DEGRADATI da un writer automatico (supports_tool_use=
+        // false con reason 'tool_probe_failed:%' dal probe O 'malformed_tool_calls'
+        // dal runtime, solo capability_source='auto'). Senza questo secondo caso
+        // il re-enable promesso era IRRAGGIUNGIBILE: un modello marcato
+        // non-tool-capable non veniva mai piu' ri-testato (catch-22) e restava
+        // degradato anche dopo che il provider tornava sano (es. i magistral; e
+        // il degrado runtime era riabilitabile SOLO se la routing matrix
+        // continuava a scegliere il modello — caso deepseek-v4-pro). I modelli
+        // pure-chat (mai tool-capable) e le curature manual
         // (capability_source='manual') NON vengono toccati. Provider in cooldown
         // gia' saltato sopra.
-        let tool_probe_was_auto_degraded = !supports_tool_use
-            && capability_source == "auto"
-            && auto_disabled_reason
-                .as_deref()
-                .is_some_and(|r| r.starts_with("tool_probe_failed:"));
+        // PUNTO UNICO (regola L): il criterio di riaggancio vive in
+        // tool_capability::was_auto_degraded e copre ANCHE le righe ORFANE
+        // (reason NULL con counter > 0): un re-enable esterno (catalog_sync
+        // "ricomparso API", ciclo billing cooldown) puo' azzerare il reason
+        // senza ripristinare il flag — senza questo ramo il degrado restava
+        // permanente (incidente magistral-small-2509, 2026-06-10).
+        let tool_probe_was_auto_degraded = crate::tool_capability::was_auto_degraded(
+            supports_tool_use,
+            &capability_source,
+            auto_disabled_reason.as_deref(),
+            consecutive_tool_failures,
+        );
         if tool_probe_enabled && (supports_tool_use || tool_probe_was_auto_degraded) {
             match tool_probe_one_model(
                 orchestrator,
                 db,
                 &provider,
                 &model,
-                tool_failures,
                 tool_failure_threshold,
             )
             .await
@@ -291,9 +299,11 @@ struct ProbeModel {
     model: String,
     consecutive_failures: i32,
     supports_tool_use: bool,
-    consecutive_tool_failures: i32,
     capability_source: String,
     auto_disabled_reason: Option<String>,
+    /// Counter del ciclo tool-capability: serve al gate di ri-test per
+    /// riconoscere le righe orfane (false + reason NULL + counter > 0).
+    consecutive_tool_failures: i32,
 }
 
 /// Legge i modelli enabled dal catalog (con i campi necessari al tool-probe).
@@ -301,9 +311,9 @@ async fn load_enabled_models(db: &PgPool) -> sqlx::Result<Vec<ProbeModel>> {
     let rows = sqlx::query(
         "SELECT provider, model, consecutive_failures, \
                 COALESCE(supports_tool_use, false) AS supports_tool_use, \
-                COALESCE(consecutive_tool_failures, 0) AS consecutive_tool_failures, \
                 COALESCE(capability_source, 'auto') AS capability_source, \
-                auto_disabled_reason
+                auto_disabled_reason, \
+                COALESCE(consecutive_tool_failures, 0) AS consecutive_tool_failures
            FROM ai_price_catalog
           WHERE is_enabled = true
           ORDER BY provider, model",
@@ -318,11 +328,11 @@ async fn load_enabled_models(db: &PgPool) -> sqlx::Result<Vec<ProbeModel>> {
             model: r.try_get("model").unwrap_or_default(),
             consecutive_failures: r.try_get("consecutive_failures").unwrap_or(0),
             supports_tool_use: r.try_get("supports_tool_use").unwrap_or(false),
-            consecutive_tool_failures: r.try_get("consecutive_tool_failures").unwrap_or(0),
             capability_source: r
                 .try_get("capability_source")
                 .unwrap_or_else(|_| "auto".to_string()),
             auto_disabled_reason: r.try_get("auto_disabled_reason").ok().flatten(),
+            consecutive_tool_failures: r.try_get("consecutive_tool_failures").unwrap_or(0),
         })
         .collect())
 }
@@ -587,7 +597,6 @@ async fn tool_probe_one_model(
     db: &PgPool,
     provider: &str,
     model: &str,
-    prior_tool_failures: i32,
     threshold: i32,
 ) -> ToolProbeOutcome {
     // Tool fittizio minimale + tool_choice forzato. Mettiamo il tool_choice
@@ -676,75 +685,40 @@ async fn tool_probe_one_model(
             ToolProbeOutcome::Skipped
         }
         ToolProbeVerdict::Success => {
-            // Reset contatore + riabilita tool-capability se era stata marcata
-            // off da un precedente tool_probe_failed (NON tocca un disable manuale
-            // ne' is_enabled). Reset idempotente. Guard capability_source='auto'
-            // (ADR 0024, regola L): il probe non modifica MAI le righe curate a
-            // mano dall'admin (vale per reset, increment e mark non-tool-capable).
-            let _ = sqlx::query(
-                "UPDATE ai_price_catalog
-                    SET consecutive_tool_failures = 0,
-                        supports_tool_use = true,
-                        updated_at = NOW()
-                  WHERE provider = $1 AND model = $2
-                    AND capability_source = 'auto'
-                    AND (consecutive_tool_failures > 0 OR supports_tool_use = false)
-                    AND (auto_disabled_reason IS NULL OR auto_disabled_reason LIKE 'tool_probe_failed:%')",
-            )
-            .bind(provider)
-            .bind(model)
-            .execute(db)
-            .await;
+            // PUNTO UNICO (regola L): reset contatore + riabilitazione della
+            // tool-capability se il degrado era automatico, da QUALUNQUE fonte
+            // (tool_probe_failed:% O malformed_tool_calls dal runtime). Le
+            // curature admin e is_enabled non vengono toccati.
+            crate::tool_capability::reset_tool_failures_on_success(db, provider, model, false)
+                .await;
             tracing::debug!("model_health_probe[tool]: {provider}/{model} tool-probe OK");
             ToolProbeOutcome::Ok
         }
         ToolProbeVerdict::ToolFailed(kind) => {
-            let new_count = prior_tool_failures + 1;
-            if new_count >= threshold {
-                let reason = format!("tool_probe_failed:{kind}");
-                // Guard capability_source='auto': non degradare righe curate a
-                // mano (ADR 0024, regola L). Le decisioni 'manual' (es. flag
-                // thinking della mig 0318) sono protette dal classificatore E dal
-                // probe: l'enforcement del 'manual' e' unico in tutto il sistema.
-                let _ = sqlx::query(
-                    "UPDATE ai_price_catalog
-                        SET supports_tool_use = false,
-                            consecutive_tool_failures = $3,
-                            auto_disabled_reason = $4,
-                            updated_at = NOW()
-                      WHERE provider = $1 AND model = $2
-                        AND capability_source = 'auto'",
-                )
-                .bind(provider)
-                .bind(model)
-                .bind(new_count)
-                .bind(&reason)
-                .execute(db)
-                .await;
-                tracing::warn!(
-                    "model_health_probe[tool]: MARK NON-TOOL-CAPABLE {provider}/{model} \
-                     (tool_failures={new_count}, reason={kind}) — is_enabled invariato"
-                );
-                ToolProbeOutcome::MarkedNonToolCapable
-            } else {
-                // Guard capability_source='auto' (regola L): il counter NON sale
-                // sulle righe manual, cosi' una curatela admin non raggiunge mai
-                // la soglia di degrado per colpa del probe.
-                let _ = sqlx::query(
-                    "UPDATE ai_price_catalog
-                        SET consecutive_tool_failures = $3, updated_at = NOW()
-                      WHERE provider = $1 AND model = $2
-                        AND capability_source = 'auto'",
-                )
-                .bind(provider)
-                .bind(model)
-                .bind(new_count)
-                .execute(db)
-                .await;
-                tracing::debug!(
-                    "model_health_probe[tool]: {provider}/{model} tool-fail #{new_count}/{threshold} ({kind})"
-                );
-                ToolProbeOutcome::FailedCounted
+            // PUNTO UNICO (regola L): counter + degrado a soglia con guard
+            // capability_source='auto' vivono in tool_capability — l'enforcement
+            // del 'manual' e' davvero unico in tutto il sistema (probe E runtime).
+            let reason = format!("{}{kind}", crate::tool_capability::REASON_TOOL_PROBE_PREFIX);
+            match crate::tool_capability::record_tool_failure(
+                db, provider, model, threshold, &reason,
+            )
+            .await
+            {
+                crate::tool_capability::ToolFailureRecord::MarkedNonToolCapable { .. } => {
+                    ToolProbeOutcome::MarkedNonToolCapable
+                }
+                crate::tool_capability::ToolFailureRecord::Counted { failures } => {
+                    tracing::debug!(
+                        "model_health_probe[tool]: {provider}/{model} tool-fail #{failures}/{threshold} ({kind})"
+                    );
+                    ToolProbeOutcome::FailedCounted
+                }
+                crate::tool_capability::ToolFailureRecord::Protected => {
+                    tracing::debug!(
+                        "model_health_probe[tool]: {provider}/{model} riga manual — degrado non applicato ({kind})"
+                    );
+                    ToolProbeOutcome::FailedCounted
+                }
             }
         }
     }

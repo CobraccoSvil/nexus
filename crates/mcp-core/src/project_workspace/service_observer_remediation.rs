@@ -11,7 +11,7 @@ use nexus_events::event::ProjectEvent;
 use uuid::Uuid;
 
 use crate::agent_types::SupervisorMode;
-use crate::chat_messages::{insert_message, spawn_agent_run, SpawnAgentParams};
+use crate::chat_messages::{insert_message, spawn_agent_run, SpawnAgentParams, SpawnOutcome};
 use crate::orchestrator::AutomationMode;
 use crate::AppState;
 
@@ -70,12 +70,13 @@ pub(crate) async fn maybe_trigger_debugger(
     }
 
     // Owner del progetto (user_id per l'agent run).
-    let owner: Option<Uuid> = sqlx::query_scalar("SELECT owner_user_id FROM projects WHERE id = $1")
-        .bind(project_id)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten();
+    let owner: Option<Uuid> =
+        sqlx::query_scalar("SELECT owner_user_id FROM projects WHERE id = $1")
+            .bind(project_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
     let owner = match owner {
         Some(o) => o,
         None => return,
@@ -141,7 +142,8 @@ pub(crate) async fn maybe_trigger_debugger(
         content,
         // Eredita la modalita' della sessione (mig 0371) invece di hardcodare
         // Confirm, cosi' l'auto-debug rispetta la scelta dell'utente.
-        automation_mode: crate::chat_messages::read_session_automation_mode(&state.db, session).await,
+        automation_mode: crate::chat_messages::read_session_automation_mode(&state.db, session)
+            .await,
         supervisor_mode: SupervisorMode::None,
         profile_prompt_block: String::new(),
         system_context,
@@ -155,60 +157,74 @@ pub(crate) async fn maybe_trigger_debugger(
         nexus_agent_type_hint: Some("debugger".to_string()),
     };
 
-    if let Some(result) = spawn_agent_run(state, params).await {
-        let run_id = result.run_id;
-        if let Some(id) = diag_id {
-            let _ = sqlx::query(
+    match spawn_agent_run(state, params).await {
+        SpawnOutcome::Started(result) => {
+            let run_id = result.run_id;
+            if let Some(id) = diag_id {
+                let _ = sqlx::query(
                 "UPDATE service_diagnoses SET status = 'diagnosing', triggered_run_id = $1 WHERE id = $2",
             )
             .bind(run_id)
             .bind(id)
             .execute(&state.db)
             .await;
-        }
-        nexus_events::dispatcher::emit_global(
-            project_id,
-            ProjectEvent::ServiceDiagnosisStarted {
-                unit: unit.to_string(),
-                run_id: run_id.to_string(),
-            },
-        );
-        tracing::info!(
-            "service_observer: auto-debug avviato run={} per {} ({})",
-            run_id,
-            unit,
-            kind
-        );
-
-        // Auto-remediation loop (chiusura del ciclo): quando il debugger termina,
-        // riavvia il servizio cosi' l'observer al ciclo successivo ri-verifica la
-        // readiness. Se il servizio e' UP -> resolve; se ancora giu' con causa
-        // DIVERSA (nuova firma) -> nuovo trigger. Il cap orario + cooldown per
-        // firma sono il freno anti-loop. Task in background: non blocca l'observer.
-        let state_cl = state.clone();
-        let unit_cl = unit.to_string();
-        tokio::spawn(async move {
-            // Attende la fine del run debugger (max ~5 min), poi riavvia.
-            for _ in 0..60u32 {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                let status: Option<String> =
-                    sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1")
-                        .bind(run_id)
-                        .fetch_optional(&state_cl.db)
-                        .await
-                        .ok()
-                        .flatten();
-                match status.as_deref() {
-                    // run ancora in corso: continua ad attendere
-                    Some("running") | Some("awaiting_confirmation") | None => continue,
-                    // terminato (completed/failed/...): procedi al riavvio
-                    _ => break,
-                }
             }
-            crate::project_workspace::services::restart_project_unit(
-                &state_cl, project_id, &unit_cl,
-            )
-            .await;
-        });
+            nexus_events::dispatcher::emit_global(
+                project_id,
+                ProjectEvent::ServiceDiagnosisStarted {
+                    unit: unit.to_string(),
+                    run_id: run_id.to_string(),
+                },
+            );
+            tracing::info!(
+                "service_observer: auto-debug avviato run={} per {} ({})",
+                run_id,
+                unit,
+                kind
+            );
+
+            // Auto-remediation loop (chiusura del ciclo): quando il debugger termina,
+            // riavvia il servizio cosi' l'observer al ciclo successivo ri-verifica la
+            // readiness. Se il servizio e' UP -> resolve; se ancora giu' con causa
+            // DIVERSA (nuova firma) -> nuovo trigger. Il cap orario + cooldown per
+            // firma sono il freno anti-loop. Task in background: non blocca l'observer.
+            let state_cl = state.clone();
+            let unit_cl = unit.to_string();
+            tokio::spawn(async move {
+                // Attende la fine del run debugger (max ~5 min), poi riavvia.
+                for _ in 0..60u32 {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let status: Option<String> =
+                        sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = $1")
+                            .bind(run_id)
+                            .fetch_optional(&state_cl.db)
+                            .await
+                            .ok()
+                            .flatten();
+                    match status.as_deref() {
+                        // run ancora in corso: continua ad attendere
+                        Some("running") | Some("awaiting_confirmation") | None => continue,
+                        // terminato (completed/failed/...): procedi al riavvio
+                        _ => break,
+                    }
+                }
+                crate::project_workspace::services::restart_project_unit(
+                    &state_cl, project_id, &unit_cl,
+                )
+                .await;
+            });
+        }
+        SpawnOutcome::Disambiguation(_) => {
+            // Non dovrebbe accadere: passiamo nexus_agent_type_hint="debugger"
+            // che forza l'AgentType e salta il gate di disambiguazione.
+            tracing::warn!(
+                "service_observer: disambiguazione inattesa per {} ({}), nessun auto-debug avviato",
+                unit,
+                kind
+            );
+        }
+        SpawnOutcome::NotStarted => {
+            // Progetto non caricabile o altro fallback: nessun run (come prima).
+        }
     }
 }

@@ -191,8 +191,22 @@ _stop_pattern() {
     done
 }
 
+# Unit systemd --user dei servizi del meta-progetto (auto-restart on-failure,
+# install: deploy/install-nexus-units.sh). Se per <name> esiste
+# nexus-<name>.service, start/stop DEVONO passare da systemctl: un pkill
+# diretto sul processo gestito dalla unit verrebbe rilanciato da Restart=
+# creando doppia istanza sulla porta.
+_service_unit_installed() {
+    systemctl --user cat "nexus-$1.service" >/dev/null 2>&1
+}
+
 stop_service() {
     local name="$1"
+    if _service_unit_installed "$name"; then
+        systemctl --user stop "nexus-${name}.service" 2>/dev/null || true
+    fi
+    # Il pattern-kill sotto resta come defense-in-depth contro processi nohup
+    # legacy residui (transizione pre-unit). Innocuo se la unit e' gia' ferma.
     # Root cause (regola H): `pkill -f "$name"` su nudo nome di servizio matcha
     # anche la command line dello script stesso quando invocato come
     # `deploy-local.sh --service mcp-core` (l'argomento "mcp-core" e' presente
@@ -225,6 +239,17 @@ start_service() {
     shift
     local bin="${BIN_DIR}/${name}"
     local logfile="/tmp/nexus-${name}.log"
+    # Ramo systemd: aggiorna il symlink stabile al binario del profilo corrente
+    # (debug|release) e riavvia la unit. NB: le eventuali env extra ($@) NON
+    # vengono propagate qui — una unit che ne richiede deve dichiararle nel
+    # proprio file .service (oggi nessuna unit installata le richiede).
+    if [ -f "$bin" ] && _service_unit_installed "$name"; then
+        mkdir -p "${ROOT}/target/nexus-current"
+        ln -sfn "$bin" "${ROOT}/target/nexus-current/${name}"
+        systemctl --user restart "nexus-${name}.service"
+        echo "  ${name} via systemd nexus-${name}.service (auto-restart on-failure) log=${logfile}"
+        return
+    fi
     # Esporta le variabili extra (es. ENABLE_TOOL_RUNNER=1) nell'ambiente corrente
     # prima di lanciare il processo, poi le rimuove per non inquinare il resto.
     local env_backup=""
@@ -268,12 +293,30 @@ start_service_with_env() {
     fi
 }
 
+# Unit systemd --user del brain (auto-restart on-failure). Se installata
+# (deploy/install-brain-unit.sh), start/stop DEVONO passare da systemctl:
+# un pkill diretto sul processo gestito dalla unit verrebbe rilanciato da
+# Restart= entro 5s, creando doppia istanza sulla porta col nohup successivo.
+_brain_unit_installed() {
+    systemctl --user cat nexus-brain.service >/dev/null 2>&1
+}
+
 stop_brain() {
+    if _brain_unit_installed; then
+        systemctl --user stop nexus-brain.service 2>/dev/null || true
+    fi
+    # Defense-in-depth: ferma anche eventuali processi nohup legacy residui
+    # (transizione pre-unit). Innocuo se la unit e' gia' stoppata.
     _stop_pattern 'brain.grpc_server.main' 'brain'
 }
 
 start_brain() {
     local logfile="/tmp/nexus-neural.log"
+    if _brain_unit_installed; then
+        systemctl --user restart nexus-brain.service
+        echo "  brain via systemd nexus-brain.service (auto-restart on-failure) log=${logfile}"
+        return
+    fi
     setsid nohup env \
         DATABASE_URL="${DATABASE_URL:-postgres://nexus:nexus@localhost:5433/nexus?sslmode=disable}" \
         HF_HUB_OFFLINE=1 \
@@ -282,7 +325,7 @@ start_brain() {
         > "$logfile" 2>&1 < /dev/null &
     local pid=$!
     disown || true
-    echo "  brain PID=${pid} log=${logfile}"
+    echo "  brain PID=${pid} log=${logfile} (nohup legacy: installa l'auto-restart con deploy/install-brain-unit.sh)"
 }
 
 stop_gateway() {

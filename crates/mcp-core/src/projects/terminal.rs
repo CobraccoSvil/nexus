@@ -26,7 +26,10 @@ async fn ensure_project_membership(
 fn require_consumer_id(consumer_id: &str) -> Result<&str, ApiError> {
     let trimmed = consumer_id.trim();
     if trimmed.is_empty() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "consumerId obbligatorio"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "consumerId obbligatorio",
+        ));
     }
     Ok(trimmed)
 }

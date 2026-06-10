@@ -18,7 +18,6 @@ export type BehaviorMode = "veloce" | "economica" | "bilanciata" | "approfondita
 
 export interface RoutingConfigState {
   providerHierarchy: ProviderName[];
-  providerModels: Record<ProviderName, string>;
   intentChains: Record<string, ProviderName[]>;
   tokenBudget: string;
   maxTokenBudget: string;
@@ -124,16 +123,10 @@ export const ROUTING_INTENTS = [
 export const MANAGED_ROUTING_KEYS = new Set([
   "provider_hierarchy",
   "default_provider",
-  "default_model",
   "token_budget",
   "max_token_budget",
   "nexus_behavior_mode",
   "nexus_active_routing_pct",
-  "provider_model_anthropic",
-  "provider_model_openai",
-  "provider_model_google",
-  "provider_model_deepseek",
-  "provider_model_mistral",
   "routing_chat_providers",
   "routing_fix_providers",
   "routing_refactor_providers",
@@ -166,15 +159,6 @@ export function buildRoutingState(settings: SettingEntry[]): RoutingConfigState 
 
   return {
     providerHierarchy,
-    providerModels: {
-      // Fallback dal catalogo UI (PROVIDER_MODELS[0]), non da nomi hardcoded.
-      // Il valore effettivo viene da nexus_provider_default_model in DB.
-      anthropic: get("provider_model_anthropic") || PROVIDER_MODELS.anthropic[0],
-      openai:    get("provider_model_openai")    || PROVIDER_MODELS.openai[0],
-      google:    get("provider_model_google")    || PROVIDER_MODELS.google[0],
-      deepseek:  get("provider_model_deepseek")  || PROVIDER_MODELS.deepseek[0],
-      mistral:   get("provider_model_mistral")   || PROVIDER_MODELS.mistral[0],
-    },
     intentChains: Object.fromEntries(
       ROUTING_INTENTS.map((intent) => [
         intent.key,

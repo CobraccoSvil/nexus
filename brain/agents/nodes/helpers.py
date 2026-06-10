@@ -335,6 +335,31 @@ def should_force_tool_choice(
     return True
 
 
+def turn_action_oriented(state) -> bool:
+    """Punto unico (regola L): il TURNO CORRENTE richiede azione con tool?
+
+    Fonte autoritativa: il campo `action_oriented` calcolato da router_node
+    dalla semantica del classifier LLM del turno corrente (requires_tools /
+    agentic_score, soglia DB `routing.action_oriented_min_agentic_score`).
+
+    Sostituisce le euristiche testuali locali (`_detect_action_request` sul
+    PRIMO messaggio della history) sparse in 5 call site: in una sessione
+    iniziata con una richiesta d'azione OGNI turno successivo risultava
+    "azione" per sempre. Incidente osservato 2026-06-10: "riassumi in due
+    righe cosa hai sistemato" valutato sul primo messaggio (un crash da
+    debuggare) -> tool_choice forzato -> ri-esecuzione di npm run dev invece
+    della risposta testuale.
+
+    Default conservativo True quando il campo manca (run ripresi da checkpoint
+    creati prima dell'introduzione del campo): mantiene attivi i guard
+    anti-descrittivi; il transitorio si esaurisce coi run nuovi.
+    """
+    v = state.get("action_oriented")
+    if v is None:
+        return True
+    return bool(v)
+
+
 def provider_style_supports_forcing(tool_choice_style: str | None) -> bool:
     """True se lo style di tool_choice del provider permette di OBBLIGARE una
     tool call (anthropic_any / openai_required / google_function_calling_any).
@@ -480,6 +505,26 @@ def _load_progress_controller_enabled() -> bool:
     _PROGRESS_CTRL_CACHE["enabled"] = value
     _PROGRESS_CTRL_CACHE["loaded_at"] = now
     return value
+
+
+def _load_repeated_action_force_diagnose_enabled() -> bool:
+    """Legge agent.repeated_action_force_diagnose_enabled dal DB (default True).
+
+    Abilita lo stadio intermedio force_diagnose del progress_controller per
+    l'azione ripetuta (mig 0386). get_bool_setting non solleva mai: default
+    sicuro se il DB e' irraggiungibile.
+    """
+    try:
+        from brain.utils.settings_db import get_bool_setting
+        return bool(
+            get_bool_setting("agent.repeated_action_force_diagnose_enabled", True)
+        )
+    except Exception as exc:
+        logger.warning(
+            "repeated_action_force_diagnose_enabled: load DB fallito, default True (%s)",
+            exc,
+        )
+        return True
 
 
 # ── Cache reminder lingua resiliente (TTL 60s) ──────────────────────────────
@@ -995,10 +1040,14 @@ _ACTION_PATTERNS: tuple[str, ...] = (
 
 
 def _detect_action_request(text: str) -> bool:
-    """G1 Python: True se il testo contiene una richiesta d'azione concreta.
+    """DEPRECATA (2026-06-10): non usare in nuovi call site.
+
+    Euristica keyword sostituita dal punto unico `turn_action_oriented(state)`
+    (campo `action_oriented` calcolato da router_node dal classifier LLM sul
+    turno corrente). I 5 call site storici sono stati convertiti; questa resta
+    solo come riferimento e per i test unitari finche' non vengono migrati.
 
     Speculare a crates/mcp-core/src/agent_types.rs::detect_action_request.
-    Usato per forzare nudge quando l'agente risponde con 0 tool call.
     """
     if not text or not text.strip():
         return False
@@ -1419,6 +1468,36 @@ def _has_tool_calls_in_history(messages: list) -> bool:
     return False
 
 
+def has_productive_action_in_history(messages: list) -> bool:
+    """True se il run ha gia' eseguito almeno UN'azione PRODUTTIVA (tool_use con
+    nome NON in _EXPLORATION_ONLY_TOOLS: write_file, edit_file, run_command, ...).
+
+    Punto unico (regola L) del fatto strutturale "questo run ha gia' agito".
+    Usato dal routing G1: se il run ha gia' prodotto azioni, una chiusura
+    end_turn testuale e' il RESOCONTO FINALE legittimo del lavoro svolto, NON
+    una "risposta descrittiva senza azione" — ri-mandarla all'executor produceva
+    reroute G1 a vuoto su lavoro gia' concluso, escalation inutile di modello e
+    infine il cap-text contraddittorio appeso in coda a una risposta conclusa
+    ("Modello non risponde con azione..." dopo "Considero l'intervento
+    concluso."). Fatto strutturale, nessuna analisi lessicale del testo.
+    """
+    for m in messages:
+        if not isinstance(m, AIMessage):
+            continue
+        extra = getattr(m, "additional_kwargs", {}) or {}
+        blocks = extra.get("anthropic_content") or []
+        if not isinstance(blocks, list):
+            continue
+        for b in blocks:
+            if (
+                isinstance(b, dict)
+                and b.get("type") == "tool_use"
+                and (b.get("name") or "") not in _EXPLORATION_ONLY_TOOLS
+            ):
+                return True
+    return False
+
+
 # Pattern testuali che indicano errore dentro un tool_result. Match case-insensitive.
 # Non e' esaustivo, copre i casi piu' frequenti (npm/cargo/python/shell/network).
 _TOOL_ERROR_HINTS = (
@@ -1561,6 +1640,59 @@ def _load_repeated_action_threshold() -> int:
     return value
 
 
+def _tool_result_outcome_after(recent: list, idx: int, max_ahead: int = 3) -> bool | None:
+    """Esito del primo tool_result nei `max_ahead` messaggi dopo recent[idx].
+
+    Ritorna True=errore, False=successo, None=nessun risultato trovato (es.
+    tool_use ancora pending in coda alla history). Gestisce ENTRAMBI i formati
+    di tool_result presenti nel grafo: ToolMessage (formato langchain classico)
+    e HumanMessage con anthropic_content=[{type: tool_result, ...}] (formato
+    emesso da tool_dispatch_node). Punto unico (regola L) della domanda
+    "il tool_use a recent[idx] e' riuscito?".
+    """
+    for j in range(idx + 1, min(idx + 1 + max_ahead, len(recent))):
+        nm = recent[j]
+        if isinstance(nm, ToolMessage):
+            if getattr(nm, "status", "") == "error":
+                return True
+            c = getattr(nm, "content", "")
+            if isinstance(c, list):
+                for cc in c:
+                    if isinstance(cc, dict):
+                        if cc.get("is_error"):
+                            return True
+                        txt = str(cc.get("text", "") or cc.get("content", ""))
+                        if any(h in txt.lower() for h in _TOOL_ERROR_HINTS):
+                            return True
+                return False
+            return any(h in str(c).lower() for h in _TOOL_ERROR_HINTS)
+        if isinstance(nm, HumanMessage):
+            extra = getattr(nm, "additional_kwargs", {}) or {}
+            blocks = extra.get("anthropic_content") or []
+            found_result = False
+            for bb in blocks if isinstance(blocks, list) else []:
+                if not isinstance(bb, dict) or bb.get("type") != "tool_result":
+                    continue
+                found_result = True
+                if bb.get("is_error"):
+                    return True
+                cont = bb.get("content")
+                txts: list[str] = []
+                if isinstance(cont, list):
+                    for cc in cont:
+                        if isinstance(cc, dict):
+                            txts.append(str(cc.get("text", "") or cc.get("content", "")))
+                elif cont is not None:
+                    txts.append(str(cont))
+                if any(
+                    h in t.lower() for t in txts for h in _TOOL_ERROR_HINTS
+                ):
+                    return True
+            if found_result:
+                return False
+    return None
+
+
 def _detect_repeated_action(messages: list, lookback: int = 24) -> tuple[str | None, int]:
     """Rileva la ripetizione IDENTICA di una azione produttiva (scrittura/comando).
 
@@ -1573,6 +1705,16 @@ def _detect_repeated_action(messages: list, lookback: int = 24) -> tuple[str | N
     in `_REPEATED_ACTION_TOOLS` e costruisce una signature `name|valore-chiave`.
     Conta le occorrenze di ogni signature.
 
+    FALSO-DOPPIONE (incidente 2026-06-10, due run buoni chiusi failed): una
+    signature la cui PRIMA occorrenza e' RIUSCITA non e' uno stallo. Il pattern
+    reale era: edit_file applicato con successo -> il modello ri-emette lo stesso
+    edit -> fallisce con "old_string non trovato" (perche' GIA' applicato) ->
+    count=2 -> abort "bloccato ripetendo la stessa azione" su un run COMPLETO.
+    Le signature con almeno un esito di successo vengono quindi escluse dal
+    conteggio: la ri-esecuzione di un'azione gia' applicata e' ridondanza
+    innocua (il tool_result d'errore informa il modello), non uno stallo. Lo
+    stallo vero (stessa azione che NON riesce mai) resta rilevato.
+
     Ritorna `(label, count)` della signature piu' frequente (label leggibile
     "name: valore"), oppure `(None, 0)` se nessuna azione tracciata e' presente.
     """
@@ -1580,9 +1722,10 @@ def _detect_repeated_action(messages: list, lookback: int = 24) -> tuple[str | N
         return (None, 0)
     counts: dict[str, int] = {}
     labels: dict[str, str] = {}
+    succeeded: set[str] = set()
     last_sig: str | None = None
     recent = messages[-lookback:] if len(messages) > lookback else messages
-    for m in recent:
+    for idx, m in enumerate(recent):
         if not isinstance(m, AIMessage):
             continue
         extra = getattr(m, "additional_kwargs", {}) or {}
@@ -1609,6 +1752,12 @@ def _detect_repeated_action(messages: list, lookback: int = 24) -> tuple[str | N
             counts[sig] = counts.get(sig, 0) + 1
             labels[sig] = f"{name}: {value[:120]}"
             last_sig = sig
+            # Esito strutturale: un successo marca la signature come
+            # "lavoro gia' riuscito" -> mai stallo da abort.
+            if _tool_result_outcome_after(recent, idx) is False:
+                succeeded.add(sig)
+    for sig in succeeded:
+        counts.pop(sig, None)
     if not counts:
         return (None, 0)
     top = max(counts.items(), key=lambda kv: (kv[1], kv[0] == last_sig))

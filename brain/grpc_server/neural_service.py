@@ -182,7 +182,15 @@ class NeuralCoreServicer(pb2_grpc.NeuralCoreServiceServicer):
 
     def GenerateCompletion(self, request, context):
         try:
-            result = providers.generate_completion(request.provider, request.model, request.prompt)
+            # internal_task=True (mig 0390): questo canale gRPC e' usato SOLO da
+            # task interni di mcp-core (purpose: title gen, doc enricher, probe,
+            # prompt templates, ...) — la chat utente vive nel LangGraph del
+            # brain. Sui dual-mode spegne il thinking testuale (anti-hollow).
+            # Se in futuro un percorso chat passasse di qui, il flag va promosso
+            # a campo del proto valorizzato dal chiamante.
+            result = providers.generate_completion(
+                request.provider, request.model, request.prompt, internal_task=True,
+            )
             # Punto unico in _normalize_provider_result (regola L, S66).
             content, error_meta, error_class = _normalize_provider_result(
                 result, request.provider, request.model
@@ -208,7 +216,10 @@ class NeuralCoreServicer(pb2_grpc.NeuralCoreServiceServicer):
             }))
 
     def GenerateStructuredCompletion(self, request, context):
-        result = providers.generate_completion(request.provider, request.model, request.prompt)
+        # internal_task=True: canale solo task interni, vedi GenerateCompletion.
+        result = providers.generate_completion(
+            request.provider, request.model, request.prompt, internal_task=True,
+        )
         return pb2.JsonResponse(json=json.dumps({
             "provider": result.provider,
             "model": result.model,
@@ -246,9 +257,14 @@ class NeuralCoreServicer(pb2_grpc.NeuralCoreServiceServicer):
                 "AgentTurn: provider=%s model=%s system_text_len=%d tools=%d msgs=%d",
                 request.provider, request.model, len(system_text), len(tools), len(messages),
             )
+            # internal_task=True (mig 0390): tutti i call site Rust di questo RPC
+            # sono task interni purpose-driven (conversation_summary, chat title,
+            # chat feedback, service discovery, model health probe) — il loop
+            # agentico della chat utente vive nel LangGraph del brain e non passa
+            # di qui. Sui dual-mode spegne il thinking nelle chiamate senza tool.
             result = providers.generate_agent_turn_sync(
                 request.provider, request.model, messages, tools, max_tokens,
-                system_text=system_text,
+                system_text=system_text, internal_task=True,
             )
             # Sanitizza errori grezzi e normalizza il content list/non-str.
             # Punto unico in _normalize_provider_result (regola L, S66).

@@ -167,10 +167,7 @@ fn err404(msg: &str) -> (StatusCode, String) {
     (StatusCode::NOT_FOUND, msg.to_string())
 }
 
-async fn build_acl(
-    state: &AppState,
-    claims: &Claims,
-) -> Result<WikiAcl, (StatusCode, String)> {
+async fn build_acl(state: &AppState, claims: &Claims) -> Result<WikiAcl, (StatusCode, String)> {
     WikiAcl::from_claims(state, claims).await.map_err(err500)
 }
 
@@ -240,20 +237,22 @@ pub async fn create_doc(
         public_read: body.public_read,
         vault_file_path: body.vault_file_path,
     };
-    let doc = storage::create_doc(&state, &acl, input).await.map_err(|e| {
-        let msg = format!("{e}");
-        // I bail dell'ACL diventano 403, gli altri 400/500.
-        if msg.contains("permesso negato")
-            || msg.contains("non membro")
-            || msg.contains("solo admin")
-        {
-            err403(&msg)
-        } else if msg.contains("scope") || msg.contains("slug") {
-            err400(msg)
-        } else {
-            err500(msg)
-        }
-    })?;
+    let doc = storage::create_doc(&state, &acl, input)
+        .await
+        .map_err(|e| {
+            let msg = format!("{e}");
+            // I bail dell'ACL diventano 403, gli altri 400/500.
+            if msg.contains("permesso negato")
+                || msg.contains("non membro")
+                || msg.contains("solo admin")
+            {
+                err403(&msg)
+            } else if msg.contains("scope") || msg.contains("slug") {
+                err400(msg)
+            } else {
+                err500(msg)
+            }
+        })?;
     Ok((
         StatusCode::CREATED,
         Json(serde_json::to_value(doc).unwrap_or_else(|_| json!({}))),
@@ -658,9 +657,8 @@ pub async fn recompute_titles_handler(
             let mut overall_updated = 0usize;
 
             if do_meta {
-                let rep =
-                    title_gen::generate_titles_for_scope(&state, title_gen::TitleScope::Meta)
-                        .await?;
+                let rep = title_gen::generate_titles_for_scope(&state, title_gen::TitleScope::Meta)
+                    .await?;
                 overall_processed += rep.processed_count;
                 overall_updated += rep.updated_count;
                 aggregated.insert(
@@ -842,7 +840,11 @@ pub async fn list_doc_links(
         // (oggetti WikiDoc con .title). Il frontend usa l.to_doc/l.from_doc; "target"
         // (flat) faceva l.from_doc undefined -> crash reading 'title'. Esponiamo la
         // chiave nidificata attesa (più "target" per retrocompatibilità).
-        let doc_key = if edge_dir == "outbound" { "to_doc" } else { "from_doc" };
+        let doc_key = if edge_dir == "outbound" {
+            "to_doc"
+        } else {
+            "from_doc"
+        };
         let mut obj = serde_json::Map::new();
         obj.insert("from_doc_id".to_string(), json!(from_id));
         obj.insert("to_doc_id".to_string(), json!(to_id));
@@ -856,8 +858,14 @@ pub async fn list_doc_links(
         Value::Object(obj)
     };
 
-    let outbound: Vec<Value> = outbound_rows.into_iter().map(|r| map_row(r, "outbound")).collect();
-    let inbound: Vec<Value> = inbound_rows.into_iter().map(|r| map_row(r, "inbound")).collect();
+    let outbound: Vec<Value> = outbound_rows
+        .into_iter()
+        .map(|r| map_row(r, "outbound"))
+        .collect();
+    let inbound: Vec<Value> = inbound_rows
+        .into_iter()
+        .map(|r| map_row(r, "inbound"))
+        .collect();
 
     Ok(Json(json!({
         "doc_id": id,
@@ -1003,7 +1011,9 @@ pub async fn get_graph(
     ];
     let mut edge_next_idx = 3usize;
     if predicates.is_some() {
-        edge_where.push(format!("wiki_links.rel_type = ANY(${edge_next_idx}::text[])"));
+        edge_where.push(format!(
+            "wiki_links.rel_type = ANY(${edge_next_idx}::text[])"
+        ));
         edge_next_idx += 1;
     }
     let edges_sql = format!(

@@ -116,6 +116,7 @@ export function ChatPanel({
   externalInput,
   externalAutoSend,
   externalProviderHint,
+  externalAgentTypeHint,
   externalAutomationOverride,
   onExternalInputConsumed,
   onTracesChange,
@@ -145,6 +146,10 @@ export function ChatPanel({
   externalInput?: string;
   externalAutoSend?: boolean;
   externalProviderHint?: { provider?: string; model?: string };
+  /** Hint strutturale sul tipo di agente per questo invio esterno (es. "debugger"
+   *  dai pannelli error-fix). Propagato come `agentTypeHint` nel POST: bypassa la
+   *  disambiguazione d'intent A/B lato backend. */
+  externalAgentTypeHint?: string;
   /** Se impostato con input esterno, questo invio usa la modalità indicata (es. `confirm` da pannello debug). */
   externalAutomationOverride?: "study" | "confirm" | "automatic";
   onExternalInputConsumed?: () => void;
@@ -275,12 +280,17 @@ export function ChatPanel({
   // Salva il provider hint in un ref per evitare che onExternalInputConsumed()
   // lo resetti prima che l'auto-send effect lo possa usare.
   const pendingProviderHintRef = useRef<{ provider?: string; model?: string } | undefined>(undefined);
+  // Stesso meccanismo per l'agent type hint (es. "debugger" dai pannelli error-fix):
+  // serve sopravvivere fino all'auto-send dopo che onExternalInputConsumed() ha
+  // azzerato i pending nel parent.
+  const pendingAgentTypeHintRef = useRef<string | undefined>(undefined);
   const automationOnceRef = useRef<"study" | "confirm" | "automatic" | null>(null);
   useEffect(() => {
     if (externalInput) {
       if (externalAutoSend) {
         autoSendPendingRef.current = externalInput;
         pendingProviderHintRef.current = externalProviderHint;
+        pendingAgentTypeHintRef.current = externalAgentTypeHint;
       }
       if (externalAutomationOverride) {
         automationOnceRef.current = externalAutomationOverride;
@@ -584,10 +594,17 @@ export function ChatPanel({
 
   /* ---- Handlers ---- */
 
-  const doSend = async (text: string, providerHintOverride?: { provider?: string; model?: string }) => {
+  const doSend = async (
+    text: string,
+    providerHintOverride?: { provider?: string; model?: string },
+    agentTypeHintOverride?: string,
+  ) => {
     // Se il provider e' "auto" e c'e' un hint esterno (es. generazione documenti),
     // usa il hint per forzare un provider/modello capace.
     const hint = providerHintOverride || externalProviderHint;
+    // Agent type hint (es. "debugger" dai pannelli error-fix): override esplicito
+    // dall'auto-send (via ref) oppure prop esterna. Strutturale, mai dedotto dal testo.
+    const agentTypeHint = agentTypeHintOverride ?? externalAgentTypeHint;
     // ADR 0023: provider e modello sono override indipendenti.
     // Provider: forzato solo se selezionato esplicitamente (diverso da "auto");
     // altrimenti lascia decidere al routing (eventuale hint esterno).
@@ -613,6 +630,7 @@ export function ChatPanel({
       automationMode: modeForSend,
       supervisorMode: supervisorMode !== "none" ? supervisorMode : undefined,
       attachments: snapshotAttachments,
+      agentTypeHint,
     };
     // Snapshot del messaggio in volo: se l'invio fallisce (es. 500 backend,
     // network, body limit), useEffect su `error` riporta input + attachments
@@ -648,10 +666,12 @@ export function ChatPanel({
     if (autoSendPendingRef.current && input === autoSendPendingRef.current && !isAgentRunning && !isLoading) {
       const text = autoSendPendingRef.current;
       const hint = pendingProviderHintRef.current;
+      const agentTypeHint = pendingAgentTypeHintRef.current;
       autoSendPendingRef.current = null;
       pendingProviderHintRef.current = undefined;
+      pendingAgentTypeHintRef.current = undefined;
       // Piccolo delay per assicurare che lo stato React sia stabile
-      const timer = setTimeout(() => doSend(text, hint), 150);
+      const timer = setTimeout(() => doSend(text, hint, agentTypeHint), 150);
       return () => clearTimeout(timer);
     }
   // isAgentRunning e isLoading inclusi intenzionalmente: se bloccati l'effect riprova

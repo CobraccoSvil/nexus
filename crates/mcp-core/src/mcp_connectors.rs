@@ -32,14 +32,15 @@ use crate::{
 
 // Request types e helper SQL: punto unico in nexus_mcp_client::server_storage
 // (regola L / ADR 0026, Wave C1). Prima erano duplicati con plugin-service.
-pub use nexus_mcp_client::server_storage::{
-    CreateMcpServerRequest, ToggleRequest, UpdateMcpServerRequest,
-};
 use nexus_mcp_client::server_storage::{
     apply_update_and_fetch, build_config, build_tool_upsert_args, can_manage_server,
     delete_mcp_server as ss_delete, fetch_owner_scope, fetch_server_for_test, insert_mcp_server,
     is_tool_allowed_by_policy, list_cached_tools, list_cached_tools_with_schema,
-    list_servers_for_user, parse_json_string_set, row_to_json, set_enabled, upsert_discovered_tools,
+    list_servers_for_user, parse_json_string_set, row_to_json, set_enabled,
+    upsert_discovered_tools,
+};
+pub use nexus_mcp_client::server_storage::{
+    CreateMcpServerRequest, ToggleRequest, UpdateMcpServerRequest,
 };
 
 // build_config: punto unico in nexus_mcp_client::server_storage (regola L /

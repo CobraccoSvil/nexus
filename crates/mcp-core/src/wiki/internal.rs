@@ -85,7 +85,12 @@ pub async fn internal_kb_search(
 
     let doc_hits: Vec<(Uuid, f32)> = hits
         .iter()
-        .filter_map(|h| h.point_id.parse::<Uuid>().ok().map(|id| (id, h.score as f32)))
+        .filter_map(|h| {
+            h.point_id
+                .parse::<Uuid>()
+                .ok()
+                .map(|id| (id, h.score as f32))
+        })
         .take(top_k)
         .collect();
     if doc_hits.is_empty() {

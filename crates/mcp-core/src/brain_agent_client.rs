@@ -578,6 +578,16 @@ pub async fn run_via_brain(
     sse_max_silence_secs: u64,
     emit_final_event: bool,
     automation_mode: String,
+    // Intent gia' RISOLTO a monte (oggi: risposta dell'utente a una
+    // disambiguazione, resolve_disambiguation_reply). Quando presente il
+    // router_node del brain lo usa al posto di ri-classificare il prompt:
+    // la lettera secca "A" verrebbe ri-marcata 'chat' (prompt_len=1) perdendo
+    // l'intent scelto dall'utente. None = classificazione brain normale.
+    intent_hint: Option<String>,
+    // Pool DB: serve per marcare `generation_ended_at` all'istante dell'end_turn
+    // (mig 0388), cosi' la finestra reflection/learner post-end_turn non blocca
+    // la sessione col guard anti-run-concorrente (409). Solo questo UPDATE leggero.
+    db: PgPool,
 ) -> AgentRunResult {
     let run_id_str = run_id.to_string();
     let url = format!(
@@ -585,7 +595,7 @@ pub async fn run_via_brain(
         brain_rest_url().trim_end_matches('/')
     );
 
-    let body = json!({
+    let mut body = json!({
         "thread_id": run_id_str,
         "prompt": initial_msg,
         "behavior_mode": "bilanciata",
@@ -598,6 +608,9 @@ pub async fn run_via_brain(
         "run_id": run_id_str,
         "automation_mode": automation_mode,
     });
+    if let Some(hint) = intent_hint.as_deref() {
+        body["intent_hint"] = json!(hint);
+    }
 
     // Solo connect_timeout: il timeout sulla connessione TCP iniziale.
     // Il precedente timeout monolitico di 1200s sull'intera request impediva
@@ -659,6 +672,14 @@ pub async fn run_via_brain(
     // B5: metadata routing propagati dal brain Python nell'evento end_turn
     let mut nexus_task_type: Option<String> = None;
     let mut nexus_agent_type: Option<String> = None;
+    // Macchina a stati di terminazione (mig 0386): segnale autoritativo che il run
+    // e' stato chiuso da un abort anti-loop senza verifica. Propagato dal brain
+    // nell'evento end_turn; sopravvive alla riscrittura di stop_reason a "end_turn"
+    // operata dal final_gate sul ramo forced_close.
+    let mut forced_close_unverified = false;
+    // Macchina a stati (mig 0386): verifica E2E (final_gate) superata -> esito
+    // canonico CompletedVerified. Propagato dal brain nell'evento end_turn.
+    let mut final_gate_passed = false;
     // Provider/model EFFETTIVI dell'ultima iterazione, propagati dal brain
     // nell'evento end_turn quando avviene un cascade fallback sticky intra-run
     // (es. deepseek -> google/gemini-2.5-pro). Default al provider/model iniziale
@@ -748,14 +769,19 @@ pub async fn run_via_brain(
                                         );
                                     }
                                     CooldownKind::Short => {
+                                        // Durata DB-driven (regola G): slow_cooldown_s, non 60 letterale.
+                                        let secs =
+                                            crate::provider_cooldown::provider_health_timings()
+                                                .slow_cooldown_s;
                                         crate::provider_cooldown::put_provider_in_short_cooldown(
                                             provider_key,
                                             human_reason,
-                                            60,
+                                            secs,
                                         );
                                         tracing::warn!(
-                                            "Provider '{}' COOLDOWN BREVE 60s ({}): {}",
+                                            "Provider '{}' COOLDOWN BREVE {}s ({}): {}",
                                             provider,
+                                            secs,
                                             err_class,
                                             human_reason
                                         );
@@ -870,6 +896,19 @@ pub async fn run_via_brain(
                 }
                 "end_turn" => {
                     ended = true;
+                    // Marca la fine della fase generativa (mig 0388): da qui il
+                    // frontend e' libero (riceve end_turn) e reflection/learner
+                    // girano in post-processing. Il guard anti-run-concorrente
+                    // (handlers.rs) esclude i run con generation_ended_at valorizzato,
+                    // evitando il 409 "la chat sembra libera". Best-effort: un errore
+                    // qui non deve interrompere lo stream. IS NULL: marca una volta sola.
+                    let _ = sqlx::query(
+                        "UPDATE agent_runs SET generation_ended_at = NOW() \
+                         WHERE id = $1 AND generation_ended_at IS NULL",
+                    )
+                    .bind(run_id)
+                    .execute(&db)
+                    .await;
                     acc_prompt_tokens = evt
                         .get("prompt_tokens")
                         .and_then(|v| v.as_u64())
@@ -894,6 +933,20 @@ pub async fn run_via_brain(
                     // B5: legge metadata routing propagati dal brain Python
                     if let Some(tt) = evt.get("nexus_task_type").and_then(|v| v.as_str()) {
                         nexus_task_type = Some(tt.to_string());
+                    }
+                    if evt
+                        .get("forced_close_unverified")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        forced_close_unverified = true;
+                    }
+                    if evt
+                        .get("final_gate_passed")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        final_gate_passed = true;
                     }
                     if let Some(at) = evt.get("nexus_agent_type").and_then(|v| v.as_str()) {
                         nexus_agent_type = Some(at.to_string());
@@ -985,13 +1038,26 @@ pub async fn run_via_brain(
                     // la barra context si aggiorna in tempo reale senza polling.
                     // Riusa il campo meta_step esistente per non toccare i 12 call
                     // site di AgentStepEvent (regola: niente patch speculative).
-                    let prompt_t = evt.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    let completion_t =
-                        evt.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    let total_t = evt.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    let cost_t = evt.get("total_cost").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let last_pt =
-                        evt.get("last_prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    let prompt_t = evt
+                        .get("prompt_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    let completion_t = evt
+                        .get("completion_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    let total_t = evt
+                        .get("total_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    let cost_t = evt
+                        .get("total_cost")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    let last_pt = evt
+                        .get("last_prompt_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
                     // Mantieni gli accumulatori coerenti col risultato finale anche
                     // se end_turn non dovesse arrivare (es. stream troncato).
                     if total_t > 0 {
@@ -1095,12 +1161,24 @@ pub async fn run_via_brain(
             }
             _ => AgentRunStatus::Failed,
         }
+    } else if forced_close_unverified
+        || matches!(
+            last_stop_reason.as_deref(),
+            Some("loop_detected") | Some("loop_aborted") | Some("loop_abort")
+        )
+    {
+        // Esito canonico (macchina a stati, mig 0386): un abort anti-loop NON e' un
+        // successo ne' un errore infrastrutturale, ma un FALLIMENTO DIAGNOSTICATO.
+        // Il recap M44 dell'executor porta sempre esito + file toccati + prossimo
+        // passo. `forced_close_unverified` e' il segnale autoritativo: copre anche
+        // il caso in cui il final_gate ha riscritto stop_reason a "end_turn" sul
+        // ramo forced_close (prima un abort finiva erroneamente come Completed).
+        AgentRunStatus::FailedDiagnosed
+    } else if ended && final_gate_passed {
+        // Verifica E2E (final_gate) superata: successo verificato (mig 0386).
+        AgentRunStatus::CompletedVerified
     } else if ended {
-        // Distingui fine normale da loop abortito
-        match last_stop_reason.as_deref() {
-            Some("loop_detected") | Some("loop_aborted") => AgentRunStatus::LoopAborted,
-            _ => AgentRunStatus::Completed,
-        }
+        AgentRunStatus::Completed
     } else {
         AgentRunStatus::Completed
     };

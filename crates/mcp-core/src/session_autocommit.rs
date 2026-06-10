@@ -62,11 +62,7 @@ fn short_session(session_id: Uuid) -> String {
     s.chars().take(8).collect()
 }
 
-async fn git(
-    root: &Path,
-    args: &[&str],
-    env: &[(&str, &str)],
-) -> Result<String, (i32, String)> {
+async fn git(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String, (i32, String)> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.arg("-C")
         .arg(root)
@@ -168,8 +164,7 @@ pub async fn snapshot_after_mutation(
     }
 
     // 2) stage del singolo file (-A copre anche delete/rename)
-    if let Err((code, err)) =
-        git(project_root, &["add", "-A", "--", relative_path_hint], env).await
+    if let Err((code, err)) = git(project_root, &["add", "-A", "--", relative_path_hint], env).await
     {
         tracing::warn!(
             session = %short, code, file = %relative_path_hint,
@@ -248,12 +243,7 @@ pub async fn snapshot_after_mutation(
     let new_commit = commit_out.trim();
 
     // 6) update-ref: fa avanzare il branch nexus al nuovo commit
-    if let Err((code, err)) = git(
-        project_root,
-        &["update-ref", &branch_ref, new_commit],
-        env,
-    )
-    .await
+    if let Err((code, err)) = git(project_root, &["update-ref", &branch_ref, new_commit], env).await
     {
         tracing::warn!(
             session = %short, code, branch = %branch_with_slash,

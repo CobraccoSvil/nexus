@@ -101,11 +101,9 @@ mod tests {
     /// bit-per-bit fra Rust e Python (regola L / ADR 0026, Wave 8a).
     #[test]
     fn parita_cross_language_da_fixture_golden() {
-        const FIXTURE: &str = include_str!(
-            "../../../../tests/fixtures/chunker_golden.json"
-        );
-        let parsed: serde_json::Value = serde_json::from_str(FIXTURE)
-            .expect("fixture golden non e' JSON valido");
+        const FIXTURE: &str = include_str!("../../../../tests/fixtures/chunker_golden.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(FIXTURE).expect("fixture golden non e' JSON valido");
         let cases = parsed["cases"]
             .as_array()
             .expect("fixture senza array 'cases'");

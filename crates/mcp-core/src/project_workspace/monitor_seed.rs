@@ -95,12 +95,7 @@ async fn recent_active_projects(
     .map_err(|e| e.to_string())?;
     Ok(rows
         .into_iter()
-        .map(|r| {
-            (
-                r.get::<Uuid, _>("project_id"),
-                r.get::<String, _>("slug"),
-            )
-        })
+        .map(|r| (r.get::<Uuid, _>("project_id"), r.get::<String, _>("slug")))
         .collect())
 }
 
@@ -115,9 +110,13 @@ async fn compute_metrics(
     let services = count_services(slug).await;
     let containers = count_containers_up(slug).await;
     let ports = count_ports_used(state, project_id).await;
-    let problems = count_problems_open(&state.db, project_id).await.unwrap_or(0);
+    let problems = count_problems_open(&state.db, project_id)
+        .await
+        .unwrap_or(0);
     let usage = read_usage_24h(&state.db, project_id).await;
-    let runs_24h = count_agent_runs_24h(&state.db, project_id).await.unwrap_or(0);
+    let runs_24h = count_agent_runs_24h(&state.db, project_id)
+        .await
+        .unwrap_or(0);
     let primary_model = read_primary_model(&state.db, project_id).await;
 
     let svc_label = match services {
@@ -131,11 +130,7 @@ async fn compute_metrics(
         Some(n) => n.to_string(),
         None => "—".to_string(),
     };
-    let ports_label = format!(
-        "{}/{}",
-        ports,
-        super::services::PROJECT_PORT_BUCKET_SIZE
-    );
+    let ports_label = format!("{}/{}", ports, super::services::PROJECT_PORT_BUCKET_SIZE);
     // Token: scala a "k"/"M" per leggibilita' a colpo d'occhio.
     let tokens_label = match usage {
         Some(ref u) if u.total_tokens >= 1_000_000 => {
@@ -154,10 +149,7 @@ async fn compute_metrics(
         Some(_) => "$0".to_string(),
         None => "—".to_string(),
     };
-    let model_label = primary_model
-        .as_deref()
-        .unwrap_or("—")
-        .to_string();
+    let model_label = primary_model.as_deref().unwrap_or("—").to_string();
 
     vec![
         (
@@ -398,7 +390,12 @@ async fn load_bool(state: &AppState, key: &str, default: bool) -> bool {
         .await
         .ok()
         .flatten()
-        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .map(|v| {
+            !matches!(
+                v.trim().to_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(default)
 }
 

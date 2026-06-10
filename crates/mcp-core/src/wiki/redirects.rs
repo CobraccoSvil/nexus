@@ -73,10 +73,7 @@ pub async fn meta_docs_list() -> Response<Body> {
 }
 
 pub async fn meta_docs_get(Path(id): Path<Uuid>) -> Response<Body> {
-    build_redirect(
-        "/api/meta-docs/:id",
-        &format!("/api/wiki/docs/{id}"),
-    )
+    build_redirect("/api/meta-docs/:id", &format!("/api/wiki/docs/{id}"))
 }
 
 pub async fn meta_docs_graph() -> Response<Body> {

@@ -71,7 +71,11 @@ pub async fn provider_error_handler(
             );
         }
         "rate_limit" => {
-            let secs = body.retry_after_seconds.unwrap_or(60);
+            // Durata DB-driven (regola G): retry_after del provider se presente,
+            // altrimenti la soglia short configurata (slow_cooldown_s), non un 60 letterale.
+            let secs = body.retry_after_seconds.unwrap_or_else(|| {
+                crate::provider_cooldown::provider_health_timings().slow_cooldown_s
+            });
             crate::provider_cooldown::put_provider_in_cooldown(&provider, Some(secs));
             tracing::warn!(
                 "provider-error bridge: '{}' → cooldown breve {}s (rate_limit)",
@@ -80,10 +84,12 @@ pub async fn provider_error_handler(
             );
         }
         "overloaded" | "provider_error" => {
-            crate::provider_cooldown::put_provider_in_cooldown(&provider, Some(60));
+            let secs = crate::provider_cooldown::provider_health_timings().slow_cooldown_s;
+            crate::provider_cooldown::put_provider_in_cooldown(&provider, Some(secs));
             tracing::warn!(
-                "provider-error bridge: '{}' → cooldown breve 60s ({})",
+                "provider-error bridge: '{}' → cooldown breve {}s ({})",
                 provider,
+                secs,
                 body.error_class
             );
         }
@@ -151,7 +157,9 @@ impl PurposeResolution {
     /// duplicare il match a 4 rami in ogni chiamante (regola L).
     pub fn into_model(self, purpose: &str) -> Result<(String, String), String> {
         match self {
-            PurposeResolution::Resolved { provider, model, .. } => Ok((provider, model)),
+            PurposeResolution::Resolved {
+                provider, model, ..
+            } => Ok((provider, model)),
             PurposeResolution::NoCapableModel { tier } => Err(format!(
                 "nessun modello del tier '{tier}' disponibile per purpose '{purpose}' \
                  (capability mancante o provider in cooldown)"
@@ -360,11 +368,7 @@ pub async fn cooldown_snapshot_handler(State(_state): State<AppState>) -> impl I
             reason,
         })
         .collect();
-    (
-        StatusCode::OK,
-        Json(CooldownSnapshotResponse { providers }),
-    )
-        .into_response()
+    (StatusCode::OK, Json(CooldownSnapshotResponse { providers })).into_response()
 }
 
 /// Body della richiesta `POST /api/internal/routing/decide`.
@@ -420,8 +424,22 @@ pub async fn decide_routing(
     Json(body): Json<RoutingDecideRequest>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     use axum::response::IntoResponse;
-    if body.message.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "campo `message` vuoto".to_string()));
+    // `message` vuoto e' un errore SOLO se manca anche l'intent: senza nessuno
+    // dei due non c'e' nulla da classificare. Con un intent gia' classificato
+    // dal chiamante (brain router_node) il message serve solo alla
+    // risky-detection (stringa vuota = non risky), quindi e' legittimo che
+    // manchi (es. re-route per-turno dopo un tool_result). Il 400
+    // indiscriminato faceva morire i run agentici multi-turno con la
+    // sentinella __router_unavailable__ (incidente 2026-06-10).
+    let has_intent = body
+        .intent
+        .as_deref()
+        .is_some_and(|v| !v.trim().is_empty());
+    if body.message.trim().is_empty() && !has_intent {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "campo `message` vuoto e nessun `intent` fornito".to_string(),
+        ));
     }
     let result = state
         .orchestrator

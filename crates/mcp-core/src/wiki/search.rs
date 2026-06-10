@@ -153,7 +153,9 @@ fn make_snippet(body: &str, q: &str) -> String {
         let start = pos.saturating_sub(half);
         let end = (pos + q.len() + half).min(body.len());
         // Allinea ai char boundary (multi-byte safe).
-        let start = (start..=pos).find(|i| body.is_char_boundary(*i)).unwrap_or(0);
+        let start = (start..=pos)
+            .find(|i| body.is_char_boundary(*i))
+            .unwrap_or(0);
         let end = (pos..=end)
             .rev()
             .find(|i| body.is_char_boundary(*i))
@@ -183,7 +185,9 @@ pub async fn search(
     Extension(claims): Extension<Claims>,
     Json(body): Json<SearchBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let acl = WikiAcl::from_claims(&state, &claims).await.map_err(err500)?;
+    let acl = WikiAcl::from_claims(&state, &claims)
+        .await
+        .map_err(err500)?;
 
     let q = body.q.trim();
     if q.is_empty() {
@@ -205,7 +209,12 @@ pub async fn search(
         .neural
         .embed_text("", embed_text)
         .await
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("embed fallito: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("embed fallito: {e}"),
+            )
+        })?;
 
     // ── Qdrant search con filtro payload ──────────────────────────────────
     let qfilter = build_qdrant_filter(scope, body.project_id, include_cross_scope, &filter);
@@ -221,7 +230,12 @@ pub async fn search(
         qfilter,
     )
     .await
-    .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("qdrant search: {e}")))?;
+    .map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("qdrant search: {e}"),
+        )
+    })?;
 
     if hits.is_empty() {
         return Ok(Json(json!({

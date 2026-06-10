@@ -37,13 +37,10 @@ pub async fn list_mutations(
     let project_id = Uuid::parse_str(&id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
 
-    let rows = crate::file_mutations::list_recent_mutations(
-        &state.db,
-        project_id,
-        q.limit.unwrap_or(100),
-    )
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+    let rows =
+        crate::file_mutations::list_recent_mutations(&state.db, project_id, q.limit.unwrap_or(100))
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
 
     Ok(Json(json!({ "mutations": rows })))
 }
@@ -126,14 +123,12 @@ pub async fn revert_mutation(
                 "message": "File ripristinato",
             })))
         }
-        crate::file_mutations::RevertOutcome::NotFound => Err(api_error(
-            StatusCode::NOT_FOUND,
-            "Mutazione non trovata",
-        )),
-        crate::file_mutations::RevertOutcome::AlreadyReverted => Err(api_error(
-            StatusCode::CONFLICT,
-            "Mutazione gia' revertita",
-        )),
+        crate::file_mutations::RevertOutcome::NotFound => {
+            Err(api_error(StatusCode::NOT_FOUND, "Mutazione non trovata"))
+        }
+        crate::file_mutations::RevertOutcome::AlreadyReverted => {
+            Err(api_error(StatusCode::CONFLICT, "Mutazione gia' revertita"))
+        }
         crate::file_mutations::RevertOutcome::NotRevertible(reason) => Err(api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("Ripristino non disponibile: {reason}"),

@@ -11,7 +11,7 @@ use std::sync::{Mutex, OnceLock};
 
 /// Tempi di health/cooldown provider, DB-driven (regola G). Inizializzati da
 /// `main.rs` all'avvio leggendo la tabella `settings` (chiavi `provider.*`,
-/// migrazione 0252). Se `init_provider_health_timings` non viene chiamato (es.
+/// migrazioni 0253/0255). Se `init_provider_health_timings` non viene chiamato (es.
 /// nei test unitari), si usano i default storici qui sotto — cosi' il modulo
 /// resta utilizzabile senza dipendere dal DB.
 #[derive(Debug, Clone, Copy)]
@@ -246,6 +246,33 @@ pub async fn propagate_billing_disable_to_db(db: &sqlx::PgPool, provider: &str) 
         );
     }
 
+    // Fonte PERSISTENTE del billing cooldown (letta al boot da
+    // restore_billing_cooldowns_from_db). WRITER UNICO (regola L/ADR 0020):
+    // questa tabella e' scritta SOLO qui (lato Rust). Prima la scriveva anche il
+    // brain (_mark_billing_cooldown via psycopg2), creando una seconda fonte che
+    // il gate non controllava; ora il brain notifica solo il bridge e Rust
+    // persiste. TTL = cooldown lungo DB-driven (cooldown_long_s).
+    let ttl_long_s = provider_health_timings().cooldown_long_s as i64;
+    let health_res = sqlx::query(
+        "INSERT INTO nexus_provider_health (provider, billing_cooldown_until, last_error, updated_at) \
+         VALUES ($1, NOW() + ($2 || ' seconds')::interval, $3, NOW()) \
+         ON CONFLICT (provider) DO UPDATE SET \
+           billing_cooldown_until = EXCLUDED.billing_cooldown_until, \
+           last_error = EXCLUDED.last_error, updated_at = NOW()",
+    )
+    .bind(&provider_lower)
+    .bind(ttl_long_s.to_string())
+    .bind("billing_cooldown")
+    .execute(db)
+    .await;
+    if let Err(ref e) = health_res {
+        tracing::warn!(
+            "propagate_billing_disable: nexus_provider_health UPSERT fallita per '{}': {}",
+            provider,
+            e
+        );
+    }
+
     tracing::warn!(
         target: "provider_cooldown",
         provider = %provider,
@@ -291,12 +318,25 @@ pub async fn propagate_billing_reenable_to_db(db: &sqlx::PgPool, provider: &str)
     .await;
     let matrix_n = matrix_res.as_ref().map(|r| r.rows_affected()).unwrap_or(0);
 
-    if catalog_n > 0 || matrix_n > 0 {
+    // Clear della fonte persistente (writer unico Rust): azzera il cooldown
+    // billing in nexus_provider_health cosi' il prossimo boot non lo ripristina.
+    let health_res = sqlx::query(
+        "UPDATE nexus_provider_health \
+         SET billing_cooldown_until = NULL, updated_at = NOW() \
+         WHERE LOWER(provider) = $1 AND billing_cooldown_until IS NOT NULL",
+    )
+    .bind(&provider_lower)
+    .execute(db)
+    .await;
+    let health_n = health_res.as_ref().map(|r| r.rows_affected()).unwrap_or(0);
+
+    if catalog_n > 0 || matrix_n > 0 || health_n > 0 {
         tracing::info!(
             target: "provider_cooldown",
             provider = %provider,
             catalog_reenabled = catalog_n,
             matrix_reenabled = matrix_n,
+            health_cleared = health_n,
             "billing cooldown rimosso dal DB: provider riabilitato"
         );
     }
@@ -576,7 +616,9 @@ pub async fn restore_billing_cooldowns_from_db(db: &sqlx::PgPool) {
         // (probe-then-reenable) lo rimuovera' appena il provider torna 200.
         put_provider_in_long_cooldown(
             &provider,
-            reason.as_deref().unwrap_or("billing_cooldown (ripristino DB al boot)"),
+            reason
+                .as_deref()
+                .unwrap_or("billing_cooldown (ripristino DB al boot)"),
         );
     }
     if n > 0 {

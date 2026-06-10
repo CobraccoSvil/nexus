@@ -5,6 +5,15 @@ import logging
 import os
 from typing import Any, AsyncIterator
 
+# NB (ADR 0024 / regola L): _is_o_series qui sotto NON e' una decisione di
+# CAPABILITY (tool_use/thinking, che vengono dalla vista 0318 via cap), ma un
+# QUIRK DI PROTOCOLLO dell'API OpenAI: questi modelli usano max_completion_tokens
+# invece di max_tokens, non accettano temperature/top_p ne' tool_choice, e
+# vogliono il ruolo "developer" al posto di "system". Sono dettagli di FORMATO
+# della richiesta, non modellati come capability: per questo restano legittimamente
+# detection-nome (vedi ADR 0030). Una futura colonna uses_max_completion_tokens
+# nella vista potrebbe spostarli nel DB, ma non e' una violazione di regola L.
+#
 # Modelli della serie "reasoning" di OpenAI che non accettano temperature, top_p
 # e usano max_completion_tokens invece di max_tokens.
 #

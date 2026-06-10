@@ -162,7 +162,10 @@ pub(super) async fn tool_dispatcher_update_monitor(
         value.clone(),
         label,
     );
-    format!("Monitor '{}' aggiornato a {} (seq={})", monitor_id, value, seq)
+    format!(
+        "Monitor '{}' aggiornato a {} (seq={})",
+        monitor_id, value, seq
+    )
 }
 
 pub(super) async fn tool_dispatcher_highlight_panel(

@@ -42,7 +42,11 @@ Axis = Literal[
 ]
 
 # Azioni possibili, in ordine di severita' crescente.
-Action = Literal["proceed", "guide", "escalate", "abort"]
+# force_diagnose: stadio intermedio per l'asse repeated_action (dopo GUIDE, prima
+# di ESCALATE/ABORT). Obbliga l'agente a leggere l'errore, dichiarare la causa
+# radice e cambiare azione, cosi' un eventuale esito FAILED porta sempre una
+# diagnosi (mai una chiusura grezza). Vedi mig 0386.
+Action = Literal["proceed", "guide", "force_diagnose", "escalate", "abort"]
 
 # stop_reason UNICO emesso da un abort coordinato. route_after_executor lo
 # instrada alla verifica E2E (final_gate) per i task software, non al learner
@@ -78,6 +82,12 @@ class ProgressSignals:
     # Assi per i quali la forza-azione (GUIDE) e' GIA' stata applicata in un
     # turno precedente di questo run: per loro la prossima mossa sale di livello.
     already_guided: frozenset[str] = field(default_factory=frozenset)
+    # Assi per i quali la DIAGNOSI FORZATA (force_diagnose) e' GIA' stata applicata:
+    # per loro la prossima mossa dopo lo stallo sale a escalate/abort.
+    already_diagnosed: frozenset[str] = field(default_factory=frozenset)
+    # Se True abilita lo stadio intermedio force_diagnose per l'asse
+    # repeated_action (setting agent.repeated_action_force_diagnose_enabled).
+    force_diagnose_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -151,6 +161,28 @@ def _repeated_action_nudge(label: str, count: int) -> str:
     )
 
 
+def _force_diagnose_nudge(label: str, count: int) -> str:
+    """Nudge di DIAGNOSI FORZATA: lo stadio tra GUIDE e ABORT per l'azione ripetuta.
+
+    Il nudge soft (GUIDE) non ha cambiato nulla: l'agente ha ri-ripetuto. Qui non
+    si chiude ancora: si OBBLIGA a capire perche' l'azione fallisce e a cambiare
+    strategia, oppure a dichiararsi bloccato con una causa precisa. Cosi' l'esito
+    successivo e' una diagnosi (FailedDiagnosed/BlockedNeedsInput), mai una
+    chiusura grezza "ho ripetuto N volte".
+    """
+    return (
+        f"STOP: hai ripetuto '{label}' {count} volte e il sollecito precedente non "
+        "ha cambiato nulla. PRIMA di qualunque altra mossa DEVI, in quest'ordine: "
+        "(1) leggere l'output/errore ESATTO dell'ultima esecuzione; (2) dichiarare "
+        "in una frase la CAUSA RADICE del fallimento (non il sintomo); (3) eseguire "
+        "UN'AZIONE DIVERSA che attacchi quella causa (comando o edit diverso), NON "
+        "la stessa di prima. Se non esiste un'azione diversa praticabile, dichiara "
+        "ESPLICITAMENTE che sei bloccato e perche' (es. dipendenza/credenziale/"
+        "permesso/servizio mancante): il turno chiudera' con la diagnosi e il "
+        "prossimo passo, non con una ripetizione."
+    )
+
+
 def decide(signals: ProgressSignals) -> ProgressDecision:
     """Punto unico: data la fotografia del progresso, decide la prossima mossa.
 
@@ -180,6 +212,7 @@ def decide(signals: ProgressSignals) -> ProgressDecision:
         return ProgressDecision(action="proceed", reason="nessuno stallo bloccante")
 
     already = axis in signals.already_guided
+    already_diagnosed = axis in signals.already_diagnosed
     can_escalate = (
         signals.has_escalation_candidate
         and signals.escalations < signals.max_escalations
@@ -211,6 +244,24 @@ def decide(signals: ProgressSignals) -> ProgressDecision:
             force_action=_force,
             nudge_text=nudge,
             reason=_reason,
+        )
+
+    # Livello 1.5 — FORCE_DIAGNOSE: solo per l'azione ripetuta, dopo che la GUIDE
+    # soft non ha cambiato nulla e PRIMA di escalation/abort. Obbliga la diagnosi
+    # del fallimento e un cambio di azione (o la dichiarazione esplicita di blocco),
+    # cosi' l'esito porta sempre una diagnosi. Abilitato da flag DB-driven.
+    if (
+        axis == "repeated_action"
+        and signals.force_diagnose_enabled
+        and not already_diagnosed
+    ):
+        _ra_label, _ra_count = signals.repeated_action or ("", 0)
+        return ProgressDecision(
+            action="force_diagnose",
+            axis=axis,
+            force_action=False,
+            nudge_text=_force_diagnose_nudge(_ra_label, _ra_count),
+            reason="stallo repeated_action: diagnosi forzata prima di escalation/abort",
         )
 
     # Livello 2 — ESCALATE: gia' guidato ma ancora bloccato, c'e' budget.

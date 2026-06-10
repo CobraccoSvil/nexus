@@ -437,8 +437,11 @@ pub(super) async fn tool_run_playwright_tests(ctx: &AgentToolContext, input: &Va
             // ADR 0017: se Sudo Manager e' installato + purpose
             // `playwright-install-deps` e' executable, tentiamo l'autofix.
             let auto_installed = match crate::sudo_manager::is_executable(
-                &ctx.db, "playwright-install-deps",
-            ).await {
+                &ctx.db,
+                "playwright-install-deps",
+            )
+            .await
+            {
                 Ok(true) => {
                     tracing::info!(
                         "preflight: tentativo autofix via sudo_manager::execute(playwright-install-deps), {} libs mancanti",

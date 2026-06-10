@@ -179,13 +179,8 @@ impl NexusToolHandler for ProjectDbBackupTool {
         let args_ref: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
 
         // Punto unico in nexus_tools::run_pg_dump (regola L, S74).
-        let outcome = super::run_pg_dump(
-            &args_ref,
-            &password,
-            Some(&ctx.project_root),
-            &backup_path,
-        )
-        .await?;
+        let outcome =
+            super::run_pg_dump(&args_ref, &password, Some(&ctx.project_root), &backup_path).await?;
         if outcome.success {
             Ok(json!({
                 "ok": true,

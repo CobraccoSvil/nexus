@@ -10,16 +10,27 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useThemeColors } from "../lib/theme";
-import { TruncatedText } from "./truncated-text";
+import { useProjectStore } from "../lib/project-dispatcher";
 
 type FeedbackTone = "success" | "error" | "info";
 
 type FeedbackContextValue = {
   notifyAction: (message: string, tone?: FeedbackTone) => void;
+  /// Operazioni di mutazione (POST/PUT/DELETE) attualmente in volo: il footer
+  /// le mostra come messaggio "in corso" finche' non arriva l'esito.
+  pendingCount: number;
+  pendingLabel: string;
 };
 
 const FeedbackContext = createContext<FeedbackContextValue | null>(null);
+
+/// Mappa il tono UI sulla severity del toast store (punto unico di
+/// visualizzazione: lo store project-dispatcher, reso al centro del footer).
+function severityFromTone(tone: FeedbackTone): "info" | "success" | "warning" | "error" {
+  if (tone === "success") return "success";
+  if (tone === "error") return "error";
+  return "info";
+}
 
 function inferActionLabel(input: RequestInfo | URL, init?: RequestInit): string {
   const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
@@ -110,23 +121,14 @@ async function parseResponseError(response: Response): Promise<string | undefine
 }
 
 export function GlobalActionFeedbackProvider({ children }: { children: ReactNode }) {
-  const tc = useThemeColors();
   const [pendingCount, setPendingCount] = useState(0);
   const [pendingLabel, setPendingLabel] = useState("Operazione");
-  const [feedback, setFeedback] = useState<{ tone: FeedbackTone; message: string } | null>(null);
-  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingRef = useRef(0);
 
+  // L'esito dell'azione confluisce nello store toast (punto unico): il footer
+  // lo rende al centro come messaggio non invasivo, con auto-dismiss via TTL.
   const notifyAction = useCallback((message: string, tone: FeedbackTone = "info") => {
-    setFeedback({ tone, message });
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-    }
-    const duration = tone === "error" ? 6000 : 2000;
-    timeoutRef.current = setTimeout(() => {
-      setFeedback(null);
-      timeoutRef.current = null;
-    }, duration);
+    useProjectStore.getState().pushToast(severityFromTone(tone), message);
   }, []);
 
   useEffect(() => {
@@ -171,102 +173,17 @@ export function GlobalActionFeedbackProvider({ children }: { children: ReactNode
     window.fetch = wrappedFetch;
     return () => {
       window.fetch = originalFetch;
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-      }
     };
   }, [notifyAction]);
 
-  const api = useMemo<FeedbackContextValue>(() => ({ notifyAction }), [notifyAction]);
-
-  const toneColors =
-    feedback?.tone === "error"
-      ? { border: tc.error, text: tc.error, background: `${tc.error}14` }
-      : feedback?.tone === "success"
-        ? { border: "#22c55e", text: "#16a34a", background: "#22c55e12" }
-        : { border: tc.border, text: tc.textSecondary, background: tc.bgCard };
-
-  return (
-    <FeedbackContext.Provider value={api}>
-      {children}
-      {pendingCount > 0 && (
-        <div
-          style={{
-            position: "fixed",
-            top: 58,
-            right: 12,
-            zIndex: 1300,
-            borderRadius: 999,
-            border: `1px solid ${tc.accent}`,
-            background: tc.accentBg,
-            color: tc.accent,
-            fontSize: 12,
-            fontWeight: 600,
-            padding: "6px 10px",
-            display: "inline-flex",
-            alignItems: "center",
-            gap: 8,
-            maxWidth: 360,
-            boxShadow: "0 10px 20px rgba(0,0,0,0.18)",
-          }}
-          aria-live="polite"
-        >
-          <span>{pendingCount > 1 ? "⏳" : "⌛"}</span>
-          <TruncatedText
-            text={pendingCount > 1 ? `${pendingCount} operazioni in corso` : `${pendingLabel} in corso`}
-            tc={tc}
-            maxWidth={200}
-          />
-        </div>
-      )}
-      {feedback && (
-        <div
-          style={{
-            position: "fixed",
-            right: 12,
-            bottom: 36,
-            zIndex: 1300,
-            borderRadius: 8,
-            border: `1px solid ${toneColors.border}`,
-            background: toneColors.background,
-            color: toneColors.text,
-            fontSize: 12,
-            padding: "8px 10px",
-            maxWidth: 480,
-            boxShadow: "0 10px 20px rgba(0,0,0,0.16)",
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-word",
-            lineHeight: 1.4,
-          }}
-          aria-live="polite"
-        >
-          <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
-            <span style={{ flex: 1 }}>{feedback.message}</span>
-            <button
-              onClick={() => {
-                setFeedback(null);
-                if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
-              }}
-              style={{
-                background: "none",
-                border: "none",
-                color: toneColors.text,
-                cursor: "pointer",
-                padding: 0,
-                fontSize: 14,
-                lineHeight: 1,
-                flexShrink: 0,
-                opacity: 0.7,
-              }}
-              title="Chiudi"
-            >
-              ✕
-            </button>
-          </div>
-        </div>
-      )}
-    </FeedbackContext.Provider>
+  const api = useMemo<FeedbackContextValue>(
+    () => ({ notifyAction, pendingCount, pendingLabel }),
+    [notifyAction, pendingCount, pendingLabel],
   );
+
+  // Nessun popup fixed: l'IDE non viene piu' invasa. Pending ed esiti vengono
+  // resi al centro del footer da FooterToastCenter (status bar).
+  return <FeedbackContext.Provider value={api}>{children}</FeedbackContext.Provider>;
 }
 
 export function useActionFeedback() {

@@ -35,7 +35,18 @@ pub async fn list_revisions(
     let doc = ensure_doc_readable(state, acl, doc_id).await?;
     let _ = doc; // silenzia warning unused (l'ACL check e' il side-effect utile)
 
-    let rows = sqlx::query_as::<_, (i32, String, String, Option<String>, Option<String>, i32, chrono::DateTime<chrono::Utc>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i32,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            i32,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
         r#"
         SELECT version_no, title, source, author, edit_summary,
                length(body_md) AS body_bytes, created_at
@@ -51,17 +62,19 @@ pub async fn list_revisions(
 
     Ok(rows
         .into_iter()
-        .map(|(version_no, title, source, author, edit_summary, body_bytes, created_at)| {
-            RevisionMeta {
-                version_no,
-                title,
-                source,
-                author,
-                edit_summary,
-                body_bytes: body_bytes as i64,
-                created_at,
-            }
-        })
+        .map(
+            |(version_no, title, source, author, edit_summary, body_bytes, created_at)| {
+                RevisionMeta {
+                    version_no,
+                    title,
+                    source,
+                    author,
+                    edit_summary,
+                    body_bytes: body_bytes as i64,
+                    created_at,
+                }
+            },
+        )
         .collect())
 }
 

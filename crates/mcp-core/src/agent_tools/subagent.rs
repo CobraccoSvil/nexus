@@ -372,12 +372,13 @@ const MAX_PARALLEL_HARD_CAP: u64 = 8;
 /// del parallelismo dei sub-agenti. PUNTO UNICO condiviso col DAG scheduler
 /// Python e col pannello admin "Agenti Paralleli".
 async fn read_max_parallel_subagents(ctx: &AgentToolContext) -> u64 {
-    let v: Option<String> =
-        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'orchestrator.max_parallel_subagents'")
-            .fetch_optional(&*ctx.db)
-            .await
-            .ok()
-            .flatten();
+    let v: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM settings WHERE key = 'orchestrator.max_parallel_subagents'",
+    )
+    .fetch_optional(&*ctx.db)
+    .await
+    .ok()
+    .flatten();
     v.and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(3)
         .clamp(1, MAX_PARALLEL_HARD_CAP)

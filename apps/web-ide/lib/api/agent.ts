@@ -62,7 +62,7 @@ export interface AgentRunUsage {
 export interface AgentRunInfo {
   runId: string;
   sessionId: string;
-  status: "running" | "completed" | "awaiting_confirmation" | "failed" | "timed_out" | "cancelled" | "interrupted" | "loop_aborted" | "provider_unavailable";
+  status: "running" | "completed" | "awaiting_confirmation" | "failed" | "timed_out" | "cancelled" | "interrupted" | "loop_aborted" | "provider_unavailable" | "completed_verified" | "failed_diagnosed" | "blocked_needs_input";
   automationMode: string;
   provider: string;
   model: string;
@@ -213,7 +213,11 @@ function isAgentRunTerminal(status: string): boolean {
     status === "cancelled" ||
     status === "interrupted" ||
     status === "loop_aborted" ||
-    status === "provider_unavailable"
+    status === "provider_unavailable" ||
+    // Esiti canonici macchina a stati (mig 0386): terminali. blocked_needs_input
+    // NO: e' in attesa di input (come awaiting_confirmation), non terminale.
+    status === "completed_verified" ||
+    status === "failed_diagnosed"
   );
 }
 

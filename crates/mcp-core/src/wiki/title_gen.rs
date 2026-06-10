@@ -239,7 +239,10 @@ async fn render_prompt(state: &AppState, doc: &DocRow, max_words: u32) -> Result
     }
     let snippet = if doc.body_md.len() > BODY_SNIPPET_MAX {
         // Taglio su confine di char per evitare slice non-UTF8.
-        doc.body_md.chars().take(BODY_SNIPPET_MAX).collect::<String>()
+        doc.body_md
+            .chars()
+            .take(BODY_SNIPPET_MAX)
+            .collect::<String>()
     } else {
         doc.body_md.clone()
     };
@@ -432,12 +435,10 @@ pub async fn generate_title_for_doc(state: &AppState, doc_id: Uuid) -> Result<Ti
     // No-op se il titolo coincide: aggiorna comunque title_generated_at per
     // far avanzare il cap e non riconsiderare il doc al giro successivo.
     if new_title == doc.title {
-        let _ = sqlx::query(
-            "UPDATE wiki_docs SET title_generated_at = NOW() WHERE id = $1",
-        )
-        .bind(doc.id)
-        .execute(&state.db)
-        .await;
+        let _ = sqlx::query("UPDATE wiki_docs SET title_generated_at = NOW() WHERE id = $1")
+            .bind(doc.id)
+            .execute(&state.db)
+            .await;
         report.new_title = Some(new_title);
         report.updated = false;
         report.elapsed_ms = started.elapsed().as_millis();

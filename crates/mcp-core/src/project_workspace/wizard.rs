@@ -664,12 +664,15 @@ pub async fn wizard_detect_services(
     // e' in NEXUS_RESERVED_PORTS) ne' hardcoded. La porta concreta e' iniettata
     // dall'install al posto del placeholder __PORT__.
     {
-        let mut has_framework =
-            tokio::fs::metadata(format!("{}/package.json", root)).await.is_ok()
-                || tokio::fs::metadata(format!("{}/Cargo.toml", root)).await.is_ok()
-                || tokio::fs::metadata(format!("{}/launchSettings.json", root))
-                    .await
-                    .is_ok();
+        let mut has_framework = tokio::fs::metadata(format!("{}/package.json", root))
+            .await
+            .is_ok()
+            || tokio::fs::metadata(format!("{}/Cargo.toml", root))
+                .await
+                .is_ok()
+            || tokio::fs::metadata(format!("{}/launchSettings.json", root))
+                .await
+                .is_ok();
         if !has_framework {
             for f in &["main.py", "app.py", "server.py", "run.py", "manage.py"] {
                 if tokio::fs::metadata(format!("{}/{}", root, f)).await.is_ok() {
@@ -718,7 +721,9 @@ async fn write_compose_env_file(cwd: &str, env_map: &std::collections::HashMap<S
         return;
     }
     let env_path = format!("{}/.env", cwd.trim_end_matches('/'));
-    let existing = tokio::fs::read_to_string(&env_path).await.unwrap_or_default();
+    let existing = tokio::fs::read_to_string(&env_path)
+        .await
+        .unwrap_or_default();
     let mut out: Vec<String> = Vec::new();
     let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line in existing.lines() {
@@ -813,7 +818,10 @@ async fn generate_docker_port_override(
             tracing::info!(
                 "docker-compose: override porte coerente generato ({path}) sopra {base_name}"
             );
-            Some((base_name.to_string(), compose_ports::OVERRIDE_FILE.to_string()))
+            Some((
+                base_name.to_string(),
+                compose_ports::OVERRIDE_FILE.to_string(),
+            ))
         }
         Err(e) => {
             tracing::warn!("docker-compose: scrittura override fallita ({path}): {e}");
@@ -1110,7 +1118,9 @@ pub async fn wizard_install_service(
             }
             Err(_) => {
                 // Ramo difensivo (regex statica valida: mai raggiunto in pratica).
-                for bad in ["3000", "5173", "4321", "3001", "8080", "4200", "5000", "8000"] {
+                for bad in [
+                    "3000", "5173", "4321", "3001", "8080", "4200", "5000", "8000",
+                ] {
                     out = out.replace(&format!("--port {}", bad), &format!("--port {}", p));
                     out = out.replace(&format!("--port={}", bad), &format!("--port={}", p));
                 }
@@ -1120,8 +1130,8 @@ pub async fn wizard_install_service(
         // blacklist mirata (non una regex generica) per NON riscrivere porte
         // legittime in URL verso servizi esterni o DB (es. 5432, 6379).
         for bad in [
-            "3000", "3001", "3002", "4200", "4321", "5173", "5174", "5000", "5001", "8000",
-            "8080", "9000",
+            "3000", "3001", "3002", "4200", "4321", "5173", "5174", "5000", "5001", "8000", "8080",
+            "9000",
         ] {
             out = out.replace(&format!("localhost:{}", bad), &format!("localhost:{}", p));
             out = out.replace(&format!("127.0.0.1:{}", bad), &format!("127.0.0.1:{}", p));
@@ -1342,8 +1352,7 @@ pub async fn wizard_install_service(
     let exec_start = {
         let el = exec_start.to_lowercase();
         if el.contains("docker compose") || el.contains("docker-compose") {
-            if let Some((base, ov)) =
-                generate_docker_port_override(&state, &project_id, cwd).await
+            if let Some((base, ov)) = generate_docker_port_override(&state, &project_id, cwd).await
             {
                 inject_override_flag(&exec_start, &base, &ov)
             } else {
@@ -1384,9 +1393,7 @@ pub async fn wizard_install_service(
             let prefix = format!("{}-", slug);
             while let Ok(Some(ent)) = rd.next_entry().await {
                 let fname = ent.file_name().to_string_lossy().to_string();
-                if fname == unit_name
-                    || !fname.starts_with(&prefix)
-                    || !fname.ends_with(".service")
+                if fname == unit_name || !fname.starts_with(&prefix) || !fname.ends_with(".service")
                 {
                     continue;
                 }

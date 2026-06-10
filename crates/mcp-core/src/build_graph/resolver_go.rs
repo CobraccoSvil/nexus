@@ -43,10 +43,7 @@ pub async fn resolve_go(project_id: Uuid, project_root: &Path) -> anyhow::Result
             entry_points.push("main.go".to_string());
         }
     } else {
-        anyhow::bail!(
-            "nessun go.mod o go.work in {}",
-            project_root.display()
-        );
+        anyhow::bail!("nessun go.mod o go.work in {}", project_root.display());
     }
 
     Ok(BuildGraphInfo {

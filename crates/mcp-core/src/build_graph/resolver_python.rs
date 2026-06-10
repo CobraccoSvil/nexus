@@ -364,7 +364,9 @@ exclude = ["tests*"]
             .await
             .unwrap();
         tokio::fs::create_dir(root.join("mypkg")).await.unwrap();
-        tokio::fs::write(root.join("mypkg/__init__.py"), "").await.unwrap();
+        tokio::fs::write(root.join("mypkg/__init__.py"), "")
+            .await
+            .unwrap();
         let info = resolve_python(Uuid::nil(), root).await.unwrap();
         assert!(info.include_globs.iter().any(|g| g.starts_with("mypkg")));
     }

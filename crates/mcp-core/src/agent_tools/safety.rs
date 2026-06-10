@@ -143,6 +143,19 @@ static FORBIDDEN_PATTERNS: &[(&str, &str, &str, &str)] = &[
         "kill processi infrastruttura Nexus vietato",
         "Non killare mcp-core, brain.grpc_server, postgres-nexus.",
     ),
+    // pkill/killall per NOME di runtime generico condiviso (node, python, ...):
+    // colpisce per nome di processo, quindi non isola il progetto e uccide anche
+    // il web-ide di Nexus (Next.js = node), il brain (python) e gli altri
+    // progetti. Causa radice di un incidente reale: `pkill node` lanciato da un
+    // run su un progetto-utente ha ucciso il web-ide di Nexus (violazione
+    // isolamento, CLAUDE.md regola E). Il pattern NON blocca `kill <PID>`
+    // numerico ne' `pkill -f <path-assoluto-progetto>`: quelli isolano davvero.
+    (
+        "kill_generic_runtime",
+        r#"(?i)\b(?:pkill|killall)\b(?:\s+-\S+)*\s+['"]?(?:node|nodejs|npm|npx|pnpm|yarn|next|next-server|vite|nodemon|ts-node|tsx|python|python3|deno|bun|java|php|ruby)\b"#,
+        "pkill/killall per nome di runtime generico (node, python, ...) colpisce anche Nexus e gli altri progetti",
+        "Termina solo i TUOI processi: individua i PID con `lsof -i :<porta_del_progetto>` e usa `kill <PID>`, oppure `pkill -f <path-assoluto-della-project-root>`. Mai pkill/killall per nome di runtime.",
+    ),
     (
         "iptables_route",
         // NB: `systemctl` NON e' qui: e' gestito context-aware in check_command
@@ -226,8 +239,8 @@ fn has_system_systemctl(cmd: &str) -> bool {
     while let Some(rel) = lower[from..].find("systemctl") {
         let start = from + rel;
         // Confine di parola a sinistra (evita match dentro identificatori).
-        let left_ok = start == 0
-            || (!bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_');
+        let left_ok =
+            start == 0 || (!bytes[start - 1].is_ascii_alphanumeric() && bytes[start - 1] != b'_');
         if left_ok {
             let after = lower[start + "systemctl".len()..].trim_start();
             // `systemctl --user ...` -> servizi utente/progetto, permesso.
@@ -321,7 +334,9 @@ mod tests {
             "iptables_route"
         );
         assert_eq!(
-            check_command("ip route add default via 1.2.3.4").unwrap().category,
+            check_command("ip route add default via 1.2.3.4")
+                .unwrap()
+                .category,
             "iptables_route"
         );
     }
@@ -427,6 +442,60 @@ mod tests {
         let r = check_command("pkill -9 mcp-core");
         assert!(r.is_some());
         assert_eq!(r.unwrap().category, "kill_brain_mcp");
+    }
+
+    #[test]
+    fn blocca_pkill_node_generico() {
+        // Incidente reale: `pkill node` ha ucciso il web-ide di Nexus (Next.js).
+        let r = check_command("pkill node");
+        assert!(r.is_some(), "pkill node deve essere bloccato");
+        assert_eq!(r.unwrap().category, "kill_generic_runtime");
+    }
+
+    #[test]
+    fn blocca_pkill_f_e_killall_runtime() {
+        assert_eq!(
+            check_command("pkill -f node").unwrap().category,
+            "kill_generic_runtime"
+        );
+        assert_eq!(
+            check_command("pkill -9 -f nodemon").unwrap().category,
+            "kill_generic_runtime"
+        );
+        assert_eq!(
+            check_command("killall -9 node").unwrap().category,
+            "kill_generic_runtime"
+        );
+        assert_eq!(
+            check_command("killall python3").unwrap().category,
+            "kill_generic_runtime"
+        );
+        assert!(check_command("pkill -f vite").is_some());
+        assert!(check_command("pkill ts-node").is_some());
+    }
+
+    #[test]
+    fn permette_kill_pid_numerico() {
+        // Il modo CORRETTO di terminare i propri orfani: kill per PID specifico
+        // individuato via lsof sulla porta del progetto. Non deve essere bloccato.
+        assert!(check_command("kill -9 731383 761157 805611").is_none());
+        assert!(check_command("kill 12345").is_none());
+    }
+
+    #[test]
+    fn permette_pkill_f_path_progetto() {
+        // pkill -f su path assoluto del progetto isola davvero: permesso.
+        assert!(
+            check_command("pkill -f /home/administrator/projects/Beauty-Book").is_none(),
+            "pkill -f <path-progetto> isola il progetto, va permesso"
+        );
+        // Nome di servizio specifico del progetto (non un runtime generico).
+        assert!(check_command("pkill -f beauty-book-backend").is_none());
+        // node_modules nel path non deve far scattare \bnode\b.
+        assert!(check_command(
+            "pkill -f /home/administrator/projects/x/node_modules/.bin/server"
+        )
+        .is_none());
     }
 
     #[test]

@@ -250,49 +250,47 @@ pub async fn best_model_for_tier(
         .await;
     }
 
-    // Caso NON-agentico (es. purpose vision/chat/embedding): nessun filtro
-    // tool_use/policy; esclude comunque i provider in cooldown.
-    let cooldown_providers: Vec<String> = crate::provider_cooldown::cooldown_snapshot()
-        .into_iter()
-        .map(|(name, _, _)| name)
-        .collect();
-    // La capability "vision" NON e' nel jsonb `capabilities` ma nella colonna
-    // booleana `supports_vision` (fonte unica capability, ADR 0024): va filtrata
-    // a parte. Le altre capability restano sul match jsonb `capabilities @> [..]`.
-    let is_vision = capability == Some("vision");
-    let capability_json = capability
-        .filter(|_| !is_vision)
-        .map(|c| format!("[\"{c}\"]"));
-
-    let mut idx = 1; // $1 = tier
-    let mut capability_predicate = String::new();
-    if is_vision {
-        capability_predicate.push_str("AND supports_vision = TRUE ");
+    // Caso NON-agentico (es. purpose vision/chat/embedding): vista sottile sul
+    // punto unico (FASE 2). `require_tool_use=false` e `require_thinking_non_exclude=false`
+    // -> nessun filtro tool_use/policy e nessun pre-ordinamento non-thinking
+    // (coerente con il comportamento precedente di questo ramo). La vision e' via
+    // `supports_vision`, le altre capability via jsonb. Il blocco SQL inline (il
+    // TERZO selettore duplicato) e' stato eliminato (regola L).
+    let filter = crate::orchestrator::EligibilityFilter {
+        require_tool_use: false,
+        require_thinking_non_exclude: false,
+        capability,
+        min_context_window: 0,
+        exclude_providers: &[],
+        apply_cooldown: true,
+    };
+    // Pre-ordinamento anti "reasoner puro" (incidente 2026-06-10): i modelli
+    // con uses_thinking_mode=TRUE e supports_tool_use=FALSE (es. deepseek-v4-flash)
+    // nelle chiamate TESTUALI senza tool bruciano l'intero budget di output in
+    // reasoning (content vuoto sistematico, finish_reason=length, reasoning 7-8K
+    // su completion 2000) e non hanno un percorso adapter per spegnere il
+    // thinking (la policy 'disable_for_tools' agisce solo nelle richieste con
+    // tool). Con i provider forti in cooldown risalivano la classifica del tier
+    // e avvelenavano i 41 purpose non-agentici. NON esclusi (il pool non si
+    // svuota: restano ultima spiaggia se tutto il resto e' giu'), solo
+    // retrocessi in coda. I thinking CON tool_use (gemini-2.5, claude) non sono
+    // toccati: i loro adapter governano il thinking budget.
+    match crate::orchestrator::select_models_tierchain(
+        db,
+        &filter,
+        &[tier],
+        "(uses_thinking_mode AND NOT supports_tool_use) ASC, \
+         is_featured DESC, input_cost_per_million_tokens ASC",
+        1,
+    )
+    .await
+    {
+        Ok(mut v) => v.drain(..).next(),
+        Err(e) => {
+            tracing::warn!("best_model_for_tier (non-agentico): {e}");
+            None
+        }
     }
-    if capability_json.is_some() {
-        idx += 1;
-        capability_predicate.push_str(&format!("AND capabilities @> ${idx}::jsonb "));
-    }
-    idx += 1;
-    let cooldown_idx = idx; // ultimo placeholder
-
-    let query = format!(
-        r#"SELECT provider, model FROM ai_price_catalog
-           WHERE is_enabled = TRUE
-             AND performance_tier = $1
-             {capability_predicate}
-             AND provider <> ALL(${cooldown_idx})
-           ORDER BY is_featured DESC, input_cost_per_million_tokens ASC
-           LIMIT 1"#
-    );
-
-    let mut q = sqlx::query_as::<_, (String, String)>(&query).bind(tier);
-    if let Some(cap) = capability_json.as_ref() {
-        q = q.bind(cap);
-    }
-    q = q.bind(&cooldown_providers);
-
-    q.fetch_optional(db).await.ok().flatten()
 }
 
 /// PUNTO UNICO di selezione di un modello AGENTICO dal catalog (CLAUDE.md, regola L).
@@ -331,76 +329,28 @@ pub(crate) async fn select_agentic_model(
     exclude_providers: &[String],
     order_by: &str,
 ) -> Option<(String, String)> {
-    // Provider esclusi = cooldown (snapshot) + extra del chiamante, lowercase.
-    let mut excluded: Vec<String> = crate::provider_cooldown::cooldown_snapshot()
-        .into_iter()
-        .map(|(name, _, _)| name.to_lowercase())
-        .collect();
-    for p in exclude_providers {
-        let pl = p.to_lowercase();
-        if !excluded.contains(&pl) {
-            excluded.push(pl);
-        }
-    }
-
-    // Tier da provare: nessuno (None) oppure la chain in ordine.
-    let tiers: Vec<Option<&str>> = if tier_chain.is_empty() {
-        vec![None]
-    } else {
-        tier_chain.iter().map(|t| Some(*t)).collect()
+    // Vista sottile sul punto unico (FASE 2): l'eleggibilita' agentica
+    // (supports_tool_use=TRUE, agentic_thinking_policy<>'exclude', cooldown,
+    // pre-ordinamento non-thinking) e' definita una sola volta in
+    // `EligibilityFilter` + `select_models_tierchain`. La firma di questa
+    // funzione resta invariata: i ~6 call site non cambiano.
+    let filter = crate::orchestrator::EligibilityFilter {
+        require_tool_use: true,
+        require_thinking_non_exclude: true,
+        capability,
+        min_context_window,
+        exclude_providers,
+        apply_cooldown: true,
     };
-    let capability_json = capability.map(|c| format!("[\"{c}\"]"));
-
-    for tier in tiers {
-        // $1 = array provider esclusi (sempre). Placeholder successivi assegnati
-        // in ordine per tenere bind e SQL coerenti.
-        let mut idx = 1;
-        let mut sql = String::from(
-            "SELECT provider, model FROM ai_price_catalog \
-             WHERE is_enabled = TRUE \
-               AND supports_tool_use = TRUE \
-               AND agentic_thinking_policy <> 'exclude' \
-               AND LOWER(provider) <> ALL($1)",
-        );
-        if tier.is_some() {
-            idx += 1;
-            sql.push_str(&format!(" AND performance_tier = ${idx}"));
-        }
-        if capability_json.is_some() {
-            idx += 1;
-            sql.push_str(&format!(" AND capabilities @> ${idx}::jsonb"));
-        }
-        if min_context_window > 0 {
-            idx += 1;
-            sql.push_str(&format!(" AND context_window >= ${idx}"));
-        }
-        // ADR 0025 (estensione regola L): preferisci i modelli NATIVAMENTE
-        // non-thinking (`agentic_thinking_policy = 'none'`) ai dual-mode
-        // (`disable_for_tools`/`native`). Nei run a tool il non-thinking e' la
-        // modalita' corretta (gli adapter lo forzano comunque sui dual-mode);
-        // un modello nativamente non-thinking e' pero' piu' AFFIDABILE sotto
-        // `tool_choice` forzato (planner/clarify), dove i thinking model
-        // ritornano talvolta MALFORMED/empty -> apparente "completamento vuoto".
-        // E' un solo punto di ordinamento, valido per OGNI call site agentico.
-        sql.push_str(&format!(
-            " ORDER BY (agentic_thinking_policy = 'none') DESC, {order_by} LIMIT 1"
-        ));
-
-        let mut q = sqlx::query_as::<_, (String, String)>(&sql).bind(&excluded);
-        if let Some(t) = tier {
-            q = q.bind(t);
-        }
-        if let Some(c) = capability_json.as_ref() {
-            q = q.bind(c);
-        }
-        if min_context_window > 0 {
-            q = q.bind(min_context_window);
-        }
-        if let Some(found) = q.fetch_optional(db).await.ok().flatten() {
-            return Some(found);
+    match crate::orchestrator::select_models_tierchain(db, &filter, tier_chain, order_by, 1).await {
+        Ok(mut v) => v.drain(..).next(),
+        Err(e) => {
+            // Regola H: l'errore SQL viene loggato, non silenziato come "nessun
+            // modello" (prima `.ok().flatten()` lo inghiottiva).
+            tracing::warn!("select_agentic_model: {e}");
+            None
         }
     }
-    None
 }
 
 /// Mapping intent classificato -> intent_key per il lookup nella routing matrix.
@@ -573,10 +523,8 @@ pub(crate) struct SettingValueRow {
 pub(crate) struct RoutingConfig {
     pub(crate) provider_hierarchy: Vec<String>,
     pub(crate) default_provider: Option<String>,
-    pub(crate) default_model: Option<String>,
     pub(crate) token_budget: u32,
     pub(crate) max_token_budget: u32,
-    pub(crate) provider_models: HashMap<String, String>,
     pub(crate) intent_provider_hierarchy: HashMap<String, Vec<String>>,
     pub(crate) behavior_mode: String,
 }
@@ -611,10 +559,6 @@ impl RoutingConfig {
             .get("default_provider")
             .map(|value| value.to_lowercase())
             .filter(|value| !value.is_empty());
-        let default_model = values
-            .get("default_model")
-            .cloned()
-            .filter(|value| !value.is_empty());
 
         let token_budget = values
             .get("token_budget")
@@ -625,18 +569,12 @@ impl RoutingConfig {
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(token_budget.max(4096));
 
-        let mut provider_models = HashMap::new();
-        for provider in KNOWN_PROVIDERS {
-            for key in [
-                format!("provider_model_{provider}"),
-                format!("{provider}_model"),
-            ] {
-                if let Some(value) = values.get(key.as_str()).filter(|value| !value.is_empty()) {
-                    provider_models.insert(provider.to_string(), value.clone());
-                    break;
-                }
-            }
-        }
+        // NB (regola G): i settings `provider_model_<provider>` / `<provider>_model`
+        // e `default_model` NON vengono piu' letti. La fonte UNICA del default-per-
+        // provider e' `nexus_provider_default_model` (DB, mig 0101) via
+        // `default_model_for_provider`. I vecchi settings erano una seconda fonte
+        // hardcoded e stale (es. provider_model_google=flash mentre il default DB e'
+        // gemini-2.5-pro). Restano nel DB come dati orfani innocui (cleanup = follow-up).
 
         let mut intent_provider_hierarchy = HashMap::new();
         for intent in KNOWN_INTENTS {
@@ -662,10 +600,8 @@ impl RoutingConfig {
         Self {
             provider_hierarchy,
             default_provider,
-            default_model,
             token_budget,
             max_token_budget,
-            provider_models,
             intent_provider_hierarchy,
             behavior_mode,
         }
@@ -714,26 +650,17 @@ impl RoutingConfig {
         suggested_provider: Option<&str>,
         suggested_model: Option<&str>,
     ) -> String {
-        if let Some(model) = self.provider_models.get(provider) {
-            return model.clone();
-        }
-
-        if self.default_provider.as_deref() == Some(provider) {
-            if let Some(model) = self
-                .default_model
-                .as_ref()
-                .filter(|value| !value.is_empty())
-            {
-                return model.clone();
-            }
-        }
-
+        // Override esplicito del chiamante per il provider scelto.
         if suggested_provider == Some(provider) {
             if let Some(model) = suggested_model.filter(|value| !value.is_empty()) {
                 return model.to_string();
             }
         }
 
+        // Default-per-provider: UNICA fonte = nexus_provider_default_model (DB,
+        // mig 0101) via default_model_for_provider (regola G). Rimossi i branch
+        // su provider_models / default_model (settings hardcoded), seconda fonte
+        // stale e ridondante.
         default_model_for_provider(matrix, provider)
     }
 }
@@ -767,18 +694,17 @@ pub(crate) fn push_unique(values: &mut Vec<String>, candidate: String) {
 }
 
 /// Modello di default per un provider, letto dalla matrice DB
-/// (`nexus_provider_default_model`, vedi migrazione 0101).
+/// (`nexus_provider_default_model`, migrazione 0101) tramite la
+/// `RoutingMatrixCache` (regola G: unica fonte nel DB, NIENTE env var ne'
+/// fallback hardcoded). A DB irraggiungibile la cache mantiene l'ultima
+/// matrice valida; se nessuna matrice e' disponibile gli handler ritornano
+/// 503 (vedi `RoutingMatrixCache`).
 ///
-/// La matrice e' SEMPRE popolata: in caso di DB irraggiungibile,
-/// `RoutingMatrix::fallback_safe()` riempie i 5 provider standard
-/// (openai, anthropic, google, mistral, deepseek) con modelli letti
-/// da env var `NEXUS_FALLBACK_<PROVIDER>_MODEL` o, in ultima istanza,
-/// dal fallback hardcoded di emergenza in fallback_safe().
-///
-/// Se viene richiesto un provider sconosciuto (non in DB ne' nei 5
-/// standard), ritorna un placeholder `unknown-provider-model` che
-/// triggera errore 400 dal layer chiamante. NON c'e' fallback al
-/// modello "gpt-4o-mini" hardcoded come prima.
+/// Se il provider non e' presente nella matrice, ritorna il sentinel
+/// `unknown-provider-<provider>` che triggera errore 400 dal layer chiamante:
+/// NON c'e' alcun fallback a un modello hardcoded. (NB: `fallback_safe()`
+/// esiste solo sotto `#[cfg(test)]`, non e' un meccanismo di produzione, e non
+/// esistono env var `NEXUS_FALLBACK_*`.)
 pub fn default_model_for_provider(
     matrix: &crate::routing_matrix::RoutingMatrix,
     provider: &str,
@@ -1016,7 +942,10 @@ mod intent_key_tests {
         // un intent_key dedicato -> modelli tool-robust, non chat_* lite.
         let t = thresholds();
         assert_eq!(intent_key_for("agentic_default", 50, &t), "agentic_default");
-        assert_eq!(intent_key_for("agentic_default", 100_000, &t), "agentic_default");
+        assert_eq!(
+            intent_key_for("agentic_default", 100_000, &t),
+            "agentic_default"
+        );
     }
 
     #[test]

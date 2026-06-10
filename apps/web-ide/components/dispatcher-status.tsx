@@ -5,7 +5,6 @@ import { useThemeColors } from "../lib/theme";
 import {
   refreshDispatcher,
   selectConnection,
-  selectToasts,
   useProjectStore,
 } from "../lib/project-dispatcher";
 
@@ -71,77 +70,6 @@ export function ConnectionStatusBadge() {
       {label}
     </button>
   );
-}
-
-/**
- * Stack di toast in basso a destra. Auto-dismiss dopo `ttl_ms`.
- */
-export function ToastStack() {
-  const tc = useThemeColors();
-  const toasts = useProjectStore(selectToasts);
-  const dismiss = useProjectStore((s) => s.dismissToast);
-
-  if (toasts.length === 0) return null;
-
-  return (
-    <div
-      style={{
-        position: "fixed",
-        bottom: 16,
-        right: 16,
-        display: "flex",
-        flexDirection: "column",
-        gap: 8,
-        zIndex: 9000,
-        maxWidth: 360,
-      }}
-    >
-      {toasts.map((t) => (
-        <div
-          key={t.id}
-          style={{
-            background: bgForSeverity(t.severity, tc),
-            color: "#fff",
-            borderRadius: 6,
-            padding: "10px 14px",
-            fontSize: 13,
-            boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
-            display: "flex",
-            alignItems: "flex-start",
-            justifyContent: "space-between",
-            gap: 12,
-          }}
-        >
-          <span>{t.message}</span>
-          <button
-            type="button"
-            onClick={() => dismiss(t.id)}
-            aria-label="Chiudi notifica"
-            style={{
-              background: "transparent",
-              border: "none",
-              color: "rgba(255,255,255,0.85)",
-              cursor: "pointer",
-              fontSize: 14,
-              padding: 0,
-              lineHeight: 1,
-            }}
-          >
-            ×
-          </button>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function bgForSeverity(sev: string, tc: ReturnType<typeof useThemeColors>): string {
-  switch (sev) {
-    case "success": return "#059669";
-    case "warning": return "#d97706";
-    case "error": return "#dc2626";
-    default: return tc.accent;
-  }
 }
 
 /**

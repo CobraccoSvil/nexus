@@ -55,10 +55,14 @@ export function TokenUsageBar({
       ? `${(totalTokens / 1_000_000).toFixed(1)}M token`
       : totalTokens >= 1_000
       ? `${(totalTokens / 1_000).toFixed(1)}K token`
-      : `${totalTokens} token`;
+      : `${totalTokens ?? 0} token`;
 
+  // null-safe: per messaggi senza usage (es. disambiguazione, dove non gira un
+  // run) totalCostUsd puo' essere null. In JS `null < 0.01` e' true, quindi senza
+  // questa guardia si finiva in `null.toFixed(4)` -> crash client-side dell'intera
+  // app al processing live della risposta del send.
   const costLabel =
-    totalCostUsd === 0
+    totalCostUsd == null || totalCostUsd === 0
       ? "$0.00"
       : totalCostUsd < 0.01
       ? `$${totalCostUsd.toFixed(4)}`

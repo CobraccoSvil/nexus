@@ -196,7 +196,12 @@ pub async fn tool_knowledge_search(ctx: &AgentToolContext, input: &Value) -> Str
     let doc_hits: Vec<(Uuid, f32)> = hits
         .iter()
         .filter(|h| (h.score as f32) >= min_score)
-        .filter_map(|h| h.point_id.parse::<Uuid>().ok().map(|id| (id, h.score as f32)))
+        .filter_map(|h| {
+            h.point_id
+                .parse::<Uuid>()
+                .ok()
+                .map(|id| (id, h.score as f32))
+        })
         .take(top_k)
         .collect();
     if doc_hits.is_empty() {
@@ -338,8 +343,14 @@ pub async fn tool_knowledge_get_note(ctx: &AgentToolContext, input: &Value) -> S
         Err(e) => return json!({"error": format!("DB: {e}")}).to_string(),
     };
 
-    let edit_lock: String = row.try_get("edit_lock").unwrap_or_else(|_| "none".to_string());
-    let status = if edit_lock == "frozen" { "off_topic" } else { "active" };
+    let edit_lock: String = row
+        .try_get("edit_lock")
+        .unwrap_or_else(|_| "none".to_string());
+    let status = if edit_lock == "frozen" {
+        "off_topic"
+    } else {
+        "active"
+    };
 
     json!({
         "id": note_id.to_string(),
@@ -460,7 +471,11 @@ pub async fn tool_knowledge_create_note(ctx: &AgentToolContext, input: &Value) -
     };
 
     // Embedding + upsert Qdrant (best-effort).
-    let snippet = if body_md.len() > 2000 { &body_md[..2000] } else { &body_md };
+    let snippet = if body_md.len() > 2000 {
+        &body_md[..2000]
+    } else {
+        &body_md
+    };
     let combined = format!("{title}\n\n{snippet}");
     let qdrant_indexed = match ctx.neural.embed_text("", &combined).await {
         Ok(vector) => {
@@ -480,13 +495,11 @@ pub async fn tool_knowledge_create_note(ctx: &AgentToolContext, input: &Value) -
             .await
             {
                 Ok(_) => {
-                    let _ = sqlx::query(
-                        "UPDATE wiki_docs SET qdrant_point_id = $1 WHERE id = $2",
-                    )
-                    .bind(&point_id)
-                    .bind(note_id)
-                    .execute(&*ctx.db)
-                    .await;
+                    let _ = sqlx::query("UPDATE wiki_docs SET qdrant_point_id = $1 WHERE id = $2")
+                        .bind(&point_id)
+                        .bind(note_id)
+                        .execute(&*ctx.db)
+                        .await;
                     true
                 }
                 Err(e) => {
@@ -1016,8 +1029,16 @@ pub async fn tool_knowledge_import_graph(ctx: &AgentToolContext, input: &Value) 
         Ok(v) => v,
         Err(e) => return json!({"error": format!("JSON invalido: {e}")}).to_string(),
     };
-    let nodes_in = payload.get("nodes").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let edges_in = payload.get("edges").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let nodes_in = payload
+        .get("nodes")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let edges_in = payload
+        .get("edges")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     if nodes_in.is_empty() {
         return json!({"error": "nessun nodo trovato nel grafo"}).to_string();
     }
@@ -1101,8 +1122,16 @@ pub async fn tool_knowledge_import_graph(ctx: &AgentToolContext, input: &Value) 
 
     let mut edges_created = 0usize;
     for e in &edges_in {
-        let source = e.get("source").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let target = e.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let source = e
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let target = e
+            .get("target")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if source.is_empty() || target.is_empty() {
             continue;
         }
@@ -1113,7 +1142,11 @@ pub async fn tool_knowledge_import_graph(ctx: &AgentToolContext, input: &Value) 
             continue;
         }
         // edge_type -> rel_type: heuristica semplice.
-        let etype = e.get("type").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+        let etype = e
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
         let rel = match etype.as_str() {
             "depends_on" | "requires" | "needs" => "depends_on",
             "blocks" => "blocks",

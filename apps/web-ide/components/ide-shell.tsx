@@ -67,7 +67,7 @@ import {
   selectRunConfigsChangedAt,
 } from "../lib/project-dispatcher";
 import { isBinaryDocPath } from "../lib/file-kind";
-import { ToastStack } from "./dispatcher-status";
+import { ACTION_AGENT_HINT } from "../lib/chat-prompts";
 import {
   EMPTY_GROUPS,
   basename,
@@ -170,6 +170,9 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
   const [pendingChatMessage, setPendingChatMessage] = useState<string | undefined>(undefined);
   const [pendingAutoSend, setPendingAutoSend] = useState(false);
   const [pendingProviderHint, setPendingProviderHint] = useState<{ provider?: string; model?: string } | undefined>(undefined);
+  /** Hint tipo agente per i prompt d'azione (error-fix) dai pannelli del bottom panel:
+   *  propagato come `agentTypeHint` -> bypassa la disambiguazione d'intent A/B lato backend. */
+  const [pendingAgentTypeHint, setPendingAgentTypeHint] = useState<string | undefined>(undefined);
   /** Per messaggi da pannelli diagnostic (debug, problemi, ecc.): un turno con agente + tool anche se la chat era in «Studio». */
   const [pendingExternalAutomation, setPendingExternalAutomation] = useState<
     "study" | "confirm" | "automatic" | undefined
@@ -415,6 +418,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
     setPendingChatMessage(undefined);
     setPendingAutoSend(false);
     setPendingProviderHint(undefined);
+    setPendingAgentTypeHint(undefined);
     setPendingExternalAutomation(undefined);
   }, []);
 
@@ -1554,6 +1558,7 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               externalInput={pendingChatMessage}
               externalAutoSend={pendingAutoSend}
               externalProviderHint={pendingProviderHint}
+              externalAgentTypeHint={pendingAgentTypeHint}
               externalAutomationOverride={pendingExternalAutomation}
               onExternalInputConsumed={handleExternalInputConsumed}
               onTracesChange={setAiTraces}
@@ -2040,11 +2045,15 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
               setPendingChatMessage(msg);
               setPendingAutoSend(true);
               setPendingExternalAutomation("confirm");
+              // Pulsanti del bottom panel = workflow d'azione (error-fix): forza
+              // l'hint cosi' il backend salta la disambiguazione d'intent A/B.
+              setPendingAgentTypeHint(ACTION_AGENT_HINT);
             }}
             onAutoSendToChat={(msg) => {
               setPendingChatMessage(msg);
               setPendingAutoSend(true);
               setPendingExternalAutomation("confirm");
+              setPendingAgentTypeHint(ACTION_AGENT_HINT);
             }}
             onKillPort={async (port) => {
               if (!activeProject) return;
@@ -2102,7 +2111,6 @@ export function IdeShell({ dashboard, initialProjectId }: { dashboard: Dashboard
         projectError={projectError}
         liveHealth={liveHealth}
       />
-      <ToastStack />
     </main>
   );
 }

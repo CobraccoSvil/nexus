@@ -131,7 +131,6 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
     setSaved(false);
 
     const primaryProvider = config.providerHierarchy[0] ?? "anthropic";
-    const primaryModel = config.providerModels[primaryProvider];
 
     try {
       const res = await fetch(`${API_BASE}/api/admin/settings`, {
@@ -142,13 +141,7 @@ export function RoutingConfig({ settings, onSaveComplete }: RoutingConfigProps) 
           settings: [
             { key: "provider_hierarchy", value: config.providerHierarchy.join(",") },
             { key: "default_provider", value: primaryProvider },
-            { key: "default_model", value: primaryModel },
             { key: "nexus_behavior_mode",       value: config.behaviorMode },
-            { key: "provider_model_anthropic",  value: config.providerModels.anthropic },
-            { key: "provider_model_openai",     value: config.providerModels.openai },
-            { key: "provider_model_google",     value: config.providerModels.google },
-            { key: "provider_model_deepseek",   value: config.providerModels.deepseek },
-            { key: "provider_model_mistral",    value: config.providerModels.mistral },
             { key: "token_budget", value: config.tokenBudget },
             { key: "max_token_budget", value: config.maxTokenBudget },
             ...ROUTING_INTENTS.map((intent) => ({

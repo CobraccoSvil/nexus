@@ -86,9 +86,8 @@ impl TripleExtractSettings {
 
 const SETTINGS_CACHE_TTL: Duration = Duration::from_secs(60);
 
-static SETTINGS_CACHE: once_cell::sync::Lazy<
-    RwLock<Option<(TripleExtractSettings, Instant)>>,
-> = once_cell::sync::Lazy::new(|| RwLock::new(None));
+static SETTINGS_CACHE: once_cell::sync::Lazy<RwLock<Option<(TripleExtractSettings, Instant)>>> =
+    once_cell::sync::Lazy::new(|| RwLock::new(None));
 
 pub async fn current_settings(db: &PgPool) -> TripleExtractSettings {
     {
@@ -230,13 +229,12 @@ struct DocRow {
 }
 
 async fn fetch_doc(db: &PgPool, doc_id: Uuid) -> Result<Option<DocRow>> {
-    let row = sqlx::query(
-        "SELECT id, scope, project_id, title, body_md FROM wiki_docs WHERE id = $1",
-    )
-    .bind(doc_id)
-    .fetch_optional(db)
-    .await
-    .context("SELECT wiki_docs per triple_extractor")?;
+    let row =
+        sqlx::query("SELECT id, scope, project_id, title, body_md FROM wiki_docs WHERE id = $1")
+            .bind(doc_id)
+            .fetch_optional(db)
+            .await
+            .context("SELECT wiki_docs per triple_extractor")?;
     Ok(row.map(|r| DocRow {
         id: r.get("id"),
         scope: r.get("scope"),
@@ -250,11 +248,7 @@ async fn fetch_doc(db: &PgPool, doc_id: Uuid) -> Result<Option<DocRow>> {
 // Render prompt
 // ───────────────────────────────────────────────────────────────────────────
 
-async fn render_prompt(
-    state: &AppState,
-    doc: &DocRow,
-    max_triples: u32,
-) -> Result<String> {
+async fn render_prompt(state: &AppState, doc: &DocRow, max_triples: u32) -> Result<String> {
     // Template via cache 60s (`prompt_templates::get_template_or_default`).
     let tmpl = get_template_or_default(
         &state.db,
@@ -300,8 +294,12 @@ use crate::llm_json::extract_json_object;
 fn parse_triples_from_llm(content: &str) -> Result<Vec<ParsedTriple>> {
     let json_slice = extract_json_object(content)
         .ok_or_else(|| anyhow!("output LLM non contiene un oggetto JSON"))?;
-    let parsed: Value = serde_json::from_str(json_slice)
-        .with_context(|| format!("JSON parse error sul payload LLM (len={})", json_slice.len()))?;
+    let parsed: Value = serde_json::from_str(json_slice).with_context(|| {
+        format!(
+            "JSON parse error sul payload LLM (len={})",
+            json_slice.len()
+        )
+    })?;
     let arr = parsed
         .get("triples")
         .and_then(|v| v.as_array())
@@ -486,10 +484,7 @@ async fn upsert_triple(
 // API pubblica — estrazione singolo doc
 // ───────────────────────────────────────────────────────────────────────────
 
-pub async fn extract_triples_for_doc(
-    state: &AppState,
-    doc_id: Uuid,
-) -> Result<ExtractReport> {
+pub async fn extract_triples_for_doc(state: &AppState, doc_id: Uuid) -> Result<ExtractReport> {
     let started = Instant::now();
     let mut report = ExtractReport {
         doc_id: Some(doc_id),
@@ -498,7 +493,9 @@ pub async fn extract_triples_for_doc(
 
     let settings = current_settings(&state.db).await;
     if !settings.enabled {
-        report.errors.push("worker disabilitato via settings".to_string());
+        report
+            .errors
+            .push("worker disabilitato via settings".to_string());
         report.elapsed_ms = started.elapsed().as_millis();
         return Ok(report);
     }
@@ -719,10 +716,7 @@ impl ExtractScope {
 
 /// Quanti doc con almeno una tripla LLM sono stati creati nelle ultime 24h
 /// dentro lo scope. Usato per il cap diurno.
-async fn docs_processed_last_24h(
-    db: &PgPool,
-    scope: ExtractScope,
-) -> Result<i64> {
+async fn docs_processed_last_24h(db: &PgPool, scope: ExtractScope) -> Result<i64> {
     let count: i64 = match scope {
         ExtractScope::Meta => sqlx::query_scalar(
             "SELECT COUNT(DISTINCT t.subj_doc_id) \
@@ -754,11 +748,7 @@ async fn docs_processed_last_24h(
 
 /// Seleziona i doc candidati: priorita' a quelli senza alcuna tripla LLM,
 /// poi quelli con triple LLM piu' vecchie del `updated_at` del doc.
-async fn fetch_candidates(
-    db: &PgPool,
-    scope: ExtractScope,
-    limit: i64,
-) -> Result<Vec<Uuid>> {
+async fn fetch_candidates(db: &PgPool, scope: ExtractScope, limit: i64) -> Result<Vec<Uuid>> {
     let rows = match scope {
         ExtractScope::Meta => sqlx::query(
             "SELECT d.id FROM wiki_docs d \
@@ -844,8 +834,7 @@ pub async fn extract_triples_for_scope(
                 batch.processed_count += 1;
                 // Aggiorna il restante in modo conservativo: il doc e' stato
                 // "consumato" indipendentemente da quante triple ha prodotto.
-                batch.daily_cap_remaining_after =
-                    (batch.daily_cap_remaining_after - 1).max(0);
+                batch.daily_cap_remaining_after = (batch.daily_cap_remaining_after - 1).max(0);
                 batch.batch_results.push(rep);
             }
             Err(e) => {
@@ -913,8 +902,7 @@ pub fn start_triple_extractor_worker(state: AppState) {
                     }
                 };
             for pid in project_ids {
-                if let Err(e) =
-                    extract_triples_for_scope(&state, ExtractScope::Project(pid)).await
+                if let Err(e) = extract_triples_for_scope(&state, ExtractScope::Project(pid)).await
                 {
                     tracing::warn!(
                         project_id = %pid,

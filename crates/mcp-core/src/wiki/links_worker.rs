@@ -63,9 +63,8 @@ impl LinkWorkerSettings {
 
 const SETTINGS_CACHE_TTL: Duration = Duration::from_secs(60);
 
-static SETTINGS_CACHE: once_cell::sync::Lazy<
-    RwLock<Option<(LinkWorkerSettings, Instant)>>,
-> = once_cell::sync::Lazy::new(|| RwLock::new(None));
+static SETTINGS_CACHE: once_cell::sync::Lazy<RwLock<Option<(LinkWorkerSettings, Instant)>>> =
+    once_cell::sync::Lazy::new(|| RwLock::new(None));
 
 /// Carica i settings con cache 60s. Mancanze loggano WARN + safe_defaults.
 pub async fn current_settings(db: &PgPool) -> LinkWorkerSettings {
@@ -346,11 +345,7 @@ async fn upsert_link(
 // Strategie
 // ───────────────────────────────────────────────────────────────────────────
 
-async fn process_wikilinks(
-    db: &PgPool,
-    doc: &DocRow,
-    report: &mut RecomputeReport,
-) -> Result<()> {
+async fn process_wikilinks(db: &PgPool, doc: &DocRow, report: &mut RecomputeReport) -> Result<()> {
     let links = extract_wikilinks(&doc.body_md);
     if links.is_empty() {
         return Ok(());
@@ -507,9 +502,7 @@ async fn process_semantic(
                     error = %e,
                     "wiki.links: upsert semantic fallito"
                 );
-                report
-                    .errors
-                    .push(format!("semantic {target_id}: {e}"));
+                report.errors.push(format!("semantic {target_id}: {e}"));
             }
         }
     }
@@ -521,10 +514,7 @@ async fn process_semantic(
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Ricompila i link per UN solo documento. Esegue entrambe le strategie.
-pub async fn recompute_links_for_doc(
-    state: &AppState,
-    doc_id: Uuid,
-) -> Result<RecomputeReport> {
+pub async fn recompute_links_for_doc(state: &AppState, doc_id: Uuid) -> Result<RecomputeReport> {
     let started = Instant::now();
     let mut report = RecomputeReport::default();
     let settings = current_settings(&state.db).await;
@@ -578,9 +568,7 @@ pub async fn recompute_links_for_scope(
 
     for doc in docs {
         if let Err(e) = process_wikilinks(&state.db, &doc, &mut report).await {
-            report
-                .errors
-                .push(format!("doc {} wikilinks: {e}", doc.id));
+            report.errors.push(format!("doc {} wikilinks: {e}", doc.id));
         }
         if let Err(e) = process_semantic(&state.db, &doc, settings, &mut report).await {
             report.errors.push(format!("doc {} semantic: {e}", doc.id));
@@ -630,9 +618,7 @@ pub fn start_links_worker(state: std::sync::Arc<AppState>) {
             }
 
             // Scope Meta
-            if let Err(e) =
-                recompute_links_for_scope(&state, Some(WikiScope::Meta), None).await
-            {
+            if let Err(e) = recompute_links_for_scope(&state, Some(WikiScope::Meta), None).await {
                 tracing::warn!(error = %e, "wiki.links: recompute periodico meta fallito");
             }
 
@@ -640,12 +626,9 @@ pub fn start_links_worker(state: std::sync::Arc<AppState>) {
             match fetch_project_ids(&state.db).await {
                 Ok(ids) => {
                     for pid in ids {
-                        if let Err(e) = recompute_links_for_scope(
-                            &state,
-                            Some(WikiScope::Project),
-                            Some(pid),
-                        )
-                        .await
+                        if let Err(e) =
+                            recompute_links_for_scope(&state, Some(WikiScope::Project), Some(pid))
+                                .await
                         {
                             tracing::warn!(
                                 project_id = %pid,

@@ -210,9 +210,9 @@ pub fn start_cleanup_worker(db: PgPool) {
         loop {
             interval.tick().await;
             match cleanup_expired(&db).await {
-                Ok(n) if n > 0 => tracing::info!(
-                    "agent_tool_result_cache: pulite {} righe scadute", n
-                ),
+                Ok(n) if n > 0 => {
+                    tracing::info!("agent_tool_result_cache: pulite {} righe scadute", n)
+                }
                 Ok(_) => tracing::debug!("agent_tool_result_cache: cleanup, 0 righe"),
                 Err(e) => tracing::warn!("agent_tool_result_cache cleanup fallito: {e}"),
             }

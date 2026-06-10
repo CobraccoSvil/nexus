@@ -443,6 +443,7 @@ mod tests {
             purpose_models,
             purpose_tiers: HashMap::new(),
             escalations: HashMap::new(),
+            manual_overrides: std::collections::HashSet::new(),
             loaded_at: Instant::now(),
         }
     }

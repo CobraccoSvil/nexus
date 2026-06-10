@@ -194,6 +194,7 @@ async def summarize_old_messages(
                 full_prompt,
                 max_tokens=SUMMARY_MAX_TOKENS,
                 temperature=SUMMARY_TEMPERATURE,
+                internal_task=True,
             ),
             timeout=SUMMARY_TIMEOUT_S,
         )

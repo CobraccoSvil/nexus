@@ -68,9 +68,16 @@ def list_todos(run_id: str) -> list[dict[str, Any]]:
     try:
         with conn.cursor() as cur:
             cur.execute(
+                # depends_on e' uuid[]: psycopg2 senza array-uuid typecaster lo
+                # ritorna come STRINGA '{...}' invece di lista. Il cast a text[]
+                # forza il parsing nativo psycopg2 -> list[str] di UUID. Senza
+                # questo, compute_ready_layer/get_next_executable_todo iteravano
+                # sui caratteri della stringa ('{','}') -> nessun match -> il DAG
+                # parallelo non partiva mai e il verifier andava in falso deadlock.
+                # id::text allinea il tipo per il confronto str(dep) in {id}.
                 """SELECT id::text, seq, content, status, priority, acceptance_criteria,
                           verify_failures, iteration_seen, updated_at,
-                          depends_on, node_key, dag_layer
+                          depends_on::text[] AS depends_on, node_key, dag_layer
                    FROM nexus_agent_todos
                    WHERE run_id = %s
                    ORDER BY seq ASC""",

@@ -45,6 +45,20 @@ export function buildTerminalRunSummary(run: AgentRunInfo): string {
       ? `In attesa di conferma per ${awaiting} azion${awaiting === 1 ? "e" : "i"}.`
       : "In attesa di conferma per proseguire.";
   }
+  // Esiti canonici della macchina a stati di terminazione (mig 0386).
+  if (run.status === "completed_verified") {
+    return completed > 0
+      ? `Operazione completata e verificata. Ho eseguito ${completed} step.`
+      : "Operazione completata e verificata.";
+  }
+  if (run.status === "failed_diagnosed") {
+    return completed > 0
+      ? `Operazione non completata dopo ${completed} step: ho interrotto e diagnosticato il blocco (esito e prossimo passo nel messaggio).`
+      : "Operazione non completata: ho interrotto e diagnosticato il blocco (esito e prossimo passo nel messaggio).";
+  }
+  if (run.status === "blocked_needs_input") {
+    return "In attesa di input esterno per proseguire (es. credenziale, permesso o servizio mancante).";
+  }
   return "Operazione conclusa.";
 }
 
@@ -131,6 +145,15 @@ export function createTerminalMessage(
   } else {
     // Nessuna risposta dal modello: usa status + dettaglio semantico
     baseContent = statusSummary + semanticDetail;
+  }
+
+  // Run CANCELLATO (es. superato da un nuovo messaggio, last-wins): il suo esito
+  // viene pubblicato DOPO il messaggio utente successivo, quindi senza
+  // un'intestazione esplicita sembra la risposta alla NUOVA domanda (incidente
+  // reale: l'epitaffio del run formatters letto come risposta all'error-fix).
+  // Etichetta basata sul FATTO strutturale run.status — mai sul testo.
+  if (run.status === "cancelled") {
+    baseContent = `> **Run precedente interrotto** — questo e' l'esito del lavoro precedente, non la risposta al tuo ultimo messaggio.\n\n${baseContent}`;
   }
 
   // Prependi l'avviso privacy se il provider non e' EU/locale

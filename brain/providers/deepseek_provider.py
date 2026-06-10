@@ -70,6 +70,21 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
             # I modelli reasoning (deepseek-reasoner / R1) non accettano temperature.
             if not _is_deepseek_reasoning(model):
                 create_kwargs["temperature"] = kwargs.get("temperature", 0.7)
+            # Mig 0390: i task interni TESTUALI (kwarg internal_task=True dai
+            # canali gRPC/REST e dai nodi interni del brain) spengono il thinking
+            # dei dual-mode V4: senza questo il budget di output finisce in
+            # reasoning_content e il content torna vuoto (hollow). Decisione nel
+            # PUNTO UNICO should_disable_thinking (regola L); capability
+            # best-effort: se manca, nessun cambio di comportamento.
+            if kwargs.get("internal_task"):
+                from .adapter_base import should_disable_thinking
+                try:
+                    from .capability_loader import load_capability
+                    cap = load_capability(self.name, model)
+                except Exception:  # noqa: BLE001
+                    cap = None
+                if should_disable_thinking(cap, has_tools=False, internal_task=True):
+                    create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
             response = await client.chat.completions.create(**create_kwargs)
             choice = response.choices[0]
             return ProviderResult(
@@ -101,8 +116,14 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
         max_tokens: int = 4096,
         system_text: str = "",
         force_tool_choice: bool | None = None,
+        internal_task: bool = False,
     ) -> ProviderResult:
-        """Esegue un turno agente con function calling (deepseek-chat V3+ supporta tool use)."""
+        """Esegue un turno agente con function calling (deepseek-chat V3+ supporta tool use).
+
+        ``internal_task`` (mig 0390): True per i task interni (purpose, canali
+        gRPC/REST di mcp-core) — sui dual-mode V4 spegne il thinking anche nelle
+        chiamate SENZA tool, evitando il content vuoto da reasoning overflow.
+        """
         if not self._api_key:
             return ProviderResult(
                 provider=self.name, model=model,
@@ -117,9 +138,15 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
                 self.name, model, max_tokens, messages, system_text,
             )
 
-            # I modelli reasoning (deepseek-reasoner / R1) non supportano tool calling
-            # e non accettano temperature.
-            supports_tools = not _is_deepseek_reasoning(model)
+            # Capability tool_use dalla fonte UNICA (vista 0318 / ADR 0024) via
+            # cap.tool_use: niente piu' decisione di capability dal nome modello
+            # (regola L). I modelli reasoning (R1) hanno tool_use=false in vista.
+            # L'euristica _is_deepseek_reasoning sul nome resta SOLO come fallback
+            # se la riga capability manca (cap is None) (degrado safe, come google_provider).
+            if cap is not None:
+                supports_tools = cap.tool_use
+            else:
+                supports_tools = not _is_deepseek_reasoning(model)
             compressed = compress_tool_list(tools) if tools and supports_tools else []
             oai_tools = [_anthropic_tool_to_openai(t) for t in compressed] if compressed else []
 
@@ -144,14 +171,17 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
                         model, oai_messages, force_override=force_tool_choice,
                     )
 
-                # ADR 0025: DeepSeek V4 e' dual-mode e di DEFAULT gira in thinking
-                # mode; nel loop agentico (tool) il thinking mode richiede il
-                # passback di reasoning_content (400 altrimenti). Per i modelli
-                # 'disable_for_tools' forziamo la modalita' NON-THINKING via il
-                # parametro ufficiale extra_body.thinking=disabled (DeepSeek thinking
-                # mode guide): function calling normale, nessuno stato reasoning.
-                if cap is not None and cap.thinking_disabled_for_tools:
-                    kwargs_call["extra_body"] = {"thinking": {"type": "disabled"}}
+            # ADR 0025 + mig 0390: DeepSeek V4 e' dual-mode e di DEFAULT gira in
+            # thinking mode. Il PUNTO UNICO should_disable_thinking (regola L)
+            # decide quando forzare il NON-THINKING via il parametro ufficiale
+            # extra_body.thinking=disabled (DeepSeek thinking mode guide):
+            # - richieste CON tool (ADR 0025): function calling deterministico,
+            #   nessun reasoning_content da ri-passare (400 altrimenti);
+            # - task interni TESTUALI (internal_task, mig 0390): il reasoning
+            #   brucerebbe il budget di output producendo content vuoto (hollow).
+            from .adapter_base import should_disable_thinking
+            if should_disable_thinking(cap, bool(oai_tools), internal_task):
+                kwargs_call["extra_body"] = {"thinking": {"type": "disabled"}}
 
             response = await client.chat.completions.create(**kwargs_call)
             choice = response.choices[0]

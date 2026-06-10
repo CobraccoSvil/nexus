@@ -104,11 +104,12 @@ pub(super) async fn handle_file_revert(
     let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
 
     // Determina la project root del progetto (path-traversal-safe).
-    let root_row =
-        sqlx::query("SELECT w.absolute_path FROM workspaces w WHERE w.project_id = $1 AND w.is_primary = TRUE")
-            .bind(pid)
-            .fetch_optional(db)
-            .await;
+    let root_row = sqlx::query(
+        "SELECT w.absolute_path FROM workspaces w WHERE w.project_id = $1 AND w.is_primary = TRUE",
+    )
+    .bind(pid)
+    .fetch_optional(db)
+    .await;
     let root_path = match root_row {
         Ok(Some(r)) => r
             .try_get::<String, _>("absolute_path")

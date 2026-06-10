@@ -129,7 +129,10 @@ pub(super) fn parse_service_ports(compose: &str) -> Vec<ServicePorts> {
             flush(&mut cur, &mut out);
             in_ports = false;
             let name = trimmed.trim_end_matches(':').trim().to_string();
-            cur = Some(ServicePorts { name, mappings: Vec::new() });
+            cur = Some(ServicePorts {
+                name,
+                mappings: Vec::new(),
+            });
             continue;
         }
 
@@ -149,7 +152,10 @@ pub(super) fn parse_service_ports(compose: &str) -> Vec<ServicePorts> {
         }
 
         if in_ports && trimmed.starts_with('-') {
-            let item = trimmed.trim_start_matches('-').trim().trim_matches(['"', '\'']);
+            let item = trimmed
+                .trim_start_matches('-')
+                .trim()
+                .trim_matches(['"', '\'']);
             // Mapping host:container (ignora la forma a 3 campi ip:host:container per ora).
             if let Some((host, container)) = split_mapping(item) {
                 if let Some(s) = cur.as_mut() {
@@ -195,7 +201,9 @@ fn is_managed_host(host_expr: &str) -> bool {
             return true;
         }
     }
-    port_default(host_expr).map(in_project_range).unwrap_or(false)
+    port_default(host_expr)
+        .map(in_project_range)
+        .unwrap_or(false)
 }
 
 /// Un mapping applicativo da riscrivere: servizio, porta interna reale
@@ -225,12 +233,19 @@ pub(super) fn planned_mappings(services: &[ServicePorts]) -> Vec<PlannedMapping>
                 None => continue,
             };
             let mut vars: Vec<String> = Vec::new();
-            for v in [port_var(host_expr), port_var(container_expr)].into_iter().flatten() {
+            for v in [port_var(host_expr), port_var(container_expr)]
+                .into_iter()
+                .flatten()
+            {
                 if !vars.contains(&v) {
                     vars.push(v);
                 }
             }
-            out.push(PlannedMapping { service: svc.name.clone(), container, vars });
+            out.push(PlannedMapping {
+                service: svc.name.clone(),
+                container,
+                vars,
+            });
         }
     }
     out
@@ -295,7 +310,10 @@ volumes:
 
     #[test]
     fn port_var_estrae_il_nome() {
-        assert_eq!(port_var("${PORT_FRONTEND:-20001}").as_deref(), Some("PORT_FRONTEND"));
+        assert_eq!(
+            port_var("${PORT_FRONTEND:-20001}").as_deref(),
+            Some("PORT_FRONTEND")
+        );
         assert_eq!(port_var("${PORT_BACKEND}").as_deref(), Some("PORT_BACKEND"));
         assert_eq!(port_var("5432"), None);
     }

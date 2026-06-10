@@ -86,7 +86,9 @@ fn parse_object_slice(raw: &str) -> Result<Value> {
 
 /// Rimuove i delimitatori di code fence (```json / ```) mantenendo il corpo.
 fn strip_code_fences(s: &str) -> String {
-    s.replace("```json", "").replace("```JSON", "").replace("```", "")
+    s.replace("```json", "")
+        .replace("```JSON", "")
+        .replace("```", "")
 }
 
 #[cfg(test)]

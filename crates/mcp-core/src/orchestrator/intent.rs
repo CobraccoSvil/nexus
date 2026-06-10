@@ -254,7 +254,10 @@ pub(crate) async fn classify_intent_async_with_threshold(
     let resp = match http.post(&url).json(&body).send().await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
-            tracing::debug!("classifier LLM: HTTP {} — fallback agentic_default", r.status());
+            tracing::debug!(
+                "classifier LLM: HTTP {} — fallback agentic_default",
+                r.status()
+            );
             return NEUTRAL;
         }
         Err(e) => {

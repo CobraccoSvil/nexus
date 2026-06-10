@@ -30,6 +30,9 @@ const TOGGLES: { key: string; label: string; hint: string }[] = [
   { key: "orchestrator.auto_delegation_enabled", label: "Auto-delegation by description", hint: "Cursor pattern: inserisce <available_subagents> nel system_text" },
   { key: "orchestrator.subagent_project_override_enabled", label: "Project YAML overrides", hint: "Permette .nexus/agents/<kind>.md di shadow-are le definition DB" },
   { key: "orchestrator.subagent_parallel_in_round", label: "Parallel sub-agents per turn", hint: "Permette N dispatch_subagent nello stesso turno LLM" },
+  { key: "orchestrator.dag_parallel_enabled", label: "DAG parallel execution", hint: "Se true (e DAG presente), i todo ready vengono eseguiti in parallelo via dispatch_subagents. Mutuamente esclusivo col worker-mode" },
+  { key: "orchestrator.dag_topological_enabled", label: "DAG topological order", hint: "Il verifier sceglie il prossimo todo rispettando depends_on (ordine topologico) invece del solo seq lineare" },
+  { key: "orchestrator.dag_verify_layer", label: "DAG verify per layer", hint: "Dopo ogni ondata parallela verifica i todo completati prima di procedere al layer successivo" },
 ];
 
 const NUMS: { key: string; label: string; type?: "int" | "float" | "csv" }[] = [
@@ -38,6 +41,7 @@ const NUMS: { key: string; label: string; type?: "int" | "float" | "csv" }[] = [
   { key: "orchestrator.todo_reminder_every_n_steps", label: "TODO reminder every N steps", type: "int" },
   { key: "orchestrator.todo_reminder_min_todos", label: "TODO reminder min todos", type: "int" },
   { key: "orchestrator.max_parallel_subagents", label: "Max parallel sub-agents", type: "int" },
+  { key: "orchestrator.dag_max_parallel", label: "DAG max parallel per wave", type: "int" },
   { key: "orchestrator.subagent_max_depth", label: "Sub-agent max depth", type: "int" },
   { key: "orchestrator.subagent_cost_cap_per_run_usd", label: "Sub-agent cost cap per run (USD)", type: "float" },
   { key: "orchestrator.verifier_timeout_s", label: "Verifier timeout (s)", type: "float" },

@@ -176,14 +176,13 @@ impl ToolRunner for ToolRunnerService {
         // marker [cache_ref] nel content. Miss → esegue, cacha (se non in
         // skiplist) e ritorna. I tool con side-effect (run_command,
         // write_file, ecc.) non vengono cachati: cache_cfg.skip_for.
-        let cache_cfg =
-            crate::agent_tool_result_cache::CacheConfig::load(&self.deps.db).await;
+        let cache_cfg = crate::agent_tool_result_cache::CacheConfig::load(&self.deps.db).await;
         let cache_eligible = cache_cfg.should_cache(&req.tool_name);
 
         if cache_eligible {
-            if let Some(hit) = crate::agent_tool_result_cache::lookup(
-                &self.deps.db, &req.tool_name, &input,
-            ).await {
+            if let Some(hit) =
+                crate::agent_tool_result_cache::lookup(&self.deps.db, &req.tool_name, &input).await
+            {
                 let duration_ms = started.elapsed().as_millis() as u64;
                 tracing::info!(
                     tool = %req.tool_name,
@@ -216,7 +215,11 @@ impl ToolRunner for ToolRunnerService {
             let ttl = cache_cfg.ttl_seconds;
             tokio::spawn(async move {
                 if let Err(e) = crate::agent_tool_result_cache::store(
-                    &db, &tool_name, &args_for_cache, &payload, ttl,
+                    &db,
+                    &tool_name,
+                    &args_for_cache,
+                    &payload,
+                    ttl,
                 )
                 .await
                 {

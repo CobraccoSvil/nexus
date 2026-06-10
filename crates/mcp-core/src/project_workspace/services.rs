@@ -55,10 +55,7 @@ pub(super) fn unit_env_map(content: &str) -> std::collections::HashMap<String, S
         if let Some(rest) = l.trim().strip_prefix("Environment=") {
             let rest = rest.trim().trim_matches('"');
             if let Some((k, v)) = rest.split_once('=') {
-                m.insert(
-                    k.trim().to_string(),
-                    v.trim().trim_matches('"').to_string(),
-                );
+                m.insert(k.trim().to_string(), v.trim().trim_matches('"').to_string());
             }
         }
     }
@@ -179,7 +176,9 @@ pub(super) async fn list_services_fallback(
             .strip_suffix(".service")
             .unwrap_or(&fname)
             .to_string();
-        let content = tokio::fs::read_to_string(entry.path()).await.unwrap_or_default();
+        let content = tokio::fs::read_to_string(entry.path())
+            .await
+            .unwrap_or_default();
         let exec_start = unit_exec_start(&content);
         // Determinazione dello stato con 3 casi, dal piu' specifico al generico:
         // 1) il servizio E' il wrapper docker-compose -> stato dai container;
@@ -320,7 +319,8 @@ pub async fn get_project_services_status(
                 // nexus_dev_diagnostics (DB, hot-reload); fallback all'euristica
                 // hardcoded come rete di sicurezza se nessun pattern DB matcha.
                 let (err, sugg, kind) =
-                    match crate::agent_tools::dev_diagnostics::diagnose_log_db(&state.db, &log).await
+                    match crate::agent_tools::dev_diagnostics::diagnose_log_db(&state.db, &log)
+                        .await
                     {
                         Some((desc, fix, cat)) => (desc, fix, cat),
                         None => {
@@ -438,7 +438,9 @@ pub async fn control_project_service(
     if user_manager_unavailable(&out) {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/administrator".to_string());
         let unit_path = format!("{home}/.config/systemd/user/{svc_name}");
-        let content = tokio::fs::read_to_string(&unit_path).await.unwrap_or_default();
+        let content = tokio::fs::read_to_string(&unit_path)
+            .await
+            .unwrap_or_default();
         let exec_start = unit_exec_start(&content);
         if exec_start.is_empty() {
             return Ok(Json(json!({
@@ -468,12 +470,14 @@ pub async fn control_project_service(
             }
             // start e restart: spawn_detached_service e' idempotente (fa pkill
             // del precedente prima di riavviare), quindi copre entrambi.
-            _ => match super::wizard::spawn_detached_service(&svc_name, &cwd, &env_map, &exec_start)
-                .await
-            {
-                Ok(log) => (true, format!("avviato (detached), log={log}")),
-                Err(e) => (false, e),
-            },
+            _ => {
+                match super::wizard::spawn_detached_service(&svc_name, &cwd, &env_map, &exec_start)
+                    .await
+                {
+                    Ok(log) => (true, format!("avviato (detached), log={log}")),
+                    Err(e) => (false, e),
+                }
+            }
         };
         if ok {
             let evt = match systemctl_action {

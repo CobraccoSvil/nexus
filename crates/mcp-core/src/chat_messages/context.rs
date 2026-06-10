@@ -200,7 +200,12 @@ pub(crate) async fn build_knowledge_context(
     let note_ids: Vec<(Uuid, f32)> = hits
         .iter()
         .filter(|h| (h.score as f32) >= min_score)
-        .filter_map(|h| h.point_id.parse::<Uuid>().ok().map(|id| (id, h.score as f32)))
+        .filter_map(|h| {
+            h.point_id
+                .parse::<Uuid>()
+                .ok()
+                .map(|id| (id, h.score as f32))
+        })
         .take(top_k)
         .collect();
     if note_ids.is_empty() {
@@ -271,9 +276,7 @@ pub(crate) async fn build_knowledge_context(
             if body.len() > 280 { "..." } else { "" }
         ));
     }
-    out.push_str(
-        "_(Fonte: wiki_docs scope=project — KB unificata del progetto, ADR 0017 v2.)_\n",
-    );
+    out.push_str("_(Fonte: wiki_docs scope=project — KB unificata del progetto, ADR 0017 v2.)_\n");
 
     tracing::info!(
         project_id = %project_id,

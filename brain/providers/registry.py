@@ -121,56 +121,43 @@ def _is_in_billing_cooldown(provider: str) -> bool:
 
 
 def _mark_billing_cooldown(provider: str, reason: str = "billing_error") -> None:
-    """Registra un provider in cooldown (in-memory + DB persistente, mig 0255)."""
-    global _db_cooldown_cache_ts
+    """Registra un provider in cooldown billing.
+
+    WRITER UNICO del DB (regola L / ADR 0020): la persistenza in
+    nexus_provider_health e' scritta SOLO da mcp-core (Rust) via il bridge
+    (notify_provider_error -> propagate_billing_disable_to_db). Qui NON si scrive
+    piu' il DB direttamente: si tiene solo la cache in-memory locale per la
+    visibilita' IMMEDIATA nella cascade dello stesso turno (il round-trip HTTP al
+    gate renderebbe altrimenti invisibile il cooldown appena segnalato).
+    """
     key = provider.lower()
     ttl = _billing_cooldown_ttl_s()
     _provider_cooldown_until[key] = time.monotonic() + ttl
+    # Notifica mcp-core (writer DB unico): Rust applica il cooldown lungo e
+    # persiste in nexus_provider_health. Sync best-effort, non blocca il flusso.
     try:
-        import psycopg2  # type: ignore[import]
-        with psycopg2.connect(_cooldown_db_url()) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO nexus_provider_health "
-                    "(provider, billing_cooldown_until, last_error, updated_at) "
-                    "VALUES (%s, NOW() + (%s || ' seconds')::interval, %s, NOW()) "
-                    "ON CONFLICT (provider) DO UPDATE SET "
-                    "  billing_cooldown_until = EXCLUDED.billing_cooldown_until, "
-                    "  last_error = EXCLUDED.last_error, updated_at = NOW()",
-                    (key, str(ttl), reason),
-                )
-            conn.commit()
-        _db_cooldown_cache_ts = 0.0  # invalida cache
+        from .cooldown_bridge import notify_provider_error_sync
+        notify_provider_error_sync(provider, "billing_error")
     except Exception as e:
-        logger.debug("cooldown DB write fallito: %s", e)
+        logger.debug("cooldown bridge notify fallito: %s", e)
     logger.warning(
-        "Provider %s in billing-cooldown (%s) per %ds (skip nelle prossime richieste)",
+        "Provider %s in billing-cooldown (%s) per %ds locale (skip immediato; "
+        "persistenza DB via mcp-core)",
         provider, reason, ttl,
     )
 
 
 def _clear_billing_cooldown(provider: str) -> None:
-    """Ripristino automatico: azzera il cooldown del provider al primo successo."""
-    global _db_cooldown_cache_ts
+    """Pulisce la cache in-memory locale del cooldown billing.
+
+    NON scrive piu' nexus_provider_health: il clear PERSISTENTE del billing e'
+    fatto da mcp-core (Rust) dal recovery loop probe-then-reenable
+    (propagate_billing_reenable_to_db), writer unico del DB (regola L/ADR 0020).
+    Qui si azzera solo la vista locale immediata; la riabilitazione cross-process
+    e' governata da Rust dopo un probe andato a buon fine (evita riattivazioni
+    alla cieca del provider billing-esausto)."""
     key = provider.lower()
-    had_mem = _provider_cooldown_until.pop(key, None) is not None
-    if not had_mem and key not in _db_cooldown_set_cached:
-        return
-    try:
-        import psycopg2  # type: ignore[import]
-        with psycopg2.connect(_cooldown_db_url()) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE nexus_provider_health "
-                    "SET billing_cooldown_until = NULL, updated_at = NOW() "
-                    "WHERE provider = %s AND billing_cooldown_until IS NOT NULL",
-                    (key,),
-                )
-            conn.commit()
-        _db_cooldown_cache_ts = 0.0
-        logger.info("Provider %s ripristinato (cooldown azzerato dopo un 200)", provider)
-    except Exception as e:
-        logger.debug("cooldown DB clear fallito: %s", e)
+    _provider_cooldown_until.pop(key, None)
 
 
 def get_billing_cooldown_snapshot() -> dict[str, int]:
@@ -675,7 +662,17 @@ class ProviderRegistry:
         except Exception as e:
             return {"provider": provider, "status": "error", "reason": str(e)}
 
-    def generate_completion(self, provider: str, model: str, prompt: str) -> ProviderResult:
+    def generate_completion(
+        self, provider: str, model: str, prompt: str, internal_task: bool = False,
+    ) -> ProviderResult:
+        """Completion sincrona (canale gRPC GenerateCompletion e affini).
+
+        ``internal_task`` (mig 0390): True quando la chiamata e' un task interno
+        (purpose: chat title, doc gen, probe, ...). I provider dual-mode
+        (deepseek-v4) la usano per spegnere il thinking nelle richieste testuali,
+        evitando il content vuoto da reasoning overflow. I provider che non
+        conoscono il kwarg lo ignorano (firme ``**kwargs``).
+        """
         if not self.is_enabled(provider):
             return ProviderResult(
                 provider=provider, model=model,
@@ -703,7 +700,9 @@ class ProviderRegistry:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
-                    return loop.run_until_complete(p.generate(model, prompt))
+                    return loop.run_until_complete(
+                        p.generate(model, prompt, internal_task=internal_task)
+                    )
                 finally:
                     _close_loop_safely(loop, p)
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -800,8 +799,14 @@ class ProviderRegistry:
         usage_intent: str = "",
         force_tool_choice: bool | None = None,
         soft_failure_fallback: bool = True,
+        internal_task: bool = False,
     ) -> ProviderResult:
         """Versione sincrona di generate_agent_turn, sicura da chiamare da thread gRPC.
+
+        ``internal_task`` (mig 0390): True per i task interni (il canale gRPC
+        GenerateAgentTurn e' usato SOLO da purpose mcp-core). Sui provider
+        dual-mode spegne il thinking anche senza tool (anti-hollow). Passato con
+        introspezione difensiva come ``force_tool_choice``.
 
         ``force_tool_choice`` (ADR 0018 leva 2): override del tool_choice del
         provider. True forza una tool call (turni d'azione); False disattiva la
@@ -919,12 +924,21 @@ class ProviderRegistry:
                 # I provider tool-mute o legacy (ollama/vllm/base) non lo hanno:
                 # passarlo solleverebbe TypeError -> introspezione difensiva.
                 _agent_kwargs: dict[str, Any] = {"system_text": system_text}
+                # Kwargs opzionali passati SOLO ai provider che li espongono
+                # (introspezione difensiva: gli adapter legacy senza il kwarg
+                # solleverebbero TypeError).
+                _optional_kwargs: dict[str, Any] = {}
                 if force_tool_choice is not None:
+                    _optional_kwargs["force_tool_choice"] = force_tool_choice
+                if internal_task:
+                    _optional_kwargs["internal_task"] = True
+                if _optional_kwargs:
                     try:
                         import inspect as _inspect
                         _sig = _inspect.signature(prov.generate_agent_turn)
-                        if "force_tool_choice" in _sig.parameters:
-                            _agent_kwargs["force_tool_choice"] = force_tool_choice
+                        for _k, _v in _optional_kwargs.items():
+                            if _k in _sig.parameters:
+                                _agent_kwargs[_k] = _v
                     except (TypeError, ValueError):
                         pass
                 def _run():

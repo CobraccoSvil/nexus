@@ -137,7 +137,13 @@ pub(crate) fn list_pending_files(
 /// Punto unico (regola L, S68) per il pattern duplicato negli adapter SQL.
 pub(crate) fn sanitize_migration_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
