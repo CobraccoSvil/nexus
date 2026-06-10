@@ -1428,6 +1428,18 @@ def _check_superseded(state: dict[str, Any]) -> bool:
         return False
 
 
+def _billing_exhausted_providers() -> list[str]:
+    """Provider AI in cooldown per quota/credito esaurito (billing). Vuoto se
+    nessuno. Letto dalla fonte autoritativa del registry (stesso stato dei LED UI
+    e del pre-check no_capable_provider). Best-effort: ogni errore -> lista vuota."""
+    try:
+        from brain.providers.registry import get_billing_cooldown_snapshot
+        snap = get_billing_cooldown_snapshot()
+        return sorted(snap.keys()) if snap else []
+    except Exception:
+        return []
+
+
 async def executor_node(state: AgentState) -> dict[str, Any]:
     """Chiama il provider LLM. In modalita' agent (tools_json non vuoto) usa
     `generate_agent_turn` e popola `pending_tool_uses` + `stop_reason`.
@@ -1782,6 +1794,34 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     # i turni del run (mig 0386): al loro ritorno la gerarchia sale a escalate/abort.
     _progress_diagnosed: set[str] = set(state.get("progress_diagnosed_axes") or [])
     _progress_ctrl_on = _load_progress_controller_enabled()
+    # ── Fail-fast onesto: provider principali esauriti ───────────────────────
+    # Se l'esplorazione ha raggiunto la soglia E i provider AI buoni sono in
+    # cooldown per quota/credito esaurito, NON insistere con nudge/escalation su
+    # un modello di riserva che esplora senza concludere (caso reale: deepseek-v4
+    # legge 15 file su task architecture, 70K token sprecati). La causa vera e' la
+    # ricarica crediti, non il modello: si chiude SUBITO col messaggio onesto,
+    # risparmiando i turni successivi. Coerente col fix Rust cooldown_exhaustion_note.
+    if _exploration_count >= _exploration_threshold:
+        _exhausted = _billing_exhausted_providers()
+        if _exhausted:
+            _ff_msg = (
+                f"L'elaborazione si e' interrotta: i provider AI principali sono in "
+                f"cooldown per quota/credito esaurito ({', '.join(_exhausted)}). "
+                f"Ricarica i crediti (o attendi il reset) e riprova."
+            )
+            logger.warning(
+                "executor_node: fail-fast esplorazione (count=%d) — provider esauriti %s, "
+                "chiusura onesta invece di insistere (risparmio token)",
+                _exploration_count, _exhausted,
+            )
+            return {
+                "messages": [AIMessage(content=_ff_msg)],
+                "result": _ff_msg,
+                "pending_tool_uses": [],
+                "stop_reason": "loop_abort",
+                "iterations": int(state.get("iterations") or 0) + 1,
+                "consecutive_exploration_calls": _exploration_count,
+            }
     if _exploration_count >= 2 * _exploration_threshold and _progress_ctrl_on:
         # PUNTO UNICO (progress_controller): a 2x soglia NON abortiamo subito. La
         # gerarchia coordinata decide guida(forza-azione) -> abort-verso-verifica.
