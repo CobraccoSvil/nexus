@@ -225,6 +225,27 @@ impl ToolRunner for ToolRunnerService {
         let is_error = result.trim_start().starts_with('\u{274C}');
         let duration_ms = started.elapsed().as_millis() as u64;
 
+        // Coerenza cache dopo mutazione (incidente Beauty-Book 2026-06-11): un
+        // tool che muta il filesystem invalida le LETTURE cacheate (list_files,
+        // read_file, ...), altrimenti il modello vede listing/contenuti
+        // antecedenti alla propria modifica e produce resoconti falsi.
+        // Best-effort in background: non allunga la risposta del tool.
+        if !is_error && cache_cfg.is_mutator(&req.tool_name) {
+            let db = self.deps.db.clone();
+            let readers = cache_cfg.readers.clone();
+            let mutator = req.tool_name.clone();
+            tokio::spawn(async move {
+                let n = crate::agent_tool_result_cache::invalidate_readers(&db, &readers).await;
+                if n > 0 {
+                    tracing::info!(
+                        tool = %mutator,
+                        invalidated = n,
+                        "tool_result_cache: letture invalidate dopo mutazione"
+                    );
+                }
+            });
+        }
+
         // Store cache (best-effort, solo se ok e tool cacheable).
         if cache_eligible && !is_error {
             let db = self.deps.db.clone();

@@ -20,12 +20,42 @@ pub struct CacheHit {
     pub age_seconds: i64,
 }
 
+/// Tool che MUTANO lo stato del filesystem/progetto (default; override DB via
+/// `agent.tools.result_cache_mutators`). Mai cacheabili E, dopo l'esecuzione,
+/// invalidano le letture cacheate. Causa radice (incidente Beauty-Book
+/// 2026-06-11): `rename_file` e il meta-tool `nexus_mcp_tool_call` (che wrappa
+/// estrattori che scrivono su disco) NON erano nella skiplist; il modello ha
+/// ricevuto manifest e `list_files` cacheati di ~700s che descrivevano una
+/// directory che i suoi stessi rename avevano appena svuotato -> resoconto falso.
+const MUTATORS_DEFAULT: &str = "write_file,edit_file,delete_file,rename_file,file_write,\
+fs_copy,fs_mkdir,fs_move,format_file,run_lint_fix,run_command,command,run_in_terminal,\
+git_command,git_pull,git_commit,git_stage,git_push,nexus_extract_figma_code,\
+nexus_install_shadcn_components,nexus_mcp_tool_call,cargo_install,run_service,\
+service_restart,stop_service";
+
+/// Tool di LETTURA dello stato filesystem/progetto (default; override DB via
+/// `agent.tools.result_cache_readers`): le loro entry cache vengono invalidate
+/// quando un mutatore viene eseguito, cosi' il modello non vede mai un listing
+/// o un contenuto antecedente a una mutazione.
+const READERS_DEFAULT: &str = "list_files,read_file,read_file_lines,file_read,find,\
+search_in_files,git_status,nexus_verify_scaffold,tail_service_logs,read_service_output,\
+list_active_services";
+
 /// Settings cache (cache 60s a livello processo).
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
     pub enabled: bool,
     pub ttl_seconds: u64,
     pub skip_for: Vec<String>,
+    pub mutators: Vec<String>,
+    pub readers: Vec<String>,
+}
+
+fn split_csv(csv: &str) -> Vec<String> {
+    csv.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 impl CacheConfig {
@@ -38,21 +68,48 @@ impl CacheConfig {
             "run_command,write_file,edit_file,delete_file",
         )
         .await;
-        let skip_for: Vec<String> = skip_csv
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let mutators_csv =
+            read_text(db, "agent.tools.result_cache_mutators", MUTATORS_DEFAULT).await;
+        let readers_csv =
+            read_text(db, "agent.tools.result_cache_readers", READERS_DEFAULT).await;
         Self {
             enabled,
             ttl_seconds,
-            skip_for,
+            skip_for: split_csv(&skip_csv),
+            mutators: split_csv(&mutators_csv),
+            readers: split_csv(&readers_csv),
         }
     }
 
+    /// Cacheabile solo se: abilitata, non in skiplist E non mutatore. I mutatori
+    /// sono esclusi STRUTTURALMENTE (anche se la skiplist DB e' rimasta al
+    /// default legacy senza rename_file/nexus_mcp_tool_call): un tool con
+    /// side-effect cacheato e' sempre un bug, mai una scelta.
     pub fn should_cache(&self, tool_name: &str) -> bool {
-        self.enabled && !self.skip_for.iter().any(|s| s == tool_name)
+        self.enabled
+            && !self.skip_for.iter().any(|s| s == tool_name)
+            && !self.is_mutator(tool_name)
     }
+
+    pub fn is_mutator(&self, tool_name: &str) -> bool {
+        self.mutators.iter().any(|s| s == tool_name)
+    }
+}
+
+/// Invalida le entry cache dei tool di LETTURA dopo una mutazione del
+/// filesystem (punto unico, regola L). Invalidazione globale per tool_name:
+/// la cache key non porta il progetto, e correttezza > risparmio (la cache
+/// si ripopola alla lettura successiva). Ritorna le righe rimosse.
+pub async fn invalidate_readers(db: &PgPool, readers: &[String]) -> u64 {
+    if readers.is_empty() {
+        return 0;
+    }
+    sqlx::query("DELETE FROM agent_tool_result_cache WHERE tool_name = ANY($1)")
+        .bind(readers)
+        .execute(db)
+        .await
+        .map(|r| r.rows_affected())
+        .unwrap_or(0)
 }
 
 async fn read_bool(db: &PgPool, key: &str, default: bool) -> bool {
@@ -219,4 +276,71 @@ pub fn start_cleanup_worker(db: PgPool) {
         }
     });
     tracing::info!("agent_tool_result_cache: cleanup worker avviato (15m interval)");
+}
+
+#[cfg(test)]
+mod tests_cache_config {
+    use super::*;
+
+    fn cfg(skip: &str, mutators: &str, readers: &str) -> CacheConfig {
+        CacheConfig {
+            enabled: true,
+            ttl_seconds: 1800,
+            skip_for: split_csv(skip),
+            mutators: split_csv(mutators),
+            readers: split_csv(readers),
+        }
+    }
+
+    #[test]
+    fn mutatore_mai_cacheabile_anche_con_skiplist_legacy() {
+        // Incidente Beauty-Book: skiplist DB rimasta al default storico SENZA
+        // rename_file/nexus_mcp_tool_call. Con la nuova regola strutturale i
+        // mutatori restano comunque esclusi dalla cache.
+        let c = cfg(
+            "run_command,write_file,edit_file,delete_file",
+            MUTATORS_DEFAULT,
+            READERS_DEFAULT,
+        );
+        assert!(!c.should_cache("rename_file"), "rename_file e' un mutatore");
+        assert!(
+            !c.should_cache("nexus_mcp_tool_call"),
+            "meta-tool wrappa estrattori"
+        );
+        assert!(!c.should_cache("nexus_extract_figma_code"));
+        assert!(c.should_cache("list_files"), "i reader restano cacheabili");
+        assert!(c.should_cache("read_file"));
+    }
+
+    #[test]
+    fn skiplist_esplicita_resta_rispettata() {
+        let c = cfg("read_file", MUTATORS_DEFAULT, READERS_DEFAULT);
+        assert!(
+            !c.should_cache("read_file"),
+            "skiplist DB vince anche sui reader"
+        );
+    }
+
+    #[test]
+    fn disabilitata_niente_cache() {
+        let mut c = cfg("", MUTATORS_DEFAULT, READERS_DEFAULT);
+        c.enabled = false;
+        assert!(!c.should_cache("list_files"));
+    }
+
+    #[test]
+    fn is_mutator_riconosce_la_lista() {
+        let c = cfg("", MUTATORS_DEFAULT, READERS_DEFAULT);
+        assert!(c.is_mutator("write_file"));
+        assert!(c.is_mutator("run_command"));
+        assert!(c.is_mutator("git_pull"));
+        assert!(!c.is_mutator("list_files"));
+        assert!(!c.is_mutator("nexus_search_semantic"));
+    }
+
+    #[test]
+    fn split_csv_trim_e_vuoti() {
+        assert_eq!(split_csv(" a , b ,, c "), vec!["a", "b", "c"]);
+        assert!(split_csv("").is_empty());
+    }
 }
