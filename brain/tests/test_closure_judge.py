@@ -34,6 +34,24 @@ def test_parse_strict_bool() -> None:
     print("OK test_parse_strict_bool")
 
 
+def test_coerce_text_reasoner_blocks() -> None:
+    # Regressione (3 bug trovati live): i modelli reasoner (magistral) ritornano
+    # content come LISTA di blocchi [thinking, text]; _coerce_text estrae il solo
+    # blocco text (dove sta il JSON), ignorando il thinking.
+    assert cj._coerce_text("gia stringa") == "gia stringa"
+    blocks = [
+        {"type": "thinking", "thinking": [{"type": "text", "text": "ragiono..."}], "closed": True},
+        {"type": "text", "text": '{"fulfilled": false, "reason": "rimandato"}'},
+    ]
+    assert cj._coerce_text(blocks) == '{"fulfilled": false, "reason": "rimandato"}'
+    # Il verdetto estratto deve essere parsabile end-to-end.
+    assert cj._parse_response(cj._coerce_text(blocks)) == {"fulfilled": False, "reason": "rimandato"}
+    # Lista senza blocchi text espliciti: fallback concatenazione, mai eccezione.
+    assert isinstance(cj._coerce_text([{"type": "thinking", "text": "x"}]), str)
+    assert cj._coerce_text([]) == ""
+    print("OK test_coerce_text_reasoner_blocks")
+
+
 def test_prompt_contains_task_and_result() -> None:
     p = cj._build_prompt("crea il login", "ho creato il file login.tsx")
     assert "crea il login" in p
@@ -113,6 +131,7 @@ def test_shadow_abstains_short_result() -> None:
 
 if __name__ == "__main__":
     test_parse_strict_bool()
+    test_coerce_text_reasoner_blocks()
     test_prompt_contains_task_and_result()
     test_shadow_abstains_when_disabled()
     test_shadow_abstains_when_declared()

@@ -47,8 +47,12 @@ _CFG_DEFAULTS: dict[str, Any] = {
 
 # Timeout della chiamata LLM: il judge e' leggero e off-path (shadow), non deve
 # allungare percettibilmente la chiusura del run.
-_JUDGE_TIMEOUT_S = 6.0
-_JUDGE_MAX_TOKENS = 120
+_JUDGE_TIMEOUT_S = 12.0
+# Budget token ampio: il purpose tier=light+reasoning puo' risolvere a un modello
+# REASONER (es. magistral-small) che consuma token nel thinking PRIMA di produrre
+# il JSON. Con un budget stretto il verdetto verrebbe troncato e non parsabile.
+# 512 da spazio al ragionamento + l'oggetto JSON finale.
+_JUDGE_MAX_TOKENS = 512
 
 
 def _load_config() -> dict[str, Any]:
@@ -121,6 +125,30 @@ def _build_prompt(task_input: str, result: str) -> str:
         f"RISPOSTA FINALE:\n{result_trunc}\n\n"
         "JSON:"
     )
+
+
+def _coerce_text(content: Any) -> str:
+    """Normalizza il `content` di un ProviderResult a stringa. I modelli reasoning
+    (es. magistral) ritornano content come LISTA di blocchi [{type:thinking,...},
+    {type:text, text:'{...json...}'}]: si estraggono i soli blocchi `text` (il
+    verdetto JSON sta li', il blocco thinking va ignorato). Senza questa coercion
+    _parse_response riceverebbe una lista e solleverebbe -> il judge non girerebbe
+    mai sui reasoner. Stessa logica di neural_service._normalize_provider_result."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            b["text"] for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+        ]
+        if not parts:
+            # nessun blocco text esplicito: concatena qualunque testo disponibile
+            parts = [
+                str(b.get("text", "")) if isinstance(b, dict) else str(b)
+                for b in content
+            ]
+        return " ".join(p for p in parts if p)
+    return str(content)
 
 
 _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
@@ -222,14 +250,18 @@ async def run_shadow(
         prov = providers._providers.get(prov_name)  # type: ignore[attr-defined]
     except Exception:
         prov = None
-    if prov is None or not hasattr(prov, "generate_completion_async"):
+    # `generate` e' il metodo CANONICO dell'interfaccia provider (base.py),
+    # presente in TUTTI i provider. NON usare `generate_completion_async`: esiste
+    # solo su anthropic/openai, quindi il judge si asterrebbe ogni volta che il
+    # purpose risolve a mistral/google/deepseek (tier light -> spesso mistral).
+    if prov is None or not hasattr(prov, "generate"):
         return
 
     prompt = _build_prompt(task_input, result)
     t0 = time.monotonic()
     try:
         raw_res = await asyncio.wait_for(
-            prov.generate_completion_async(model, prompt, max_tokens=_JUDGE_MAX_TOKENS, temperature=0.0),
+            prov.generate(model, prompt, max_tokens=_JUDGE_MAX_TOKENS, temperature=0.0),
             timeout=_JUDGE_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
@@ -240,7 +272,13 @@ async def run_shadow(
         return
     latency_ms = int((time.monotonic() - t0) * 1000)
 
-    raw_text = raw_res.content if hasattr(raw_res, "content") else str(raw_res)
+    raw_content = raw_res.content if hasattr(raw_res, "content") else str(raw_res)
+    raw_text = _coerce_text(raw_content)
+    # `generate` non solleva: su errore ritorna un ProviderResult con content
+    # "[Error: ...]" o "[<Provider> ...]". Non e' un verdetto -> astensione.
+    if raw_text.startswith("[Error:") or raw_text.startswith("[Mistral") or "not configured" in raw_text[:40]:
+        logger.debug("closure_judge: provider error/non configurato, astensione")
+        return
     verdict = _parse_response(raw_text)
     if verdict is None:
         logger.debug("closure_judge: verdetto non parsabile, astensione")
