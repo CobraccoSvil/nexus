@@ -429,14 +429,37 @@ async def planner_node(state: AgentState) -> dict[str, Any]:
                 }
 
     if todo_block is None:
-        logger.warning(
-            "planner_node: il modello non ha emesso nexus_todo_write (pending=%d) — skip",
-            len(pending_tool_uses),
-        )
-        return {
-            "plan_phase_active": False,
-            "plan_phase_skip_reason": "no_tool_use_emitted",
-        }
+        # Fallback DETERMINISTICO dai passi del playbook (mig 0395, incidente
+        # Beauty-Book): il playbook implement.figma_make matchava in TUTTI i run
+        # ma il piano non nasceva mai perche' il modello non emetteva
+        # nexus_todo_write -> niente DoD, niente verifier, task mai decomposto.
+        # Se il router ha salvato passi strutturati nello state, il piano viene
+        # generato DA QUELLI (niente speranza che l'LLM li trascriva).
+        _pb_steps = state.get("playbook_steps") or []
+        if _pb_steps:
+            logger.info(
+                "planner_node: todos deterministici dai passi del playbook %s (%d passi)",
+                state.get("playbook_key") or "?", len(_pb_steps),
+            )
+            todo_block = {
+                "name": "nexus_todo_write",
+                "input": {
+                    "action": "create",
+                    "todos": [
+                        {"content": str(s), "status": "pending", "priority": "normal"}
+                        for s in _pb_steps
+                    ],
+                },
+            }
+        else:
+            logger.warning(
+                "planner_node: il modello non ha emesso nexus_todo_write (pending=%d) — skip",
+                len(pending_tool_uses),
+            )
+            return {
+                "plan_phase_active": False,
+                "plan_phase_skip_reason": "no_tool_use_emitted",
+            }
 
     # Esegui il tool via ToolRunner (audit + isolation server-side)
     tool_input = dict(todo_block.get("input") or {})

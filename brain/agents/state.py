@@ -60,6 +60,10 @@ class AgentState(TypedDict, total=False):
     # Propagato a mcp-core via error_class=infrastructure nell'end_turn -> non si
     # scalano i provider (il problema non e' il modello).
     tool_infra_error: bool
+    # Passi STRUTTURATI del playbook matchato (mig 0395): il planner li usa per
+    # generare i todos deterministicamente se il modello non emette nexus_todo_write.
+    playbook_steps: list[str] | None
+    playbook_key: str | None
     task_type: str
     behavior_mode: str
     token_budget: int

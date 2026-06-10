@@ -89,11 +89,12 @@ def load_enabled_playbooks() -> list[dict[str, Any]]:
             with psycopg2.connect(url) as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT key, trigger_json, guidance_text, priority "
+                        "SELECT key, trigger_json, guidance_text, priority, "
+                        "       COALESCE(steps_json, '[]'::jsonb) "
                         "FROM nexus_task_playbooks WHERE enabled = TRUE "
                         "ORDER BY priority DESC, key ASC"
                     )
-                    for key, trigger_json, guidance, priority in cur.fetchall():
+                    for key, trigger_json, guidance, priority, steps_json in cur.fetchall():
                         # psycopg2 ritorna JSONB come dict (se registrato) o str.
                         trig = trigger_json
                         if isinstance(trig, str):
@@ -101,11 +102,18 @@ def load_enabled_playbooks() -> list[dict[str, Any]]:
                                 trig = _json.loads(trig)
                             except Exception:  # noqa: BLE001
                                 trig = {}
+                        steps = steps_json
+                        if isinstance(steps, str):
+                            try:
+                                steps = _json.loads(steps)
+                            except Exception:  # noqa: BLE001
+                                steps = []
                         out.append({
                             "key": key,
                             "trigger": trig or {},
                             "guidance": guidance or "",
                             "priority": int(priority or 100),
+                            "steps": [str(s) for s in steps] if isinstance(steps, list) else [],
                         })
         except Exception as exc:  # noqa: BLE001 — best-effort (tabella assente, DB down)
             logger.debug("task_playbook: load fallita (%s)", exc)
@@ -177,6 +185,24 @@ def build_block(playbooks: list[dict[str, Any]]) -> str:
         key = pb.get("key", "")
         parts.append(f'<task_playbook key="{key}">\n{guidance}\n</task_playbook>')
     return "\n\n".join(parts)
+
+
+def matched_steps(context: dict[str, Any]) -> tuple[str, list[str]] | None:
+    """Ritorna (key, steps) del primo playbook matchato con passi STRUTTURATI
+    (steps_json, mig 0395), o None. Usato dal planner per generare i todos
+    deterministicamente quando il modello non emette nexus_todo_write: i passi
+    del playbook diventano il piano, senza sperare che l'LLM li trascriva.
+    Best-effort, mai solleva."""
+    try:
+        if not is_enabled():
+            return None
+        for pb in match(context):
+            steps = pb.get("steps") or []
+            if steps:
+                return str(pb.get("key", "")), [str(s) for s in steps]
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.debug("task_playbook: matched_steps skip (%s)", exc)
+    return None
 
 
 def guidance_for(context: dict[str, Any]) -> str:

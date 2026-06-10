@@ -856,6 +856,13 @@ async def router_node(state: AgentState) -> dict[str, Any]:
                 pb_block = task_playbook.guidance_for({"intent": intent, "text": str(text)})
                 if pb_block:
                     updates["system_text"] = effective_st + "\n\n" + pb_block
+            # Passi STRUTTURATI del playbook (mig 0395) -> state: il planner li
+            # usa per generare i todos deterministicamente se il modello non
+            # emette nexus_todo_write (prima: planner skip -> niente DoD/verifier).
+            _pb_steps = task_playbook.matched_steps({"intent": intent, "text": str(text)})
+            if _pb_steps:
+                updates["playbook_steps"] = _pb_steps[1]
+                updates["playbook_key"] = _pb_steps[0]
         except Exception as _exc:
             logger.debug("task_playbook injection skip: %s", _exc)
         # Filtriamo tools_json combinando whitelist profilo + intent (BP5).
