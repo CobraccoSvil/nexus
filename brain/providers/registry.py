@@ -160,6 +160,54 @@ def _clear_billing_cooldown(provider: str) -> None:
     _provider_cooldown_until.pop(key, None)
 
 
+_FALLBACK_ADAPT_DEFAULT_TEXT = (
+    "Sei subentrato come modello di riserva su questo task dopo un fallimento "
+    "del modello precedente. Adatta il lavoro alle tue capacita': procedi in "
+    "passi PICCOLI e concreti, una sola tool call alla volta; non ripetere "
+    "letture o esplorazioni gia' fatte (i risultati sono nella cronologia); "
+    "appena hai informazioni sufficienti produci il risultato concreto. Se il "
+    "task e' troppo ampio per un solo turno, completa la prima parte utile e "
+    "dichiara esplicitamente cosa resta da fare (usa task_complete se "
+    "disponibile). Non descrivere il lavoro: eseguilo."
+)
+
+
+def _fallback_adapt_directive(to_model: str) -> str | None:
+    """Direttiva di adattamento del turno al modello di FALLBACK (mig 0393).
+
+    Il sistema adatta gia' i limiti QUANTITATIVI al modello (max_tokens clampato,
+    soglie contesto su context_window, forced-RAG): qui si adatta il lato
+    QUALITATIVO — un modello di riserva che eredita a meta' un task tarato su un
+    modello piu' capace riceve istruzioni di lavoro esplicite (passi piccoli,
+    niente ri-esplorazioni, chiusura onesta) invece del turno pari-pari.
+    DB-driven (regola G); None se disabilitato. Best-effort: errori -> default.
+    """
+    try:
+        from brain.utils import settings_db
+        if not settings_db.get_bool_setting("agent.fallback.adapt_enabled", True):
+            return None
+        text = settings_db.get_setting(
+            "agent.fallback.adapt_directive_text", _FALLBACK_ADAPT_DEFAULT_TEXT
+        ) or _FALLBACK_ADAPT_DEFAULT_TEXT
+    except Exception:
+        text = _FALLBACK_ADAPT_DEFAULT_TEXT
+    return text.replace("{model}", to_model)
+
+
+def inject_fallback_directive(messages: list, directive: str) -> list:
+    """Ritorna una NUOVA lista messaggi con la direttiva appesa come turno user.
+
+    Pura e idempotente (non muta l'input; se la direttiva e' gia' presente in
+    coda non la duplica): testabile senza stato condiviso. L'append come user
+    mantiene anche l'invariante Mistral "ultimo ruolo user/tool" (fix 422
+    trailing-assistant: il turno molle del provider fallito non resta ultimo).
+    """
+    if messages and isinstance(messages[-1], dict):
+        if messages[-1].get("content") == directive:
+            return list(messages)
+    return list(messages) + [{"role": "user", "content": directive}]
+
+
 def get_billing_cooldown_snapshot() -> dict[str, int]:
     """Restituisce {provider: secondi_rimanenti} per i provider in cooldown.
 
@@ -1073,6 +1121,11 @@ class ProviderRegistry:
             return False
 
         if _should_fallback(result):
+            # Adattamento del turno al modello subentrante (mig 0393): iniettato
+            # UNA volta per turno, prima del primo fallback effettivo. Il flag
+            # vive fuori dal loop: i fallback successivi della stessa chain
+            # riusano la stessa direttiva (gia' in coda ai messages).
+            _adapt_injected = False
             for fb_prov in self._provider_fallback_chain(exclude=effective_provider):
                 # Skip provider gia' in billing-cooldown locale.
                 if _is_in_billing_cooldown(fb_prov):
@@ -1108,6 +1161,17 @@ class ProviderRegistry:
                     result.metadata.get("stop_reason", "error"),
                     fb_prov, fb_model,
                 )
+                if not _adapt_injected:
+                    _directive = _fallback_adapt_directive(fb_model)
+                    if _directive:
+                        # Rebinding visto da _run_agent_turn (stessa cella di
+                        # closure): il turno del fallback include la direttiva.
+                        messages = inject_fallback_directive(messages, _directive)
+                        _adapt_injected = True
+                        logger.info(
+                            "Fallback adapt: direttiva di adattamento iniettata per %s/%s (mig 0393)",
+                            fb_prov, fb_model,
+                        )
                 fb_result = _run_agent_turn(fb_prov, fb_model)
                 usage = (fb_result.metadata or {}).get("usage")
                 _record_usage(
