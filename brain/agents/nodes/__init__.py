@@ -569,6 +569,8 @@ async def router_node(state: AgentState) -> dict[str, Any]:
     agentic_score_val: float | None = None
     is_ambiguous_val: bool | None = None
     requires_tools_val: bool | None = None
+    _action_verb_val: str = ""
+    _slots_conf_val: float = 0.0
     # Intent gia' RISOLTO a monte (mcp-core, risposta dell'utente a una
     # disambiguazione "A"/"B"/"C"): si usa quello, NIENTE ri-classificazione.
     # Ri-classificare la lettera secca dava 'chat' (prompt_len=1), vanificando
@@ -595,6 +597,14 @@ async def router_node(state: AgentState) -> dict[str, Any]:
                 agentic_score_val = getattr(ag, "agentic_score", None)
                 is_ambiguous_val = getattr(ag, "is_ambiguous", None)
                 requires_tools_val = getattr(ag, "requires_tools", None)
+                _slots = getattr(ag, "slots", None)
+                _action_verb_val = (
+                    getattr(_slots, "action_verb", "") if _slots else ""
+                )
+                _slots_conf_val = (
+                    float(getattr(_slots, "confidence", 0.0) or 0.0)
+                    if _slots else 0.0
+                )
                 logger.info(
                     "router_node: classifier LLM -> intent=%s conf=%.2f complexity=%s "
                     "agentic=%.2f ambiguous=%s",
@@ -647,6 +657,28 @@ async def router_node(state: AgentState) -> dict[str, Any]:
         action_oriented_val, requires_tools_val,
         float(agentic_score_val or 0.0), bool(_intent_hint),
     )
+
+    # ── Punto unico report-only (incidente "verifica->fix" 2026-06-10) ──────
+    # Il task chiede di VERIFICARE/LEGGERE e RIPORTARE l'esito, non di
+    # modificare il codice. Segnale STRUTTURALE dal classifier LLM (regola
+    # utente: niente keyword): action_verb 'read'/'analyze' con slot affidabili,
+    # oppure intent 'code_read'. In report_only i tool di MODIFICA file
+    # (write/edit/delete/rename) vengono rimossi ANCHE se in _ALWAYS_ON_TOOLS:
+    # senza questo l'agente, trovato un problema durante la verifica, lo
+    # CORREGGEVA invece di riportarlo (scope-creep), spesso bloccandosi.
+    # Guard di confidence (>=0.7) per non bloccare i fix legittimi quando il
+    # classifier e' incerto. Una disambiguazione risolta (_intent_hint) o una
+    # richiesta esplicita d'azione non sono mai report-only.
+    report_only_val = (not _intent_hint) and (
+        intent == "code_read"
+        or (_action_verb_val in ("read", "analyze") and _slots_conf_val >= 0.7)
+    )
+    if report_only_val:
+        logger.info(
+            "router_node: report_only=True (intent=%s action_verb=%s slots_conf=%.2f)"
+            " -> tool di modifica rimossi, atteso REPORT non fix",
+            intent, _action_verb_val, _slots_conf_val,
+        )
 
     behavior_mode = state.get("behavior_mode", "bilanciata")
 
@@ -766,6 +798,7 @@ async def router_node(state: AgentState) -> dict[str, Any]:
     # Punto unico action-oriented: SEMPRE presente nello state dopo il router
     # (i consumatori leggono via turn_action_oriented, default True se assente).
     updates["action_oriented"] = action_oriented_val
+    updates["report_only"] = report_only_val
 
     if profile is not None:
         updates["profile_name"] = profile.name
@@ -855,6 +888,47 @@ async def router_node(state: AgentState) -> dict[str, Any]:
             "router_node: intent=%s token_budget=%d mode=%s profile=<none>",
             intent, token_budget, behavior_mode,
         )
+
+    # ── Enforcement report-only: rimuovi i tool di MODIFICA file ────────────
+    # I tool write/edit/delete/rename sono in _ALWAYS_ON_TOOLS (bypassano il
+    # filtro per intent), quindi anche un task di sola verifica li avrebbe.
+    # In report_only li togliamo: l'agente puo' ancora LEGGERE e eseguire
+    # CHECK (read_file, list_files, grep, run_command per build/test/curl) ma
+    # non MODIFICARE -> esegue le verifiche e chiude con un REPORT, niente
+    # scope-creep correttivo. run_command resta (i check ne hanno bisogno);
+    # la direttiva sotto chiede di non usarlo per modificare.
+    if report_only_val:
+        _MUTATING_FILE_TOOLS = {
+            "write_file", "edit_file", "delete_file", "rename_file",
+            "nexus_install_shadcn_components",
+        }
+        _tools_now = updates.get("tools_json", state.get("tools_json")) or []
+        _tools_ro = [
+            t for t in _tools_now if t.get("name") not in _MUTATING_FILE_TOOLS
+        ]
+        if len(_tools_ro) != len(_tools_now):
+            logger.info(
+                "router_node: report_only rimuove %d tool di modifica (%d -> %d)",
+                len(_tools_now) - len(_tools_ro), len(_tools_now), len(_tools_ro),
+            )
+            updates["tools_json"] = _tools_ro
+        # Direttiva esplicita: il modello sa che e' un task di verifica e che
+        # non deve cercare di modificare (i tool di modifica non ci sono).
+        _ro_directive = (
+            "<modalita_verifica>\n"
+            "Questo turno e' una VERIFICA/REPORT, non un intervento. Esegui i "
+            "controlli richiesti (lettura file, build, test, curl, query) e "
+            "RIPORTA in modo esplicito l'esito di OGNI controllo. NON modificare "
+            "file ne' applicare correzioni: se rilevi problemi che richiederebbero "
+            "una modifica, ELENCALI nel report come raccomandazioni, non come "
+            "azioni gia' fatte. I tool di modifica sono volutamente disattivati.\n"
+            "</modalita_verifica>"
+        )
+        _eff_st = updates.get("system_text") or state.get("system_text") or ""
+        if "<modalita_verifica>" not in _eff_st:
+            updates["system_text"] = (
+                (_eff_st + "\n\n" + _ro_directive) if _eff_st else _ro_directive
+            )
 
     # ── Chat: meta-tool di gestione/discovery, NON azzeramento totale ───────
     # Prima azzeravamo tools_json per gli intent conversazionali, forzando la

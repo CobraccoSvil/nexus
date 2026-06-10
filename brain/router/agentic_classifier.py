@@ -363,6 +363,7 @@ CRITICAL:
 - "scaffold/genera progetto" / "boilerplate" / "starter kit" → intent=architecture, scope=system_wide.
 - "imposta/configura/abilita un utente admin|il backend|un servizio|CORS|HTTPS", "setup X", "deploya/avvia X" → intent=system_admin, requires_tools=true. E' un task agentico multi-step, NON chat anche se la frase e' breve.
 - RETROSPECTIVE/META requests about work ALREADY done in this conversation — "riassumi cosa hai fatto/sistemato", "spiega cosa e' successo", "che modifiche hai applicato?", "fammi il punto" → intent=chat, requires_tools=false, agentic_score<=0.2. The user wants a TEXT answer about past work, NOT new actions or documentation files. NOT docs (docs = write documentation files into the repo).
+- VERIFY/REPORT requests — "verifica/controlla che X compili|funzioni|risponda E riporta/dimmi l'esito", "controlla lo stato di X e fammi sapere", "fai un check di X e riportami" → action_verb=analyze, requires_tools=true (the checks need build/test/curl/read), agentic_score~0.5. The user wants the RESULT of checks REPORTED, NOT code changes. CRITICAL: this is report-only even if a check FAILS — do NOT switch to action_verb=resolve/write just because something is broken. If instead the user says "verifica e CORREGGI|SISTEMA|fai funzionare X" → action_verb=resolve (modification authorized).
 
 Use confidence<0.7 honestly when ambiguous (downstream asks user). NEVER inflate.
 
@@ -377,6 +378,8 @@ Examples:
 - "fix null pointer at handlers.py:42" → {{"intent":"fix","agentic_score":0.85,"requires_tools":true,"complexity":"medium","confidence":0.90,"candidates":[{{"intent":"fix","confidence":0.90}}],"slots":{{"action_verb":"resolve","target_type":"code","framework":"","scope":"single","confidence":0.85}}}}
 - "deploya il microservizio doc-service" → {{"intent":"system_admin","agentic_score":0.9,"requires_tools":true,"complexity":"high","confidence":0.92,"candidates":[{{"intent":"system_admin","confidence":0.92}}],"slots":{{"action_verb":"deploy","target_type":"service","framework":"docker","scope":"cross_service","confidence":0.90}}}}
 - "elimina i dockerfile rimasti" → {{"intent":"file_ops","agentic_score":0.7,"requires_tools":true,"complexity":"low","confidence":0.88,"candidates":[{{"intent":"file_ops","confidence":0.88}}],"slots":{{"action_verb":"delete","target_type":"infrastructure","framework":"docker","scope":"multi_file","confidence":0.85}}}}
+- "verifica che il backend compili e che il frontend buildi, riporta l'esito di ogni controllo" → {{"intent":"code_read","agentic_score":0.5,"requires_tools":true,"complexity":"medium","confidence":0.85,"candidates":[{{"intent":"code_read","confidence":0.85}}],"slots":{{"action_verb":"analyze","target_type":"code","framework":"","scope":"multi_file","confidence":0.85}}}}
+- "controlla che il servizio risponda e dimmi lo stato" → {{"intent":"code_read","agentic_score":0.4,"requires_tools":true,"complexity":"low","confidence":0.88,"candidates":[{{"intent":"code_read","confidence":0.88}}],"slots":{{"action_verb":"analyze","target_type":"service","framework":"","scope":"single","confidence":0.88}}}}
 
 Return ONLY the JSON object."""
 
