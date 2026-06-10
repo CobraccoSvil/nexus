@@ -117,7 +117,20 @@ def _normalize_provider_result(result, provider: str, model: str) -> tuple[str, 
     if content.startswith("[Error:") or error_meta:
         raw = error_meta or content[len("[Error:"):].rstrip("]").strip()
         logger.error("Provider %s/%s error: %s", provider, model, raw)
-        error_class, human = _classify_provider_error(Exception(raw))
+        # Contratto dati B (regola L, telemetria 2026-06-10): se il provider ha
+        # gia' classificato l'errore sull'oggetto SDK REALE (format_error_result
+        # -> error_class + http_status strutturati nel metadata), USA quei campi.
+        # Ri-classificare qui la STRINGA (Exception(raw)) era una SECONDA
+        # classificazione (regola L) che perdeva gli attributi SDK e faceva
+        # scattare il fallback lessicale http_status su OGNI errore provider.
+        structured_class = result.metadata.get("error_class")
+        if structured_class:
+            error_class = structured_class
+            human = error_meta if isinstance(error_meta, str) and error_meta else raw
+        else:
+            # Niente metadata strutturato (path legacy "[Error:...]" o provider
+            # che non usa format_error_result): ri-classifica come fallback.
+            error_class, human = _classify_provider_error(Exception(raw))
         content = human
         error_meta = human
     return content, error_meta, error_class
