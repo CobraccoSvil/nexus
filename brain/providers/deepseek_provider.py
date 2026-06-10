@@ -101,11 +101,13 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
                 },
             )
         except Exception as e:
-            logger.error("DeepSeek generation failed: %s", e)
+            # Contratto dati B (regola L): error_class + http_status strutturati
+            # dall'oggetto SDK reale (niente fallback lessicale a valle).
+            meta = format_error_result(e, self.name, model)
             return ProviderResult(
                 provider=self.name, model=model,
-                content=f"[Error: {e}]",
-                metadata={"error": str(e)},
+                content=f"[Error: {meta['error']}]",
+                metadata=meta,
             )
 
     async def generate_agent_turn(

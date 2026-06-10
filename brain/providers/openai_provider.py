@@ -171,11 +171,15 @@ class OpenAIProvider(BaseProvider, ApiKeyClientMixin):
                 },
             )
         except Exception as e:
-            logger.error("OpenAI generation failed: %s", e)
+            # Contratto dati B (regola L): errore classificato sull'oggetto SDK
+            # reale -> metadata con error_class + http_status STRUTTURATI (niente
+            # fallback lessicale a valle). format_error_result logga gia' con
+            # http/stop_reason.
+            meta = format_error_result(e, self.name, model)
             return ProviderResult(
                 provider=self.name, model=model,
-                content=f"[Error: {e}]",
-                metadata={"error": str(e)},
+                content=f"[Error: {meta['error']}]",
+                metadata=meta,
             )
 
     async def generate_agent_turn(

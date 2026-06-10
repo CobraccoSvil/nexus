@@ -108,11 +108,14 @@ class OllamaProvider(BaseProvider):
                 },
             )
         except Exception as e:
-            logger.error("Ollama generate failed model=%s: %s", model, e)
+            # Contratto dati B (regola L): error_class + http_status strutturati
+            # dall'oggetto SDK reale (niente fallback lessicale a valle).
+            from .error_handler import format_error_result
+            meta = format_error_result(e, self.name, model)
             return ProviderResult(
                 provider=self.name, model=model,
-                content=f"[Ollama Error: {e}]",
-                metadata={"error": str(e)},
+                content=f"[Ollama Error: {meta['error']}]",
+                metadata=meta,
             )
 
     async def generate_stream(self, model: str, prompt: str, **kwargs: Any) -> AsyncIterator[str]:

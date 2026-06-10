@@ -711,11 +711,14 @@ class ProviderRegistry:
                 _record_usage(provider, model, usage if isinstance(usage, dict) else None, {"feature": "neural.GenerateCompletion"})
                 return result
         except Exception as e:
-            logger.error("Completion failed for %s/%s: %s", provider, model, e)
+            # Contratto dati B (regola L): error_class + http_status strutturati
+            # dall'oggetto SDK reale (niente fallback lessicale a valle).
+            from .error_handler import format_error_result
+            meta = format_error_result(e, provider, model)
             return ProviderResult(
                 provider=provider, model=model,
-                content=f"[Error: {e}]",
-                metadata={"error": str(e)},
+                content=f"[Error: {meta['error']}]",
+                metadata=meta,
             )
 
     def _provider_fallback_chain(self, exclude: str | None = None) -> list[str]:
