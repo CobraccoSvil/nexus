@@ -858,21 +858,42 @@ def estimate_prompt_complexity(prompt: str, config: dict[str, Any] | None = None
     return min(score, 100)
 
 
-def compute_iteration_budget(prompt: str, model: str | None = None) -> tuple[int, int]:
+# Mappa label complexity del classifier LLM -> score 0-100 (universale, no keyword).
+_COMPLEXITY_LABEL_SCORE = {"low": 10, "medium": 40, "high": 70}
+
+
+def compute_iteration_budget(
+    prompt: str,
+    model: str | None = None,
+    classifier_complexity: str | None = None,
+    agentic_score: float | None = None,
+) -> tuple[int, int]:
     """Calcola il budget di iterazioni per un run agente.
 
     Ritorna (iter_budget, complexity_score). Il budget e':
         base + per_complexity_point * complexity_score, scalato per weak model,
         capped a max.
 
+    Fonte dello score (WAVE 4, de-lessicalizzazione): se il classifier LLM ha
+    prodotto complexity (low/medium/high) e/o agentic_score, lo score viene da
+    LI' — universale, indipendente dalla lingua. Solo se il classifier non ha
+    fornito nulla si ricade su estimate_prompt_complexity (keyword it/en),
+    loggato come lexical_fallback_used.
+
     Esempi (config default 60/4/300):
-        prompt semplice (score=0)   -> 60 iter
-        prompt medio    (score=20)  -> 140 iter
-        prompt complesso (score=50) -> 260 iter
-        prompt fullstack (score>=60)-> 300 iter (cap)
+        low    (score~10) -> 100 iter ; medium (~40) -> 220 ; high (~70) -> 300.
     """
     config = _load_adaptive_budget_config()
-    score = estimate_prompt_complexity(prompt, config)
+    label = (classifier_complexity or "").strip().lower()
+    if label in _COMPLEXITY_LABEL_SCORE:
+        score = _COMPLEXITY_LABEL_SCORE[label]
+        # Boost dall'agentic_score: un task molto multi-step merita piu' budget.
+        if agentic_score is not None:
+            score = min(100, score + int(max(0.0, min(1.0, agentic_score)) * 30))
+    else:
+        score = estimate_prompt_complexity(prompt, config)
+        if score > 0:
+            logger.info("lexical_fallback_used: compute_iteration_budget keyword complexity")
     base = int(config["iteration_budget_base"])
     per_pt = int(config["iteration_budget_per_complexity_point"])
     budget = base + per_pt * score

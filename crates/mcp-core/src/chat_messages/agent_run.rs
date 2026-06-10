@@ -226,6 +226,81 @@ pub(crate) fn compose_turn_answer(
 /// (cap difensivo per-chunk `CHUNK_INJECT_CAP`, non un budget di sessione); il
 /// resto resta accessibile via `nexus_search_semantic`. Estrazioni fallite
 /// degradano con metadata + nota, mai panic.
+/// Blocco metadata degli allegati di SESSIONE per i turni senza allegati nuovi.
+///
+/// Complementare a `build_initial_msg_with_attachments` (stesso punto unico,
+/// regola L): quando il messaggio corrente non allega nulla ma la sessione ha
+/// allegati su messaggi precedenti, il modello deve sapere che esistono e come
+/// raggiungerli (nexus_inspect_attachment / estrattori), altrimenti li cerca
+/// nel filesystem del progetto. Metadata-only: niente pre-extraction, cap 10
+/// allegati piu' recenti.
+async fn build_session_attachments_block(
+    db: &PgPool,
+    content: &str,
+    session_id: Uuid,
+    current_message_id: Uuid,
+) -> String {
+    let rows = match sqlx::query(
+        r#"SELECT a.id, a.file_name, a.mime_type, a.size_bytes, a.kind
+           FROM chat_message_attachments a
+           JOIN chat_messages m ON m.id = a.message_id
+          WHERE m.session_id = $1 AND a.message_id <> $2
+          ORDER BY a.created_at DESC
+          LIMIT 10"#,
+    )
+    .bind(session_id)
+    .bind(current_message_id)
+    .fetch_all(db)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "initial_msg: lettura allegati di sessione fallita — prompt senza blocco"
+            );
+            return content.to_string();
+        }
+    };
+    if rows.is_empty() {
+        return content.to_string();
+    }
+
+    let mut b = String::new();
+    b.push_str("<allegati_sessione>\n");
+    b.push_str(&format!(
+        "Questa sessione ha {} allegato/i caricati in messaggi PRECEDENTI. \
+         NON sono file nel filesystem del progetto: si leggono SOLO con i tool \
+         allegati.\n\n## Allegati di sessione:\n",
+        rows.len()
+    ));
+    for r in &rows {
+        let id = r
+            .try_get::<Uuid, _>("id")
+            .map(|u| u.to_string())
+            .unwrap_or_default();
+        let name: String = r.try_get("file_name").unwrap_or_default();
+        let mime: String = r.try_get("mime_type").unwrap_or_default();
+        let size: i64 = r.try_get("size_bytes").unwrap_or(0);
+        let kind: String = r.try_get("kind").unwrap_or_default();
+        b.push_str(&format!(
+            "- {} ({}, {} byte, kind={}) [ID: {}]\n",
+            name, mime, size, kind, id
+        ));
+    }
+    b.push_str(
+        "\nISTRUZIONE: se il task riguarda uno di questi allegati, chiama \
+         nexus_inspect_attachment(attachment_id) e poi il tool di estrazione \
+         consigliato in next_action_recommended (es. nexus_extract_figma_code, \
+         nexus_extract_pdf_text, nexus_read_attachment). Non cercare questi \
+         file con list_files/read_file: non esistono sul filesystem.\n\
+         </allegati_sessione>\n\n",
+    );
+    b.push_str(content);
+    b
+}
+
 pub(crate) async fn build_initial_msg_with_attachments(
     db: &PgPool,
     content: &str,
@@ -235,7 +310,16 @@ pub(crate) async fn build_initial_msg_with_attachments(
     session_id: Uuid,
 ) -> String {
     if attachments.is_empty() {
-        return content.to_string();
+        // ROOT CAUSE (2026-06-10, "ha perso il riferimento al file allegato"):
+        // il blocco <allegati> copriva SOLO gli allegati del messaggio corrente.
+        // Su un turno successivo senza allegati ("riprendi") il run non aveva
+        // alcuna traccia degli allegati caricati nei messaggi precedenti della
+        // sessione (il blocco non viene persistito in history) e l'agente
+        // andava a cercare il file nel filesystem del progetto, concludendo
+        // che non esiste. Qui si inietta un blocco METADATA-ONLY con gli
+        // allegati di sessione (niente pre-extraction: l'investigazione passa
+        // dai tool, ADR 0010/0012).
+        return build_session_attachments_block(db, content, session_id, user_message_id).await;
     }
 
     let n = attachments.len();
@@ -1903,25 +1987,28 @@ pub(crate) async fn spawn_agent_run(
                 // l'utente chiede di scrivere/leggere documentazione) il retry
                 // serve perche' il modello dovrebbe usare tool.
                 //
-                // G1 override: se il messaggio utente e' una richiesta d'azione
-                // (avvia/installa/configura/docker/...) forziamo il retry ANCHE se
-                // l'intent classifier ha classificato come "chat" — in questo caso
-                // la classificazione e' probabile mente errata e la risposta senza
-                // tool e' sempre un fallimento.
-                let is_action_request =
-                    crate::agent_types::detect_action_request(&initial_msg_clone);
                 // Intent AUTORITATIVO: quello del router del brain propagato in
-                // nexus_task_type, NON la pre-classificazione locale di mcp-core
-                // (che diverge: mcp-core passa i tool, il brain li azzera per le
-                // chat dirette -> had_tools=true marcava hollow a torto). Evita il
-                // retry/cascade hollow spurio quando il brain ha instradato come
-                // 'chat'. Fallback al locale se il task_type non e' propagato.
-                let brain_intent = result
-                    .nexus_task_type
-                    .as_deref()
-                    .unwrap_or(classified_intent_for_loop);
-                let hollow_retry =
-                    result.hollow_completion && (brain_intent != "chat" || is_action_request);
+                // nexus_task_type (segnale del classifier LLM). WAVE 4
+                // (de-lessicalizzazione): se il brain ha fornito l'intent, e' LUI
+                // a decidere se il run d'azione hollow va ritentato (intent !=
+                // "chat") — niente piu' OR con le keyword di detect_action_request
+                // sull'initial_msg, che introducevano falsi positivi (una chat con
+                // la parola "crea" forzava un retry inutile). Il keyword resta SOLO
+                // come fallback quando il brain NON ha propagato l'intent (caso
+                // degradato), loggato come lexical_fallback_used.
+                let action_intent = match result.nexus_task_type.as_deref() {
+                    Some(intent) => intent != "chat",
+                    None => {
+                        let kw = crate::agent_types::detect_action_request(&initial_msg_clone);
+                        if kw {
+                            tracing::info!(
+                                "lexical_fallback_used: hollow_retry detect_action_request (brain_intent assente)"
+                            );
+                        }
+                        kw || classified_intent_for_loop != "chat"
+                    }
+                };
+                let hollow_retry = result.hollow_completion && action_intent;
                 let should_retry = failed_retry || hollow_retry;
 
                 if !should_retry || fallback_attempt + 1 >= max_provider_fallbacks {

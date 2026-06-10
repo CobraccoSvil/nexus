@@ -766,7 +766,14 @@ async def router_node(state: AgentState) -> dict[str, Any]:
                 last_human_text = str(content)
                 break
         initial_model = state.get("model_override") or state.get("sticky_model")
-        iter_budget, complexity_score = compute_iteration_budget(last_human_text, initial_model)
+        # WAVE 4: lo score di complessita' viene dal classifier LLM (universale),
+        # non piu' dalle keyword it/en del prompt. Fallback keyword solo se il
+        # classifier non ha prodotto la label.
+        iter_budget, complexity_score = compute_iteration_budget(
+            last_human_text, initial_model,
+            classifier_complexity=task_complexity,
+            agentic_score=agentic_score_val,
+        )
         logger.info(
             "router_node: adaptive budget iter=%d complexity=%d model=%s prompt_len=%d",
             iter_budget, complexity_score, initial_model or "?", len(last_human_text)
