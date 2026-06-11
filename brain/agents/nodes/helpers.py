@@ -2245,13 +2245,42 @@ def _load_system_offload_config() -> tuple[int, int]:
     return threshold, max_summary
 
 
-def _offload_system_prompt_if_huge(system_text: str, embeddings: Any | None) -> str:
-    """Se `system_text` > threshold token, offload in Qdrant e ritorna summary+pointer.
+# Sezioni del system prompt OFFLOADABILI senza perdita operativa (P2 roadmap
+# contesto): blocchi INFORMATIVI a tag chiuso (convenzione nostra, mig 0086).
+# Le DIRETTIVE (role/autonomia/protocollo/anti_loop/safety/playbook) NON sono
+# mai offloadabili: il vecchio taglio "head 3.200 char" decapitava il system
+# (la soglia 8000 era sotto il peso del solo system.nexus_base = 8.043 token,
+# scattava SEMPRE) e il modello non vedeva MAI act-first/playbook/KB — concausa
+# di "descrive invece di eseguire", loop, G1. Override DB:
+# agent.context.system_offload_sections (CSV di tag).
+_SYS_OFFLOADABLE_SECTIONS_DEFAULT = "examples,reflection,knowledge_base_progetto"
 
-    Mantiene SEMPRE l'intestazione del system prompt (prime righe, fino a
-    `summary_max_tokens` stimati). Il resto va in Qdrant ed e' raggiungibile
-    via `nexus_search_semantic(source_kinds=system_context)`. Best-effort:
-    in caso di errore offload, ritorna il system_text invariato.
+
+def _extract_offloadable_sections(
+    system_text: str, tags: list[str]
+) -> tuple[str, list[tuple[str, str]]]:
+    """Estrae i blocchi <tag>...</tag> offloadabili. Ritorna (testo_rimanente,
+    [(tag, blocco_completo), ...]). Parser di formato fisso (tag nostri)."""
+    import re as _re
+    extracted: list[tuple[str, str]] = []
+    remaining = system_text
+    for tag in tags:
+        pattern = _re.compile(
+            rf"<{_re.escape(tag)}[^>]*>.*?</{_re.escape(tag)}>", _re.DOTALL
+        )
+        for m in pattern.finditer(remaining):
+            extracted.append((tag, m.group(0)))
+        remaining = pattern.sub("", remaining)
+    return remaining, extracted
+
+
+def _offload_system_prompt_if_huge(system_text: str, embeddings: Any | None) -> str:
+    """Se `system_text` > threshold token, offload PER SEZIONI (P2): i blocchi
+    informativi (examples/reflection/KB) vanno in Qdrant con pointer; le
+    DIRETTIVE operative restano SEMPRE inline. Solo se anche dopo l'estrazione
+    il testo resta sopra 2x threshold scatta il vecchio taglio head (con ERROR
+    loggato: significa che i prompt DB vanno dimagriti). Best-effort: su errore
+    ritorna il system_text invariato.
     """
     if not system_text:
         return system_text
@@ -2260,26 +2289,63 @@ def _offload_system_prompt_if_huge(system_text: str, embeddings: Any | None) -> 
     if est_tokens <= threshold_tokens:
         return system_text
 
-    # Calcola char budget per il summary: ~4 char/token + 200 per pointer.
-    summary_chars = max_summary_tokens * 4
-    head = system_text[:summary_chars]
+    try:
+        from brain.utils.settings_db import get_setting
+        tags_csv = get_setting(
+            "agent.context.system_offload_sections",
+            _SYS_OFFLOADABLE_SECTIONS_DEFAULT,
+        ) or _SYS_OFFLOADABLE_SECTIONS_DEFAULT
+    except Exception:
+        tags_csv = _SYS_OFFLOADABLE_SECTIONS_DEFAULT
+    tags = [t.strip() for t in tags_csv.split(",") if t.strip()]
+
     try:
         from brain.agents import context_offload
-        offload = context_offload.offload_to_rag(
-            embeddings,
-            system_text,
-            source_kind="system_context",
-            metadata={"est_tokens": est_tokens},
-        )
-        pointer = context_offload.build_pointer(
-            len(system_text), offload, what="system prompt"
-        )
+        remaining, sections = _extract_offloadable_sections(system_text, tags)
+        pointers: list[str] = []
+        offloaded_chars = 0
+        for tag, block in sections:
+            offload = context_offload.offload_to_rag(
+                embeddings,
+                block,
+                source_kind="system_context",
+                metadata={"section": tag},
+            )
+            offloaded_chars += len(block)
+            pointers.append(
+                f"[Sezione <{tag}> ({len(block)} char) disponibile via "
+                f"nexus_search_semantic se serve.]"
+            )
+        result = remaining.rstrip()
+        if pointers:
+            result += "\n\n" + "\n".join(pointers)
+        new_tokens = _count_tokens(result)
         logger.info(
-            "system_prompt_offload: est_tokens=%d > threshold=%d -> offloadato "
-            "(head=%d char + pointer)",
-            est_tokens, threshold_tokens, len(head),
+            "system_prompt_offload: %d -> %d token (offload %d sezioni, %d char; "
+            "DIRETTIVE intatte)",
+            est_tokens, new_tokens, len(sections), offloaded_chars,
         )
-        return f"{head}\n\n{pointer}"
+        # Safety-net: se ANCHE senza le sezioni informative il system resta
+        # enorme (>2x threshold), il vecchio taglio head e' l'ultima risorsa —
+        # ma e' un segnale che i prompt nel DB vanno dimagriti, loggato ERROR.
+        if new_tokens > threshold_tokens * 2:
+            summary_chars = max_summary_tokens * 4
+            head = result[:summary_chars]
+            offload = context_offload.offload_to_rag(
+                embeddings, result, source_kind="system_context",
+                metadata={"est_tokens": new_tokens},
+            )
+            pointer = context_offload.build_pointer(
+                len(result), offload, what="system prompt"
+            )
+            logger.error(
+                "system_prompt_offload: system ANCORA %d token dopo offload "
+                "sezioni (>2x threshold %d): taglio head d'emergenza — "
+                "DIMAGRIRE i prompt in nexus_prompt_templates",
+                new_tokens, threshold_tokens,
+            )
+            return f"{head}\n\n{pointer}"
+        return result
     except Exception as exc:
         logger.warning(
             "system_prompt_offload: fallito (%s), system_text inviato intero", exc
