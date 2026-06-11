@@ -1,8 +1,8 @@
 //! `project_db_rollback` — annulla l'ultima migration applicata al DB del progetto utente.
 
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
-use crate::nexus_tools::db_helper::get_pool;
-use crate::project_db::{runner::MigrationRunner, MigrationTool, ProjectDbContext};
+use crate::db_helper::get_pool;
+use nexus_project_db::{runner::MigrationRunner, MigrationTool, ProjectDbContext};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::Row;

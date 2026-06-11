@@ -17,10 +17,10 @@
 //! eventi `ProjectEvent::Notification` sul dispatcher per notification UI in real-time.
 
 pub mod api;
-pub mod audit;
+pub use nexus_tool_kit::audit;
 pub mod guardrail_metrics;
 pub mod port_enforcer;
-pub mod quotas;
+pub use nexus_tool_kit::quotas;
 pub mod resource_governance;
 pub mod resource_linter;
 

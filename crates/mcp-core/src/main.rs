@@ -73,7 +73,7 @@ mod routing_matrix_auto_promoter;
 mod routing_slots;
 mod brain_url;
 mod run_reaper;
-mod sandbox;
+pub use nexus_tool_kit::sandbox;
 mod security;
 mod services_watchdog;
 mod session_autocommit;

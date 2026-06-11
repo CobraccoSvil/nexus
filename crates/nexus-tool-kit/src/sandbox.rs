@@ -708,9 +708,7 @@ async fn validate_port_for_project(
     project_id: uuid::Uuid,
     port: u16,
 ) -> Result<(), String> {
-    use crate::project_workspace::services::{
-        project_bucket_start, NEXUS_RESERVED_PORTS, PROJECT_PORT_BUCKET_SIZE,
-    };
+    use crate::ports::{project_bucket_start, NEXUS_RESERVED_PORTS, PROJECT_PORT_BUCKET_SIZE};
     if NEXUS_RESERVED_PORTS.contains(&port) {
         return Err(format!(
             "porta {port} riservata Nexus (web-ide/microservizi/DB infrastruttura). \

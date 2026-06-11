@@ -2007,6 +2007,7 @@ dependencies = [
  "nexus-mcp-client",
  "nexus-orchestrator",
  "nexus-project-db",
+ "nexus-tool-kit",
  "nexus-types",
  "notify",
  "once_cell",
@@ -2336,6 +2337,33 @@ dependencies = [
  "regex",
  "sqlx",
  "tokio",
+]
+
+[[package]]
+name = "nexus-tool-kit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "libc",
+ "mcp-ast",
+ "mcp-quality",
+ "nexus-events",
+ "nexus-project-db",
+ "rand 0.8.5",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "urlencoding",
+ "uuid",
 ]
 
 [[package]]

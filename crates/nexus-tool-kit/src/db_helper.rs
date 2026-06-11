@@ -393,7 +393,7 @@ pub async fn get_pool_for_project(
 
     // Applica max_db_pool_size dalla quota del progetto (cache 60s, no round-trip
     // aggiuntivo in hot path). Se la quota non esiste usa emergency_default (10).
-    let quota = crate::security::quotas::load_quota(nexus_pool, project_id).await;
+    let quota = crate::quotas::load_quota(nexus_pool, project_id).await;
     let max_conn = (quota.max_db_pool_size.max(1) as u32).min(50); // cap ragionevole
 
     let normalized = normalize_dsn(dsn.trim())?;
@@ -590,8 +590,8 @@ pub async fn ensure_project_db_isolation(
     );
 
     // Audit
-    crate::security::record_audit(
-        crate::security::AuditEntry::allowed(project_id, "db_isolation_setup", "db")
+    crate::audit::record_audit(
+        crate::audit::AuditEntry::allowed(project_id, "db_isolation_setup", "db")
             .with_resource(db_name.clone())
             .with_details(serde_json::json!({
                 "role": role_name,

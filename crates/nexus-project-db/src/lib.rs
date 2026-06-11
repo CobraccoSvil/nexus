@@ -103,6 +103,12 @@ impl MigrationTool {
         }
     }
 
+    // Inherent e non `impl FromStr` per scelta: ritorna Option (assenza =
+    // tool sconosciuto, non un errore) e i call site usano il turbofish
+    // `MigrationTool::from_str(..)` senza import del trait. Il lint
+    // should_implement_trait scatta solo ora che il modulo e' una lib
+    // (split 7.4): firma identica e comportamento invariato.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "alembic" => Some(MigrationTool::Alembic),

@@ -1,7 +1,7 @@
 //! `project_db_status` — stato del database e migration pending per un progetto utente.
 
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
-use crate::nexus_tools::db_helper::get_pool;
+use crate::db_helper::get_pool;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::Row;

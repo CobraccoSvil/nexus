@@ -3,7 +3,7 @@
 //! Scrive in `nexus_resource_audit` in batch async per non rallentare il path
 //! critico dei tool agente. Architettura:
 //!
-//! ```
+//! ```text
 //! tool_handler ──record(entry)──► mpsc::Sender (unbounded) ──► batch_writer_loop ──► INSERT INTO ... VALUES (...), (...), ...
 //!                                                              flush ogni 100 eventi o 5s
 //! ```

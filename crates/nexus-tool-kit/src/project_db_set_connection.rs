@@ -5,7 +5,7 @@
 //! tabelle Nexus direttamente.
 
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
-use crate::nexus_tools::db_helper::get_pool;
+use crate::db_helper::get_pool;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::Row;

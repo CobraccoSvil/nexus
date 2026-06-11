@@ -1,9 +1,9 @@
 //! `project_db_apply_migration` — applica le migration pending al DB del progetto utente.
 
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
-use crate::nexus_tools::db_helper::get_pool;
-use crate::project_db::exec::{open_pool, resolve_project_conn};
-use crate::project_db::{runner::MigrationRunner, MigrationTool, ProjectDbContext};
+use crate::db_helper::get_pool;
+use nexus_project_db::exec::{open_pool, resolve_project_conn};
+use nexus_project_db::{runner::MigrationRunner, MigrationTool, ProjectDbContext};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::Row;

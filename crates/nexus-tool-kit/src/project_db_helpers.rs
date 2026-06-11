@@ -8,7 +8,7 @@
 //!
 //! Ognuna era ~36 righe (cluster jscpd 58L+51L+34L). Ora vive qui una volta sola.
 
-use crate::nexus_tools::{db_helper, NexusToolError};
+use crate::{db_helper, NexusToolError};
 
 /// Risolve il DSN Postgres del progetto leggendolo da `project_database_config`.
 /// Ritorna l'errore se: il progetto non ha config, l'engine non e' 'postgres',

@@ -50,11 +50,11 @@ impl NexusToolHandler for DockerRunTool {
         // Best-effort: se il pool fallisce, salta il check (degrado graceful).
         if let Ok(nexus_pool) = super::db_helper::get_pool().await {
             if let Err(reason) =
-                crate::security::quotas::check_can_start_container(&nexus_pool, ctx.project_id)
+                crate::quotas::check_can_start_container(&nexus_pool, ctx.project_id)
                     .await
             {
-                crate::security::record_audit(
-                    crate::security::AuditEntry::blocked(
+                crate::audit::record_audit(
+                    crate::audit::AuditEntry::blocked(
                         ctx.project_id,
                         "container_create",
                         "container",
@@ -144,8 +144,8 @@ impl NexusToolHandler for DockerRunTool {
 
         if out.success() {
             let container_id = out.stdout.trim().to_string();
-            crate::security::record_audit(
-                crate::security::AuditEntry::allowed(
+            crate::audit::record_audit(
+                crate::audit::AuditEntry::allowed(
                     ctx.project_id,
                     "container_create",
                     "container",

@@ -106,9 +106,9 @@ assert_single "rust classify_text" 'pub fn classify_text' 'crates/mcp-core/src/p
 # assert_single "python chunker" 'def _?chunk_text' 'brain/utils/text_chunk.py' brain
 
 # Wave 4+5 (2026-06-11): punti unici del consolidamento E1-E6
-assert_single "walk FS nexus_tools" 'pub fn walk_project_files' 'crates/mcp-core/src/nexus_tools/fs_scan.rs' crates
-assert_single "catalog query Postgres" 'pub fn list_catalog_rows' 'crates/mcp-core/src/nexus_tools/db_helper.rs' crates
-assert_single "registrazione progetto" 'pub async fn register_project_records' 'crates/mcp-core/src/nexus_tools/project_register_common.rs' crates
+assert_single "walk FS nexus_tools" 'pub fn walk_project_files' 'crates/nexus-tool-kit/src/fs_scan.rs' crates
+assert_single "catalog query Postgres" 'pub fn list_catalog_rows' 'crates/nexus-tool-kit/src/db_helper.rs' crates
+assert_single "registrazione progetto" 'pub async fn register_project_records' 'crates/nexus-tool-kit/src/project_register_common.rs' crates
 assert_single "endpoint MCP server condivisi" 'pub async fn list_servers_core' 'crates/nexus-mcp-client/src/server_endpoints.rs' crates
 assert_single "coda generate provider OpenAI-compat" '^def build_generate_result' 'brain/providers/_response_parsers.py' brain
 

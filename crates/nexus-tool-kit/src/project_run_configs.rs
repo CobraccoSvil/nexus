@@ -1,7 +1,7 @@
 //! `project_run_configs` — configurazioni di esecuzione (comandi) disponibili per il progetto.
 
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
-use crate::nexus_tools::db_helper::get_pool;
+use crate::db_helper::get_pool;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::Row;
