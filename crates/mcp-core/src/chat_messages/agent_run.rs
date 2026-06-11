@@ -281,6 +281,25 @@ fn looks_like_textual_tool_call(s: &str) -> bool {
     )
 }
 
+/// True se il testo e' composto SOLO da blocchi `[Error: ...]` concatenati
+/// (formato fisso nostro: i provider impacchettano cosi' gli errori). Incidente
+/// run 2c6e41fb: final_answer = "[Error: An assistant message with][Error:
+/// Unexpected tool call id ...]..." — gli errori della cascade erano diventati
+/// la "risposta" di un run completed. Strutturale, zero semantica.
+fn is_only_provider_errors(s: &str) -> bool {
+    let mut rest = s.trim();
+    if !rest.starts_with("[Error:") {
+        return false;
+    }
+    while rest.starts_with("[Error:") {
+        match rest.find(']') {
+            Some(end) => rest = rest[end + 1..].trim_start(),
+            None => return false,
+        }
+    }
+    rest.trim().is_empty()
+}
+
 /// Messaggio finale GARANTITO (ADR 0025): la risposta reale + footer di recap se
 /// non menziona i file toccati; oppure, per un run hollow, il recap deterministico
 /// delle azioni o un placeholder esplicito. `None` solo se non c'e' nulla da dire
@@ -289,17 +308,20 @@ pub(crate) fn compose_turn_answer(
     result: &crate::agent_types::AgentRunResult,
 ) -> Option<String> {
     match result.final_answer.as_deref() {
-        // Tool call colata nel testo come "risposta": non e' una risposta.
-        // Recap deterministico delle azioni (o nota cooldown/placeholder).
-        Some(s) if looks_like_textual_tool_call(s) => build_action_recap(&result.steps)
-            .or_else(cooldown_exhaustion_note)
-            .or_else(|| {
-                Some(format!(
-                    "_(Il modello {} / {} ha chiuso con una tool call malformata nel \
-                     testo invece di una risposta. Riformula la richiesta.)_",
-                    result.provider, result.model
-                ))
-            }),
+        // Tool call colata nel testo o soli errori provider come "risposta":
+        // non e' una risposta. Recap deterministico (o nota cooldown/placeholder).
+        Some(s) if looks_like_textual_tool_call(s) || is_only_provider_errors(s) => {
+            build_action_recap(&result.steps)
+                .or_else(cooldown_exhaustion_note)
+                .or_else(|| {
+                    Some(format!(
+                        "_(Il modello {} / {} non ha prodotto una risposta valida \
+                         (output malformato o soli errori provider). Riformula la \
+                         richiesta.)_",
+                        result.provider, result.model
+                    ))
+                })
+        }
         Some(s) if !s.trim().is_empty() => {
             let mut a = s.to_string();
             if let Some(footer) = action_recap_footer(&a, &result.steps) {
@@ -3070,6 +3092,25 @@ mod tests_finalize_turn {
         let msg = compose_turn_answer(&r).expect("recap atteso");
         assert!(msg.contains("a.ts"), "deve usare il recap deterministico: {msg}");
         assert!(!msg.contains("bookingService"), "niente tool call nel testo: {msg}");
+    }
+
+    #[test]
+    fn soli_errori_provider_rilevati_e_sostituiti() {
+        // Caso reale run 2c6e41fb: final_answer = concatenazione di 422 Mistral.
+        let raw = "[Error: An assistant message with][Error: Unexpected tool call id FbW0bLZsv in tool results][Error: An assistant message with]";
+        assert!(super::is_only_provider_errors(raw));
+        // Risposte legittime (anche se citano errori) NON matchano.
+        assert!(!super::is_only_provider_errors("Il build fallisce con [Error: x]"));
+        assert!(!super::is_only_provider_errors("Il DB ha 6 tabelle."));
+        assert!(!super::is_only_provider_errors(""));
+        // compose: con step -> recap, non la concatenazione di errori.
+        let r = mk_result(
+            AgentRunStatus::Completed, vec![write_step()], Some(raw), false,
+            "", Some("fix"),
+        );
+        let msg = compose_turn_answer(&r).expect("recap atteso");
+        assert!(msg.contains("a.ts"), "recap deterministico atteso: {msg}");
+        assert!(!msg.contains("FbW0bLZsv"), "niente errori grezzi: {msg}");
     }
 
     #[test]

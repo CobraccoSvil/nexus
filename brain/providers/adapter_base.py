@@ -212,26 +212,59 @@ def _sanitize_tool_message_sequence(oai_messages: list[dict]) -> list[dict]:
         persistito ma i suoi ToolMessage si.
     Il drop e' loggato come WARNING con il tool_call_id, cosi' i casi non
     triviali sono visibili e si puo' risalire alla causa upstream."""
-    declared: set[str] = set()
+    # ADIACENZA per-blocco (incidente run 2c6e41fb, 422 Mistral "Unexpected tool
+    # call id ... in tool results" + "An assistant message with 'tool_calls'
+    # must be followed by ..."): il set GLOBALE degli id dichiarati non basta.
+    # I provider strict richiedono che (a) ogni tool message segua IMMEDIATAMENTE
+    # l'assistant che ha dichiarato quel tool_call_id (stesso blocco, prima del
+    # prossimo messaggio non-tool) e (b) ogni tool_call dell'assistant abbia il
+    # suo tool message. La compressione della history (rolling_summary/compress)
+    # spezza i blocchi nel mezzo producendo entrambe le violazioni. Qui:
+    #   - tool message fuori dal blocco corrente -> DROP (orfano);
+    #   - tool_call senza result a fine blocco -> tool result SINTETICO
+    #     ("non disponibile, troncato"): preserva il contenuto dell'assistant
+    #     mantenendo la sequenza valida.
     out: list[dict] = []
+    pending: set[str] = set()  # id del blocco assistant corrente non ancora consumati
     dropped = 0
+    synthesized = 0
+
+    def _flush_pending() -> None:
+        nonlocal synthesized
+        for tid in sorted(pending):
+            out.append({
+                "role": "tool",
+                "tool_call_id": tid,
+                "content": "[tool result non disponibile: troncato dalla compressione della history]",
+            })
+            synthesized += 1
+        pending.clear()
+
     for msg in oai_messages:
         role = msg.get("role")
+        if role == "tool":
+            tid = msg.get("tool_call_id")
+            if not tid or tid not in pending:
+                dropped += 1
+                continue
+            pending.discard(tid)
+            out.append(msg)
+            continue
+        # Messaggio non-tool: chiude il blocco corrente (sintetizza i mancanti).
+        _flush_pending()
         if role == "assistant":
             for tc in msg.get("tool_calls") or []:
                 tid = tc.get("id")
                 if tid:
-                    declared.add(tid)
-        elif role == "tool":
-            tid = msg.get("tool_call_id")
-            if not tid or tid not in declared:
-                dropped += 1
-                continue
+                    pending.add(tid)
         out.append(msg)
-    if dropped:
+    _flush_pending()
+
+    if dropped or synthesized:
         logger.warning(
-            "adapter sanitize: rimossi %d tool message orfani su %d totali",
-            dropped, len(oai_messages),
+            "adapter sanitize: %d tool message orfani rimossi, %d result sintetici "
+            "per tool_call senza esito (su %d msg totali)",
+            dropped, synthesized, len(oai_messages),
         )
     return out
 
