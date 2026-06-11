@@ -316,11 +316,10 @@ pub(crate) struct ProjectContext {
     pub(crate) details: UserProjectDetails,
 }
 
-#[derive(Debug, Default, Clone)]
-pub(crate) struct GitCommandOptions {
-    pub(crate) configs: Vec<(String, String)>,
-    pub(crate) env: Vec<(String, String)>,
-}
+// Punto unico esecuzione git: nexus_types::git_exec (regola L).
+pub(crate) use nexus_types::git_exec::{
+    run_git_command, run_git_command_with_options, GitCommandOptions,
+};
 
 #[derive(Debug)]
 pub(crate) struct GitRepoInfo {
@@ -524,42 +523,6 @@ pub(crate) fn resolve_workspace_target(
     })
 }
 
-pub(crate) async fn run_git_command_with_options(
-    root: &Path,
-    args: &[&str],
-    options: &GitCommandOptions,
-) -> Result<(String, String), anyhow::Error> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(root);
-
-    for (key, value) in &options.configs {
-        command.arg("-c").arg(format!("{key}={value}"));
-    }
-
-    command.args(args);
-
-    for (key, value) in &options.env {
-        command.env(key, value);
-    }
-
-    let output = command.output().await?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if output.status.success() {
-        Ok((stdout, stderr))
-    } else {
-        anyhow::bail!(stderr.trim().to_string())
-    }
-}
-
-pub(crate) async fn run_git_command(
-    root: &Path,
-    args: &[&str],
-) -> Result<(String, String), anyhow::Error> {
-    run_git_command_with_options(root, args, &GitCommandOptions::default()).await
-}
 
 pub(crate) async fn record_git_operation(
     db: &PgPool,

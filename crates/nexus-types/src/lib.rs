@@ -15,6 +15,7 @@ pub use fs_browse::{
 
 pub mod admin_dto;
 pub mod documents_dto;
+pub mod git_exec;
 pub mod long_running_dto;
 pub mod routing_client;
 pub mod settings_dto;

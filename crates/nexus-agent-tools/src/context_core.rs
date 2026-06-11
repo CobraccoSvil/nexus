@@ -9,10 +9,34 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::monitor::MonitorRegistry;
+
+/// Contratto di reindicizzazione vettoriale di un singolo file dopo una
+/// mutazione (commit, write). I tool estratti lo invocano senza conoscere
+/// l'implementazione (in mcp-core: `reindex_single_file` via NeuralCoreClient).
+/// Best-effort: gli errori sono assorbiti/loggati dall'implementazione.
+pub trait FileReindexer: std::fmt::Debug + Send + Sync {
+    fn reindex_file(
+        &self,
+        project_id: Uuid,
+        root: PathBuf,
+        file: PathBuf,
+    ) -> BoxFuture<'static, ()>;
+}
+
+/// Implementazione no-op per i test e per contesti senza indicizzazione.
+#[derive(Debug, Clone, Copy)]
+pub struct NoopReindexer;
+
+impl FileReindexer for NoopReindexer {
+    fn reindex_file(&self, _: Uuid, _: PathBuf, _: PathBuf) -> BoxFuture<'static, ()> {
+        Box::pin(async {})
+    }
+}
 
 /// Campi core del contesto tool, sufficienti per i tool estratti dal monolite.
 #[derive(Debug, Clone)]
@@ -41,4 +65,6 @@ pub struct ToolContextCore {
     pub project_channels: nexus_events::ProjectChannels,
     /// Registro monitor in-memory (per `dispatcher_update_monitor` tool).
     pub monitor_registry: MonitorRegistry,
+    /// Reindicizzazione vettoriale post-mutazione (vedi `FileReindexer`).
+    pub reindexer: Arc<dyn FileReindexer>,
 }

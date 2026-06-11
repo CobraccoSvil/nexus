@@ -302,6 +302,7 @@ mod tests {
                 monitor_registry: Arc::new(parking_lot::RwLock::new(
                     std::collections::HashMap::new(),
                 )),
+                reindexer: Arc::new(nexus_agent_tools::context_core::NoopReindexer),
             },
             playwright_channels: crate::playwright_live::new_channels(),
             neural: crate::orchestrator::NeuralCoreClient::disconnected_for_tests(),

@@ -30,7 +30,6 @@ pub(crate) mod command;
 pub(crate) mod context;
 pub(crate) mod dispatch;
 pub(crate) mod files;
-pub(crate) mod git;
 pub(crate) mod helpers;
 pub(crate) mod knowledge;
 pub(crate) mod port_scanner;
@@ -60,7 +59,7 @@ pub(crate) use sqlx::Row;
 pub(crate) use tokio::process::Command;
 pub(crate) use uuid::Uuid;
 
-pub(crate) use crate::projects::{resolve_relative_path, run_git_command};
+pub(crate) use crate::projects::resolve_relative_path;
 
 pub(crate) use helpers::{
     classify_command_error, extract_file_structure, format_process_output, is_protected_path,

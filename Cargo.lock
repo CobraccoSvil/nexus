@@ -2396,6 +2396,7 @@ dependencies = [
 name = "nexus-types"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "chrono",
  "nexus-auth",
@@ -2404,6 +2405,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tokio",
  "tracing",
  "uuid",
 ]

@@ -10,8 +10,14 @@
 //! al monolite.
 
 use std::ops::Deref;
+use std::path::PathBuf;
+use std::sync::Arc;
 
+use futures::future::BoxFuture;
+use nexus_agent_tools::context_core::FileReindexer;
 use nexus_agent_tools::ToolContextCore;
+use sqlx::PgPool;
+use uuid::Uuid;
 
 /// Contesto necessario all'esecuzione dei tool.
 #[derive(Debug, Clone)]
@@ -35,5 +41,29 @@ impl Deref for AgentToolContext {
 
     fn deref(&self) -> &Self::Target {
         &self.core
+    }
+}
+
+/// Implementazione mcp-core del contratto `FileReindexer`: delega al punto
+/// unico `crate::projects::reindex_single_file` (NeuralCoreClient + Qdrant).
+#[derive(Debug, Clone)]
+pub struct NeuralFileReindexer {
+    pub db: Arc<PgPool>,
+    pub neural: crate::orchestrator::NeuralCoreClient,
+}
+
+impl FileReindexer for NeuralFileReindexer {
+    fn reindex_file(
+        &self,
+        project_id: Uuid,
+        root: PathBuf,
+        file: PathBuf,
+    ) -> BoxFuture<'static, ()> {
+        let db = self.db.clone();
+        let neural = self.neural.clone();
+        Box::pin(async move {
+            let _ = crate::projects::reindex_single_file(&db, &neural, project_id, &root, &file)
+                .await;
+        })
     }
 }

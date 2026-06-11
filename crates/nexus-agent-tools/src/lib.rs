@@ -7,8 +7,9 @@
 //! senza dipendenze da mcp-core) + i tool che usano solo quei campi.
 //! Passo agent_tools-3: vision_tools (settings via punto unico nexus-auth)
 //! e figma_tools (path-safety via nexus_types::workspace_paths).
-//! Candidati successivi: git (richiede de-accoppiare reindex_single_file
-//! da NeuralCoreClient) e il pacchetto wiki (richiede de-axumizzazione).
+//! Passo agent_tools-4: git (esecutore in nexus_types::git_exec; reindex
+//! post-commit de-accoppiato via trait `FileReindexer` nel context core).
+//! Candidato successivo: il pacchetto wiki (richiede de-axumizzazione).
 
 pub mod archive_tools;
 pub mod attachment_inspector;
@@ -20,6 +21,7 @@ pub mod dev_diagnostics;
 pub mod dispatcher;
 pub mod document_tools;
 pub mod figma_tools;
+pub mod git;
 pub mod monitor;
 pub mod profile_tools;
 pub mod quality_tools;

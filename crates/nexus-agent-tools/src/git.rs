@@ -1,8 +1,11 @@
 //! Tool Git: status, stage, commit, push, pull.
 
-use super::*;
+use nexus_types::git_exec::run_git_command;
+use serde_json::Value;
 
-pub(super) async fn tool_git_status(ctx: &AgentToolContext) -> String {
+use super::ToolContextCore;
+
+pub async fn tool_git_status(ctx: &ToolContextCore) -> String {
     if !ctx.is_git_repo {
         return "Il progetto non e' un repository git.".to_string();
     }
@@ -18,7 +21,7 @@ pub(super) async fn tool_git_status(ctx: &AgentToolContext) -> String {
     }
 }
 
-pub(super) async fn tool_git_stage(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_git_stage(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.is_git_repo {
         return "Il progetto non e' un repository git.".to_string();
     }
@@ -44,7 +47,7 @@ pub(super) async fn tool_git_stage(ctx: &AgentToolContext, input: &Value) -> Str
     }
 }
 
-pub(super) async fn tool_git_commit(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_git_commit(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.is_git_repo {
         return "Il progetto non e' un repository git.".to_string();
     }
@@ -84,8 +87,8 @@ pub(super) async fn tool_git_commit(ctx: &AgentToolContext, input: &Value) -> St
                 );
             }
             // Re-indicizza i file modificati nel commit in background
-            let db_bg = ctx.db.clone();
-            let neural_bg = ctx.neural.clone();
+            // (contratto FileReindexer: l'impl mcp-core delega a reindex_single_file).
+            let reindexer = ctx.reindexer.clone();
             let project_id_bg = ctx.project_id;
             let root_bg = ctx.root_path.clone();
             tokio::spawn(async move {
@@ -99,14 +102,9 @@ pub(super) async fn tool_git_commit(ctx: &AgentToolContext, input: &Value) -> St
                     for line in diff_out.lines() {
                         let file_path = root_bg.join(line.trim());
                         if file_path.exists() {
-                            let _ = crate::projects::reindex_single_file(
-                                &db_bg,
-                                &neural_bg,
-                                project_id_bg,
-                                &root_bg,
-                                &file_path,
-                            )
-                            .await;
+                            reindexer
+                                .reindex_file(project_id_bg, root_bg.clone(), file_path)
+                                .await;
                         }
                     }
                 }
@@ -117,7 +115,7 @@ pub(super) async fn tool_git_commit(ctx: &AgentToolContext, input: &Value) -> St
     }
 }
 
-pub(super) async fn tool_git_push(ctx: &AgentToolContext) -> String {
+pub async fn tool_git_push(ctx: &ToolContextCore) -> String {
     if !ctx.is_git_repo {
         return "Il progetto non e' un repository git.".to_string();
     }
@@ -137,7 +135,7 @@ pub(super) async fn tool_git_push(ctx: &AgentToolContext) -> String {
     }
 }
 
-pub(super) async fn tool_git_pull(ctx: &AgentToolContext) -> String {
+pub async fn tool_git_pull(ctx: &ToolContextCore) -> String {
     if !ctx.is_git_repo {
         return "Il progetto non e' un repository git.".to_string();
     }
@@ -150,7 +148,7 @@ pub(super) async fn tool_git_pull(ctx: &AgentToolContext) -> String {
 /// Fix M16: configura un remote git (es. `origin`) puntando a un URL.
 /// Tool agente che evita all'agente di usare `run_command git remote add ...` shell.
 /// Input: `{name: string, url: string}` (default name = "origin")
-pub(super) async fn tool_git_remote_add(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_git_remote_add(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.is_git_repo {
         return "Il progetto non e' un repository git.".to_string();
     }

@@ -125,6 +125,10 @@ impl ToolRunnerService {
                 is_nexus_operator: matches!(info.user_role.as_str(), "owner" | "admin"),
                 project_channels: self.deps.project_channels.clone(),
                 monitor_registry: self.deps.monitor_registry.clone(),
+                reindexer: Arc::new(crate::agent_tools::context::NeuralFileReindexer {
+                    db: Arc::new(self.deps.db.clone()),
+                    neural: self.deps.neural.clone(),
+                }),
             },
             playwright_channels: self.deps.playwright_channels.clone(),
             neural: self.deps.neural.clone(),
