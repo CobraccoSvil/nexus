@@ -656,6 +656,18 @@ class GoogleProvider(BaseProvider):
                     "input_tokens": response.usage_metadata.prompt_token_count or 0,
                     "output_tokens": response.usage_metadata.candidates_token_count or 0,
                 }
+                # Telemetria implicit caching Gemini 2.5+ (P1): sconto ~75% sui
+                # token cached, prima invisibile al ledger. prompt_token_count
+                # INCLUDE i cached: la decurtazione avviene in _record_usage.
+                _cached = getattr(
+                    response.usage_metadata, "cached_content_token_count", None
+                )
+                if isinstance(_cached, int) and _cached > 0:
+                    usage_data["cache_read_input_tokens"] = _cached
+                    logger.info(
+                        "gemini cache hit: %d/%d token dall'implicit caching",
+                        _cached, usage_data["input_tokens"],
+                    )
 
             metadata = {
                 "stop_reason": stop_reason,

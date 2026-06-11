@@ -299,6 +299,19 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
                     "input_tokens": response.usage.prompt_tokens,
                     "output_tokens": response.usage.completion_tokens,
                 }
+                # Telemetria context caching DeepSeek (P1, roadmap contesto):
+                # il caching e' AUTOMATICO lato server (hit a ~1/10 del prezzo)
+                # ma questi campi non venivano letti -> ledger cieco che
+                # fatturava tutto a prezzo pieno. NB: prompt_tokens INCLUDE i
+                # cached; la decurtazione avviene nel punto unico _record_usage.
+                _hit = getattr(response.usage, "prompt_cache_hit_tokens", None)
+                _miss = getattr(response.usage, "prompt_cache_miss_tokens", None)
+                if isinstance(_hit, int) and _hit > 0:
+                    usage_data["cache_read_input_tokens"] = _hit
+                    logger.info(
+                        "deepseek cache hit: %d/%d token dal context caching (miss=%s)",
+                        _hit, response.usage.prompt_tokens, _miss,
+                    )
 
             return ProviderResult(
                 provider=self.name,

@@ -105,7 +105,6 @@ from .helpers import (
     _PRICE_CACHE,
     _PRICE_CACHE_TS,
     _PRICE_TTL_S,
-    _lookup_price,
     MAX_TOOL_RESULT_CHARS,
     MAX_CONTEXT_CHARS,
     _smart_truncate,
@@ -2719,22 +2718,15 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             # completion_tokens (OpenAI/Mistral/DeepSeek/Google). Prima leggeva
             # solo input_tokens -> token=0 nello stream per i provider
             # non-Anthropic, quindi la barra context live restava a 0.
-            from brain.providers.registry import extract_usage_tokens
-            prompt_tokens, completion_tokens, _total_norm, cache_creation_tokens, cache_read_tokens = (
-                extract_usage_tokens(meta.get("usage"))
+            # Costo dal punto unico compute_turn_cost (regola L, P1 roadmap):
+            # prezzi cache dal catalog (mig 0403) + decurtazione cached dai
+            # prompt_tokens per i provider che li includono. Prima qui c'erano
+            # moltiplicatori hardcoded 1.25x/0.1x divergenti dal ledger.
+            from brain.providers.registry import compute_turn_cost
+            prompt_tokens, completion_tokens, total_cost_usd = compute_turn_cost(
+                provider, model, meta.get("usage")
             )
             token_usage = prompt_tokens + completion_tokens
-
-            input_price, output_price = _lookup_price(provider, model)
-            if input_price > 0 or output_price > 0:
-                cache_write_price = input_price * 1.25
-                cache_read_price = input_price * 0.1
-                total_cost_usd = (
-                    (prompt_tokens * input_price) / 1_000_000.0 +
-                    (completion_tokens * output_price) / 1_000_000.0 +
-                    (cache_creation_tokens * cache_write_price) / 1_000_000.0 +
-                    (cache_read_tokens * cache_read_price) / 1_000_000.0
-                )
 
             # Preserviamo il content strutturato per il prossimo round.
             assistant_msg = AIMessage(
@@ -2763,21 +2755,12 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 provider, model, last_text
             )
             result_text = prov_result.content
-            # Punto unico di normalizzazione usage (regola L), come sopra.
-            from brain.providers.registry import extract_usage_tokens
-            prompt_tokens, completion_tokens, _total_norm, cache_creation_tokens, cache_read_tokens = (
-                extract_usage_tokens(prov_result.metadata.get("usage"))
+            # Costo dal punto unico compute_turn_cost (regola L, P1 roadmap).
+            from brain.providers.registry import compute_turn_cost
+            prompt_tokens, completion_tokens, total_cost_usd = compute_turn_cost(
+                provider, model, prov_result.metadata.get("usage")
             )
             token_usage = prompt_tokens + completion_tokens
-
-            input_price, output_price = _lookup_price(provider, model)
-            if input_price > 0 or output_price > 0:
-                cache_read_price = input_price * 0.1
-                total_cost_usd = (
-                    (prompt_tokens * input_price) / 1_000_000.0 +
-                    (completion_tokens * output_price) / 1_000_000.0 +
-                    (cache_read_tokens * cache_read_price) / 1_000_000.0
-                )
         except Exception as exc:
             logger.error("executor_node: completion %s/%s: %s", provider, model, exc)
             result_text = f"[Errore provider {provider}: {exc}]"

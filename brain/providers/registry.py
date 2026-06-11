@@ -208,6 +208,32 @@ def inject_fallback_directive(messages: list, directive: str) -> list:
     return list(messages) + [{"role": "user", "content": directive}]
 
 
+def compute_turn_cost(provider: str, model: str, usage: Any) -> tuple[int, int, float]:
+    """Punto unico (regola L) del costo di un turno: normalizza la usage,
+    decurta i token cached da prompt_tokens per i provider che li includono
+    (tutti tranne anthropic) e applica i prezzi del catalog INCLUSI quelli
+    cache (mig 0403). Prima l'executor usava moltiplicatori HARDCODED
+    1.25x/0.1x sul prezzo input, divergendo dal ledger.
+
+    Ritorna (prompt_tokens_normalizzati, completion_tokens, costo_usd).
+    """
+    prompt_tokens, completion_tokens, _tot, cache_creation, cache_read = (
+        extract_usage_tokens(usage)
+    )
+    if cache_read > 0 and provider != "anthropic":
+        prompt_tokens = max(0, prompt_tokens - cache_read)
+    in_m, out_m, cache_read_m, cache_creation_m, _cur = _lookup_price_any_currency(
+        provider, model
+    )
+    cost = (
+        (prompt_tokens / 1_000_000.0) * in_m
+        + (completion_tokens / 1_000_000.0) * out_m
+        + (cache_read / 1_000_000.0) * cache_read_m
+        + (cache_creation / 1_000_000.0) * cache_creation_m
+    )
+    return prompt_tokens, completion_tokens, cost
+
+
 def get_billing_cooldown_snapshot() -> dict[str, int]:
     """Restituisce {provider: secondi_rimanenti} per i provider in cooldown.
 
@@ -478,6 +504,14 @@ def _record_usage(provider: str, model: str, usage: dict[str, Any] | None, detai
     prompt_tokens, completion_tokens, total_tokens, cache_creation_tokens, cache_read_tokens = (
         extract_usage_tokens(usage)
     )
+
+    # Fix double-counting (P1 roadmap contesto): per i provider OpenAI-compat
+    # (openai/deepseek/google) prompt_tokens INCLUDE i token serviti dalla cache;
+    # senza decurtazione, valorizzare i prezzi cache nel catalog farebbe pagare
+    # quei token DUE volte (prezzo pieno + prezzo cache). Anthropic invece
+    # esclude gia' i cache token da input_tokens: nessuna decurtazione.
+    if cache_read_tokens > 0 and provider != "anthropic":
+        prompt_tokens = max(0, prompt_tokens - cache_read_tokens)
 
     in_cost_m, out_cost_m, cache_read_m, cache_creation_m, currency = _lookup_price_any_currency(provider, model)
     input_cost = (prompt_tokens / 1_000_000.0) * in_cost_m
