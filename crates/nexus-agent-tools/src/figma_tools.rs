@@ -29,16 +29,16 @@ use uuid::Uuid;
 
 use super::attachment_inspector::load_attachment;
 use super::attachment_settings::{self, AttachmentLimits};
-use super::AgentToolContext;
-use crate::projects::resolve_workspace_target;
+use super::ToolContextCore;
+use nexus_types::workspace_paths::resolve_workspace_target;
 
 /// Lunghezza minima di una stringa leggibile considerata "interessante"
 /// nel fallback `figma_binary_legacy`.
 const MIN_STRING_LEN: usize = 4;
 
 /// `nexus_extract_figma_structure(attachment_id)`.
-pub(super) async fn tool_nexus_extract_figma_structure(
-    ctx: &AgentToolContext,
+pub async fn tool_nexus_extract_figma_structure(
+    ctx: &ToolContextCore,
     input: &Value,
 ) -> String {
     let attachment_id = match input
@@ -78,7 +78,7 @@ const DEFAULT_FIGMA_EXPORT_SUBDIR: &str = "figma_export";
 /// Estrae il code-snapshot finale dal .make e lo scrive su disco sotto la
 /// project_root (default `figma_export/`). Ritorna SOLO un manifest JSON con
 /// metadati: niente contenuto file, per non saturare il contesto del modello.
-pub(super) async fn tool_nexus_extract_figma_code(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_nexus_extract_figma_code(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.can_write {
         return json!({
             "error": "Permesso di scrittura non concesso su questo progetto: \

@@ -29,7 +29,6 @@ pub use nexus_agent_tools::*;
 pub(crate) mod command;
 pub(crate) mod context;
 pub(crate) mod dispatch;
-pub(crate) mod figma_tools;
 pub(crate) mod files;
 pub(crate) mod git;
 pub(crate) mod helpers;
@@ -42,7 +41,6 @@ pub(crate) mod sandbox;
 pub(crate) mod semantic_tools;
 pub(crate) mod service;
 pub(crate) mod testing;
-pub(crate) mod vision_tools;
 pub(crate) mod visual_compare;
 
 // ── API pubblica del package (call site esterni: invariata) ─────────────────

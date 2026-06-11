@@ -402,9 +402,8 @@ pub(crate) fn terminal_consumer_key(user_id: Uuid, project_id: Uuid) -> String {
     format!("{user_id}:{project_id}")
 }
 
-pub(crate) fn path_within(base: &Path, candidate: &Path) -> bool {
-    candidate.starts_with(base)
-}
+// Punto unico path-safety workspace: nexus_types::workspace_paths (regola L).
+pub(crate) use nexus_types::workspace_paths::path_within;
 
 pub(crate) fn to_relative(root: &Path, target: &Path) -> String {
     target
@@ -507,33 +506,22 @@ pub(crate) fn resolve_relative_path(root: &Path, relative: &str) -> Result<PathB
     Ok(canonical)
 }
 
+/// Adapter HTTP del punto unico `nexus_types::workspace_paths` (regola L):
+/// stessa logica, errore neutro mappato su StatusCode per i call site axum.
 pub(crate) fn resolve_workspace_target(
     root: &Path,
     relative: &str,
 ) -> Result<(String, PathBuf), ApiError> {
-    let clean = relative
-        .trim()
-        .trim_start_matches(['\\', '/'])
-        .replace('\\', "/");
-    if clean.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Il percorso relativo e' obbligatorio",
-        ));
-    }
-    if clean.contains('\0') {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "Il percorso contiene caratteri non validi",
-        ));
-    }
-
-    let candidate = root.join(&clean);
-    if !path_within(root, &candidate) {
-        return Err(api_error(StatusCode::FORBIDDEN, "Percorso non autorizzato"));
-    }
-
-    Ok((clean, candidate))
+    use nexus_types::workspace_paths::WorkspaceTargetError;
+    nexus_types::workspace_paths::resolve_workspace_target(root, relative).map_err(|e| {
+        let status = match e {
+            WorkspaceTargetError::OutsideRoot => StatusCode::FORBIDDEN,
+            WorkspaceTargetError::EmptyPath | WorkspaceTargetError::InvalidChars => {
+                StatusCode::BAD_REQUEST
+            }
+        };
+        api_error(status, e.message())
+    })
 }
 
 pub(crate) async fn run_git_command_with_options(

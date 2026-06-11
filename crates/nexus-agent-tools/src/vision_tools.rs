@@ -23,16 +23,16 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::attachment_inspector::{detect_kind, load_attachment, read_header};
-use super::AgentToolContext;
-use crate::settings;
+use super::ToolContextCore;
+use nexus_auth::get_setting_checked;
 
 /// Timeout HTTP verso il brain. Vision puo' essere lento (cold start, immagini grandi).
 const VISION_HTTP_TIMEOUT_SECS: u64 = 60;
 /// Default safe se il setting agent.attachment.image_max_bytes non e' impostato.
 const IMAGE_MAX_BYTES_DEFAULT: usize = 2 * 1024 * 1024;
 
-pub(super) async fn tool_nexus_describe_image_attachment(
-    ctx: &AgentToolContext,
+pub async fn tool_nexus_describe_image_attachment(
+    ctx: &ToolContextCore,
     input: &Value,
 ) -> String {
     let attachment_id = match input
@@ -167,7 +167,7 @@ fn is_image_kind(kind: &str) -> bool {
 /// Legge agent.attachment.image_max_bytes da settings. Se mancante o DB
 /// down, ritorna il default safe documentato (2 MB) e logga WARN.
 async fn image_max_bytes(db: &sqlx::PgPool) -> usize {
-    match settings::get_setting(db, "agent.attachment.image_max_bytes").await {
+    match get_setting_checked(db, "agent.attachment.image_max_bytes").await {
         Ok(Some(raw)) => match raw.trim().parse::<usize>() {
             Ok(v) if v > 0 => v,
             _ => {
@@ -190,7 +190,7 @@ async fn image_max_bytes(db: &sqlx::PgPool) -> usize {
 /// Resolve URL brain: prima settings.brain_rest_url, poi env var, poi default
 /// locale. Coerente con brain_agent_client::brain_rest_url ma con accesso al DB.
 async fn resolve_brain_url(db: &sqlx::PgPool) -> String {
-    if let Ok(Some(v)) = settings::get_setting(db, "brain_rest_url").await {
+    if let Ok(Some(v)) = get_setting_checked(db, "brain_rest_url").await {
         let trimmed = v.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();

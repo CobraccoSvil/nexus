@@ -9,7 +9,9 @@ infer = "0.16"
 lru = "0.12"
 mcp-db = { path = "../mcp-db" }
 mcp-quality = { path = "../mcp-quality" }
+nexus-auth = { path = "../nexus-auth" }
 nexus-events = { path = "../nexus-events" }
+nexus-types = { path = "../nexus-types" }
 parking_lot = "0.12"
 pdf-extract = "0.7"
 quick-xml = "0.36"
