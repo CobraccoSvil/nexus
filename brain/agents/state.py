@@ -70,6 +70,15 @@ class AgentState(TypedDict, total=False):
     # True se una dichiarazione blocked e' gia' stata rifiutata perche' l'unico
     # blocco del turno era il predictive context cap (guard una-tantum).
     blocked_cap_rejected: bool
+    # P3 prefix stabile: tool M16 scoperti PERSISTENTI per il run (accumulo
+    # dedup per nome). Evita che tools_json cambi forma tra le iterazioni
+    # invalidando il KV-cache dei provider.
+    discovered_tools_run: list[dict] | None
+    # P3: indice di taglio della compressione "a generazioni" — fissato al
+    # cambio di fase; tra un boundary e l'altro si comprimono SOLO i messaggi
+    # sotto questo indice (prefix byte-identico tra le iterazioni della fase).
+    compress_cutoff_index: int
+    compress_cutoff_phase: int
     task_type: str
     behavior_mode: str
     token_budget: int

@@ -1105,34 +1105,47 @@ def _compress_old_tool_results(
     messages: list[Any],
     keep_recent: int = 6,
     max_content_chars: int = 500,
+    cutoff_index: int | None = None,
 ) -> list[Any]:
     """Comprime i tool_result dei messaggi piu' vecchi per ridurre il contesto.
 
-    Mantiene intatti gli ultimi `keep_recent` messaggi. Per i precedenti,
-    i blocchi tool_result con contenuto > `max_content_chars` char vengono
-    sostituiti con un riassunto troncato.
+    Due modalita':
+    - LEGACY (cutoff_index=None): boundary mobile = len(messages)-keep_recent,
+      con dedup preliminare su tutta la history. Riscrive la vista a OGNI
+      iterazione (KV-cache dei provider invalidato).
+    - A GENERAZIONI (P3, cutoff_index assoluto): comprime SOLO i messaggi con
+      indice < cutoff_index (fissato al cambio di fase dall'executor) e NIENTE
+      dedup retroattivo. Tra un boundary di fase e l'altro l'input della parte
+      compressa e' identico -> output identico -> prefix byte-stabile, e i
+      messaggi nuovi vengono solo APPESI (cacheabili dal provider).
 
-    `max_content_chars` e' configurabile: nelle fasi di loop avanzato
-    (iterazioni alte) l'executor passa un valore piu' basso (es. 150)
-    per una compressione piu' aggressiva.
-
-    Prima della compressione applica _dedup_tool_results: spesso la stessa
-    risorsa viene letta piu' volte e il dedup risparmia tokens senza
-    perdere informazione (l'ultima copia e' preservata).
+    `max_content_chars` e' configurabile per fase (DB-driven, mig 0199).
     """
-    # Step 0: dedup duplicati su tutta la history (anche keep_recent benefici).
-    messages = _dedup_tool_results(messages)
-    if len(messages) <= keep_recent:
-        return messages
+    if cutoff_index is None:
+        # Step 0 (solo legacy): dedup duplicati su tutta la history.
+        messages = _dedup_tool_results(messages)
+        if len(messages) <= keep_recent:
+            return messages
+        boundary = len(messages) - keep_recent
+    else:
+        boundary = max(0, min(cutoff_index, len(messages)))
+        if boundary == 0:
+            return messages
 
     compressed = []
-    boundary = len(messages) - keep_recent
     # La finestra "recente" usa una soglia piu' permissiva: 2× max_content_chars.
     recent_threshold = max_content_chars * 2
 
     for i, m in enumerate(messages):
         if i >= boundary:
-            # Anche i messaggi recenti vengono compressi, ma con soglia piu' alta.
+            # Modalita' a generazioni (P3): i messaggi oltre il cutoff restano
+            # INTATTI (qualsiasi riscrittura dei recenti invaliderebbe la cache;
+            # il loro turno arriva al prossimo cambio di fase). Il troncamento
+            # all'inserimento (MAX_TOOL_RESULT_CHARS=6000) resta il cap.
+            if cutoff_index is not None:
+                compressed.append(m)
+                continue
+            # Legacy: anche i recenti vengono compressi, con soglia piu' alta.
             extra = getattr(m, "additional_kwargs", {}) or {}
             blocks = extra.get("anthropic_content")
             if blocks is None or not isinstance(blocks, list):
@@ -1513,12 +1526,18 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             "iterations": int(state.get("iterations") or 0) + 1,
         }
 
-    # ── M16: merge tool scoperti (discovery-first) per QUESTO turno ───────────
-    # Il turno precedente ha eseguito nexus_mcp_tool_search; tool_dispatch_node
-    # ha estratto i tool trovati in `discovered_tools_next_turn`. Qui li
-    # iniettiamo come native nel tools_json (dedup per nome, cap DB-driven).
-    # Durata 1 turno: il prossimo tool_dispatch riscrive [] se non c'e' search.
-    _discovered = state.get("discovered_tools_next_turn") or []
+    # ── M16: merge tool scoperti (discovery-first) ───────────────────────────
+    # P3 (prefix stabile): i tool scoperti sono PERSISTENTI per il run
+    # (discovered_tools_run, accumulativa nel dispatch). Prima avevano "durata
+    # 1 turno" (discovered_tools_next_turn azzerata a ogni dispatch senza
+    # search): il tools_json cambiava forma tra iterazioni e, siccome i tool
+    # precedono il system nel prompt dei provider, OGNI variazione invalidava
+    # l'intero KV-cache. Un tool scoperto resta disponibile fino a fine run.
+    _discovered = (
+        state.get("discovered_tools_run")
+        or state.get("discovered_tools_next_turn")
+        or []
+    )
     if _discovered and tools_json:
         try:
             from brain.utils.settings_db import get_int_setting
@@ -2384,6 +2403,8 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         # Tutto in cache 60s via _load_ctx_mgmt_config().
         _ctx_cfg = _load_ctx_mgmt_config()
         _compress_iter = _current_iterations
+        # P3: updates di generazione (cutoff fisso) da persistere nel return.
+        _gen_cutoff_updates: dict[str, int] = {}
 
         # ── Continuity gate semantico (mig 0397) ─────────────────────────────
         # SOLO al primo turno del run: se la richiesta corrente non e'
@@ -2412,46 +2433,57 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             except Exception as _cont_exc:
                 logger.debug("continuity_gate skip (%s)", _cont_exc)
 
-        # FIX B: dedup tool_result identici per signature.
-        if _ctx_cfg.get("dedup_tool_results_enabled", True):
-            _pre_dedup_size = ctx_size
-            messages = _dedup_tool_results_history(messages)
-            _post_dedup = _estimate_context_chars(messages)
-            if _post_dedup != _pre_dedup_size:
-                logger.info(
-                    "executor_node: FIX B dedup signature iter=%d: %d -> %d char",
-                    _compress_iter, _pre_dedup_size, _post_dedup,
-                )
-                ctx_size = _post_dedup
-
-        # FIX C: drop base64 vecchi non citati.
-        _pre_drop = ctx_size
-        messages = _drop_unused_base64_payloads(messages)
-        _post_drop = _estimate_context_chars(messages)
-        if _post_drop != _pre_drop:
-            logger.info(
-                "executor_node: FIX C drop base64 iter=%d: %d -> %d char",
-                _compress_iter, _pre_drop, _post_drop,
-            )
-            ctx_size = _post_drop
-
-        # FIX A: compressione escalante anticipata.
+        # ── Compressione "A GENERAZIONI" (P3, prefix stabile per KV-cache) ───
+        # Prima: dedup + drop base64 + compressione con boundary MOBILE
+        # (len-keep_recent) + rolling summary giravano a OGNI iterazione,
+        # riscrivendo la history e invalidando il caching del provider a ogni
+        # giro (DeepSeek/OpenAI/Gemini hanno caching AUTOMATICO ma non scattava
+        # mai). Ora le trasformazioni RETROATTIVE (dedup, drop base64, rolling)
+        # avvengono SOLO ai cambi di fase (boundary 5/10/20/50, DB-driven) e il
+        # cutoff di compressione e' un INDICE FISSO persistito nello state: tra
+        # un boundary e l'altro la parte compressa e' byte-identica e i nuovi
+        # messaggi vengono solo APPESI -> il prefix resta cacheabile. Si
+        # accettano ~4 invalidazioni per run invece di una per iterazione.
+        _boundaries = [
+            int(b) for b in (_ctx_cfg.get("compress_phase_boundaries") or [5, 10, 20, 50])
+        ]
+        _phase_now = sum(1 for b in _boundaries if _compress_iter >= b)
+        _prev_phase = int(state.get("compress_cutoff_phase") or 0)
+        _cutoff_idx = int(state.get("compress_cutoff_index") or 0)
         _compress, _params = _should_compress_now(_compress_iter, _ctx_cfg)
-        if _compress:
-            messages = _compress_old_tool_results(
-                messages,
-                keep_recent=_params["keep_recent"],
-                max_content_chars=_params["max_content_chars"],
-            )
+
+        if _phase_now > _prev_phase:
+            # CAMBIO DI FASE: qui (e solo qui) le trasformazioni retroattive.
+            if _ctx_cfg.get("dedup_tool_results_enabled", True):
+                messages = _dedup_tool_results_history(messages)
+            messages = _drop_unused_base64_payloads(messages)
+            try:
+                messages = _apply_rolling_summary(
+                    messages, _current_iterations, _embeddings
+                )
+            except Exception as _roll_exc:
+                logger.warning("rolling_summary best-effort fallita: %s", _roll_exc)
+            _cutoff_idx = max(0, len(messages) - int(_params.get("keep_recent", 6)))
+            _gen_cutoff_updates["compress_cutoff_index"] = _cutoff_idx
+            _gen_cutoff_updates["compress_cutoff_phase"] = _phase_now
             new_size = _estimate_context_chars(messages)
             logger.info(
-                "executor_node: FIX A compressione iter=%d keep_recent=%d "
-                "max_content_chars=%d: %d -> %d char",
-                _compress_iter, _params["keep_recent"], _params["max_content_chars"],
+                "executor_node: GENERAZIONE fase %d->%d iter=%d (dedup+rolling, "
+                "cutoff=%d): %d -> %d char — prefix stabile fino al prossimo boundary",
+                _prev_phase, _phase_now, _compress_iter, _cutoff_idx,
                 ctx_size, new_size,
             )
             ctx_size = new_size
-        elif ctx_size > MAX_CONTEXT_CHARS // 2:
+
+        if _compress and _cutoff_idx > 0:
+            # Compressione DETERMINISTICA sulla sola parte sotto il cutoff fisso.
+            messages = _compress_old_tool_results(
+                messages,
+                max_content_chars=_params["max_content_chars"],
+                cutoff_index=_cutoff_idx,
+            )
+            ctx_size = _estimate_context_chars(messages)
+        elif not _compress and ctx_size > MAX_CONTEXT_CHARS // 2:
             # Safety net storica: contesto >50% MAX anche pre-iter=start.
             messages = _compress_old_tool_results(messages, keep_recent=6)
             new_size = _estimate_context_chars(messages)
@@ -2459,15 +2491,6 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 "executor_node: contesto compresso (safety net) %d -> %d char",
                 ctx_size, new_size,
             )
-        # ── ADR 0016 Fase A.3: rolling summary cross-turno ───────────────────
-        # Ogni N turni offloada i messaggi vecchi in Qdrant chat_history_rolling
-        # e li sostituisce con un summary compatto. Originali retrievabili via
-        # nexus_search_semantic(source_kinds=chat_history). Best-effort: se
-        # offload fallisce, no compressione (degrada ai brake successivi).
-        try:
-            messages = _apply_rolling_summary(messages, _current_iterations, _embeddings)
-        except Exception as _roll_exc:
-            logger.warning("rolling_summary best-effort fallita: %s", _roll_exc)
 
         # ── ADR 0016 Fase C: smart upscale modello ───────────────────────────
         # Se il context stimato supera il window del modello attivo, escalation
@@ -2723,9 +2746,10 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             # prompt_tokens per i provider che li includono. Prima qui c'erano
             # moltiplicatori hardcoded 1.25x/0.1x divergenti dal ledger.
             from brain.providers.registry import compute_turn_cost
-            prompt_tokens, completion_tokens, total_cost_usd = compute_turn_cost(
-                provider, model, meta.get("usage")
-            )
+            (
+                prompt_tokens, completion_tokens,
+                cache_creation_tokens, cache_read_tokens, total_cost_usd,
+            ) = compute_turn_cost(provider, model, meta.get("usage"))
             token_usage = prompt_tokens + completion_tokens
 
             # Preserviamo il content strutturato per il prossimo round.
@@ -2757,9 +2781,10 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
             result_text = prov_result.content
             # Costo dal punto unico compute_turn_cost (regola L, P1 roadmap).
             from brain.providers.registry import compute_turn_cost
-            prompt_tokens, completion_tokens, total_cost_usd = compute_turn_cost(
-                provider, model, prov_result.metadata.get("usage")
-            )
+            (
+                prompt_tokens, completion_tokens,
+                cache_creation_tokens, cache_read_tokens, total_cost_usd,
+            ) = compute_turn_cost(provider, model, prov_result.metadata.get("usage"))
             token_usage = prompt_tokens + completion_tokens
         except Exception as exc:
             logger.error("executor_node: completion %s/%s: %s", provider, model, exc)
@@ -3050,6 +3075,8 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 )
 
     return {
+        # P3: cutoff di generazione persistito (vuoto se la fase non e' cambiata).
+        **(_gen_cutoff_updates if isinstance(locals().get("_gen_cutoff_updates"), dict) else {}),
         "messages": [assistant_msg],
         "result": result_text,
         "provider_used": provider,
@@ -3684,6 +3711,19 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
         # M16: durata 1 turno (overwrite reducer). [] azzera i discovered precedenti.
         "discovered_tools_next_turn": _discovered_next,
     }
+    # P3 (prefix stabile): accumulo PERSISTENTE per il run dei tool scoperti
+    # (dedup per nome, l'ultimo schema vince). L'executor inietta da questa
+    # chiave, cosi' il tools_json non cambia piu' forma tra le iterazioni.
+    if _discovered_next:
+        _run_tools = {
+            t.get("name"): t
+            for t in (state.get("discovered_tools_run") or [])
+            if isinstance(t, dict) and t.get("name")
+        }
+        for _t in _discovered_next:
+            if isinstance(_t, dict) and _t.get("name"):
+                _run_tools[_t["name"]] = _t
+        _dispatch_updates["discovered_tools_run"] = list(_run_tools.values())
     # WAVE 3: esito dichiarato dal modello in questo turno (task_complete).
     # L'ultimo prevale se piu' chiamate. Consumato da route_after_executor.
     if _declared_outcomes:

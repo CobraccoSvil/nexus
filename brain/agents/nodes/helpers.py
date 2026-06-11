@@ -694,37 +694,32 @@ def _inject_forced_rag_reminder(
     if est_tokens < threshold:
         return messages, system_text
 
-    base_system = system_text or ""
-    if _RAG_REMINDER_MARKER not in base_system:
-        rag_block = f"### RECUPERO ON-DEMAND DEL CONTESTO ###\n{reminder_text}"
-        new_system = (
-            f"{_RAG_REMINDER_MARKER}\n{rag_block}\n\n{base_system}\n\n{rag_block}"
-        )
-    else:
-        new_system = system_text
-
-    new_messages = messages
-    for idx in range(len(messages) - 1, -1, -1):
-        msg = messages[idx]
-        if not isinstance(msg, HumanMessage):
-            continue
+    # P3 (prefix stabile per KV-cache): il reminder NON tocca piu' il system
+    # (prima veniva PREPESO in testa -> il primo byte del prompt cambiava a
+    # meta' run e invalidava il caching di TUTTI i provider) e NON modifica
+    # messaggi esistenti (l'append sull'ultimo HumanMessage "si spostava" coi
+    # nudge -> divergenza nel mezzo del prefix). Ora: APPEND-ONLY di un
+    # HumanMessage dedicato in coda, una sola volta (idempotente sul marker
+    # negli ultimi 8 messaggi: oltre, il reminder puo' legittimamente essere
+    # ri-emesso perche' ormai lontano dalla finestra di attenzione).
+    for msg in messages[-8:]:
         content = getattr(msg, "content", None)
-        if not isinstance(content, str):
-            break
-        if _RAG_REMINDER_MARKER in content:
-            break
-        # Crea copia (no mutate sullo stato condiviso).
-        appended = f"{content}\n\n{_RAG_REMINDER_MARKER} {reminder_text}"
-        new_msg = HumanMessage(content=appended)
-        new_messages = list(messages)
-        new_messages[idx] = new_msg
-        break
+        if isinstance(content, str) and _RAG_REMINDER_MARKER in content:
+            return messages, system_text
 
+    reminder_msg = HumanMessage(
+        content=(
+            f"{_RAG_REMINDER_MARKER} ### RECUPERO ON-DEMAND DEL CONTESTO ###\n"
+            f"{reminder_text}"
+        )
+    )
+    new_messages = list(messages) + [reminder_msg]
     logger.info(
-        "forced_rag_reminder: iniettato (est_tokens=%d window=%d threshold=%d ratio=%.2f)",
+        "forced_rag_reminder: appeso in coda (est_tokens=%d window=%d "
+        "threshold=%d ratio=%.2f, system INTATTO)",
         est_tokens, window, threshold, ratio,
     )
-    return new_messages, new_system
+    return new_messages, system_text
 
 
 def _load_language_reminder() -> tuple[bool, str]:
@@ -808,27 +803,13 @@ def _inject_language_reminder(
     else:
         new_system = system_text
 
-    # Punto 2: recency sull'ultimo HumanMessage con content stringa.
-    new_messages = messages
-    for idx in range(len(messages) - 1, -1, -1):
-        msg = messages[idx]
-        if not isinstance(msg, HumanMessage):
-            continue
-        content = getattr(msg, "content", None)
-        if not isinstance(content, str):
-            # Ultimo HumanMessage ha content non-stringa (lista blocchi):
-            # salta il punto 2, il punto 1 copre comunque.
-            break
-        if reminder_text in content:
-            # Gia' presente: idempotenza, niente riappensione.
-            break
-        new_content = f"{content}\n\n{reminder_text}"
-        new_msg = msg.model_copy(update={"content": new_content})
-        new_messages = list(messages)
-        new_messages[idx] = new_msg
-        break
-
-    return new_messages, new_system
+    # P3 (prefix stabile): il vecchio "punto 2" appendeva il reminder al
+    # content dell'ULTIMO HumanMessage — ma l'ultimo cambia a ogni iterazione
+    # (nudge, tool result), quindi il reminder "migrava" mutando messaggi nel
+    # MEZZO del prefix e invalidando il KV-cache dei provider a ogni giro.
+    # Rimosso: il recency e' garantito dal punto 1, che mette il blocco lingua
+    # sia in TESTA sia in CODA al system (deterministico tra iterazioni).
+    return messages, new_system
 
 
 def estimate_prompt_complexity(prompt: str, config: dict[str, Any] | None = None) -> int:

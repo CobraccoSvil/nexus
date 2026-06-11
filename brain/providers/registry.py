@@ -208,14 +208,17 @@ def inject_fallback_directive(messages: list, directive: str) -> list:
     return list(messages) + [{"role": "user", "content": directive}]
 
 
-def compute_turn_cost(provider: str, model: str, usage: Any) -> tuple[int, int, float]:
+def compute_turn_cost(
+    provider: str, model: str, usage: Any
+) -> tuple[int, int, int, int, float]:
     """Punto unico (regola L) del costo di un turno: normalizza la usage,
     decurta i token cached da prompt_tokens per i provider che li includono
     (tutti tranne anthropic) e applica i prezzi del catalog INCLUSI quelli
     cache (mig 0403). Prima l'executor usava moltiplicatori HARDCODED
     1.25x/0.1x sul prezzo input, divergendo dal ledger.
 
-    Ritorna (prompt_tokens_normalizzati, completion_tokens, costo_usd).
+    Ritorna (prompt_tokens_normalizzati, completion_tokens,
+             cache_creation_tokens, cache_read_tokens, costo_usd).
     """
     prompt_tokens, completion_tokens, _tot, cache_creation, cache_read = (
         extract_usage_tokens(usage)
@@ -231,7 +234,7 @@ def compute_turn_cost(provider: str, model: str, usage: Any) -> tuple[int, int, 
         + (cache_read / 1_000_000.0) * cache_read_m
         + (cache_creation / 1_000_000.0) * cache_creation_m
     )
-    return prompt_tokens, completion_tokens, cost
+    return prompt_tokens, completion_tokens, cache_creation, cache_read, cost
 
 
 def get_billing_cooldown_snapshot() -> dict[str, int]:
