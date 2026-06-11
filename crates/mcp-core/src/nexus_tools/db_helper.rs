@@ -8,9 +8,249 @@
 //!     Err(msg) => return Ok(serde_json::json!({"ok": false, "error": msg})),
 //! };
 //! ```
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use serde_json::{json, Value};
+use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
+use sqlx::Row;
 
 use super::{NexusToolContext, NexusToolError};
+
+/// Estrae l'argomento `schema` (default `public`) dagli args JSON dei tool
+/// db_*. Punto unico (regola L) per db_table_list / db_view_list / ecc.
+pub fn schema_arg(args: &Value) -> String {
+    args.get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("public")
+        .to_string()
+}
+
+/// Estrae l'argomento `limit` con default e clamp [1, max]. Punto unico per
+/// db_bloat_check / db_dead_tuples e tool simili.
+pub fn limit_arg(args: &Value, default: i64, max: i64) -> i64 {
+    args.get("limit")
+        .and_then(Value::as_i64)
+        .unwrap_or(default)
+        .clamp(1, max)
+}
+
+/// Valore da bindare come unico parametro `$1` nelle query di catalogo.
+pub enum CatalogBind {
+    Text(String),
+    Int(i64),
+}
+
+/// Tipo SQL della colonna proiettata da `list_catalog_rows`.
+pub enum CatalogColKind {
+    Text,
+    TextOpt,
+    Int,
+    Float,
+}
+
+/// Proiezione `colonna SQL -> chiave JSON` per `list_catalog_rows`.
+pub struct CatalogCol {
+    pub col: &'static str,
+    pub key: &'static str,
+    pub kind: CatalogColKind,
+}
+
+impl CatalogCol {
+    pub const fn text(col: &'static str, key: &'static str) -> Self {
+        Self {
+            col,
+            key,
+            kind: CatalogColKind::Text,
+        }
+    }
+    pub const fn text_opt(col: &'static str, key: &'static str) -> Self {
+        Self {
+            col,
+            key,
+            kind: CatalogColKind::TextOpt,
+        }
+    }
+    pub const fn int(col: &'static str, key: &'static str) -> Self {
+        Self {
+            col,
+            key,
+            kind: CatalogColKind::Int,
+        }
+    }
+    pub const fn float(col: &'static str, key: &'static str) -> Self {
+        Self {
+            col,
+            key,
+            kind: CatalogColKind::Float,
+        }
+    }
+}
+
+/// Esegue una query di catalogo Postgres con un singolo bind. Gli errori
+/// pool/query diventano il JSON `{"ok": false, "error": ...}` canonico dei
+/// tool db_* (ramo `Err`).
+async fn fetch_catalog(sql: &str, bind: CatalogBind) -> Result<Vec<PgRow>, Value> {
+    let pool = match get_pool().await {
+        Ok(p) => p,
+        Err(e) => return Err(json!({"ok": false, "error": e})),
+    };
+    let query = sqlx::query(sql);
+    let query = match bind {
+        CatalogBind::Text(s) => query.bind(s),
+        CatalogBind::Int(i) => query.bind(i),
+    };
+    match query.fetch_all(&pool).await {
+        Ok(r) => Ok(r),
+        Err(e) => Err(json!({"ok": false, "error": format!("query: {}", e)})),
+    }
+}
+
+/// Lista di valori testuali da una singola colonna di catalogo (le righe non
+/// decodificabili vengono scartate). Punto unico (regola L) per
+/// db_table_list / db_view_list / db_seq_list.
+pub async fn list_catalog_strings(
+    sql: &str,
+    bind: CatalogBind,
+    col: &str,
+) -> Result<Vec<String>, Value> {
+    let rows = fetch_catalog(sql, bind).await?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| r.try_get::<String, _>(col).ok())
+        .collect())
+}
+
+/// Lista di oggetti JSON proiettati secondo `cols`. Punto unico (regola L)
+/// per db_index_list / db_constraint_list / db_foreign_keys / db_bloat_check
+/// / db_dead_tuples.
+pub async fn list_catalog_rows(
+    sql: &str,
+    bind: CatalogBind,
+    cols: &[CatalogCol],
+) -> Result<Vec<Value>, Value> {
+    let rows = fetch_catalog(sql, bind).await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let mut obj = serde_json::Map::new();
+            for c in cols {
+                let v = match c.kind {
+                    CatalogColKind::Text => {
+                        json!(r.try_get::<String, _>(c.col).unwrap_or_default())
+                    }
+                    CatalogColKind::TextOpt => {
+                        json!(r.try_get::<Option<String>, _>(c.col).unwrap_or_default())
+                    }
+                    CatalogColKind::Int => json!(r.try_get::<i64, _>(c.col).unwrap_or(0)),
+                    CatalogColKind::Float => json!(r.try_get::<f64, _>(c.col).unwrap_or(0.0)),
+                };
+                obj.insert(c.key.to_string(), v);
+            }
+            Value::Object(obj)
+        })
+        .collect())
+}
+
+/// Introspezione tabelle+colonne via `information_schema` su un pool gia'
+/// aperto. Con `with_defaults_and_estimates` aggiunge `column_default` per
+/// colonna e `estimated_row_count` per tabella (variante project_db_schema).
+/// Punto unico (regola L) per db_schema_inspect / project_db_schema.
+pub async fn inspect_schema_tables(
+    pool: &PgPool,
+    schema: &str,
+    table_filter: Option<&str>,
+    with_defaults_and_estimates: bool,
+) -> Result<Vec<Value>, NexusToolError> {
+    let mut tables_q = sqlx::query(
+        "SELECT table_name FROM information_schema.tables
+         WHERE table_schema = $1 AND table_type='BASE TABLE'
+         ORDER BY table_name",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| NexusToolError::BadInput(format!("query tables failed: {}", e)))?;
+
+    if let Some(f) = table_filter {
+        tables_q.retain(|r| {
+            r.try_get::<String, _>("table_name")
+                .map(|n| n == f)
+                .unwrap_or(false)
+        });
+    }
+
+    let cols_sql = if with_defaults_and_estimates {
+        "SELECT column_name, data_type, is_nullable, column_default
+         FROM information_schema.columns
+         WHERE table_schema = $1 AND table_name = $2
+         ORDER BY ordinal_position"
+    } else {
+        "SELECT column_name, data_type, is_nullable
+         FROM information_schema.columns
+         WHERE table_schema = $1 AND table_name = $2
+         ORDER BY ordinal_position"
+    };
+
+    let mut tables_out: Vec<Value> = Vec::with_capacity(tables_q.len());
+    for row in tables_q {
+        let table_name: String = row
+            .try_get("table_name")
+            .map_err(|e| NexusToolError::BadInput(format!("row decode: {}", e)))?;
+        let cols = sqlx::query(cols_sql)
+            .bind(schema)
+            .bind(&table_name)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| NexusToolError::BadInput(format!("query cols failed: {}", e)))?;
+        let cols_json: Vec<Value> = cols
+            .iter()
+            .map(|c| {
+                let name: String = c.try_get("column_name").unwrap_or_default();
+                let dtype: String = c.try_get("data_type").unwrap_or_default();
+                let nullable: String = c.try_get("is_nullable").unwrap_or_default();
+                if with_defaults_and_estimates {
+                    let default: Option<String> = c.try_get("column_default").ok();
+                    json!({
+                        "name": name,
+                        "type": dtype,
+                        "nullable": nullable == "YES",
+                        "default": default,
+                    })
+                } else {
+                    json!({
+                        "name": name,
+                        "type": dtype,
+                        "nullable": nullable == "YES",
+                    })
+                }
+            })
+            .collect();
+
+        if with_defaults_and_estimates {
+            // Conta righe (best-effort, ignora errore)
+            let row_count: Option<i64> = sqlx::query_scalar(&format!(
+                "SELECT reltuples::bigint AS estimate
+                 FROM pg_class
+                 WHERE oid = '\"{}\".\"{}\"'::regclass",
+                schema.replace('"', "\"\""),
+                table_name.replace('"', "\"\"")
+            ))
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+            tables_out.push(json!({
+                "name": table_name,
+                "columns": cols_json,
+                "estimated_row_count": row_count,
+            }));
+        } else {
+            tables_out.push(json!({
+                "name": table_name,
+                "columns": cols_json,
+            }));
+        }
+    }
+    Ok(tables_out)
+}
 
 /// Valida che un identifier SQL sia ASCII alfanumerico + underscore (no punto,
 /// no spazi, no virgolette). Punto unico (regola L, S76) per i tool DB stretti

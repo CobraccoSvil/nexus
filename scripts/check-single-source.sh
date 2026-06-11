@@ -94,3 +94,10 @@ if [[ "$fail" -ne 0 ]]; then
   exit 1
 fi
 echo "OK check-single-source: nessuna regressione sui punti unici attivi."
+
+# Wave 4 (2026-06-11): nuovi punti unici del consolidamento E1-E6
+assert_single "fn walk_project_files" crates/mcp-core/src/nexus_tools/fs_scan.rs "walk FS nexus_tools"
+assert_single "fn list_catalog_rows" crates/mcp-core/src/nexus_tools/db_helper.rs "catalog query Postgres"
+assert_single "fn register_project_records" crates/mcp-core/src/nexus_tools/project_register_common.rs "registrazione progetto"
+assert_single "fn list_servers_core" crates/nexus-mcp-client/src/server_endpoints.rs "endpoint MCP server condivisi"
+assert_single "def build_generate_result" brain/providers/_response_parsers.py "coda generate provider OpenAI-compat"

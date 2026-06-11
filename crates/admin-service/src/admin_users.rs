@@ -10,7 +10,7 @@ use crate::AppState;
 // Tipi DTO: punto unico in nexus_types::admin_dto (regola L / ADR 0026, Wave C2).
 pub use nexus_types::admin_dto::{
     ListUsersQuery, ListUsersResponse, SearchUsersQuery, UpdateUserRequest, UpdateUserRoleRequest,
-    UserProjectRole, UserResponse, UserWithProjectsResponse,
+    UserResponse, UserWithProjectsResponse,
 };
 
 pub async fn list_users(
@@ -53,35 +53,13 @@ pub async fn get_user(
 ) -> Result<Json<UserWithProjectsResponse>, StatusCode> {
     let user_uuid = Uuid::parse_str(&user_id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let user: (String, String, String, Option<String>, Option<String>, String, String) = sqlx::query_as(
-        "SELECT id::text, email, display_name, github_username, avatar_url, role, created_at::text FROM users WHERE id = $1 AND deleted_at IS NULL",
-    )
-    .bind(user_uuid)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::NOT_FOUND)?;
+    // Query condivisa: punto unico in nexus_types::admin_dto (cluster E6).
+    let response = nexus_types::admin_dto::fetch_user_with_projects(&state.db, user_uuid)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
 
-    let (id, email, display_name, github_username, avatar_url, role, created_at) = user;
-
-    let projects: Vec<UserProjectRole> = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT p.id, p.name, pm.role FROM project_members pm JOIN projects p ON pm.project_id = p.id WHERE pm.user_id = $1 ORDER BY p.name",
-    )
-    .bind(user_uuid)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .map(|(project_id, project_name, role)| UserProjectRole { project_id, project_name, role })
-    .collect();
-
-    let project_count = projects.len() as i32;
-
-    Ok(Json(UserWithProjectsResponse {
-        user: UserResponse { id, email, display_name, github_username, avatar_url, role, created_at },
-        project_count,
-        projects,
-    }))
+    Ok(Json(response))
 }
 
 pub async fn update_user(
@@ -183,27 +161,11 @@ pub async fn search_users(
     State(state): State<AppState>,
     Query(params): Query<SearchUsersQuery>,
 ) -> Result<Json<Vec<UserResponse>>, StatusCode> {
-    let query_pattern = format!("%{}%", params.q.to_lowercase());
-
-    let users: Vec<UserResponse> = sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>, String, String)>(
-        r#"
-        SELECT id::text, email, display_name, github_username, avatar_url, role, created_at::text
-        FROM users
-        WHERE deleted_at IS NULL AND (
-            LOWER(email) LIKE $1 OR LOWER(display_name) LIKE $1 OR LOWER(github_username) LIKE $1
-        )
-        ORDER BY created_at DESC LIMIT 50
-        "#,
-    )
-    .bind(&query_pattern)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .map(|(id, email, display_name, github_username, avatar_url, role, created_at)| UserResponse {
-        id, email, display_name, github_username, avatar_url, role, created_at,
-    })
-    .collect();
+    // Query condivisa: punto unico in nexus_types::admin_dto (cluster E6).
+    // Semantica storica preservata: errore DB -> lista vuota.
+    let users = nexus_types::admin_dto::search_users_like(&state.db, &params.q)
+        .await
+        .unwrap_or_default();
 
     Ok(Json(users))
 }

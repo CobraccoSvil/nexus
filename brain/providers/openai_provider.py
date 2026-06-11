@@ -84,53 +84,37 @@ def _is_o_series(model: str) -> bool:
     model_lower = model.lower()
     return any(model_lower == m or model_lower.startswith(m + "-") for m in _O_SERIES_MODELS)
 
-from .base import (
-    ApiKeyClientMixin,
-    BaseProvider,
-    ProviderCatalogEntry,
-    ProviderResult,
-    build_openai_compatible_client,
-)
+from .base import OpenAICompatProviderBase, ProviderResult
 from .error_handler import format_error_result
-from ._response_parsers import build_agent_turn_error, build_agent_turn_result
+from ._response_parsers import (
+    build_agent_turn_error,
+    build_agent_turn_result,
+    build_generate_result,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class OpenAIProvider(BaseProvider, ApiKeyClientMixin):
+class OpenAIProvider(OpenAICompatProviderBase):
     """Provider OpenAI ufficiale.
 
-    La gestione API key + client cacheato vive nel mixin ``ApiKeyClientMixin``
-    (punto unico, regola L / ADR 0026, Wave C3).
+    Plumbing comune (API key/client, catalogo da DB, guard key mancante,
+    test_connection) nel punto unico ``OpenAICompatProviderBase``
+    (regola L / ADR 0026, Wave E3).
     """
 
     name = "openai"
-
-    def __init__(self) -> None:
-        self._init_api_key_cache()
-
-    def _create_client(self, api_key: str) -> Any:
-        # Punto unico build_openai_compatible_client (regola L, S70).
-        # max_retries=0: i retry sono governati a livello applicativo (cascade
-        # M60 nel registry), non dall'SDK. Su errori non-retriabili come
-        # 402/insufficient_quota (credit_balance_too_low) il client OpenAI
-        # ritenterebbe comunque, sprecando latenza durante il cascade mentre
-        # openai e' gia' in cooldown billing. Vedi FIX cooldown openai.
-        return build_openai_compatible_client(api_key, max_retries=0)
-
-    def list_models(self) -> list[ProviderCatalogEntry]:
-        # Lista modelli letta da DB (ai_price_catalog) con cache 60s.
-        # Niente fallback hardcoded.
-        from .catalog_loader import load_provider_catalog
-        return load_provider_catalog(self.name)
+    api_key_label = "OpenAI"
+    # client_max_retries=0: i retry sono governati a livello applicativo
+    # (cascade M60 nel registry), non dall'SDK. Su errori non-retriabili come
+    # 402/insufficient_quota (credit_balance_too_low) il client OpenAI
+    # ritenterebbe comunque, sprecando latenza durante il cascade mentre
+    # openai e' gia' in cooldown billing. Vedi FIX cooldown openai.
+    client_max_retries = 0
 
     async def generate(self, model: str, prompt: str, **kwargs: Any) -> ProviderResult:
         if not self._api_key:
-            return ProviderResult(
-                provider=self.name, model=model,
-                content="[OpenAI API key not configured]",
-                metadata={"error": "missing_api_key"},
-            )
+            return self._missing_api_key_result(model)
         # Early return per modelli che richiedono v1/responses (brain non supporta).
         # Il model_health_probe Rust riconosce "model_not_found" e auto-disabilita.
         if _is_responses_only(model):
@@ -157,31 +141,10 @@ class OpenAIProvider(BaseProvider, ApiKeyClientMixin):
             if kwargs.get("json_mode"):
                 create_kwargs["response_format"] = {"type": "json_object"}
             response = await client.chat.completions.create(**create_kwargs)
-            choice = response.choices[0]
-            return ProviderResult(
-                provider=self.name,
-                model=model,
-                content=choice.message.content or "",
-                metadata={
-                    "usage": {
-                        "prompt_tokens": response.usage.prompt_tokens,
-                        "completion_tokens": response.usage.completion_tokens,
-                        "total_tokens": response.usage.total_tokens,
-                    },
-                    "finish_reason": choice.finish_reason,
-                },
-            )
+            # Coda comune di generate (punto unico _response_parsers, regola L).
+            return build_generate_result(self.name, model, response)
         except Exception as e:
-            # Contratto dati B (regola L): errore classificato sull'oggetto SDK
-            # reale -> metadata con error_class + http_status STRUTTURATI (niente
-            # fallback lessicale a valle). format_error_result logga gia' con
-            # http/stop_reason.
-            meta = format_error_result(e, self.name, model)
-            return ProviderResult(
-                provider=self.name, model=model,
-                content=f"[Error: {meta['error']}]",
-                metadata=meta,
-            )
+            return build_agent_turn_error(e, self.name, model)
 
     async def generate_agent_turn(
         self,
@@ -194,11 +157,7 @@ class OpenAIProvider(BaseProvider, ApiKeyClientMixin):
     ) -> ProviderResult:
         """Esegue un turno agente con function calling OpenAI, normalizza output al formato Anthropic."""
         if not self._api_key:
-            return ProviderResult(
-                provider=self.name, model=model,
-                content="[OpenAI API key not configured]",
-                metadata={"error": "missing_api_key"},
-            )
+            return self._missing_api_key_result(model)
         if _is_responses_only(model):
             return ProviderResult(
                 provider=self.name, model=model,
@@ -471,18 +430,6 @@ class OpenAIProvider(BaseProvider, ApiKeyClientMixin):
         except Exception as e:
             meta = format_error_result(e, self.name, model)
             yield {"type": "error", "message": meta.get("error", str(e)), "metadata": meta}
-
-    async def test_connection(self) -> dict[str, Any]:
-        if not self._api_key:
-            return {"provider": self.name, "status": "not_configured", "reason": "API key non configurata"}
-        try:
-            client = self._get_client()
-            await client.models.list()
-            return {"provider": self.name, "status": "ready"}
-        except Exception as e:
-            from .error_handler import classify_error
-            info = classify_error(e, self.name)
-            return {"provider": self.name, "status": "error", "reason": info["message"], "error_class": info["stop_reason"]}
 
 
 # _anthropic_tool_to_openai e _convert_messages_to_openai vivono in adapter_base

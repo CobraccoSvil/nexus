@@ -4,6 +4,7 @@
 //! Verifica esistenza, rileva info Git, registra nel DB con transazione.
 
 use super::db_helper;
+use super::project_register_common::{register_project_records, NewProjectRecord};
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -90,89 +91,20 @@ impl NexusToolHandler for ProjectRegisterExistingDirTool {
                 .unwrap_or_else(|| "Project".to_string())
         });
 
-        let project_id = Uuid::new_v4();
-        let workspace_id = Uuid::new_v4();
-        let repository_id = Uuid::new_v4();
-
-        let team_id: Uuid =
-            sqlx::query_scalar("SELECT id FROM teams WHERE owner_user_id = $1 LIMIT 1")
-                .bind(ctx.user_id)
-                .fetch_optional(&pool)
-                .await
-                .map_err(|e| NexusToolError::BadInput(format!("lookup team: {}", e)))?
-                .unwrap_or_else(Uuid::new_v4);
-
-        let slug = format!(
-            "{}-{}",
-            project_name.to_lowercase().replace(' ', "-"),
-            &project_id.to_string()[..8]
-        );
-
         let abs_str = abs_path.to_string_lossy().to_string();
 
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| NexusToolError::BadInput(format!("begin tx: {}", e)))?;
-
-        sqlx::query(
-            r#"INSERT INTO projects (id, team_id, owner_user_id, name, slug, default_branch, visibility, last_opened_by_user_id)
-               VALUES ($1, $2, $3, $4, $5, $6, 'private', $3)"#,
+        let (project_id, slug) = register_project_records(
+            &pool,
+            &NewProjectRecord {
+                user_id: ctx.user_id,
+                name: &project_name,
+                default_branch: &current_branch,
+                abs_path: &abs_str,
+                remote_url: None,
+                is_git_repo: is_git,
+            },
         )
-        .bind(project_id)
-        .bind(team_id)
-        .bind(ctx.user_id)
-        .bind(&project_name)
-        .bind(&slug)
-        .bind(&current_branch)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| NexusToolError::BadInput(format!("insert projects: {}", e)))?;
-
-        sqlx::query(
-            "INSERT INTO project_members (id, project_id, user_id, role) VALUES ($1, $2, $3, 'owner')",
-        )
-        .bind(Uuid::new_v4())
-        .bind(project_id)
-        .bind(ctx.user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| NexusToolError::BadInput(format!("insert members: {}", e)))?;
-
-        sqlx::query(
-            "INSERT INTO workspaces (id, project_id, absolute_path, is_primary) VALUES ($1, $2, $3, TRUE)",
-        )
-        .bind(workspace_id)
-        .bind(project_id)
-        .bind(&abs_str)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| NexusToolError::BadInput(format!("insert workspaces: {}", e)))?;
-
-        sqlx::query(
-            r#"INSERT INTO repositories (id, project_id, provider, root_path, is_git_repo, current_branch)
-               VALUES ($1, $2, 'local', $3, $4, $5)"#,
-        )
-        .bind(repository_id)
-        .bind(project_id)
-        .bind(&abs_str)
-        .bind(is_git)
-        .bind(&current_branch)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| NexusToolError::BadInput(format!("insert repositories: {}", e)))?;
-
-        // Auto-provisioning quote risorse (PR hardening)
-        let _ = sqlx::query(
-            "INSERT INTO nexus_resource_quotas (project_id) VALUES ($1) ON CONFLICT (project_id) DO NOTHING",
-        )
-        .bind(project_id)
-        .execute(&mut *tx)
-        .await;
-
-        tx.commit()
-            .await
-            .map_err(|e| NexusToolError::BadInput(format!("commit: {}", e)))?;
+        .await?;
 
         pool.close().await;
 

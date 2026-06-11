@@ -286,21 +286,11 @@ pub(super) async fn tool_run_command(ctx: &AgentToolContext, input: &Value) -> S
 
 /// Esegue i test del progetto in modo sincrono con timeout esteso.
 ///
-/// NB: il tool `run_tests` e' esposto al modello (tool_schema), raccomandato
-/// dai prompt e whitelistato nelle migrazioni 0218/0286, ma il dispatcher
-/// `execute_agent_tool` NON ha il braccio "run_tests": ogni invocazione oggi
-/// fallisce con "Tool run_tests non esiste". Il vecchio chiamante
-/// (agent_loop.rs) e' stato smantellato col passaggio del loop al brain.
-/// Fix tracciato: ricablare il braccio in dispatch.rs (task aperto).
-#[expect(
-    dead_code,
-    reason = "tool dichiarato nel catalogo DB, scollegato dal dispatcher: in attesa di ricablaggio (vedi doc-comment)"
-)]
-pub(crate) async fn tool_run_tests(
-    ctx: &AgentToolContext,
-    input: &Value,
-    test_run_number: usize,
-) -> String {
+/// Dispatchato da `execute_agent_tool` (braccio "run_tests"). Il vecchio
+/// chiamante diretto (agent_loop.rs di mcp-core) e' stato smantellato col
+/// passaggio del loop al brain Python: il contenimento delle esecuzioni
+/// ripetute e' governato dall'anti-loop del brain, non da un contatore qui.
+pub(crate) async fn tool_run_tests(ctx: &AgentToolContext, input: &Value) -> String {
     // 1. Determina comando test
     let explicit_cmd = input.get("command").and_then(Value::as_str);
     let filter = input.get("filter").and_then(Value::as_str);
@@ -414,26 +404,20 @@ pub(crate) async fn tool_run_tests(
                 "TEST FALLITI"
             };
             format!(
-                "=== RUN TEST #{} ===\nComando: {}\nStato: {} (exit code: {})\n\n\
-                 --- STDOUT ---\n{}\n\n--- STDERR ---\n{}\n=== FINE RUN TEST #{} ===",
-                test_run_number,
-                command,
-                status_label,
-                exit_code,
-                truncated_stdout,
-                truncated_stderr,
-                test_run_number
+                "=== RUN TEST ===\nComando: {}\nStato: {} (exit code: {})\n\n\
+                 --- STDOUT ---\n{}\n\n--- STDERR ---\n{}\n=== FINE RUN TEST ===",
+                command, status_label, exit_code, truncated_stdout, truncated_stderr
             )
         }
         Ok(Err(e)) => format!("[Errore attesa test '{}': {}]", command, e),
         Err(_) => {
             let _ = child.kill().await;
             format!(
-                "=== RUN TEST #{} ===\nComando: {}\n\
+                "=== RUN TEST ===\nComando: {}\n\
                  [TIMEOUT] I test non sono terminati entro {}s.\n\
                  Suggerimento: usa il parametro 'filter' per eseguire un sottoinsieme di test specifici.\n\
-                 === FINE RUN TEST #{} ===",
-                test_run_number, command, timeout, test_run_number
+                 === FINE RUN TEST ===",
+                command, timeout
             )
         }
     }

@@ -63,6 +63,9 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "rename_file" => files::tool_rename_file(ctx, input).await,
         "edit_file" => files::tool_edit_file(ctx, input).await,
         "run_command" => command::tool_run_command(ctx, input).await,
+        // Tool dedicato ai cicli test-fix-test: esecuzione sincrona con
+        // timeout esteso (raccomandato dai prompt al posto di run_command).
+        "run_tests" => command::tool_run_tests(ctx, input).await,
         "dispatch_subtask" => tool_dispatch_subtask(ctx.clone(), input.clone()).await,
         "create_profile" => tool_create_profile(ctx, input).await,
         "update_profile" => tool_update_profile(ctx, input).await,
@@ -267,5 +270,71 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
             };
             format!("❌ Tool '{other}' non esiste.{hint}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    /// Contesto minimale senza infrastruttura: pool DB lazy mai contattato,
+    /// brain non connesso. Sufficiente per i path di dispatch che non
+    /// toccano rete ne' DB.
+    fn ctx_for_dispatch_tests(root: std::path::PathBuf) -> AgentToolContext {
+        let db = sqlx::PgPool::connect_lazy("postgres://test:test@127.0.0.1:1/test")
+            .expect("pool lazy");
+        AgentToolContext {
+            root_path: root,
+            user_id: Uuid::nil(),
+            is_git_repo: false,
+            can_write: true,
+            project_id: Uuid::nil(),
+            session_id: None,
+            db: Arc::new(db.clone()),
+            parent_run_id: None,
+            playwright_channels: crate::playwright_live::new_channels(),
+            neural: crate::orchestrator::NeuralCoreClient::disconnected_for_tests(),
+            long_running_patterns: Vec::new(),
+            user_role: "admin".to_string(),
+            is_nexus_operator: true,
+            dependency_status: Arc::new(crate::task_watchdog::DependencyStatus::new()),
+            project_channels: Arc::new(dashmap::DashMap::new()),
+            monitor_registry: Arc::new(parking_lot::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            port_registry: crate::port_registry::PortRegistryCache::empty_for_tests(db),
+        }
+    }
+
+    /// Regressione: `run_tests` e' esposto al modello (tool_schema, prompt
+    /// test-fix-test, whitelist migrazioni 0218/0286) ma il braccio nel
+    /// dispatcher era assente — ogni invocazione cadeva nel fallback
+    /// "Tool non esiste". Su una root vuota e senza comando esplicito
+    /// l'implementazione risponde con l'errore di auto-detection, senza
+    /// toccare DB ne' sandbox: basta a provare il ricablaggio.
+    #[tokio::test]
+    async fn run_tests_e_dispatchato_e_non_cade_nel_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ctx_for_dispatch_tests(dir.path().to_path_buf());
+        let out = execute_agent_tool(&ctx, "run_tests", &serde_json::json!({})).await;
+        assert!(
+            !out.contains("non esiste"),
+            "run_tests caduto nel fallback del dispatcher: {out}"
+        );
+        assert!(
+            out.contains("impossibile rilevare il comando test"),
+            "output inatteso da tool_run_tests: {out}"
+        );
+    }
+
+    /// Contro-prova: un nome sconosciuto cade ancora nel fallback.
+    #[tokio::test]
+    async fn tool_sconosciuto_cade_nel_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ctx_for_dispatch_tests(dir.path().to_path_buf());
+        let out = execute_agent_tool(&ctx, "tool_che_non_esiste", &serde_json::json!({})).await;
+        assert!(out.contains("non esiste"), "fallback atteso, ottenuto: {out}");
     }
 }

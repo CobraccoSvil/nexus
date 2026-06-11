@@ -3,6 +3,7 @@
 import dynamic from "next/dynamic";
 import { useEffect, useRef } from "react";
 import { useTheme, useThemeColors } from "../../lib/theme";
+import { iconButton } from "../../lib/icon-button-style";
 import type { EditorGroupState, EditorTabState, ProblemItem, UserProjectDetails } from "../../lib/api-client";
 import type * as Monaco from "monaco-editor";
 import { MarkdownBlock } from "../chat/markdown-renderer";
@@ -87,27 +88,6 @@ function detectMonacoLanguage(path: string): string {
 
   if (normalized.endsWith("dockerfile")) return "dockerfile";
   return map[ext] ?? "plaintext";
-}
-
-function iconButton(
-  tc: ReturnType<typeof useThemeColors>,
-  disabled = false,
-  active = false,
-) {
-  return {
-    width: 30,
-    height: 30,
-    border: `1px solid ${active ? tc.accent : tc.border}`,
-    background: disabled ? tc.bgInput : active ? tc.accentBg : tc.bgCard,
-    color: disabled ? tc.textMuted : active ? tc.accent : tc.textSecondary,
-    borderRadius: 7,
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    cursor: disabled ? "not-allowed" : "pointer",
-    fontSize: 13,
-    lineHeight: 1,
-  } as const;
 }
 
 // Map ProblemItem severity → Monaco MarkerSeverity number

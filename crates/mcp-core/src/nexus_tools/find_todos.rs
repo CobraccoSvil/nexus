@@ -2,10 +2,10 @@
 //!
 //! Output: lista di `{path, line, marker, text}`.
 
+use super::fs_scan::scan_file_lines;
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::Path;
 
 pub struct FindTodosTool;
 
@@ -44,72 +44,6 @@ fn is_source_ext(ext: &str) -> bool {
     )
 }
 
-fn walk_todos(
-    root: &Path,
-    dir: &Path,
-    markers_re: &regex::Regex,
-    out: &mut Vec<Value>,
-    limit: usize,
-    depth: usize,
-) {
-    if out.len() >= limit || depth > 8 {
-        return;
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        if out.len() >= limit {
-            break;
-        }
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if super::is_skipped_dir(&name) {
-            continue;
-        }
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if meta.is_dir() {
-            walk_todos(root, &path, markers_re, out, limit, depth + 1);
-            continue;
-        }
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        if !is_source_ext(&ext) {
-            continue;
-        }
-        if meta.len() > 1_000_000 {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let rel = path
-            .strip_prefix(root)
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| name.clone());
-        for (i, line) in content.lines().enumerate() {
-            if out.len() >= limit {
-                break;
-            }
-            if let Some(m) = markers_re.find(line) {
-                out.push(json!({
-                    "path": rel,
-                    "line": i + 1,
-                    "marker": m.as_str(),
-                    "text": line.trim().chars().take(200).collect::<String>(),
-                }));
-            }
-        }
-    }
-}
-
 #[async_trait]
 impl NexusToolHandler for FindTodosTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
@@ -139,14 +73,29 @@ impl NexusToolHandler for FindTodosTool {
             .unwrap_or(500)
             .min(5000);
 
-        let mut results = Vec::new();
-        walk_todos(
+        let results = scan_file_lines(
             &ctx.project_root,
             &ctx.project_root,
-            &re,
-            &mut results,
+            1_000_000,
             limit,
-            0,
+            &|_name, path| {
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                is_source_ext(&ext)
+            },
+            &mut |rel, line_no, line| {
+                re.find(line).map(|m| {
+                    json!({
+                        "path": rel,
+                        "line": line_no,
+                        "marker": m.as_str(),
+                        "text": line.trim().chars().take(200).collect::<String>(),
+                    })
+                })
+            },
         );
 
         // Group counts per marker

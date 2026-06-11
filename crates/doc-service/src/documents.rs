@@ -1,10 +1,15 @@
 use axum::{
     body::Body,
     extract::{Extension, Path as AxumPath, State},
-    http::{header, StatusCode},
+    http::StatusCode,
     Json,
 };
-use nexus_types::{api_error, parse_user_id, ApiError, ApiResult};
+use nexus_types::documents_dto::{
+    delete_document_db, document_row_to_json, docx_attachment_response, fetch_document_file_path,
+    fetch_document_row, fetch_project_documents, fetch_versions, parse_document_id,
+    resolve_workspace_root,
+};
+use nexus_types::{api_error, parse_project_id, parse_user_id, ApiError, ApiResult};
 use nexus_auth::Claims;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -21,30 +26,10 @@ pub async fn list_documents(
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult {
     let _user_id = parse_user_id(&claims)?;
-    let project_id = Uuid::parse_str(&id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let project_id = parse_project_id(&id)?;
 
-    let rows = sqlx::query(
-        "SELECT id, project_id, doc_type, title, version, file_path, status, metadata, created_at, updated_at
-         FROM project_documents WHERE project_id = $1 ORDER BY doc_type, updated_at DESC",
-    )
-    .bind(project_id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-
-    let docs: Vec<Value> = rows.iter().map(|r| json!({
-        "id": r.get::<Uuid, _>("id").to_string(),
-        "project_id": r.get::<Uuid, _>("project_id").to_string(),
-        "doc_type": r.get::<String, _>("doc_type"),
-        "title": r.get::<String, _>("title"),
-        "version": r.get::<String, _>("version"),
-        "file_path": r.get::<String, _>("file_path"),
-        "status": r.get::<String, _>("status"),
-        "metadata": r.get::<Value, _>("metadata"),
-        "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
-        "updated_at": r.get::<chrono::DateTime<chrono::Utc>, _>("updated_at").to_rfc3339(),
-    })).collect();
+    // Query + mapping nel punto unico documents_dto (regola L, cluster E4).
+    let docs = fetch_project_documents(&state.db, project_id).await?;
 
     Ok(Json(json!({ "documents": docs })))
 }
@@ -56,68 +41,11 @@ pub async fn get_document(
     AxumPath((_id, doc_id)): AxumPath<(String, String)>,
 ) -> ApiResult {
     let _user_id = parse_user_id(&claims)?;
-    let document_id = Uuid::parse_str(&doc_id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Document id non valido"))?;
+    let document_id = parse_document_id(&doc_id)?;
 
-    let row = sqlx::query(
-        "SELECT id, project_id, doc_type, title, version, file_path, structure_json, status, metadata, created_at, updated_at
-         FROM project_documents WHERE id = $1",
-    )
-    .bind(document_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
-    .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Documento non trovato"))?;
-
-    // Punto unico mapping JSON in nexus_types::documents_dto (regola L, S62).
-    Ok(Json(nexus_types::documents_dto::document_row_to_json(&row)))
-}
-
-/// GET /api/projects/:id/documents/:doc_id/download
-pub async fn download_document(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    AxumPath((id, doc_id)): AxumPath<(String, String)>,
-) -> Result<axum::response::Response<Body>, ApiError> {
-    let _user_id = parse_user_id(&claims)?;
-    let project_id = Uuid::parse_str(&id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
-    let document_id = Uuid::parse_str(&doc_id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Document id non valido"))?;
-
-    let row = sqlx::query("SELECT file_path, title FROM project_documents WHERE id = $1 AND project_id = $2")
-        .bind(document_id).bind(project_id)
-        .fetch_optional(&state.db).await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Documento non trovato"))?;
-
-    let file_path: String = row.get("file_path");
-
-    // Resolve project root path from workspace
-    let root_row = sqlx::query("SELECT absolute_path FROM workspaces WHERE project_id = $1 AND is_primary = TRUE")
-        .bind(project_id)
-        .fetch_optional(&state.db).await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Workspace non trovato"))?;
-
-    let root_path: String = root_row.get("absolute_path");
-    let abs_path = std::path::PathBuf::from(&root_path).join(&file_path);
-
-    if !abs_path.exists() {
-        return Err(api_error(StatusCode::NOT_FOUND, "File non trovato sul filesystem"));
-    }
-
-    let bytes = fs::read(&abs_path).await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Errore lettura: {e}")))?;
-
-    let filename = abs_path.file_name().and_then(|n| n.to_str()).unwrap_or("document.docx");
-
-    axum::response::Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename))
-        .body(Body::from(bytes))
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Response error: {e}")))
+    // Punto unico query + mapping JSON in nexus_types::documents_dto (regola L, S62).
+    let row = fetch_document_row(&state.db, document_id).await?;
+    Ok(Json(document_row_to_json(&row)))
 }
 
 /// GET /api/projects/:id/documents/:doc_id/versions
@@ -127,27 +55,35 @@ pub async fn list_versions(
     AxumPath((_id, doc_id)): AxumPath<(String, String)>,
 ) -> ApiResult {
     let _user_id = parse_user_id(&claims)?;
-    let document_id = Uuid::parse_str(&doc_id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Document id non valido"))?;
-
-    let rows = sqlx::query(
-        "SELECT id, document_id, version, file_path, change_summary, changed_sections, created_at
-         FROM project_document_versions WHERE document_id = $1 ORDER BY created_at DESC",
-    )
-    .bind(document_id)
-    .fetch_all(&state.db).await
-    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-
-    let versions: Vec<Value> = rows.iter().map(|r| json!({
-        "id": r.get::<Uuid, _>("id").to_string(),
-        "version": r.get::<String, _>("version"),
-        "file_path": r.get::<String, _>("file_path"),
-        "change_summary": r.get::<Option<String>, _>("change_summary"),
-        "changed_sections": r.get::<Option<Vec<String>>, _>("changed_sections"),
-        "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
-    })).collect();
+    let versions = fetch_versions(&state.db, parse_document_id(&doc_id)?).await?;
 
     Ok(Json(json!({ "versions": versions })))
+}
+
+/// GET /api/projects/:id/documents/:doc_id/download
+pub async fn download_document(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath((id, doc_id)): AxumPath<(String, String)>,
+) -> Result<axum::response::Response<Body>, ApiError> {
+    let _user_id = parse_user_id(&claims)?;
+    let project_id = parse_project_id(&id)?;
+    let document_id = parse_document_id(&doc_id)?;
+
+    let file_path = fetch_document_file_path(&state.db, document_id, project_id).await?;
+
+    // Resolve project root path from workspace
+    let root_path = resolve_workspace_root(&state.db, project_id).await?;
+    let abs_path = root_path.join(&file_path);
+
+    if !abs_path.exists() {
+        return Err(api_error(StatusCode::NOT_FOUND, "File non trovato sul filesystem"));
+    }
+
+    let bytes = fs::read(&abs_path).await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Errore lettura: {e}")))?;
+
+    docx_attachment_response(&abs_path, bytes)
 }
 
 /// DELETE /api/projects/:id/documents/:doc_id
@@ -157,32 +93,16 @@ pub async fn delete_document(
     AxumPath((id, doc_id)): AxumPath<(String, String)>,
 ) -> ApiResult {
     let _user_id = parse_user_id(&claims)?;
-    let project_id = Uuid::parse_str(&id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
-    let document_id = Uuid::parse_str(&doc_id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Document id non valido"))?;
+    let project_id = parse_project_id(&id)?;
+    let document_id = parse_document_id(&doc_id)?;
 
-    let row = sqlx::query("SELECT file_path, qdrant_point_ids FROM project_documents WHERE id = $1 AND project_id = $2")
-        .bind(document_id).bind(project_id)
-        .fetch_optional(&state.db).await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Documento non trovato"))?;
+    // Fetch riferimenti + DELETE riga nel punto unico documents_dto.
+    let (file_path, qdrant_point_ids) =
+        delete_document_db(&state.db, document_id, project_id).await?;
 
-    let file_path: String = row.get("file_path");
-    let qdrant_point_ids: Vec<String> = row.get("qdrant_point_ids");
-
-    // Delete from DB
-    sqlx::query("DELETE FROM project_documents WHERE id = $1")
-        .bind(document_id).execute(&state.db).await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-
-    // Delete file
-    let root_row = sqlx::query("SELECT absolute_path FROM workspaces WHERE project_id = $1 AND is_primary = TRUE")
-        .bind(project_id).fetch_optional(&state.db).await.ok().flatten();
-
-    if let Some(root_row) = root_row {
-        let root_path: String = root_row.get("absolute_path");
-        let abs_path = std::path::PathBuf::from(&root_path).join(&file_path);
+    // Delete file (tollerante: workspace assente non blocca la cancellazione)
+    if let Ok(root_path) = resolve_workspace_root(&state.db, project_id).await {
+        let abs_path = root_path.join(&file_path);
         let _ = fs::remove_file(&abs_path).await;
     }
 
@@ -210,8 +130,7 @@ pub async fn generate_document(
     Json(req): Json<GenerateDocRequest>,
 ) -> ApiResult {
     let user_id = parse_user_id(&claims)?;
-    let pid = Uuid::parse_str(&req.project_id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let pid = parse_project_id(&req.project_id)?;
 
     let standard = req.standard.as_deref().unwrap_or("ieee830");
 
@@ -324,8 +243,7 @@ pub async fn search_documents(
     Extension(_claims): Extension<Claims>,
     Json(req): Json<SearchDocRequest>,
 ) -> ApiResult {
-    let pid = Uuid::parse_str(&req.project_id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Project id non valido"))?;
+    let pid = parse_project_id(&req.project_id)?;
     let limit = req.limit.unwrap_or(5);
 
     // Embed query via brain REST

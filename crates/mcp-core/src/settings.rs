@@ -3,7 +3,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde_json::{json, Value};
+use serde_json::json;
 use std::path::PathBuf;
 
 // Tipi DTO: punto unico in nexus_types::settings_dto (regola L / ADR 0026, S8).
@@ -13,22 +13,13 @@ pub use nexus_types::settings_dto::{
 };
 
 // FS browse: punto unico in nexus_types::fs_browse (regola L / ADR 0026).
-// Prima `BrowseDirectoryNode`, `list_root_candidates`, `list_directories` e
-// `validate_directory_name` erano duplicati con crates/admin-service/src/settings.rs.
-use nexus_types::fs_browse::{
-    list_directories, list_root_candidates, validate_directory_name as validate_dir_name,
+use nexus_types::fs_browse::{list_directories, list_root_candidates};
+// Tipi e helper API: punto unico in nexus_types (regola L / ADR 0026, cluster E6).
+// Prima `ApiError`/`ApiResult`/`api_error`/`validate_directory_name` erano
+// ri-implementati identici qui e in crates/admin-service/src/settings.rs.
+use nexus_types::{
+    api_error, validate_directory_name_api as validate_directory_name, ApiError, ApiResult,
 };
-
-type ApiError = (StatusCode, Json<Value>);
-type ApiResult = Result<Json<Value>, ApiError>;
-
-fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
-    (status, Json(json!({ "error": message.into() })))
-}
-
-fn validate_directory_name(name: &str) -> Result<&str, ApiError> {
-    validate_dir_name(name).map_err(|msg| api_error(StatusCode::BAD_REQUEST, msg))
-}
 
 fn map_create_dir_error(error: std::io::Error) -> ApiError {
     let status = match error.kind() {

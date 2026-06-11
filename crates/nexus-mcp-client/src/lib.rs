@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+pub mod server_endpoints;
 pub mod server_storage;
 
 // -- Public types --

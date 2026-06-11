@@ -23,6 +23,7 @@
 //! rispettivamente l'helper `run_cmd` e i 20 handler previsti dal piano.
 
 pub mod exec;
+pub mod fs_scan;
 pub mod parse_ndjson;
 
 /// Valida che `path` non contenga `..` (path traversal) e che, joined con
@@ -154,6 +155,83 @@ pub async fn run_cargo_test_subset(
         "stdout_preview": out.stdout.chars().take(2000).collect::<String>(),
         "duration_ms": out.duration_ms,
     }))
+}
+
+/// Legge il file Markdown indicato da `args.path` (default `README.md`)
+/// dentro la project_root, con check anti-traversal. Punto unico (regola L)
+/// per i tool `doc_*` che prima duplicavano il blocco path+join+read.
+pub fn read_doc_file<'a>(
+    ctx: &NexusToolContext,
+    args: &'a serde_json::Value,
+) -> Result<(&'a str, String), NexusToolError> {
+    let path = args
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("README.md");
+    let full = validate_no_path_traversal(&ctx.project_root, path)?;
+    let content = std::fs::read_to_string(&full).map_err(NexusToolError::Io)?;
+    Ok((path, content))
+}
+
+/// Esegue `cargo metadata --format-version=1 --no-deps` e ritorna il JSON
+/// parsato + durata in ms. Punto unico (regola L) per cargo_workspace_members,
+/// cargo_targets_list e perf_compile_units.
+pub async fn run_cargo_metadata_json(
+    ctx: &NexusToolContext,
+) -> Result<(serde_json::Value, u64), NexusToolError> {
+    let out = exec::run_cmd(
+        "cargo",
+        &["metadata", "--format-version=1", "--no-deps"],
+        &ctx.project_root,
+        ctx.timeout_secs,
+    )
+    .await?;
+    if !out.success() {
+        return Err(NexusToolError::Exec {
+            exit_code: out.exit_code,
+            stderr: out.stderr,
+        });
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&out.stdout).unwrap_or_else(|_| serde_json::json!({}));
+    Ok((parsed, out.duration_ms))
+}
+
+/// Esegue `gh <area> list --limit N --json <campi>` e ritorna
+/// `(count, json_parsato, duration_ms)`. Il limite viene letto da
+/// `args.limit` con default/cap parametrici. Punto unico (regola L) per
+/// gh_release_list / gh_workflow_list.
+pub async fn run_gh_json_list(
+    ctx: &NexusToolContext,
+    args: &serde_json::Value,
+    area: &str,
+    default_limit: u64,
+    max_limit: u64,
+    json_fields: &str,
+) -> Result<(usize, serde_json::Value, u64), NexusToolError> {
+    let limit = args
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(default_limit)
+        .min(max_limit)
+        .to_string();
+    let out = exec::run_cmd(
+        "gh",
+        &[area, "list", "--limit", &limit, "--json", json_fields],
+        &ctx.project_root,
+        ctx.timeout_secs,
+    )
+    .await?;
+    if !out.success() {
+        return Err(NexusToolError::Exec {
+            exit_code: out.exit_code,
+            stderr: out.stderr,
+        });
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&out.stdout).unwrap_or_else(|_| serde_json::json!([]));
+    let count = parsed.as_array().map(|a| a.len()).unwrap_or(0);
+    Ok((count, parsed, out.duration_ms))
 }
 
 /// Directory che vengono SEMPRE saltate dai tool che scansionano il filesystem
@@ -562,6 +640,7 @@ pub mod service_healthcheck;
 
 // ── Fase 4: Bootstrap progetto ────────────────────────────────────────────
 pub mod project_delete;
+pub mod project_register_common;
 pub mod project_register_existing_dir;
 pub mod project_register_from_git;
 pub mod project_set_default_branch;

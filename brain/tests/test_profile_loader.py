@@ -41,16 +41,23 @@ def test_unknown_profile_is_none():
 def test_filter_tools_respects_allowlist():
     p = profile_loader.get_profile("reviewer")
     assert p is not None
-    # reviewer e' read-only: niente delete_file (non e' in _ALWAYS_ON_TOOLS).
-    # write_file/edit_file/run_command/run_service sono in _ALWAYS_ON_TOOLS e
-    # bypassano il filtro profilo — il gating difensivo per study mode avviene
-    # a monte nel Rust (build_tools_json_for_agent).
-    tools = [{"name": "read_file"}, {"name": "delete_file"}, {"name": "list_files"}]
+    # I tool fuori allowlist e fuori _ALWAYS_ON_TOOLS vengono filtrati.
+    # delete_file invece e' in _ALWAYS_ON_TOOLS dal commit 8101fd7 (bug
+    # "cancella il file": senza tool il modello allucinava l'eliminazione)
+    # e bypassa il filtro profilo — il gating difensivo per i task read-only
+    # avviene a monte (report_only nel router + study mode lato Rust).
+    tools = [
+        {"name": "read_file"},
+        {"name": "delete_file"},
+        {"name": "tool_non_ammesso"},
+        {"name": "list_files"},
+    ]
     filtered = p.filter_tools(tools)
     names = {t["name"] for t in filtered}
     assert "read_file" in names
     assert "list_files" in names
-    assert "delete_file" not in names
+    assert "delete_file" in names  # always-on, bypassa la allowlist
+    assert "tool_non_ammesso" not in names
 
 
 def test_filter_tools_wildcard_passthrough():

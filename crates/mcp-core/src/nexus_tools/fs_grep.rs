@@ -8,76 +8,12 @@
 //!
 //! Output: `{ok, count, matches: [{path, line, text}]}`
 
+use super::fs_scan::scan_file_lines;
 use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::Path;
 
 pub struct FsGrepTool;
-
-fn walk_grep(
-    root: &Path,
-    dir: &Path,
-    file_re: Option<&regex::Regex>,
-    content_re: &regex::Regex,
-    out: &mut Vec<Value>,
-    limit: usize,
-    depth: usize,
-) {
-    if out.len() >= limit || depth > 8 {
-        return;
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        if out.len() >= limit {
-            break;
-        }
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if super::is_skipped_dir(&name) {
-            continue;
-        }
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if meta.is_dir() {
-            walk_grep(root, &path, file_re, content_re, out, limit, depth + 1);
-            continue;
-        }
-        if let Some(re) = file_re {
-            if !re.is_match(&name) {
-                continue;
-            }
-        }
-        // Skip large binaries (>2MB)
-        if meta.len() > 2 * 1024 * 1024 {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let rel = path
-            .strip_prefix(root)
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| name.clone());
-        for (i, line) in content.lines().enumerate() {
-            if out.len() >= limit {
-                break;
-            }
-            if content_re.is_match(line) {
-                out.push(json!({
-                    "path": rel,
-                    "line": i + 1,
-                    "text": line.chars().take(300).collect::<String>(),
-                }));
-            }
-        }
-    }
-}
 
 #[async_trait]
 impl NexusToolHandler for FsGrepTool {
@@ -119,15 +55,22 @@ impl NexusToolHandler for FsGrepTool {
             return Err(NexusToolError::BadInput("path traversal denied".into()));
         }
 
-        let mut matches = Vec::new();
-        walk_grep(
+        // Skip large binaries (>2MB)
+        let matches = scan_file_lines(
             &ctx.project_root,
             &start_dir,
-            file_re.as_ref(),
-            &content_re,
-            &mut matches,
+            2 * 1024 * 1024,
             max_matches,
-            0,
+            &|name, _path| file_re.as_ref().map(|re| re.is_match(name)).unwrap_or(true),
+            &mut |rel, line_no, line| {
+                content_re.is_match(line).then(|| {
+                    json!({
+                        "path": rel,
+                        "line": line_no,
+                        "text": line.chars().take(300).collect::<String>(),
+                    })
+                })
+            },
         );
 
         Ok(json!({

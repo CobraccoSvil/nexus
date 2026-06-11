@@ -30,6 +30,18 @@ impl NeuralCoreClient {
         Ok(Self { client })
     }
 
+    /// Client NON connesso per i test unit: canale lazy verso un endpoint
+    /// irraggiungibile. Qualunque RPC fallirebbe al primo uso; serve solo a
+    /// costruire un `AgentToolContext` nei test di tool che non toccano il brain.
+    #[cfg(test)]
+    pub(crate) fn disconnected_for_tests() -> Self {
+        let channel =
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        Self {
+            client: NeuralCoreServiceClient::new(channel),
+        }
+    }
+
     pub async fn embed_text(&self, model: &str, text: &str) -> anyhow::Result<Vec<f32>> {
         let (_model, vector) = self.embed_text_with_model(model, text).await?;
         Ok(vector)

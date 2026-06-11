@@ -147,3 +147,60 @@ def build_openai_compatible_client(
     if max_retries is not None:
         kwargs["max_retries"] = max_retries
     return AsyncOpenAI(**kwargs)
+
+
+class OpenAICompatProviderBase(BaseProvider, ApiKeyClientMixin):
+    """Base comune dei provider con endpoint OpenAI-compatible (punto unico,
+    regola L / ADR 0026, Wave E3). Relazione is-a reale e poco profonda:
+    deepseek/mistral/openai SONO provider OpenAI-compatible e condividono il
+    plumbing (client builder, catalogo modelli da DB, guard API key mancante,
+    test_connection). Prima questi blocchi erano duplicati pari-pari nei tre
+    moduli (cluster jscpd E3). La logica di business (``generate*``, quirk
+    per-provider come cache proprietarie o o-series) resta nelle sottoclassi.
+
+    Le sottoclassi impostano:
+      - ``name`` (gia' richiesto da ``BaseProvider``);
+      - ``base_url``: endpoint OpenAI-compatible (None per OpenAI ufficiale);
+      - ``api_key_label``: etichetta umana del messaggio
+        ``[X API key not configured]`` (fallback: ``name``);
+      - ``client_max_retries``: override dei retry SDK (None = default SDK).
+    """
+
+    base_url: str | None = None
+    api_key_label: str = ""
+    client_max_retries: int | None = None
+
+    def __init__(self) -> None:
+        self._init_api_key_cache()
+
+    def _create_client(self, api_key: str) -> Any:
+        # Punto unico build_openai_compatible_client (regola L, S70).
+        return build_openai_compatible_client(
+            api_key, base_url=self.base_url, max_retries=self.client_max_retries,
+        )
+
+    def list_models(self) -> list[ProviderCatalogEntry]:
+        # Lista modelli letta da DB (ai_price_catalog) con cache 60s.
+        # Niente fallback hardcoded.
+        from .catalog_loader import load_provider_catalog
+        return load_provider_catalog(self.name)
+
+    def _missing_api_key_result(self, model: str) -> ProviderResult:
+        """Guard comune: ProviderResult strutturato per API key assente."""
+        return ProviderResult(
+            provider=self.name, model=model,
+            content=f"[{self.api_key_label or self.name} API key not configured]",
+            metadata={"error": "missing_api_key"},
+        )
+
+    async def test_connection(self) -> dict[str, Any]:
+        if not self._api_key:
+            return {"provider": self.name, "status": "not_configured", "reason": "API key non configurata"}
+        try:
+            client = self._get_client()
+            await client.models.list()
+            return {"provider": self.name, "status": "ready"}
+        except Exception as e:
+            from .error_handler import classify_error
+            info = classify_error(e, self.name)
+            return {"provider": self.name, "status": "error", "reason": info["message"], "error_class": info["stop_reason"]}

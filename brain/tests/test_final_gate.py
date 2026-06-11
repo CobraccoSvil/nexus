@@ -91,7 +91,13 @@ async def test_software_mounted_design_closes(monkeypatch):
     )
     state = {"user_intent": "build", "session_id": "s1"}
     out = await fg.final_gate_node(state)
-    assert out == {"final_gate_cycle": 0, "stop_reason": "end_turn"}
+    # final_gate_passed: segnale per l'esito canonico CompletedVerified (mig 0386),
+    # presente SOLO sul ramo "verifica passata" (non su forced_close/cap).
+    assert out == {
+        "final_gate_cycle": 0,
+        "stop_reason": "end_turn",
+        "final_gate_passed": True,
+    }
 
 
 @pytest.mark.asyncio

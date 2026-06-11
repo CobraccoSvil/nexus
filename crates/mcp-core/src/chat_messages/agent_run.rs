@@ -1450,7 +1450,7 @@ pub(crate) async fn spawn_agent_run(
             4. Se lo stesso test fallisce 3 volte con lo stesso errore, FERMATI e chiedi all'utente\n\
             5. Procedi incrementalmente — non correggere tutto insieme\n\
             6. Dopo ogni fix, spiega brevemente cosa hai cambiato e perche'\n\
-            7. Hai massimo 7 esecuzioni test per sessione — usale con giudizio\n\
+            7. Esegui i test con parsimonia: ogni run completo e' costoso, limita le esecuzioni al minimo necessario\n\
             8. Se i test passano tutti, concludi con un riepilogo delle modifiche effettuate\n\
             9. Per eseguire test specifici, usa il parametro 'filter' di run_tests\n\
             === FINE MODALITA TEST ===\n"

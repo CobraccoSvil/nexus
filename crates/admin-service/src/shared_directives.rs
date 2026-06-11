@@ -53,6 +53,33 @@ pub struct UpdateDirectiveRequest {
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
+/// SELECT per chiave con mapping 500/404 (punto unico, regola L):
+/// prima duplicato identico in `get_directive` e `update_directive`.
+async fn fetch_directive_or_404(
+    db: &sqlx::PgPool,
+    key: &str,
+) -> Result<SharedDirective, (StatusCode, Json<Value>)> {
+    sqlx::query_as::<_, SharedDirective>(
+        "SELECT key, content, scope, priority, is_active, description, created_at, updated_at \
+         FROM nexus_shared_directives WHERE key = $1",
+    )
+    .bind(key)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })?
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("Direttiva '{}' non trovata", key) })),
+        )
+    })
+}
+
 /// GET /api/admin/shared-directives
 pub async fn list_directives(State(state): State<AppState>) -> ApiResult {
     let rows = sqlx::query_as::<_, SharedDirective>(
@@ -79,25 +106,7 @@ pub async fn get_directive(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> ApiResult {
-    let row = sqlx::query_as::<_, SharedDirective>(
-        "SELECT key, content, scope, priority, is_active, description, created_at, updated_at \
-         FROM nexus_shared_directives WHERE key = $1",
-    )
-    .bind(&key)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-    })?
-    .ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("Direttiva '{}' non trovata", key) })),
-        )
-    })?;
+    let row = fetch_directive_or_404(&state.db, &key).await?;
 
     Ok(Json(json!(row)))
 }
@@ -158,25 +167,7 @@ pub async fn update_directive(
     Path(key): Path<String>,
     Json(body): Json<UpdateDirectiveRequest>,
 ) -> ApiResult {
-    let existing = sqlx::query_as::<_, SharedDirective>(
-        "SELECT key, content, scope, priority, is_active, description, created_at, updated_at \
-         FROM nexus_shared_directives WHERE key = $1",
-    )
-    .bind(&key)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-    })?
-    .ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("Direttiva '{}' non trovata", key) })),
-        )
-    })?;
+    let existing = fetch_directive_or_404(&state.db, &key).await?;
 
     let new_content = body.content.as_deref().unwrap_or(&existing.content).to_string();
     let new_scope = body.scope.as_deref().unwrap_or(&existing.scope).to_string();

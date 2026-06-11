@@ -15,16 +15,13 @@ def _is_deepseek_reasoning(model: str) -> bool:
     model_lower = model.lower()
     return model_lower in _DEEPSEEK_REASONING_MODELS or "deepseek-r" in model_lower
 
-from .base import (
-    ApiKeyClientMixin,
-    BaseProvider,
-    ProviderCatalogEntry,
-    ProviderResult,
-    build_openai_compatible_client,
+from .base import OpenAICompatProviderBase, ProviderResult
+from .openai_provider import _anthropic_tool_to_openai
+from ._response_parsers import (
+    build_agent_turn_error,
+    build_agent_turn_result,
+    build_generate_result,
 )
-from .error_handler import format_error_result
-from .openai_provider import _anthropic_tool_to_openai, _convert_messages_to_openai
-from ._response_parsers import build_agent_turn_error, build_agent_turn_result
 from ._schema_utils import compress_tool_list
 
 logger = logging.getLogger(__name__)
@@ -62,35 +59,21 @@ def _strip_dsml_leak(text: str) -> tuple[str, bool]:
     return text, False
 
 
-class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
+class DeepSeekProvider(OpenAICompatProviderBase):
     """Provider DeepSeek (OpenAI-compatible endpoint).
 
-    La gestione API key + client cacheato vive nel mixin
-    ``ApiKeyClientMixin`` (punto unico, regola L / ADR 0026, Wave C3).
+    Plumbing comune (API key/client, catalogo da DB, guard key mancante,
+    test_connection) nel punto unico ``OpenAICompatProviderBase``
+    (regola L / ADR 0026, Wave E3).
     """
 
     name = "deepseek"
-
-    def __init__(self) -> None:
-        self._init_api_key_cache()
-
-    def _create_client(self, api_key: str) -> Any:
-        # Punto unico build_openai_compatible_client (regola L, S70).
-        return build_openai_compatible_client(api_key, base_url=BASE_URL)
-
-    def list_models(self) -> list[ProviderCatalogEntry]:
-        # Lista modelli letta da DB (ai_price_catalog) con cache 60s.
-        # Niente fallback hardcoded.
-        from .catalog_loader import load_provider_catalog
-        return load_provider_catalog(self.name)
+    base_url = BASE_URL
+    api_key_label = "DeepSeek"
 
     async def generate(self, model: str, prompt: str, **kwargs: Any) -> ProviderResult:
         if not self._api_key:
-            return ProviderResult(
-                provider=self.name, model=model,
-                content="[DeepSeek API key not configured]",
-                metadata={"error": "missing_api_key"},
-            )
+            return self._missing_api_key_result(model)
         try:
             client = self._get_client()
             create_kwargs: dict[str, Any] = {
@@ -124,28 +107,11 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
                     "deepseek %s: marker DSML grezzi nel content (generate), troncato",
                     model,
                 )
-            return ProviderResult(
-                provider=self.name,
-                model=model,
-                content=_gen_content,
-                metadata={
-                    "usage": {
-                        "prompt_tokens": response.usage.prompt_tokens,
-                        "completion_tokens": response.usage.completion_tokens,
-                        "total_tokens": response.usage.total_tokens,
-                    },
-                    "finish_reason": choice.finish_reason,
-                },
-            )
+            # Coda comune di generate (punto unico _response_parsers, regola L):
+            # content passato esplicito perche' gia' sanitizzato dal leak DSML.
+            return build_generate_result(self.name, model, response, content=_gen_content)
         except Exception as e:
-            # Contratto dati B (regola L): error_class + http_status strutturati
-            # dall'oggetto SDK reale (niente fallback lessicale a valle).
-            meta = format_error_result(e, self.name, model)
-            return ProviderResult(
-                provider=self.name, model=model,
-                content=f"[Error: {meta['error']}]",
-                metadata=meta,
-            )
+            return build_agent_turn_error(e, self.name, model)
 
     async def generate_agent_turn(
         self,
@@ -164,11 +130,7 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
         chiamate SENZA tool, evitando il content vuoto da reasoning overflow.
         """
         if not self._api_key:
-            return ProviderResult(
-                provider=self.name, model=model,
-                content="[DeepSeek API key not configured]",
-                metadata={"error": "missing_api_key"},
-            )
+            return self._missing_api_key_result(model)
         try:
             client = self._get_client()
             # Punto unico prepare_openai_compat_request (regola L, S78).
@@ -241,45 +203,22 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
             # Guarded: presente solo con thinking attivo ('native'); con
             # 'disable_for_tools' (default dual-mode) e' vuoto -> no-op.
             reasoning_content = getattr(msg, "reasoning_content", "") or ""
-            stop_reason = "end_turn"
-            tool_use_blocks: list[dict] = []
-            assistant_content: list[dict] = []
+            initial_content: list[dict] = []
             if reasoning_content:
-                assistant_content.append(
+                initial_content.append(
                     {"type": "reasoning", "reasoning": reasoning_content}
                 )
 
-            if choice.finish_reason == "tool_calls" and msg.tool_calls:
-                stop_reason = "tool_use"
-                for tc in msg.tool_calls:
-                    import json as _json
-                    try:
-                        args = _json.loads(tc.function.arguments)
-                    except Exception:
-                        args = {}
-                    block = {"id": tc.id, "name": tc.function.name, "input": args}
-                    tool_use_blocks.append(block)
-                    assistant_content.append({"type": "tool_use", **block})
-            else:
-                # M64: alcuni modelli (deepseek-chat in particolare) talvolta
-                # emettono tool_call come XML inline nel content invece di
-                # usare il campo tool_calls nativo. Esempio:
-                # <invoke name="run_command"><parameter name="command">ls</parameter></invoke>
-                # Se rilevato, parsiamo e convertiamo in tool_use_blocks per
-                # evitare che finisca nel display come testo grezzo (DSML leak).
-                tool_names = {t.get("name", "") for t in tools if t.get("name")}
-                from ._schema_utils import parse_inline_tool_invocations
-                xml_blocks, cleaned_text = parse_inline_tool_invocations(text_content, tool_names)
-                if xml_blocks:
-                    stop_reason = "tool_use"
-                    for blk in xml_blocks:
-                        tool_use_blocks.append(blk)
-                        assistant_content.append({"type": "tool_use", **blk})
-                    if cleaned_text.strip():
-                        assistant_content.insert(0, {"type": "text", "text": cleaned_text})
-                    text_content = cleaned_text
-                elif text_content:
-                    assistant_content.append({"type": "text", "text": text_content})
+            # Punto unico in _response_parsers (regola L, S61): tool_calls nativi
+            # + fallback XML inline nel content (M64, quirk osservato proprio su
+            # deepseek-chat). Il blocco reasoning entra come contenuto iniziale.
+            from ._response_parsers import parse_openai_compatible_choice
+            stop_reason, text_content, tool_use_blocks, assistant_content = (
+                parse_openai_compatible_choice(
+                    msg, choice.finish_reason, tools, text_content,
+                    initial_assistant_content=initial_content,
+                )
+            )
 
             # Diagnostica (regola F: solo lunghezze + finish_reason, niente payload):
             # i modelli deepseek a volte chiudono con content vuoto (la risposta
@@ -325,17 +264,5 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
             )
         except Exception as e:
             return build_agent_turn_error(e, self.name, model)
-
-    async def test_connection(self) -> dict[str, Any]:
-        if not self._api_key:
-            return {"provider": self.name, "status": "not_configured", "reason": "API key non configurata"}
-        try:
-            client = self._get_client()
-            await client.models.list()
-            return {"provider": self.name, "status": "ready"}
-        except Exception as e:
-            from .error_handler import classify_error
-            info = classify_error(e, self.name)
-            return {"provider": self.name, "status": "error", "reason": info["message"], "error_class": info["stop_reason"]}
 
 

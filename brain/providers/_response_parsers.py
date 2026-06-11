@@ -20,6 +20,7 @@ def parse_openai_compatible_choice(
     finish_reason: str | None,
     tools: list[dict],
     text_content: str,
+    initial_assistant_content: list[dict] | None = None,
 ) -> tuple[str, str, list[dict], list[dict]]:
     """Interpreta una `choice.message` di un SDK OpenAI-compatible.
 
@@ -34,12 +35,20 @@ def parse_openai_compatible_choice(
     - In assenza di tool calls, ``assistant_content`` contiene il solo blocco
       `{"type": "text", ...}` se il testo non e' vuoto.
 
+    ``initial_assistant_content``: blocchi da preservare in testa
+    all'``assistant_content`` (es. il blocco ``reasoning`` del thinking mode
+    DeepSeek, che DEVE essere rispedito nei turni successivi). NB: nel ramo
+    XML inline il testo ripulito viene inserito a indice 0, quindi PRIMA di
+    questi blocchi (comportamento storico DeepSeek preservato).
+
     ``stop_reason`` parte da ``"end_turn"`` e diventa ``"tool_use"`` se almeno
     un blocco tool e' stato emesso.
     """
     stop_reason = "end_turn"
     tool_use_blocks: list[dict] = []
-    assistant_content: list[dict] = []
+    assistant_content: list[dict] = (
+        list(initial_assistant_content) if initial_assistant_content else []
+    )
 
     if finish_reason == "tool_calls" and getattr(msg, "tool_calls", None):
         stop_reason = "tool_use"
@@ -101,8 +110,43 @@ def build_agent_turn_result(
     )
 
 
+def build_generate_result(
+    provider: str,
+    model: str,
+    response: Any,
+    content: str | None = None,
+) -> Any:
+    """Coda comune di ``generate`` (non agentico) per i provider
+    OpenAI-compatible: ``ProviderResult`` di successo con usage standard
+    (prompt/completion/total) + ``finish_reason``. Prima era duplicata
+    pari-pari in openai/deepseek/mistral (cluster jscpd E3).
+
+    ``content``: testo gia' post-processato dal provider (es. strip dei marker
+    DSML in deepseek); default il content della prima choice.
+    """
+    from .base import ProviderResult
+
+    choice = response.choices[0]
+    return ProviderResult(
+        provider=provider,
+        model=model,
+        content=(choice.message.content or "") if content is None else content,
+        metadata={
+            "usage": {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens,
+            },
+            "finish_reason": choice.finish_reason,
+        },
+    )
+
+
 def build_agent_turn_error(exc: Exception, provider: str, model: str) -> Any:
-    """Coda d'errore comune di ``generate_agent_turn`` (OpenAI-compatible).
+    """Coda d'errore comune di ``generate`` e ``generate_agent_turn``
+    (OpenAI-compatible). Contratto dati B (regola L): error_class +
+    http_status strutturati dall'oggetto SDK reale, niente fallback lessicale
+    a valle.
 
     Delega la classificazione a ``format_error_result`` (punto unico W2.2) e
     impacchetta il ``ProviderResult`` d'errore con il contratto ``[Error: ...]``

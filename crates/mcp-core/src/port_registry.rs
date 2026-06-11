@@ -126,6 +126,20 @@ impl std::fmt::Debug for PortRegistryCache {
 }
 
 impl PortRegistryCache {
+    /// Cache vuota per i test unit: nessun accesso al DB finche' non parte
+    /// un refresh (che nei test non viene mai avviato). Il pool puo' essere
+    /// un `connect_lazy` mai contattato.
+    #[cfg(test)]
+    pub(crate) fn empty_for_tests(db: PgPool) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Arc::new(PortRegistry {
+                by_port: HashMap::new(),
+                by_project: HashMap::new(),
+            }))),
+            db,
+        }
+    }
+
     /// Inizializza la cache. Retry 5x5s per dare tempo a Postgres di salire.
     /// A differenza di RoutingMatrixCache, NON panica se la tabella e' vuota
     /// (situazione normale al primo avvio senza allocazioni).

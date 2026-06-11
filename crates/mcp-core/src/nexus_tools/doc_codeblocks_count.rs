@@ -3,26 +3,13 @@ use super::{NexusToolContext, NexusToolError, NexusToolHandler, NexusToolSafety}
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::Component;
 
 pub struct DocCodeblocksCountTool;
 
 #[async_trait]
 impl NexusToolHandler for DocCodeblocksCountTool {
     async fn execute(&self, ctx: &NexusToolContext, args: &Value) -> Result<Value, NexusToolError> {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or("README.md");
-        let pb = std::path::PathBuf::from(path);
-        if pb.components().any(|c| matches!(c, Component::ParentDir)) {
-            return Err(NexusToolError::BadInput("path traversal denied".into()));
-        }
-        let full = ctx.project_root.join(&pb);
-        if !full.starts_with(&ctx.project_root) {
-            return Err(NexusToolError::BadInput("path traversal denied".into()));
-        }
-        let content = std::fs::read_to_string(&full).map_err(NexusToolError::Io)?;
+        let (path, content) = super::read_doc_file(ctx, args)?;
         let mut counts: HashMap<String, usize> = HashMap::new();
         let mut in_block = false;
         let mut total = 0usize;

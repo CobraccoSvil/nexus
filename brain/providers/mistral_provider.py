@@ -5,16 +5,13 @@ import logging
 import os
 from typing import Any
 
-from .base import (
-    ApiKeyClientMixin,
-    BaseProvider,
-    ProviderCatalogEntry,
-    ProviderResult,
-    build_openai_compatible_client,
+from .base import OpenAICompatProviderBase, ProviderResult
+from .openai_provider import _anthropic_tool_to_openai
+from ._response_parsers import (
+    build_agent_turn_error,
+    build_agent_turn_result,
+    build_generate_result,
 )
-from .error_handler import format_error_result
-from .openai_provider import _anthropic_tool_to_openai, _convert_messages_to_openai
-from ._response_parsers import build_agent_turn_error, build_agent_turn_result
 from ._schema_utils import compress_tool_list, resolve_tool_choice_openai
 
 logger = logging.getLogger(__name__)
@@ -22,35 +19,21 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://api.mistral.ai/v1"
 
 
-class MistralProvider(BaseProvider, ApiKeyClientMixin):
+class MistralProvider(OpenAICompatProviderBase):
     """Provider Mistral (OpenAI-compatible endpoint).
 
-    La gestione API key + client cacheato vive nel mixin ``ApiKeyClientMixin``
-    (punto unico, regola L / ADR 0026, Wave C3).
+    Plumbing comune (API key/client, catalogo da DB, guard key mancante,
+    test_connection) nel punto unico ``OpenAICompatProviderBase``
+    (regola L / ADR 0026, Wave E3).
     """
 
     name = "mistral"
-
-    def __init__(self) -> None:
-        self._init_api_key_cache()
-
-    def _create_client(self, api_key: str) -> Any:
-        # Punto unico build_openai_compatible_client (regola L, S70).
-        return build_openai_compatible_client(api_key, base_url=BASE_URL)
-
-    def list_models(self) -> list[ProviderCatalogEntry]:
-        # Lista modelli letta da DB (ai_price_catalog) con cache 60s.
-        # Niente fallback hardcoded.
-        from .catalog_loader import load_provider_catalog
-        return load_provider_catalog(self.name)
+    base_url = BASE_URL
+    api_key_label = "Mistral"
 
     async def generate(self, model: str, prompt: str, **kwargs: Any) -> ProviderResult:
         if not self._api_key:
-            return ProviderResult(
-                provider=self.name, model=model,
-                content="[Mistral API key not configured]",
-                metadata={"error": "missing_api_key"},
-            )
+            return self._missing_api_key_result(model)
         try:
             client = self._get_client()
             response = await client.chat.completions.create(
@@ -59,29 +42,10 @@ class MistralProvider(BaseProvider, ApiKeyClientMixin):
                 max_tokens=kwargs.get("max_tokens", 4096),
                 temperature=kwargs.get("temperature", 0.7),
             )
-            choice = response.choices[0]
-            return ProviderResult(
-                provider=self.name,
-                model=model,
-                content=choice.message.content or "",
-                metadata={
-                    "usage": {
-                        "prompt_tokens": response.usage.prompt_tokens,
-                        "completion_tokens": response.usage.completion_tokens,
-                        "total_tokens": response.usage.total_tokens,
-                    },
-                    "finish_reason": choice.finish_reason,
-                },
-            )
+            # Coda comune di generate (punto unico _response_parsers, regola L).
+            return build_generate_result(self.name, model, response)
         except Exception as e:
-            # Contratto dati B (regola L): error_class + http_status strutturati
-            # dall'oggetto SDK reale (niente fallback lessicale a valle).
-            meta = format_error_result(e, self.name, model)
-            return ProviderResult(
-                provider=self.name, model=model,
-                content=f"[Error: {meta['error']}]",
-                metadata=meta,
-            )
+            return build_agent_turn_error(e, self.name, model)
 
     async def generate_agent_turn(
         self,
@@ -107,11 +71,7 @@ class MistralProvider(BaseProvider, ApiKeyClientMixin):
         one-shot, dove il caching non porterebbe beneficio.
         """
         if not self._api_key:
-            return ProviderResult(
-                provider=self.name, model=model,
-                content="[Mistral API key not configured]",
-                metadata={"error": "missing_api_key"},
-            )
+            return self._missing_api_key_result(model)
         try:
             client = self._get_client()
             # Punto unico prepare_openai_compat_request (regola L, S78).
@@ -268,15 +228,3 @@ class MistralProvider(BaseProvider, ApiKeyClientMixin):
             )
         except Exception as e:
             return build_agent_turn_error(e, self.name, model)
-
-    async def test_connection(self) -> dict[str, Any]:
-        if not self._api_key:
-            return {"provider": self.name, "status": "not_configured", "reason": "API key non configurata"}
-        try:
-            client = self._get_client()
-            await client.models.list()
-            return {"provider": self.name, "status": "ready"}
-        except Exception as e:
-            from .error_handler import classify_error
-            info = classify_error(e, self.name)
-            return {"provider": self.name, "status": "error", "reason": info["message"], "error_class": info["stop_reason"]}

@@ -136,7 +136,8 @@ impl NexusToolHandler for ProjectDbBackupTool {
             .await
             .map_err(|e| NexusToolError::BadInput(format!("nexus db: {}", e)))?;
 
-        let dsn = get_project_dsn(&nexus_pool, ctx.project_id).await?;
+        let dsn =
+            super::project_db_helpers::get_project_dsn(&nexus_pool, ctx.project_id).await?;
         nexus_pool.close().await;
 
         let (host, port, dbname, user, password) = parse_dsn_parts(&dsn)?;
@@ -225,45 +226,6 @@ impl NexusToolHandler for ProjectDbBackupTool {
             network_egress: true,
         }
     }
-}
-
-async fn get_project_dsn(
-    nexus_pool: &sqlx::PgPool,
-    project_id: uuid::Uuid,
-) -> Result<String, NexusToolError> {
-    let row: Option<(Vec<u8>, String)> = sqlx::query_as(
-        r#"SELECT connection_secret, engine
-           FROM project_database_config
-           WHERE project_id = $1
-           ORDER BY is_primary DESC, created_at ASC
-           LIMIT 1"#,
-    )
-    .bind(project_id)
-    .fetch_optional(nexus_pool)
-    .await
-    .map_err(|e| NexusToolError::BadInput(format!("lookup config: {}", e)))?;
-
-    let (secret_bytes, engine) = row.ok_or_else(|| {
-        NexusToolError::BadInput(format!(
-            "Nessuna connessione DB per il progetto {}. Usa project_db_set_connection.",
-            project_id
-        ))
-    })?;
-
-    if engine != "postgres" {
-        return Err(NexusToolError::BadInput(format!(
-            "Engine '{}' non supportato",
-            engine
-        )));
-    }
-
-    let dsn = String::from_utf8(secret_bytes)
-        .map_err(|_| NexusToolError::BadInput("connection_secret non UTF-8".into()))?;
-
-    let normalized = db_helper::normalize_dsn_pub(dsn.trim())
-        .map_err(|e| NexusToolError::BadInput(format!("DSN: {}", e)))?;
-
-    Ok(normalized)
 }
 
 #[cfg(test)]

@@ -816,24 +816,20 @@ def _inject_language_reminder(
     enabled: bool,
     reminder_text: str,
 ) -> tuple[list[Any], str]:
-    """Inietta il reminder di lingua nel system_text e nell'ultimo HumanMessage.
+    """Inietta il reminder di lingua nel system_text (testa + coda).
 
     Funzione pura e idempotente (testabile senza far girare executor_node):
+    il reminder viene messo in TESTA al system_text (con marcatore univoco
+    _LANG_REMINDER_MARKER) e ribadito in CODA. Copre profili/template senza
+    direttiva di lingua e resiste al bias linguistico dei modelli small.
 
-      1. GARANZIA NEL SYSTEM: appende il reminder in coda a system_text con
-         marcatore univoco _LANG_REMINDER_MARKER. Copre profili/template senza
-         direttiva di lingua.
-      2. RECENCY NEI MESSAGGI: appende il reminder al content dell'ULTIMO
-         HumanMessage con content stringa (recency bias dei modelli small).
-         NON aggiunge un nuovo messaggio (l'alternanza user/assistant richiesta
-         da Anthropic resterebbe rotta). Crea una COPIA del messaggio, non muta
-         l'oggetto originale dello stato condiviso. Se l'ultimo HumanMessage ha
-         content non-stringa (lista di blocchi) il punto 2 viene saltato: il
-         punto 1 garantisce comunque la copertura.
+    I messaggi NON vengono mai modificati (P3 prefix stabile): la vecchia
+    iniezione nell'ultimo HumanMessage mutava il prefix a ogni iterazione e
+    invalidava il KV-cache dei provider.
 
-    Ritorna (messages, system_text) eventualmente modificati. Se enabled e'
-    False ritorna gli input invariati. Idempotente: il marcatore e il testo
-    gia' presenti non vengono riappesi.
+    Ritorna (messages, system_text); messages e' sempre l'input invariato.
+    Se enabled e' False ritorna entrambi gli input invariati. Idempotente:
+    il marcatore gia' presente non viene riappeso.
     """
     if not enabled or not reminder_text:
         return messages, system_text

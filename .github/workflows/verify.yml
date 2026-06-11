@@ -44,3 +44,32 @@ jobs:
 
       - name: Lint commits (xtask)
         run: pnpm xtask lint-commits origin/main HEAD || true
+
+  # Suite pytest del brain Python. Job separato (parallelo a verify): la suite
+  # e' auto-contenuta (mock puri, nessun Postgres/Qdrant richiesto). Gate nato
+  # dall'audit 11/06/2026: 9 test marciti perche' pnpm verify non li copriva.
+  brain-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # torch arriva come dipendenza transitiva di sentence-transformers: il
+      # wheel CPU pesa una frazione di quello CUDA di default (inutile in CI).
+      - name: Install torch CPU
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      # Fonte unica dipendenze: brain/pyproject.toml (build backend poetry-core).
+      # pytest/pytest-asyncio sono nel gruppo dev poetry, che pip non installa.
+      - name: Install brain dependencies
+        run: pip install ./brain pytest pytest-asyncio
+
+      - name: Pytest brain
+        run: python -m pytest -o addopts="" brain/tests -q
+        env:
+          PYTHONPATH: ${{ github.workspace }}

@@ -15,22 +15,11 @@ pub use nexus_types::settings_dto::{
 };
 
 // FS browse: punto unico in nexus_types::fs_browse (regola L / ADR 0026).
-// Prima `BrowseDirectoryNode`, `list_root_candidates`, `list_directories` e
-// `validate_directory_name` erano duplicati con crates/mcp-core/src/settings.rs.
-use nexus_types::fs_browse::{
-    list_directories, list_root_candidates, validate_directory_name as validate_dir_name,
-};
-
-type ApiError = (StatusCode, Json<Value>);
-type ApiResult = Result<Json<Value>, ApiError>;
-
-fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
-    (status, Json(json!({ "error": message.into() })))
-}
-
-fn validate_directory_name(name: &str) -> Result<&str, ApiError> {
-    validate_dir_name(name).map_err(|msg| api_error(StatusCode::BAD_REQUEST, msg))
-}
+use nexus_types::fs_browse::{list_directories, list_root_candidates};
+// Tipi e helper API: punto unico in nexus_types (regola L / ADR 0026, cluster E6).
+// Prima `ApiError`/`ApiResult`/`api_error`/`validate_directory_name` erano
+// ri-implementati identici qui e in crates/mcp-core/src/settings.rs.
+use nexus_types::{api_error, validate_directory_name_api as validate_directory_name, ApiResult};
 
 async fn ensure_required_settings(state: &AppState) {
     // Default statici: migrazione 0325 (regola G/H). Parte dinamica

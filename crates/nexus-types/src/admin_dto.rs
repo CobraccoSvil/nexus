@@ -187,6 +187,100 @@ pub async fn fetch_all_projects_summary(
         .collect())
 }
 
+/// Riga utente come tornata dalle query admin (id, email, display_name,
+/// github_username, avatar_url, role, created_at).
+type UserRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
+
+fn map_user_row(
+    (id, email, display_name, github_username, avatar_url, role, created_at): UserRow,
+) -> UserResponse {
+    UserResponse {
+        id,
+        email,
+        display_name,
+        github_username,
+        avatar_url,
+        role,
+        created_at,
+    }
+}
+
+/// Fetch utente singolo + progetti per la view `get_user` dell'admin.
+/// Punto unico fra admin-service e mcp-core (cluster jscpd E6).
+/// `Ok(None)` = utente inesistente o soft-deleted.
+///
+/// NOTA: la query progetti conserva la semantica storica `.unwrap_or_default()`
+/// (errore DB -> lista vuota) per parita' di comportamento con i due handler
+/// originali (refactor puro, regola sul comportamento identico).
+pub async fn fetch_user_with_projects(
+    db: &PgPool,
+    user_uuid: Uuid,
+) -> Result<Option<UserWithProjectsResponse>, sqlx::Error> {
+    let row: Option<UserRow> = sqlx::query_as(
+        "SELECT id::text, email, display_name, github_username, avatar_url, role, created_at::text FROM users WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(user_uuid)
+    .fetch_optional(db)
+    .await?;
+
+    let Some(user_row) = row else {
+        return Ok(None);
+    };
+
+    let projects: Vec<UserProjectRole> = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT p.id, p.name, pm.role FROM project_members pm JOIN projects p ON pm.project_id = p.id WHERE pm.user_id = $1 ORDER BY p.name",
+    )
+    .bind(user_uuid)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(project_id, project_name, role)| UserProjectRole {
+        project_id,
+        project_name,
+        role,
+    })
+    .collect();
+
+    let project_count = projects.len() as i32;
+
+    Ok(Some(UserWithProjectsResponse {
+        user: map_user_row(user_row),
+        project_count,
+        projects,
+    }))
+}
+
+/// Ricerca utenti per email/display_name/github_username (LIKE case-insensitive,
+/// max 50 risultati). Punto unico fra admin-service e mcp-core (cluster jscpd E6).
+pub async fn search_users_like(db: &PgPool, q: &str) -> Result<Vec<UserResponse>, sqlx::Error> {
+    let pattern = format!("%{}%", q.to_lowercase());
+    let rows: Vec<UserRow> = sqlx::query_as(
+        r#"
+        SELECT id::text, email, display_name, github_username, avatar_url, role, created_at::text
+        FROM users
+        WHERE deleted_at IS NULL AND (
+            LOWER(email) LIKE $1 OR LOWER(display_name) LIKE $1 OR LOWER(github_username) LIKE $1
+        )
+        ORDER BY created_at DESC
+        LIMIT 50
+        "#,
+    )
+    .bind(&pattern)
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows.into_iter().map(map_user_row).collect())
+}
+
 /// SELECT membri di un progetto (join con users). Propaga l'errore SQL al
 /// chiamante (regola H: fail-loud invece di ingoiare). Punto unico per
 /// `list_project_members` admin.

@@ -29,6 +29,14 @@ pub fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
     (status, Json(json!({ "error": message.into() })))
 }
 
+/// Validazione nome directory con errore API pronto (BAD_REQUEST).
+/// Punto unico (regola L / ADR 0026): prima il wrapper era duplicato
+/// identico nei settings.rs di admin-service e mcp-core.
+pub fn validate_directory_name_api(name: &str) -> Result<&str, ApiError> {
+    fs_browse::validate_directory_name(name)
+        .map_err(|msg| api_error(StatusCode::BAD_REQUEST, msg))
+}
+
 pub fn parse_user_id(claims: &Claims) -> Result<Uuid, ApiError> {
     Uuid::parse_str(&claims.sub)
         .map_err(|_| api_error(StatusCode::UNAUTHORIZED, "Sessione utente non valida"))

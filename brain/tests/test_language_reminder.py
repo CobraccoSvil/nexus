@@ -3,10 +3,12 @@
 Copre la funzione pura _inject_language_reminder e il loader cache
 _load_language_reminder di brain/agents/nodes.py:
 
-  1. reminder iniettato in system_text e nell'ultimo HumanMessage (enabled=True);
+  1. reminder iniettato nel system_text in TESTA e ribadito in CODA
+     (enabled=True); i messaggi NON vengono toccati (P3 prefix stabile:
+     mutare l'ultimo HumanMessage invalidava il KV-cache a ogni iterazione);
   2. nessuna modifica quando enabled=False;
   3. idempotenza: chiamare due volte non duplica;
-  4. content come lista di blocchi: punto 2 saltato, punto 1 applicato;
+  4. content come lista di blocchi: messaggi comunque invariati;
   5. default sicuri quando il DB e' irraggiungibile (loader settings mockato).
 
 Mock puri: nessuna connessione DB o provider LLM reale.
@@ -31,7 +33,7 @@ REMINDER = "Rispondi SEMPRE e SOLO in italiano. Mai cinese."
 class TestInjectLanguageReminder(unittest.TestCase):
     """Funzione pura _inject_language_reminder."""
 
-    def test_inietta_system_e_ultimo_human(self):
+    def test_inietta_system_testa_e_coda(self):
         messages = [
             HumanMessage(content="primo task"),
             AIMessage(content="ok procedo"),
@@ -43,15 +45,16 @@ class TestInjectLanguageReminder(unittest.TestCase):
             messages, system_text, enabled=True, reminder_text=REMINDER
         )
 
-        # Punto 1: system_text contiene marcatore + reminder.
+        # System: marcatore in testa, reminder ribadito in testa E in coda,
+        # testo originale preservato nel mezzo.
         self.assertIn(_LANG_REMINDER_MARKER, new_system)
-        self.assertIn(REMINDER, new_system)
-        self.assertTrue(new_system.startswith("Sei un agente."))
+        self.assertTrue(new_system.startswith(_LANG_REMINDER_MARKER))
+        self.assertEqual(new_system.count(REMINDER), 2)
+        self.assertIn("Sei un agente.", new_system)
 
-        # Punto 2: solo l'ULTIMO HumanMessage modificato.
-        self.assertIn(REMINDER, new_messages[2].content)
-        self.assertNotIn(REMINDER, new_messages[0].content)
-        # L'AIMessage intermedio resta intatto.
+        # P3 prefix stabile: i messaggi NON vengono toccati.
+        self.assertIs(new_messages, messages)
+        self.assertNotIn(REMINDER, new_messages[2].content)
         self.assertEqual(new_messages[1].content, "ok procedo")
 
     def test_non_muta_originale(self):
@@ -90,13 +93,14 @@ class TestInjectLanguageReminder(unittest.TestCase):
         # Seconda chiamata non duplica nel system.
         self.assertEqual(sys1, sys2)
         self.assertEqual(sys2.count(_LANG_REMINDER_MARKER), 1)
-        # Seconda chiamata non duplica nel content dell'ultimo HumanMessage.
-        self.assertEqual(msgs1[0].content, msgs2[0].content)
-        self.assertEqual(msgs2[0].content.count(REMINDER), 1)
+        # I messaggi restano sempre invariati (P3 prefix stabile).
+        self.assertIs(msgs2, msgs1)
+        self.assertEqual(msgs2[0].content, "task")
+        self.assertNotIn(REMINDER, msgs2[0].content)
 
-    def test_content_lista_blocchi_salta_punto2(self):
+    def test_content_lista_blocchi_messaggi_invariati(self):
         # Ultimo HumanMessage con content non-stringa (lista di blocchi):
-        # punto 2 saltato, punto 1 comunque applicato.
+        # system iniettato, messaggi comunque invariati.
         blocks = [{"type": "text", "text": "vedi allegato"}]
         last = HumanMessage(content=blocks)
         messages = [HumanMessage(content="intro"), last]
@@ -106,14 +110,12 @@ class TestInjectLanguageReminder(unittest.TestCase):
             messages, system_text, enabled=True, reminder_text=REMINDER
         )
 
-        # Punto 1 applicato.
         self.assertIn(REMINDER, new_system)
-        # Punto 2 saltato: nessun messaggio modificato (lista invariata).
         self.assertIs(new_messages, messages)
         self.assertEqual(new_messages[1].content, blocks)
 
     def test_nessun_human_message(self):
-        # Solo AIMessage: punto 2 saltato senza errori, punto 1 applicato.
+        # Solo AIMessage: nessun errore, system comunque iniettato.
         messages = [AIMessage(content="solo assistant")]
         new_messages, new_system = _inject_language_reminder(
             messages, "sys", enabled=True, reminder_text=REMINDER

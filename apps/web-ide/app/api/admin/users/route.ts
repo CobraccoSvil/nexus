@@ -35,19 +35,24 @@ export async function GET(request: NextRequest) {
   }
 }
 
-export async function PUT(request: NextRequest) {
+// Punto unico per PUT/DELETE (regola L): stesso forwarding, gestione 204
+// e status passthrough; il body viene letto solo per la PUT.
+async function forwardUsersRequest(
+  request: NextRequest,
+  method: "PUT" | "DELETE",
+): Promise<NextResponse> {
   const url = new URL(request.url);
   const backendUrl = `http://localhost:4000/api/admin/users${url.search}`;
-  const body = await request.json();
+  const body = method === "PUT" ? JSON.stringify(await request.json()) : undefined;
 
   try {
     const response = await fetch(backendUrl, {
-      method: "PUT",
+      method,
       headers: {
         "Cookie": request.headers.get("cookie") || "",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(body),
+      body,
     });
 
     // Handle empty responses
@@ -66,31 +71,10 @@ export async function PUT(request: NextRequest) {
   }
 }
 
+export async function PUT(request: NextRequest) {
+  return forwardUsersRequest(request, "PUT");
+}
+
 export async function DELETE(request: NextRequest) {
-  const url = new URL(request.url);
-  const backendUrl = `http://localhost:4000/api/admin/users${url.search}`;
-
-  try {
-    const response = await fetch(backendUrl, {
-      method: "DELETE",
-      headers: {
-        "Cookie": request.headers.get("cookie") || "",
-        "Content-Type": "application/json",
-      },
-    });
-
-    // Handle empty responses
-    if (response.status === 204 || response.headers.get("content-length") === "0") {
-      return NextResponse.json(null, { status: response.status });
-    }
-
-    const data = await response.json();
-    return NextResponse.json(data, { status: response.status });
-  } catch (error) {
-    console.error("API proxy error:", error);
-    return NextResponse.json(
-      { error: "Internal server error" },
-      { status: 500 }
-    );
-  }
+  return forwardUsersRequest(request, "DELETE");
 }

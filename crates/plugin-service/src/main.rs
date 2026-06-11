@@ -1,8 +1,5 @@
 use axum::{
-    extract::State,
-    http::{Request, StatusCode},
-    middleware::{self as axum_mw, Next},
-    response::Response,
+    middleware as axum_mw,
     routing::{delete, get, post, put},
     Router,
 };
@@ -13,16 +10,6 @@ use tower_http::trace::TraceLayer;
 mod mcp_client;
 mod mcp_connectors;
 mod plugins;
-
-async fn require_auth(
-    State(state): State<AppState>,
-    mut req: Request<axum::body::Body>,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    let claims = nexus_auth::validate_token(&state.db, req.headers()).await?;
-    req.extensions_mut().insert(claims);
-    Ok(next.run(req).await)
-}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -77,7 +64,11 @@ async fn main() -> anyhow::Result<()> {
         // Figma OAuth
         .route("/figma/oauth/status", get(plugins::get_figma_oauth_status))
         .route("/figma/oauth/start", post(plugins::start_figma_oauth))
-        .layer(axum_mw::from_fn_with_state(state.clone(), require_auth))
+        // Middleware auth dal punto unico nexus-auth (regola L, cluster E4).
+        .layer(axum_mw::from_fn_with_state(
+            db.clone(),
+            nexus_auth::require_auth::<AppState>,
+        ))
         .with_state(state.clone());
 
     // -- MCP connector routes (auth required) --
@@ -89,7 +80,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/:id/test", post(mcp_connectors::test_mcp_server))
         .route("/:id/toggle", put(mcp_connectors::toggle_mcp_server))
-        .layer(axum_mw::from_fn_with_state(state.clone(), require_auth))
+        .layer(axum_mw::from_fn_with_state(
+            db.clone(),
+            nexus_auth::require_auth::<AppState>,
+        ))
         .with_state(state.clone());
 
     // -- Internal routes (no auth - localhost only) --

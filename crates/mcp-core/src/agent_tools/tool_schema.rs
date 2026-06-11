@@ -645,7 +645,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "run_tests",
-    "description": "Usa questo tool per eseguire test del progetto con timeout esteso (120s). Auto-rileva il comando test (package.json, Cargo.toml, pyproject.toml, etc.) o accetta comando esplicito. Massimo 7 esecuzioni per sessione. Non usare run_command per test: questo tool è specializzato.",
+    "description": "Usa questo tool per eseguire test del progetto con timeout esteso (120s). Auto-rileva il comando test (package.json, Cargo.toml, pyproject.toml, etc.) o accetta comando esplicito. Esegui i test con parsimonia: preferisci 'filter' per sottoinsiemi mirati invece di rieseguire l'intera suite. Non usare run_command per test: questo tool è specializzato.",
     "input_schema": {
       "type": "object",
       "properties": {

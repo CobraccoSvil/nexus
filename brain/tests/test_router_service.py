@@ -36,8 +36,10 @@ def test_route_model_delegates_to_rust_endpoint() -> None:
         decision = router.route_model("file_ops", 800, "bilanciata", message="elimina i file")
     assert decision.provider == "anthropic"
     assert decision.model == "claude-sonnet-4-6"
+    # L'intent gia' classificato dal brain viene propagato al /decide Rust
+    # (commit 4f1c99d): mcp-core salta la classificazione LLM ridondante.
     mock_singleton.return_value.decide.assert_called_once_with(
-        message="elimina i file", behavior_mode="bilanciata",
+        message="elimina i file", behavior_mode="bilanciata", intent="file_ops",
     )
 
 
@@ -114,14 +116,15 @@ def test_cooldown_providers_none_when_unreachable() -> None:
 
 
 def test_routing_client_caches_per_message() -> None:
-    """Cache LRU-like: chiamate ripetute con stesso (msg, mode) entro 30s
-    non rifanno HTTP."""
+    """Cache LRU-like: chiamate ripetute con stesso (msg, mode, intent) entro
+    30s non rifanno HTTP. La chiave e' una tripla con intent (o "" se assente)
+    da quando il /decide riceve l'intent gia' classificato (commit 4f1c99d)."""
     from brain.router.service import _RoutingClient
     fake = RoutingDecision(provider="anthropic", model="claude-haiku-4-5-20251001", rationale="m", confidence=0.92)
     client = _RoutingClient(base_url="http://test")
     # Inietto a mano nella cache un'entry valida
     import time
-    client._cache[("hello", "bilanciata")] = (time.monotonic(), fake)
+    client._cache[("hello", "bilanciata", "")] = (time.monotonic(), fake)
     # La seconda chiamata deve restituire dalla cache (no HTTP -> no eccezione)
     d = client.decide(message="hello", behavior_mode="bilanciata")
     assert d.provider == "anthropic"

@@ -32,6 +32,10 @@ aiosqlite = ">=0.19.0"
 typing-extensions = ">=4.12"
 asyncpg = ">=0.31.0"
 sqlalchemy = {version = ">=2.0", extras = ["asyncio"]}
+# Driver sincrono usato dai punti unici settings_db/db_pool e da 20+ moduli
+# (criteria_runner, todo_store, ...). Era installato solo a mano sul dev box:
+# senza questa riga un install dal pyproject (CI inclusa) non lo porta.
+psycopg2-binary = "^2.9"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.5"

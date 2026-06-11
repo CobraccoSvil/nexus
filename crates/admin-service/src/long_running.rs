@@ -1,52 +1,25 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
     Json,
 };
-use serde_json::{json, Value};
 
 use crate::AppState;
 
-// Tipi DTO: punto unico in nexus_types::long_running_dto (regola L, S21).
-pub use nexus_types::long_running_dto::{
-    CreatePatternRequest, LongRunningPattern, UpdatePatternRequest,
-};
-
-type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
+// Tipi DTO e logica handler: punto unico in nexus_types::long_running_dto
+// (regola L, S21 + cluster E6). Qui restano solo i wrapper axum che
+// estraggono lo State del crate e delegano.
+pub use nexus_types::long_running_dto::{CreatePatternRequest, UpdatePatternRequest};
+use nexus_types::ApiResult;
 
 pub async fn list_patterns(State(state): State<AppState>) -> ApiResult {
-    let rows = sqlx::query_as::<_, LongRunningPattern>(
-        "SELECT id, pattern, description, enabled, created_at FROM long_running_patterns ORDER BY pattern",
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))))?;
-
-    Ok(Json(json!(rows)))
+    nexus_types::long_running_dto::list_patterns_core(&state.db).await
 }
 
 pub async fn create_pattern(
     State(state): State<AppState>,
     Json(body): Json<CreatePatternRequest>,
 ) -> ApiResult {
-    let pattern = body.pattern.trim().to_string();
-    if pattern.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": "pattern vuoto" }))));
-    }
-
-    let row = sqlx::query_as::<_, LongRunningPattern>(
-        "INSERT INTO long_running_patterns (pattern, description) VALUES ($1, $2) RETURNING id, pattern, description, enabled, created_at",
-    )
-    .bind(&pattern)
-    .bind(&body.description)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        let msg = if e.to_string().contains("duplicate") { format!("Pattern '{}' già esistente", pattern) } else { e.to_string() };
-        (StatusCode::CONFLICT, Json(json!({ "error": msg })))
-    })?;
-
-    Ok(Json(json!(row)))
+    nexus_types::long_running_dto::create_pattern_core(&state.db, body).await
 }
 
 pub async fn update_pattern(
@@ -54,43 +27,12 @@ pub async fn update_pattern(
     Path(id): Path<uuid::Uuid>,
     Json(body): Json<UpdatePatternRequest>,
 ) -> ApiResult {
-    let existing = sqlx::query_as::<_, LongRunningPattern>(
-        "SELECT id, pattern, description, enabled, created_at FROM long_running_patterns WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))))?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({ "error": "Pattern non trovato" }))))?;
-
-    let new_pattern = body.pattern.as_deref().unwrap_or(&existing.pattern).trim().to_string();
-    let new_desc = body.description.as_deref().unwrap_or(&existing.description).to_string();
-    let new_enabled = body.enabled.unwrap_or(existing.enabled);
-
-    let row = sqlx::query_as::<_, LongRunningPattern>(
-        "UPDATE long_running_patterns SET pattern = $2, description = $3, enabled = $4 WHERE id = $1 RETURNING id, pattern, description, enabled, created_at",
-    )
-    .bind(id).bind(&new_pattern).bind(&new_desc).bind(new_enabled)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))))?;
-
-    Ok(Json(json!(row)))
+    nexus_types::long_running_dto::update_pattern_core(&state.db, id, body).await
 }
 
 pub async fn delete_pattern(
     State(state): State<AppState>,
     Path(id): Path<uuid::Uuid>,
 ) -> ApiResult {
-    let result = sqlx::query("DELETE FROM long_running_patterns WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))))?;
-
-    if result.rows_affected() == 0 {
-        return Err((StatusCode::NOT_FOUND, Json(json!({ "error": "Pattern non trovato" }))));
-    }
-
-    Ok(Json(json!({ "ok": true })))
+    nexus_types::long_running_dto::delete_pattern_core(&state.db, id).await
 }

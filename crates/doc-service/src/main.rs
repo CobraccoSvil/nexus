@@ -1,8 +1,5 @@
 use axum::{
-    extract::State,
-    http::{Request, StatusCode},
-    middleware::{self as axum_mw, Next},
-    response::Response,
+    middleware as axum_mw,
     routing::{get, post},
     Router,
 };
@@ -12,16 +9,6 @@ use tower_http::trace::TraceLayer;
 
 mod documents;
 mod vector;
-
-async fn require_auth(
-    State(state): State<AppState>,
-    mut req: Request<axum::body::Body>,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    let claims = nexus_auth::validate_token(&state.db, req.headers()).await?;
-    req.extensions_mut().insert(claims);
-    Ok(next.run(req).await)
-}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -95,7 +82,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/documents/generate", post(documents::generate_document))
         .route("/documents/search", post(documents::search_documents))
-        .layer(axum_mw::from_fn_with_state(state.clone(), require_auth))
+        // Middleware auth dal punto unico nexus-auth (regola L, cluster E4).
+        .layer(axum_mw::from_fn_with_state(
+            db.clone(),
+            nexus_auth::require_auth::<AppState>,
+        ))
         .with_state(state.clone());
 
     let app = Router::new()

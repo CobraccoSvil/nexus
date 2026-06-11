@@ -40,10 +40,13 @@ def _safe_cfg(**overrides):
 class TestCriteriaRunner(unittest.TestCase):
 
     def test_run_command_passa_su_exit_0(self):
+        # Contratto dati A: l'exit code arriva STRUTTURATO nel ToolResult.
         from brain.agents.criteria_runner import run_criterion
         tool_runner = MagicMock()
         tool_runner.execute_tool = AsyncMock()
-        tool_runner.execute_tool.return_value = MagicMock(result_json="EXIT CODE: 0\nSTDOUT:\nok")
+        tool_runner.execute_tool.return_value = MagicMock(
+            result_json="STDOUT:\nok", exit_code=0,
+        )
         ctx = {"tool_runner": tool_runner, "session_id": "sess-1", "timeout_s": 5.0}
         ok, ev = _run(run_criterion({"type": "run_command", "spec": {"command": "true"}, "expected": {"exit_code": 0}}, ctx))
         self.assertTrue(ok)
@@ -53,11 +56,40 @@ class TestCriteriaRunner(unittest.TestCase):
         from brain.agents.criteria_runner import run_criterion
         tool_runner = MagicMock()
         tool_runner.execute_tool = AsyncMock()
-        tool_runner.execute_tool.return_value = MagicMock(result_json="EXIT CODE: 1\nSTDERR:\nfail")
+        tool_runner.execute_tool.return_value = MagicMock(
+            result_json="STDERR:\nfail", exit_code=1,
+        )
         ctx = {"tool_runner": tool_runner, "session_id": "sess-1"}
         ok, ev = _run(run_criterion({"type": "run_command", "spec": {"command": "false"}, "expected": {"exit_code": 0}}, ctx))
         self.assertFalse(ok)
         self.assertEqual(ev["exit_code"], 1)
+
+    def test_run_command_strutturato_vince_sul_testo(self):
+        # Se exit_code strutturato e testo divergono, vince lo strutturato
+        # (il testo "EXIT CODE: N" e' solo fallback per run vecchi/cache).
+        from brain.agents.criteria_runner import run_criterion
+        tool_runner = MagicMock()
+        tool_runner.execute_tool = AsyncMock()
+        tool_runner.execute_tool.return_value = MagicMock(
+            result_json="EXIT CODE: 0\nSTDOUT:\nok", exit_code=1,
+        )
+        ctx = {"tool_runner": tool_runner, "session_id": "sess-1"}
+        ok, ev = _run(run_criterion({"type": "run_command", "spec": {"command": "x"}, "expected": {"exit_code": 0}}, ctx))
+        self.assertFalse(ok)
+        self.assertEqual(ev["exit_code"], 1)
+
+    def test_run_command_fallback_lessicale_se_strutturato_assente(self):
+        # exit_code=None nel ToolResult: si ri-parsa "EXIT CODE: N" dal testo.
+        from brain.agents.criteria_runner import run_criterion
+        tool_runner = MagicMock()
+        tool_runner.execute_tool = AsyncMock()
+        tool_runner.execute_tool.return_value = MagicMock(
+            result_json="EXIT CODE: 0\nSTDOUT:\nok", exit_code=None,
+        )
+        ctx = {"tool_runner": tool_runner, "session_id": "sess-1"}
+        ok, ev = _run(run_criterion({"type": "run_command", "spec": {"command": "true"}, "expected": {"exit_code": 0}}, ctx))
+        self.assertTrue(ok)
+        self.assertEqual(ev["exit_code"], 0)
 
     def test_http_passa_su_status_atteso(self):
         from brain.agents import criteria_runner
@@ -108,12 +140,13 @@ class TestCriteriaRunner(unittest.TestCase):
         from brain.agents.criteria_runner import run_criterion
         tool_runner = MagicMock()
         tool_runner.execute_tool = AsyncMock()
-        # read_file ritorna contenuto del file
-        tool_runner.execute_tool.return_value = MagicMock(result_json="contenuto del file")
+        # list_files sulla dir parent elenca il basename (fonte di verita').
+        tool_runner.execute_tool.return_value = MagicMock(result_json="- x.txt\n- altro.md")
         ctx = {"tool_runner": tool_runner, "session_id": "sess-1"}
         ok, ev = _run(run_criterion({"type": "file_exists", "spec": {"path": "x.txt"}, "expected": {"exists": True}}, ctx))
         self.assertTrue(ok)
         self.assertTrue(ev["exists"])
+        self.assertEqual(ev["method"], "list_files")
 
     def test_file_exists_false_quando_read_file_errore(self):
         from brain.agents.criteria_runner import run_criterion

@@ -6,7 +6,6 @@ import type {
   WorkbenchLayoutMode,
   WorkbenchState,
 } from "../../lib/api-client";
-import type { useThemeColors } from "../../lib/theme";
 import type { SidebarView } from "../sidebar/sidebar-manager";
 import type { PanelTab } from "../panels/bottom-panel-manager";
 
@@ -273,19 +272,5 @@ export function providerTitle(label: string, state: ProviderHealthState): string
   return `${label} non disponibile`;
 }
 
-export function iconButton(tc: ReturnType<typeof useThemeColors>, disabled = false, active = false) {
-  return {
-    width: 30,
-    height: 30,
-    border: `1px solid ${active ? tc.accent : tc.border}`,
-    background: disabled ? tc.bgInput : active ? tc.accentBg : tc.bgCard,
-    color: disabled ? tc.textMuted : active ? tc.accent : tc.textSecondary,
-    borderRadius: 7,
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    cursor: disabled ? "not-allowed" : "pointer",
-    fontSize: 13,
-    lineHeight: 1,
-  } as const;
-}
+// Punto unico in lib/icon-button-style.ts (regola L); re-export per i call site esistenti.
+export { iconButton } from "../../lib/icon-button-style";
