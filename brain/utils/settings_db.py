@@ -132,6 +132,68 @@ def get_int_setting(key: str, default: int = 0) -> int:
         return default
 
 
+# ── Varianti CACHED (TTL 60s) per letture calde per-turno. ──────────────────
+# Punto unico (regola L): i call site del loop agentico che leggevano una
+# setting a OGNI turno (es. knowledge.rag_injection_mode, agent.tools.
+# discovery_first_*) passano da qui invece di replicare blocchi cache fatti a
+# mano. Riusa brain/utils/ttl_cache.TtlCache (punto unico Wave 6b).
+# Il valore cachato e' il RAW dal DB incapsulato in una tupla, per distinguere
+# "chiave assente in DB" (raw=None, si applica il default del chiamante) dal
+# cache-miss (TtlCache.get -> None). Gli errori DB NON vengono cachati: il
+# turno successivo riprova (stesso degraded mode delle varianti legacy).
+_SETTING_CACHE_TTL_S = 60.0
+_setting_cache: Any = None
+
+
+def _get_setting_cache() -> Any:
+    global _setting_cache
+    if _setting_cache is None:
+        from brain.utils.ttl_cache import TtlCache
+        _setting_cache = TtlCache(ttl_seconds=_SETTING_CACHE_TTL_S)
+    return _setting_cache
+
+
+def get_setting_cached(key: str, default: str = "") -> str:
+    """Come ``get_setting`` ma con cache TTL 60s sul valore raw.
+
+    Da usare nei path caldi eseguiti a ogni turno del loop agentico. Per le
+    letture one-shot o gia' dietro una cache di modulo restano valide le
+    varianti non cached.
+    """
+    cache = _get_setting_cache()
+    hit = cache.get(key)
+    if hit is not None:
+        raw = hit[0]
+        return raw if raw is not None else default
+    try:
+        raw = _read_setting_raw(key)
+    except Exception as exc:
+        logger.debug("settings_db.get_setting_cached(%r) fallito: %s — uso default=%r", key, exc, default)
+        return default
+    cache.set(key, (raw,))
+    return raw if raw is not None else default
+
+
+def get_bool_setting_cached(key: str, default: bool = False) -> bool:
+    """Variante booleana di ``get_setting_cached``."""
+    return get_setting_cached(key, "true" if default else "false").strip().lower() in (
+        "true", "1", "yes", "on",
+    )
+
+
+def get_int_setting_cached(key: str, default: int = 0) -> int:
+    """Variante intera di ``get_setting_cached``."""
+    raw = get_setting_cached(key, str(default)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        logger.debug(
+            "settings_db: key=%r valore=%r non e' un intero, uso default=%r",
+            key, raw, default,
+        )
+        return default
+
+
 def resolve_port(key: str) -> int:
     """Risolve una porta di bind leggendola ESCLUSIVAMENTE dal DB (tabella
     settings, regola G: il DB e' l'unica fonte di verita'). Nessun default

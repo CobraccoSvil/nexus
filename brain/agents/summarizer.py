@@ -268,17 +268,13 @@ def _resolve_summary_model(provider: str) -> str:
             "nexus_purpose_model. Configurare la variabile d'ambiente."
         )
     try:
-        import psycopg2  # type: ignore[import-untyped]
-        conn = psycopg2.connect(database_url)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT provider, model_id FROM nexus_purpose_model "
-                    "WHERE purpose = 'conversation_summary'",
-                )
-                row = cur.fetchone()
-        finally:
-            conn.close()
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT provider, model_id FROM nexus_purpose_model "
+                "WHERE purpose = 'conversation_summary'",
+            )
+            row = cur.fetchone()
     except Exception as exc:
         raise SummaryModelUnavailable(
             f"DB irraggiungibile: {exc}. Verifica Postgres e migrazione 0102."

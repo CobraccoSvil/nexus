@@ -56,8 +56,8 @@ def is_enabled() -> bool:
     url = _db_url()
     if url:
         try:
-            import psycopg2  # type: ignore[import-untyped]
-            with psycopg2.connect(url) as conn:
+            from brain.utils.db_pool import connect as _db_connect
+            with _db_connect() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT value FROM settings WHERE key = %s",
@@ -85,8 +85,8 @@ def load_enabled_playbooks() -> list[dict[str, Any]]:
         try:
             import json as _json
 
-            import psycopg2  # type: ignore[import-untyped]
-            with psycopg2.connect(url) as conn:
+            from brain.utils.db_pool import connect as _db_connect
+            with _db_connect() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT key, trigger_json, guidance_text, priority, "

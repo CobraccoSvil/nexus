@@ -1,11 +1,75 @@
 // safety: tutte le `Regex::new("...").unwrap()` in questo modulo sono
-// pattern literal hardcoded ammessi da CLAUDE.md §F. Refactor opportuno
-// (LazyLock<Regex>) ma non e' una violazione.
+// pattern literal hardcoded, compilati UNA volta in static `LazyLock<Regex>`
+// (C3, docs/tech-debt-rust.md): `index_source` e' chiamata in loop per-file
+// dagli scan di progetto e ricompilare le regex ad ogni file era il collo di
+// bottiglia del fallback non-tree-sitter.
+
+use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 mod ts_parser;
+
+// --- Regex compilate una sola volta (pattern literal; safety: literal valido) ---
+
+// TS/JS: funzioni, classi, interfacce, costanti, arrow function.
+static RE_TS_FN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:export\s+)?(?:async\s+)?function\s+(\w+)").unwrap());
+static RE_TS_CLASS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:export\s+)?class\s+(\w+)").unwrap());
+static RE_TS_IFACE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:export\s+)?interface\s+(\w+)").unwrap());
+static RE_TS_CONST: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:export\s+)?const\s+(\w+)\s*[=:]").unwrap());
+static RE_TS_ARROW: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?\(").unwrap());
+
+// Rust: fn, struct, enum, impl.
+static RE_RS_FN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:pub(?:\(crate\))?\s+)?(?:async\s+)?fn\s+(\w+)").unwrap());
+static RE_RS_STRUCT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:pub\s+)?struct\s+(\w+)").unwrap());
+static RE_RS_ENUM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:pub\s+)?enum\s+(\w+)").unwrap());
+static RE_RS_IMPL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"impl\s+(\w+)").unwrap());
+
+// Python: def (con indent catturato) e class.
+static RE_PY_DEF: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\s*)(?:async\s+)?def\s+(\w+)").unwrap());
+static RE_PY_CLASS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^class\s+(\w+)").unwrap());
+
+// Estrattore generico language-agnostic (Go/Java/C++/C#/Ruby/PHP/...).
+static RE_GEN_FN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:function|fn|def|func|sub|fun)\s+(\w+)").unwrap());
+// Tipi: class/struct/interface/enum/trait/type/record/protocol/object.
+// Include `type Nome` (Go: `type X struct`, TS/Swift type alias) oltre alle
+// keyword che precedono direttamente il nome del tipo.
+static RE_GEN_TYPE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:class|struct|interface|enum|trait|record|protocol|object|type)\s+(\w+)")
+        .unwrap()
+});
+// Metodi a graffe stile C/Java/Go: `tipo Nome(...)` o `func (r R) Nome(...)`.
+static RE_GEN_METHOD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*(?:[\w<>:\*\&\[\] ]+\s+)?(\w+)\s*\([^;]*\)\s*\{?\s*$").unwrap()
+});
+static RE_GEN_CONST: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:const|val|let|final|static)\s+(\w+)").unwrap());
+static RE_GEN_PUBLIC: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:pub|public|export)\b").unwrap());
+static RE_GEN_PRIVATE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:private|priv|internal)\b").unwrap());
+
+// Import per-linguaggio.
+static RE_TS_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"import\s+(?:\{([^}]+)\}|(\w+))\s+from\s+['"]([^'"]+)['"]"#).unwrap()
+});
+static RE_RS_USE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"use\s+([\w:]+)(?:::\{([^}]+)\})?").unwrap());
+static RE_PY_FROM_IMPORT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"from\s+([\w.]+)\s+import\s+(.+)").unwrap());
+static RE_PY_IMPORT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^import\s+([\w.]+)").unwrap());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
@@ -159,12 +223,6 @@ pub fn index_source(file_path: &str, source: &str) -> AstIndex {
 }
 
 fn extract_ts_symbols(lines: &[&str]) -> Vec<Symbol> {
-    let fn_re = Regex::new(r"(?:export\s+)?(?:async\s+)?function\s+(\w+)").unwrap();
-    let class_re = Regex::new(r"(?:export\s+)?class\s+(\w+)").unwrap();
-    let iface_re = Regex::new(r"(?:export\s+)?interface\s+(\w+)").unwrap();
-    let const_re = Regex::new(r"(?:export\s+)?const\s+(\w+)\s*[=:]").unwrap();
-    let arrow_re = Regex::new(r"(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?\(").unwrap();
-
     let mut symbols = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -175,35 +233,35 @@ fn extract_ts_symbols(lines: &[&str]) -> Vec<Symbol> {
             Visibility::Private
         };
 
-        if let Some(cap) = arrow_re.captures(trimmed) {
+        if let Some(cap) = RE_TS_ARROW.captures(trimmed) {
             symbols.push(Symbol {
                 name: cap[1].to_string(),
                 kind: SymbolKind::Function,
                 line: i + 1,
                 visibility: vis,
             });
-        } else if let Some(cap) = fn_re.captures(trimmed) {
+        } else if let Some(cap) = RE_TS_FN.captures(trimmed) {
             symbols.push(Symbol {
                 name: cap[1].to_string(),
                 kind: SymbolKind::Function,
                 line: i + 1,
                 visibility: vis,
             });
-        } else if let Some(cap) = class_re.captures(trimmed) {
+        } else if let Some(cap) = RE_TS_CLASS.captures(trimmed) {
             symbols.push(Symbol {
                 name: cap[1].to_string(),
                 kind: SymbolKind::Class,
                 line: i + 1,
                 visibility: vis,
             });
-        } else if let Some(cap) = iface_re.captures(trimmed) {
+        } else if let Some(cap) = RE_TS_IFACE.captures(trimmed) {
             symbols.push(Symbol {
                 name: cap[1].to_string(),
                 kind: SymbolKind::Interface,
                 line: i + 1,
                 visibility: vis,
             });
-        } else if let Some(cap) = const_re.captures(trimmed) {
+        } else if let Some(cap) = RE_TS_CONST.captures(trimmed) {
             symbols.push(Symbol {
                 name: cap[1].to_string(),
                 kind: SymbolKind::Constant,
@@ -216,11 +274,6 @@ fn extract_ts_symbols(lines: &[&str]) -> Vec<Symbol> {
 }
 
 fn extract_rust_symbols(lines: &[&str]) -> Vec<Symbol> {
-    let fn_re = Regex::new(r"(?:pub(?:\(crate\))?\s+)?(?:async\s+)?fn\s+(\w+)").unwrap();
-    let struct_re = Regex::new(r"(?:pub\s+)?struct\s+(\w+)").unwrap();
-    let enum_re = Regex::new(r"(?:pub\s+)?enum\s+(\w+)").unwrap();
-    let impl_re = Regex::new(r"impl\s+(\w+)").unwrap();
-
     let mut symbols = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -230,28 +283,28 @@ fn extract_rust_symbols(lines: &[&str]) -> Vec<Symbol> {
             Visibility::Private
         };
 
-        if let Some(cap) = fn_re.captures(trimmed) {
+        if let Some(cap) = RE_RS_FN.captures(trimmed) {
             symbols.push(Symbol {
                 name: cap[1].to_string(),
                 kind: SymbolKind::Function,
                 line: i + 1,
                 visibility: vis,
             });
-        } else if let Some(cap) = struct_re.captures(trimmed) {
+        } else if let Some(cap) = RE_RS_STRUCT.captures(trimmed) {
             symbols.push(Symbol {
                 name: cap[1].to_string(),
                 kind: SymbolKind::Struct,
                 line: i + 1,
                 visibility: vis,
             });
-        } else if let Some(cap) = enum_re.captures(trimmed) {
+        } else if let Some(cap) = RE_RS_ENUM.captures(trimmed) {
             symbols.push(Symbol {
                 name: cap[1].to_string(),
                 kind: SymbolKind::Enum,
                 line: i + 1,
                 visibility: vis,
             });
-        } else if let Some(cap) = impl_re.captures(trimmed) {
+        } else if let Some(cap) = RE_RS_IMPL.captures(trimmed) {
             if !trimmed.starts_with("//") {
                 symbols.push(Symbol {
                     name: cap[1].to_string(),
@@ -266,19 +319,16 @@ fn extract_rust_symbols(lines: &[&str]) -> Vec<Symbol> {
 }
 
 fn extract_python_symbols(lines: &[&str]) -> Vec<Symbol> {
-    let fn_re = Regex::new(r"^(\s*)(?:async\s+)?def\s+(\w+)").unwrap();
-    let class_re = Regex::new(r"^class\s+(\w+)").unwrap();
-
     let mut symbols = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        if let Some(cap) = class_re.captures(line) {
+        if let Some(cap) = RE_PY_CLASS.captures(line) {
             symbols.push(Symbol {
                 name: cap[1].to_string(),
                 kind: SymbolKind::Class,
                 line: i + 1,
                 visibility: Visibility::Public,
             });
-        } else if let Some(cap) = fn_re.captures(line) {
+        } else if let Some(cap) = RE_PY_DEF.captures(line) {
             let indent = cap[1].len();
             let kind = if indent > 0 {
                 SymbolKind::Method
@@ -306,21 +356,6 @@ fn extract_python_symbols(lines: &[&str]) -> Vec<Symbol> {
 /// piu' comuni con euristiche che funzionano nella maggioranza dei linguaggi a
 /// graffe e a indentazione. Best-effort: la documentazione AI completa il resto.
 fn extract_generic_symbols(lines: &[&str]) -> Vec<Symbol> {
-    let fn_re = Regex::new(r"\b(?:function|fn|def|func|sub|fun)\s+(\w+)").unwrap();
-    // Tipi: class/struct/interface/enum/trait/type/record/protocol/object.
-    // Include `type Nome` (Go: `type X struct`, TS/Swift type alias) oltre alle
-    // keyword che precedono direttamente il nome del tipo.
-    let type_re = Regex::new(
-        r"\b(?:class|struct|interface|enum|trait|record|protocol|object|type)\s+(\w+)",
-    )
-    .unwrap();
-    // Metodi a graffe stile C/Java/Go: `tipo Nome(...)` o `func (r R) Nome(...)`.
-    let method_re = Regex::new(r"^\s*(?:[\w<>:\*\&\[\] ]+\s+)?(\w+)\s*\([^;]*\)\s*\{?\s*$").unwrap();
-    let const_re = Regex::new(r"\b(?:const|val|let|final|static)\s+(\w+)").unwrap();
-
-    let public_re = Regex::new(r"\b(?:pub|public|export)\b").unwrap();
-    let private_re = Regex::new(r"\b(?:private|priv|internal)\b").unwrap();
-
     let mut symbols = Vec::new();
     let mut seen: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
     for (i, raw) in lines.iter().enumerate() {
@@ -328,9 +363,9 @@ fn extract_generic_symbols(lines: &[&str]) -> Vec<Symbol> {
         if line.is_empty() || line.starts_with("//") || line.starts_with('#') || line.starts_with('*') {
             continue;
         }
-        let vis = if public_re.is_match(line) {
+        let vis = if RE_GEN_PUBLIC.is_match(line) {
             Visibility::Public
-        } else if private_re.is_match(line) {
+        } else if RE_GEN_PRIVATE.is_match(line) {
             Visibility::Private
         } else {
             Visibility::Unknown
@@ -345,14 +380,14 @@ fn extract_generic_symbols(lines: &[&str]) -> Vec<Symbol> {
             }
         };
 
-        if let Some(cap) = type_re.captures(line) {
+        if let Some(cap) = RE_GEN_TYPE.captures(line) {
             push(&cap[1], SymbolKind::Class, &mut symbols);
         }
-        if let Some(cap) = fn_re.captures(line) {
+        if let Some(cap) = RE_GEN_FN.captures(line) {
             push(&cap[1], SymbolKind::Function, &mut symbols);
-        } else if let Some(cap) = const_re.captures(line) {
+        } else if let Some(cap) = RE_GEN_CONST.captures(line) {
             push(&cap[1], SymbolKind::Constant, &mut symbols);
-        } else if let Some(cap) = method_re.captures(line) {
+        } else if let Some(cap) = RE_GEN_METHOD.captures(line) {
             // Evita falsi positivi su keyword di controllo (if/for/while/switch).
             let name = &cap[1];
             if !matches!(name, "if" | "for" | "while" | "switch" | "catch" | "return" | "match") {
@@ -364,10 +399,9 @@ fn extract_generic_symbols(lines: &[&str]) -> Vec<Symbol> {
 }
 
 fn extract_ts_imports(lines: &[&str]) -> Vec<ImportInfo> {
-    let re = Regex::new(r#"import\s+(?:\{([^}]+)\}|(\w+))\s+from\s+['"]([^'"]+)['"]"#).unwrap();
     let mut imports = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        if let Some(cap) = re.captures(line) {
+        if let Some(cap) = RE_TS_IMPORT.captures(line) {
             let items = if let Some(named) = cap.get(1) {
                 named
                     .as_str()
@@ -391,10 +425,9 @@ fn extract_ts_imports(lines: &[&str]) -> Vec<ImportInfo> {
 }
 
 fn extract_rust_imports(lines: &[&str]) -> Vec<ImportInfo> {
-    let re = Regex::new(r"use\s+([\w:]+)(?:::\{([^}]+)\})?").unwrap();
     let mut imports = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        if let Some(cap) = re.captures(line.trim()) {
+        if let Some(cap) = RE_RS_USE.captures(line.trim()) {
             let module = cap[1].to_string();
             let items = cap
                 .get(2)
@@ -416,19 +449,17 @@ fn extract_rust_imports(lines: &[&str]) -> Vec<ImportInfo> {
 }
 
 fn extract_python_imports(lines: &[&str]) -> Vec<ImportInfo> {
-    let from_re = Regex::new(r"from\s+([\w.]+)\s+import\s+(.+)").unwrap();
-    let import_re = Regex::new(r"^import\s+([\w.]+)").unwrap();
     let mut imports = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if let Some(cap) = from_re.captures(trimmed) {
+        if let Some(cap) = RE_PY_FROM_IMPORT.captures(trimmed) {
             let items: Vec<String> = cap[2].split(',').map(|s| s.trim().to_string()).collect();
             imports.push(ImportInfo {
                 module: cap[1].to_string(),
                 items,
                 line: i + 1,
             });
-        } else if let Some(cap) = import_re.captures(trimmed) {
+        } else if let Some(cap) = RE_PY_IMPORT.captures(trimmed) {
             imports.push(ImportInfo {
                 module: cap[1].to_string(),
                 items: vec![],

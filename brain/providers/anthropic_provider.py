@@ -9,7 +9,6 @@ from .base import BaseProvider, ProviderCatalogEntry, ProviderResult
 from .error_handler import format_error_result
 from ._schema_utils import compress_tool_list, measure_tools_bytes
 from brain.agents import thinking_config as _thinking_config
-from brain.utils.db_pool import get_db_url
 
 logger = logging.getLogger(__name__)
 
@@ -76,22 +75,15 @@ def _load_thinking_models() -> frozenset[str]:
         if cached is not None and now < _THINKING_MODELS_CACHE["expires_at"]:
             return cached
         try:
-            import psycopg2  # type: ignore[import-untyped]
-            db_url = get_db_url()
-            if not db_url:
-                raise ThinkingModelsUnavailable("DATABASE_URL/POSTGRES_URL non configurato")
-            conn = psycopg2.connect(db_url)
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT model FROM ai_price_catalog "
-                        "WHERE provider = 'anthropic' "
-                        "  AND is_enabled = TRUE "
-                        "  AND uses_thinking_mode IS TRUE"
-                    )
-                    rows = cur.fetchall()
-            finally:
-                conn.close()
+            from brain.utils.db_pool import connect as _db_connect
+            with _db_connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT model FROM ai_price_catalog "
+                    "WHERE provider = 'anthropic' "
+                    "  AND is_enabled = TRUE "
+                    "  AND uses_thinking_mode IS TRUE"
+                )
+                rows = cur.fetchall()
         except ThinkingModelsUnavailable:
             raise
         except Exception as exc:

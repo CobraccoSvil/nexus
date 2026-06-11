@@ -66,10 +66,26 @@ assert_single "ensure_projects_base_root" 'fn ensure_projects_base_root' 'crates
 # Wave 6a + Residuo R1: get_db_url() e' il punto unico della DB URL. Niente
 # default hardcoded "postgres://..." altrove (regola G). I 28 call site con
 # psycopg2.connect convergono via questa URL.
-# Lasciato come guard "soft" (solo get_db_url): permettiamo psycopg2.connect
-# diretti con get_db_url() per i casi che richiedono kwargs particolari
-# (cursor_factory, autocommit), mentre per la maggioranza usare db_pool.connect.
 assert_single "get_db_url" 'def get_db_url' 'brain/utils/db_pool.py' brain
+
+# Wave 5 (perf): db_pool.connect() e' un ThreadedConnectionPool — psycopg2.connect
+# diretto fuori dal punto unico riapre una connessione TCP per chiamata (baseline
+# misurata: ~14 ms/lettura). Esclusi: brain/tests/** (fixture con DB effimeri) e
+# postgres_checkpointer.py (pool asyncpg proprio di LangGraph). Per i DSN
+# applicativi di progetto usare db_pool.connect_external.
+psycopg2_connect_hits="$(grep -rEln --include='*.py' \
+  --exclude-dir=__pycache__ \
+  -e 'psycopg2\.connect\(' brain 2>/dev/null \
+  | grep -v '^brain/tests/' \
+  | grep -v 'postgres_checkpointer\.py' \
+  | grep -v '^brain/utils/db_pool\.py' || true)"
+if [[ -n "$psycopg2_connect_hits" ]]; then
+  echo "!! single-source [psycopg2.connect]: connessione diretta fuori dal pool (brain/utils/db_pool.py):" >&2
+  printf '  %s\n' $psycopg2_connect_hits >&2
+  fail=1
+else
+  echo "OK single-source [psycopg2.connect]"
+fi
 
 # Wave 6b (cache TTL Python, paritetica a nexus-cache lato Rust):
 assert_single "TtlCache python" 'class TtlCache' 'brain/utils/ttl_cache.py' brain
@@ -89,15 +105,15 @@ assert_single "rust classify_text" 'pub fn classify_text' 'crates/mcp-core/src/p
 # Wave 8a:
 # assert_single "python chunker" 'def _?chunk_text' 'brain/utils/text_chunk.py' brain
 
+# Wave 4+5 (2026-06-11): punti unici del consolidamento E1-E6
+assert_single "walk FS nexus_tools" 'pub fn walk_project_files' 'crates/mcp-core/src/nexus_tools/fs_scan.rs' crates
+assert_single "catalog query Postgres" 'pub fn list_catalog_rows' 'crates/mcp-core/src/nexus_tools/db_helper.rs' crates
+assert_single "registrazione progetto" 'pub async fn register_project_records' 'crates/mcp-core/src/nexus_tools/project_register_common.rs' crates
+assert_single "endpoint MCP server condivisi" 'pub async fn list_servers_core' 'crates/nexus-mcp-client/src/server_endpoints.rs' crates
+assert_single "coda generate provider OpenAI-compat" '^def build_generate_result' 'brain/providers/_response_parsers.py' brain
+
 if [[ "$fail" -ne 0 ]]; then
   echo "!! check-single-source: regressione su un punto unico (regola L / ADR 0026)." >&2
   exit 1
 fi
 echo "OK check-single-source: nessuna regressione sui punti unici attivi."
-
-# Wave 4 (2026-06-11): nuovi punti unici del consolidamento E1-E6
-assert_single "fn walk_project_files" crates/mcp-core/src/nexus_tools/fs_scan.rs "walk FS nexus_tools"
-assert_single "fn list_catalog_rows" crates/mcp-core/src/nexus_tools/db_helper.rs "catalog query Postgres"
-assert_single "fn register_project_records" crates/mcp-core/src/nexus_tools/project_register_common.rs "registrazione progetto"
-assert_single "fn list_servers_core" crates/nexus-mcp-client/src/server_endpoints.rs "endpoint MCP server condivisi"
-assert_single "def build_generate_result" brain/providers/_response_parsers.py "coda generate provider OpenAI-compat"

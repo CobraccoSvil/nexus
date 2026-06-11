@@ -115,8 +115,8 @@ def _load_config() -> dict[str, Any]:
     if not url:
         return defaults
     try:
-        import psycopg2  # type: ignore[import-untyped]
-        with psycopg2.connect(url) as conn:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT key, value FROM settings "
@@ -358,8 +358,8 @@ def _note_implementation_status(note_id: str | None) -> dict[str, Any]:
     if not url:
         return {}
     try:
-        import psycopg2  # type: ignore[import-untyped]
-        with psycopg2.connect(url) as conn:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 # Il legame nota->run e' duplice: source_run_id (se valorizzato,
                 # es. agent_summary) OPPURE, per le note 'chat' della richiesta

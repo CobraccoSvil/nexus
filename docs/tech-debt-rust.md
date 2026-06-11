@@ -30,8 +30,8 @@ CLAUDE.md §F ammette esplicitamente `Regex::new("...").unwrap()` su pattern
 literal. I 6 file con cluster denso hanno commento `// safety:` in testa che
 ricorda la regola e segnala il refactor opportuno (`LazyLock<Regex>`):
 
-- `crates/mcp-quality/src/lib.rs`            — 29
-- `crates/mcp-ast/src/lib.rs`                — 16
+- `crates/mcp-quality/src/lib.rs`            — 29 — FATTO (C3, static LazyLock)
+- `crates/mcp-ast/src/lib.rs`                — 16 — FATTO (C3, static LazyLock)
 - `crates/mcp-core/src/project_workspace/scan_ports.rs` — 14
 - `crates/mcp-learning/src/lib.rs`            — 8
 - `crates/mcp-core/src/nexus_tools/secret_scan.rs` — 7
@@ -116,3 +116,29 @@ pattern match, error propagation). Aprire un commit dedicato per crate.
 Migrare i `Regex::new("...").unwrap()` annotati a `std::sync::LazyLock<Regex>`
 per evitare ricompilazione ad ogni chiamata. Miglioramento di performance, non
 fix di sicurezza — gestire come tech-debt separato.
+
+### C3 — cluster HOT completati (2026-06-11)
+
+I cluster con compilazione per-file durante gli scan di progetto sono stati
+convertiti a `static LazyLock<Regex>` a livello di modulo:
+
+- `crates/mcp-quality/src/lib.rs` — 25 static (28 occorrenze, 3 pattern condivisi
+  consolidati in `RE_FN_DEF_CAPTURE`); `analyze_source` e' chiamata in loop
+  per-file da `projects/quality.rs`.
+- `crates/mcp-quality/src/injection.rs` — gia' a `LazyLock` (ADR 0021), nessuna
+  modifica necessaria.
+- `crates/mcp-ast/src/lib.rs` — 21 static; `index_source` per-file (fallback
+  non-tree-sitter).
+- `crates/mcp-core/src/agent_tools/port_scanner.rs` — gia' a `once_cell::Lazy`
+  (PORT_REGEXES, RANGE_REGEX, DEFAULT_PORT_REGEX, ENV_FALLBACK_PORT_REGEXES),
+  nessuna modifica necessaria. Nota: ENV_FALLBACK_PORT_REGEXES usa `format!`
+  ma su costanti, dentro lo static — compilazione comunque una-tantum.
+
+Misura empirica: test `bench_analyze_source_200_iterazioni` in mcp-quality
+(200 iterazioni di `analyze_source` su sorgente sintetico ~110 righe, build
+dev): 200 iterazioni in ~816 ms, ~4,08 ms per iterazione, senza alcuna
+ricompilazione regex per-chiamata. Lanciare con:
+`cargo test -p mcp-quality --message-format=short -- --nocapture bench_analyze_source`
+
+Cluster residui (compilazione NON per-file o bassa frequenza): `scan_ports.rs`,
+`mcp-learning/src/lib.rs`, `secret_scan.rs`, `sast_scan.rs`, `sync_ports.rs`.

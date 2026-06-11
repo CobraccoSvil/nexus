@@ -9,20 +9,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime, timezone
 from typing import Any
-from brain.utils.db_pool import get_db_url
+
+from brain.utils.db_pool import connect as _db_connect
 
 logger = logging.getLogger(__name__)
-
-
-def _get_db_url() -> str:
-    """Restituisce la connection string PostgreSQL da DATABASE_URL."""
-    return os.environ.get(
-        "DATABASE_URL",
-        "postgresql://nexus:nexus@localhost:5433/nexus",
-    )
 
 
 class PostgresLearningStorage:
@@ -30,14 +22,15 @@ class PostgresLearningStorage:
 
     Interfaccia identica al vecchio LocalLearningStorage (SQLite) per
     garantire retrocompatibilita con tutti i call site esistenti.
+
+    La connessione passa dal pool condiviso ``brain.utils.db_pool`` (punto
+    unico DB, regola L): niente connection string locale ne' default
+    hardcoded (regola G).
     """
 
-    def __init__(self, db_url: str | None = None) -> None:
-        self._db_url = db_url or _get_db_url()
-
     def _connect(self):  # type: ignore[no-untyped-def]
-        import psycopg2  # type: ignore[import-untyped]
-        return psycopg2.connect(self._db_url)
+        """Context manager: connessione prestata dal pool condiviso."""
+        return _db_connect()
 
     def save_interaction(
         self,

@@ -118,6 +118,25 @@ export async function fetchJson<T>(url: string, init?: RequestInit, timeoutMs = 
   return res.json();
 }
 
+/** Variante di fetchJson per risposte testuali (script, file di testo).
+ *  Stesso timeout/AbortController e stesse credenziali; ritorna il body come stringa. */
+export async function fetchText(url: string, init?: RequestInit, timeoutMs = 30000): Promise<string> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort("timeout"), timeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...init,
+      credentials: "include",
+      signal: init?.signal ?? controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+  if (!res.ok) throw new Error(`API error ${res.status}: ${res.statusText}`);
+  return res.text();
+}
+
 export async function fetchJsonNoAuth<T>(url: string, init?: RequestInit, timeoutMs = 5000): Promise<T> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);

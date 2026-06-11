@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../../lib/theme";
 import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
 import { ListEditorLayout } from "../../../components/admin/ListEditorLayout";
+import { fetchJson } from "../../../lib/api/_shared";
 
 
 const API = process.env.NEXT_PUBLIC_API_URL || "";
@@ -27,8 +28,7 @@ export default function LongRunningPage() {
 
   const load = useCallback(async () => {
     try {
-      const r = await fetch(`${API}/api/admin/long-running`, { credentials: "include" });
-      if (r.ok) setPatterns(await r.json());
+      setPatterns(await fetchJson<Pattern[]>(`${API}/api/admin/long-running`));
     } catch {
       /* ignore */
     } finally {
@@ -43,40 +43,38 @@ export default function LongRunningPage() {
     setSaving(true);
     setError("");
     try {
-      const r = await fetch(`${API}/api/admin/long-running`, {
+      await fetchJson(`${API}/api/admin/long-running`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
         body: JSON.stringify({ pattern: newPattern.trim(), description: newDesc.trim() }),
       });
-      if (!r.ok) {
-        const e = await r.json().catch(() => ({}));
-        setError(e.error || "Errore");
-        return;
-      }
       setNewPattern("");
       setNewDesc("");
       await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Errore");
     } finally {
       setSaving(false);
     }
   };
 
   const toggle = async (p: Pattern) => {
-    await fetch(`${API}/api/admin/long-running/${p.id}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ enabled: !p.enabled }),
-    });
+    try {
+      await fetchJson(`${API}/api/admin/long-running/${p.id}`, {
+        method: "PUT",
+        body: JSON.stringify({ enabled: !p.enabled }),
+      });
+    } catch {
+      /* fire-and-forget come il fetch precedente: l'esito visibile e' il reload */
+    }
     await load();
   };
 
   const remove = async (id: string) => {
-    await fetch(`${API}/api/admin/long-running/${id}`, {
-      method: "DELETE",
-      credentials: "include",
-    });
+    try {
+      await fetchJson(`${API}/api/admin/long-running/${id}`, { method: "DELETE" });
+    } catch {
+      /* fire-and-forget come il fetch precedente: l'esito visibile e' il reload */
+    }
     await load();
   };
 

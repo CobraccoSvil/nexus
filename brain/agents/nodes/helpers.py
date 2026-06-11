@@ -21,7 +21,7 @@ import uuid
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from brain.utils.db_pool import get_db_url
+from brain.utils.db_pool import connect as db_connect
 
 logger = logging.getLogger(__name__)
 
@@ -77,10 +77,7 @@ def _load_adaptive_budget_config() -> dict[str, Any]:
 
     config = dict(_ADAPTIVE_BUDGET_DEFAULTS)
     try:
-        import os as _os
-        import psycopg2
-        db_url = get_db_url()  # regola G: niente fallback hardcoded
-        with psycopg2.connect(db_url) as conn:
+        with db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT key, value FROM settings WHERE key LIKE 'agent.iteration_budget.%%' OR key LIKE 'agent.complexity.%%'"
@@ -140,9 +137,7 @@ def _load_tier_floor_config() -> dict[str, Any]:
         return _TIER_FLOOR_CACHE["config"]
     config = dict(_TIER_FLOOR_DEFAULTS)
     try:
-        import psycopg2
-        db_url = get_db_url()  # regola G: niente fallback hardcoded sull'URL
-        with psycopg2.connect(db_url) as conn:
+        with db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT key, value FROM settings WHERE key LIKE 'agent.tier_floor.%%'")
                 for key, value in cur.fetchall():
@@ -954,22 +949,17 @@ def _nexus_thinking_enabled() -> bool:
     enabled = True
     try:
         import os as _os
-        import psycopg2  # type: ignore[import-untyped]
         dburl = _os.environ.get("DATABASE_URL")
         if dburl:
-            conn = psycopg2.connect(dburl)
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT value FROM settings WHERE key = %s",
-                        ("chat_show_nexus_thinking",),
-                    )
-                    row = cur.fetchone()
-                    if row and row[0] is not None:
-                        raw = str(row[0]).strip().lower().strip('"')
-                        enabled = raw not in ("false", "0", "off", "no")
-            finally:
-                conn.close()
+            with db_connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM settings WHERE key = %s",
+                    ("chat_show_nexus_thinking",),
+                )
+                row = cur.fetchone()
+                if row and row[0] is not None:
+                    raw = str(row[0]).strip().lower().strip('"')
+                    enabled = raw not in ("false", "0", "off", "no")
     except Exception as exc:
         logger.debug("_nexus_thinking_enabled: lettura DB fallita: %s", exc)
     _NEXUS_THINKING_CACHE["loaded_at"] = now
@@ -1478,10 +1468,7 @@ def _pick_escalation_model(
     # Tier 1: catena intra-provider (stesso provider, tier superiore).
     if provider and model and provider.strip().lower() not in cooldown_set:
         try:
-            import psycopg2  # type: ignore[import]
-            import os as _os
-            _db_url = _get_db_url()
-            with psycopg2.connect(_db_url) as _conn:
+            with db_connect() as _conn:
                 with _conn.cursor() as _cur:
                     _cur.execute(
                         "SELECT escalation_model FROM nexus_model_escalation_chain "
@@ -2335,10 +2322,7 @@ def _provider_from_model(model: str) -> str | None:
     if cached is not None:
         return cached
     try:
-        import os as _os
-        import psycopg2  # type: ignore[import-untyped]
-        db_url = get_db_url()  # regola G: niente fallback hardcoded
-        with psycopg2.connect(db_url) as conn:
+        with db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT provider FROM ai_price_catalog WHERE model = %s AND is_enabled = TRUE LIMIT 1",
@@ -2374,9 +2358,7 @@ def _smart_upscale_model(
     required = int(est_tokens * cfg["overhead"])
     target_tier = cfg["target_tier"]
     try:
-        import psycopg2  # type: ignore[import-untyped]
-        db_url = get_db_url()  # regola G: niente fallback hardcoded
-        with psycopg2.connect(db_url) as conn:
+        with db_connect() as conn:
             with conn.cursor() as cur:
                 # Scelta DINAMICA dal catalog: tier + capability + context window.
                 # Niente whitelist hardcoded: il miglior modello disponibile vince.
@@ -2602,10 +2584,7 @@ def _load_ctx_mgmt_config() -> dict[str, Any]:
         "aggressive_max_chars": int(_CTX_MGMT_DEFAULTS["aggressive_max_chars"]),
     }
     try:
-        import os as _os
-        import psycopg2  # type: ignore[import-untyped]
-        db_url = get_db_url()  # regola G: niente fallback hardcoded
-        with psycopg2.connect(db_url) as conn:
+        with db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT key, value FROM settings WHERE key LIKE 'agent.context.%%'"
@@ -2938,10 +2917,7 @@ def _model_context_window(model: str) -> int:
         return entry[1]
     window = 128_000
     try:
-        import os as _os
-        import psycopg2  # type: ignore[import-untyped]
-        db_url = get_db_url()  # regola G: niente fallback hardcoded
-        with psycopg2.connect(db_url) as conn:
+        with db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT context_window FROM ai_price_catalog "
@@ -3212,24 +3188,19 @@ def _attachment_budget_bytes() -> int:
         return _ATTACHMENT_BUDGET_CACHE["value"]
     value = 500_000
     try:
-        import psycopg2  # type: ignore[import-untyped]
         dburl = _os.environ.get("DATABASE_URL")
         if dburl:
-            conn = psycopg2.connect(dburl)
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT value FROM settings WHERE key = %s",
-                        ("agent.attachment.session_read_budget_bytes",),
-                    )
-                    row = cur.fetchone()
-                    if row and row[0] is not None:
-                        try:
-                            value = int(str(row[0]).strip().strip('"'))
-                        except ValueError:
-                            pass
-            finally:
-                conn.close()
+            with db_connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM settings WHERE key = %s",
+                    ("agent.attachment.session_read_budget_bytes",),
+                )
+                row = cur.fetchone()
+                if row and row[0] is not None:
+                    try:
+                        value = int(str(row[0]).strip().strip('"'))
+                    except ValueError:
+                        pass
     except Exception as exc:
         logger.debug("_attachment_budget_bytes: lettura DB fallita: %s", exc)
     _ATTACHMENT_BUDGET_CACHE["value"] = value

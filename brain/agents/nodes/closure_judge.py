@@ -69,19 +69,14 @@ def _load_config() -> dict[str, Any]:
     if not database_url:
         return dict(_CFG_DEFAULTS)
     try:
-        import psycopg2  # type: ignore[import-untyped]
-
-        conn = psycopg2.connect(database_url)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT key, value FROM settings WHERE key IN "
-                    "('agent.closure_judge.shadow_enabled',"
-                    " 'agent.closure_judge.min_result_chars')"
-                )
-                rows = dict(cur.fetchall())
-        finally:
-            conn.close()
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT key, value FROM settings WHERE key IN "
+                "('agent.closure_judge.shadow_enabled',"
+                " 'agent.closure_judge.min_result_chars')"
+            )
+            rows = dict(cur.fetchall())
         cfg = {
             "shadow_enabled": str(
                 rows.get("agent.closure_judge.shadow_enabled", "true")

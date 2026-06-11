@@ -19,7 +19,8 @@ from __future__ import annotations
 import logging
 import os
 import time
-from brain.utils.db_pool import get_db_url
+
+from brain.utils.db_pool import connect as _db_connect
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +35,7 @@ def _load_from_db(provider: str) -> str | None:
     """Legge `settings.{provider}_api_key` da Postgres. Ritorna None se DB
     irraggiungibile o key vuota/assente."""
     try:
-        import psycopg2  # type: ignore[import]
-        db_url = get_db_url()
-        with psycopg2.connect(db_url) as conn:
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT value FROM settings WHERE key = %s",

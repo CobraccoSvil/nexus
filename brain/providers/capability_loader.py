@@ -17,7 +17,7 @@ import os
 import time
 
 from ._models import ProviderCapability
-from brain.utils.db_pool import get_db_url
+from brain.utils.db_pool import connect as _db_connect
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +49,6 @@ _COLUMNS = (
 _ttl_value: float = 60.0
 _ttl_ts: float = 0.0
 _TTL_REFRESH_S = 60.0
-
-
-def _db_url() -> str:
-    return get_db_url()
 
 
 def _get_ttl() -> float:
@@ -91,8 +87,7 @@ def _row_to_capability(row: tuple) -> ProviderCapability:
 
 def _load_from_db(provider: str, model: str) -> ProviderCapability | None:
     """Cerca (provider, model) esatto, poi (provider, '*'). None se nessuna riga."""
-    import psycopg2  # type: ignore[import]
-    with psycopg2.connect(_db_url()) as conn:
+    with _db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"SELECT {_COLUMNS} FROM v_model_capabilities "

@@ -39,9 +39,8 @@ def _default_model_for_provider(provider: str) -> str:
     now = time.time()
     if (now - _DEFAULT_MODEL_CACHE_TS) >= 60.0 or not _DEFAULT_MODEL_CACHE:
         try:
-            import psycopg2  # type: ignore[import]
-            db_url = get_db_url()
-            with psycopg2.connect(db_url) as conn:
+            from brain.utils.db_pool import connect as _db_connect
+            with _db_connect() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT provider, model_id FROM nexus_provider_default_model"

@@ -27,7 +27,6 @@ import hashlib
 import logging
 import time
 from typing import Any
-from brain.utils.db_pool import get_db_url
 
 logger = logging.getLogger(__name__)
 
@@ -69,13 +68,8 @@ def _load_offload_config() -> dict[str, Any]:
 
     config = dict(_OFFLOAD_DEFAULTS)
     try:
-        import os
-        import psycopg2  # type: ignore[import-untyped]
-
-        db_url = get_db_url()
-        if not db_url:
-            raise RuntimeError("DATABASE_URL assente")
-        with psycopg2.connect(db_url) as conn:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT key, value FROM settings WHERE "

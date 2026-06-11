@@ -157,9 +157,9 @@ async def clarifications_get(run_id: str) -> dict[str, object]:
     if not url:
         return {"error": "db_unavailable"}
     try:
-        import psycopg2  # type: ignore[import-untyped]
         from psycopg2.extras import RealDictCursor  # type: ignore[import-untyped]
-        with psycopg2.connect(url, cursor_factory=RealDictCursor) as conn:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect(cursor_factory=RealDictCursor) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """SELECT id::text, run_id::text, questions, user_answers, applied_defaults,
@@ -191,8 +191,8 @@ async def clarifications_answer(run_id: str, body: ClarificationsAnswerRequest) 
     if not url:
         return {"error": "db_unavailable"}
     try:
-        import psycopg2  # type: ignore[import-untyped]
-        with psycopg2.connect(url) as conn:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """UPDATE nexus_agent_clarifications
@@ -248,9 +248,8 @@ def _load_analyzer_provider_chain() -> list[dict]:
     if _ANALYZER_CHAIN_CACHE is not None and (now - _ANALYZER_CHAIN_CACHE_TS) < 60.0:
         return _ANALYZER_CHAIN_CACHE
     try:
-        import psycopg2
-        db_url = get_db_url()
-        with psycopg2.connect(db_url) as conn:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 # Ordine preferenziale per analyzer: economici/veloci prima,
                 # capable per ultimo come fallback. L'ordine e' definito
@@ -282,9 +281,8 @@ def _load_project_analyzer_prompt() -> str | None:
     Ritorna None se non trovato.
     """
     try:
-        import psycopg2
-        db_url = get_db_url()
-        with psycopg2.connect(db_url) as conn:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT content FROM nexus_prompt_templates "
@@ -425,9 +423,8 @@ def _load_active_guidelines(applies_to_values: list[str]) -> list[dict]:
     Lista vuota se DB irraggiungibile (loggato; il chiamante decide come gestire).
     """
     try:
-        import psycopg2
-        db_url = get_db_url()
-        with psycopg2.connect(db_url) as conn:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT practice_key, description, check_hint, severity "

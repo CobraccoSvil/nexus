@@ -308,13 +308,11 @@ def _model_has_vision_capability(provider: str, model: str) -> bool | None:
         return False
     try:
         import os
-        import psycopg2
         database_url = os.environ.get("DATABASE_URL")
         if not database_url:
             return None
-        conn = psycopg2.connect(database_url, connect_timeout=2)
-        try:
-            cur = conn.cursor()
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT supports_vision "
                 "FROM ai_price_catalog "
@@ -325,8 +323,6 @@ def _model_has_vision_capability(provider: str, model: str) -> bool | None:
             if row is None:
                 return False
             return bool(row[0])
-        finally:
-            conn.close()
     except Exception as exc:
         logger.warning("vision_routing: catalog lookup fallita per %s/%s: %s", provider, model, exc)
         return None
@@ -336,13 +332,11 @@ def _select_cheapest_vision_model() -> tuple[str, str] | None:
     """Ritorna (provider, model) del piu economico vision-capable in catalog."""
     try:
         import os
-        import psycopg2
         database_url = os.environ.get("DATABASE_URL")
         if not database_url:
             return None
-        conn = psycopg2.connect(database_url, connect_timeout=2)
-        try:
-            cur = conn.cursor()
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT provider, model FROM ai_price_catalog "
                 "WHERE supports_vision = true AND is_enabled = true "
@@ -352,8 +346,6 @@ def _select_cheapest_vision_model() -> tuple[str, str] | None:
             if row is None:
                 return None
             return (str(row[0]), str(row[1]))
-        finally:
-            conn.close()
     except Exception as exc:
         logger.warning("vision_routing: select_cheapest fallito: %s", exc)
         return None

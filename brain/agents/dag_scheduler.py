@@ -75,20 +75,15 @@ def _mark(todo_id: str, status: str) -> None:
     if not todo_id:
         return
     try:
-        import psycopg2  # type: ignore[import-untyped]
         url = os.environ.get("DATABASE_URL")
         if not url:
             return
-        conn = psycopg2.connect(url)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE nexus_agent_todos SET status = %s, updated_at = NOW() WHERE id = %s",
-                    (status, todo_id),
-                )
-            conn.commit()
-        finally:
-            conn.close()
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE nexus_agent_todos SET status = %s, updated_at = NOW() WHERE id = %s",
+                (status, todo_id),
+            )
     except Exception as exc:
         logger.warning("dag_scheduler._mark %s -> %s fallito: %s", todo_id, status, exc)
 

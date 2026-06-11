@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from brain.utils.db_pool import get_db_url
+from brain.utils.db_pool import connect as db_connect
 from .. import (
     meta_steps,
     profile_loader,
@@ -236,17 +236,12 @@ def _get_learning_config() -> dict[str, Any]:
         return dict(_LEARNING_CFG_DEFAULTS)
 
     try:
-        import psycopg2  # type: ignore[import-untyped]
-        conn = psycopg2.connect(database_url)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT key, value FROM settings "
-                    "WHERE key IN ('learning_auto_extract','learning_min_confidence')"
-                )
-                rows = dict(cur.fetchall())
-        finally:
-            conn.close()
+        with db_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT key, value FROM settings "
+                "WHERE key IN ('learning_auto_extract','learning_min_confidence')"
+            )
+            rows = dict(cur.fetchall())
         cfg: dict[str, Any] = {
             "auto_extract": rows.get("learning_auto_extract", "true").strip().lower() != "false",
             "min_confidence": float(rows.get("learning_min_confidence", "0.6") or "0.6"),
@@ -337,8 +332,9 @@ def _rag_injection_mode() -> str:
     Fallback 'index' se DB down.
     """
     try:
-        from brain.utils.settings_db import get_setting
-        v = (get_setting("knowledge.rag_injection_mode", "index") or "index").strip().lower()
+        # Lettura per-turno: variante cached 60s (punto unico settings_db, C2).
+        from brain.utils.settings_db import get_setting_cached
+        v = (get_setting_cached("knowledge.rag_injection_mode", "index") or "index").strip().lower()
         return v if v in ("index", "full") else "index"
     except Exception:
         return "index"
@@ -1434,12 +1430,10 @@ def _check_superseded(state: dict[str, Any]) -> bool:
         return False
     try:
         import os
-        import psycopg2  # type: ignore[import-untyped]
         _dburl = os.environ.get("DATABASE_URL")
         if not _dburl:
             return False
-        _conn = psycopg2.connect(_dburl)
-        try:
+        with db_connect() as _conn:
             with _conn.cursor() as _cur:
                 _cur.execute(
                     "SELECT status, cancellation_requested FROM agent_runs WHERE id=%s",
@@ -1461,8 +1455,6 @@ def _check_superseded(state: dict[str, Any]) -> bool:
                     _conn.commit()
                 except Exception:
                     _conn.rollback()
-        finally:
-            _conn.close()
         if not _row:
             return False
         _status, _cancel_req = _row[0], _row[1]
@@ -1557,8 +1549,9 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
     )
     if _discovered and tools_json:
         try:
-            from brain.utils.settings_db import get_int_setting
-            _cap = get_int_setting("agent.tools.discovery_max_injected", 20)
+            # Lettura per-turno: variante cached 60s (punto unico settings_db, C2).
+            from brain.utils.settings_db import get_int_setting_cached
+            _cap = get_int_setting_cached("agent.tools.discovery_max_injected", 20)
         except Exception:
             _cap = 20
         _existing_names = {t.get("name") for t in tools_json if isinstance(t, dict)}
@@ -2736,18 +2729,15 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 # la chat UI mostra il fallback invece del primario fallito. Best-effort:
                 # se il DB e' down logghiamo soltanto.
                 try:
-                    import os, psycopg2  # type: ignore[import-untyped]
+                    import os
                     _run_id = str(state.get("thread_id") or "")
                     _dburl = os.environ.get("DATABASE_URL")
                     if _run_id and _dburl:
-                        _conn = psycopg2.connect(_dburl)
-                        with _conn.cursor() as _cur:
+                        with db_connect() as _conn, _conn.cursor() as _cur:
                             _cur.execute(
                                 "UPDATE agent_runs SET provider=%s, model=%s WHERE id=%s",
                                 (provider, model, _run_id),
                             )
-                        _conn.commit()
-                        _conn.close()
                 except Exception as _exc:
                     logger.warning("executor_node: UPDATE agent_runs cascade fallita: %s", _exc)
             result_text = prov_result.content or ""
@@ -2888,10 +2878,7 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
 
                 # === Tier 1: catena intra-provider ===
                 try:
-                    import psycopg2  # type: ignore[import]
-                    import os as _os
-                    _db_url = _get_db_url()
-                    with psycopg2.connect(_db_url) as _conn:
+                    with db_connect() as _conn:
                         with _conn.cursor() as _cur:
                             _cur.execute(
                                 "SELECT escalation_model FROM nexus_model_escalation_chain "
@@ -3273,8 +3260,9 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     # M16: gate per la validazione tool-in-list nel loop sottostante.
     _M16_META_TOOLS = {"nexus_mcp_tool_search", "nexus_mcp_tool_call"}
     try:
-        from brain.utils.settings_db import get_bool_setting, get_setting
-        _discovery_first_on = get_bool_setting("agent.tools.discovery_first_enabled", False)
+        # Letture per-turno: varianti cached 60s (punto unico settings_db, C2).
+        from brain.utils.settings_db import get_bool_setting_cached, get_setting_cached
+        _discovery_first_on = get_bool_setting_cached("agent.tools.discovery_first_enabled", False)
         # Whitelist dei tool SEMPRE esposti al primo turno discovery (STESSA fonte
         # DB usata da mcp-core build_tools_json: agent.tools.discovery_first_whitelist).
         # Vanno permessi dalla validazione M16 anche se non "scoperti", altrimenti
@@ -3282,7 +3270,7 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
         # verrebbero rifiutati e il modello entra in loop search->reject.
         _df_whitelist = {
             t.strip()
-            for t in get_setting(
+            for t in get_setting_cached(
                 "agent.tools.discovery_first_whitelist",
                 "nexus_mcp_tool_search,nexus_mcp_tool_call",
             ).split(",")
@@ -3555,14 +3543,13 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     # Ora ogni step viene scritto subito cosi' la UI lo vede via polling
     # (M67) o via refresh, senza dover aspettare la fine del run.
     try:
-        import os, psycopg2  # type: ignore[import-untyped]
+        import os
         from psycopg2.extras import Json as _Json  # type: ignore[import-untyped]
         _run_id = state.get("thread_id") or ""
         _dburl = os.environ.get("DATABASE_URL")
         if _run_id and _dburl and _run_id not in _UNTRACKED_RUN_IDS:
             _step_base = int(state.get("iterations") or 0) * 1000
-            _conn = psycopg2.connect(_dburl)
-            try:
+            with db_connect() as _conn:
                 with _conn.cursor() as _cur:
                     # Guard run-fantasma (incidente Beauty-Book, run e51a6ed9/
                     # 1ae40cd6): se il run NON e' registrato in agent_runs, ogni
@@ -3601,8 +3588,6 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
                                 (_run_id, _step_base + _idx, _t_name, _Json(_t_input), _t_result, _status),
                             )
                 _conn.commit()
-            finally:
-                _conn.close()
     except Exception as _persist_exc:
         logger.warning("tool_dispatch_node: persistenza incrementale agent_steps fallita: %s", _persist_exc)
 
@@ -3721,8 +3706,9 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     _discovered_next: list[dict] = []
     _max_bytes = 8192
     try:
-        from brain.utils.settings_db import get_int_setting
-        _max_bytes = get_int_setting("agent.tools.discovery_schema_max_bytes", 8192)
+        # Lettura per-turno: variante cached 60s (punto unico settings_db, C2).
+        from brain.utils.settings_db import get_int_setting_cached
+        _max_bytes = get_int_setting_cached("agent.tools.discovery_schema_max_bytes", 8192)
     except Exception:
         pass
     for b, r in zip(pending, results):
@@ -4249,8 +4235,7 @@ def _build_pr3_system_blocks(state: AgentState) -> str:
         if cfg.get("plan_phase_enabled", False) and project_id:
             url = _os.environ.get("DATABASE_URL")
             if url:
-                import psycopg2  # type: ignore[import-untyped]
-                with psycopg2.connect(url) as conn:
+                with db_connect() as conn:
                     proj_root = None
                     try:
                         with conn.cursor() as cur:
@@ -4278,8 +4263,7 @@ def _build_pr3_system_blocks(state: AgentState) -> str:
             url = __import__("os").environ.get("DATABASE_URL", "")
             if url and project_id:
                 try:
-                    import psycopg2  # type: ignore[import-untyped]
-                    with psycopg2.connect(url) as conn:
+                    with db_connect() as conn:
                         with conn.cursor() as cur:
                             cur.execute(
                                 "SELECT absolute_path FROM workspaces WHERE project_id=%s AND is_primary=true LIMIT 1",

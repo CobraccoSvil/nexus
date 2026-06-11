@@ -469,10 +469,8 @@ async def _check_outputs_exist(
         return True, {"skipped": "DATABASE_URL assente: N/A (fail-open diagnostico)"}
     paths: list[str] = []
     try:
-        import psycopg2  # type: ignore[import-untyped]
-
-        conn = psycopg2.connect(conn_str)
-        try:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT tool_name, tool_input FROM agent_steps "
@@ -495,8 +493,6 @@ async def _check_outputs_exist(
                         p = str(raw.get(key) or "").strip()
                         if p and p not in paths:
                             paths.append(p)
-        finally:
-            conn.close()
     except Exception as exc:
         return True, {"skipped": f"lettura agent_steps fallita ({exc}): N/A"}
 
@@ -716,7 +712,6 @@ async def _check_db_query(
         return False, {"error": "connection_string o DATABASE_URL obbligatori"}
 
     try:
-        import psycopg2  # type: ignore[import-untyped]
         from psycopg2.extras import RealDictCursor  # type: ignore[import-untyped]
     except ImportError:
         return False, {"error": "psycopg2 non installato"}
@@ -724,17 +719,19 @@ async def _check_db_query(
     loop = asyncio.get_event_loop()
 
     def _run_query():
-        conn = psycopg2.connect(conn_str, cursor_factory=RealDictCursor, connect_timeout=int(timeout_s))
-        try:
-            with conn.cursor() as cur:
-                cur.execute(query)
-                if cur.description:
-                    rows = cur.fetchall()
-                else:
-                    rows = []
-                return rows
-        finally:
-            conn.close()
+        # connect_external: il connection string puo' puntare al DB applicativo
+        # del progetto, non al DB Nexus — niente pool condiviso qui.
+        from brain.utils.db_pool import connect_external
+
+        with connect_external(
+            conn_str, cursor_factory=RealDictCursor, connect_timeout=int(timeout_s)
+        ) as conn, conn.cursor() as cur:
+            cur.execute(query)
+            if cur.description:
+                rows = cur.fetchall()
+            else:
+                rows = []
+            return rows
 
     try:
         rows = await asyncio.wait_for(loop.run_in_executor(None, _run_query), timeout=timeout_s)

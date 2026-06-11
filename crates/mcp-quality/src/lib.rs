@@ -1,15 +1,113 @@
 // safety: tutte le `Regex::new("...").unwrap()` in questo modulo sono
-// applicate a pattern literal hardcoded in-line. Sono ammesse da CLAUDE.md
-// §F (clausola "Conversioni da static literals dove l'impossibilita' e'
-// dimostrata"); se uno dei pattern fosse malformato verrebbe scoperto al
-// primo lancio del modulo, mai a runtime su dati utente. Refactor opportuno:
-// migrare a `std::sync::LazyLock<Regex>` per evitare ricompilazione ad ogni
-// chiamata, ma non e' una violazione di §F.
+// applicate a pattern literal hardcoded, compilati UNA volta in static
+// `LazyLock<Regex>` (C3, docs/tech-debt-rust.md): `analyze_source` e' chiamata
+// in loop per-file dagli scan di progetto e ricompilare le regex ad ogni file
+// era il collo di bottiglia. Se un pattern fosse malformato il panic
+// avverrebbe al primo accesso allo static, mai a runtime su dati utente.
+
+use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 pub mod injection;
+
+// --- Regex compilate una sola volta (pattern literal; safety: literal valido) ---
+
+// Definizione funzione con cattura del nome (Rust/TS/JS/Python).
+static RE_FN_DEF_CAPTURE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:pub\s+)?(?:async\s+)?(?:fn|function|def)\s+(\w+)").unwrap()
+});
+// Definizione funzione senza cattura (solo match).
+static RE_FN_DEF: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:pub\s+)?(?:async\s+)?(?:fn|function|def)\s+\w+").unwrap()
+});
+// Branch keyword per la complessita' ciclomatica (variante completa con ??).
+// JS/TS don't have `match` as a control-flow keyword; omitting it avoids false
+// positives from variable names like `const match of` or `match.index`.
+static RE_BRANCH_FULL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(if|else if|elif|while|for|switch|case|catch|\?\?|&&|\|\|)\b").unwrap()
+});
+// Branch keyword per JS/TS (senza `match`, vedi check_complexity).
+static RE_BRANCH_JS_TS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(if|else\s+if|elif|while|for|switch|case|catch|&&|\|\|)\b").unwrap()
+});
+// Branch keyword per Rust/Python (con `match`).
+static RE_BRANCH_RUST_PY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(if|else\s+if|elif|while|for|match|case|catch|&&|\|\|)\b").unwrap()
+});
+// Funzione Rust con nome PascalCase (violazione naming).
+static RE_RS_FN_UPPERCASE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:pub\s+)?fn\s+([A-Z]\w*)").unwrap());
+// Classe JS/TS con nome lowercase (violazione naming).
+static RE_JS_CLASS_LOWERCASE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"class\s+([a-z]\w*)").unwrap());
+// Marker TODO/FIXME/HACK/XXX/WORKAROUND con messaggio.
+static RE_TODO_MARKER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(TODO|FIXME|HACK|XXX|WORKAROUND)\b:?\s*(.*)").unwrap());
+// Soppressioni di warning che possono indicare dead code.
+static RE_SUPPRESSED_WARNING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"#\[allow\(dead_code\)\]|// @ts-ignore|# type: ignore|#\[cfg\(dead_code\)\]")
+        .unwrap()
+});
+// `var` JS legacy.
+static RE_JS_VAR_DECL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*var\s+\w+").unwrap());
+// def Python con cattura della lista parametri.
+static RE_PY_FN_PARAMS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"def\s+\w+\s*\(([^)]*)\)").unwrap());
+// import { X, Y } from '...' (TS/JS).
+static RE_TS_NAMED_IMPORT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"import\s+\{([^}]+)\}\s+from"#).unwrap());
+// import Python (con eventuale from).
+static RE_PY_IMPORT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:from\s+\S+\s+)?import\s+(\S+)").unwrap());
+// Numeri "magici" (>= 200 a 3+ cifre, o qualunque 4+ cifre).
+static RE_MAGIC_NUMBER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b([2-9]\d{2,}|\d{4,})\b").unwrap());
+// Righe da saltare nel check dei magic number (dichiarazioni/commenti).
+static RE_MAGIC_SKIP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:const|let|var|val|=\s*)\s*\w+\s*[=:]|//|#").unwrap());
+// Branch keyword semplice per i blocchi complessi senza commenti.
+static RE_BRANCH_KEYWORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(if|for|while|match|switch)\b").unwrap());
+// Dichiarazione const/let TS/JS con cattura del nome.
+static RE_TSJS_DECL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:const|let)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*[=:]").unwrap());
+// Dichiarazione let Rust con cattura del nome.
+static RE_RS_LET_DECL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\blet\s+(?:mut\s+)?([a-zA-Z][a-zA-Z0-9_]*)\s*[=:]").unwrap());
+// Firma funzione con lista parametri lunga (>= 80 char) per il check parametri.
+static RE_FN_LONG_PARAMS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:pub\s+)?(?:async\s+)?(?:fn|function|def)\s+(\w+)\s*\(([^)]{80,})").unwrap()
+});
+// Stringhe letterali candidate a estrazione come costante.
+static RE_STRING_LITERAL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"["']([A-Za-z0-9_/.-]{6,40})["']"#).unwrap());
+// Inizio loop (for/while con parentesi, o metodi iterativi).
+static RE_LOOP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(for|while)\s*\(|\b(forEach|flatMap|reduce|each|loop)\b").unwrap()
+});
+// Query DB in file con JSX: pattern restrittivo (solo ORM/client espliciti).
+static RE_QUERY_JSX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\.query\(|\.execute\(|\.findOne\(|\.findAll\(|prisma\.\w+\.\w+\(|knex\(|db\.\w+\(|await\s+\w+\.(query|execute|findOne|findAll|select|load)\b"
+    ).unwrap()
+});
+// Query DB in file backend: pattern esteso (SQL inline + driver/ORM).
+static RE_QUERY_BACKEND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(select|insert|update|delete)\b.*\b(from|into|set)\b|\.query\(|\.execute\(|\.findOne\(|\.findAll\(|await\s+\w+\.(query|execute|findOne|findAll|select|load)\b|prisma\.\w+\.\w+\(|knex\(|db\.\w+\("
+    ).unwrap()
+});
+// Ordinamento/filtro applicato in codice (candidato a clausola SQL).
+static RE_SORT_IN_CODE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\.(sort|filter|find|reduce|slice|splice)\s*\(").unwrap());
+// Chiamata DB generica nelle righe precedenti (lookback post-query).
+static RE_DB_CALL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(\.query|\.execute|prisma\.|knex\(|db\.|\.from\(|SqlCommand|ExecuteReader|\.fetch\(|await fetch)"
+    ).unwrap()
+});
 
 pub struct RuleOverrides {
     pub disabled_rules: std::collections::HashSet<String>,
@@ -66,11 +164,10 @@ pub fn extract_context_snippet(source: &str, line: usize, context: usize) -> Str
 
 pub fn extract_function_bodies(source: &str, max_fns: usize) -> Vec<FunctionBody> {
     let lines: Vec<&str> = source.lines().collect();
-    let fn_re = Regex::new(r"(?:pub\s+)?(?:async\s+)?(?:fn|function|def)\s+(\w+)").unwrap();
     let mut result = Vec::new();
     let mut i = 0;
     while i < lines.len() && result.len() < max_fns {
-        if let Some(caps) = fn_re.captures(lines[i]) {
+        if let Some(caps) = RE_FN_DEF_CAPTURE.captures(lines[i]) {
             let name = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
             let start = i;
             let mut depth = 0i32;
@@ -208,16 +305,10 @@ fn count_comment_lines(lines: &[&str]) -> usize {
 }
 
 fn extract_functions(lines: &[&str]) -> Vec<FunctionInfo> {
-    let fn_re = Regex::new(r"(?:pub\s+)?(?:async\s+)?(?:fn|function|def)\s+\w+").unwrap();
-    // JS/TS don't have `match` as a control-flow keyword; omitting it avoids false positives
-    // from variable names like `const match of` or `match.index`.
-    let branch_re =
-        Regex::new(r"\b(if|else if|elif|while|for|switch|case|catch|\?\?|&&|\|\|)\b").unwrap();
-
     let mut functions = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        if fn_re.is_match(lines[i]) {
+        if RE_FN_DEF.is_match(lines[i]) {
             let start = i;
             let mut depth = 0;
             let mut complexity = 1;
@@ -234,7 +325,7 @@ fn extract_functions(lines: &[&str]) -> Vec<FunctionInfo> {
                         '}' if found_open => {
                             depth -= 1;
                             if depth == 0 {
-                                complexity += branch_re.find_iter(line_j135).count();
+                                complexity += RE_BRANCH_FULL.find_iter(line_j135).count();
                                 functions.push(FunctionInfo {
                                     complexity,
                                     length: j - start + 1,
@@ -250,7 +341,7 @@ fn extract_functions(lines: &[&str]) -> Vec<FunctionInfo> {
                     break;
                 }
                 if found_open {
-                    complexity += branch_re.find_iter(line_j135).count();
+                    complexity += RE_BRANCH_FULL.find_iter(line_j135).count();
                 }
             }
         }
@@ -260,7 +351,6 @@ fn extract_functions(lines: &[&str]) -> Vec<FunctionInfo> {
 }
 
 fn check_complexity(lines: &[&str], file_path: &str) -> Vec<QualityFinding> {
-    let fn_re = Regex::new(r"(?:pub\s+)?(?:async\s+)?(?:fn|function|def)\s+(\w+)").unwrap();
     // For JS/TS files, `match` is not a control-flow keyword — it's commonly used as a
     // variable name (e.g. `const match of`, `match.index`). Including `\bmatch\b` would
     // inflate complexity counts with false positives. Use `match` only for Rust/Python.
@@ -268,16 +358,12 @@ fn check_complexity(lines: &[&str], file_path: &str) -> Vec<QualityFinding> {
         std::path::Path::new(file_path).extension().and_then(|e| e.to_str()).unwrap_or(""),
         "ts" | "tsx" | "js" | "jsx"
     );
-    let branch_re = if is_js_ts {
-        Regex::new(r"\b(if|else\s+if|elif|while|for|switch|case|catch|&&|\|\|)\b").unwrap()
-    } else {
-        Regex::new(r"\b(if|else\s+if|elif|while|for|match|case|catch|&&|\|\|)\b").unwrap()
-    };
+    let branch_re: &Regex = if is_js_ts { &RE_BRANCH_JS_TS } else { &RE_BRANCH_RUST_PY };
     let mut findings = Vec::new();
     let mut i = 0;
 
     while i < lines.len() {
-        if let Some(cap) = fn_re.captures(lines[i]) {
+        if let Some(cap) = RE_FN_DEF_CAPTURE.captures(lines[i]) {
             let name = cap[1].to_string();
             let fn_start = i;
             let mut depth = 0;
@@ -324,12 +410,11 @@ fn check_complexity(lines: &[&str], file_path: &str) -> Vec<QualityFinding> {
 }
 
 fn check_long_functions(lines: &[&str]) -> Vec<QualityFinding> {
-    let fn_re = Regex::new(r"(?:pub\s+)?(?:async\s+)?(?:fn|function|def)\s+(\w+)").unwrap();
     let mut findings = Vec::new();
     let mut i = 0;
 
     while i < lines.len() {
-        if let Some(cap) = fn_re.captures(lines[i]) {
+        if let Some(cap) = RE_FN_DEF_CAPTURE.captures(lines[i]) {
             let name = cap[1].to_string();
             let start = i;
             let mut depth = 0;
@@ -378,9 +463,8 @@ fn check_naming_conventions(lines: &[&str], file_path: &str) -> Vec<QualityFindi
         || file_path.ends_with(".jsx");
 
     if is_rust {
-        let fn_re = Regex::new(r"(?:pub\s+)?fn\s+([A-Z]\w*)").unwrap();
         for (i, line) in lines.iter().enumerate() {
-            if let Some(cap) = fn_re.captures(line) {
+            if let Some(cap) = RE_RS_FN_UPPERCASE.captures(line) {
                 findings.push(QualityFinding {
                     category: "naming".into(),
                     severity: "low".into(),
@@ -394,9 +478,8 @@ fn check_naming_conventions(lines: &[&str], file_path: &str) -> Vec<QualityFindi
     }
 
     if is_js_ts {
-        let class_re = Regex::new(r"class\s+([a-z]\w*)").unwrap();
         for (i, line) in lines.iter().enumerate() {
-            if let Some(cap) = class_re.captures(line) {
+            if let Some(cap) = RE_JS_CLASS_LOWERCASE.captures(line) {
                 findings.push(QualityFinding {
                     category: "naming".into(),
                     severity: "low".into(),
@@ -511,11 +594,10 @@ fn check_code_smells(lines: &[&str]) -> Vec<QualityFinding> {
 }
 
 fn check_todos_fixmes(lines: &[&str]) -> Vec<QualityFinding> {
-    let re = Regex::new(r"(?i)\b(TODO|FIXME|HACK|XXX|WORKAROUND)\b:?\s*(.*)").unwrap();
     let mut findings = Vec::new();
 
     for (i, line) in lines.iter().enumerate() {
-        if let Some(cap) = re.captures(line) {
+        if let Some(cap) = RE_TODO_MARKER.captures(line) {
             let kind = cap[1].to_uppercase();
             let msg = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
             findings.push(QualityFinding {
@@ -542,12 +624,9 @@ fn check_todos_fixmes(lines: &[&str]) -> Vec<QualityFinding> {
 
 fn check_dead_code_hints(lines: &[&str]) -> Vec<QualityFinding> {
     let mut findings = Vec::new();
-    let unused_re =
-        Regex::new(r"#\[allow\(dead_code\)\]|// @ts-ignore|# type: ignore|#\[cfg\(dead_code\)\]")
-            .unwrap();
 
     for (i, line) in lines.iter().enumerate() {
-        if unused_re.is_match(line.trim()) {
+        if RE_SUPPRESSED_WARNING.is_match(line.trim()) {
             findings.push(QualityFinding {
                 category: "dead_code".into(),
                 severity: "low".into(),
@@ -591,10 +670,6 @@ fn check_untyped_variables(lines: &[&str], file_path: &str) -> Vec<QualityFindin
     let is_js = file_path.ends_with(".js") || file_path.ends_with(".jsx");
     let is_py = file_path.ends_with(".py");
 
-    // Regex compilate una sola volta fuori dal loop (direttiva: no regex in loop)
-    let var_re = regex::Regex::new(r"^\s*var\s+\w+").unwrap();
-    let py_fn_re = regex::Regex::new(r"def\s+\w+\s*\(([^)]*)\)").unwrap();
-
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim();
         if t.starts_with("//") || t.starts_with('#') { continue; }
@@ -609,7 +684,7 @@ fn check_untyped_variables(lines: &[&str], file_path: &str) -> Vec<QualityFindin
                 suggested_comment: Some("// TODO: replace `any` with a specific type".into()),
             });
         }
-        if is_js && var_re.is_match(line) {
+        if is_js && RE_JS_VAR_DECL.is_match(line) {
             findings.push(QualityFinding {
                 category: "typing".into(),
                 severity: "low".into(),
@@ -620,7 +695,7 @@ fn check_untyped_variables(lines: &[&str], file_path: &str) -> Vec<QualityFindin
             });
         }
         if is_py {
-            if let Some(cap) = py_fn_re.captures(line) {
+            if let Some(cap) = RE_PY_FN_PARAMS.captures(line) {
                 let params = &cap[1];
                 if !params.trim().is_empty()
                     && !params.contains(':')
@@ -651,9 +726,8 @@ fn check_unused_imports(lines: &[&str], file_path: &str) -> Vec<QualityFinding> 
 
     if is_ts_js {
         // Match: import { X, Y } from '...' or import X from '...'
-        let import_re = regex::Regex::new(r#"import\s+\{([^}]+)\}\s+from"#).unwrap();
         for (i, line) in lines.iter().enumerate() {
-            if let Some(cap) = import_re.captures(line) {
+            if let Some(cap) = RE_TS_NAMED_IMPORT.captures(line) {
                 for name in cap[1].split(',') {
                     let trimmed = name.trim().split(" as ").last().unwrap_or("").trim();
                     if trimmed.is_empty() { continue; }
@@ -675,10 +749,9 @@ fn check_unused_imports(lines: &[&str], file_path: &str) -> Vec<QualityFinding> 
     }
 
     if is_py {
-        let import_re = regex::Regex::new(r"^(?:from\s+\S+\s+)?import\s+(\S+)").unwrap();
         for (i, line) in lines.iter().enumerate() {
             let t = line.trim();
-            if let Some(cap) = import_re.captures(t) {
+            if let Some(cap) = RE_PY_IMPORT.captures(t) {
                 let name = cap[1].split(" as ").last().unwrap_or("").trim();
                 let name = name.split(',').next().unwrap_or("").trim();
                 if name.is_empty() { continue; }
@@ -785,11 +858,9 @@ fn check_comment_quality(lines: &[&str], file_path: &str) -> Vec<QualityFinding>
 
     // Magic numbers (not in .sql files)
     if !file_path.ends_with(".sql") {
-        let magic_re = regex::Regex::new(r"\b([2-9]\d{2,}|\d{4,})\b").unwrap();
-        let skip_re = regex::Regex::new(r"(?:const|let|var|val|=\s*)\s*\w+\s*[=:]|//|#").unwrap();
         for (i, line) in lines.iter().enumerate() {
-            if skip_re.is_match(line) { continue; }
-            if let Some(m) = magic_re.find(line) {
+            if RE_MAGIC_SKIP.is_match(line) { continue; }
+            if let Some(m) = RE_MAGIC_NUMBER.find(line) {
                 let num: u64 = m.as_str().parse().unwrap_or(0);
                 // skip common non-magic: port numbers like 3000, 4000, 8080 are OK
                 if num > 99 && num != 100 && num != 1000 && num != 1024 {
@@ -808,7 +879,6 @@ fn check_comment_quality(lines: &[&str], file_path: &str) -> Vec<QualityFinding>
     }
 
     // Complex blocks without comments (> 15 lines with branches, no comment)
-    let branch_re = regex::Regex::new(r"\b(if|for|while|match|switch)\b").unwrap();
     let mut block_start = 0;
     let mut branch_count = 0;
     let mut has_comment = false;
@@ -817,7 +887,7 @@ fn check_comment_quality(lines: &[&str], file_path: &str) -> Vec<QualityFinding>
         if t.starts_with("//") || t.starts_with("/*") || t.starts_with("*") || t.starts_with("#") {
             has_comment = true;
         }
-        if branch_re.is_match(t) {
+        if RE_BRANCH_KEYWORD.is_match(t) {
             branch_count += 1;
         }
         if t.is_empty() || i == lines.len() - 1 {
@@ -853,11 +923,10 @@ fn check_unused_variables(lines: &[&str], file_path: &str) -> Vec<QualityFinding
 
     if is_ts || is_js {
         // const/let foo = ... dove foo non appare altrove
-        let decl_re = Regex::new(r"(?:const|let)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*[=:]").unwrap();
         for (i, line) in lines.iter().enumerate() {
             let t = line.trim();
             if t.starts_with("//") || t.starts_with("export ") { continue; }
-            for cap in decl_re.captures_iter(line) {
+            for cap in RE_TSJS_DECL.captures_iter(line) {
                 let name = &cap[1];
                 if name == "_" || name.starts_with('_') { continue; }
                 // Conta le occorrenze nel file (esclusa la dichiarazione stessa)
@@ -878,11 +947,10 @@ fn check_unused_variables(lines: &[&str], file_path: &str) -> Vec<QualityFinding
 
     if is_rs {
         // let foo = ... (non prefissata da _) mai usata
-        let decl_re = Regex::new(r"\blet\s+(?:mut\s+)?([a-zA-Z][a-zA-Z0-9_]*)\s*[=:]").unwrap();
         for (i, line) in lines.iter().enumerate() {
             let t = line.trim();
             if t.starts_with("//") { continue; }
-            for cap in decl_re.captures_iter(line) {
+            for cap in RE_RS_LET_DECL.captures_iter(line) {
                 let name = &cap[1];
                 if name.starts_with('_') { continue; }
                 let count = source.matches(name).count();
@@ -911,9 +979,8 @@ fn check_too_many_params(lines: &[&str], file_path: &str) -> Vec<QualityFinding>
         || file_path.ends_with(".py") || file_path.ends_with(".cs");
     if !is_code { return findings; }
 
-    let fn_re = Regex::new(r"(?:pub\s+)?(?:async\s+)?(?:fn|function|def)\s+(\w+)\s*\(([^)]{80,})").unwrap();
     for (i, line) in lines.iter().enumerate() {
-        if let Some(cap) = fn_re.captures(line) {
+        if let Some(cap) = RE_FN_LONG_PARAMS.captures(line) {
             let params = &cap[2];
             // Conta le virgole come approssimazione del numero di parametri
             let param_count = params.chars().filter(|&c| c == ',').count() + 1;
@@ -941,13 +1008,12 @@ fn check_repeated_literals(lines: &[&str], file_path: &str) -> Vec<QualityFindin
     if !is_code { return findings; }
 
     // Conta stringhe letterali ripetute (escluse quelle brevi o comuni)
-    let str_re = Regex::new(r#"["']([A-Za-z0-9_/.-]{6,40})["']"#).unwrap();
     let mut counts: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
 
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim();
         if t.starts_with("//") || t.starts_with('#') || t.starts_with("import ") || t.starts_with("use ") { continue; }
-        for cap in str_re.captures_iter(line) {
+        for cap in RE_STRING_LITERAL.captures_iter(line) {
             let val = cap[1].to_string();
             // Salta valori comuni non meritevoli di costante
             if matches!(val.as_str(), "utf-8" | "UTF-8" | "application/json" | "text/plain" | "GET" | "POST" | "PUT" | "DELETE") { continue; }
@@ -1009,31 +1075,18 @@ fn check_db_queries_in_loops(lines: &[&str], file_path: &str, overrides: &RuleOv
             || (t.starts_with("return") && t.contains("</"))
     });
 
-    // Pattern che indicano un loop.
+    // Pattern che indicano un loop (RE_LOOP).
     // `for` e `while` richiedono esplicitamente `(` dopo (con eventuale spazio) per evitare
     // false match su parole come "for user" dentro template literal o commenti.
     // `forEach`, `map`, `flatMap`, `reduce`, `each`, `loop` vengono lasciati come word boundary
     // perché in pratica appaiono sempre come metodi (`.forEach(`, `.map(`, ecc.).
-    let loop_re = Regex::new(r"\b(for|while)\s*\(|\b(forEach|flatMap|reduce|each|loop)\b").unwrap();
+    //
     // Pattern che indicano una query DB dentro il loop.
     // Per file con JSX: pattern molto restrittivo (solo ORM/client espliciti, no fetch generico).
     // Per file backend: pattern esteso MA limitato a veri driver/ORM DB — `await fetch(` e metodi
     // HTTP generici (.get/.post/.fetch/.read) sono ESCLUSI: sono chiamate HTTP, non query DB, e
     // causavano falsi positivi su webhook handler e API route (es. Stripe, PayPal, ecc.).
-    let query_re = if has_jsx_return {
-        Regex::new(
-            r"(?i)\.query\(|\.execute\(|\.findOne\(|\.findAll\(|prisma\.\w+\.\w+\(|knex\(|db\.\w+\(|await\s+\w+\.(query|execute|findOne|findAll|select|load)\b"
-        ).unwrap()
-    } else {
-        Regex::new(
-            r"(?i)\b(select|insert|update|delete)\b.*\b(from|into|set)\b|\.query\(|\.execute\(|\.findOne\(|\.findAll\(|await\s+\w+\.(query|execute|findOne|findAll|select|load)\b|prisma\.\w+\.\w+\(|knex\(|db\.\w+\("
-        ).unwrap()
-    };
-    // Pattern che suggeriscono ordinamento/filtro in codice invece che in DB
-    let sort_in_code_re = Regex::new(r"\.(sort|filter|find|reduce|slice|splice)\s*\(").unwrap();
-    let db_call_re = Regex::new(
-        r"(?i)(\.query|\.execute|prisma\.|knex\(|db\.|\.from\(|SqlCommand|ExecuteReader|\.fetch\(|await fetch)"
-    ).unwrap();
+    let query_re: &Regex = if has_jsx_return { &RE_QUERY_JSX } else { &RE_QUERY_BACKEND };
 
     let mut loop_depth = 0usize;
     let mut loop_start_line = 0usize;
@@ -1059,7 +1112,7 @@ fn check_db_queries_in_loops(lines: &[&str], file_path: &str, overrides: &RuleOv
         }
 
         // Rileva inizio loop
-        if loop_re.is_match(t) && (t.contains('{') || t.ends_with(')') || t.ends_with("=>")) {
+        if RE_LOOP.is_match(t) && (t.contains('{') || t.ends_with(')') || t.ends_with("=>")) {
             loop_depth += 1;
             loop_start_line = i + 1;
             loop_brace_depth = brace_depth - 1;
@@ -1085,9 +1138,9 @@ fn check_db_queries_in_loops(lines: &[&str], file_path: &str, overrides: &RuleOv
         }
 
         // Cerca sort/filter su dati che potrebbero venire dal DB
-        if sort_in_code_re.is_match(t) && !t.starts_with("//") {
+        if RE_SORT_IN_CODE.is_match(t) && !t.starts_with("//") {
             // Controlla se nelle righe precedenti (fino a 15) c'è una chiamata DB
-            let lookback = lines[i.saturating_sub(15)..i].iter().any(|l| db_call_re.is_match(l));
+            let lookback = lines[i.saturating_sub(15)..i].iter().any(|l| RE_DB_CALL.is_match(l));
             if lookback {
                 let op = if t.contains(".sort") { "sort" }
                     else if t.contains(".filter") { "filter" }
@@ -1215,5 +1268,43 @@ fn foo() {
 "#;
         let report = analyze_source("test.rs", source);
         assert!(report.findings.iter().any(|f| f.title.contains("unwrap")));
+    }
+
+    #[test]
+    fn bench_analyze_source_200_iterazioni() {
+        // MISURA C3 (docs/tech-debt-rust.md): conferma empirica che le regex
+        // static LazyLock vengono compilate una sola volta e non per-file.
+        // Lanciare con --nocapture per leggere il tempo:
+        //   cargo test -p mcp-quality --message-format=short -- --nocapture bench_analyze_source
+        // Sorgente sintetico di ~100 righe con funzioni, branch, loop e marker.
+        let mut source = String::new();
+        for i in 0..10 {
+            source.push_str(&format!(
+                "fn funzione_{i}(a: i32, b: i32) -> i32 {{\n\
+                 \x20   // TODO: rifinire il blocco {i}\n\
+                 \x20   let totale = a + b + {i}21;\n\
+                 \x20   if a > b && b > 0 {{\n\
+                 \x20       for k in 0..a {{\n\
+                 \x20           println!(\"valore {{}}\", k);\n\
+                 \x20       }}\n\
+                 \x20   }}\n\
+                 \x20   totale\n\
+                 }}\n\n"
+            ));
+        }
+        assert!(source.lines().count() >= 100, "il sorgente sintetico deve avere ~100 righe");
+
+        let start = std::time::Instant::now();
+        for _ in 0..200 {
+            let report = analyze_source("bench.rs", &source);
+            assert!(report.metrics.total_lines >= 100);
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "bench analyze_source: 200 iterazioni su ~{} righe in {:?} ({:?} per iterazione)",
+            source.lines().count(),
+            elapsed,
+            elapsed / 200
+        );
     }
 }

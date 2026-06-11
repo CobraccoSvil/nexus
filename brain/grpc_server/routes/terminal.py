@@ -87,24 +87,20 @@ async def terminal_ws(websocket: WebSocket, session_id: str):
             if not _db_url:
                 return
             try:
-                import psycopg2
                 raw = b"".join(_output_buf).decode("utf-8", errors="replace")
                 clean = _strip_ansi(raw)[-8000:]
-                conn = psycopg2.connect(_db_url)
-                cur = conn.cursor()
-                cur.execute(
-                    "UPDATE terminal_commands "
-                    "SET full_output = %s, exit_code = %s, finished_at = NOW() "
-                    "WHERE id = ("
-                    "  SELECT id FROM terminal_commands "
-                    "  WHERE session_id = %s AND full_output IS NULL "
-                    "  ORDER BY created_at DESC LIMIT 1"
-                    ")",
-                    (clean, exit_code_val, session_id),
-                )
-                conn.commit()
-                cur.close()
-                conn.close()
+                from brain.utils.db_pool import connect as _db_connect
+                with _db_connect() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE terminal_commands "
+                        "SET full_output = %s, exit_code = %s, finished_at = NOW() "
+                        "WHERE id = ("
+                        "  SELECT id FROM terminal_commands "
+                        "  WHERE session_id = %s AND full_output IS NULL "
+                        "  ORDER BY created_at DESC LIMIT 1"
+                        ")",
+                        (clean, exit_code_val, session_id),
+                    )
                 logger.debug("_flush_output_to_db: wrote %d chars, exit=%s", len(clean), exit_code_val)
             except Exception as e:
                 logger.debug("_flush_output_to_db error: %s", e)

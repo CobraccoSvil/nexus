@@ -426,25 +426,20 @@ def _mark_todo_status(todo_id: str, new_status: str) -> None:
     if not todo_id:
         return
     try:
-        import psycopg2  # type: ignore[import-untyped]
         url = os.environ.get("DATABASE_URL")
         if not url:
             return
-        conn = psycopg2.connect(url)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """UPDATE nexus_agent_todos
-                       SET status = %s, updated_at = NOW(),
-                           verify_failures = CASE WHEN %s = 'blocked'
-                                                  THEN verify_failures + 1
-                                                  ELSE verify_failures END
-                       WHERE id = %s""",
-                    (new_status, new_status, todo_id),
-                )
-            conn.commit()
-        finally:
-            conn.close()
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE nexus_agent_todos
+                   SET status = %s, updated_at = NOW(),
+                       verify_failures = CASE WHEN %s = 'blocked'
+                                              THEN verify_failures + 1
+                                              ELSE verify_failures END
+                   WHERE id = %s""",
+                (new_status, new_status, todo_id),
+            )
     except Exception as exc:
         logger.warning("verifier_node._mark_todo_status %s -> %s fallito: %s", todo_id, new_status, exc)
 
@@ -453,23 +448,18 @@ def _persist_verifier_run(
     run_id: str, todo_id: str, cycle: int, results: list[dict], passed: bool, duration_ms: int,
 ) -> None:
     try:
-        import psycopg2  # type: ignore[import-untyped]
         from psycopg2.extras import Json  # type: ignore[import-untyped]
         url = os.environ.get("DATABASE_URL")
         if not url:
             return
-        conn = psycopg2.connect(url)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """INSERT INTO nexus_agent_verifier_runs
-                       (run_id, todo_id, cycle, criteria_results, passed, duration_ms)
-                       VALUES (%s, %s, %s, %s, %s, %s)""",
-                    (run_id, todo_id, cycle, Json(results), passed, duration_ms),
-                )
-            conn.commit()
-        finally:
-            conn.close()
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO nexus_agent_verifier_runs
+                   (run_id, todo_id, cycle, criteria_results, passed, duration_ms)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (run_id, todo_id, cycle, Json(results), passed, duration_ms),
+            )
     except Exception as exc:
         logger.warning("verifier_node._persist_verifier_run fallita: %s", exc)
 

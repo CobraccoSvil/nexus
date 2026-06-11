@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useThemeColors } from "../../../lib/theme";
 import { formatBytes, formatDateTime } from "../../../lib/format";
 import { AdminPageHeader } from "../../../components/admin/AdminPageHeader";
+import { fetchJson } from "../../../lib/api/_shared";
 
 interface TableStats {
   name: string;
@@ -48,9 +49,7 @@ export default function NexusDatabasePage() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/admin/nexus-database-stats");
-      if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-      const json: DatabaseStats = await res.json();
+      const json = await fetchJson<DatabaseStats>("/api/admin/nexus-database-stats");
       setData(json);
       setLastRefresh(new Date());
     } catch (e) {

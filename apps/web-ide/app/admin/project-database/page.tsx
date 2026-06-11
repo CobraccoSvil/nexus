@@ -9,8 +9,15 @@ import {
   rollbackProjectMigration,
   type ProjectMigration,
 } from "../../../lib/api-client";
+import { fetchJson } from "../../../lib/api/_shared";
 
 type Tab = "migrazioni" | "audit" | "nexus-database";
+
+type NexusDbStats = {
+  tables?: Array<{ name: string; row_count?: number; last_updated?: string }>;
+  stats?: Record<string, unknown>;
+  [key: string]: unknown;
+};
 
 export default function ProjectDatabasePage() {
   return (
@@ -31,11 +38,7 @@ function ProjectDatabasePageInner() {
   const [applying, setApplying] = useState(false);
   const [rollingBack, setRollingBack] = useState(false);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
-  const [nexusDbStats, setNexusDbStats] = useState<{
-    tables?: Array<{ name: string; row_count?: number; last_updated?: string }>;
-    stats?: Record<string, unknown>;
-    [key: string]: unknown;
-  } | null>(null);
+  const [nexusDbStats, setNexusDbStats] = useState<NexusDbStats | null>(null);
   const [nexusLoading, setNexusLoading] = useState(false);
 
   async function loadMigrations() {
@@ -58,13 +61,10 @@ function ProjectDatabasePageInner() {
     try {
       // Tenta di caricare dall'API, altrimenti mostra mock
       try {
-        const response = await fetch("/api/admin/nexus-database-stats");
-        if (response.ok) {
-          const data = await response.json();
-          setNexusDbStats(data);
-          setNexusLoading(false);
-          return;
-        }
+        const data = await fetchJson<NexusDbStats>("/api/admin/nexus-database-stats");
+        setNexusDbStats(data);
+        setNexusLoading(false);
+        return;
       } catch {
         // Continua con i dati mock
       }

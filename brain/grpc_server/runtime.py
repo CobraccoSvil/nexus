@@ -105,11 +105,8 @@ def _registered_project_roots() -> set[str]:
 
     roots: set[str] = set()
     try:
-        import psycopg2
-
-        conn = psycopg2.connect(db_url)
-        try:
-            cur = conn.cursor()
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT repository_root_path FROM projects "
                 "WHERE repository_root_path IS NOT NULL AND repository_root_path <> ''"
@@ -119,9 +116,6 @@ def _registered_project_roots() -> set[str]:
                     roots.add(str(Path(path_value).expanduser().resolve()))
                 except Exception:
                     continue
-            cur.close()
-        finally:
-            conn.close()
     except Exception as exc:
         logger.warning("registered_project_roots: query progetti fallita: %s", exc)
         if _PROJECT_ROOTS_CACHE:
@@ -460,9 +454,8 @@ async def _warmup_google_provider() -> None:
         # di pre-warm del client SDK, non una scelta di routing).
         def _resolve_warmup_model() -> str | None:
             try:
-                import psycopg2  # type: ignore[import-untyped]
-                from brain.utils.settings_db import get_db_url
-                with psycopg2.connect(get_db_url()) as conn:
+                from brain.utils.db_pool import connect as _db_connect
+                with _db_connect() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
                             "SELECT model FROM ai_price_catalog "
@@ -556,7 +549,6 @@ def _apply_dns_override(dns_servers: list[str]) -> None:
 def _load_keys_from_db() -> dict[str, object]:
     """Load API keys and enabled flags from PostgreSQL and apply to providers."""
     import os
-    import psycopg2
 
     updated = []
     errors = []
@@ -566,73 +558,68 @@ def _load_keys_from_db() -> dict[str, object]:
         return {"status": "error", "updated": [], "errors": ["DATABASE_URL not set"]}
 
     try:
-        conn = psycopg2.connect(database_url)
-        cur = conn.cursor()
-
-        # Carica tutte le chiavi *_api_key dal DB
-        cur.execute(
-            "SELECT key, value FROM settings WHERE key LIKE %s AND value != ''",
-            ("%_api_key",)
-        )
-        for setting_key, value in cur.fetchall():
-            provider_name = setting_key.replace("_api_key", "")
-            try:
-                p = providers.get_provider(provider_name)
-                if p is not None:
-                    p._api_key = value
-                    p._client = None  # Force reconnect
-                    updated.append(provider_name)
-            except Exception as e:
-                errors.append(f"{provider_name}: {e}")
-
-        # Carica le impostazioni di abilitazione *_enabled dal DB
-        cur.execute(
-            "SELECT key, value FROM settings WHERE key LIKE %s",
-            ("%_enabled",)
-        )
-        for setting_key, value in cur.fetchall():
-            # Filtra solo i provider noti (ignora google_batch_api_enabled ecc.)
-            provider_name = setting_key.replace("_enabled", "")
-            if providers.get_provider(provider_name) is not None:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn, conn.cursor() as cur:
+            # Carica tutte le chiavi *_api_key dal DB
+            cur.execute(
+                "SELECT key, value FROM settings WHERE key LIKE %s AND value != ''",
+                ("%_api_key",)
+            )
+            for setting_key, value in cur.fetchall():
+                provider_name = setting_key.replace("_api_key", "")
                 try:
-                    providers.set_enabled(provider_name, value.strip().lower() not in ("false", "0", "no"))
+                    p = providers.get_provider(provider_name)
+                    if p is not None:
+                        p._api_key = value
+                        p._client = None  # Force reconnect
+                        updated.append(provider_name)
                 except Exception as e:
-                    errors.append(f"{provider_name}_enabled: {e}")
+                    errors.append(f"{provider_name}: {e}")
 
+            # Carica le impostazioni di abilitazione *_enabled dal DB
+            cur.execute(
+                "SELECT key, value FROM settings WHERE key LIKE %s",
+                ("%_enabled",)
+            )
+            for setting_key, value in cur.fetchall():
+                # Filtra solo i provider noti (ignora google_batch_api_enabled ecc.)
+                provider_name = setting_key.replace("_enabled", "")
+                if providers.get_provider(provider_name) is not None:
+                    try:
+                        providers.set_enabled(provider_name, value.strip().lower() not in ("false", "0", "no"))
+                    except Exception as e:
+                        errors.append(f"{provider_name}_enabled: {e}")
 
-        # Carica ollama_url per il provider locale
-        cur.execute("SELECT value FROM settings WHERE key = 'ollama_url'")
-        ollama_url_row = cur.fetchone()
-        if ollama_url_row and ollama_url_row[0] and ollama_url_row[0].strip():
-            ollama_url_val = ollama_url_row[0].strip()
-            ollama_prov = providers.get_provider("ollama")
-            if ollama_prov is not None:
-                ollama_prov._base_url = ollama_url_val
-                ollama_prov._client = None  # Force reconnect
-                updated.append(f"ollama_url:{ollama_url_val}")
+            # Carica ollama_url per il provider locale
+            cur.execute("SELECT value FROM settings WHERE key = 'ollama_url'")
+            ollama_url_row = cur.fetchone()
+            if ollama_url_row and ollama_url_row[0] and ollama_url_row[0].strip():
+                ollama_url_val = ollama_url_row[0].strip()
+                ollama_prov = providers.get_provider("ollama")
+                if ollama_prov is not None:
+                    ollama_prov._base_url = ollama_url_val
+                    ollama_prov._client = None  # Force reconnect
+                    updated.append(f"ollama_url:{ollama_url_val}")
 
-        # Carica network_dns_servers e applica override DNS
-        cur.execute("SELECT value FROM settings WHERE key = 'network_dns_servers'")
-        dns_row = cur.fetchone()
-        if dns_row and dns_row[0] and dns_row[0].strip():
-            dns_servers = [s.strip() for s in dns_row[0].split(',') if s.strip()]
-            _apply_dns_override(dns_servers)
-            updated.append(f"dns:{','.join(dns_servers)}")
+            # Carica network_dns_servers e applica override DNS
+            cur.execute("SELECT value FROM settings WHERE key = 'network_dns_servers'")
+            dns_row = cur.fetchone()
+            if dns_row and dns_row[0] and dns_row[0].strip():
+                dns_servers = [s.strip() for s in dns_row[0].split(',') if s.strip()]
+                _apply_dns_override(dns_servers)
+                updated.append(f"dns:{','.join(dns_servers)}")
 
-        # Carica nexus_external_proxy — imposta NEXUS_PROXY per httpx/requests
-        cur.execute("SELECT value FROM settings WHERE key = 'nexus_external_proxy'")
-        proxy_row = cur.fetchone()
-        if proxy_row is not None:
-            proxy_val = (proxy_row[0] or "").strip()
-            if proxy_val:
-                os.environ["NEXUS_PROXY"] = proxy_val
-                # Riconfigura il transport DNS se il proxy prende il sopravvento
-                updated.append(f"proxy:{proxy_val}")
-            else:
-                os.environ.pop("NEXUS_PROXY", None)
-
-        cur.close()
-        conn.close()
+            # Carica nexus_external_proxy — imposta NEXUS_PROXY per httpx/requests
+            cur.execute("SELECT value FROM settings WHERE key = 'nexus_external_proxy'")
+            proxy_row = cur.fetchone()
+            if proxy_row is not None:
+                proxy_val = (proxy_row[0] or "").strip()
+                if proxy_val:
+                    os.environ["NEXUS_PROXY"] = proxy_val
+                    # Riconfigura il transport DNS se il proxy prende il sopravvento
+                    updated.append(f"proxy:{proxy_val}")
+                else:
+                    os.environ.pop("NEXUS_PROXY", None)
     except Exception as e:
         errors.append(f"DB connection: {e}")
 

@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useThemeColors } from "../../../lib/theme";
 import { createMcpServer } from "../../../lib/api-client";
+import { fetchJson, fetchText } from "../../../lib/api/_shared";
 
 type Info = {
   extension_id: string | null;
@@ -40,9 +41,7 @@ export default function BrowserBridgePage() {
     setLoading(true);
     setFetchError(null);
     try {
-      const r = await fetch(PROXY_INFO, { credentials: "include" });
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-      setInfo((await r.json()) as Info);
+      setInfo(await fetchJson<Info>(PROXY_INFO));
     } catch (e) {
       setFetchError(e instanceof Error ? e.message : String(e));
       setInfo(null);
@@ -57,9 +56,10 @@ export default function BrowserBridgePage() {
   const download = useCallback(async (url: string, filename: string) => {
     setDlError(null);
     try {
-      const r = await fetch(url, { credentials: "include" });
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText} — il daemon e' raggiungibile?`);
-      const text = await r.text();
+      const text = await fetchText(url).catch((e: unknown) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        throw new Error(`${msg} — il daemon e' raggiungibile?`);
+      });
       if (!text.trim()) throw new Error("risposta vuota dal daemon");
 
       // Metodo 1: data-URL inline (funziona anche con popup-blocker).

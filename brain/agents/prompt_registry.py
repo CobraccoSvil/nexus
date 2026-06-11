@@ -75,13 +75,13 @@ def load_from_db(database_url: Optional[str] = None) -> int:
         logger.warning("prompt_registry: DATABASE_URL non impostato, skip load")
         return 0
     try:
-        import psycopg2  # type: ignore[import-untyped]
+        import psycopg2  # type: ignore[import-untyped]  # noqa: F401
     except ImportError:
         logger.warning("prompt_registry: psycopg2 non installato, skip load")
         return 0
     try:
-        conn = psycopg2.connect(url)
-        try:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT key, content FROM nexus_prompt_templates "
@@ -89,8 +89,6 @@ def load_from_db(database_url: Optional[str] = None) -> int:
                 )
                 rows = cur.fetchall()
             _load_shared_directives(conn)
-        finally:
-            conn.close()
     except Exception as exc:
         logger.error("prompt_registry: errore query nexus_prompt_templates: %s", exc)
         return 0

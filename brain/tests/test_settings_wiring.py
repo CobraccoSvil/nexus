@@ -12,8 +12,6 @@ caricate dal DB dai rispettivi loader: il valore in tabella era inerte.
 from __future__ import annotations
 
 import contextlib
-import sys
-import types
 from unittest import mock
 
 from brain.agents import orchestrator_config as oc
@@ -30,18 +28,21 @@ def test_clarifying_questions_sono_caricate_dal_db() -> None:
     assert oc._full_key("clarifying_questions_max") == "orchestrator.clarifying_questions_max"
 
 
-def _fake_psycopg2(rows: list[tuple[str, str]]) -> types.ModuleType:
+def _fake_db_pool_connect(rows: list[tuple[str, str]]):
+    """Sostituto di brain.utils.db_pool.connect (punto unico DB, Wave 5):
+    context manager che presta una connessione finta con le righe date."""
     cur = mock.MagicMock()
     cur.fetchall.return_value = rows
     cur.__enter__ = lambda self: cur
     cur.__exit__ = lambda self, *a: False
     conn = mock.MagicMock()
     conn.cursor.return_value = cur
-    conn.__enter__ = lambda self: conn
-    conn.__exit__ = lambda self, *a: False
-    fake = types.ModuleType("psycopg2")
-    fake.connect = lambda url: conn  # type: ignore[attr-defined]
-    return fake
+
+    @contextlib.contextmanager
+    def _connect(*args, **kwargs):
+        yield conn
+
+    return _connect
 
 
 def test_confirm_if_implemented_mappata_dal_loader_clarify(monkeypatch) -> None:
@@ -51,8 +52,9 @@ def test_confirm_if_implemented_mappata_dal_loader_clarify(monkeypatch) -> None:
     assert cfg["confirm_if_implemented"] is True
 
     # Con la riga DB a false, il loader la applica (era il ramo mancante).
+    # Il loader passa dal pool condiviso: si mocka il punto unico db_pool.connect.
     monkeypatch.setenv("DATABASE_URL", "postgres://fake/fake")
-    fake = _fake_psycopg2([("clarify.confirm_if_implemented", "false")])
-    with mock.patch.dict(sys.modules, {"psycopg2": fake}):
+    fake_connect = _fake_db_pool_connect([("clarify.confirm_if_implemented", "false")])
+    with mock.patch("brain.utils.db_pool.connect", fake_connect):
         cfg = cn._load_config()
     assert cfg["confirm_if_implemented"] is False

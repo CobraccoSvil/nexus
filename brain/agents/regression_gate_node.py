@@ -71,11 +71,10 @@ def _modified_files_from_steps(run_id: str) -> list[str]:
         logger.debug("regression_gate: DATABASE_URL assente, impossibile leggere agent_steps")
         return paths
     try:
-        import psycopg2  # type: ignore[import-untyped]
         from psycopg2.extras import RealDictCursor  # type: ignore[import-untyped]
 
-        conn = psycopg2.connect(database_url, cursor_factory=RealDictCursor)
-        try:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect(cursor_factory=RealDictCursor) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """SELECT tool_name, tool_input
@@ -103,8 +102,6 @@ def _modified_files_from_steps(run_id: str) -> list[str]:
                         if p and p not in seen:
                             seen.add(p)
                             paths.append(p)
-        finally:
-            conn.close()
     except Exception as exc:
         logger.warning(
             "regression_gate: lettura agent_steps fallita per run_id=%s: %s", run_id, exc

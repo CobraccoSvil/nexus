@@ -60,16 +60,13 @@ def _load_from_db() -> dict[str, Any]:
         return dict(_SAFE_DEFAULTS)
 
     try:
-        conn = psycopg2.connect(database_url)
-        try:
-            with conn.cursor() as cur:
-                keys_placeholder = ",".join(f"'{k}'" for k in _KEYS)
-                cur.execute(
-                    f"SELECT key, value FROM settings WHERE key IN ({keys_placeholder})"
-                )
-                rows = {k: v for k, v in cur.fetchall()}
-        finally:
-            conn.close()
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn, conn.cursor() as cur:
+            keys_placeholder = ",".join(f"'{k}'" for k in _KEYS)
+            cur.execute(
+                f"SELECT key, value FROM settings WHERE key IN ({keys_placeholder})"
+            )
+            rows = {k: v for k, v in cur.fetchall()}
     except Exception as exc:
         logger.error("thinking_config: errore lettura DB: %s", exc)
         return dict(_cache)  # mantiene valori precedenti in caso di errore transitorio

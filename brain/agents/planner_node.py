@@ -835,9 +835,9 @@ def _persist_clarifications(
     if not url:
         return
     try:
-        import psycopg2  # type: ignore[import-untyped]
         import json as _json
-        with psycopg2.connect(url) as conn:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO nexus_agent_clarifications

@@ -111,7 +111,7 @@ async def _load_classifier_config() -> dict[str, str]:
         ):
             return {k: _CONFIG_CACHE[k][1] for k in _CONFIG_KEYS}
 
-        # Miss: query DB
+        # Miss: query DB (connessione prestata dal pool, punto unico db_pool)
         db_url = os.environ.get("DATABASE_URL")
         if not db_url:
             raise ClassifierConfigUnavailable(
@@ -120,16 +120,13 @@ async def _load_classifier_config() -> dict[str, str]:
                 "Configurare la variabile d'ambiente."
             )
         try:
-            import psycopg2
-            conn = psycopg2.connect(db_url)
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT key, value FROM settings WHERE key = ANY(%s)",
-                ([k for k in _CONFIG_KEYS],),
-            )
-            rows = cur.fetchall()
-            cur.close()
-            conn.close()
+            from brain.utils.db_pool import connect as _db_connect
+            with _db_connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT key, value FROM settings WHERE key = ANY(%s)",
+                    ([k for k in _CONFIG_KEYS],),
+                )
+                rows = cur.fetchall()
         except Exception as exc:  # noqa: BLE001
             raise ClassifierConfigUnavailable(
                 f"DB irraggiungibile: {exc}. Verifica Postgres e migrazione 0111."

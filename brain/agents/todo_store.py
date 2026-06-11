@@ -10,37 +10,33 @@ Tutte le funzioni sono filtrate per `project_id` quando rilevante (multi-tenant)
 """
 from __future__ import annotations
 
+import contextlib
 import logging
-import os
-from typing import Any
+from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
 
 
-def _get_conn():
-    """Apre una connessione psycopg2 al DB Nexus.
+@contextlib.contextmanager
+def _cursor() -> Iterator[Any]:
+    """Cursor RealDict su connessione prestata dal pool condiviso.
 
-    Ritorna None se DB non disponibile (caller gestisce graceful degrade).
+    Delega a ``brain.utils.db_pool.connect`` (punto unico DB, regola L):
+    niente piu' connessione TCP nuova per ogni lettura. Le eccezioni
+    (incluse ``DbUrlUnavailable``) risalgono al caller, che degrada graceful.
     """
-    database_url = os.environ.get("DATABASE_URL")
-    if not database_url:
-        return None
-    try:
-        import psycopg2  # type: ignore[import-untyped]
-        from psycopg2.extras import RealDictCursor  # type: ignore[import-untyped]
-        return psycopg2.connect(database_url, cursor_factory=RealDictCursor)
-    except Exception as exc:
-        logger.warning("todo_store: connessione DB fallita: %s", exc)
-        return None
+    from psycopg2.extras import RealDictCursor  # type: ignore[import-untyped]
+
+    from brain.utils.db_pool import connect
+
+    with connect(cursor_factory=RealDictCursor) as conn, conn.cursor() as cur:
+        yield cur
 
 
 def fetch_plan(run_id: str) -> dict[str, Any] | None:
     """Ritorna il plan associato al run_id, o None se non esiste."""
-    conn = _get_conn()
-    if conn is None:
-        return None
     try:
-        with conn.cursor() as cur:
+        with _cursor() as cur:
             cur.execute(
                 """SELECT run_id::text, project_id::text, thread_id, acceptance_criteria,
                           planner_model, approved_at, score, plan_revisions, created_at,
@@ -53,8 +49,6 @@ def fetch_plan(run_id: str) -> dict[str, Any] | None:
     except Exception as exc:
         logger.warning("todo_store.fetch_plan run_id=%s fallito: %s", run_id, exc)
         return None
-    finally:
-        conn.close()
 
 
 def list_todos(run_id: str) -> list[dict[str, Any]]:
@@ -62,11 +56,8 @@ def list_todos(run_id: str) -> list[dict[str, Any]]:
 
     Ogni elemento: {id, seq, content, status, priority, acceptance_criteria, verify_failures}
     """
-    conn = _get_conn()
-    if conn is None:
-        return []
     try:
-        with conn.cursor() as cur:
+        with _cursor() as cur:
             cur.execute(
                 # depends_on e' uuid[]: psycopg2 senza array-uuid typecaster lo
                 # ritorna come STRINGA '{...}' invece di lista. Il cast a text[]
@@ -87,8 +78,6 @@ def list_todos(run_id: str) -> list[dict[str, Any]]:
     except Exception as exc:
         logger.warning("todo_store.list_todos run_id=%s fallito: %s", run_id, exc)
         return []
-    finally:
-        conn.close()
 
 
 def active_todo(run_id: str) -> dict[str, Any] | None:
@@ -107,12 +96,9 @@ def active_todo(run_id: str) -> dict[str, Any] | None:
 
 def stats(run_id: str) -> dict[str, int]:
     """Conteggio per status: utile per il PlanInspector e per logging."""
-    conn = _get_conn()
     out = {"pending": 0, "in_progress": 0, "completed": 0, "blocked": 0, "skipped": 0, "total": 0}
-    if conn is None:
-        return out
     try:
-        with conn.cursor() as cur:
+        with _cursor() as cur:
             cur.execute(
                 """SELECT status, COUNT(*) AS n FROM nexus_agent_todos
                    WHERE run_id = %s GROUP BY status""",
@@ -125,8 +111,6 @@ def stats(run_id: str) -> dict[str, int]:
     except Exception as exc:
         logger.warning("todo_store.stats run_id=%s fallito: %s", run_id, exc)
         return out
-    finally:
-        conn.close()
 
 
 def increment_iteration_seen(run_id: str) -> None:
@@ -135,19 +119,13 @@ def increment_iteration_seen(run_id: str) -> None:
     Usato dal reminder injection per tracciare quante iterazioni hanno
     "visto" un todo (utile per heuristic anti-stall).
     """
-    conn = _get_conn()
-    if conn is None:
-        return
     try:
-        with conn.cursor() as cur:
+        with _cursor() as cur:
             cur.execute(
                 """UPDATE nexus_agent_todos
                    SET iteration_seen = iteration_seen + 1
                    WHERE run_id = %s AND status IN ('pending','in_progress')""",
                 (run_id,),
             )
-        conn.commit()
     except Exception as exc:
         logger.warning("todo_store.increment_iteration_seen run_id=%s fallito: %s", run_id, exc)
-    finally:
-        conn.close()

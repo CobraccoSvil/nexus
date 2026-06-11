@@ -16,7 +16,7 @@ from .deepseek_provider import DeepSeekProvider
 from .mistral_provider import MistralProvider
 from .ollama_provider import OllamaProvider
 from .vllm_provider import VllmProvider
-from brain.utils.db_pool import get_db_url
+from brain.utils.db_pool import connect as _db_connect
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +38,6 @@ _db_cooldown_cache_ts: float = 0.0
 _DB_COOLDOWN_CACHE_TTL_S = 30.0
 
 
-def _cooldown_db_url() -> str:
-    return get_db_url()
-
-
 def _billing_cooldown_ttl_s() -> int:
     """TTL del cooldown billing (secondi), DB-driven (regola G). Default 600 se
     il setting manca o il DB e' irraggiungibile."""
@@ -59,8 +55,7 @@ def _db_cooldown_providers() -> set[str]:
     if now - _db_cooldown_cache_ts < _DB_COOLDOWN_CACHE_TTL_S:
         return _db_cooldown_set_cached
     try:
-        import psycopg2  # type: ignore[import]
-        with psycopg2.connect(_cooldown_db_url()) as conn:
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT provider FROM nexus_provider_health "
@@ -308,10 +303,8 @@ def _record_intent_health(provider: str, model: str, intent: str, outcome: str) 
         min_attempts, fail_pct, cooldown_secs = 8, 60, 600
 
     last_ts_col = "last_success_at" if outcome == "success" else "last_failure_at"
-    import psycopg2  # type: ignore[import]
     try:
-        db_url = get_db_url()
-        with psycopg2.connect(db_url) as conn:
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"INSERT INTO nexus_provider_intent_health "
@@ -352,10 +345,8 @@ def _intent_in_cooldown(provider: str, intent: str) -> bool:
     if not provider or not _intent_health_enabled():
         return False
     intent = (intent or "chat").strip() or "chat"
-    import psycopg2  # type: ignore[import]
     try:
-        db_url = get_db_url()
-        with psycopg2.connect(db_url) as conn:
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT 1 FROM nexus_provider_intent_health "
@@ -396,9 +387,7 @@ def _billing_context() -> tuple[str, str]:
     now = time.time()
     if _BILLING_CTX_CACHE and (now - _BILLING_CTX_TS) < 30.0:
         return _BILLING_CTX_CACHE
-    import psycopg2  # type: ignore[import]
-    db_url = get_db_url()
-    with psycopg2.connect(db_url) as conn:
+    with _db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT id::text FROM users ORDER BY created_at DESC LIMIT 1")
             user_row = cur.fetchone()
@@ -416,10 +405,8 @@ def _lookup_price_any_currency(provider: str, model: str) -> tuple[float, float,
 
     Legge anche i prezzi cache (0130_price_cache_columns). Fallback 0 se non trovato.
     """
-    import psycopg2  # type: ignore[import]
-    db_url = get_db_url()
     try:
-        with psycopg2.connect(db_url) as conn:
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT input_cost_per_million_tokens, output_cost_per_million_tokens, "
@@ -546,10 +533,8 @@ def _record_usage(provider: str, model: str, usage: dict[str, Any] | None, detai
             "creation_cost": round(cache_creation_cost, 8),
         }
 
-    import psycopg2  # type: ignore[import]
     try:
-        db_url = get_db_url()
-        with psycopg2.connect(db_url) as conn:
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO ai_usage_ledger "
@@ -615,10 +600,8 @@ def _enforce_quota_estimate(provider: str, model: str, estimated_prompt_tokens: 
         (max(0, int(estimated_completion_tokens)) / 1_000_000.0) * out_cost_m
     )
 
-    import psycopg2  # type: ignore[import]
-    db_url = get_db_url()
     try:
-        with psycopg2.connect(db_url) as conn:
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT scope_type, token_limit, cost_limit, valid_from, valid_to "
@@ -814,10 +797,7 @@ class ProviderRegistry:
         come fallback magico — l'admin puo' configurare la priorita' via DB.
         """
         try:
-            import psycopg2  # type: ignore[import]
-            import os
-            db_url = get_db_url()
-            with psycopg2.connect(db_url) as conn:
+            with _db_connect() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT value FROM settings WHERE key = 'provider_hierarchy' LIMIT 1"

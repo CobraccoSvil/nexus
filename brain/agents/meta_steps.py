@@ -56,8 +56,8 @@ def _load_flags() -> dict[str, bool]:
         _FLAG_CACHE_AT = now
         return defaults
     try:
-        import psycopg2  # type: ignore[import-untyped]
-        with psycopg2.connect(url) as conn:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT key, value FROM settings WHERE category = 'orchestrator' "
@@ -117,9 +117,9 @@ def persist_async(run_id: str | None, step: dict[str, Any]) -> None:
     if not url:
         return
     try:
-        import psycopg2  # type: ignore[import-untyped]
         import json as _json
-        with psycopg2.connect(url) as conn:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO nexus_agent_meta_steps
