@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{MatchedPath, State},
     http::{Method, Request, StatusCode},
     middleware::Next,
     response::Response,
@@ -7,6 +7,27 @@ use axum::{
 use uuid::Uuid;
 
 use crate::{auth, AppState};
+
+/// Middleware di timing HTTP: registra durata/route/status nell'histogram
+/// in-memory (`http_metrics`), esposto da `GET /nexus/metrics`. Usa il
+/// template di route (`MatchedPath`) come label, mai il path raw: gli UUID
+/// nei path non devono esplodere la cardinalita'. Richieste senza route
+/// matchata (404 da fallback) sono ignorate di proposito.
+pub async fn http_timing_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
+    let method = req.method().as_str().to_string();
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_string());
+    let start = std::time::Instant::now();
+
+    let resp = next.run(req).await;
+
+    if let Some(route) = route {
+        crate::http_metrics::record(&route, &method, resp.status().as_u16(), start.elapsed());
+    }
+    resp
+}
 
 pub async fn require_auth(
     State(state): State<AppState>,

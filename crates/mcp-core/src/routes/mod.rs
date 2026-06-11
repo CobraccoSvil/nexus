@@ -80,4 +80,7 @@ pub fn build_app_router(state: AppState, cors: CorsLayer) -> Router {
         // esporre a payload abusivi.
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(cors)
+        // Timing HTTP piu' esterno di tutto: misura la durata completa della
+        // richiesta (CORS e body-limit inclusi) per /nexus/metrics.
+        .layer(axum_mw::from_fn(middleware::http_timing_middleware))
 }

@@ -4,6 +4,17 @@
 services:
   postgres-nexus:
     image: pgvector/pgvector:pg17
+    # pg_stat_statements: telemetria query (calls, mean_exec_time) per
+    # diagnosi performance. Richiede preload all'avvio del server; la
+    # CREATE EXTENSION e' una tantum nel DB nexus.
+    command:
+      [
+        "postgres",
+        "-c",
+        "shared_preload_libraries=pg_stat_statements",
+        "-c",
+        "pg_stat_statements.track=all",
+      ]
     environment:
       POSTGRES_USER: nexus
       POSTGRES_PASSWORD: nexus

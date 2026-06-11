@@ -1154,6 +1154,9 @@ pub async fn nexus_prometheus(
     // Telemetria guard-rail risorse (governance porte/url/db/fs/container).
     out.push_str(&crate::security::guardrail_metrics::render_guardrail_metrics(&state.db).await);
 
+    // Histogram latenze HTTP per route (middleware::http_timing_middleware).
+    out.push_str(&crate::http_metrics::render_prometheus());
+
     (
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4")],

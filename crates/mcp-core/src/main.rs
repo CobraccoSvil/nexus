@@ -28,6 +28,7 @@ mod domain;
 mod environment;
 mod file_mutations;
 mod github;
+mod http_metrics;
 mod internal_learning;
 mod internal_routing;
 mod llm_json;
