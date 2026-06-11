@@ -88,6 +88,8 @@ condividere codice (fragile base class, accoppiamento al genitore).
 | Chunking testo | `crates/mcp-core/src/rag/chunker.rs` (riferimento) + `brain/utils/text_chunk.py` (paritetico, golden test) | esistente |
 | Classificazione errore provider (testo) | `crates/mcp-core/src/provider_error_classifier.rs` (paritetico a `brain/providers/error_handler.py`, golden test) | esistente |
 | Path-safety workspace (resolve_workspace_target, path_within) | `crates/nexus-types/src/workspace_paths.rs` (adapter HTTP in `mcp-core::projects`) | esistente |
+| Esecuzione comandi git (run_git_command, GitCommandOptions) | `crates/nexus-types/src/git_exec.rs` (re-export in `mcp-core::projects`) | esistente |
+| Reindex vettoriale post-mutazione (contratto tool agente) | trait `FileReindexer` in `nexus-agent-tools::context_core` (impl `NeuralFileReindexer` in mcp-core, delega a `reindex_single_file`) | esistente |
 
 ### Enforcement
 
