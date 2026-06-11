@@ -8,6 +8,8 @@
 #   --menu              mostra menu interattivo per scegliere il servizio
 #                       (equivalente a --service senza nome)
 #   --debug             compila Rust in debug (stacktrace completi, compilazione rapida)
+#   --clean             forza la purge di .next/.turbo prima del build web (di
+#                       default la cache viene riusata; serve solo dopo merge/stash)
 #   --list-services     elenca i servizi disponibili e esce
 #   --sync              sincronizza worktree Windows -> WSL prima del deploy
 #   --sync-only         sincronizza e basta (senza build/restart)
@@ -50,6 +52,7 @@ _db_port() {
 
 log() { echo "==> $*"; }
 
+CLEAN_BUILD=false
 RUST_ONLY=false
 WEB_ONLY=false
 SINGLE_SERVICE=""
@@ -133,6 +136,7 @@ while [ $# -gt 0 ]; do
         --menu)            SHOW_MENU=true ;;
         --list-services)   LIST_SERVICES=true ;;
         --debug)           DEBUG_BUILD=true ;;
+        --clean)           CLEAN_BUILD=true ;;
         --sync)            DO_SYNC=true ;;
         --sync-only)       SYNC_ONLY=true; DO_SYNC=true ;;
     esac
@@ -436,11 +440,15 @@ start_webide() {
 build_webide() {
     log "Build web-ide (Next.js)..."
     cd "${ROOT}/apps/web-ide"
-    # Pulizia cache build prima del rebuild. Senza questo, una `.next/` cached
-    # con stato inconsistente (es. dopo merge/stash) puo' includere chunks
-    # vecchi che escludono moduli per tree-shaking errato. Esempio osservato:
-    # dispatcher SSE non incluso nel bundle nonostante presente nei sorgenti.
-    rm -rf .next .turbo
+    # Purge cache CONDIZIONALE (--clean). La purge incondizionata era una toppa:
+    # serviva solo dopo merge/stash, quando una `.next/` con stato inconsistente
+    # includeva chunks vecchi (es. dispatcher SSE escluso per tree-shaking
+    # errato). Nel deploy quotidiano la cache di Next/Turbo e' valida e
+    # riusarla taglia minuti dal rebuild. Forzare la pulizia con --clean.
+    if [ "${CLEAN_BUILD:-false}" = true ]; then
+        log "  (--clean) rimozione cache .next/.turbo"
+        rm -rf .next .turbo
+    fi
     NODE_ENV=production node_modules/.bin/next build
     cd "$ROOT"
 }

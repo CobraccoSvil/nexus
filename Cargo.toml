@@ -25,6 +25,24 @@ version = "0.1.0"
 license = "MIT"
 authors = ["Cobracco S.r.l."]
 
+# Profili build (bonifica dev-loop 2026-06-11). Portabili (versionati): il
+# guadagno e' nel rebuild incrementale del dev-loop locale, senza toccare la
+# correttezza ne il profilo release di produzione.
+[profile.dev]
+# Debuginfo minimale: solo tabelle di riga (basta per backtrace/panic con
+# numero di riga). Genera e LINKA molto meno DWARF -> link incrementale piu'
+# rapido. I debugger step-by-step perdono qualcosa, raro nel dev-loop di Nexus.
+debug = "line-tables-only"
+# DWARF fuori dagli oggetti .o: il linker non deve copiarlo dentro il binario
+# (su Linux/WSL e' il default piu' rapido per ricompilazioni frequenti).
+split-debuginfo = "unpacked"
+
+# Le dipendenze esterne in dev: compilarle con un minimo di ottimizzazione le
+# rende piu' veloci a runtime (es. sqlx/regex/serde) senza rallentare il
+# rebuild del NOSTRO codice (le dep si compilano una volta sola e si cachano).
+[profile.dev.package."*"]
+opt-level = 1
+
 [workspace.dependencies]
 anyhow = "1.0"
 axum = { version = "0.7", features = ["ws", "http2", "macros"] }
@@ -68,4 +86,5 @@ version = "0.12"
 too_many_arguments = "allow"          # 16 firme storiche; refactor invasivo, backlog
 type_complexity = "allow"             # 9 tipi axum/tuple storici, backlog
 doc_overindented_list_items = "allow" # 38 doc-comment storici, solo formattazione
+doc_lazy_continuation = "allow"       # liste numerate nei doc-comment, solo rendering
 empty_line_after_doc_comments = "allow" # 5 casi, solo formattazione
