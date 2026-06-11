@@ -64,6 +64,9 @@ class AgentState(TypedDict, total=False):
     # generare i todos deterministicamente se il modello non emette nexus_todo_write.
     playbook_steps: list[str] | None
     playbook_key: str | None
+    # Conteggio cumulativo delle dichiarazioni task_complete outcome=done: alla
+    # 3a l'executor chiude d'autorita' (anti dichiara-e-prosegui).
+    declared_done_count: int
     task_type: str
     behavior_mode: str
     token_budget: int

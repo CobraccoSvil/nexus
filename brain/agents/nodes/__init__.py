@@ -1479,6 +1479,37 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         )
         return {"stop_reason": "superseded"}
 
+    # ── Chiusura d'autorita' su dichiarazioni 'done' RIPETUTE ────────────────
+    # Incidente Beauty-Book (run 963a51fa): il modello ha dichiarato
+    # task_complete outcome=done 24 volte continuando a chiamare tool -> 68
+    # iterazioni sprecate. La dichiarazione chiude solo quando arriva SENZA
+    # altre tool call pendenti (route_after_executor); se il modello dichiara
+    # e prosegue, dalla 3a dichiarazione chiudiamo NOI: il lavoro e' stato
+    # dichiarato finito ripetutamente, le tool call ulteriori sono rumore.
+    _decl_prev = state.get("declared_outcome")
+    _done_count = int(state.get("declared_done_count") or 0)
+    if (
+        isinstance(_decl_prev, dict)
+        and _decl_prev.get("outcome") == "done"
+        and _done_count >= 3
+    ):
+        _decl_summary = str(_decl_prev.get("summary") or "").strip()
+        _close_text = _decl_summary or (state.get("result") or "").strip() or (
+            "Lavoro dichiarato completato dal modello (task_complete ripetuto)."
+        )
+        logger.warning(
+            "executor_node: outcome=done dichiarato %d volte, chiusura d'autorita' "
+            "(thread=%s) — stop alle iterazioni ridondanti",
+            _done_count, state.get("thread_id"),
+        )
+        return {
+            "messages": [AIMessage(content=_close_text)],
+            "result": _close_text,
+            "pending_tool_uses": [],
+            "stop_reason": "end_turn",
+            "iterations": int(state.get("iterations") or 0) + 1,
+        }
+
     # ── M16: merge tool scoperti (discovery-first) per QUESTO turno ───────────
     # Il turno precedente ha eseguito nexus_mcp_tool_search; tool_dispatch_node
     # ha estratto i tool trovati in `discovered_tools_next_turn`. Qui li
@@ -3601,6 +3632,15 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     # L'ultimo prevale se piu' chiamate. Consumato da route_after_executor.
     if _declared_outcomes:
         _dispatch_updates["declared_outcome"] = _declared_outcomes[-1]
+        # Contatore CUMULATIVO delle dichiarazioni outcome=done (incidente
+        # Beauty-Book run 963a51fa: 24 task_complete 'done' ripetuti mentre il
+        # modello continuava a chiamare tool -> 68 iterazioni sprecate). Letto
+        # dall'executor che alla soglia chiude il run d'autorita'.
+        _done_now = sum(1 for d in _declared_outcomes if d.get("outcome") == "done")
+        if _done_now:
+            _dispatch_updates["declared_done_count"] = (
+                int(state.get("declared_done_count") or 0) + _done_now
+            )
     # WAVE 2.2: errore infrastruttura tool (ToolRunner down) -> propagato a
     # end_turn perche' mcp-core non scali i provider.
     if _infra_tool_errors:

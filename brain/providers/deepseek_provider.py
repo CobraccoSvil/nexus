@@ -30,6 +30,36 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.deepseek.com/v1"
 
+# Marker del formato interno DSML di DeepSeek (token speciali per le tool call)
+# colati nel TESTO: segnale STRUTTURALE di output corrotto/allucinato (incidente
+# Beauty-Book run 963a51fa: final_answer con contenuto allucinato + blocchi
+# "<｜｜DSML｜｜tool_calls>" grezzi). U+FF5C = fullwidth vertical bar; copriamo
+# anche la variante ASCII per robustezza.
+_DSML_LEAK_MARKERS = ("｜DSML｜", "|DSML|")
+
+
+def _strip_dsml_leak(text: str) -> tuple[str, bool]:
+    """Tronca il testo al primo marker DSML grezzo. Ritorna (testo, leaked).
+
+    Il contenuto DOPO il marker e' formato interno del modello (mai testo per
+    l'utente); anche il contenuto PRIMA e' sospetto, ma il troncamento e' il
+    taglio strutturale certo: se il residuo resta sotto soglia, la pipeline
+    soft-failure esistente (is_soft_failure -> cascade fallback) fa il resto.
+    """
+    if not text:
+        return text, False
+    for marker in _DSML_LEAK_MARKERS:
+        idx = text.find(marker)
+        if idx != -1:
+            # Il marker puo' essere preceduto da '<' (es. "<｜｜DSML｜｜tool_calls>"):
+            # tronca dal '<' immediatamente precedente se contiguo.
+            cut = idx
+            if cut > 0 and text[cut - 1] in "<｜":
+                while cut > 0 and text[cut - 1] in "<｜":
+                    cut -= 1
+            return text[:cut].rstrip(), True
+    return text, False
+
 
 class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
     """Provider DeepSeek (OpenAI-compatible endpoint).
@@ -87,10 +117,16 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
                     create_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
             response = await client.chat.completions.create(**create_kwargs)
             choice = response.choices[0]
+            _gen_content, _gen_leaked = _strip_dsml_leak(choice.message.content or "")
+            if _gen_leaked:
+                logger.warning(
+                    "deepseek %s: marker DSML grezzi nel content (generate), troncato",
+                    model,
+                )
             return ProviderResult(
                 provider=self.name,
                 model=model,
-                content=choice.message.content or "",
+                content=_gen_content,
                 metadata={
                     "usage": {
                         "prompt_tokens": response.usage.prompt_tokens,
@@ -189,6 +225,14 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
             choice = response.choices[0]
             msg = choice.message
             text_content = msg.content or ""
+            # Sanitizzazione leak DSML (output corrotto, segnale strutturale).
+            text_content, _dsml_leaked = _strip_dsml_leak(text_content)
+            if _dsml_leaked:
+                logger.warning(
+                    "deepseek %s: marker DSML grezzi nel content (output corrotto), "
+                    "troncato a %d char — la pipeline soft-failure gestisce il residuo",
+                    model, len(text_content),
+                )
             # DeepSeek thinking mode: il reasoning_content del turno con tool_calls
             # DEVE essere rispedito nei turni successivi (HTTP 400 altrimenti).
             # Lo conserviamo in assistant_content come blocco type="reasoning";
