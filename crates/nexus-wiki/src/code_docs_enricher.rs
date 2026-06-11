@@ -26,8 +26,7 @@
 // Settings DB-driven (mig 0331 -> agent.wiki.code_docs_enricher_*), cache 60s.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::internal_routing::{resolve_purpose_model, PurposeResolution};
-use crate::AppState;
+use crate::deps::WikiDeps;
 use anyhow::{Context, Result};
 use serde_json::json;
 use sqlx::{PgPool, Row};
@@ -158,7 +157,7 @@ async fn load_settings(db: &PgPool) -> Result<CodeDocsEnricherSettings> {
 
 /// Avvia il loop in background. Delay iniziale 75s: lascia completare boot e
 /// prima indicizzazione code (che crea i placeholder) prima di arricchirli.
-pub fn start_code_docs_enricher_worker(state: Arc<AppState>) {
+pub fn start_code_docs_enricher_worker(state: Arc<WikiDeps>) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(75)).await;
         let init = current_settings(&state.db).await;
@@ -193,7 +192,7 @@ pub fn start_code_docs_enricher_worker(state: Arc<AppState>) {
 
 /// Singolo batch: arricchisce fino a `batch_max` doc code non ancora arricchiti,
 /// rispettando il cap diurno.
-async fn scan_and_enrich(state: &AppState, settings: &CodeDocsEnricherSettings) -> Result<usize> {
+async fn scan_and_enrich(state: &WikiDeps, settings: &CodeDocsEnricherSettings) -> Result<usize> {
     // Cap diurno: quanti arricchimenti nelle ultime 24h. Protegge il costo.
     let enriched_24h: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM wiki_docs \
@@ -328,14 +327,14 @@ async fn resolve_project_root(db: &PgPool, project_id: Uuid) -> Option<String> {
 /// Ritorna Ok(true) se il doc e' stato arricchito, Ok(false) se saltato
 /// (sorgente troppo breve o output LLM vuoto).
 async fn enrich_code_doc(
-    state: &AppState,
+    state: &WikiDeps,
     settings: &CodeDocsEnricherSettings,
     doc_id: Uuid,
     project_id: Uuid,
     relative_path: &str,
     content: &str,
 ) -> Result<bool> {
-    let source_hash = crate::wiki::vault::sha256_hex(content);
+    let source_hash = crate::vault::sha256_hex(content);
 
     // File banale: marca con l'hash corrente per non riprovare, senza LLM.
     if content.trim().chars().count() < settings.min_source_chars {
@@ -344,21 +343,11 @@ async fn enrich_code_doc(
     }
 
     // Risolve provider+model dal PUNTO UNICO (regola L): routing tier-only.
-    let (provider, model) = match resolve_purpose_model(state, PURPOSE).await {
-        PurposeResolution::Resolved {
-            provider, model, ..
-        } => (provider, model),
-        PurposeResolution::NoCapableModel { tier } => {
-            anyhow::bail!("nessun modello del tier '{tier}' disponibile per purpose {PURPOSE}");
-        }
-        PurposeResolution::NotFound => {
-            anyhow::bail!(
-                "purpose non configurato o privo di tier: {PURPOSE} (applicare migrazione 0331/0344)"
-            );
-        }
-        PurposeResolution::MatrixUnavailable(e) => {
-            anyhow::bail!("routing_matrix non disponibile: {e}");
-        }
+    // I messaggi diagnostici (tier mancante, purpose non configurato, matrix
+    // non disponibile) arrivano dall'impl WikiAiServices in mcp-core.
+    let (provider, model) = match state.ai.resolve_purpose_model(PURPOSE).await {
+        Ok(pm) => pm,
+        Err(e) => anyhow::bail!("{e}"),
     };
 
     let snippet: String = content.chars().take(settings.max_source_chars).collect();
@@ -374,8 +363,7 @@ async fn enrich_code_doc(
     );
 
     let resp = state
-        .orchestrator
-        .neural
+        .ai
         .generate_completion(&provider, &model, &prompt)
         .await
         .context("generate_completion code_docs")?;
@@ -401,19 +389,14 @@ async fn enrich_code_doc(
          dalla knowledge base Nexus (wiki code-docs enricher). Modifica manuale = \
          blocca la rigenerazione._\n"
     );
-    let body_hash = crate::wiki::vault::sha256_hex(&body_md);
+    let body_hash = crate::vault::sha256_hex(&body_md);
 
     // Embedding + upsert Qdrant (best-effort). Contratto: wiki_docs.id == point_id.
     let combined = {
         let snip: String = description.chars().take(2000).collect();
         format!("{title}\n\n{snip}")
     };
-    let qdrant_point_id: Option<String> = match state
-        .orchestrator
-        .neural
-        .embed_text("", &combined)
-        .await
-    {
+    let qdrant_point_id: Option<String> = match state.ai.embed_text("", &combined).await {
         Ok(vector) => {
             let point_id = doc_id.to_string();
             let payload = json!({
@@ -424,7 +407,7 @@ async fn enrich_code_doc(
                 "kind": "code",
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             });
-            match crate::vector_memory::upsert_wiki_content_point(
+            match crate::content_points::upsert_wiki_content_point(
                 &state.db, &point_id, vector, payload,
             )
             .await
@@ -539,7 +522,7 @@ pub async fn mark_code_doc_stale_if_changed(
     relative_path: &str,
     content: &str,
 ) {
-    let new_hash = crate::wiki::vault::sha256_hex(content);
+    let new_hash = crate::vault::sha256_hex(content);
     let _ = sqlx::query(
         "UPDATE wiki_docs SET code_source_hash = NULL, updated_at = NOW() \
          WHERE scope = 'project' AND kind = 'code' AND project_id = $1 \

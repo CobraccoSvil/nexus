@@ -29,6 +29,7 @@ base64.workspace = true
 mcp-token = { path = "../mcp-token" }
 mcp-ast = { path = "../mcp-ast" }
 mcp-quality = { path = "../mcp-quality" }
+nexus-wiki = { path = "../nexus-wiki" }
 mcp-db = { path = "../mcp-db" }
 mcp-proto = { path = "../mcp-proto" }
 nexus-auth = { path = "../nexus-auth" }

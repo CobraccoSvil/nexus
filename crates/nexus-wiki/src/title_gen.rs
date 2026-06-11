@@ -28,8 +28,8 @@
 // resta invariato e si logga WARN senza payload (no body/prompt nei log).
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::prompt_templates::get_template_or_default;
-use crate::AppState;
+use nexus_types::get_template_or_default;
+use crate::deps::WikiDeps;
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use sqlx::{PgPool, Row};
@@ -228,7 +228,7 @@ async fn fetch_doc(db: &PgPool, doc_id: Uuid) -> Result<Option<DocRow>> {
 // Render prompt
 // ───────────────────────────────────────────────────────────────────────────
 
-async fn render_prompt(state: &AppState, doc: &DocRow, max_words: u32) -> Result<String> {
+async fn render_prompt(state: &WikiDeps, doc: &DocRow, max_words: u32) -> Result<String> {
     let tmpl =
         get_template_or_default(&state.db, &state.template_cache, "agent.wiki_title_gen").await;
     if tmpl.trim().is_empty() {
@@ -322,7 +322,7 @@ fn sanitize_title(raw: &str, max_words: u32) -> Option<String> {
 ///
 /// In caso di errore LLM o output vuoto il titolo resta invariato (regola F);
 /// l'errore e' riportato nel `TitleGenReport.errors` senza payload nei log.
-pub async fn generate_title_for_doc(state: &AppState, doc_id: Uuid) -> Result<TitleGenReport> {
+pub async fn generate_title_for_doc(state: &WikiDeps, doc_id: Uuid) -> Result<TitleGenReport> {
     let started = Instant::now();
     let mut report = TitleGenReport {
         doc_id: Some(doc_id),
@@ -359,9 +359,10 @@ pub async fn generate_title_for_doc(state: &AppState, doc_id: Uuid) -> Result<Ti
     }
 
     // Risolvi modello dal PUNTO UNICO tier-only (regola L/G).
-    let (provider, model) = crate::internal_routing::resolve_purpose_model(state, "wiki_title_gen")
+    let (provider, model) = state
+        .ai
+        .resolve_purpose_model("wiki_title_gen")
         .await
-        .into_model("wiki_title_gen")
         .map_err(|m| anyhow!(m))?;
 
     let prompt = render_prompt(state, &doc, settings.max_words).await?;
@@ -377,8 +378,7 @@ pub async fn generate_title_for_doc(state: &AppState, doc_id: Uuid) -> Result<Ti
     );
 
     let resp = match state
-        .orchestrator
-        .neural
+        .ai
         .generate_completion(&provider, &model, &prompt)
         .await
     {
@@ -548,7 +548,7 @@ async fn fetch_candidates(db: &PgPool, scope: TitleScope, limit: i64) -> Result<
 /// Generazione batch su uno scope, rispettando cap diurno. Sequenziale (no
 /// parallelismo) per non sforare rate limit del provider.
 pub async fn generate_titles_for_scope(
-    state: &AppState,
+    state: &WikiDeps,
     scope: TitleScope,
 ) -> Result<TitleGenBatchReport> {
     let mut batch = TitleGenBatchReport::default();
@@ -628,7 +628,7 @@ pub async fn generate_titles_for_scope(
 /// loop non puo' spammare l'LLM oltre i cap configurati. Interval e enabled
 /// sono DB-driven (`agent.wiki.title_gen_*`, cache 60s). Senza questo loop i
 /// titoli dei progetti restavano da rigenerare finche' non triggerati a mano.
-pub fn start_title_gen_worker(state: std::sync::Arc<AppState>) {
+pub fn start_title_gen_worker(state: std::sync::Arc<WikiDeps>) {
     tokio::spawn(async move {
         // Delay iniziale (150s): dopo links/run_summary per non concentrare il
         // carico LLM al boot.

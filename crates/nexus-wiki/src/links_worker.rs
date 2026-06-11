@@ -24,10 +24,10 @@
 // visibile all'amministratore.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::vector_memory::{get_wiki_content_point_vector, search_wiki_content_points};
-use crate::wiki::model::WikiScope;
-use crate::wiki::vault::extract_wikilinks;
-use crate::AppState;
+use crate::content_points::{get_wiki_content_point_vector, search_wiki_content_points};
+use crate::model::WikiScope;
+use crate::vault::extract_wikilinks;
+use crate::deps::WikiDeps;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use sqlx::PgPool;
@@ -511,7 +511,7 @@ async fn process_semantic(
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Ricompila i link per UN solo documento. Esegue entrambe le strategie.
-pub async fn recompute_links_for_doc(state: &AppState, doc_id: Uuid) -> Result<RecomputeReport> {
+pub async fn recompute_links_for_doc(state: &WikiDeps, doc_id: Uuid) -> Result<RecomputeReport> {
     let started = Instant::now();
     let mut report = RecomputeReport::default();
     let settings = current_settings(&state.db).await;
@@ -538,7 +538,7 @@ pub async fn recompute_links_for_doc(state: &AppState, doc_id: Uuid) -> Result<R
 
 /// Ricompila i link per tutti i documenti in uno scope (+ filtro project_id).
 pub async fn recompute_links_for_scope(
-    state: &AppState,
+    state: &WikiDeps,
     scope: Option<WikiScope>,
     project_id: Option<Uuid>,
 ) -> Result<RecomputeReport> {
@@ -595,7 +595,7 @@ pub async fn recompute_links_for_scope(
 /// registrato (`SELECT id FROM projects`). Interval e enabled sono DB-driven
 /// (settings `agent.wiki.link_worker_*`, cache 60s). Senza questo loop i
 /// progetti restavano senza link finche' non triggerati a mano via REST.
-pub fn start_links_worker(state: std::sync::Arc<AppState>) {
+pub fn start_links_worker(state: std::sync::Arc<WikiDeps>) {
     tokio::spawn(async move {
         // Delay iniziale (120s): lascia tempo al bootstrap F4 (scope=Meta) e al
         // re-ingest F3 di completare prima del primo giro periodico.

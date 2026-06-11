@@ -19,10 +19,10 @@
 // successivo lo completera'.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::wiki::model::WikiScope;
-use crate::wiki::storage::record_revision;
-use crate::wiki::vault::{parse_frontmatter, sha256_hex, slugify, vault_root_for_scope};
-use crate::AppState;
+use crate::model::WikiScope;
+use crate::storage::record_revision;
+use crate::vault::{parse_frontmatter, sha256_hex, slugify, vault_root_for_scope};
+use crate::deps::WikiDeps;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -50,7 +50,7 @@ pub struct ReingestReport {
 /// - `scope_filter = Some(Project)` + `project_id_filter = None` -> tutti i
 ///   progetti registrati.
 pub async fn reingest_all(
-    state: &AppState,
+    state: &WikiDeps,
     scope_filter: Option<WikiScope>,
     project_id_filter: Option<Uuid>,
 ) -> Result<ReingestReport> {
@@ -124,7 +124,7 @@ pub async fn reingest_all(
 /// Ritorna il numero di file effettivamente ingestiti (UPSERT andato a buon
 /// fine), aggiornando i contatori `files_skipped` / `errors` del report.
 async fn reingest_scope(
-    state: &AppState,
+    state: &WikiDeps,
     scope: WikiScope,
     project_id: Option<Uuid>,
     report: &mut ReingestReport,
@@ -245,7 +245,7 @@ fn collect_markdown_files(root: &Path) -> Result<Vec<PathBuf>> {
 /// Errori del filesystem o di DB risalgono; lo skip silenzioso (slug vuoto,
 /// estensione non `.md`) ritorna `Ok(false)`.
 pub async fn reingest_path(
-    state: &AppState,
+    state: &WikiDeps,
     scope: WikiScope,
     project_id: Option<Uuid>,
     abs_path: &Path,
@@ -276,7 +276,7 @@ pub async fn reingest_path(
 /// aggiornata in DB, `Ok(false)` se il file e' stato saltato (frontmatter
 /// invalido, slug vuoto, ecc.).
 async fn ingest_one_file(
-    state: &AppState,
+    state: &WikiDeps,
     scope: WikiScope,
     project_id: Option<Uuid>,
     abs_path: &Path,
@@ -463,7 +463,7 @@ async fn ingest_one_file(
         body_md.as_str()
     };
     let combined = format!("{title}\n\n{snippet}");
-    match state.orchestrator.neural.embed_text("", &combined).await {
+    match state.ai.embed_text("", &combined).await {
         Ok(vector) => {
             let point_id = doc_id.to_string();
             let payload = serde_json::json!({
@@ -475,7 +475,7 @@ async fn ingest_one_file(
                 "kind": kind,
                 "updated_at": chrono::Utc::now().to_rfc3339(),
             });
-            if let Err(e) = crate::vector_memory::upsert_wiki_content_point(
+            if let Err(e) = crate::content_points::upsert_wiki_content_point(
                 &state.db, &point_id, vector, payload,
             )
             .await

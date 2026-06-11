@@ -168,7 +168,7 @@ fn err404(msg: &str) -> (StatusCode, String) {
 }
 
 async fn build_acl(state: &AppState, claims: &Claims) -> Result<WikiAcl, (StatusCode, String)> {
-    WikiAcl::from_claims(state, claims).await.map_err(err500)
+    WikiAcl::from_claims(&state.wiki_deps(), claims).await.map_err(err500)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -194,7 +194,7 @@ pub async fn list_docs(
         limit: q.limit.unwrap_or(50),
         offset: q.offset.unwrap_or(0),
     };
-    let (items, total) = storage::list_docs(&state, &acl, qparams)
+    let (items, total) = storage::list_docs(&state.wiki_deps(), &acl, qparams)
         .await
         .map_err(err500)?;
     Ok(Json(json!({
@@ -210,7 +210,7 @@ pub async fn get_doc(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let acl = build_acl(&state, &claims).await?;
-    let doc = storage::get_doc(&state, &acl, id)
+    let doc = storage::get_doc(&state.wiki_deps(), &acl, id)
         .await
         .map_err(err500)?
         .ok_or_else(|| err404("documento non trovato o non accessibile"))?;
@@ -237,7 +237,7 @@ pub async fn create_doc(
         public_read: body.public_read,
         vault_file_path: body.vault_file_path,
     };
-    let doc = storage::create_doc(&state, &acl, input)
+    let doc = storage::create_doc(&state.wiki_deps(), &acl, input)
         .await
         .map_err(|e| {
             let msg = format!("{e}");
@@ -267,7 +267,7 @@ pub async fn patch_doc(
     Json(patch): Json<WikiDocPatch>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let acl = build_acl(&state, &claims).await?;
-    let outcome = storage::update_doc(&state, &acl, id, patch)
+    let outcome = storage::update_doc(&state.wiki_deps(), &acl, id, patch)
         .await
         .map_err(|e| {
             let msg = format!("{e}");
@@ -293,7 +293,7 @@ pub async fn delete_doc(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let acl = build_acl(&state, &claims).await?;
-    storage::delete_doc(&state, &acl, id).await.map_err(|e| {
+    storage::delete_doc(&state.wiki_deps(), &acl, id).await.map_err(|e| {
         let msg = format!("{e}");
         if msg.contains("permesso negato") || msg.contains("frozen") {
             err403(&msg)
@@ -313,7 +313,7 @@ pub async fn list_revisions(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let acl = build_acl(&state, &claims).await?;
-    let items = revisions::list_revisions(&state, &acl, id)
+    let items = revisions::list_revisions(&state.wiki_deps(), &acl, id)
         .await
         .map_err(err500)?;
     let total = items.len();
@@ -327,7 +327,7 @@ pub async fn get_revision(
     Path((id, version)): Path<(Uuid, i32)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let acl = build_acl(&state, &claims).await?;
-    let rev = revisions::get_revision(&state, &acl, id, version)
+    let rev = revisions::get_revision(&state.wiki_deps(), &acl, id, version)
         .await
         .map_err(err500)?
         .ok_or_else(|| err404("revisione non trovata"))?;
@@ -342,7 +342,7 @@ pub async fn diff(
     Query(q): Query<DiffQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let acl = build_acl(&state, &claims).await?;
-    let (a, b) = revisions::diff(&state, &acl, id, q.from, q.to)
+    let (a, b) = revisions::diff(&state.wiki_deps(), &acl, id, q.from, q.to)
         .await
         .map_err(err500)?;
     Ok(Json(json!({ "from": a, "to": b })))
@@ -356,7 +356,7 @@ pub async fn restore(
     Json(body): Json<RestoreBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let acl = build_acl(&state, &claims).await?;
-    let new_version = revisions::restore_revision(&state, &acl, id, body.version)
+    let new_version = revisions::restore_revision(&state.wiki_deps(), &acl, id, body.version)
         .await
         .map_err(|e| {
             let msg = format!("{e}");
@@ -406,7 +406,7 @@ pub async fn reingest_handler(
     let wait = q.wait.unwrap_or(false);
 
     if wait {
-        let report = reingest::reingest_all(&state, scope_filter, project_filter)
+        let report = reingest::reingest_all(&state.wiki_deps(), scope_filter, project_filter)
             .await
             .map_err(err500)?;
         Ok((
@@ -424,7 +424,7 @@ pub async fn reingest_handler(
                 project_id = ?project_filter,
                 "wiki.reingest: avvio task background"
             );
-            match reingest::reingest_all(&state_cloned, scope_filter, project_filter).await {
+            match reingest::reingest_all(&state_cloned.wiki_deps(), scope_filter, project_filter).await {
                 Ok(report) => {
                     tracing::info!(
                         run_id = %run_id,
@@ -478,7 +478,7 @@ pub async fn recompute_links_handler(
     // Path "singolo documento" — ignora scope/project_id.
     if let Some(doc_id) = q.doc_id {
         if wait {
-            let report = links_worker::recompute_links_for_doc(&state, doc_id)
+            let report = links_worker::recompute_links_for_doc(&state.wiki_deps(), doc_id)
                 .await
                 .map_err(err500)?;
             return Ok((
@@ -494,7 +494,7 @@ pub async fn recompute_links_handler(
                 doc_id = %doc_id,
                 "wiki.recompute-links: avvio task background (singolo doc)"
             );
-            match links_worker::recompute_links_for_doc(&state_cloned, doc_id).await {
+            match links_worker::recompute_links_for_doc(&state_cloned.wiki_deps(), doc_id).await {
                 Ok(rep) => tracing::info!(
                     run_id = %run_id,
                     scanned = rep.docs_scanned,
@@ -531,7 +531,7 @@ pub async fn recompute_links_handler(
     let project_filter = q.project_id;
 
     if wait {
-        let report = links_worker::recompute_links_for_scope(&state, scope_filter, project_filter)
+        let report = links_worker::recompute_links_for_scope(&state.wiki_deps(), scope_filter, project_filter)
             .await
             .map_err(err500)?;
         return Ok((
@@ -549,7 +549,7 @@ pub async fn recompute_links_handler(
             project_id = ?project_filter,
             "wiki.recompute-links: avvio task background"
         );
-        match links_worker::recompute_links_for_scope(&state_cloned, scope_filter, project_filter)
+        match links_worker::recompute_links_for_scope(&state_cloned.wiki_deps(), scope_filter, project_filter)
             .await
         {
             Ok(rep) => tracing::info!(
@@ -602,7 +602,7 @@ pub async fn recompute_titles_handler(
     // Path "singolo documento" — ignora scope/project_id, bypassa il cap.
     if let Some(doc_id) = q.doc_id {
         if wait {
-            let report = title_gen::generate_title_for_doc(&state, doc_id)
+            let report = title_gen::generate_title_for_doc(&state.wiki_deps(), doc_id)
                 .await
                 .map_err(err500)?;
             return Ok((
@@ -618,7 +618,7 @@ pub async fn recompute_titles_handler(
                 doc_id = %doc_id,
                 "wiki.recompute-titles: avvio task background (singolo doc)"
             );
-            match title_gen::generate_title_for_doc(&state_cloned, doc_id).await {
+            match title_gen::generate_title_for_doc(&state_cloned.wiki_deps(), doc_id).await {
                 Ok(rep) => tracing::info!(
                     run_id = %run_id,
                     updated = rep.updated,
@@ -657,7 +657,7 @@ pub async fn recompute_titles_handler(
             let mut overall_updated = 0usize;
 
             if do_meta {
-                let rep = title_gen::generate_titles_for_scope(&state, title_gen::TitleScope::Meta)
+                let rep = title_gen::generate_titles_for_scope(&state.wiki_deps(), title_gen::TitleScope::Meta)
                     .await?;
                 overall_processed += rep.processed_count;
                 overall_updated += rep.updated_count;
@@ -678,7 +678,7 @@ pub async fn recompute_titles_handler(
                 let mut projects_map = serde_json::Map::new();
                 for pid in project_ids {
                     let rep = title_gen::generate_titles_for_scope(
-                        &state,
+                        &state.wiki_deps(),
                         title_gen::TitleScope::Project(pid),
                     )
                     .await?;
@@ -754,7 +754,7 @@ pub async fn list_doc_links(
     let acl = build_acl(&state, &claims).await?;
 
     // Verifica che il doc sorgente sia visibile.
-    let source = storage::get_doc(&state, &acl, id).await.map_err(err500)?;
+    let source = storage::get_doc(&state.wiki_deps(), &acl, id).await.map_err(err500)?;
     if source.is_none() {
         return Err(err404("documento non trovato o non accessibile"));
     }
@@ -1101,7 +1101,7 @@ pub async fn extract_triples_handler(
         // `extract_triples_for_doc` non controlla il cap (lo fa solo il batch).
         let _ = override_cap; // dichiarato per chiarezza, no-op qui
         if wait {
-            let report = triple_extractor::extract_triples_for_doc(&state, doc_id)
+            let report = triple_extractor::extract_triples_for_doc(&state.wiki_deps(), doc_id)
                 .await
                 .map_err(err500)?;
             return Ok((
@@ -1117,7 +1117,7 @@ pub async fn extract_triples_handler(
                 doc_id = %doc_id,
                 "wiki.extract-triples: avvio task background (singolo doc)"
             );
-            match triple_extractor::extract_triples_for_doc(&state_cloned, doc_id).await {
+            match triple_extractor::extract_triples_for_doc(&state_cloned.wiki_deps(), doc_id).await {
                 Ok(rep) => tracing::info!(
                     run_id = %run_id,
                     extracted = rep.triples_extracted,
@@ -1149,7 +1149,7 @@ pub async fn extract_triples_handler(
 
         if scope_label == "meta" || scope_label == "all" {
             let rep = triple_extractor::extract_triples_for_scope(
-                &state,
+                &state.wiki_deps(),
                 triple_extractor::ExtractScope::Meta,
             )
             .await
@@ -1173,7 +1173,7 @@ pub async fn extract_triples_handler(
             let mut projects_map = serde_json::Map::new();
             for pid in project_ids {
                 let rep = triple_extractor::extract_triples_for_scope(
-                    &state,
+                    &state.wiki_deps(),
                     triple_extractor::ExtractScope::Project(pid),
                 )
                 .await
@@ -1210,7 +1210,7 @@ pub async fn extract_triples_handler(
         );
         if scope_clone == "meta" || scope_clone == "all" {
             if let Err(e) = triple_extractor::extract_triples_for_scope(
-                &state_cloned,
+                &state_cloned.wiki_deps(),
                 triple_extractor::ExtractScope::Meta,
             )
             .await
@@ -1232,7 +1232,7 @@ pub async fn extract_triples_handler(
             };
             for pid in pids {
                 if let Err(e) = triple_extractor::extract_triples_for_scope(
-                    &state_cloned,
+                    &state_cloned.wiki_deps(),
                     triple_extractor::ExtractScope::Project(pid),
                 )
                 .await
@@ -1267,7 +1267,7 @@ pub async fn list_doc_triples(
     let acl = build_acl(&state, &claims).await?;
 
     // Verifica visibilita' del doc sorgente.
-    let source = storage::get_doc(&state, &acl, id).await.map_err(err500)?;
+    let source = storage::get_doc(&state.wiki_deps(), &acl, id).await.map_err(err500)?;
     if source.is_none() {
         return Err(err404("documento non trovato o non accessibile"));
     }

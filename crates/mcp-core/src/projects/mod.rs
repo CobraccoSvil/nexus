@@ -54,9 +54,8 @@ pub(crate) const EXCLUDED_NAMES: &[&str] = &[
 /// un'estensione richiedeva di toccarle tutte. Include i linguaggi di
 /// programmazione E il markup `html`/`htm` (le pagine sono contenuto
 /// indicizzabile e ricercabile semanticamente nella KB del progetto).
-pub(crate) const CODE_EXTENSIONS: &[&str] = &[
-    "tsx", "jsx", "ts", "js", "rs", "py", "cs", "go", "vue", "html", "htm",
-];
+/// Punto unico in nexus_types::code_files (regola L).
+pub(crate) use nexus_types::code_files::CODE_EXTENSIONS;
 
 // ── Struct request/response pubbliche ────────────────────────────────────────
 

@@ -90,6 +90,9 @@ condividere codice (fragile base class, accoppiamento al genitore).
 | Path-safety workspace (resolve_workspace_target, path_within) | `crates/nexus-types/src/workspace_paths.rs` (adapter HTTP in `mcp-core::projects`) | esistente |
 | Esecuzione comandi git (run_git_command, GitCommandOptions) | `crates/nexus-types/src/git_exec.rs` (re-export in `mcp-core::projects`) | esistente |
 | Reindex vettoriale post-mutazione (contratto tool agente) | trait `FileReindexer` in `nexus-agent-tools::context_core` (impl `NeuralFileReindexer` in mcp-core, delega a `reindex_single_file`) | esistente |
+| Estrazione JSON da output LLM (Rust, paritetico ADR 0032) | `crates/nexus-types/src/llm_json.rs` (re-export in mcp-core via `crate::llm_json`) | esistente |
+| Estensioni file di codice (CODE_EXTENSIONS) | `crates/nexus-types/src/code_files.rs` (re-export in `mcp-core::projects`) | esistente |
+| Servizi AI del wiki (embed/completion/purpose) | trait `WikiAiServices` in `nexus-wiki::deps` (impl `AppStateWikiAi` in `mcp-core::wiki`, delega a NeuralCoreClient + internal_routing) | esistente |
 
 ### Enforcement
 

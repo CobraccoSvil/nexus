@@ -10,8 +10,8 @@
 //     project=<repository_root_path>/.nexus-vault/)
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::wiki::model::WikiScope;
-use crate::AppState;
+use crate::model::WikiScope;
+use crate::deps::WikiDeps;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -187,7 +187,7 @@ pub fn extract_tags(content: &str) -> Vec<String> {
 /// La funzione non fa side-effect su filesystem: i chiamanti che devono
 /// scrivere il file vault gestiscono `create_dir_all` separatamente.
 pub async fn vault_root_for_scope(
-    state: &AppState,
+    state: &WikiDeps,
     scope: WikiScope,
     project_id: Option<Uuid>,
 ) -> Result<String> {

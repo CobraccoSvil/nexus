@@ -24,7 +24,7 @@
 // in DB senza qdrant_point_id (re-embed possibile a posteriori).
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::AppState;
+use crate::deps::WikiDeps;
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde_json::json;
@@ -145,7 +145,7 @@ async fn load_settings(db: &PgPool) -> Result<ChatNoteSettings> {
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Avvia il loop in background. Delay iniziale 60s per non sovraccaricare boot.
-pub fn start_chat_note_worker(state: Arc<AppState>) {
+pub fn start_chat_note_worker(state: Arc<WikiDeps>) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(60)).await;
         let init = current_settings(&state.db).await;
@@ -178,7 +178,7 @@ pub fn start_chat_note_worker(state: Arc<AppState>) {
 }
 
 /// Singolo batch: legge i messaggi pending e ne ingesta fino al cap.
-async fn scan_and_ingest(state: &AppState, settings: &ChatNoteSettings) -> Result<usize> {
+async fn scan_and_ingest(state: &WikiDeps, settings: &ChatNoteSettings) -> Result<usize> {
     // Compila la regex skip una volta per batch (case-insensitive). Errori
     // di compilazione -> WARN + skip filtraggio (zero false-negative).
     let skip_re: Option<Regex> = match Regex::new(&format!("(?i){}", settings.skip_pattern_raw)) {
@@ -284,7 +284,7 @@ async fn scan_and_ingest(state: &AppState, settings: &ChatNoteSettings) -> Resul
 /// Crea il wiki_doc + embedding per un singolo messaggio. Idempotente via
 /// slug deterministico (`chat-{message_id}`) e ON CONFLICT.
 async fn ingest_message(
-    state: &AppState,
+    state: &WikiDeps,
     message_id: Uuid,
     project_id: Uuid,
     session_id: Uuid,
@@ -307,13 +307,13 @@ async fn ingest_message(
         message = message_id,
         content = content
     );
-    let body_hash = crate::wiki::vault::sha256_hex(&body_md);
+    let body_hash = crate::vault::sha256_hex(&body_md);
 
     // content_hash: hash del CONTENUTO UTENTE normalizzato (trim), NON del
     // body_md arricchito. body_md include created_at/session_id/message_id e
     // sarebbe sempre diverso anche per testi identici (mig 0314). Questo hash
     // intercetta i duplicati reali (stesso testo, messaggi distinti).
-    let content_hash = crate::wiki::vault::sha256_hex(content.trim());
+    let content_hash = crate::vault::sha256_hex(content.trim());
 
     // Prevenzione duplicati di contenuto (mig 0314): se esiste gia' un chat_note
     // con lo stesso (scope, project_id, content_hash) lo saltiamo. L'indice
@@ -360,7 +360,7 @@ async fn ingest_message(
     .context("SELECT id wiki_docs chat_note esistente")?
     .unwrap_or_else(Uuid::new_v4);
     let qdrant_point_id: Option<String> =
-        match state.orchestrator.neural.embed_text("", &combined).await {
+        match state.ai.embed_text("", &combined).await {
             Ok(vector) => {
                 let point_id = doc_uuid.to_string();
                 let payload = json!({
@@ -371,7 +371,7 @@ async fn ingest_message(
                     "kind": "chat_note",
                     "session_id": session_id.to_string(),
                 });
-                match crate::vector_memory::upsert_wiki_content_point(
+                match crate::content_points::upsert_wiki_content_point(
                     &state.db, &point_id, vector, payload,
                 )
                 .await

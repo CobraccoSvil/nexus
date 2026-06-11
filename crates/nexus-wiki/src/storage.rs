@@ -10,10 +10,10 @@
 // a runtime (regola H: il problema e' "applica la mig", non "patcha il codice").
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::wiki::acl::WikiAcl;
-use crate::wiki::model::{WikiDoc, WikiDocPatch, WikiScope};
-use crate::wiki::vault::{sha256_hex, slugify};
-use crate::AppState;
+use crate::acl::WikiAcl;
+use crate::model::{WikiDoc, WikiDocPatch, WikiScope};
+use crate::vault::{sha256_hex, slugify};
+use crate::deps::WikiDeps;
 use anyhow::{anyhow, bail, Context, Result};
 use uuid::Uuid;
 
@@ -46,7 +46,7 @@ pub struct PatchOutcome {
 
 /// Crea un nuovo documento applicando l'ACL: scope=meta richiede admin,
 /// scope=project richiede membership.
-pub async fn create_doc(state: &AppState, acl: &WikiAcl, input: WikiDocCreate) -> Result<WikiDoc> {
+pub async fn create_doc(state: &WikiDeps, acl: &WikiAcl, input: WikiDocCreate) -> Result<WikiDoc> {
     // ── ACL preventiva ───────────────────────────────────────────────────
     match input.scope {
         WikiScope::Meta => {
@@ -133,7 +133,7 @@ pub async fn create_doc(state: &AppState, acl: &WikiAcl, input: WikiDocCreate) -
 
 /// Carica un singolo documento applicando l'ACL. Ritorna `None` se inesistente
 /// o se l'utente non ha permessi di lettura.
-pub async fn get_doc(state: &AppState, acl: &WikiAcl, doc_id: Uuid) -> Result<Option<WikiDoc>> {
+pub async fn get_doc(state: &WikiDeps, acl: &WikiAcl, doc_id: Uuid) -> Result<Option<WikiDoc>> {
     let row: Option<WikiDoc> =
         sqlx::query_as::<_, WikiDoc>("SELECT * FROM wiki_docs WHERE id = $1")
             .bind(doc_id)
@@ -160,7 +160,7 @@ pub struct WikiListQuery {
 
 /// Elenca documenti applicando ACL + filtri. Ritorna `(items, total)`.
 pub async fn list_docs(
-    state: &AppState,
+    state: &WikiDeps,
     acl: &WikiAcl,
     query: WikiListQuery,
 ) -> Result<(Vec<WikiDoc>, i64)> {
@@ -253,7 +253,7 @@ pub async fn list_docs(
 ///   3. Se body cambiato: registra revisione (`record_revision`).
 ///   4. Best-effort: riscrittura del file vault (TODO worker dedicato in F3).
 pub async fn update_doc(
-    state: &AppState,
+    state: &WikiDeps,
     acl: &WikiAcl,
     doc_id: Uuid,
     patch: WikiDocPatch,
@@ -345,7 +345,7 @@ pub async fn update_doc(
 
 /// Elimina un documento (cascade su revisioni, link, triple via FK). ACL: same
 /// regola di `can_write` (admin per scope=meta, membro per scope=project).
-pub async fn delete_doc(state: &AppState, acl: &WikiAcl, doc_id: Uuid) -> Result<()> {
+pub async fn delete_doc(state: &WikiDeps, acl: &WikiAcl, doc_id: Uuid) -> Result<()> {
     let prev: WikiDoc = sqlx::query_as::<_, WikiDoc>("SELECT * FROM wiki_docs WHERE id = $1")
         .bind(doc_id)
         .fetch_optional(&state.db)

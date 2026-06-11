@@ -6,10 +6,10 @@
 // metodi di read e l'operazione composita `restore_revision`.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::wiki::acl::WikiAcl;
-use crate::wiki::model::{WikiDoc, WikiRevision};
-use crate::wiki::storage::record_revision;
-use crate::AppState;
+use crate::acl::WikiAcl;
+use crate::model::{WikiDoc, WikiRevision};
+use crate::storage::record_revision;
+use crate::deps::WikiDeps;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use uuid::Uuid;
@@ -28,7 +28,7 @@ pub struct RevisionMeta {
 
 /// Elenco revisioni applicando ACL: il documento deve essere leggibile.
 pub async fn list_revisions(
-    state: &AppState,
+    state: &WikiDeps,
     acl: &WikiAcl,
     doc_id: Uuid,
 ) -> Result<Vec<RevisionMeta>> {
@@ -80,7 +80,7 @@ pub async fn list_revisions(
 
 /// Carica una singola revisione completa (con body) applicando ACL.
 pub async fn get_revision(
-    state: &AppState,
+    state: &WikiDeps,
     acl: &WikiAcl,
     doc_id: Uuid,
     version_no: i32,
@@ -105,7 +105,7 @@ pub async fn get_revision(
 /// Diff fra due revisioni (ritorna i due body, il rendering del diff vive nel
 /// frontend per evitare dipendenze backend).
 pub async fn diff(
-    state: &AppState,
+    state: &WikiDeps,
     acl: &WikiAcl,
     doc_id: Uuid,
     from: i32,
@@ -123,7 +123,7 @@ pub async fn diff(
 /// Ripristina il body di una revisione precedente: non distruttivo, crea una
 /// nuova revisione con `source='revert'` e aggiorna il body del doc corrente.
 pub async fn restore_revision(
-    state: &AppState,
+    state: &WikiDeps,
     acl: &WikiAcl,
     doc_id: Uuid,
     version: i32,
@@ -183,7 +183,7 @@ pub async fn restore_revision(
 }
 
 /// Helper: ritorna il doc se esiste e l'utente puo' leggerlo; altrimenti error.
-async fn ensure_doc_readable(state: &AppState, acl: &WikiAcl, doc_id: Uuid) -> Result<WikiDoc> {
+async fn ensure_doc_readable(state: &WikiDeps, acl: &WikiAcl, doc_id: Uuid) -> Result<WikiDoc> {
     let doc: WikiDoc = sqlx::query_as::<_, WikiDoc>("SELECT * FROM wiki_docs WHERE id = $1")
         .bind(doc_id)
         .fetch_optional(&state.db)

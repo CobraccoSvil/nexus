@@ -20,7 +20,7 @@
 // in chiaro (regola F): solo i tool name + status del singolo step.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::AppState;
+use crate::deps::WikiDeps;
 use anyhow::{Context, Result};
 use serde_json::json;
 use sqlx::{PgPool, Row};
@@ -122,7 +122,7 @@ async fn load_settings(db: &PgPool) -> Result<RunSummarySettings> {
 // Entry-point
 // ───────────────────────────────────────────────────────────────────────────
 
-pub fn start_run_summary_worker(state: Arc<AppState>) {
+pub fn start_run_summary_worker(state: Arc<WikiDeps>) {
     tokio::spawn(async move {
         // Delay iniziale maggiore (90s) per non sovrapporsi con il chat-note worker.
         tokio::time::sleep(Duration::from_secs(90)).await;
@@ -154,7 +154,7 @@ pub fn start_run_summary_worker(state: Arc<AppState>) {
     });
 }
 
-async fn scan_and_ingest(state: &AppState, settings: &RunSummarySettings) -> Result<usize> {
+async fn scan_and_ingest(state: &WikiDeps, settings: &RunSummarySettings) -> Result<usize> {
     let rows = sqlx::query(
         r#"
         SELECT ar.id, ar.project_id, ar.session_id, ar.status, ar.provider, ar.model,
@@ -236,7 +236,7 @@ async fn scan_and_ingest(state: &AppState, settings: &RunSummarySettings) -> Res
 
 #[allow(clippy::too_many_arguments)]
 async fn ingest_run(
-    state: &AppState,
+    state: &WikiDeps,
     run_id: Uuid,
     project_id: Uuid,
     session_id: Uuid,
@@ -327,7 +327,7 @@ async fn ingest_run(
         tools = tools_section,
         final = final_section,
     );
-    let body_hash = crate::wiki::vault::sha256_hex(&body_md);
+    let body_hash = crate::vault::sha256_hex(&body_md);
 
     // Embed (best-effort).
     // Troncamento per CARATTERE, non per byte: `body_md` contiene testo utente
@@ -354,7 +354,7 @@ async fn ingest_run(
     .context("SELECT id wiki_docs run_summary esistente")?
     .unwrap_or_else(Uuid::new_v4);
     let qdrant_point_id: Option<String> =
-        match state.orchestrator.neural.embed_text("", &combined).await {
+        match state.ai.embed_text("", &combined).await {
             Ok(vector) => {
                 let point_id = doc_uuid.to_string();
                 let payload = json!({
@@ -366,7 +366,7 @@ async fn ingest_run(
                     "session_id": session_id.to_string(),
                     "status": status,
                 });
-                match crate::vector_memory::upsert_wiki_content_point(
+                match crate::content_points::upsert_wiki_content_point(
                     &state.db, &point_id, vector, payload,
                 )
                 .await

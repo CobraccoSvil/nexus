@@ -31,7 +31,7 @@ mod github;
 mod http_metrics;
 mod internal_learning;
 mod internal_routing;
-mod llm_json;
+pub(crate) use nexus_types::llm_json;
 mod long_running;
 mod mcp_client;
 mod mcp_connectors;
@@ -609,7 +609,7 @@ async fn main() -> anyhow::Result<()> {
                 return;
             }
             tracing::info!("wiki: tabella vuota, lancio re-ingest automatico dai vault");
-            match wiki::reingest::reingest_all(&state_bootstrap, None, None).await {
+            match wiki::reingest::reingest_all(&state_bootstrap.wiki_deps(), None, None).await {
                 Ok(report) => {
                     tracing::info!(
                         meta = report.meta_docs_ingested,
@@ -668,7 +668,7 @@ async fn main() -> anyhow::Result<()> {
                 "wiki.links.bootstrap: avvio recompute automatico (scope=meta)"
             );
             match wiki::links_worker::recompute_links_for_scope(
-                &state_links,
+                &state_links.wiki_deps(),
                 Some(wiki::model::WikiScope::Meta),
                 None,
             )
@@ -693,7 +693,7 @@ async fn main() -> anyhow::Result<()> {
     // l'admin la triggera manualmente via POST /api/wiki/extract-triples?wait=true
     // o lascia che il worker periodico processi un batch ogni interval_secs
     // rispettando i cap diurni configurati in settings.
-    wiki::triple_extractor::start_triple_extractor_worker(state.clone());
+    wiki::triple_extractor::start_triple_extractor_worker(state.wiki_deps());
 
     // ── ADR 0017 v2 TODO 1 — watcher bidirezionale vault->DB ──────────────
     // Osserva `docs/.nexus-vault/` e `<project_root>/.nexus-vault/` per i
@@ -701,15 +701,15 @@ async fn main() -> anyhow::Result<()> {
     // chiama `wiki::reingest::reingest_path`. Settings DB-driven (mig 0301).
     // TODO: i progetti registrati post-startup vengono osservati solo dopo un
     // restart di mcp-core (vedi nota in `wiki::watcher`).
-    wiki::watcher::start_wiki_watcher(std::sync::Arc::new(state.clone()));
+    wiki::watcher::start_wiki_watcher(std::sync::Arc::new(state.wiki_deps()));
 
     // ── ADR 0017 v2 TODO 6+7 — chat-note + run-summary worker ─────────────
     // Due loop periodici (delay iniziale rispettivamente 60s e 90s) che
     // ingestano i messaggi chat utente e i resoconti dei run terminali come
     // wiki_docs (kind='chat_note' / 'run_summary'). Settings DB-driven sotto
     // chiave `agent.wiki.chat_note_*` e `agent.wiki.run_summary_*` (mig 0305).
-    wiki::chat_note_worker::start_chat_note_worker(std::sync::Arc::new(state.clone()));
-    wiki::run_summary_worker::start_run_summary_worker(std::sync::Arc::new(state.clone()));
+    wiki::chat_note_worker::start_chat_note_worker(std::sync::Arc::new(state.wiki_deps()));
+    wiki::run_summary_worker::start_run_summary_worker(std::sync::Arc::new(state.wiki_deps()));
 
     // ── ADR 0017 v2 — worker periodici link + titoli su TUTTI gli scope ───
     // Loop DB-driven (interval `agent.wiki.link_worker_interval_secs` /
@@ -718,11 +718,11 @@ async fn main() -> anyhow::Result<()> {
     // bootstrap one-shot dei link (scope=meta) e gli endpoint manuali: i
     // progetti restavano senza link/titoli finche' non triggerati a mano. Il
     // cap diurno del title_gen resta applicato per-scope (no spam LLM).
-    wiki::links_worker::start_links_worker(std::sync::Arc::new(state.clone()));
-    wiki::title_gen::start_title_gen_worker(std::sync::Arc::new(state.clone()));
+    wiki::links_worker::start_links_worker(std::sync::Arc::new(state.wiki_deps()));
+    wiki::title_gen::start_title_gen_worker(std::sync::Arc::new(state.wiki_deps()));
     // Arricchimento LLM dei wiki_docs kind=code (placeholder -> scheda + embedding).
     // Modello come categoria/tier configurabile da admin (mig 0331, regola G/L).
-    wiki::code_docs_enricher::start_code_docs_enricher_worker(std::sync::Arc::new(state.clone()));
+    wiki::code_docs_enricher::start_code_docs_enricher_worker(std::sync::Arc::new(state.wiki_deps()));
 
     // ── PR hardening: avvio writer audit centralizzato + port enforcer ───
     // Audit writer: consuma il canale `record_audit(...)` e fa batch INSERT

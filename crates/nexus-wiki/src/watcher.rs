@@ -34,10 +34,10 @@ use sqlx::PgPool;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::wiki::model::WikiScope;
-use crate::wiki::reingest::reingest_path;
-use crate::wiki::vault::vault_root_for_scope;
-use crate::AppState;
+use crate::model::WikiScope;
+use crate::reingest::reingest_path;
+use crate::vault::vault_root_for_scope;
+use crate::deps::WikiDeps;
 
 /// File di config che, se modificati, invalidano il build graph (ADR 0020).
 /// Match esatto sul nome file (case-insensitive).
@@ -146,7 +146,7 @@ fn resolve_root<'a>(path: &Path, roots: &'a [WatchedRoot]) -> Option<&'a Watched
 /// Avvia il watcher in background. Idempotente: chiamata multipla, ignora le
 /// successive (gate sul flag in `AppState.watching_projects` rifratto in una
 /// const dedicata? Per ora il chiamante deve invocarla una volta sola in main).
-pub fn start_wiki_watcher(state: Arc<AppState>) {
+pub fn start_wiki_watcher(state: Arc<WikiDeps>) {
     tokio::spawn(async move {
         if let Err(e) = run(state).await {
             tracing::error!(error = %e, "wiki.watcher: terminato con errore");
@@ -154,7 +154,7 @@ pub fn start_wiki_watcher(state: Arc<AppState>) {
     });
 }
 
-async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
+async fn run(state: Arc<WikiDeps>) -> anyhow::Result<()> {
     let settings = load_settings(&state.db).await;
     if !settings.enabled {
         tracing::info!("wiki.watcher: disabilitato via settings, no-op");
@@ -367,7 +367,7 @@ async fn maybe_invalidate_build_graph(event: &Event, roots: &[ProjectRootMap]) {
         EventKind::Remove(_) => {}
         _ => return,
     }
-    let Some(cache) = crate::build_graph::BuildGraphCache::global() else {
+    let Some(cache) = nexus_build_graph::BuildGraphCache::global() else {
         return;
     };
     let mut already_invalidated: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
@@ -408,7 +408,7 @@ async fn maybe_invalidate_build_graph(event: &Event, roots: &[ProjectRootMap]) {
 /// Esegue il reingest dei path il cui ultimo evento e' piu' vecchio di
 /// `debounce`. I path piu' freschi restano in coda per il prossimo giro.
 async fn flush(
-    state: &Arc<AppState>,
+    state: &Arc<WikiDeps>,
     roots: &[WatchedRoot],
     pending: &mut HashMap<PathBuf, Instant>,
     debounce: Duration,

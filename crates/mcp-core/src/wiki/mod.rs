@@ -1,9 +1,14 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // wiki/ — Knowledge Graph unificato (ADR 0017 v2).
 //
-// Modulo unico che sostituisce `meta_docs/`, `knowledge/` e `docs_core/`
-// (questi ultimi restano in piedi come dead code fino a F8: compilano ma
-// puntano a tabelle DB che sono state droppate dalla migrazione 0295).
+// Split 7.4 fase F: la logica (model, storage, vault, acl, workers, watcher,
+// code_graph, reingest, title_gen, triple_extractor, content_points) vive nel
+// crate nexus-wiki, de-axumizzata: niente AppState, dipendenze via `WikiDeps`
+// (db + template_cache + servizi AI dietro il trait `WikiAiServices`).
+// Qui restano gli handler HTTP (routes, search, internal, redirects) e
+// l'adapter `AppState::wiki_deps()` + l'impl `WikiAiServices` su
+// NeuralCoreClient/internal_routing. Il re-export mantiene validi i path
+// storici `crate::wiki::*`.
 //
 // Le tabelle di riferimento sono:
 //   - wiki_docs              (scope ∈ {meta, project})
@@ -15,21 +20,85 @@
 // sotto `/api/wiki/*` con `scope` come query-param. Vedi ADR 0017 v2.
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub mod acl;
-pub mod chat_note_worker;
-pub mod code_docs_enricher;
-pub mod code_graph;
+pub use nexus_wiki::*;
+
 pub mod internal;
-pub mod links_worker;
-pub mod model;
 pub mod redirects;
-pub mod reingest;
-pub mod revisions;
 pub mod routes;
-pub mod run_summary_worker;
 pub mod search;
-pub mod storage;
-pub mod title_gen;
-pub mod triple_extractor;
-pub mod vault;
-pub mod watcher;
+
+use std::sync::Arc;
+
+use futures::future::BoxFuture;
+use serde_json::Value;
+
+/// Impl mcp-core dei servizi AI del wiki: embedding/completion via
+/// NeuralCoreClient, purpose model via internal_routing (punti unici G/L).
+#[derive(Clone)]
+pub(crate) struct AppStateWikiAi {
+    state: crate::AppState,
+}
+
+impl std::fmt::Debug for AppStateWikiAi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AppStateWikiAi")
+    }
+}
+
+impl WikiAiServices for AppStateWikiAi {
+    fn embed_text(&self, model: &str, text: &str)
+        -> BoxFuture<'_, anyhow::Result<Vec<f32>>> {
+        let model = model.to_string();
+        let text = text.to_string();
+        Box::pin(async move {
+            self.state
+                .orchestrator
+                .neural
+                .embed_text(&model, &text)
+                .await
+        })
+    }
+
+    fn generate_completion(
+        &self,
+        provider: &str,
+        model: &str,
+        prompt: &str,
+    ) -> BoxFuture<'_, anyhow::Result<Value>> {
+        let provider = provider.to_string();
+        let model = model.to_string();
+        let prompt = prompt.to_string();
+        Box::pin(async move {
+            self.state
+                .orchestrator
+                .neural
+                .generate_completion(&provider, &model, &prompt)
+                .await
+        })
+    }
+
+    fn resolve_purpose_model(
+        &self,
+        purpose: &str,
+    ) -> BoxFuture<'_, Result<(String, String), String>> {
+        let purpose = purpose.to_string();
+        Box::pin(async move {
+            crate::internal_routing::resolve_purpose_model(&self.state, &purpose)
+                .await
+                .into_model(&purpose)
+        })
+    }
+}
+
+impl crate::AppState {
+    /// Costruisce il contesto `WikiDeps` per le funzioni del crate nexus-wiki.
+    pub(crate) fn wiki_deps(&self) -> WikiDeps {
+        WikiDeps {
+            db: self.db.clone(),
+            template_cache: self.template_cache.clone(),
+            ai: Arc::new(AppStateWikiAi {
+                state: self.clone(),
+            }),
+        }
+    }
+}

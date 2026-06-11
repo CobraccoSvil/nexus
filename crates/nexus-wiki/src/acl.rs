@@ -12,9 +12,9 @@
 // L'admin globale (claims.role == "admin") salta il filtro e vede tutto.
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::auth::Claims;
-use crate::wiki::model::WikiDoc;
-use crate::AppState;
+use nexus_auth::Claims;
+use crate::model::WikiDoc;
+use crate::deps::WikiDeps;
 use anyhow::{Context, Result};
 use uuid::Uuid;
 
@@ -34,7 +34,7 @@ pub struct WikiAcl {
 impl WikiAcl {
     /// Costruisce l'ACL a partire dai `Claims` validati dal middleware.
     /// Esegue una query su `project_members` per popolare `project_ids`.
-    pub async fn from_claims(state: &AppState, claims: &Claims) -> Result<Self> {
+    pub async fn from_claims(state: &WikiDeps, claims: &Claims) -> Result<Self> {
         let is_admin = claims.role == "admin";
         // `sub` puo' essere un UUID o uno user_id legacy. Se non e' UUID,
         // l'utente non avra' project_ids associati (e' lo stesso comportamento

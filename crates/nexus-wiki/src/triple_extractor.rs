@@ -20,8 +20,8 @@
 // (Result::Err propagato al chiamante).
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::prompt_templates::get_template_or_default;
-use crate::AppState;
+use nexus_types::get_template_or_default;
+use crate::deps::WikiDeps;
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use serde_json::Value;
@@ -248,7 +248,7 @@ async fn fetch_doc(db: &PgPool, doc_id: Uuid) -> Result<Option<DocRow>> {
 // Render prompt
 // ───────────────────────────────────────────────────────────────────────────
 
-async fn render_prompt(state: &AppState, doc: &DocRow, max_triples: u32) -> Result<String> {
+async fn render_prompt(state: &WikiDeps, doc: &DocRow, max_triples: u32) -> Result<String> {
     // Template via cache 60s (`prompt_templates::get_template_or_default`).
     let tmpl = get_template_or_default(
         &state.db,
@@ -289,7 +289,7 @@ struct ParsedTriple {
 }
 
 // Estrazione blocco JSON: punto unico in `crate::llm_json` (regola L / ADR 0026).
-use crate::llm_json::extract_json_object;
+use nexus_types::llm_json::extract_json_object;
 
 fn parse_triples_from_llm(content: &str) -> Result<Vec<ParsedTriple>> {
     let json_slice = extract_json_object(content)
@@ -484,7 +484,7 @@ async fn upsert_triple(
 // API pubblica — estrazione singolo doc
 // ───────────────────────────────────────────────────────────────────────────
 
-pub async fn extract_triples_for_doc(state: &AppState, doc_id: Uuid) -> Result<ExtractReport> {
+pub async fn extract_triples_for_doc(state: &WikiDeps, doc_id: Uuid) -> Result<ExtractReport> {
     let started = Instant::now();
     let mut report = ExtractReport {
         doc_id: Some(doc_id),
@@ -505,11 +505,11 @@ pub async fn extract_triples_for_doc(state: &AppState, doc_id: Uuid) -> Result<E
     };
 
     // Risolvi modello dal PUNTO UNICO tier-only (regola L/G).
-    let (provider, model) =
-        crate::internal_routing::resolve_purpose_model(state, "wiki_triple_extract")
-            .await
-            .into_model("wiki_triple_extract")
-            .map_err(|m| anyhow!(m))?;
+    let (provider, model) = state
+        .ai
+        .resolve_purpose_model("wiki_triple_extract")
+        .await
+        .map_err(|m| anyhow!(m))?;
 
     let prompt = render_prompt(state, &doc, settings.max_triples_per_doc).await?;
 
@@ -524,8 +524,7 @@ pub async fn extract_triples_for_doc(state: &AppState, doc_id: Uuid) -> Result<E
     );
 
     let resp = match state
-        .orchestrator
-        .neural
+        .ai
         .generate_completion(&provider, &model, &prompt)
         .await
     {
@@ -788,7 +787,7 @@ async fn fetch_candidates(db: &PgPool, scope: ExtractScope, limit: i64) -> Resul
 /// Estrazione batch su uno scope, rispettando cap diurno. Sequenziale (no
 /// parallelismo) per non sforare rate limit del provider.
 pub async fn extract_triples_for_scope(
-    state: &AppState,
+    state: &WikiDeps,
     scope: ExtractScope,
 ) -> Result<BatchReport> {
     let mut batch = BatchReport::default();
@@ -861,7 +860,7 @@ pub async fn extract_triples_for_scope(
 // Worker periodico
 // ───────────────────────────────────────────────────────────────────────────
 
-pub fn start_triple_extractor_worker(state: AppState) {
+pub fn start_triple_extractor_worker(state: WikiDeps) {
     tokio::spawn(async move {
         // Delay iniziale per non sovraccaricare il boot.
         tokio::time::sleep(Duration::from_secs(90)).await;

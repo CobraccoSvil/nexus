@@ -21,7 +21,7 @@
 //     reindex dei chunk vettoriali).
 // ═══════════════════════════════════════════════════════════════════════════
 
-use crate::wiki::vault::{sha256_hex, slugify};
+use crate::vault::{sha256_hex, slugify};
 use regex::Regex;
 use sqlx::PgPool;
 use std::sync::OnceLock;
@@ -209,7 +209,7 @@ pub async fn persist_code_graph_for_file(
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    if !crate::projects::CODE_EXTENSIONS.contains(&ext.as_str()) {
+    if !nexus_types::code_files::CODE_EXTENSIONS.contains(&ext.as_str()) {
         return 0;
     }
 

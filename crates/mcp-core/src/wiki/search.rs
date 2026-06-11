@@ -185,7 +185,7 @@ pub async fn search(
     Extension(claims): Extension<Claims>,
     Json(body): Json<SearchBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let acl = WikiAcl::from_claims(&state, &claims)
+    let acl = WikiAcl::from_claims(&state.wiki_deps(), &claims)
         .await
         .map_err(err500)?;
 
