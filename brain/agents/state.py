@@ -67,6 +67,9 @@ class AgentState(TypedDict, total=False):
     # Conteggio cumulativo delle dichiarazioni task_complete outcome=done: alla
     # 3a l'executor chiude d'autorita' (anti dichiara-e-prosegui).
     declared_done_count: int
+    # True se una dichiarazione blocked e' gia' stata rifiutata perche' l'unico
+    # blocco del turno era il predictive context cap (guard una-tantum).
+    blocked_cap_rejected: bool
     task_type: str
     behavior_mode: str
     token_budget: int

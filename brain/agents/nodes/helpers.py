@@ -3025,6 +3025,16 @@ def _current_context_token_estimate(messages: list[Any], system_text: str = "") 
     return int(total_chars / 3.5)
 
 
+# Sentinella a convenzione chiusa NOSTRA (formato fisso, parser legittimo):
+# prefisso del tool_result quando il predictive context cap blocca una chiamata.
+# Usata anche dal tool_dispatch per RIFIUTARE (una volta) un task_complete
+# outcome=blocked dichiarato nello stesso turno di un blocco-cap: il blocco e'
+# della SINGOLA chiamata, non del task (incidente run 5df5cef2: "quante tabelle
+# nel db" chiuso blocked "per mancanza di spazio" dopo un'estrazione figma
+# deragliata e bloccata dal cap, coi dati per rispondere gia' raccolti).
+PREDICTIVE_CAP_SENTINEL = "[ERROR: chiamata bloccata da predictive context cap]"
+
+
 def _predictive_cap_check(
     tool_name: str,
     args: dict[str, Any],
@@ -3053,16 +3063,22 @@ def _predictive_cap_check(
         "projected=%d tok, cap=%d tok = %.0f%% di %d)",
         tool_name, current, expected_tokens, projected, cap_tokens, ratio * 100, window,
     )
+    # Anti-deragliamento (incidente run 5df5cef2): vedi PREDICTIVE_CAP_SENTINEL.
     return (
-        "[ERROR: chiamata bloccata da predictive context cap]\n"
-        f"Il context attuale e' a {current} token ({pct}% del budget {window}). "
-        f"Il risultato atteso del tool aggiungerebbe ~{expected_tokens} token "
-        f"portandolo oltre il {int(ratio*100)}% (cap={cap_tokens}).\n"
-        "Suggerimenti:\n"
+        PREDICTIVE_CAP_SENTINEL + "\n"
+        "ATTENZIONE: e' stata bloccata SOLO questa chiamata, NON il task. "
+        "Se questo tool non e' essenziale per la RICHIESTA CORRENTE dell'utente "
+        "(es. l'hai chiamato per via di contenuti storici della conversazione), "
+        "IGNORALO e prosegui col task usando i dati che hai gia' raccolto. "
+        "NON dichiarare il task bloccato per questo motivo.\n"
+        f"Dettaglio: context a {current} token ({pct}% del budget {window}); il "
+        f"risultato atteso aggiungerebbe ~{expected_tokens} token oltre il "
+        f"{int(ratio*100)}% (cap={cap_tokens}).\n"
+        "Solo se il tool e' DAVVERO necessario alla richiesta corrente:\n"
         "- Riduci i parametri (es. length piu' piccolo).\n"
         "- Usa estrazione strutturata (nexus_extract_figma_structure, "
         "nexus_extract_pdf_text, nexus_extract_docx_text).\n"
-        "- Chiedi all'utente di fornire una versione testuale."
+        "- Oppure dichiara con task_complete outcome=needs_input cosa serve dall'utente."
     )
 
 

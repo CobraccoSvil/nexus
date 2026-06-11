@@ -917,6 +917,10 @@ async def router_node(state: AgentState) -> dict[str, Any]:
         _MUTATING_FILE_TOOLS = {
             "write_file", "edit_file", "delete_file", "rename_file",
             "nexus_install_shadcn_components",
+            # request_port alloca risorse (INSERT in nexus_port_allocations):
+            # e' una MODIFICA, va rimosso dai task di sola verifica. Il task di
+            # verifica usa nexus_list_ports (read-only), che resta disponibile.
+            "request_port",
         }
         _tools_now = updates.get("tools_json", state.get("tools_json")) or []
         _tools_ro = [
@@ -3293,6 +3297,8 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     # Holder degli esiti DICHIARATI via task_complete in questo turno (WAVE 3):
     # _run e' una closure, raccoglie qui senza poter scrivere nello state.
     _declared_outcomes: list[dict] = []
+    # tool_use_id dei task_complete del turno (per la guard blocked-da-cap).
+    _task_complete_ids: list[str] = []
     # WAVE 2.2: True se almeno un tool e' fallito per ToolRunner gRPC down.
     _infra_tool_errors: list[bool] = []
 
@@ -3304,6 +3310,7 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
         # l'esito dichiarato e rispondiamo con un ack. Se l'input e' invalido
         # (outcome fuori enum), is_error=True cosi' il modello lo ri-emette bene.
         if _t_name == TASK_COMPLETE_TOOL_NAME:
+            _task_complete_ids.append(tool_use_id)
             decl = normalize_declared_outcome(_t_input)
             if decl is not None:
                 _declared_outcomes.append(decl)
@@ -3396,6 +3403,45 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
         if b.get("name", "") in _ATTACHMENT_READ_TOOLS and not r.get("is_error"):
             added_bytes += _extract_returned_bytes(r.get("content", ""))
     new_attachment_read_bytes = current_bytes + added_bytes
+
+    # ── Guard blocked-da-cap (incidente run 5df5cef2) ────────────────────────
+    # Se in QUESTO turno il modello ha dichiarato task_complete outcome=blocked
+    # INSIEME a chiamate respinte dal predictive context cap, il blocco e' della
+    # SINGOLA chiamata (anti-saturazione), non del task: il modello sta
+    # generalizzando l'errore del cap a "task bloccato" (caso reale: "quante
+    # tabelle nel db" chiuso blocked "per mancanza di spazio" coi dati gia'
+    # raccolti). Rifiutiamo la dichiarazione UNA volta (ack is_error che lo
+    # rimanda al lavoro); se ri-dichiara blocked al turno dopo, la onoriamo.
+    _blocked_cap_rejected_now = False
+    from .helpers import PREDICTIVE_CAP_SENTINEL as _CAP_SENTINEL
+    if (
+        _declared_outcomes
+        and _declared_outcomes[-1].get("outcome") == "blocked"
+        and not state.get("blocked_cap_rejected")
+        and any(_CAP_SENTINEL in str(r.get("content") or "") for r in results)
+    ):
+        for r in results:
+            if r.get("tool_use_id") in _task_complete_ids:
+                r["content"] = json.dumps(
+                    {
+                        "acknowledged": False,
+                        "reason": (
+                            "Dichiarazione 'blocked' RIFIUTATA: l'unico blocco di "
+                            "questo turno e' il predictive context cap su una "
+                            "singola chiamata, NON un blocco del task. Prosegui "
+                            "col task usando i dati gia' raccolti e rispondi alla "
+                            "richiesta corrente dell'utente."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+                r["is_error"] = True
+        _declared_outcomes.clear()
+        _blocked_cap_rejected_now = True
+        logger.warning(
+            "tool_dispatch_node: task_complete blocked RIFIUTATO (blocco era del "
+            "predictive cap, non del task) — run=%s", state.get("thread_id"),
+        )
 
 
     # M68: persisti gli step in agent_steps INCREMENTALMENTE durante il run.
@@ -3645,6 +3691,10 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     # end_turn perche' mcp-core non scali i provider.
     if _infra_tool_errors:
         _dispatch_updates["tool_infra_error"] = True
+    # Guard blocked-da-cap: la dichiarazione e' stata rifiutata una volta; il
+    # flag evita rifiuti ripetuti (la 2a dichiarazione blocked viene onorata).
+    if _blocked_cap_rejected_now:
+        _dispatch_updates["blocked_cap_rejected"] = True
     return _dispatch_updates
 
 
