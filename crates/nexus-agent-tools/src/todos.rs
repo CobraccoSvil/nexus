@@ -28,13 +28,13 @@ use sqlx::Row;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use super::AgentToolContext;
+use super::ToolContextCore;
 
 /// Stati ammessi (mirror del CHECK constraint in mig 0148).
 const VALID_STATUSES: &[&str] = &["pending", "in_progress", "completed", "blocked", "skipped"];
 const VALID_PRIORITIES: &[&str] = &["high", "normal", "low"];
 
-pub async fn tool_nexus_todo_write(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_nexus_todo_write(ctx: &ToolContextCore, input: &Value) -> String {
     // 1. Parse e validazione input.
     let action = match input.get("action").and_then(Value::as_str) {
         Some(a) => a,
@@ -90,7 +90,7 @@ pub async fn tool_nexus_todo_write(ctx: &AgentToolContext, input: &Value) -> Str
 }
 
 async fn create_plan(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     run_id: Uuid,
     project_id: Uuid,
     todos_in: &[Value],
@@ -277,7 +277,7 @@ async fn create_plan(
 }
 
 async fn add_todos(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     run_id: Uuid,
     project_id: Uuid,
     todos_in: &[Value],
@@ -364,7 +364,7 @@ async fn add_todos(
 /// Aggiorna lo status (e altri campi) di todos esistenti.
 /// `check_mode=true` significa azione "check" (target esplicito = mark completed).
 async fn update_status(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     run_id: Uuid,
     _project_id: Uuid,
     todos_in: &[Value],

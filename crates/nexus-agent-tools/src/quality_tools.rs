@@ -5,9 +5,9 @@
 use serde_json::Value;
 use sqlx::Row;
 
-use super::AgentToolContext;
+use super::ToolContextCore;
 
-pub(super) async fn tool_scan_code_quality(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_scan_code_quality(ctx: &ToolContextCore, input: &Value) -> String {
     let file_path = input.get("file_path").and_then(Value::as_str);
     let severity_filter = input
         .get("severity_filter")
@@ -112,7 +112,7 @@ pub(super) async fn tool_scan_code_quality(ctx: &AgentToolContext, input: &Value
     }
 }
 
-pub(super) async fn tool_batch_analyze_code(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_batch_analyze_code(ctx: &ToolContextCore, input: &Value) -> String {
     let task = input
         .get("task")
         .and_then(Value::as_str)

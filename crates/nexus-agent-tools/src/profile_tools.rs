@@ -5,10 +5,10 @@
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::AgentToolContext;
+use super::ToolContextCore;
 
 // TODO(fase 4b): portare subtask dispatch sul brain
-pub(super) async fn tool_dispatch_subtask(_ctx: AgentToolContext, _input: Value) -> String {
+pub async fn tool_dispatch_subtask(_ctx: ToolContextCore, _input: Value) -> String {
     // Fase 4 refactor Nexus: AgentLoop locale eliminato. dispatch_subtask non
     // e' piu' esposto nello schema (vedi rimozione in TOOL_CATALOG). Se un
     // client legacy lo invoca, istruisci l'agente a procedere direttamente
@@ -21,7 +21,7 @@ pub(super) async fn tool_dispatch_subtask(_ctx: AgentToolContext, _input: Value)
 
 // ── Profili utente ──────────────────────────────────────────────────────────
 
-pub(super) async fn tool_create_profile(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_create_profile(ctx: &ToolContextCore, input: &Value) -> String {
     let name = match input.get("name").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => return "[Errore: parametro 'name' obbligatorio]".to_string(),
@@ -115,7 +115,7 @@ pub(super) async fn tool_create_profile(ctx: &AgentToolContext, input: &Value) -
     }
 }
 
-pub(super) async fn tool_update_profile(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_update_profile(ctx: &ToolContextCore, input: &Value) -> String {
     let profile_name = match input.get("profile_name").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => return "[Errore: parametro 'profile_name' obbligatorio]".to_string(),

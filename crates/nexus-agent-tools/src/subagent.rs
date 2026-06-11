@@ -15,9 +15,9 @@ use sqlx::Row;
 use std::time::Duration;
 use uuid::Uuid;
 
-use super::AgentToolContext;
+use super::ToolContextCore;
 
-pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_dispatch_subagent(ctx: &ToolContextCore, input: &Value) -> String {
     // 1. Parse input
     let kind = match input.get("kind").and_then(Value::as_str) {
         Some(k) if !k.is_empty() => k.to_string(),
@@ -51,7 +51,7 @@ pub async fn tool_dispatch_subagent(ctx: &AgentToolContext, input: &Value) -> St
 /// per ogni sub-run; nel batch il cost cap e' best-effort (race tollerata
 /// dato il cap conservativo sul parallelismo).
 async fn run_single_subagent(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
     kind: &str,
     task: &str,
     context_blob: &str,
@@ -247,7 +247,7 @@ async fn run_single_subagent(
 /// Esegue a ondate di `max_parallel` via join_all (I/O-bound verso il brain).
 /// E' la base del DAG scheduler parallelo (Comp.3b); i guard per-sub e il
 /// cost cap restano quelli di `run_single_subagent`.
-pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_dispatch_subagents(ctx: &ToolContextCore, input: &Value) -> String {
     let tasks = match input.get("tasks").and_then(|v| v.as_array()) {
         Some(a) if !a.is_empty() => a.clone(),
         _ => return err("parametro 'tasks' (array non vuoto) obbligatorio"),
@@ -318,7 +318,7 @@ pub async fn tool_dispatch_subagents(ctx: &AgentToolContext, input: &Value) -> S
 }
 
 async fn read_subagent_settings(
-    ctx: &AgentToolContext,
+    ctx: &ToolContextCore,
 ) -> Result<(bool, String, i64, f64, i64), String> {
     // Lettura blocco per minimizzare round-trip.
     let rows = sqlx::query(
@@ -371,7 +371,7 @@ const MAX_PARALLEL_HARD_CAP: u64 = 8;
 /// Legge `orchestrator.max_parallel_subagents` (default 3) come tetto effettivo
 /// del parallelismo dei sub-agenti. PUNTO UNICO condiviso col DAG scheduler
 /// Python e col pannello admin "Agenti Paralleli".
-async fn read_max_parallel_subagents(ctx: &AgentToolContext) -> u64 {
+async fn read_max_parallel_subagents(ctx: &ToolContextCore) -> u64 {
     let v: Option<String> = sqlx::query_scalar(
         "SELECT value FROM settings WHERE key = 'orchestrator.max_parallel_subagents'",
     )
@@ -390,7 +390,7 @@ fn err(msg: &str) -> String {
 
 /// PR-3: tool `nexus_subagent_poll` — leggi lo stato di un sub-agent run.
 /// Usato dal main quando ha invocato un sub-agent background.
-pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_nexus_subagent_poll(ctx: &ToolContextCore, input: &Value) -> String {
     let run_id = match input.get("subagent_run_id").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => {
@@ -431,7 +431,7 @@ pub async fn tool_nexus_subagent_poll(ctx: &AgentToolContext, input: &Value) -> 
 }
 
 /// PR-3: tool `nexus_subagent_resume` — riprendi un sub-agent paused/background.
-pub async fn tool_nexus_subagent_resume(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_nexus_subagent_resume(ctx: &ToolContextCore, input: &Value) -> String {
     let run_id = match input.get("subagent_run_id").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => {

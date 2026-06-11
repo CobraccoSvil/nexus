@@ -8,12 +8,10 @@
 //! resto del crate (e i sottomoduli che fanno `use super::*`) si aspettano.
 //!
 //! Splitting interno (refactor god-file):
-//! - `tool_schema`    — costante `AGENT_TOOLS_JSON` (schema tool, dato puro)
-//! - `context`        — `AgentToolContext`
+//! - `tool_schema`    — costante `AGENT_TOOLS_JSON` (schema tool, dato puro; in nexus-agent-tools)
+//! - `context`        — `AgentToolContext` (wrapper di `ToolContextCore` + campi mcp-core)
 //! - `helpers`        — costanti lettura file, pattern protetti, helper condivisi
 //! - `dispatch`       — `execute_agent_tool` (routing nome-tool -> handler)
-//! - `profile_tools`  — tool profili utente + stub dispatch_subtask
-//! - `quality_tools`  — analisi qualita codice (scan, batch)
 //! - `semantic_tools` — ricerca semantica (codebase, recall, in-file)
 //!
 //! Sottomoduli per dominio operativo:
@@ -23,19 +21,14 @@
 //! - `sandbox` — configurazione sandbox del progetto
 //! - `command` — esecuzione comandi shell e test runner
 
-// Split 7.4: i moduli senza AgentToolContext vivono nel crate
-// nexus-agent-tools; il re-export mantiene i path crate::agent_tools::*.
+// Split 7.4: i moduli senza AgentToolContext (passo 1) e i tool che usano
+// solo i campi core del contesto (passo 2, `ToolContextCore`) vivono nel
+// crate nexus-agent-tools; il re-export mantiene i path crate::agent_tools::*.
 pub use nexus_agent_tools::*;
 
-pub(crate) mod archive_tools;
-pub(crate) mod attachment_inspector;
-pub(crate) mod attachments;
 pub(crate) mod command;
 pub(crate) mod context;
-pub(crate) mod dev_diagnostics;
 pub(crate) mod dispatch;
-pub(crate) mod dispatcher;
-pub(crate) mod document_tools;
 pub(crate) mod figma_tools;
 pub(crate) mod files;
 pub(crate) mod git;
@@ -43,18 +36,12 @@ pub(crate) mod helpers;
 pub(crate) mod knowledge;
 pub(crate) mod port_scanner;
 pub(crate) mod ports;
-pub(crate) mod profile_tools;
 pub(crate) mod project_db_query;
-pub(crate) mod quality_tools;
 pub(crate) mod rag_search;
 pub(crate) mod sandbox;
-pub(crate) mod scaffold_verifier;
 pub(crate) mod semantic_tools;
 pub(crate) mod service;
-pub(crate) mod shadcn_setup;
-pub(crate) mod subagent;
 pub(crate) mod testing;
-pub(crate) mod todos;
 pub(crate) mod vision_tools;
 pub(crate) mod visual_compare;
 

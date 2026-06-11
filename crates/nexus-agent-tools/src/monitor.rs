@@ -19,7 +19,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 /// Tipo del registro monitor in-memory: `project_id -> { monitor_id -> {value,label,updated_at} }`.
-pub(crate) type MonitorRegistry = Arc<RwLock<HashMap<Uuid, HashMap<String, Value>>>>;
+pub type MonitorRegistry = Arc<RwLock<HashMap<Uuid, HashMap<String, Value>>>>;
 
 /// Aggiorna un monitor nel registry in-memory ed emette `MonitorUpdated` sul
 /// dispatcher del progetto. Ritorna il numero di sequenza dell'evento emesso.

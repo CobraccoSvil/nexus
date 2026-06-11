@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-use super::AgentToolContext;
+use super::ToolContextCore;
 
 /// File critici che un progetto Vite+React+TS deve avere per partire.
 struct VerifyResult {
@@ -34,7 +34,7 @@ struct InconsistentImport {
     suggested_path: Option<String>,
 }
 
-pub(super) async fn tool_nexus_verify_scaffold(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_nexus_verify_scaffold(ctx: &ToolContextCore, input: &Value) -> String {
     let target_rel = input
         .get("target_dir")
         .and_then(Value::as_str)

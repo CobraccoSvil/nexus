@@ -111,22 +111,24 @@ impl ToolRunnerService {
         let info = self.resolve_session(session_id).await?;
         let long_running_patterns = crate::long_running::load_enabled_patterns(&self.deps.db).await;
         Ok(AgentToolContext {
-            root_path: info.root_path,
-            user_id: info.user_id,
-            is_git_repo: info.is_git_repo,
-            can_write: info.can_write,
-            project_id: info.project_id,
-            session_id: Some(session_id),
-            db: Arc::new(self.deps.db.clone()),
-            parent_run_id: None,
+            core: nexus_agent_tools::ToolContextCore {
+                root_path: info.root_path,
+                user_id: info.user_id,
+                is_git_repo: info.is_git_repo,
+                can_write: info.can_write,
+                project_id: info.project_id,
+                session_id: Some(session_id),
+                db: Arc::new(self.deps.db.clone()),
+                parent_run_id: None,
+                long_running_patterns,
+                user_role: info.user_role.clone(),
+                is_nexus_operator: matches!(info.user_role.as_str(), "owner" | "admin"),
+                project_channels: self.deps.project_channels.clone(),
+                monitor_registry: self.deps.monitor_registry.clone(),
+            },
             playwright_channels: self.deps.playwright_channels.clone(),
             neural: self.deps.neural.clone(),
-            long_running_patterns,
-            user_role: info.user_role.clone(),
-            is_nexus_operator: matches!(info.user_role.as_str(), "owner" | "admin"),
             dependency_status: self.deps.dependency_status.clone(),
-            project_channels: self.deps.project_channels.clone(),
-            monitor_registry: self.deps.monitor_registry.clone(),
             port_registry: self.deps.port_registry.clone(),
         })
     }

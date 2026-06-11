@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use super::AgentToolContext;
+use super::ToolContextCore;
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
 const MAX_FINDINGS: usize = 50;
@@ -105,7 +105,7 @@ async fn get_diagnostics(db: &PgPool) -> Vec<Diagnostic> {
 /// `(descrizione, fix_renderizzato, category)`. None se nessun pattern matcha
 /// o la tabella e' vuota — in tal caso il chiamante usa il fallback hardcoded.
 /// Usata sia dal tool sia da `services.rs` per non duplicare la diagnosi crash.
-pub(crate) async fn diagnose_log_db(db: &PgPool, log: &str) -> Option<(String, String, String)> {
+pub async fn diagnose_log_db(db: &PgPool, log: &str) -> Option<(String, String, String)> {
     let diagnostics = get_diagnostics(db).await;
     for diag in &diagnostics {
         if let Some(caps) = diag.pattern.captures(log) {
@@ -172,8 +172,8 @@ async fn read_log_tail(path: &Path) -> Result<String, String> {
 }
 
 /// Tool entry point.
-pub(super) async fn tool_nexus_dev_server_diagnose(
-    ctx: &AgentToolContext,
+pub async fn tool_nexus_dev_server_diagnose(
+    ctx: &ToolContextCore,
     input: &Value,
 ) -> String {
     // Input opzionali: log_path (file da scansionare), inline_log (stringa), port (per nota)

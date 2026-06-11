@@ -66,7 +66,7 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         // Tool dedicato ai cicli test-fix-test: esecuzione sincrona con
         // timeout esteso (raccomandato dai prompt al posto di run_command).
         "run_tests" => command::tool_run_tests(ctx, input).await,
-        "dispatch_subtask" => tool_dispatch_subtask(ctx.clone(), input.clone()).await,
+        "dispatch_subtask" => tool_dispatch_subtask(ctx.core.clone(), input.clone()).await,
         "create_profile" => tool_create_profile(ctx, input).await,
         "update_profile" => tool_update_profile(ctx, input).await,
         "set_sandbox_config" => sandbox::tool_set_sandbox_config(ctx, input).await,
@@ -286,24 +286,26 @@ mod tests {
         let db = sqlx::PgPool::connect_lazy("postgres://test:test@127.0.0.1:1/test")
             .expect("pool lazy");
         AgentToolContext {
-            root_path: root,
-            user_id: Uuid::nil(),
-            is_git_repo: false,
-            can_write: true,
-            project_id: Uuid::nil(),
-            session_id: None,
-            db: Arc::new(db.clone()),
-            parent_run_id: None,
+            core: nexus_agent_tools::ToolContextCore {
+                root_path: root,
+                user_id: Uuid::nil(),
+                is_git_repo: false,
+                can_write: true,
+                project_id: Uuid::nil(),
+                session_id: None,
+                db: Arc::new(db.clone()),
+                parent_run_id: None,
+                long_running_patterns: Vec::new(),
+                user_role: "admin".to_string(),
+                is_nexus_operator: true,
+                project_channels: Arc::new(dashmap::DashMap::new()),
+                monitor_registry: Arc::new(parking_lot::RwLock::new(
+                    std::collections::HashMap::new(),
+                )),
+            },
             playwright_channels: crate::playwright_live::new_channels(),
             neural: crate::orchestrator::NeuralCoreClient::disconnected_for_tests(),
-            long_running_patterns: Vec::new(),
-            user_role: "admin".to_string(),
-            is_nexus_operator: true,
             dependency_status: Arc::new(crate::task_watchdog::DependencyStatus::new()),
-            project_channels: Arc::new(dashmap::DashMap::new()),
-            monitor_registry: Arc::new(parking_lot::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
             port_registry: crate::port_registry::PortRegistryCache::empty_for_tests(db),
         }
     }

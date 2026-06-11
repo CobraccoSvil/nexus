@@ -17,7 +17,7 @@ use sqlx::{PgPool, Row};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
-use super::AgentToolContext;
+use super::ToolContextCore;
 
 /// Bytes letti per la magic byte detection. 32 KB e' sufficiente per:
 /// - ZIP/PDF/PNG/JPEG/GIF (firma in primi 8 byte)
@@ -28,7 +28,7 @@ const HEADER_READ_BYTES: usize = 32 * 1024;
 /// Lookup di un allegato accessibile dal contesto agente corrente.
 ///
 /// Filtra per `project_id` per impedire cross-project leak.
-pub(super) struct AttachmentRecord {
+pub struct AttachmentRecord {
     pub id: Uuid,
     pub file_path: PathBuf,
     pub file_name: String,
@@ -45,7 +45,7 @@ pub(super) struct AttachmentRecord {
 ///    del progetto, prendendo il piu' recente.
 /// 3. Match case-sensitive sul nome esatto. Match parziale rifiutato per evitare
 ///    ambiguita' (es. "report.pdf" non risolve a "weekly_report.pdf").
-pub(super) async fn resolve_attachment_id_by_name(
+pub async fn resolve_attachment_id_by_name(
     db: &PgPool,
     file_name: &str,
     project_id: Uuid,
@@ -86,7 +86,7 @@ pub(super) async fn resolve_attachment_id_by_name(
     Ok(id)
 }
 
-pub(super) async fn load_attachment(
+pub async fn load_attachment(
     db: &PgPool,
     attachment_id: Uuid,
     project_id: Uuid,
@@ -126,7 +126,7 @@ pub(super) async fn load_attachment(
 }
 
 /// Legge i primi `HEADER_READ_BYTES` byte del file allegato.
-pub(super) async fn read_header(path: &std::path::Path) -> Result<Vec<u8>, String> {
+pub async fn read_header(path: &std::path::Path) -> Result<Vec<u8>, String> {
     let mut file = tokio::fs::File::open(path)
         .await
         .map_err(|e| format!("impossibile aprire '{}': {e}", path.display()))?;
@@ -383,7 +383,7 @@ fn kind_is_text(kind: &str) -> bool {
 ///    pre-fix `enrich_attachments_with_ids` dove il blocco `<allegati>` non
 ///    esponeva l'UUID e il modello e' costretto a guessare (osservato 30/05/2026:
 ///    Vertex passava sia il filename "PL.make" sia un UUID allucinato).
-pub(super) async fn tool_nexus_inspect_attachment(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_nexus_inspect_attachment(ctx: &ToolContextCore, input: &Value) -> String {
     let raw_id = match input.get("attachment_id").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s.trim(),
         _ => {

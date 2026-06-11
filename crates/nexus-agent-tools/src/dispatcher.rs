@@ -11,7 +11,9 @@
 //! - `dispatcher_update_monitor`    — widget monitor custom (in-memory)
 //! - `dispatcher_highlight_panel`   — flash animation su un pannello
 
-use super::*;
+use serde_json::Value;
+
+use super::ToolContextCore;
 use nexus_events::{dispatcher, event::ProjectEvent};
 
 /// Allowlist di chiavi per `dispatcher_set_flag`. Le chiavi che non matchano
@@ -23,7 +25,7 @@ fn is_allowed_flag(key: &str) -> bool {
     FLAG_KEY_PREFIXES.iter().any(|p| key.starts_with(p))
 }
 
-pub(super) async fn tool_dispatcher_emit_event(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_dispatcher_emit_event(ctx: &ToolContextCore, input: &Value) -> String {
     let event_name = match input.get("kind").and_then(Value::as_str) {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return "[Errore: parametro 'kind' obbligatorio]".to_string(),
@@ -50,8 +52,8 @@ pub(super) async fn tool_dispatcher_emit_event(ctx: &AgentToolContext, input: &V
     )
 }
 
-pub(super) async fn tool_dispatcher_post_notification(
-    ctx: &AgentToolContext,
+pub async fn tool_dispatcher_post_notification(
+    ctx: &ToolContextCore,
     input: &Value,
 ) -> String {
     let severity = input
@@ -92,7 +94,7 @@ pub(super) async fn tool_dispatcher_post_notification(
     )
 }
 
-pub(super) async fn tool_dispatcher_set_flag(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_dispatcher_set_flag(ctx: &ToolContextCore, input: &Value) -> String {
     if !ctx.can_write {
         return "[Errore: permesso di scrittura non concesso]".to_string();
     }
@@ -136,8 +138,8 @@ pub(super) async fn tool_dispatcher_set_flag(ctx: &AgentToolContext, input: &Val
     format!("Flag '{}' impostata a {} (seq={})", key, value, env.seq)
 }
 
-pub(super) async fn tool_dispatcher_update_monitor(
-    ctx: &AgentToolContext,
+pub async fn tool_dispatcher_update_monitor(
+    ctx: &ToolContextCore,
     input: &Value,
 ) -> String {
     let monitor_id = match input.get("monitor_id").and_then(Value::as_str) {
@@ -168,8 +170,8 @@ pub(super) async fn tool_dispatcher_update_monitor(
     )
 }
 
-pub(super) async fn tool_dispatcher_highlight_panel(
-    ctx: &AgentToolContext,
+pub async fn tool_dispatcher_highlight_panel(
+    ctx: &ToolContextCore,
     input: &Value,
 ) -> String {
     let panel = match input.get("panel").and_then(Value::as_str) {

@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::attachment_inspector::load_attachment;
-use super::AgentToolContext;
+use super::ToolContextCore;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Helper inline (estrazione per indicizzazione RAG)
@@ -58,7 +58,7 @@ pub async fn extract_docx_text_inline(file_path: &std::path::Path) -> Result<Str
 // ──────────────────────────────────────────────────────────────────────────
 
 /// `nexus_extract_pdf_text(attachment_id, page_start?, page_end?)`.
-pub(super) async fn tool_nexus_extract_pdf_text(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_nexus_extract_pdf_text(ctx: &ToolContextCore, input: &Value) -> String {
     let attachment_id = match input
         .get("attachment_id")
         .and_then(Value::as_str)
@@ -147,7 +147,7 @@ fn extract_pdf(
 // ──────────────────────────────────────────────────────────────────────────
 
 /// `nexus_extract_docx_text(attachment_id)`.
-pub(super) async fn tool_nexus_extract_docx_text(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_nexus_extract_docx_text(ctx: &ToolContextCore, input: &Value) -> String {
     let attachment_id = match input
         .get("attachment_id")
         .and_then(Value::as_str)
@@ -237,7 +237,7 @@ fn extract_docx(bytes: &[u8]) -> Result<Value, String> {
 // ──────────────────────────────────────────────────────────────────────────
 
 /// `nexus_extract_xlsx_data(attachment_id, sheet_name?)`.
-pub(super) async fn tool_nexus_extract_xlsx_data(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_nexus_extract_xlsx_data(ctx: &ToolContextCore, input: &Value) -> String {
     let attachment_id = match input
         .get("attachment_id")
         .and_then(Value::as_str)

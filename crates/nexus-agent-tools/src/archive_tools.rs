@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::attachment_inspector::load_attachment;
 use super::read_cache::{self, ReadCacheKey, ReadKind};
-use super::AgentToolContext;
+use super::ToolContextCore;
 
 /// Formato archivio rilevato dai magic bytes.
 #[derive(Debug, Clone, Copy)]
@@ -36,8 +36,8 @@ fn detect_format(bytes: &[u8]) -> ArchiveFormat {
 }
 
 /// `nexus_list_archive_entries(attachment_id)`.
-pub(super) async fn tool_nexus_list_archive_entries(
-    ctx: &AgentToolContext,
+pub async fn tool_nexus_list_archive_entries(
+    ctx: &ToolContextCore,
     input: &Value,
 ) -> String {
     let attachment_id = match input
@@ -145,7 +145,7 @@ fn list_tar_entries(bytes: &[u8], gz: bool) -> Result<Value, String> {
 }
 
 /// `nexus_read_archive_entry(attachment_id, entry_path, encoding?)`.
-pub(super) async fn tool_nexus_read_archive_entry(ctx: &AgentToolContext, input: &Value) -> String {
+pub async fn tool_nexus_read_archive_entry(ctx: &ToolContextCore, input: &Value) -> String {
     let attachment_id = match input
         .get("attachment_id")
         .and_then(Value::as_str)

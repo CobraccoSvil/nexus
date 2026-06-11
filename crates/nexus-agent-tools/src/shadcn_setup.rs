@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-use super::AgentToolContext;
+use super::ToolContextCore;
 
 /// Componenti supportati e relativo contenuto stub. Lista deliberatamente
 /// piccola: copre i componenti usati nel 95% delle dashboard tipiche
@@ -61,8 +61,8 @@ const SUPPORTED_LIST: &[&str] = &[
     "textarea",
 ];
 
-pub(super) async fn tool_nexus_install_shadcn_components(
-    ctx: &AgentToolContext,
+pub async fn tool_nexus_install_shadcn_components(
+    ctx: &ToolContextCore,
     input: &Value,
 ) -> String {
     // components: array opzionale; se vuoto, installa il set di base
