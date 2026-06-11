@@ -250,6 +250,37 @@ fn cooldown_note_from_snapshot(snap: &[(String, u64, Option<String>)]) -> Option
     Some(msg)
 }
 
+/// Detection STRUTTURALE di una tool call "colata nel testo" usata come
+/// risposta finale (incidente run 5ec12cad: domanda "quante tabelle nel db",
+/// dati corretti raccolti dai tool, ma final_answer = "read_file\n{\"path\":
+/// \"src/services/bookingService.ts\"}" — il modello ha scritto la chiamata
+/// come testo invece di emetterla nel canale strutturato). Criterio di FORMATO,
+/// zero semantica: prima riga = identifier snake_case breve, resto = oggetto
+/// JSON. Una risposta cosi' non e' una risposta: si passa al recap deterministico.
+fn looks_like_textual_tool_call(s: &str) -> bool {
+    let trimmed = s.trim();
+    let mut lines = trimmed.splitn(2, '\n');
+    let first = lines.next().unwrap_or("").trim();
+    let rest = lines.next().unwrap_or("").trim();
+    if first.is_empty() || first.len() > 64 {
+        return false;
+    }
+    let is_identifier = first
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && first.chars().next().is_some_and(|c| c.is_ascii_lowercase());
+    if !is_identifier {
+        return false;
+    }
+    if rest.is_empty() {
+        return false;
+    }
+    matches!(
+        serde_json::from_str::<serde_json::Value>(rest),
+        Ok(serde_json::Value::Object(_))
+    )
+}
+
 /// Messaggio finale GARANTITO (ADR 0025): la risposta reale + footer di recap se
 /// non menziona i file toccati; oppure, per un run hollow, il recap deterministico
 /// delle azioni o un placeholder esplicito. `None` solo se non c'e' nulla da dire
@@ -258,6 +289,17 @@ pub(crate) fn compose_turn_answer(
     result: &crate::agent_types::AgentRunResult,
 ) -> Option<String> {
     match result.final_answer.as_deref() {
+        // Tool call colata nel testo come "risposta": non e' una risposta.
+        // Recap deterministico delle azioni (o nota cooldown/placeholder).
+        Some(s) if looks_like_textual_tool_call(s) => build_action_recap(&result.steps)
+            .or_else(cooldown_exhaustion_note)
+            .or_else(|| {
+                Some(format!(
+                    "_(Il modello {} / {} ha chiuso con una tool call malformata nel \
+                     testo invece di una risposta. Riformula la richiesta.)_",
+                    result.provider, result.model
+                ))
+            }),
         Some(s) if !s.trim().is_empty() => {
             let mut a = s.to_string();
             if let Some(footer) = action_recap_footer(&a, &result.steps) {
@@ -3007,6 +3049,27 @@ mod tests_finalize_turn {
             AgentRunStatus::Completed, vec![], None, false, "", Some("chat"),
         );
         assert!(compose_turn_answer(&r).is_none());
+    }
+
+    #[test]
+    fn textual_tool_call_rilevata_e_sostituita_dal_recap() {
+        // Caso reale run 5ec12cad: final_answer = tool call colata nel testo.
+        let raw = "read_file\n{\"path\": \"src/services/bookingService.ts\"}";
+        assert!(super::looks_like_textual_tool_call(raw));
+        // Risposte legittime NON matchano.
+        assert!(!super::looks_like_textual_tool_call("Il DB ha 6 tabelle."));
+        assert!(!super::looks_like_textual_tool_call(
+            "read_file e' un tool che legge i file."
+        ));
+        assert!(!super::looks_like_textual_tool_call("{\"ok\": true}"));
+        // compose: con step produttivi -> recap, non la spazzatura.
+        let r = mk_result(
+            AgentRunStatus::Completed, vec![write_step()], Some(raw), false,
+            "", Some("fix"),
+        );
+        let msg = compose_turn_answer(&r).expect("recap atteso");
+        assert!(msg.contains("a.ts"), "deve usare il recap deterministico: {msg}");
+        assert!(!msg.contains("bookingService"), "niente tool call nel testo: {msg}");
     }
 
     #[test]

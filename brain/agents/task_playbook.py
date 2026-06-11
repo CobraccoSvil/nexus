@@ -130,18 +130,39 @@ def _as_list(value: Any) -> list[str]:
     return []
 
 
+import re as _re
+
+# Blocchi di SISTEMA iniettati da mcp-core nel messaggio (convenzione chiusa
+# nostra, parser di formato fisso): vanno RIMOSSI prima del match keywords.
+# Incidente run 5df5cef2/5ec12cad: il blocco <allegati_sessione> (prepended a
+# OGNI turno) contiene il filename "PL.make" -> la keyword ".make" del playbook
+# implement.figma_make matchava su QUALSIASI domanda della sessione (anche
+# "quante tabelle ci sono nel db"), iniettando la guida all'estrazione figma e
+# facendo deragliare i modelli su task non pertinenti.
+_SYSTEM_BLOCK_RE = _re.compile(
+    r"<(allegati|allegati_sessione|task_playbook)[^>]*>.*?</\1>",
+    _re.DOTALL | _re.IGNORECASE,
+)
+
+
+def _user_text_only(text: str) -> str:
+    """Testo utente PULITO per il match keywords: senza i blocchi di sistema."""
+    return _SYSTEM_BLOCK_RE.sub("", text)
+
+
 def match(context: dict[str, Any]) -> list[dict[str, Any]]:
     """Ritorna i playbook che matchano il contesto, ordinati per priority desc.
 
     context: {
       "intent": str,
-      "text": str,                      # testo utente (puo' includere il blocco <allegati>)
+      "text": str,                      # testo utente (i blocchi <allegati*> di
+                                        # sistema vengono RIMOSSI prima del match)
       "attachment_kinds": set[str]|list,# opzionale
       "project_markers": set[str]|list, # opzionale
     }
     """
     intent = str(context.get("intent") or "").strip().lower()
-    text = str(context.get("text") or "").lower()
+    text = _user_text_only(str(context.get("text") or "")).lower()
     akinds = {str(k).strip().lower() for k in (context.get("attachment_kinds") or [])}
     markers = {str(m).strip().lower() for m in (context.get("project_markers") or [])}
 
