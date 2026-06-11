@@ -117,6 +117,34 @@ def convert_messages_to_openai(messages: list[dict]) -> list[dict]:
     return result
 
 
+def extract_cached_input_tokens(usage: Any) -> int:
+    """Cached prompt tokens dal formato OpenAI-compatible
+    (``usage.prompt_tokens_details.cached_tokens``). PUNTO UNICO (regola L /
+    ADR 0026) per i provider OpenAI-compat che riportano la cache in questo
+    campo: openai e mistral (entrambi instradano la cache con
+    ``prompt_cache_key`` e fatturano i cached al 10% dell'input). DeepSeek usa
+    un campo proprietario diverso (``prompt_cache_hit_tokens``) e resta nel suo
+    provider. Ritorna 0 se il campo e' assente o non valorizzato (cache miss).
+
+    Robusto sia all'oggetto SDK (attributi) sia al dict grezzo, perche' i client
+    OpenAI-compat di provider diversi possono deserializzare l'usage in forme
+    leggermente diverse.
+    """
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is None and isinstance(usage, dict):
+        details = usage.get("prompt_tokens_details")
+    if details is None:
+        return 0
+    cached = getattr(details, "cached_tokens", None)
+    if cached is None and isinstance(details, dict):
+        cached = details.get("cached_tokens")
+    try:
+        value = int(cached)
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
 def prepare_openai_compat_request(
     provider_name: str,
     model: str,

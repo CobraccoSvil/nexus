@@ -90,8 +90,21 @@ class MistralProvider(BaseProvider, ApiKeyClientMixin):
         max_tokens: int = 4096,
         system_text: str = "",
         force_tool_choice: bool | None = None,
+        prompt_cache_key: str = "",
     ) -> ProviderResult:
-        """Esegue un turno agente. Mistral Large supporta tool use, gli altri no."""
+        """Esegue un turno agente. Mistral Large supporta tool use, gli altri no.
+
+        ``prompt_cache_key`` (gap residuo P1): Mistral NON cacha automaticamente
+        il prefix come OpenAI/DeepSeek. La cache si attiva passando un
+        identificatore stabile per-run/sessione nel body (doc ufficiale
+        https://docs.mistral.ai/studio-api/conversations/advanced/prompt-caching):
+        richieste con lo stesso ``prompt_cache_key`` e un prefix compatibile sono
+        instradate allo stesso nodo che ha gia' il prefisso in cache (cached al
+        10% dell'input). Il prefix stabile e' garantito a monte da P3 (compressione
+        a generazioni); qui si fornisce solo l'hint di routing. Il valore arriva da
+        ``usage_run_id`` (registry, introspezione difensiva): vuoto sul path gRPC
+        one-shot, dove il caching non porterebbe beneficio.
+        """
         if not self._api_key:
             return ProviderResult(
                 provider=self.name, model=model,
@@ -154,6 +167,14 @@ class MistralProvider(BaseProvider, ApiKeyClientMixin):
                         weak_models=("small", "ministral", "nemo"),
                         force_override=force_tool_choice,
                     )
+
+            # Cache esplicita Mistral (gap residuo P1): instrada la richiesta al
+            # nodo che ha il prefix in cache. Passato come extra_body per non
+            # dipendere dalla versione del client OpenAI (il param viaggia nel
+            # body, dove l'endpoint Mistral lo legge). Regola G: nessun valore
+            # hardcoded, l'id arriva dal run corrente.
+            if prompt_cache_key:
+                kwargs_call["extra_body"] = {"prompt_cache_key": prompt_cache_key}
 
             response = await client.chat.completions.create(**kwargs_call)
             choice = response.choices[0]
@@ -221,6 +242,19 @@ class MistralProvider(BaseProvider, ApiKeyClientMixin):
                     "input_tokens": response.usage.prompt_tokens,
                     "output_tokens": response.usage.completion_tokens,
                 }
+                # Cache hit Mistral: cached prompt tokens dal punto unico (regola L).
+                # Popola cache_read_input_tokens cosi' compute_turn_cost li scorpora
+                # dall'input e applica il prezzo cache (0.1x, catalog mig 0403).
+                from .adapter_base import extract_cached_input_tokens
+                cache_read = extract_cached_input_tokens(response.usage)
+                if cache_read > 0:
+                    usage_data["cache_read_input_tokens"] = cache_read
+                    logger.info(
+                        "Mistral cache hit: %d cached / %d input tokens (%.0f%%) key=%s",
+                        cache_read, response.usage.prompt_tokens,
+                        100.0 * cache_read / max(response.usage.prompt_tokens, 1),
+                        prompt_cache_key or "-",
+                    )
 
             return ProviderResult(
                 provider=self.name,

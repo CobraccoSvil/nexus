@@ -292,9 +292,9 @@ class OpenAIProvider(BaseProvider, ApiKeyClientMixin):
                 }
                 # Prompt caching automatico OpenAI: il campo cached_tokens indica
                 # quanti token di input sono stati serviti dalla cache (costo 0.5x).
-                cached_tokens = 0
-                if hasattr(response.usage, "prompt_tokens_details") and response.usage.prompt_tokens_details:
-                    cached_tokens = getattr(response.usage.prompt_tokens_details, "cached_tokens", 0) or 0
+                # Lettura dal punto unico condiviso con mistral (regola L).
+                from .adapter_base import extract_cached_input_tokens
+                cached_tokens = extract_cached_input_tokens(response.usage)
                 if cached_tokens > 0:
                     usage_data["cache_read_input_tokens"] = cached_tokens
                     logger.info(
@@ -459,10 +459,8 @@ class OpenAIProvider(BaseProvider, ApiKeyClientMixin):
                     "input_tokens": getattr(usage_obj, "prompt_tokens", 0) or 0,
                     "output_tokens": getattr(usage_obj, "completion_tokens", 0) or 0,
                 }
-                cached_tokens = 0
-                ptd = getattr(usage_obj, "prompt_tokens_details", None)
-                if ptd is not None:
-                    cached_tokens = getattr(ptd, "cached_tokens", 0) or 0
+                from .adapter_base import extract_cached_input_tokens
+                cached_tokens = extract_cached_input_tokens(usage_obj)
                 if cached_tokens > 0:
                     usage_data["cache_read_input_tokens"] = cached_tokens
 

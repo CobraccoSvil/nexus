@@ -1027,6 +1027,12 @@ class ProviderRegistry:
                     _optional_kwargs["force_tool_choice"] = force_tool_choice
                 if internal_task:
                     _optional_kwargs["internal_task"] = True
+                # prompt_cache_key (gap residuo P1): id stabile per-run come hint
+                # di routing cache. Lo espone solo mistral (cache non automatica);
+                # l'introspezione difensiva sotto lo salta per i provider che gia'
+                # cachano da soli (openai/deepseek) o che non lo accettano.
+                if usage_run_id:
+                    _optional_kwargs["prompt_cache_key"] = usage_run_id
                 if _optional_kwargs:
                     try:
                         import inspect as _inspect
