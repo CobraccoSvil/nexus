@@ -133,6 +133,61 @@ pub fn lint_file_content(
     findings
 }
 
+/// True se lo snippet e' un fallback con porta letterale: lettura da env PIU' un
+/// operatore di default, es. `process.env.PORT || 21950`, `${PORT:-21950}`,
+/// `os.environ.get("PORT", 21950)`. Euristica usata SOLO per comporre il
+/// messaggio d'azione: la decisione di violazione resta strutturale a monte
+/// (`port_scanner`), qui si raffina solo il consiglio di fix.
+fn snippet_has_env_fallback(snippet: &str) -> bool {
+    let lower = snippet.to_lowercase();
+    let has_env_hint = ["process.env", "os.environ", "env::var", "getenv", "import.meta.env"]
+        .iter()
+        .any(|h| lower.contains(h))
+        || lower.contains("${");
+    let has_fallback_op = snippet.contains("||")
+        || snippet.contains("??")
+        || snippet.contains(":-")
+        || lower.contains(".get(");
+    has_env_hint && has_fallback_op
+}
+
+/// Suffisso AZIONABILE per il `detail` di una violazione. Il pannello Problemi e
+/// il prompt di remediation costruiscono il messaggio dal `detail` del linter:
+/// senza un'azione esplicita l'agente/utente deve indovinare il fix, e una stessa
+/// violazione produce diagnosi divergenti (uno cambia il numero, l'altro rimuove
+/// il fallback). Punto unico (regola L) del testo d'azione lato linter; distingue
+/// il fallback env hardcoded - dove il fix e' allocare e usare il valore OPPURE
+/// rimuovere il fallback - dal numero hardcoded puro.
+fn violation_action_hint(kind: &ResourceViolationKind, snippet: &str) -> &'static str {
+    let env_fallback = snippet_has_env_fallback(snippet);
+    match kind {
+        ResourceViolationKind::PortBucketNotAllocated if env_fallback => {
+            "Azione: il fallback usa una porta nel range Nexus non allocata. Chiama \
+             request_port(label=\"<servizio>\") e usa il valore ritornato come default del \
+             fallback, OPPURE rimuovi il fallback numerico lasciando solo la lettura da env. \
+             Vedi ADR 0010."
+        }
+        ResourceViolationKind::PortBucketNotAllocated => {
+            "Azione: porta nel range Nexus (20000-39999) non allocata a questo progetto. Chiama \
+             request_port(label=\"<servizio>\") e usa la porta ritornata, mai sceglierla a mano. \
+             Vedi ADR 0010."
+        }
+        ResourceViolationKind::PortOutOfBucket if env_fallback => {
+            "Azione: il fallback usa una porta fuori dal range Nexus (20000-39999). Chiama \
+             request_port(label=\"<servizio>\") e usa la porta allocata come default, oppure \
+             rimuovi il fallback. Vedi ADR 0010."
+        }
+        ResourceViolationKind::PortOutOfBucket => {
+            "Azione: porta hardcoded fuori dal range Nexus (20000-39999). Chiama \
+             request_port(label=\"<servizio>\") e usa la porta allocata. Vedi ADR 0010."
+        }
+        ResourceViolationKind::InternalUrlHardcoded => {
+            "Azione: URL interno hardcoded. Leggi host e porta da variabile d'ambiente del \
+             servizio invece di scriverli nel sorgente. Vedi ADR 0010."
+        }
+    }
+}
+
 fn should_lint_file(path: &Path) -> bool {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     if LINT_INCLUDED_BARE_NAMES
@@ -256,13 +311,14 @@ pub async fn lint_project(
             &format!("{kind}/{rule}"),
         );
         let detail = format!(
-            "{}:{} {} ({}/{}) | {}",
+            "{}:{} {} ({}/{}) | {}\n-> {}",
             f.rel_path,
             f.line,
             f.value,
             kind,
             rule,
-            f.snippet.chars().take(160).collect::<String>()
+            f.snippet.chars().take(160).collect::<String>(),
+            violation_action_hint(&f.kind, &f.snippet),
         );
         let opened_id = crate::security::resource_governance::open_resource_violation(
             db,
@@ -420,5 +476,46 @@ mod tests {
         assert!(should_lint_file(Path::new("Dockerfile")));
         assert!(!should_lint_file(Path::new("README.md")));
         assert!(!should_lint_file(Path::new("logo.png")));
+    }
+
+    #[test]
+    fn env_fallback_riconosciuto_dallo_snippet() {
+        // Il caso che ha confuso i run: fallback env con porta letterale.
+        assert!(snippet_has_env_fallback(
+            "port: parseInt(process.env.PORT || '21950', 10),"
+        ));
+        assert!(snippet_has_env_fallback("PORT=${PORT_BACKEND:-21950}"));
+        assert!(snippet_has_env_fallback(
+            "port = os.environ.get(\"PORT\", 21950)"
+        ));
+        // Hardcode puro: nessun fallback env.
+        assert!(!snippet_has_env_fallback("PORT = 21970"));
+        assert!(!snippet_has_env_fallback("app.listen(21950)"));
+    }
+
+    #[test]
+    fn action_hint_distingue_fallback_da_hardcode() {
+        // Fallback env -> il consiglio include la rimozione del fallback.
+        let env = violation_action_hint(
+            &ResourceViolationKind::PortBucketNotAllocated,
+            "process.env.PORT || '21950'",
+        );
+        assert!(env.contains("rimuovi il fallback"));
+        assert!(env.contains("request_port"));
+        // Hardcode puro -> consiglio di allocazione, senza "rimuovi il fallback".
+        let pure = violation_action_hint(
+            &ResourceViolationKind::PortBucketNotAllocated,
+            "PORT = 21950",
+        );
+        assert!(pure.contains("request_port"));
+        assert!(!pure.contains("rimuovi il fallback"));
+        // Ogni kind produce un'azione che cita ADR 0010.
+        for kind in [
+            ResourceViolationKind::PortOutOfBucket,
+            ResourceViolationKind::PortBucketNotAllocated,
+            ResourceViolationKind::InternalUrlHardcoded,
+        ] {
+            assert!(violation_action_hint(&kind, "x").contains("ADR 0010"));
+        }
     }
 }
