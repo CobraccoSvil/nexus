@@ -87,6 +87,7 @@ condividere codice (fragile base class, accoppiamento al genitore).
 | Formatter frontend | `apps/web-ide/lib/format.ts` | Wave 7 |
 | Chunking testo | `crates/mcp-core/src/rag/chunker.rs` (riferimento) + `brain/utils/text_chunk.py` (paritetico, golden test) | esistente |
 | Classificazione errore provider (testo) | `crates/mcp-core/src/provider_error_classifier.rs` (paritetico a `brain/providers/error_handler.py`, golden test) | esistente |
+| Path-safety workspace (resolve_workspace_target, path_within) | `crates/nexus-types/src/workspace_paths.rs` (adapter HTTP in `mcp-core::projects`) | esistente |
 
 ### Enforcement
 
