@@ -2386,6 +2386,33 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
         _ctx_cfg = _load_ctx_mgmt_config()
         _compress_iter = _current_iterations
 
+        # ── Continuity gate semantico (mig 0397) ─────────────────────────────
+        # SOLO al primo turno del run: se la richiesta corrente non e'
+        # semanticamente pertinente alla storia della sessione (cosine MiniLM
+        # locale sotto soglia), la history inline si riduce agli ultimi
+        # messaggi + puntatore RAG. Risparmia token su OGNI provider ed evita
+        # che i modelli deraglino su contenuti storici non c'entranti.
+        if _current_iterations == 0:
+            try:
+                from .helpers import apply_continuity_trim
+                _pre_trim = len(messages)
+                messages, _cont_score, _trimmed = apply_continuity_trim(
+                    messages, _embeddings
+                )
+                if _trimmed:
+                    logger.info(
+                        "executor_node: continuity_gate NEW-TOPIC score=%.2f -> "
+                        "history %d -> %d messaggi (storia via RAG on-demand)",
+                        _cont_score or 0.0, _pre_trim, len(messages),
+                    )
+                elif _cont_score is not None:
+                    logger.debug(
+                        "executor_node: continuity_gate continuazione score=%.2f",
+                        _cont_score,
+                    )
+            except Exception as _cont_exc:
+                logger.debug("continuity_gate skip (%s)", _cont_exc)
+
         # FIX B: dedup tool_result identici per signature.
         if _ctx_cfg.get("dedup_tool_results_enabled", True):
             _pre_dedup_size = ctx_size

@@ -3025,6 +3025,114 @@ def _current_context_token_estimate(messages: list[Any], system_text: str = "") 
     return int(total_chars / 3.5)
 
 
+# ── Continuity gate semantico (mig 0397) ────────────────────────────────────
+# Risposta alla domanda utente "non possiamo gestire questi provider in maniera
+# opportuna? anche con provider piu' forti c'e' spreco di token": ogni turno
+# trascinava TUTTA la storia (compressa) anche quando la richiesta corrente non
+# c'entrava nulla (es. "quante tabelle nel db" su una sessione di 2 giorni di
+# lavoro figma -> deragliamenti e token sprecati). Il gate misura la PERTINENZA
+# SEMANTICA (cosine sull'embedding MiniLM locale, ~ms, zero LLM, language-
+# independent) della richiesta corrente vs la storia: sotto soglia, la history
+# inline viene ridotta agli ultimi messaggi + un puntatore al recupero RAG
+# on-demand (nexus_search_semantic). Fail-open: qualsiasi errore -> nessun trim.
+
+_continuity_cfg_cache: dict | None = None
+_continuity_cfg_ts: float = 0.0
+
+
+def _load_continuity_config() -> dict:
+    """Settings agent.context.continuity_* dal DB (cache 60s, default sicuri)."""
+    global _continuity_cfg_cache, _continuity_cfg_ts
+    import time as _t
+    now = _t.monotonic()
+    if _continuity_cfg_cache is not None and now - _continuity_cfg_ts < 60.0:
+        return _continuity_cfg_cache
+    cfg = {"enabled": True, "min_score": 0.30, "keep_recent": 2}
+    try:
+        from brain.utils import settings_db
+        cfg["enabled"] = settings_db.get_bool_setting(
+            "agent.context.continuity_gate_enabled", True
+        )
+        cfg["min_score"] = float(settings_db.get_setting(
+            "agent.context.continuity_min_score", "0.30") or "0.30")
+        cfg["keep_recent"] = int(settings_db.get_setting(
+            "agent.context.continuity_keep_recent", "2") or "2")
+    except Exception:
+        pass
+    _continuity_cfg_cache, _continuity_cfg_ts = cfg, now
+    return cfg
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    num = sum(x * y for x, y in zip(a, b))
+    da = sum(x * x for x in a) ** 0.5
+    db = sum(y * y for y in b) ** 0.5
+    if da == 0.0 or db == 0.0:
+        return 0.0
+    return num / (da * db)
+
+
+def semantic_continuity_score(
+    embeddings: Any, query: str, history_texts: list[str]
+) -> float | None:
+    """Max similarita' coseno tra la query e i testi della storia (embedding
+    locale, un batch). None su errore/assenza dati: il chiamante NON trimma."""
+    if embeddings is None or not query.strip() or not history_texts:
+        return None
+    try:
+        texts = [query[:1500]] + [t[:1500] for t in history_texts]
+        vecs = embeddings.embed_batch("", texts)
+        qv = list(vecs[0].values)
+        return max(_cosine(qv, list(v.values)) for v in vecs[1:])
+    except Exception as exc:
+        logger.debug("continuity_gate: embedding fallito (%s), niente trim", exc)
+        return None
+
+
+def apply_continuity_trim(
+    messages: list, embeddings: Any
+) -> tuple[list, float | None, bool]:
+    """Se la richiesta corrente NON e' pertinente alla storia (score < soglia),
+    riduce la history inline agli ultimi keep_recent messaggi + un puntatore al
+    recupero RAG. Ritorna (messages, score, trimmed). Fail-open."""
+    cfg = _load_continuity_config()
+    if not cfg["enabled"] or len(messages) < 4:
+        return messages, None, False
+    # Query = content dell'ultimo HumanMessage, senza i blocchi di sistema
+    # (<allegati_sessione> ecc.) che inquinerebbero l'embedding (punto unico
+    # del parser in task_playbook, regola L).
+    query = ""
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            c = m.content if isinstance(m.content, str) else str(m.content)
+            try:
+                from ..task_playbook import _user_text_only
+                query = _user_text_only(c)
+            except Exception:
+                query = c
+            break
+    if not query.strip():
+        return messages, None, False
+    history = messages[:-1]
+    history_texts = [
+        (m.content if isinstance(m.content, str) else str(m.content))
+        for m in history[-6:]
+        if (getattr(m, "content", None) or "")
+    ]
+    score = semantic_continuity_score(embeddings, query, history_texts)
+    if score is None or score >= cfg["min_score"]:
+        return messages, score, False
+    keep = max(0, int(cfg["keep_recent"]))
+    kept_tail = history[-keep:] if keep else []
+    pointer = HumanMessage(content=(
+        "[Contesto storico della sessione omesso: non pertinente alla richiesta "
+        f"corrente (similarita' {score:.2f}). Se ti serve la storia, recuperala "
+        "con nexus_search_semantic(query=...). Concentrati SOLO sulla richiesta "
+        "che segue.]"
+    ))
+    return [pointer, *kept_tail, messages[-1]], score, True
+
+
 # Sentinella a convenzione chiusa NOSTRA (formato fisso, parser legittimo):
 # prefisso del tool_result quando il predictive context cap blocca una chiamata.
 # Usata anche dal tool_dispatch per RIFIUTARE (una volta) un task_complete
