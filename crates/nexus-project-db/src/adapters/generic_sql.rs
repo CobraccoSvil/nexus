@@ -5,7 +5,7 @@
 //! pattern `YYYYMMDD_HHMMSS_<nome>.sql` e li applica in ordine.
 
 use super::MigrationAdapter;
-use crate::project_db::{
+use crate::{
     AppliedMigration, ProjectDbContext, ProjectDbError, RolledBackMigration,
 };
 use async_trait::async_trait;

@@ -1,7 +1,7 @@
 //! `runner` — orchestratore migration: delega all'adapter del progetto,
 //! blocca DDL diretto e gestisce il guardrail con errore strutturato.
 
-use crate::project_db::{
+use crate::{
     adapters::{
         alembic::AlembicAdapter, django::DjangoAdapter, flyway::FlywayAdapter,
         generic_sql::GenericSqlAdapter, knex::KnexAdapter, liquibase::LiquibaseAdapter,
@@ -60,7 +60,7 @@ pub fn adapter_for(tool: &MigrationTool) -> Arc<dyn MigrationAdapter> {
 }
 
 // Import locale per Rails
-use crate::project_db::adapters::rails::RailsAdapter;
+use crate::adapters::rails::RailsAdapter;
 
 /// Orchestratore principale — usato dai 3 tool MCP `project_db_*`
 /// (create_migration / apply_migration / rollback).

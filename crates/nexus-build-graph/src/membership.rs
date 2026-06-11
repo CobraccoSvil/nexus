@@ -193,7 +193,7 @@ fn normalize_glob(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build_graph::model::BuildGraphInfo;
+    use crate::model::BuildGraphInfo;
     use chrono::Utc;
 
     fn sample_info() -> BuildGraphInfo {

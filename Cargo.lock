@@ -2000,11 +2000,13 @@ dependencies = [
  "mcp-quality",
  "mcp-token",
  "nexus-auth",
+ "nexus-build-graph",
  "nexus-cache",
  "nexus-events",
  "nexus-http",
  "nexus-mcp-client",
  "nexus-orchestrator",
+ "nexus-project-db",
  "nexus-types",
  "notify",
  "once_cell",
@@ -2218,6 +2220,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-build-graph"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "globset",
+ "json5",
+ "once_cell",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "nexus-cache"
 version = "0.1.0"
 dependencies = [
@@ -2287,6 +2308,22 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tokio-test",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "nexus-project-db"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
  "tracing",
  "uuid",
 ]

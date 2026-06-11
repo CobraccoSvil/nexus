@@ -1,7 +1,7 @@
 //! Adapter Prisma (Node.js/TypeScript) — crea migration tramite `prisma migrate dev --create-only`.
 
 use super::MigrationAdapter;
-use crate::project_db::{
+use crate::{
     AppliedMigration, ProjectDbContext, ProjectDbError, RolledBackMigration,
 };
 use async_trait::async_trait;

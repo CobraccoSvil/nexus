@@ -1,7 +1,7 @@
 //! Adapter sqlx-migrate (Rust) — crea migration tramite `sqlx migrate add`.
 
 use super::MigrationAdapter;
-use crate::project_db::{
+use crate::{
     AppliedMigration, ProjectDbContext, ProjectDbError, RolledBackMigration,
 };
 use async_trait::async_trait;

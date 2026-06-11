@@ -1,7 +1,7 @@
 //! Adapter Liquibase — crea changeset XML nella directory changelog.
 
 use super::MigrationAdapter;
-use crate::project_db::{
+use crate::{
     AppliedMigration, ProjectDbContext, ProjectDbError, RolledBackMigration,
 };
 use async_trait::async_trait;

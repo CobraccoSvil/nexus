@@ -1,6 +1,8 @@
 [workspace]
 members = [
   "crates/mcp-core",
+  "crates/nexus-project-db",
+  "crates/nexus-build-graph",
   "crates/mcp-token",
   "crates/mcp-ast",
   "crates/mcp-quality",

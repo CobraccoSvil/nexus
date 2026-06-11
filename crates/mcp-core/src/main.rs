@@ -8,7 +8,7 @@ mod agent_types;
 mod auth;
 mod billing;
 mod brain_agent_client;
-mod build_graph;
+pub use nexus_build_graph as build_graph;
 mod cache;
 mod catalog_sync_worker;
 mod change_drafts;
@@ -53,7 +53,9 @@ mod plugins;
 mod port_registry;
 mod process_resume;
 mod profiles;
-mod project_db;
+// Estratto in crate workspace (split 7.4): re-export per mantenere
+// validi i path crate::project_db:: dei moduli esistenti.
+pub use nexus_project_db as project_db;
 mod project_db_routes;
 mod project_files;
 mod project_git;

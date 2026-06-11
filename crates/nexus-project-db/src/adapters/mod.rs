@@ -5,7 +5,7 @@
 //!
 //! V1 supporta solo PostgreSQL; gli adapter non-Postgres sono stub documentati.
 
-use crate::project_db::{
+use crate::{
     AppliedMigration, ProjectDbContext, ProjectDbError, RolledBackMigration,
 };
 use async_trait::async_trait;
@@ -49,7 +49,9 @@ pub trait MigrationAdapter: Send + Sync {
 }
 
 /// Calcola SHA-256 come stringa hex.
-pub(crate) fn sha256_hex(input: &str) -> String {
+/// `pub` pieno dallo split in crate workspace: usata anche dai tool di
+/// mcp-core (project_db_create_migration).
+pub fn sha256_hex(input: &str) -> String {
     // Implementazione manuale usando solo libreria standard per non aggiungere
     // dipendenze: in realtà Nexus ha sha2 transitivo, ma lo usiamo direttamente.
     // Fallback deterministico: lunghezza + hash dei byte (non crittograficamente sicuro

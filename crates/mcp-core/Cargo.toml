@@ -35,6 +35,8 @@ nexus-auth = { path = "../nexus-auth" }
 nexus-mcp-client = { path = "../nexus-mcp-client" }
 nexus-types = { path = "../nexus-types" }
 nexus-cache = { path = "../nexus-cache" }
+nexus-project-db = { path = "../nexus-project-db" }
+nexus-build-graph = { path = "../nexus-build-graph" }
 nexus-orchestrator = { path = "../nexus-orchestrator" }
 nexus-events = { path = "../nexus-events" }
 parking_lot = "0.12"
