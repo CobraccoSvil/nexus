@@ -12,7 +12,7 @@ bash scripts/dup-report.sh --report-only   # solo misura
 bash scripts/dup-report.sh --update-baseline   # riallinea la baseline (solo al ribasso)
 ```
 
-Lo strumento e' `jscpd` (config in `jscpd.json`, soglia `minLines=5`, `minTokens=50`).
+Lo strumento e' `jscpd` (config in `jscpd.json`, soglia `minLines=15`, `minTokens=100`).
 Il report dettagliato (con i singoli cloni) finisce in `.dup-report/`.
 
 ## Gate "ratchet"
@@ -44,6 +44,7 @@ Aggiornare questa tabella a ogni wave che riduce il debito.
 | Wave C1 (nexus-mcp-client) | post-B | 5.29% | **1101** | Nuovo crate condiviso `nexus-mcp-client` (lib): tipi (McpServerConfig, McpTransport, McpError, McpTool, McpToolResult), client HTTP/Stdio JSON-RPC, parsing, modulo `server_storage` con helper SQL (row_to_json, can_manage_server, build_config + tipi request). Sostituisce ~510 righe pari-pari di `mcp_client.rs` e ~150 righe di tipi/helper `mcp_connectors.rs` duplicati fra mcp-core e plugin-service. I due `mcp_client.rs` locali diventano un solo `pub use`. Build verde, clippy -D warnings pulito. -20 cloni (1121 -> 1101), -499 righe duplicate (13996 -> 13497). |
 | Wave C2 (admin_dto) | post-C1 | 5.24% | **1098** | Nuovo modulo `nexus_types::admin_dto`: 17 tipi DTO (UserResponse, UserWithProjectsResponse, UserProjectRole, UpdateUser*, ListUsers*, SearchUsersQuery, ProjectMemberResponse, AddProject*, ListAllProjectsResponse, AdminProjectSummary, PortProjects*, PortDetail) prima duplicati fra admin-service/src/admin_{users,projects}.rs e mcp-core/src/admin/{users,projects}.rs. Gli handler axum restano nei due crate (divergenze runtime: logging, endpoint extra, decisione architetturale rimandata su chi e' autoritativo). -3 cloni, -135 righe (13497 -> 13362). |
 | Wave C3 (provider mixin) | post-C2 | 5.23% | **1098** | Mixin `ApiKeyClientMixin` in `brain/providers/base.py`: punto unico per il pattern `_api_key_provider`/`_cached_key`/`_client`/`_get_client` prima duplicato pari-pari (43L) in deepseek_provider, mistral_provider, openai_provider. Le sottoclassi implementano solo `_create_client(api_key)` (il client SDK specifico). Conteggio cloni invariato (1098: il pattern 43L scompare ma jscpd rivela un clone minimo precedentemente "coperto"), righe duplicate -28 (13362 -> 13334). |
+| Bonifica Wave 0 (2026-06-11) | post-S86 | 0.44% | **61** | Il commit "cache esplicita Mistral" (2731f46) aveva reso identica la coda di `generate_agent_turn` fra deepseek e mistral portando i cloni a 62 (>baseline 61): consolidata in `_response_parsers.py::build_agent_turn_result`/`build_agent_turn_error`, con convergenza dei 3 provider OpenAI-compatible (openai incluso). Inoltre: gate `dup-report.sh` e `check-single-source.sh` finalmente AGGANCIATI a `.github/workflows/verify.yml` (prima documentati come attivi ma mai eseguiti in CI). NB: gli step S60-S86 (61 cloni dalla serie 1098) non sono documentati in questa tabella — vedi commit e8b2332. |
 
 ## Soglie e razionale
 

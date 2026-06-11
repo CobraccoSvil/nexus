@@ -64,7 +64,6 @@ This repository currently contains the full architecture scaffold, contracts, sc
 - `docs/backlog-closure-2026-05-19.md` — report degli 8 commit applicati al
   branch `chore/backlog-closure` (bonifica hardcoding modelli §G, gate
   `pnpm verify` verde, fix `unwrap`/`expect` §F, eliminazione 105 warning
-  TS lint, allineamento STYLING_REFACTOR_PROGRESS al codice reale).
+  TS lint, allineamento del report styling al codice reale).
 - `docs/tech-debt-rust.md`, `docs/tech-debt-ts.md` — backlog corrente per
   linguaggio.
-- `STYLING_REFACTOR_PROGRESS.md` — riconteggio reale 2884 inline styles in 92 file.

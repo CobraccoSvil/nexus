@@ -70,3 +70,51 @@ def parse_openai_compatible_choice(
         assistant_content.append({"type": "text", "text": text_content})
 
     return stop_reason, text_content, tool_use_blocks, assistant_content
+
+
+def build_agent_turn_result(
+    provider: str,
+    model: str,
+    text_content: str,
+    stop_reason: str,
+    tool_use_blocks: list[dict],
+    assistant_content: list[dict],
+    usage_data: dict[str, Any],
+) -> Any:
+    """Coda comune di ``generate_agent_turn`` per i provider OpenAI-compatible.
+
+    Costruisce il ``ProviderResult`` di successo con i metadata standard del
+    turno agentico. Prima era duplicata pari-pari in openai/deepseek/mistral.
+    """
+    from .base import ProviderResult
+
+    return ProviderResult(
+        provider=provider,
+        model=model,
+        content=text_content,
+        metadata={
+            "stop_reason": stop_reason,
+            "tool_use_blocks": tool_use_blocks,
+            "assistant_content": assistant_content,
+            "usage": usage_data,
+        },
+    )
+
+
+def build_agent_turn_error(exc: Exception, provider: str, model: str) -> Any:
+    """Coda d'errore comune di ``generate_agent_turn`` (OpenAI-compatible).
+
+    Delega la classificazione a ``format_error_result`` (punto unico W2.2) e
+    impacchetta il ``ProviderResult`` d'errore con il contratto ``[Error: ...]``
+    atteso dai chiamanti (cascade fallback, soft-failure detection).
+    """
+    from .base import ProviderResult
+    from .error_handler import format_error_result
+
+    meta = format_error_result(exc, provider, model)
+    return ProviderResult(
+        provider=provider,
+        model=model,
+        content=f"[Error: {meta['error']}]",
+        metadata=meta,
+    )

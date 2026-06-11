@@ -92,6 +92,7 @@ from .base import (
     build_openai_compatible_client,
 )
 from .error_handler import format_error_result
+from ._response_parsers import build_agent_turn_error, build_agent_turn_result
 
 logger = logging.getLogger(__name__)
 
@@ -304,24 +305,17 @@ class OpenAIProvider(BaseProvider, ApiKeyClientMixin):
                         100.0 * cached_tokens / max(response.usage.prompt_tokens, 1),
                     )
 
-            return ProviderResult(
+            return build_agent_turn_result(
                 provider=self.name,
                 model=model,
-                content=text_content,
-                metadata={
-                    "stop_reason": stop_reason,
-                    "tool_use_blocks": tool_use_blocks,
-                    "assistant_content": assistant_content,
-                    "usage": usage_data,
-                },
+                text_content=text_content,
+                stop_reason=stop_reason,
+                tool_use_blocks=tool_use_blocks,
+                assistant_content=assistant_content,
+                usage_data=usage_data,
             )
         except Exception as e:
-            meta = format_error_result(e, self.name, model)
-            return ProviderResult(
-                provider=self.name, model=model,
-                content=f"[Error: {meta['error']}]",
-                metadata=meta,
-            )
+            return build_agent_turn_error(e, self.name, model)
 
     async def generate_agent_turn_stream(
         self,

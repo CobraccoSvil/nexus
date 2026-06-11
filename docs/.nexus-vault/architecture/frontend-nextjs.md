@@ -22,7 +22,6 @@ Vedi anche: [[crates-rust]], [[overview]], [[nexus-architetturale]], [[knowledge
 | App | Name | Versione | Descrizione |
 |---|---|---|---|
 | `browser-bridge-extension` | `(no package.json)` | — | — |
-| `classifier-svc` | `(no package.json)` | — | — |
 | `cli` | `@ai-orchestrator/cli` | 0.1.0 | — |
 | `nexus-gateway` | `@ideai/nexus-gateway-server` | 0.1.0 | — |
 | `vscode-ext` | `ai-orchestrator` | 0.2.0 | AI-assisted development with multi-model orchestration, code quality analysis, and knowledge extraction |

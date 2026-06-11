@@ -24,6 +24,7 @@ from .base import (
 )
 from .error_handler import format_error_result
 from .openai_provider import _anthropic_tool_to_openai, _convert_messages_to_openai
+from ._response_parsers import build_agent_turn_error, build_agent_turn_result
 from ._schema_utils import compress_tool_list
 
 logger = logging.getLogger(__name__)
@@ -313,24 +314,17 @@ class DeepSeekProvider(BaseProvider, ApiKeyClientMixin):
                         _hit, response.usage.prompt_tokens, _miss,
                     )
 
-            return ProviderResult(
+            return build_agent_turn_result(
                 provider=self.name,
                 model=model,
-                content=text_content,
-                metadata={
-                    "stop_reason": stop_reason,
-                    "tool_use_blocks": tool_use_blocks,
-                    "assistant_content": assistant_content,
-                    "usage": usage_data,
-                },
+                text_content=text_content,
+                stop_reason=stop_reason,
+                tool_use_blocks=tool_use_blocks,
+                assistant_content=assistant_content,
+                usage_data=usage_data,
             )
         except Exception as e:
-            meta = format_error_result(e, self.name, model)
-            return ProviderResult(
-                provider=self.name, model=model,
-                content=f"[Error: {meta['error']}]",
-                metadata=meta,
-            )
+            return build_agent_turn_error(e, self.name, model)
 
     async def generate_stream(self, model: str, prompt: str, **kwargs: Any) -> AsyncIterator[str]:
         if not self._api_key:
