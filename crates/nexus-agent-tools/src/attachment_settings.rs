@@ -43,7 +43,7 @@ impl AttachmentLimits {
     /// Default safe (mai usati come fallback in caso di DB up: i valori
     /// arrivano dalle migrazioni). Fungono solo da "ultima rete" se DB down e
     /// la cache e' vuota — comportamento documentato in modulo.
-    pub(crate) const fn safe_defaults() -> Self {
+    pub const fn safe_defaults() -> Self {
         Self {
             read_cache_ttl_seconds: 300,
             // Guardia anti-OOM altissima: 512 MB. NON e' un budget di contenuto.

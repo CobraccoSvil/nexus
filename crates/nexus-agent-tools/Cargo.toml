@@ -1,0 +1,21 @@
+[package]
+name = "nexus-agent-tools"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+lru = "0.12"
+nexus-events = { path = "../nexus-events" }
+parking_lot = "0.12"
+chrono.workspace = true
+once_cell = "1.20"
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

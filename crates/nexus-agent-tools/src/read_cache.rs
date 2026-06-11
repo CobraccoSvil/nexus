@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use super::attachment_settings;
+use crate::attachment_settings;
 use sqlx::PgPool;
 
 /// Tipo di lettura per discriminare i namespace di cache.

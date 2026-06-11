@@ -4,6 +4,7 @@ members = [
   "crates/nexus-project-db",
   "crates/nexus-build-graph",
   "crates/nexus-tool-kit",
+  "crates/nexus-agent-tools",
   "crates/mcp-token",
   "crates/mcp-ast",
   "crates/mcp-quality",

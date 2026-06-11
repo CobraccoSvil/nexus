@@ -26,7 +26,7 @@ pub(crate) type MonitorRegistry = Arc<RwLock<HashMap<Uuid, HashMap<String, Value
 ///
 /// Questa e' la singola fonte di verita' della logica monitor: sia il tool
 /// agente sia gli aggiornamenti automatici del run la chiamano.
-pub(crate) fn set_monitor(
+pub fn set_monitor(
     monitor_registry: &MonitorRegistry,
     project_channels: &ProjectChannels,
     project_id: Uuid,

@@ -38,6 +38,7 @@ nexus-cache = { path = "../nexus-cache" }
 nexus-project-db = { path = "../nexus-project-db" }
 nexus-build-graph = { path = "../nexus-build-graph" }
 nexus-tool-kit = { path = "../nexus-tool-kit" }
+nexus-agent-tools = { path = "../nexus-agent-tools" }
 nexus-orchestrator = { path = "../nexus-orchestrator" }
 nexus-events = { path = "../nexus-events" }
 parking_lot = "0.12"

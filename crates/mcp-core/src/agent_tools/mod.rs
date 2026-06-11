@@ -23,12 +23,14 @@
 //! - `sandbox` — configurazione sandbox del progetto
 //! - `command` — esecuzione comandi shell e test runner
 
+// Split 7.4: i moduli senza AgentToolContext vivono nel crate
+// nexus-agent-tools; il re-export mantiene i path crate::agent_tools::*.
+pub use nexus_agent_tools::*;
+
 pub(crate) mod archive_tools;
 pub(crate) mod attachment_inspector;
-pub(crate) mod attachment_settings;
 pub(crate) mod attachments;
 pub(crate) mod command;
-pub(crate) mod command_hints;
 pub(crate) mod context;
 pub(crate) mod dev_diagnostics;
 pub(crate) mod dispatch;
@@ -39,16 +41,12 @@ pub(crate) mod files;
 pub(crate) mod git;
 pub(crate) mod helpers;
 pub(crate) mod knowledge;
-pub(crate) mod monitor;
 pub(crate) mod port_scanner;
 pub(crate) mod ports;
 pub(crate) mod profile_tools;
-pub(crate) mod url_scanner;
 pub(crate) mod project_db_query;
 pub(crate) mod quality_tools;
 pub(crate) mod rag_search;
-pub(crate) mod read_cache;
-pub(crate) mod safety;
 pub(crate) mod sandbox;
 pub(crate) mod scaffold_verifier;
 pub(crate) mod semantic_tools;
@@ -57,7 +55,6 @@ pub(crate) mod shadcn_setup;
 pub(crate) mod subagent;
 pub(crate) mod testing;
 pub(crate) mod todos;
-pub(crate) mod tool_schema;
 pub(crate) mod vision_tools;
 pub(crate) mod visual_compare;
 

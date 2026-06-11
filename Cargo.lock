@@ -1999,6 +1999,7 @@ dependencies = [
  "mcp-proto",
  "mcp-quality",
  "mcp-token",
+ "nexus-agent-tools",
  "nexus-auth",
  "nexus-build-graph",
  "nexus-cache",
@@ -2203,6 +2204,24 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
+]
+
+[[package]]
+name = "nexus-agent-tools"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lru",
+ "nexus-events",
+ "once_cell",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
