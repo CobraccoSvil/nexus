@@ -1138,15 +1138,33 @@ pub async fn nexus_tools() -> impl IntoResponse {
 ///
 /// Espone le metriche principali in formato `# TYPE ... / metric_name value`
 /// compatibile con Prometheus/Grafana. Questo endpoint è pensato per essere
-/// scraped ogni 15-30s; è un read-only snapshot, nessun costo di I/O.
-pub async fn nexus_prometheus() -> impl IntoResponse {
-    let Some(bridge) = NexusBridge::global() else {
+/// scraped ogni 15-30s; snapshot in-memory + blocco guardrail risorse da DB
+/// (cache 30s in `security::guardrail_metrics`).
+pub async fn nexus_prometheus(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+) -> impl IntoResponse {
+    let Some(mut out) = render_bridge_prometheus() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("content-type", "text/plain; version=0.0.4")],
             String::from("# nexus bridge not initialized\n"),
         );
     };
+
+    // Telemetria guard-rail risorse (governance porte/url/db/fs/container).
+    out.push_str(&crate::security::guardrail_metrics::render_guardrail_metrics(&state.db).await);
+
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        out,
+    )
+}
+
+/// Blocco metriche in-memory del bridge (testabile senza AppState/DB).
+/// `None` se il bridge globale non e' inizializzato.
+fn render_bridge_prometheus() -> Option<String> {
+    let bridge = NexusBridge::global()?;
 
     let r = bridge.router_stats();
     let s = bridge.scheduler_stats();
@@ -1286,11 +1304,7 @@ pub async fn nexus_prometheus() -> impl IntoResponse {
     out.push_str("# TYPE nexus_router_forced_total counter\n");
     out.push_str(&format!("nexus_router_forced_total {}\n", r.forced_count));
 
-    (
-        StatusCode::OK,
-        [("content-type", "text/plain; version=0.0.4")],
-        out,
-    )
+    Some(out)
 }
 
 /// POST /nexus/test-routing — invoca il router Q-Learning per un task di test
@@ -1647,20 +1661,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_nexus_prometheus_handler_shape() {
+        // L'handler ora richiede AppState (per il blocco guardrail da DB):
+        // qui si testa il corpo in-memory del bridge, che e' la parte con
+        // logica; status/content-type dell'handler sono costanti.
         NexusBridge::init_global();
-        let resp = super::nexus_prometheus().await;
-        let resp = resp.into_response();
-        assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        let headers = resp.headers();
-        let ct = headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+        let body = super::render_bridge_prometheus().expect("bridge inizializzato");
         assert!(
-            ct.starts_with("text/plain"),
-            "expected text/plain content-type, got: {}",
-            ct
+            body.contains("nexus_router_decisions_total"),
+            "metriche router presenti"
         );
+        assert!(body.contains("# TYPE"), "formato Prometheus text");
     }
 
     // ── agent_loop record_outcome integration tests ────────────────────────

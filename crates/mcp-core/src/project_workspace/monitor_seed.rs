@@ -374,9 +374,14 @@ async fn count_problems_open(db: &sqlx::PgPool, project_id: Uuid) -> Result<i64,
     .fetch_one(db)
     .await
     .map_err(|e| e.to_string())?;
+    // Stesso filtro del pannello (logs.rs): le violazioni di governance
+    // restano contate anche in 'diagnosing'/'failed_remediation'.
     let diag: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM service_diagnoses \
-         WHERE project_id = $1 AND status = 'open'",
+         WHERE project_id = $1 \
+           AND (status = 'open' \
+                OR (signal_kind = 'policy_violation' \
+                    AND status IN ('diagnosing', 'failed_remediation')))",
     )
     .bind(project_id)
     .fetch_one(db)

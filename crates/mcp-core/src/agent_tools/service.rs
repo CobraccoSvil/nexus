@@ -342,6 +342,27 @@ pub(super) async fn tool_run_service(ctx: &AgentToolContext, input: &Value, kind
             );
             return format!("[Quota raggiunta: {}]", reason);
         }
+        // Quota RAM pre-avvio (governance container/memory_quota): blocca se i
+        // servizi gia' attivi del progetto saturano max_memory_mb.
+        if crate::security::resource_governance::policy(&ctx.db, "container", "memory_quota")
+            .await
+            .enabled
+        {
+            if let Err(reason) =
+                crate::security::quotas::check_can_use_memory(&ctx.db, ctx.project_id).await
+            {
+                crate::security::record_audit(
+                    crate::security::AuditEntry::blocked(
+                        ctx.project_id,
+                        "container_quota_blocked",
+                        "container",
+                    )
+                    .with_resource(label.clone())
+                    .with_details(serde_json::json!({"reason": reason})),
+                );
+                return format!("[Quota memoria raggiunta: {}]", reason);
+            }
+        }
     }
 
     // ── Strato 1 hardening: auto-inject PORT per servizi web ────────────────

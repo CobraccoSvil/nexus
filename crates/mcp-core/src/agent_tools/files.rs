@@ -147,6 +147,30 @@ pub(super) async fn tool_read_file(ctx: &AgentToolContext, input: &Value) -> Str
             )
         }
     };
+    // Cap-byte difensivo (governance fs/read_max_bytes): un file enorme
+    // (bundle, dump, lock) caricato integralmente satura il contesto e la
+    // memoria. Soglia DB-driven (regola G); 0/assente = nessun cap.
+    let read_max_bytes: u64 = crate::settings::get_setting(&ctx.db, "agent.fs.read_max_bytes")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(2_097_152);
+    if read_max_bytes > 0 {
+        if let Ok(meta) = tokio::fs::metadata(&target).await {
+            if meta.len() > read_max_bytes {
+                return format!(
+                    "[Errore lettura '{}': file troppo grande ({} byte > limite {} byte). \
+                     Usa read_file_lines(path, start_line, end_line) per leggere una porzione, \
+                     o search_file_semantic per trovare le sezioni rilevanti.]",
+                    path_str,
+                    meta.len(),
+                    read_max_bytes
+                );
+            }
+        }
+    }
+
     let content = match tokio::fs::read_to_string(&target).await {
         Ok(c) => c,
         Err(e) => return format!("[Errore lettura '{}': {}]", path_str, e),
@@ -298,29 +322,18 @@ pub(super) async fn tool_write_file(ctx: &AgentToolContext, input: &Value) -> St
         None => return "[Errore: parametro 'content' mancante]".to_string(),
     };
 
-    // Enforcement porte hardcoded (ADR 0010). Se il setting
-    // `agent.enforce_port_allocation` e' true (default) e il content
-    // contiene una porta TCP fuori dal bucket Nexus 20000-39999, blocca
-    // la scrittura e istruisci l'agente a chiamare request_port.
-    if super::port_scanner::is_enforcement_enabled(&ctx.db).await {
-        if let super::port_scanner::PortScanOutcome::Reject(findings) =
-            super::port_scanner::scan_content(path_str, content)
-        {
-            return super::port_scanner::format_reject_message(path_str, &findings);
-        }
-        // Allocation-aware: anche una porta NEL bucket Nexus va rifiutata se non
-        // e' stata allocata via request_port (evita porte scelte a mano nel range
-        // ma non tracciate, fonte di collisioni tra progetti).
-        if let Some(msg) = super::port_scanner::reject_unallocated_bucket_ports(
-            &ctx.db,
-            ctx.project_id,
-            path_str,
-            content,
-        )
-        .await
-        {
-            return msg;
-        }
+    // Governance risorse in scrittura (porte ADR 0010 + URL interni), punto
+    // unico con audit: su violazione registra in nexus_resource_audit e
+    // ritorna il rifiuto. Catalogo policy: nexus_resource_policies (mig 0397).
+    if let Some(msg) = crate::security::resource_governance::enforce_on_write(
+        ctx,
+        "write_file",
+        path_str,
+        content,
+    )
+    .await
+    {
+        return msg;
     }
 
     // Preflight build graph (ADR 0020): blocca file generati, avvisa OOG.
@@ -772,24 +785,17 @@ pub(super) async fn tool_edit_file(ctx: &AgentToolContext, input: &Value) -> Str
         None => return "[Errore: parametro 'new_string' mancante]".to_string(),
     };
 
-    // Enforcement porte hardcoded (ADR 0010): scansiona la nuova porzione.
-    if super::port_scanner::is_enforcement_enabled(&ctx.db).await {
-        if let super::port_scanner::PortScanOutcome::Reject(findings) =
-            super::port_scanner::scan_content(path_str, new_string)
-        {
-            return super::port_scanner::format_reject_message(path_str, &findings);
-        }
-        // Allocation-aware: porte nel bucket non allocate via request_port -> reject.
-        if let Some(msg) = super::port_scanner::reject_unallocated_bucket_ports(
-            &ctx.db,
-            ctx.project_id,
-            path_str,
-            new_string,
-        )
-        .await
-        {
-            return msg;
-        }
+    // Governance risorse in scrittura (porte + URL interni), punto unico con
+    // audit: scansiona la nuova porzione e registra l'eventuale violazione.
+    if let Some(msg) = crate::security::resource_governance::enforce_on_write(
+        ctx,
+        "edit_file",
+        path_str,
+        new_string,
+    )
+    .await
+    {
+        return msg;
     }
 
     // Preflight build graph (ADR 0020).

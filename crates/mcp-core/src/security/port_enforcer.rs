@@ -38,7 +38,7 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 /// in /proc o query DB lente.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub async fn port_enforcer_loop(db: PgPool, project_channels: nexus_events::ProjectChannels) {
+pub async fn port_enforcer_loop(state: crate::AppState) {
     let mut ticker = tokio::time::interval(SCAN_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tracing::info!(
@@ -47,7 +47,7 @@ pub async fn port_enforcer_loop(db: PgPool, project_channels: nexus_events::Proj
     );
     loop {
         ticker.tick().await;
-        match tokio::time::timeout(SCAN_TIMEOUT, scan_and_enforce(&db, &project_channels)).await {
+        match tokio::time::timeout(SCAN_TIMEOUT, scan_and_enforce(&state)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!("port_enforcer scan fallito: {e}"),
             Err(_) => tracing::error!(
@@ -59,10 +59,9 @@ pub async fn port_enforcer_loop(db: PgPool, project_channels: nexus_events::Proj
 }
 
 /// Singola iterazione di scansione + enforcement.
-async fn scan_and_enforce(
-    db: &PgPool,
-    channels: &nexus_events::ProjectChannels,
-) -> Result<(), String> {
+async fn scan_and_enforce(state: &crate::AppState) -> Result<(), String> {
+    let db = &state.db;
+    let channels = &state.project_channels;
     let bindings = detect_all_port_bindings(db).await?;
 
     for b in &bindings {
@@ -126,9 +125,91 @@ async fn scan_and_enforce(
 
         // Notifica real-time al frontend
         emit_violation_notification(channels, project_id, b.port, bucket);
+
+        // Catena di governance (non solo sopprimere l'effetto): localizza il
+        // sorgente della porta uccisa, apre la diagnosi policy_violation
+        // (pannello Problemi, stessa firma del resource_linter: niente doppioni)
+        // e innesca subito la riparazione della CAUSA. In task separato per non
+        // ritardare la scansione successiva.
+        let state_chain = state.clone();
+        let killed_port = b.port;
+        let program = b.program.clone();
+        tokio::spawn(async move {
+            chain_violation_to_remediation(&state_chain, project_id, killed_port, &program).await;
+        });
     }
 
     Ok(())
+}
+
+/// Dopo un kill: apre la diagnosi della violazione (localizzando il sorgente
+/// se possibile) e avvia la riparazione automatica.
+async fn chain_violation_to_remediation(
+    state: &crate::AppState,
+    project_id: Uuid,
+    port: u16,
+    program: &str,
+) {
+    let root: Option<String> =
+        sqlx::query_scalar("SELECT repository_root_path FROM projects WHERE id = $1")
+            .bind(project_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+    let allocated =
+        crate::security::resource_linter::allocated_ports_for_project(&state.db, project_id)
+            .await;
+
+    // Localizza il sorgente della porta (best-effort).
+    let file_finding = if let Some(root) = root.filter(|r| !r.is_empty()) {
+        let root_path = std::path::PathBuf::from(root);
+        let alloc = allocated.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::security::resource_linter::lint_tree_for_port(&root_path, &alloc, port as u32)
+        })
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+    } else {
+        None
+    };
+
+    let (kind, rule) = ("port", "require_allocation");
+    let (file_path, line, snippet) = match &file_finding {
+        Some(f) => (Some(f.rel_path.as_str()), f.line, f.snippet.clone()),
+        None => (None, 0, String::new()),
+    };
+    let sig = crate::security::resource_governance::violation_signature(
+        project_id,
+        file_path,
+        &port.to_string(),
+        &format!("{kind}/{rule}"),
+    );
+    let detail = match file_path {
+        Some(p) => format!(
+            "{p}:{line} porta {port} non allocata (processo '{program}' terminato dal port enforcer) | {snippet}"
+        ),
+        None => format!(
+            "porta {port} non allocata bindata a runtime (processo '{program}' terminato dal port enforcer); sorgente non localizzato"
+        ),
+    };
+    crate::security::resource_governance::open_resource_violation(
+        &state.db,
+        project_id,
+        kind,
+        rule,
+        port as f64,
+        file_path,
+        &detail,
+        &sig,
+    )
+    .await;
+    crate::project_workspace::resource_violation_remediation::process_open_violations(
+        state, project_id,
+    )
+    .await;
 }
 
 /// Emette una notifica di violazione sul canale del progetto.

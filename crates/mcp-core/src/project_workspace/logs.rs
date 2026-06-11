@@ -135,12 +135,19 @@ pub async fn get_project_problems(
     // systemd del progetto). E' il secondo store di "problemi" del progetto:
     // prima visibile solo via UI separata, ora compare nel pannello "Problemi"
     // come deve essere (regola L: un solo posto dove l'utente cerca i problemi).
+    // Le violazioni di governance (signal_kind='policy_violation') restano
+    // visibili anche durante la riparazione automatica ('diagnosing') e dopo un
+    // fallimento definitivo ('failed_remediation'): un problema di sicurezza
+    // non deve sparire dal pannello finche' non e' RISOLTO.
     let diag_rows = sqlx::query(
         r#"
-        SELECT id, unit, signal_kind, metric, value, threshold, detail, created_at
+        SELECT id, unit, signal_kind, metric, value, threshold, detail, status,
+               file_path, created_at
           FROM service_diagnoses
          WHERE project_id = $1
-           AND status = 'open'
+           AND (status = 'open'
+                OR (signal_kind = 'policy_violation'
+                    AND status IN ('diagnosing', 'failed_remediation')))
          ORDER BY created_at DESC
          LIMIT 100
         "#,
@@ -157,30 +164,57 @@ pub async fn get_project_problems(
         let value: Option<f64> = row.try_get("value").ok().flatten();
         let threshold: Option<f64> = row.try_get("threshold").ok().flatten();
         let detail: Option<String> = row.try_get("detail").ok().flatten();
-        // signal_kind = "crash" e' grave; "anomaly" e' warning a meno che la
-        // metrica non sia chiaramente critica (cpu fuori range, errori/min alti).
-        let severity = if signal_kind == "crash" {
+        let status: String = row.try_get("status").unwrap_or_else(|_| "open".to_string());
+        let file_path: Option<String> = row.try_get("file_path").ok().flatten();
+        // signal_kind = "crash" e' grave; "policy_violation" e' SEMPRE error
+        // (violazione di governance risorse); "anomaly" e' warning.
+        let severity = if signal_kind == "crash" || signal_kind == "policy_violation" {
             "error"
         } else {
             "warning"
         };
-        let metric_part = match (metric.as_deref(), value, threshold) {
-            (Some(m), Some(v), Some(t)) => format!(" — {m}={v:.1} (soglia {t:.1})"),
-            (Some(m), Some(v), None) => format!(" — {m}={v:.1}"),
-            (Some(m), None, _) => format!(" — {m}"),
-            _ => String::new(),
+        let (source, mut message) = if signal_kind == "policy_violation" {
+            // metric = 'kind/rule' (es. 'port/enforce_hardcode').
+            let rule = metric.clone().unwrap_or_else(|| "resource".to_string());
+            let kind_label = rule.split('/').next().unwrap_or("resource").to_string();
+            let prefix = match status.as_str() {
+                "failed_remediation" => "Riparazione automatica FALLITA — ",
+                "diagnosing" => "Riparazione automatica in corso — ",
+                _ => "",
+            };
+            let base = detail
+                .clone()
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| format!("violazione {rule} ({unit})"));
+            (
+                format!("policy:{kind_label}"),
+                format!("{prefix}Violazione risorse [{rule}]: {base}"),
+            )
+        } else {
+            let metric_part = match (metric.as_deref(), value, threshold) {
+                (Some(m), Some(v), Some(t)) => format!(" — {m}={v:.1} (soglia {t:.1})"),
+                (Some(m), Some(v), None) => format!(" — {m}={v:.1}"),
+                (Some(m), None, _) => format!(" — {m}"),
+                _ => String::new(),
+            };
+            let mut msg = format!("Servizio {unit}: {signal_kind}{metric_part}");
+            if let Some(d) = detail.as_deref().filter(|s| !s.is_empty()) {
+                msg.push_str("\n");
+                msg.push_str(d);
+            }
+            (format!("service_observer:{signal_kind}"), msg)
         };
-        let mut message = format!("Servizio {unit}: {signal_kind}{metric_part}");
-        if let Some(d) = detail.as_deref().filter(|s| !s.is_empty()) {
-            message.push_str("\n");
-            message.push_str(d);
+        if signal_kind != "policy_violation" {
+            // message gia' completo per il ramo observer.
+        } else if message.len() > 600 {
+            message.truncate(600);
         }
         items.push(json!({
             "id": row.get::<Uuid, _>("id").to_string(),
             "severity": severity,
-            "source": format!("service_observer:{signal_kind}"),
+            "source": source,
             "message": message,
-            "filePath": serde_json::Value::Null,
+            "filePath": file_path.clone().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
             "line": serde_json::Value::Null,
             "column": serde_json::Value::Null,
             "createdAt": row.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),

@@ -756,10 +756,12 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    tokio::spawn(security::port_enforcer::port_enforcer_loop(
-        state.db.clone(),
-        state.project_channels.clone(),
-    ));
+    tokio::spawn(security::port_enforcer::port_enforcer_loop(state.clone()));
+
+    // Linter periodico di governance risorse (porte/URL hardcoded nei sorgenti):
+    // apre diagnosi policy_violation e innesca la riparazione automatica delle
+    // violazioni correggibili (mig 0397/0398, flag DB-driven).
+    security::resource_linter::spawn_resource_linter(state.clone());
 
     // Lo sweep periodico dei run orfani e' delegato al task_watchdog (gia'
     // periodico): chiama run_reaper::reap_stale_runs come punto unico (regola L).

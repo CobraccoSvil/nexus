@@ -166,6 +166,12 @@ _LAZY_MINIMAL_TOOLKIT = [
     # (whitelist kind, max_depth, cost_cap) restano lato server.
     "dispatch_subagent",
     "dispatch_subagents",
+    # Governance porte: verifica (read-only) e allocazione. Inclusi nel lazy
+    # toolkit cosi' il modello li ha nativi senza un giro di discovery — il
+    # messaggio di rifiuto dello scanner dice "chiama request_port" e non deve
+    # richiedere un nexus_mcp_tool_search per essere eseguibile.
+    "nexus_list_ports",
+    "request_port",
 ]
 
 
@@ -190,22 +196,23 @@ _INTENT_TOOL_SUBSET: dict[str, list[str]] = {
     "analyze": [
         "read_file", "read_file_lines", "list_files", "search_in_files",
         "search_codebase_semantic", "search_file_semantic",
-        "scan_code_quality", "git_status",
+        "scan_code_quality", "git_status", "nexus_list_ports",
     ],
     "review": [
         "read_file", "read_file_lines", "list_files", "search_in_files",
-        "search_codebase_semantic", "git_status",
+        "search_codebase_semantic", "git_status", "nexus_list_ports",
     ],
     "code_read": [
         "read_file", "read_file_lines", "list_files", "search_in_files",
-        "search_codebase_semantic", "search_file_semantic",
+        "search_codebase_semantic", "search_file_semantic", "nexus_list_ports",
     ],
     # Refactor: lettura + edit, niente run_command/run_tests (evita side-effects
-    # accidentali su intent ambigui).
+    # accidentali su intent ambigui). request_port + nexus_list_ports: senza
+    # request_port lo scanner bloccherebbe ogni edit con porta senza via d'uscita.
     "refactor": [
         "read_file", "read_file_lines", "list_files", "search_in_files",
         "search_codebase_semantic", "write_file", "edit_file",
-        "git_status", "git_stage",
+        "git_status", "git_stage", "nexus_list_ports", "request_port",
     ],
     # Edit/code/implement/fix: lazy tool discovery via nexus_mcp_tool_search.
     # Prima: ["*"] passava TUTTI i ~479 tool al modello, saturando il context
@@ -250,10 +257,17 @@ _READ_ONLY_TOOLS = [
     "read_file", "read_file_lines", "list_files", "search_in_files",
     "git_status", "search_codebase_semantic", "search_file_semantic",
     "scan_code_quality", "batch_analyze_code", "recall_context",
+    # Verifica/audit dello stato porte governato (sola lettura): bucket +
+    # allocazioni. Senza questo, un task "verifica le porte del progetto"
+    # non aveva alcun tool Nexus e deduceva porte hardcoded dai sorgenti.
+    "nexus_list_ports",
 ]
 _CODE_EDIT_TOOLS = _READ_ONLY_TOOLS + [
     "write_file", "edit_file", "delete_file", "rename_file",
     "git_stage", "git_commit", "run_command", "run_tests",
+    # Allocazione porta governata (unico modo sanzionato). Nessun profilo lo
+    # whitelistava: causa radice dell'incidente (l'agente non poteva chiamarlo).
+    "request_port",
 ]
 _SERVICE_TOOLS = _CODE_EDIT_TOOLS + [
     "run_service", "read_service_output", "stop_service",

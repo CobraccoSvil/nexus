@@ -182,3 +182,110 @@ pub async fn get_project_quota(
         },
     })))
 }
+
+/// GET /api/admin/security/violations/summary
+/// Riepilogo cross-progetto della governance risorse (ultimi 7 giorni):
+/// violazioni per classe/azione/esito, riparazioni per esito, progetti con
+/// piu' violazioni, diagnosi failed_remediation aperte (intervento manuale).
+pub async fn get_violations_summary(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> ApiResult {
+    let _user_id = parse_user_id(&claims)?;
+
+    let by_action: Vec<Value> = sqlx::query(
+        "SELECT resource_kind, action, outcome, COUNT(*) AS n \
+           FROM nexus_resource_audit \
+          WHERE ts > NOW() - INTERVAL '7 days' \
+            AND outcome IN ('blocked', 'detected', 'killed', 'failed') \
+          GROUP BY resource_kind, action, outcome ORDER BY n DESC LIMIT 50",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .into_iter()
+    .map(|r| {
+        json!({
+            "resource_kind": r.get::<String, _>("resource_kind"),
+            "action": r.get::<String, _>("action"),
+            "outcome": r.get::<String, _>("outcome"),
+            "count": r.get::<i64, _>("n"),
+        })
+    })
+    .collect();
+
+    let top_projects: Vec<Value> = sqlx::query(
+        "SELECT a.project_id, COALESCE(p.name, '?') AS name, COUNT(*) AS n \
+           FROM nexus_resource_audit a \
+           LEFT JOIN projects p ON p.id = a.project_id \
+          WHERE a.ts > NOW() - INTERVAL '7 days' \
+            AND a.outcome IN ('blocked', 'detected', 'killed', 'failed') \
+          GROUP BY a.project_id, p.name ORDER BY n DESC LIMIT 10",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|r| {
+        json!({
+            "project_id": r.get::<Uuid, _>("project_id").to_string(),
+            "name": r.get::<String, _>("name"),
+            "count": r.get::<i64, _>("n"),
+        })
+    })
+    .collect();
+
+    let remediations: Value = sqlx::query(
+        "SELECT \
+            COUNT(*) FILTER (WHERE triggered_run_id IS NOT NULL) AS started, \
+            COUNT(*) FILTER (WHERE status = 'resolved') AS resolved, \
+            COUNT(*) FILTER (WHERE status = 'failed_remediation') AS failed, \
+            COUNT(*) FILTER (WHERE status IN ('open', 'diagnosing')) AS open \
+           FROM service_diagnoses \
+          WHERE signal_kind = 'policy_violation' AND created_at > NOW() - INTERVAL '7 days'",
+    )
+    .fetch_one(&state.db)
+    .await
+    .map(|r| {
+        json!({
+            "started": r.get::<i64, _>("started"),
+            "resolved": r.get::<i64, _>("resolved"),
+            "failed": r.get::<i64, _>("failed"),
+            "open": r.get::<i64, _>("open"),
+        })
+    })
+    .unwrap_or_else(|_| json!({}));
+
+    let manual_needed: Vec<Value> = sqlx::query(
+        "SELECT d.id, d.project_id, COALESCE(p.name, '?') AS project, d.metric, \
+                d.file_path, d.detail, d.created_at \
+           FROM service_diagnoses d \
+           LEFT JOIN projects p ON p.id = d.project_id \
+          WHERE d.signal_kind = 'policy_violation' AND d.status = 'failed_remediation' \
+          ORDER BY d.created_at DESC LIMIT 20",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|r| {
+        json!({
+            "id": r.get::<Uuid, _>("id").to_string(),
+            "project_id": r.get::<Uuid, _>("project_id").to_string(),
+            "project": r.get::<String, _>("project"),
+            "rule": r.try_get::<Option<String>, _>("metric").ok().flatten(),
+            "file_path": r.try_get::<Option<String>, _>("file_path").ok().flatten(),
+            "detail": r.try_get::<Option<String>, _>("detail").ok().flatten(),
+            "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
+        })
+    })
+    .collect();
+
+    Ok(Json(json!({
+        "window_days": 7,
+        "violations_by_action": by_action,
+        "top_projects": top_projects,
+        "remediations": remediations,
+        "manual_intervention_needed": manual_needed,
+    })))
+}

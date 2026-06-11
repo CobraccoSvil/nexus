@@ -34,6 +34,8 @@ pub async fn execute_agent_tool(ctx: &AgentToolContext, name: &str, input: &Valu
         "git_remote_add" => git::tool_git_remote_add(ctx, input).await,
         // Fix M51: tool dedicato per allocazione porta (evita curl via run_command).
         "request_port" => ports::tool_request_port(ctx, input).await,
+        // Tool read-only per verifica/audit dello stato porte (bucket + allocazioni).
+        "nexus_list_ports" => ports::tool_nexus_list_ports(ctx, input).await,
         // PR-1 Plan/Act/Verify: emette/aggiorna la TODO list del planner.
         "nexus_todo_write" => todos::tool_nexus_todo_write(ctx, input).await,
         // PR-3 sub-agents: delega a un sub-agent isolato (riabilita ex M55).

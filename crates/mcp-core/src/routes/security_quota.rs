@@ -23,6 +23,15 @@ pub fn merge(router: Router<AppState>, state: &AppState) -> Router<AppState> {
                 middleware::require_auth,
             )),
         )
+        // Governance risorse: riepilogo cross-progetto violazioni/riparazioni
+        // (telemetria di controllo, mig 0397/0398). Admin-only.
+        .route(
+            "/api/admin/security/violations/summary",
+            get(security::api::get_violations_summary).layer(axum_mw::from_fn_with_state(
+                state.clone(),
+                middleware::require_admin,
+            )),
+        )
         .route(
             "/api/projects/:id/playwright/runs",
             get(project_workspace::get_playwright_runs)

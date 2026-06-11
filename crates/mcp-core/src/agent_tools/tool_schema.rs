@@ -179,7 +179,7 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
   },
   {
     "name": "request_port",
-    "description": "Fix M51: alloca una porta TCP libera per il progetto dal bucket deterministico Nexus (20000-39999). Usa questo tool al posto di hardcodare 3002/5173 o di chiamare curl all'endpoint REST allocate-port. Idempotente: chiamate ripetute con stessa label ritornano la stessa porta. La porta viene registrata in nexus_port_allocations e propagata automaticamente in run_configurations.env.PORT al prossimo run completed (M40). Ritorna JSON {port, label, allocation_mode}.",
+    "description": "UNICO modo sanzionato per ottenere una porta TCP per un servizio del progetto: alloca una porta libera dal bucket deterministico Nexus (20000-39999) e la registra in nexus_port_allocations. Usalo SEMPRE al posto di scegliere numeri a mano: le porte hardcoded fuori bucket, e i fallback env con default numerico (es. process.env.PORT || 5000, os.environ.get('PORT', 5000)), vengono RIFIUTATI in scrittura dallo scanner; i processi su porte non allocate vengono terminati dal port enforcer. Idempotente: stessa label -> stessa porta. Propagata in run_configurations.env.PORT al prossimo run completed (M40). Per la sola VERIFICA/elenco dello stato porte usa nexus_list_ports. Ritorna JSON {port, label, allocation_mode}.",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -189,6 +189,14 @@ pub const AGENT_TOOLS_JSON: &str = r#"[
         }
       },
       "required": ["label"]
+    }
+  },
+  {
+    "name": "nexus_list_ports",
+    "description": "Tool di SOLA LETTURA: elenca lo stato porte del progetto senza allocare nulla. Ritorna il bucket deterministico assegnato (start/end), il range Nexus (20000-39999) e le allocazioni registrate in nexus_port_allocations (port, label, allocation_mode, service_unit, created_at). Usalo per VERIFICARE o AUDITARE la gestione delle porte: non dedurre mai le porte leggendo solo i sorgenti. Per ottenere una NUOVA porta usa request_port.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
     }
   },
   {

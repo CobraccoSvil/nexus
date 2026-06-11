@@ -55,6 +55,36 @@ pub(super) async fn tool_nexus_db_query(ctx: &AgentToolContext, input: &Value) -
         .and_then(Value::as_u64)
         .map(|n| n as usize);
 
+    // Guard SQL per-query (governance db/sql_injection): blocca le query
+    // distruttive di massa (DELETE/UPDATE senza WHERE) e l'accesso a oggetti di
+    // sistema/infra. Solo blocco + audit (decisione utente: niente auto-fix su
+    // DB). Il blocco del DB Nexus a livello connessione resta in
+    // resolve_project_conn (ortogonale).
+    if crate::security::resource_governance::policy(&ctx.db, "db", "sql_injection")
+        .await
+        .enabled
+    {
+        if let Some(reason) = crate::security::resource_governance::check_dangerous_sql(&sql) {
+            let mut entry = crate::security::AuditEntry::blocked(
+                ctx.project_id,
+                "db_dangerous_statement_blocked",
+                "db",
+            )
+            .with_resource(sql.chars().take(120).collect::<String>())
+            .with_details(json!({ "reason": reason }))
+            .with_actor_user(ctx.user_id);
+            if let Some(s) = ctx.session_id {
+                entry = entry.with_actor_session(s);
+            }
+            crate::security::record_audit(entry);
+            return json!({
+                "error": format!("Query rifiutata dalla governance DB: {reason}"),
+                "blocked": true,
+            })
+            .to_string();
+        }
+    }
+
     // Connessione: se "connection" e' presente nel payload, esegue su quella
     // (es. "analytics", "legacy_replica"); altrimenti usa la primary del
     // progetto. Permette al modello di lavorare su DB multipli senza dover

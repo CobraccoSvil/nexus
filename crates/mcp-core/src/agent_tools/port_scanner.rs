@@ -81,7 +81,58 @@ static RANGE_REGEX: Lazy<Regex> =
 /// bucket nei docker-compose (es. `${PORT_FRONTEND:-20001}`) sfuggivano al
 /// guard-rail e facevano partire container su porte non ammissibili (ADR 0010).
 static DEFAULT_PORT_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-(\d{2,5})\}").unwrap());
+    Lazy::new(|| Regex::new(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?[-=](\d{2,5})\}").unwrap());
+
+/// Fallback env con porta numerica letterale: `process.env.PORT || 5000`,
+/// `os.environ.get("PORT", 5000)`, `env::var("PORT").unwrap_or("3000")`, ecc.
+/// Come `${VAR:-NNNN}`, il default e' una porta EFFETTIVA (usata quando la
+/// variabile non e' impostata) e va trattato come hardcoded, anche se la riga
+/// contiene un hint env: senza questo controllo lo skip `ENV_PORT_HINTS`
+/// faceva passare l'intera riga e i fallback fuori-bucket sfuggivano al
+/// guard-rail (incidente Beauty-Book: `const port = process.env.PORT || 5000`).
+///
+/// Anti-falsi-positivi: il NOME della variabile env deve contenere il segmento
+/// `PORT` delimitato da `_` (PORT, APP_PORT, PORT_BACKEND, VITE_PORT) — cosi'
+/// `process.env.TIMEOUT || 5000` e `process.env.REPORT_LIMIT || 5000` NON
+/// matchano (REPORT contiene PORT ma non come segmento delimitato).
+static ENV_FALLBACK_PORT_REGEXES: Lazy<Vec<Regex>> = Lazy::new(|| {
+    // Segmento nome variabile che e' PORT o *_PORT o PORT_* (case-insensitive
+    // sul confine, ma PORT in maiuscolo nei nomi env reali).
+    let name = r"(?:[A-Za-z0-9]+_)*PORT(?:_[A-Za-z0-9]+)*";
+    vec![
+        // JS/TS: process.env.PORT || 5000  /  ?? 5000  (+ import.meta.env per Vite)
+        Regex::new(&format!(
+            r#"(?i)(?:process|import\.meta)\.env\.{name}\s*(?:\|\||\?\?)\s*['"]?(\d{{2,5}})\b"#
+        ))
+        .unwrap(),
+        // JS/TS bracket: process.env["PORT"] || 5000
+        Regex::new(&format!(
+            r#"(?i)(?:process|import\.meta)\.env\[\s*['"]{name}['"]\s*\]\s*(?:\|\||\?\?)\s*['"]?(\d{{2,5}})\b"#
+        ))
+        .unwrap(),
+        // Python: os.environ.get("PORT", 5000) / os.getenv('PORT', '5000') / getenv(...)
+        Regex::new(&format!(
+            r#"(?i)(?:os\.environ\.get|os\.getenv|getenv)\(\s*['"]{name}['"]\s*,\s*['"]?(\d{{2,5}})\b"#
+        ))
+        .unwrap(),
+        // Python: os.environ.get("PORT") or 5000 / int(os.getenv("PORT") or 8080)
+        Regex::new(&format!(
+            r#"(?i)(?:os\.environ\.get|os\.getenv|getenv)\(\s*['"]{name}['"]\s*\)\s*or\s+['"]?(\d{{2,5}})\b"#
+        ))
+        .unwrap(),
+        // Rust: env::var("PORT").unwrap_or("3000") / .unwrap_or_else(|_| "3000".into())
+        // Finestra bounded [^;\n]{0,80} per catene .ok().and_then(...).
+        Regex::new(&format!(
+            r#"env::var\(\s*"{name}"\s*\)[^;\n]{{0,80}}?unwrap_or(?:_else)?\s*\(\s*(?:\|[^|]{{0,20}}\|\s*)?"?(\d{{2,5}})\b"#
+        ))
+        .unwrap(),
+        // PHP/Kotlin elvis: getenv("PORT") ?: 8080
+        Regex::new(&format!(
+            r#"(?i)getenv\(\s*['"]{name}['"]\s*\)\s*\?:\s*['"]?(\d{{2,5}})\b"#
+        ))
+        .unwrap(),
+    ]
+});
 
 #[derive(Debug)]
 pub enum PortScanOutcome {
@@ -198,6 +249,25 @@ fn collect_ports(content: &str, keep: impl Fn(u32) -> bool) -> Vec<PortFinding> 
                 }
             }
         }
+        // Fallback env con porta letterale (`process.env.PORT || 5000`, ecc.):
+        // validati SEMPRE, anche se la riga contiene un hint env. Stesso
+        // principio del `${VAR:-NNNN}` sopra. DEVE precedere lo skip
+        // `ENV_PORT_HINTS`, altrimenti la riga col fallback verrebbe saltata.
+        for regex in ENV_FALLBACK_PORT_REGEXES.iter() {
+            for caps in regex.captures_iter(raw_line) {
+                if let Some(m) = caps.get(1) {
+                    if let Ok(port) = m.as_str().parse::<u32>() {
+                        if keep(port) {
+                            findings.push(PortFinding {
+                                line: line_idx + 1,
+                                port,
+                                snippet: snip(raw_line),
+                            });
+                        }
+                    }
+                }
+            }
+        }
         if ENV_PORT_HINTS.iter().any(|hint| raw_line.contains(hint)) {
             continue;
         }
@@ -230,7 +300,23 @@ fn collect_ports(content: &str, keep: impl Fn(u32) -> bool) -> Vec<PortFinding> 
             }
         }
     }
+    // Dedup difensivo: la stessa (riga, porta) puo' essere catturata da piu'
+    // regex (es. un fallback env che matcha anche un PORT_REGEX generico).
+    findings.sort_by_key(|f| (f.line, f.port));
+    findings.dedup_by_key(|f| (f.line, f.port));
     findings
+}
+
+/// Wrapper pub: porte fuori-bucket (violazioni dirette). Punto unico riusato
+/// dal linter di governance (`security::port_linter`).
+pub fn collect_out_of_bucket_ports(content: &str) -> Vec<PortFinding> {
+    collect_ports(content, port_is_violating)
+}
+
+/// Wrapper pub: porte host NEL bucket Nexus (lecite solo se allocate). Il
+/// chiamante filtra poi su `nexus_port_allocations`.
+pub fn collect_bucket_ports(content: &str) -> Vec<PortFinding> {
+    collect_ports(content, port_in_bucket)
 }
 
 /// Porta dentro il bucket Nexus (20000-39999). Le porte nel bucket sono lecite
@@ -259,40 +345,6 @@ pub fn scan_content(path: &str, content: &str) -> PortScanOutcome {
 /// non tracciata, con rischio di collisione tra progetti. Ritorna `Some(msg)`
 /// se ci sono porte nel bucket non allocate (la write va rifiutata), altrimenti
 /// `None`. NON tocca le porte fuori-bucket (gestite da `scan_content`).
-pub async fn reject_unallocated_bucket_ports(
-    db: &PgPool,
-    project_id: uuid::Uuid,
-    path: &str,
-    content: &str,
-) -> Option<String> {
-    if should_skip_path(path) {
-        return None;
-    }
-    let bucket_ports = collect_ports(content, port_in_bucket);
-    if bucket_ports.is_empty() {
-        return None;
-    }
-    let allocated: std::collections::HashSet<u32> = sqlx::query_scalar::<_, i32>(
-        "SELECT port::int FROM nexus_port_allocations WHERE project_id = $1",
-    )
-    .bind(project_id)
-    .fetch_all(db)
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .map(|p| p as u32)
-    .collect();
-    let unallocated: Vec<PortFinding> = bucket_ports
-        .into_iter()
-        .filter(|f| !allocated.contains(&f.port))
-        .collect();
-    if unallocated.is_empty() {
-        None
-    } else {
-        Some(format_unallocated_message(path, &unallocated))
-    }
-}
-
 fn format_unallocated_message(path: &str, findings: &[PortFinding]) -> String {
     let mut msg = format!(
         "[Errore: scrittura su '{}' rifiutata. Sono state rilevate {} porta/e host nel range Nexus (20000-39999) ma NON allocate a questo progetto.]\n\nDettaglio:\n",
@@ -326,6 +378,116 @@ fn format_unallocated_message(path: &str, findings: &[PortFinding]) -> String {
     msg
 }
 
+/// Punto unico di enforcement porte in scrittura (write_file/edit_file): gate
+/// setting -> scan fuori-bucket -> check allocazione nel bucket. Su violazione
+/// registra l'audit in `nexus_resource_audit` (action `port_hardcode_rejected`
+/// o `port_unallocated_rejected`, outcome `blocked`) e ritorna `Some(messaggio)`
+/// di rifiuto. `None` = scrittura ammessa. Consolida i due blocchi prima
+/// duplicati in files.rs (regola L) e aggiunge la traccia di sicurezza che
+/// prima mancava (il rifiuto era solo un tool_result, invisibile all'audit).
+pub async fn enforce_write_ports(
+    ctx: &super::AgentToolContext,
+    tool_name: &str,
+    path: &str,
+    content: &str,
+) -> Option<String> {
+    if !is_enforcement_enabled(ctx.db.as_ref()).await {
+        return None;
+    }
+    if let PortScanOutcome::Reject(findings) = scan_content(path, content) {
+        audit_port_rejection(ctx, "port_hardcode_rejected", tool_name, path, &findings);
+        return Some(format_reject_message(path, &findings));
+    }
+    if let Some(unalloc) =
+        unallocated_bucket_findings(ctx.db.as_ref(), ctx.project_id, path, content).await
+    {
+        audit_port_rejection(ctx, "port_unallocated_rejected", tool_name, path, &unalloc);
+        return Some(format_unallocated_message(path, &unalloc));
+    }
+    None
+}
+
+/// Variante di `reject_unallocated_bucket_ports` che ritorna i findings (per
+/// auditarli) invece del solo messaggio. Punto unico riusato.
+async fn unallocated_bucket_findings(
+    db: &PgPool,
+    project_id: uuid::Uuid,
+    path: &str,
+    content: &str,
+) -> Option<Vec<PortFinding>> {
+    if should_skip_path(path) {
+        return None;
+    }
+    let bucket_ports = collect_ports(content, port_in_bucket);
+    if bucket_ports.is_empty() {
+        return None;
+    }
+    let allocated: std::collections::HashSet<u32> = sqlx::query_scalar::<_, i32>(
+        "SELECT port::int FROM nexus_port_allocations WHERE project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|p| p as u32)
+    .collect();
+    let unallocated: Vec<PortFinding> = bucket_ports
+        .into_iter()
+        .filter(|f| !allocated.contains(&f.port))
+        .collect();
+    if unallocated.is_empty() {
+        None
+    } else {
+        Some(unallocated)
+    }
+}
+
+/// Registra una violazione porte respinta in `nexus_resource_audit` (resource
+/// kind `port`, outcome `blocked`). Best-effort: il writer e' batch async e
+/// degrada in silenzio se non inizializzato.
+fn audit_port_rejection(
+    ctx: &super::AgentToolContext,
+    action: &str,
+    tool_name: &str,
+    path: &str,
+    findings: &[PortFinding],
+) {
+    let ports: Vec<u32> = {
+        let mut v: Vec<u32> = findings.iter().map(|f| f.port).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let resource_id = ports
+        .iter()
+        .take(10)
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let detail_findings: Vec<serde_json::Value> = findings
+        .iter()
+        .take(5)
+        .map(|f| {
+            let snippet: String = f.snippet.chars().take(120).collect();
+            serde_json::json!({ "line": f.line, "port": f.port, "snippet": snippet })
+        })
+        .collect();
+    let mut entry = crate::security::AuditEntry::blocked(ctx.project_id, action.to_string(), "port")
+        .with_resource(resource_id)
+        .with_details(serde_json::json!({
+            "tool": tool_name,
+            "path": path,
+            "ports": ports,
+            "findings": detail_findings,
+        }))
+        .with_actor_user(ctx.user_id);
+    if let Some(s) = ctx.session_id {
+        entry = entry.with_actor_session(s);
+    }
+    crate::security::record_audit(entry);
+}
+
 pub fn format_reject_message(path: &str, findings: &[PortFinding]) -> String {
     let mut msg = String::new();
     msg.push_str(&format!(
@@ -350,12 +512,12 @@ pub fn format_reject_message(path: &str, findings: &[PortFinding]) -> String {
     }
     msg.push_str(
         "\nAzione richiesta:\n\
-         1. Chiama il tool `request_port(label=\"<nome_servizio>\")` per ottenere una porta libera dal range 20000-39999.\n\
-         2. Sostituisci la porta hardcoded con il valore ritornato. In alternativa, leggi la porta da variabile env:\n\
-            - JS/TS: process.env.PORT\n\
-            - Python: os.environ.get(\"PORT\")\n\
+         1. Chiama il tool `request_port(label=\"<nome_servizio>\")` per ottenere una porta libera dal range 20000-39999 (verifica le porte gia' assegnate con `nexus_list_ports`).\n\
+         2. Sostituisci la porta hardcoded con il valore ritornato. Puoi leggerla da variabile env, ma SENZA un default numerico: un fallback come `process.env.PORT || 5000` e' a tutti gli effetti una porta hardcoded e verra' rifiutato. Se vuoi un default, usa la porta ALLOCATA da request_port:\n\
+            - JS/TS: process.env.PORT (oppure `process.env.PORT || <porta_allocata>`)\n\
+            - Python: os.environ.get(\"PORT\") (oppure con default la porta allocata)\n\
             - Rust: env::var(\"PORT\")\n\
-            - Docker/shell: ${PORT} oppure $PORT_BACKEND, $PORT_FRONTEND, ecc.\n\
+            - Docker/shell: ${PORT} oppure ${PORT_BACKEND:-<porta_allocata>}\n\
          3. Riprova la scrittura.\n\
          \nVedi il blocco <port_allocation> nel system prompt e ADR 0010 per i dettagli.",
     );
@@ -403,9 +565,100 @@ mod tests {
     }
 
     #[test]
-    fn allow_env_port_line() {
+    fn reject_env_fallback_port_line() {
+        // Incidente Beauty-Book: `const port = process.env.PORT || 5000;` ELUDEVA
+        // lo scanner perche' la riga conteneva l'hint `process.env.PORT` e lo
+        // skip ENV_PORT_HINTS saltava l'intera riga. Il fallback numerico e' a
+        // tutti gli effetti una porta hardcoded: deve essere rifiutato.
         let res = scan_content("src/server.js", "app.listen(process.env.PORT || 3000)\n");
+        match res {
+            PortScanOutcome::Reject(f) => {
+                assert!(f.iter().any(|x| x.port == 3000), "fallback 3000 rilevato");
+            }
+            _ => panic!("il fallback env hardcoded deve essere Reject"),
+        }
+        // Caso reale Beauty-Book: porta 5000.
+        let res = scan_content("server.js", "const port = process.env.PORT || 5000;\n");
+        assert!(matches!(res, PortScanOutcome::Reject(_)));
+    }
+
+    #[test]
+    fn allow_env_port_read_without_default() {
+        // Lettura pura da env, senza fallback numerico: ammessa.
+        let res = scan_content("src/server.js", "app.listen(process.env.PORT)\n");
         assert!(matches!(res, PortScanOutcome::Allowed));
+        let res = scan_content("src/server.js", "app.listen(parseInt(process.env.PORT, 10))\n");
+        assert!(matches!(res, PortScanOutcome::Allowed));
+    }
+
+    #[test]
+    fn reject_env_fallback_variants() {
+        // JS nullish
+        assert!(matches!(
+            scan_content("a.ts", "const p = import.meta.env.VITE_PORT ?? 5173\n"),
+            PortScanOutcome::Reject(_)
+        ));
+        // JS bracket
+        assert!(matches!(
+            scan_content("a.js", "const p = process.env[\"PORT\"] || 8080\n"),
+            PortScanOutcome::Reject(_)
+        ));
+        // Python get con default
+        assert!(matches!(
+            scan_content("a.py", "port = os.environ.get(\"PORT\", 5000)\n"),
+            PortScanOutcome::Reject(_)
+        ));
+        // Python or
+        assert!(matches!(
+            scan_content("a.py", "port = int(os.getenv(\"PORT\") or 8080)\n"),
+            PortScanOutcome::Reject(_)
+        ));
+        // Rust unwrap_or
+        assert!(matches!(
+            scan_content("a.rs", "let p = env::var(\"PORT\").unwrap_or(\"3000\".to_string());\n"),
+            PortScanOutcome::Reject(_)
+        ));
+        // Rust unwrap_or_else con closure
+        assert!(matches!(
+            scan_content("a.rs", "let p = env::var(\"PORT\").unwrap_or_else(|_| \"3000\".into());\n"),
+            PortScanOutcome::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn allow_non_port_env_fallback() {
+        // Anti-falsi-positivi: variabili che NON sono porte, anche se contengono
+        // sottostringhe simili. Il numero di fallback non e' una porta.
+        assert!(matches!(
+            scan_content("a.js", "const t = process.env.TIMEOUT || 5000\n"),
+            PortScanOutcome::Allowed
+        ));
+        assert!(matches!(
+            scan_content("a.js", "const r = process.env.REPORT_LIMIT || 5000\n"),
+            PortScanOutcome::Allowed
+        ));
+    }
+
+    #[test]
+    fn env_fallback_in_bucket_collected_for_allocation_check() {
+        // Un fallback NEL bucket non e' una violazione fuori-bucket (scan_content
+        // Allowed), ma viene raccolto da collect_bucket_ports per il check di
+        // allocazione (simmetrico a `${PORT_BACKEND:-20002}`).
+        assert!(matches!(
+            scan_content("server.js", "app.listen(process.env.PORT || 25000)\n"),
+            PortScanOutcome::Allowed
+        ));
+        let bucket = collect_bucket_ports("app.listen(process.env.PORT || 25000)\n");
+        assert!(bucket.iter().any(|p| p.port == 25000));
+    }
+
+    #[test]
+    fn reject_shell_colon_equal_default() {
+        // `${APP_PORT:=3000}` (assegnazione default) come `:-`.
+        assert!(matches!(
+            scan_content("entrypoint.sh", ": \"${APP_PORT:=3000}\"\n"),
+            PortScanOutcome::Reject(_)
+        ));
     }
 
     #[test]

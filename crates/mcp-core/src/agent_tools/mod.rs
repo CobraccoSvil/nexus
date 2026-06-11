@@ -43,6 +43,7 @@ pub(crate) mod monitor;
 pub(crate) mod port_scanner;
 pub(crate) mod ports;
 pub(crate) mod profile_tools;
+pub(crate) mod url_scanner;
 pub(crate) mod project_db_query;
 pub(crate) mod quality_tools;
 pub(crate) mod rag_search;

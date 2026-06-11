@@ -173,6 +173,134 @@ pub async fn check_can_start_container(db: &PgPool, project_id: Uuid) -> Result<
     Ok(())
 }
 
+/// Cache dell'uso disco per progetto (il `du` ricorsivo e' costoso): TTL piu'
+/// lungo della quota perche' lo spazio cambia lentamente.
+static DISK_USAGE_CACHE: OnceLock<RwLock<HashMap<Uuid, (i64, Instant)>>> = OnceLock::new();
+const DISK_USAGE_TTL: Duration = Duration::from_secs(300);
+
+fn disk_cache() -> &'static RwLock<HashMap<Uuid, (i64, Instant)>> {
+    DISK_USAGE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Uso disco stimato della project_root in MB (cache 5 min). `du` in
+/// spawn_blocking per non bloccare il runtime tokio. Best-effort: su errore
+/// ritorna 0 (non blocchiamo le scritture per un `du` fallito).
+async fn project_disk_usage_mb(project_id: Uuid, root_path: &str) -> i64 {
+    {
+        let guard = disk_cache().read().await;
+        if let Some((mb, at)) = guard.get(&project_id) {
+            if at.elapsed() < DISK_USAGE_TTL {
+                return *mb;
+            }
+        }
+    }
+    let root = root_path.to_string();
+    let mb = tokio::task::spawn_blocking(move || {
+        // `du -sm` ritorna i MB della directory (esclusi i filesystem montati).
+        std::process::Command::new("du")
+            .args(["-sm", "--", &root])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    String::from_utf8_lossy(&o.stdout)
+                        .split_whitespace()
+                        .next()
+                        .and_then(|s| s.parse::<i64>().ok())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0)
+    })
+    .await
+    .unwrap_or(0);
+    let mut write = disk_cache().write().await;
+    write.insert(project_id, (mb, Instant::now()));
+    mb
+}
+
+/// Verifica se il progetto e' entro la quota disco (`max_disk_mb`). Chiamata
+/// prima delle scritture file degli agenti. Best-effort: se non si riesce a
+/// stimare l'uso (du fallito -> 0) non blocca. Ritorna `Err` se oltre quota.
+pub async fn check_can_use_disk(
+    db: &PgPool,
+    project_id: Uuid,
+    root_path: &str,
+) -> Result<(), String> {
+    if root_path.trim().is_empty() {
+        return Ok(());
+    }
+    let quota = load_quota(db, project_id).await;
+    let used_mb = project_disk_usage_mb(project_id, root_path).await;
+    if used_mb >= quota.max_disk_mb as i64 {
+        return Err(format!(
+            "quota disco raggiunta ({used_mb}/{} MB) per il progetto; libera spazio prima di scrivere",
+            quota.max_disk_mb
+        ));
+    }
+    Ok(())
+}
+
+/// Invalida la cache uso disco di un progetto (dopo cancellazioni che liberano
+/// spazio, per non bloccare scritture legittime fino allo scadere del TTL).
+pub async fn invalidate_disk_cache(project_id: Uuid) {
+    let mut write = disk_cache().write().await;
+    write.remove(&project_id);
+}
+
+/// Somma RSS (MB) dei processi attivi del progetto, letti da
+/// `/proc/<pid>/statm` (pagine * 4KB). Best-effort: PID morti o /proc
+/// inaccessibile contano 0.
+async fn project_memory_usage_mb(db: &PgPool, project_id: Uuid) -> i64 {
+    let pids: Vec<i32> = sqlx::query_scalar::<_, Option<i32>>(
+        "SELECT pid FROM agent_processes \
+         WHERE project_id = $1 AND status IN ('running', 'starting') AND pid IS NOT NULL",
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .flatten()
+    .collect();
+    if pids.is_empty() {
+        return 0;
+    }
+    tokio::task::spawn_blocking(move || {
+        let page_kb = 4; // size pagina tipica
+        let mut total_kb: i64 = 0;
+        for pid in pids {
+            if let Ok(statm) = std::fs::read_to_string(format!("/proc/{pid}/statm")) {
+                // Campo 2 = resident set size in pagine.
+                if let Some(rss_pages) = statm.split_whitespace().nth(1) {
+                    if let Ok(pages) = rss_pages.parse::<i64>() {
+                        total_kb += pages * page_kb;
+                    }
+                }
+            }
+        }
+        total_kb / 1024
+    })
+    .await
+    .unwrap_or(0)
+}
+
+/// Verifica RAM pre-avvio: la somma RSS dei processi attivi del progetto deve
+/// stare sotto `max_memory_mb`. Best-effort (se non misurabile, non blocca).
+/// Ritorna `Err` se oltre quota.
+pub async fn check_can_use_memory(db: &PgPool, project_id: Uuid) -> Result<(), String> {
+    let quota = load_quota(db, project_id).await;
+    let used_mb = project_memory_usage_mb(db, project_id).await;
+    if used_mb >= quota.max_memory_mb as i64 {
+        return Err(format!(
+            "quota memoria raggiunta ({used_mb}/{} MB): ferma un servizio attivo prima di avviarne un altro",
+            quota.max_memory_mb
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
