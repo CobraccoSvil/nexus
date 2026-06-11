@@ -49,6 +49,9 @@ from .helpers import (
     MAX_AGENT_ITERATIONS,
     TASK_COMPLETE_TOOL,
     TASK_COMPLETE_TOOL_NAME,
+    RUN_NOTES_TOOL,
+    RUN_NOTES_TOOL_NAME,
+    apply_run_notes,
     normalize_declared_outcome,
     _ADAPTIVE_BUDGET_CACHE,
     _ADAPTIVE_BUDGET_TTL_SEC,
@@ -957,11 +960,17 @@ async def router_node(state: AgentState) -> dict[str, Any]:
     # filtri tool (punto unico), una sola volta.
     _tc_tools = updates.get("tools_json", state.get("tools_json")) or []
     if _tc_tools and intent not in ("chat", "general_chat"):
-        if not any(
-            isinstance(t, dict) and t.get("name") == TASK_COMPLETE_TOOL_NAME
-            for t in _tc_tools
-        ):
-            updates["tools_json"] = list(_tc_tools) + [TASK_COMPLETE_TOOL]
+        _names_present = {
+            t.get("name") for t in _tc_tools if isinstance(t, dict)
+        }
+        _to_add = []
+        if TASK_COMPLETE_TOOL_NAME not in _names_present:
+            _to_add.append(TASK_COMPLETE_TOOL)
+        # P4: tool note di run (brain-only), accanto a task_complete.
+        if RUN_NOTES_TOOL_NAME not in _names_present:
+            _to_add.append(RUN_NOTES_TOOL)
+        if _to_add:
+            updates["tools_json"] = list(_tc_tools) + _to_add
         # Direttiva che attiva il comportamento (additiva, gated): senza, il
         # tool resta disponibile ma inerte. Iniettata dinamicamente nel router
         # invece che nel prompt base, cosi' e' reversibile e non tocca tutti i run.
@@ -976,9 +985,23 @@ async def router_node(state: AgentState) -> dict[str, Any]:
         )
         _tc_st = updates.get("system_text") or state.get("system_text") or ""
         if "<chiusura_dichiarata>" not in _tc_st:
-            updates["system_text"] = (
-                (_tc_st + "\n\n" + _tc_directive) if _tc_st else _tc_directive
+            _tc_st = (_tc_st + "\n\n" + _tc_directive) if _tc_st else _tc_directive
+        # P4: direttiva note + taccuino corrente, incluso STABILMENTE nel system
+        # (cache-friendly: cambia solo quando l'agente aggiorna le note). Il
+        # taccuino sopravvive a compattazione/rolling/resume perche' vive nello
+        # state, non nella history compressa.
+        if "<run_notes>" not in _tc_st:
+            _rn = str(state.get("run_notes") or "").strip()
+            _rn_directive = (
+                "<run_notes>\n"
+                "Tieni un taccuino del lavoro con nexus_run_notes (decisioni, "
+                "file gia' fatti, todo, cosa NON rifare): sopravvive alla "
+                "compressione del contesto. Aggiornalo a ogni progresso.\n"
+                + (f"NOTE ATTUALI:\n{_rn}\n" if _rn else "(nessuna nota ancora)\n")
+                + "</run_notes>"
             )
+            _tc_st = _tc_st + "\n\n" + _rn_directive
+        updates["system_text"] = _tc_st
 
     # ── Chat: meta-tool di gestione/discovery, NON azzeramento totale ───────
     # Prima azzeravamo tools_json per gli intent conversazionali, forzando la
@@ -2121,6 +2144,29 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 _exploration_count, _exploration_threshold, len(_productive_tools),
             )
             tools_json = _productive_tools
+            # P5 (sub-agente come primitiva di contesto): se serve ancora
+            # esplorazione profonda e i sub-agenti sono disponibili, suggerisce
+            # di DELEGARLA a un sub-agente con contesto isolato (che ritorna un
+            # sommario di 1-2K token) invece di gonfiare la history del run
+            # principale. Direttiva additiva nel system (non spawn automatico:
+            # l'agente decide), che usa dispatch_subagent se presente nel set.
+            _has_subagent = any(
+                isinstance(t, dict)
+                and t.get("name") in ("dispatch_subagent", "dispatch_subtask")
+                for t in _productive_tools
+            )
+            if _has_subagent and int(state.get("subagent_depth") or 0) == 0:
+                _deleg = (
+                    "<delega_esplorazione>\n"
+                    "Hai gia' esplorato a fondo. Se ti serve ANCORA analisi "
+                    "estesa (leggere molti file/cercare a tappeto), DELEGALA a "
+                    "dispatch_subagent: esplora in un contesto isolato e ti "
+                    "restituisce un sommario conciso, senza gonfiare questo "
+                    "contesto. Altrimenti PROCEDI con un'azione concreta.\n"
+                    "</delega_esplorazione>"
+                )
+                if "<delega_esplorazione>" not in (system_text or ""):
+                    system_text = (system_text or "") + "\n\n" + _deleg
 
     _current_iterations = int(state.get("iterations") or 0)
     # Mig 0181: soglia forced-text proporzionale al budget adattivo del run.
@@ -3254,7 +3300,7 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     # Tool sempre ammessi dalla validazione M16 = meta di discovery + whitelist DB
     # + task_complete (WAVE 3): e' brain-only, iniettato direttamente in tools_json
     # dal router, quindi non passa per la "scoperta" e altrimenti verrebbe rifiutato.
-    _M16_ALLOWED = _M16_META_TOOLS | _df_whitelist | {TASK_COMPLETE_TOOL_NAME}
+    _M16_ALLOWED = _M16_META_TOOLS | _df_whitelist | {TASK_COMPLETE_TOOL_NAME, RUN_NOTES_TOOL_NAME}
     for _i, b in enumerate(pending):
         name = b.get("name", "")
         # FIX D: predictive cap (ha priorita' sul budget allegati: se passa di qui,
@@ -3336,6 +3382,8 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     _declared_outcomes: list[dict] = []
     # tool_use_id dei task_complete del turno (per la guard blocked-da-cap).
     _task_complete_ids: list[str] = []
+    # P4: holder mutabile delle note di run (la closure _run non scrive lo state).
+    _run_notes_holder: list[str | None] = [state.get("run_notes")]
     # WAVE 2.2: True se almeno un tool e' fallito per ToolRunner gRPC down.
     _infra_tool_errors: list[bool] = []
 
@@ -3346,6 +3394,22 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
         # task_complete e' brain-only: non lo eseguiamo via gRPC. Registriamo
         # l'esito dichiarato e rispondiamo con un ack. Se l'input e' invalido
         # (outcome fuori enum), is_error=True cosi' il modello lo ri-emette bene.
+        # P4: nexus_run_notes e' brain-only (non via gRPC): aggiorna il taccuino
+        # nello state e risponde con un ack. Sopravvive a compattazione/resume.
+        if _t_name == RUN_NOTES_TOOL_NAME:
+            _new_notes = apply_run_notes(_run_notes_holder[0], _t_input)
+            if _new_notes is not None:
+                _run_notes_holder[0] = _new_notes
+            return {
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": json.dumps(
+                    {"acknowledged": _new_notes is not None,
+                     "notes_chars": len(_new_notes or "")},
+                    ensure_ascii=False,
+                ),
+                "is_error": _new_notes is None,
+            }
         if _t_name == TASK_COMPLETE_TOOL_NAME:
             _task_complete_ids.append(tool_use_id)
             decl = normalize_declared_outcome(_t_input)
@@ -3370,6 +3434,17 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
             session_id,
             list(_t_input.keys()) if isinstance(_t_input, dict) else str(_t_input)[:80],
         )
+        # P6: telemetria recall RAG — misura quante volte l'agente recupera
+        # davvero il contesto offloadato (se il recall e' raro, l'offload e' di
+        # fatto lossy e va ripensato). grep-able: rag_recall.
+        if _t_name == "nexus_search_semantic":
+            _sk = ""
+            if isinstance(_t_input, dict):
+                _sk = str(_t_input.get("source_kinds") or _t_input.get("source_kind") or "")
+            logger.info(
+                "rag_recall: nexus_search_semantic source_kinds=%s run=%s",
+                _sk or "all", state.get("thread_id"),
+            )
         try:
             result = await _tool_runner.execute_tool(
                 tool_name=_t_name,
@@ -3745,6 +3820,9 @@ async def tool_dispatch_node(state: AgentState) -> dict[str, Any]:
     # flag evita rifiuti ripetuti (la 2a dichiarazione blocked viene onorata).
     if _blocked_cap_rejected_now:
         _dispatch_updates["blocked_cap_rejected"] = True
+    # P4: persiste il taccuino aggiornato dall'agente in questo turno.
+    if _run_notes_holder[0] != state.get("run_notes"):
+        _dispatch_updates["run_notes"] = _run_notes_holder[0]
     return _dispatch_updates
 
 

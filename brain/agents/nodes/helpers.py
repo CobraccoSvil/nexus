@@ -446,6 +446,56 @@ TASK_COMPLETE_TOOL: dict = {
 _VALID_OUTCOMES = frozenset({"done", "blocked", "needs_input"})
 
 
+# ── Note di run gestite dall'agente (P4 roadmap contesto) ───────────────────
+# Memory tool leggero: l'agente mantiene un taccuino strutturato (todo,
+# decisioni, file toccati, bug aperti) che sopravvive a compattazione/rolling
+# summary/resume. E' l'ancora anti-deriva (Anthropic: memoria + context editing
+# = +39% su task multi-step). Il blocco note viene incluso STABILMENTE nel
+# system (cache-friendly: cambia solo a eventi discreti decisi dall'agente).
+RUN_NOTES_TOOL_NAME = "nexus_run_notes"
+RUN_NOTES_MAX_CHARS = 2400
+
+RUN_NOTES_TOOL: dict = {
+    "name": RUN_NOTES_TOOL_NAME,
+    "description": (
+        "Taccuino persistente del run: annota lo STATO del lavoro (decisioni "
+        "prese, file gia' creati/modificati, todo rimanenti, bug aperti, cosa "
+        "NON rifare) cosi' non lo perdi quando il contesto viene compresso. "
+        "action='set' sostituisce le note, 'append' aggiunge una riga. Aggiorna "
+        "le note a ogni progresso significativo, in modo conciso (max ~2000 "
+        "char): e' il tuo promemoria, non un log."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["set", "append"]},
+            "content": {"type": "string"},
+        },
+        "required": ["action", "content"],
+    },
+}
+
+
+def apply_run_notes(current: str | None, tool_input: dict | None) -> str | None:
+    """Applica un'azione nexus_run_notes alle note correnti (punto unico, puro).
+    Ritorna le note aggiornate (cap RUN_NOTES_MAX_CHARS, tail-preserving) o None
+    se l'input e' invalido."""
+    if not isinstance(tool_input, dict):
+        return None
+    action = str(tool_input.get("action", "")).strip().lower()
+    content = str(tool_input.get("content", "")).strip()
+    if action not in ("set", "append") or not content:
+        return None
+    if action == "set":
+        notes = content
+    else:
+        notes = ((current or "").rstrip() + "\n" + content).strip() if current else content
+    if len(notes) > RUN_NOTES_MAX_CHARS:
+        # Tail-preserving: le note recenti contano piu' delle vecchie.
+        notes = "[...]\n" + notes[-(RUN_NOTES_MAX_CHARS - 6):]
+    return notes
+
+
 def normalize_declared_outcome(tool_input: dict | None) -> dict | None:
     """Valida/normalizza l'input di task_complete (punto unico). None se invalido
     (outcome fuori enum o input non-dict): il chiamante ricade sui segnali

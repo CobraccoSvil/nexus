@@ -79,6 +79,9 @@ class AgentState(TypedDict, total=False):
     # sotto questo indice (prefix byte-identico tra le iterazioni della fase).
     compress_cutoff_index: int
     compress_cutoff_phase: int
+    # P4: taccuino del run gestito dall'agente (tool nexus_run_notes). Incluso
+    # stabilmente nel system, sopravvive a compattazione/rolling/resume.
+    run_notes: str | None
     task_type: str
     behavior_mode: str
     token_budget: int
