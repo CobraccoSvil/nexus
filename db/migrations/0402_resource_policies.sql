@@ -1,4 +1,4 @@
--- 0397_resource_policies.sql
+-- 0402_resource_policies.sql (ex 0397: collisione numero con 0397_continuity_gate_semantico)
 --
 -- Governance unificata delle risorse di sistema (porte, filesystem, URL/rete,
 -- database, container): catalogo policy DB-driven. UN solo posto (regola G/L)
