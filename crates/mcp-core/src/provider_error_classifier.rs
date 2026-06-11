@@ -84,6 +84,36 @@ fn http_status_re() -> &'static Regex {
     })
 }
 
+/// Rate-limit testuale SENZA status HTTP affidabile (es. errori inline o
+/// eccezioni che non espongono `status_code`). Valutato DOPO la HTTP map:
+/// uno status esplicito noto vince sempre sul testo. Paritetico a
+/// `RATE_LIMIT_PATTERNS` in `brain/providers/error_handler.py`.
+fn rate_limit_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r"rate.?limit|too many requests|throttl|\b429\b")
+            .expect("RATE_LIMIT regex valida")
+    })
+}
+
+fn retry_after_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r"(?i)retry[-_ ]?(?:in|after)[:=\s]+(\d+)").expect("RETRY_AFTER regex valida")
+    })
+}
+
+/// Estrae i secondi di retry suggeriti dal testo raw dell'errore
+/// (es. "Please retry after 30 seconds"). Sostituisce l'estrazione che il
+/// bridge brain (`agentic_classifier`) faceva in proprio con regex locale:
+/// il payload raw arriva a mcp-core e l'estrazione vive qui (punto unico).
+pub fn extract_retry_after_seconds(raw: &str) -> Option<u64> {
+    retry_after_re()
+        .captures(raw)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse::<u64>().ok())
+}
+
 /// Classifica un errore provider rappresentato come testo libero.
 ///
 /// Stesso ordine di valutazione del brain Python:
@@ -92,15 +122,28 @@ fn http_status_re() -> &'static Regex {
 ///   3. pattern context too long -> `context_too_long`
 ///   4. pattern auth -> `auth_error`
 ///   5. HTTP status noto -> mapping
+///   5bis. rate-limit testuale (status assente o non mappato)
 ///   6. timeout / connection
 ///   7. fallback `error`
 pub fn classify_text(raw: &str) -> ClassifiedError {
+    classify_with_status(raw, None)
+}
+
+/// Variante di [`classify_text`] con HTTP status gia' noto al chiamante
+/// (es. estratto in modo strutturato dall'eccezione SDK lato brain e
+/// inoltrato via bridge `/api/internal/provider-error`). Lo status esplicito
+/// vince sull'estrazione regex dal testo; l'ordine di valutazione resta
+/// identico (parita' col Python, dove lo status strutturato dell'SDK entra
+/// allo stesso passo della HTTP map).
+pub fn classify_with_status(raw: &str, known_status: Option<u16>) -> ClassifiedError {
     let raw_lower = raw.to_lowercase();
 
-    let http_status = http_status_re()
-        .captures(raw)
-        .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse::<u16>().ok());
+    let http_status = known_status.or_else(|| {
+        http_status_re()
+            .captures(raw)
+            .and_then(|c| c.get(1))
+            .and_then(|m| m.as_str().parse::<u16>().ok())
+    });
 
     if billing_re().is_match(&raw_lower) {
         return ClassifiedError {
@@ -131,6 +174,17 @@ pub fn classify_text(raw: &str) -> ClassifiedError {
                 http_status: Some(status),
             };
         }
+    }
+    // 5bis. Rate-limit testuale: copre i casi senza status affidabile
+    // (errore inline, eccezione rilanciata come stringa "429 Resource has
+    // been exhausted", "throttled", ...). Dopo la HTTP map per design: uno
+    // status esplicito mappato vince sempre sul testo.
+    if rate_limit_re().is_match(&raw_lower) {
+        return ClassifiedError {
+            stop_reason: "rate_limit".into(),
+            retriable: true,
+            http_status,
+        };
     }
     if raw_lower.contains("timeout") || raw_lower.contains("timed out") {
         return ClassifiedError {
@@ -178,6 +232,43 @@ mod tests {
         let c = classify_text("Error code: 429 - rate limit hit");
         assert_eq!(c.stop_reason, "rate_limit");
         assert_eq!(c.http_status, Some(429));
+    }
+
+    #[test]
+    fn rate_limit_testuale_senza_status() {
+        // Copre l'eccezione Google rilanciata come stringa (niente "Error code:").
+        let c = classify_text("429 Resource has been exhausted (e.g. check quota).");
+        assert_eq!(c.stop_reason, "rate_limit");
+        assert!(c.retriable);
+        assert_eq!(c.http_status, None);
+
+        let c = classify_text("Request was throttled by the upstream provider");
+        assert_eq!(c.stop_reason, "rate_limit");
+    }
+
+    #[test]
+    fn status_esplicito_vince_sul_testo() {
+        // known_status passa dalla HTTP map PRIMA del pattern testuale:
+        // un 503 esplicito non diventa rate_limit anche se il testo cita 429.
+        let c = classify_with_status("please slow down, 429 in upstream", Some(503));
+        assert_eq!(c.stop_reason, "service_unavailable");
+        assert_eq!(c.http_status, Some(503));
+
+        // known_status vince sull'estrazione regex dal testo.
+        let c = classify_with_status("Error code: 500 - whatever", Some(429));
+        assert_eq!(c.stop_reason, "rate_limit");
+        assert_eq!(c.http_status, Some(429));
+    }
+
+    #[test]
+    fn estrazione_retry_after_dal_testo() {
+        assert_eq!(
+            extract_retry_after_seconds("Rate limited. Please retry after 30 seconds"),
+            Some(30)
+        );
+        assert_eq!(extract_retry_after_seconds("retry in 5"), Some(5));
+        assert_eq!(extract_retry_after_seconds("Retry-After: 120"), Some(120));
+        assert_eq!(extract_retry_after_seconds("nessun suggerimento"), None);
     }
 
     /// Parita' cross-language con ``brain/providers/error_handler.py::classify_error``.

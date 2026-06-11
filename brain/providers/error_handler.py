@@ -265,6 +265,21 @@ def classify_error(exc: Exception, provider: str = "") -> dict[str, Any]:
         info["retry_after_seconds"] = retry_after
         return info
 
+    # ── 5bis. Rate-limit testuale ─────────────────────────────────────────────
+    # Copre i casi senza status HTTP affidabile: eccezione rilanciata come
+    # stringa ("429 Resource has been exhausted", "throttled", ...). Stessa
+    # regex del punto unico Rust provider_error_classifier (ADR 0032 / golden
+    # tests/fixtures/error_classifier_golden.json). Dopo la HTTP map per design.
+    if re.search(r"rate.?limit|too many requests|throttl|\b429\b", raw_lower):
+        return {
+            "stop_reason": "rate_limit",
+            "message": "Rate limit del provider AI raggiunto. Riprovare a breve.",
+            "retriable": True,
+            "backoff": True,
+            "http_status": http_status,
+            "retry_after_seconds": retry_after,
+        }
+
     # ── 6. Pattern generici ───────────────────────────────────────────────────
     if "timeout" in raw_lower or "timed out" in raw_lower:
         return {

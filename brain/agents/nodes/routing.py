@@ -268,15 +268,3 @@ def route_after_verifier(state: AgentState) -> str:
     if stop_reason == "tool_use":
         return "executor"
     return "learner"
-
-
-def route_after_regression_gate(state: AgentState) -> str:
-    """Routing post-regression_gate (M13.4/M13.5).
-
-    SOFT (default): il nodo ritorna {} -> stop_reason invariato -> 'learner'.
-    HARD block (M13.5, default-OFF): il nodo ha settato stop_reason='tool_use'
-    e incrementato regression_cycle -> rientra in 'executor' per il fix.
-    """
-    if state.get("stop_reason") == "tool_use":
-        return "executor"
-    return "learner"

@@ -29,12 +29,59 @@ use crate::AppState;
 /// Chiamato dal brain Python (cooldown_bridge.py) quando rileva un errore
 /// provider in punti non osservati direttamente da Rust (es. catena
 /// classificatore, fallback chain in registry.py).
+///
+/// Due percorsi (retrocompatibili):
+///   - legacy: `error_class` gia' calcolata dal chiamante (es. registry.py,
+///     dove la classe e' una decisione locale del brain, non una
+///     ri-classificazione del testo);
+///   - raw: `error_class` assente, il chiamante invia `error_text` (+ `status`
+///     HTTP se noto) e mcp-core classifica con `provider_error_classifier`
+///     (punto unico regola L: niente doppia classificazione keyword in Python).
 #[derive(Debug, Deserialize)]
 pub struct ProviderErrorPayload {
     pub provider: String,
-    pub error_class: String,
+    /// Classe pre-calcolata (percorso legacy). Se assente o vuota, mcp-core
+    /// la deriva da `error_text`/`status`.
+    #[serde(default)]
+    pub error_class: Option<String>,
+    /// Testo raw dell'errore provider (percorso raw: il brain NON classifica).
+    #[serde(default)]
+    pub error_text: Option<String>,
+    /// HTTP status strutturato, se noto al chiamante (es. `exc.response.status_code`).
+    #[serde(default)]
+    pub status: Option<u16>,
     #[serde(default)]
     pub retry_after_seconds: Option<u64>,
+}
+
+/// Deriva la classe d'errore effettiva (e il retry-after) dal payload.
+/// PUNTO UNICO della classificazione: il ramo raw delega a
+/// `provider_error_classifier::classify_with_status`; il ramo legacy passa
+/// la classe cosi' com'e' (retrocompatibilita' con i payload vecchi).
+/// `Err` se il payload non contiene ne' classe ne' materiale raw.
+fn derive_error_class(body: &ProviderErrorPayload) -> Result<(String, Option<u64>), String> {
+    let explicit = body
+        .error_class
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(class) = explicit {
+        return Ok((class.to_string(), body.retry_after_seconds));
+    }
+    let raw = body.error_text.as_deref().map(str::trim).unwrap_or("");
+    if raw.is_empty() && body.status.is_none() {
+        return Err(
+            "payload senza `error_class` e senza `error_text`/`status`: nulla da classificare"
+                .to_string(),
+        );
+    }
+    let classified = crate::provider_error_classifier::classify_with_status(raw, body.status);
+    // retry-after: esplicito del payload > estratto dal testo raw (l'estrazione
+    // che il bridge brain faceva con regex locale ora vive nel classifier Rust).
+    let retry_after = body.retry_after_seconds.or_else(|| {
+        crate::provider_error_classifier::extract_retry_after_seconds(raw)
+    });
+    Ok((classified.stop_reason, retry_after))
 }
 
 /// Handler `POST /api/internal/provider-error`.
@@ -58,11 +105,15 @@ pub async fn provider_error_handler(
         )
             .into_response();
     }
-    match body.error_class.as_str() {
+    let (error_class, retry_after_seconds) = match derive_error_class(&body) {
+        Ok(derived) => derived,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    match error_class.as_str() {
         "billing_error" => {
             crate::provider_cooldown::put_provider_in_long_cooldown(
                 &provider,
-                &format!("brain bridge: {}", body.error_class),
+                &format!("brain bridge: {error_class}"),
             );
             crate::provider_cooldown::propagate_billing_disable_to_db(&state.db, &provider).await;
             tracing::warn!(
@@ -73,7 +124,7 @@ pub async fn provider_error_handler(
         "rate_limit" => {
             // Durata DB-driven (regola G): retry_after del provider se presente,
             // altrimenti la soglia short configurata (slow_cooldown_s), non un 60 letterale.
-            let secs = body.retry_after_seconds.unwrap_or_else(|| {
+            let secs = retry_after_seconds.unwrap_or_else(|| {
                 crate::provider_cooldown::provider_health_timings().slow_cooldown_s
             });
             crate::provider_cooldown::put_provider_in_cooldown(&provider, Some(secs));
@@ -90,7 +141,7 @@ pub async fn provider_error_handler(
                 "provider-error bridge: '{}' → cooldown breve {}s ({})",
                 provider,
                 secs,
-                body.error_class
+                error_class
             );
         }
         other => {
@@ -609,4 +660,98 @@ pub async fn list_catalog(
         })
         .collect();
     Ok(Json(entries))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(
+        error_class: Option<&str>,
+        error_text: Option<&str>,
+        status: Option<u16>,
+        retry_after_seconds: Option<u64>,
+    ) -> ProviderErrorPayload {
+        ProviderErrorPayload {
+            provider: "test_provider".to_string(),
+            error_class: error_class.map(str::to_string),
+            error_text: error_text.map(str::to_string),
+            status,
+            retry_after_seconds,
+        }
+    }
+
+    #[test]
+    fn legacy_classe_esplicita_passa_invariata() {
+        // Retrocompatibilita': il payload vecchio (classe pre-calcolata dal
+        // brain, es. registry.py billing) NON viene ri-classificato.
+        let (class, retry) =
+            derive_error_class(&payload(Some("billing_error"), None, None, Some(42))).unwrap();
+        assert_eq!(class, "billing_error");
+        assert_eq!(retry, Some(42));
+    }
+
+    #[test]
+    fn raw_testo_billing_classificato_da_rust() {
+        let (class, retry) = derive_error_class(&payload(
+            None,
+            Some("Your credit balance is too low to make this request"),
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(class, "billing_error");
+        assert_eq!(retry, None);
+    }
+
+    #[test]
+    fn raw_status_429_con_retry_after_dal_testo() {
+        // Lo status strutturato del chiamante mappa rate_limit; il retry-after
+        // assente nel payload viene estratto dal testo raw (punto unico Rust).
+        let (class, retry) = derive_error_class(&payload(
+            None,
+            Some("Too many requests, please retry after 30 seconds"),
+            Some(429),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(class, "rate_limit");
+        assert_eq!(retry, Some(30));
+    }
+
+    #[test]
+    fn retry_after_esplicito_vince_sul_testo() {
+        let (class, retry) = derive_error_class(&payload(
+            None,
+            Some("rate limit, retry after 30"),
+            None,
+            Some(7),
+        ))
+        .unwrap();
+        assert_eq!(class, "rate_limit");
+        assert_eq!(retry, Some(7));
+    }
+
+    #[test]
+    fn classe_vuota_equivale_ad_assente() {
+        // error_class="" (stringa vuota) deve attivare il ramo raw, non
+        // passare una classe vuota al match del cooldown.
+        let (class, _) = derive_error_class(&payload(
+            Some("  "),
+            Some("Error code: 529 - overloaded"),
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(class, "overloaded");
+    }
+
+    #[test]
+    fn payload_senza_classe_ne_materiale_raw_e_errore() {
+        assert!(derive_error_class(&payload(None, None, None, None)).is_err());
+        assert!(derive_error_class(&payload(None, Some("   "), None, None)).is_err());
+        // Solo status, senza testo: classificabile (HTTP map).
+        let (class, _) = derive_error_class(&payload(None, None, Some(500), None)).unwrap();
+        assert_eq!(class, "provider_error");
+    }
 }

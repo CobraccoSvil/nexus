@@ -826,57 +826,32 @@ class AgenticIntentClassifier:
 
 
 # ---------------------------------------------------------------------------
-# Bridge cooldown: notifica mcp-core Rust degli errori provider visti
-# nella catena classificatore (altrimenti Rust non li osserva e non
-# applica il cooldown — il provider in errore viene ritentato ogni volta).
+# Bridge cooldown: notifica mcp-core Rust degli errori provider visti nella
+# catena classificatore (altrimenti Rust non li osserva e non applica il
+# cooldown). La CLASSIFICAZIONE dell'errore (billing/rate_limit/...) vive nel
+# punto unico Rust provider_error_classifier (ADR 0032): qui si inoltra solo
+# il testo grezzo. I vecchi _BILLING_PATTERNS/_RATE_LIMIT_PATTERNS keyword
+# sono stati rimossi (doppia classificazione cross-language eliminata).
 # ---------------------------------------------------------------------------
-
-_BILLING_PATTERNS = re.compile(
-    r"credit balance|quota exceeded|billing|payment required|"
-    r"insufficient.?funds|spending limit|exceeded your current quota",
-    re.IGNORECASE,
-)
-_RATE_LIMIT_PATTERNS = re.compile(
-    r"rate.?limit|too many requests|429|throttl",
-    re.IGNORECASE,
-)
 
 
 async def _notify_cooldown_if_provider_error(exc: Exception, provider: str) -> None:
-    """Classifica un'eccezione del classificatore e notifica cooldown a Rust."""
-    exc_str = str(exc)
-    error_class: str | None = None
-    retry_after: int | None = None
-    if _BILLING_PATTERNS.search(exc_str):
-        error_class = "billing_error"
-    elif _RATE_LIMIT_PATTERNS.search(exc_str):
-        error_class = "rate_limit"
-        # Tenta di estrarre retry-after dal messaggio
-        m = re.search(r"retry.?(?:in|after)\s+(\d+)", exc_str, re.IGNORECASE)
-        if m:
-            retry_after = int(m.group(1))
-    if error_class:
-        try:
-            from brain.providers.cooldown_bridge import notify_provider_error
-            await notify_provider_error(provider, error_class, retry_after)
-        except Exception:
-            pass  # best-effort, non bloccare il classificatore
+    """Notifica a Rust l'errore RAW del classificatore: la classificazione
+    (billing/rate_limit/altro) e il cooldown sono decisi dal punto unico
+    mcp-core (ADR 0032). Qui non si classifica piu' con keyword lato Python:
+    Rust ignora le classi non-cooldown, quindi il comportamento e' invariato."""
+    try:
+        from brain.providers.cooldown_bridge import notify_provider_error
+        await notify_provider_error(provider, error_text=str(exc))
+    except Exception:
+        pass  # best-effort, non bloccare il classificatore
 
 
 async def _notify_cooldown_for_inline_error(content: str, provider: str) -> None:
-    """Classifica un errore inline (content che inizia con [Error:...]) e notifica cooldown."""
-    error_class: str | None = None
-    retry_after: int | None = None
-    if _BILLING_PATTERNS.search(content):
-        error_class = "billing_error"
-    elif _RATE_LIMIT_PATTERNS.search(content):
-        error_class = "rate_limit"
-        m = re.search(r"retry.?(?:in|after)\s+(\d+)", content, re.IGNORECASE)
-        if m:
-            retry_after = int(m.group(1))
-    if error_class:
-        try:
-            from brain.providers.cooldown_bridge import notify_provider_error
-            await notify_provider_error(provider, error_class, retry_after)
-        except Exception:
-            pass  # best-effort
+    """Come sopra per un errore inline (content che inizia con [Error:...]):
+    invia il raw, classifica Rust (ADR 0032)."""
+    try:
+        from brain.providers.cooldown_bridge import notify_provider_error
+        await notify_provider_error(provider, error_text=content)
+    except Exception:
+        pass  # best-effort

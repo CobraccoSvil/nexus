@@ -37,21 +37,37 @@ def _get_mcp_core_url() -> str:
 
 async def notify_provider_error(
     provider: str,
-    error_class: str,
+    error_class: str | None = None,
     retry_after_seconds: int | None = None,
+    *,
+    error_text: str | None = None,
+    status: int | None = None,
 ) -> None:
     """Notifica mcp-core Rust di un errore provider per attivare il cooldown.
 
+    Due percorsi (ADR 0032, la classificazione vive nel COMPILATO):
+      - classe nota: il chiamante conosce gia' la classe per le proprie
+        decisioni locali (es. registry billing) e la passa in ``error_class``;
+      - raw (preferito quando la classe servirebbe SOLO al bridge): il
+        chiamante passa ``error_text`` (+ ``status``) e mcp-core classifica con
+        il punto unico ``provider_error_classifier`` (niente keyword duplicate
+        lato Python).
+
     Args:
         provider: nome del provider (es. "anthropic", "google", "openai")
-        error_class: classe errore (es. "billing_error", "rate_limit", "overloaded")
+        error_class: classe errore gia' nota, se il brain la usa anche per se'
         retry_after_seconds: secondi suggeriti dal provider prima di ritentare
+        error_text: testo grezzo dell'errore (percorso raw)
+        status: HTTP status strutturato, se noto (percorso raw)
     """
     url = f"{_get_mcp_core_url()}/api/internal/provider-error"
-    payload = {
-        "provider": provider,
-        "error_class": error_class,
-    }
+    payload: dict[str, object] = {"provider": provider}
+    if error_class is not None:
+        payload["error_class"] = error_class
+    if error_text is not None:
+        payload["error_text"] = error_text
+    if status is not None:
+        payload["status"] = status
     if retry_after_seconds is not None:
         payload["retry_after_seconds"] = retry_after_seconds
     try:

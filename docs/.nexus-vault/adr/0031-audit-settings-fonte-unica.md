@@ -56,9 +56,15 @@ i conteggi possono solo scendere; degrada a no-op senza DB).
 - **1 bridge promesso costruito**: `nexus_profile` aggiunta a `DB_KEY_MAP`
   del gateway (il commit 5591746 la dichiarava "gestita da settings DB" senza
   che il bridge esistesse).
-- **Feature rotta documentata** (decisione di prodotto aperta, chip separato):
-  `regression_gate_node` del brain chiama `/api/internal/impact/*` rimosso da
-  eb5e47a — ripristinare l'endpoint o completare la rimozione.
+- **Feature rotta risolta** (mig 0410, 2026-06-11): il `regression_gate_node`
+  del brain chiamava `/api/internal/impact/*`, rimosso da eb5e47a (ADR 0017 v2)
+  insieme al writer che popolava le tabelle impact. Decisione: rimozione
+  completa (coerente con la nota di eb5e47a "reimplementare quando servono").
+  Rimossi il nodo dal grafo, `regression_gate_node.py`,
+  `route_after_regression_gate`, il guard `gate_status` in `auto_commit`
+  (`agent_types.rs`), le 6 settings `regression_gate.*` (le `impact.*` erano
+  gia' uscite con la mig 0406) e le 4 tabelle morte di mig 0243
+  (`project_code_nodes/edges/tests`, `project_impact_runs`).
 
 ## Decisione architetturale: categorie di navigazione derivate dai dati
 

@@ -1,0 +1,80 @@
+{
+  "_comment": "Golden fixture cross-language (regola L / ADR 0026 / ADR 0032, Wave 6): l'estrazione di un oggetto JSON da output LLM deve produrre lo stesso risultato fra brain/utils/json_extract.py::extract_json_block e crates/mcp-core/src/llm_json.rs::extract_json_block. Comportamento target: il Python attuale (3 strategie: strip fence ai bordi + parse diretto, brace-matching con stato stringhe/escape, fallback regex single-level). expected=null significa 'nessun oggetto JSON valido' (anche per liste top-level: i call site si aspettano un oggetto). Letta sia da pytest (brain/tests/test_json_extract_parity.py) sia da cargo test (llm_json.rs::parita_cross_language_da_fixture_golden). Drift = bug.",
+  "cases": [
+    {
+      "name": "json_puro",
+      "input": "{\"a\": 1}",
+      "expected": { "a": 1 }
+    },
+    {
+      "name": "fence_markdown_json",
+      "input": "```json\n{\"a\": 1}\n```",
+      "expected": { "a": 1 }
+    },
+    {
+      "name": "fence_markdown_semplice",
+      "input": "```\n{\"a\": 1}\n```",
+      "expected": { "a": 1 }
+    },
+    {
+      "name": "testo_prima_e_dopo",
+      "input": "Ecco il risultato: {\"a\": 1}. Fine.",
+      "expected": { "a": 1 }
+    },
+    {
+      "name": "preambolo_con_fence_non_in_testa",
+      "input": "Ecco il JSON richiesto:\n```json\n{\"a\": 1}\n```",
+      "expected": { "a": 1 }
+    },
+    {
+      "name": "oggetto_annidato_profondo",
+      "input": "{\"a\": {\"b\": {\"c\": {\"d\": 4}}}}",
+      "expected": { "a": { "b": { "c": { "d": 4 } } } }
+    },
+    {
+      "name": "annidato_multilivello_con_testo_attorno",
+      "input": "pre {\"a\": {\"b\": {\"c\": 3}}} post",
+      "expected": { "a": { "b": { "c": 3 } } }
+    },
+    {
+      "name": "graffa_chiusa_dentro_stringa",
+      "input": "log: {\"msg\": \"ha una } dentro\"} fine",
+      "expected": { "msg": "ha una } dentro" }
+    },
+    {
+      "name": "graffa_aperta_dentro_stringa",
+      "input": "pre {\"msg\": \"apre { e basta\"} post",
+      "expected": { "msg": "apre { e basta" }
+    },
+    {
+      "name": "quote_con_escape_dentro_stringa",
+      "input": "pre {\"msg\": \"cita \\\" e } chiusa\"} post",
+      "expected": { "msg": "cita \" e } chiusa" }
+    },
+    {
+      "name": "backslash_doppio_prima_della_quote",
+      "input": "{\"path\": \"C:\\\\tmp\\\\\"} resto",
+      "expected": { "path": "C:\\tmp\\" }
+    },
+    {
+      "name": "json_malformato_trailing_comma",
+      "input": "{\"a\": 1,}",
+      "expected": null
+    },
+    {
+      "name": "nessun_json",
+      "input": "nessun oggetto qui",
+      "expected": null
+    },
+    {
+      "name": "lista_top_level_non_e_oggetto",
+      "input": "[1, 2, 3]",
+      "expected": null
+    },
+    {
+      "name": "primo_blocco_malformato_non_recuperato",
+      "input": "{non json} {\"a\": 1}",
+      "expected": null
+    }
+  ]
+}

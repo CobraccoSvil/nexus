@@ -140,7 +140,6 @@ from .helpers import (
 )
 from .routing import (
     route_after_executor,
-    route_after_regression_gate,
     route_after_verifier,
 )
 
@@ -2070,10 +2069,10 @@ async def executor_node(state: AgentState) -> dict[str, Any]:
                 # Recap M44 deterministico (esito + cosa fatto + prossimo passo)
                 # invece del messaggio grezzo: il finale non e' piu' ambiguo. I file
                 # toccati arrivano da agent_steps (estrattore riusato, regola L).
-                from ..regression_gate_node import _modified_files_from_steps
+                from ..criteria_runner import modified_files_from_steps
                 _run_id_recap = str(state.get("thread_id") or "")
                 _modified = (
-                    _modified_files_from_steps(_run_id_recap) if _run_id_recap else []
+                    modified_files_from_steps(_run_id_recap) if _run_id_recap else []
                 )
                 _files_line = (
                     "File toccati: " + ", ".join(_modified)

@@ -142,8 +142,8 @@ pub async fn send_chat_message(
     // largo margine, ma sblocca la chat se qualcosa e' rimasto sospeso.
     //
     // Fix mig 0388: si esclude anche `generation_ended_at IS NOT NULL`. Nel grafo
-    // LangGraph l'ordine terminale e' executor -> reflection -> regression_gate ->
-    // learner -> END: l'evento end_turn (che libera il pulsante invio nel frontend)
+    // LangGraph l'ordine terminale e' executor -> reflection -> learner -> END:
+    // l'evento end_turn (che libera il pulsante invio nel frontend)
     // e' emesso a fine executor, MA reflection_node fa ancora una chiamata LLM di
     // valutazione (secondi) prima che il run sia finalizzato. In quella finestra
     // il run e' 'running' ma la generazione e' di fatto conclusa: senza questa

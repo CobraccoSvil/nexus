@@ -446,6 +446,59 @@ _OUTPUT_PATH_KEYS: dict[str, str] = {
     "fs_move": "to",
 }
 
+# Tool mutativi file considerati dal recap "File toccati" (estrattore riusato,
+# regola L). Distinto da _OUTPUT_PATH_KEYS: qui interessa l'impact set dei file
+# scritti/modificati, non la verifica di esistenza output (che include i rename).
+_MODIFIED_PATH_TOOLS = ("write_file", "create_file", "edit_file", "apply_patch", "str_replace")
+
+
+def modified_files_from_steps(run_id: str) -> list[str]:
+    """Estrae i path dei file modificati dal run leggendo `agent_steps`.
+
+    L'executor/tool_dispatch_node persiste OGNI tool eseguito in `agent_steps`
+    (tool_name + tool_input JSON). I file modificati sono i path dei tool
+    write_file/edit_file/apply_patch/str_replace/create_file con status
+    'completed'. Ritorna lista deduplicata e ordinata per step, vuota se DB down.
+
+    Punto unico (regola L): consumato dal recap anti-loop dell'executor.
+    """
+    paths: list[str] = []
+    seen: set[str] = set()
+    if not (os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")):
+        logger.debug("modified_files_from_steps: DATABASE_URL assente, skip")
+        return paths
+    try:
+        from brain.utils.db_pool import connect as _db_connect
+        with _db_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT tool_name, tool_input FROM agent_steps "
+                "WHERE run_id = %s AND tool_name = ANY(%s) AND status = 'completed' "
+                "ORDER BY step_index ASC",
+                (run_id, list(_MODIFIED_PATH_TOOLS)),
+            )
+            for _tool_name, tool_input in cur.fetchall():
+                raw = tool_input
+                if isinstance(raw, str):
+                    try:
+                        import json as _json
+                        raw = _json.loads(raw)
+                    except Exception:
+                        continue
+                if not isinstance(raw, dict):
+                    continue
+                p = raw.get("path") or raw.get("file_path") or raw.get("filename")
+                if p and isinstance(p, str):
+                    p = p.strip()
+                    if p and p not in seen:
+                        seen.add(p)
+                        paths.append(p)
+    except Exception as exc:
+        logger.warning(
+            "modified_files_from_steps: lettura agent_steps fallita per run_id=%s: %s",
+            run_id, exc,
+        )
+    return paths
+
 
 async def _check_outputs_exist(
     spec: dict[str, Any], expected: dict[str, Any], ctx: dict[str, Any], timeout_s: float,

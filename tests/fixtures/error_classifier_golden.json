@@ -37,6 +37,21 @@
       "expected_stop_reason": "rate_limit"
     },
     {
+      "name": "rate_limit_testuale",
+      "input": "Rate limit exceeded, please slow down",
+      "expected_stop_reason": "rate_limit"
+    },
+    {
+      "name": "rate_limit_throttled",
+      "input": "Request was throttled by the upstream provider",
+      "expected_stop_reason": "rate_limit"
+    },
+    {
+      "name": "rate_limit_429_senza_prefisso",
+      "input": "429 Resource has been exhausted (e.g. check quota).",
+      "expected_stop_reason": "rate_limit"
+    },
+    {
       "name": "http_500_provider",
       "input": "Error code: 500 - internal server error",
       "expected_stop_reason": "provider_error"
